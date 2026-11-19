@@ -33,6 +33,7 @@ pub mod onboarding;
 mod owner_index;
 pub mod placement;
 pub mod plugins;
+pub mod queue_backoff;
 pub mod realm;
 pub mod realm_vault;
 pub mod recorder;

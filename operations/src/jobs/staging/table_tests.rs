@@ -22,7 +22,7 @@ use crate::driver::{drive, node_routing};
 use crate::jobs::executor::{JobRunOutcome, ProgressReporter};
 use crate::s3::object::search::{ObjectKeyMatch, SearchObjectsInput};
 use crate::s3::object::search_scan::SearchObjectsOperation;
-use crate::tasks::job_context::JobContext;
+use crate::jobs::context::JobContext;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_core::time::unix_timestamp_millis;
 

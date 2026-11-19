@@ -1,11 +1,12 @@
-//! The context one job run gets from the job runner, and the seam to payload handlers.
+//! The context one job run gets from the job runner, and the seams to payload handlers and to
+//! the reconciler of lost external attempts.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{JobId, JobPayload};
+use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord};
 use futures_util::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
@@ -57,4 +58,15 @@ pub trait PayloadHandler: Send + Sync {
         context: &'a DriverContext,
         payload: &'a JobPayload,
     ) -> BoxFuture<'a, Result<bool, String>>;
+}
+
+/// Reconciliation seam for lost external attempts. A lost lease or node restart must never
+/// blindly requeue one (that double-runs the container); the sweep and recovery route it here.
+/// Until a reconciler is registered the job is untouched.
+pub trait ExternalReconciler: Send + Sync {
+    fn reconcile_lost_attempt<'a>(
+        &'a self,
+        context: &'a DriverContext,
+        record: JobRecord,
+    ) -> BoxFuture<'a, ()>;
 }

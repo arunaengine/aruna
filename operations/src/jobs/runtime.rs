@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::executor::{ProgressReporter, RangeTurns};
 use super::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
-use crate::tasks::job_context::PayloadHandler;
-use crate::tasks::job_reconcile::ExternalReconciler;
+use crate::jobs::context::ExternalReconciler;
+use crate::jobs::context::PayloadHandler;
 
 struct RunningJob {
     /// Per-execution identity: a re-spawned job at the same id gets a fresh nonce so a
@@ -454,6 +454,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::JOB_MAX_ATTEMPTS;
+    use crate::jobs::context::JobContext;
     use crate::jobs::executor::JobRunOutcome;
     use crate::jobs::runtime_steps::requeue_call;
     use crate::jobs::store::JobMutation;
@@ -464,7 +465,6 @@ mod tests {
         list_job_entries, mutate_job, read_job_record, record_attempt_intent, requeue_job,
         set_cancel_requested,
     };
-    use crate::tasks::job_context::JobContext;
     use crate::tasks::job_runner::{handle_panic, run_job};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
@@ -1536,10 +1536,15 @@ mod tests {
         seen: std::sync::Mutex<Vec<JobId>>,
     }
 
-    #[async_trait::async_trait]
     impl ExternalReconciler for RecordingReconciler {
-        async fn reconcile_lost_attempt(&self, _context: &DriverContext, record: JobRecord) {
-            self.seen.lock().unwrap().push(record.job_id);
+        fn reconcile_lost_attempt<'a>(
+            &'a self,
+            _context: &'a DriverContext,
+            record: JobRecord,
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.seen.lock().unwrap().push(record.job_id);
+            })
         }
     }
 
@@ -1663,12 +1668,17 @@ mod tests {
         release: tokio::sync::Notify,
     }
 
-    #[async_trait::async_trait]
     impl ExternalReconciler for BlockingReconciler {
-        async fn reconcile_lost_attempt(&self, _context: &DriverContext, record: JobRecord) {
-            self.seen.lock().unwrap().push(record.job_id);
-            self.entered.notify_one();
-            self.release.notified().await;
+        fn reconcile_lost_attempt<'a>(
+            &'a self,
+            _context: &'a DriverContext,
+            record: JobRecord,
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.seen.lock().unwrap().push(record.job_id);
+                self.entered.notify_one();
+                self.release.notified().await;
+            })
         }
     }
 
@@ -1743,18 +1753,23 @@ mod tests {
 
     struct AdoptingReconciler;
 
-    #[async_trait::async_trait]
     impl ExternalReconciler for AdoptingReconciler {
-        async fn reconcile_lost_attempt(&self, context: &DriverContext, record: JobRecord) {
-            let outcome = adopt_external_attempt(
-                context,
-                record.job_id,
-                record.owner_node_id,
-                unix_timestamp_millis(),
-            )
-            .await
-            .unwrap();
-            assert!(matches!(outcome, AdoptOutcome::Adopted(..)), "must adopt");
+        fn reconcile_lost_attempt<'a>(
+            &'a self,
+            context: &'a DriverContext,
+            record: JobRecord,
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                let outcome = adopt_external_attempt(
+                    context,
+                    record.job_id,
+                    record.owner_node_id,
+                    unix_timestamp_millis(),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(outcome, AdoptOutcome::Adopted(..)), "must adopt");
+            })
         }
     }
 

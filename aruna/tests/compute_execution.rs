@@ -27,7 +27,7 @@ use aruna_operations::jobs::store::job_calls::{self, ClaimOutcome};
 use aruna_operations::jobs::store::{JobMutation, row_calls};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use aruna_operations::tasks::job_reconcile::ExternalReconciler;
+use aruna_operations::jobs::context::ExternalReconciler;
 use aruna_operations::tasks::job_runner::{ComputeReconciler, run_execution_job};
 use aws_sdk_s3::primitives::ByteStream;
 use serde_json::{Value, json};

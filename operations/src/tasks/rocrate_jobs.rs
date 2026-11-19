@@ -7,7 +7,7 @@ use std::sync::Arc;
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, ImportRoCrateSpec};
 use rand::RngExt;
 
-use super::job_context::JobContext;
+use crate::jobs::context::JobContext;
 use super::job_host::run_hosted;
 use crate::driver::node_routing;
 use crate::jobs::executor::JobRunOutcome;

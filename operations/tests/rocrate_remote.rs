@@ -51,7 +51,7 @@ use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::tasks::job_context::JobContext;
+use aruna_operations::jobs::context::JobContext;
 use aruna_operations::tasks::rocrate_jobs::run_export_job;
 use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::replay_event_log;

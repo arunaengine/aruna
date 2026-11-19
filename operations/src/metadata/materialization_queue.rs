@@ -43,7 +43,7 @@ use crate::jobs::repository::links::LinkError;
 use crate::metadata::call_results::page_rows;
 use crate::metadata::checkpoint::{CheckpointError, CheckpointOperation};
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
-use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
+use crate::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
 
 use super::data_links::{DataLinkError, LinkRows};
 use super::iri_index::{MetadataIriError, ProjectRowsOperation};

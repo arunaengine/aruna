@@ -57,7 +57,7 @@ use aruna_operations::s3::imports::discovery::{
 };
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::storage_read::iter_prefix_page;
-use aruna_operations::tasks::job_context::JobContext;
+use aruna_operations::jobs::context::JobContext;
 use aruna_operations::tasks::job_host::run_backend_import;
 use aruna_operations::tasks::job_host::run_storage_purge;
 use aruna_storage::storage;

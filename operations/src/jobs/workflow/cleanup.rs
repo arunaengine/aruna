@@ -306,7 +306,7 @@ mod tests {
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;
-    use crate::tasks::job_context::JobContext;
+    use crate::jobs::context::JobContext;
 
     async fn run_terminal_cleanup(
         ctx: &JobContext,

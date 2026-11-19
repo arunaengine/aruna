@@ -28,7 +28,7 @@ use aruna_operations::jobs::repository::link_store::{ApplyChangeOperation, ListL
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::pull::StartPullOperation;
 use aruna_operations::jobs::repository::{RecordReference, TransferError, seal_token};
-use aruna_operations::tasks::job_context::JobContext;
+use aruna_operations::jobs::context::JobContext;
 use serde_json::Value;
 use ulid::Ulid;
 

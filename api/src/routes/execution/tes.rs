@@ -712,7 +712,7 @@ pub async fn create_task(
         };
         let context = state.get_ctx();
         return match drive(
-            aruna_operations::tasks::job_node::local_run(config, &context),
+            aruna_operations::jobs::node_inputs::local_run(config, &context),
             context.as_ref(),
         )
         .await

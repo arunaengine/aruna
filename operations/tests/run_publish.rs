@@ -32,7 +32,7 @@ use aruna_operations::jobs::workflow::run_crate::{WriteCrateOperation, crate_out
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_operations::tasks::job_context::JobContext;
+use aruna_operations::jobs::context::JobContext;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use topology::{TestNode, TestResult, Topology, read_group_auth, wait_until};

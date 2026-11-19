@@ -20,7 +20,7 @@ use crate::plugins::store::Txn;
 #[allow(unused_imports)]
 pub(crate) use crate::plugins::test_support::edit_work;
 use crate::plugins::test_support::installed;
-use crate::tasks::job_context::PayloadHandler;
+use crate::jobs::context::PayloadHandler;
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
@@ -61,7 +61,7 @@ struct WorkHolds;
 impl PayloadHandler for WorkHolds {
     fn run<'a>(
         &'a self,
-        _: &'a crate::tasks::job_context::JobContext,
+        _: &'a crate::jobs::context::JobContext,
         _: &'a JobPayload,
     ) -> Option<futures_util::future::BoxFuture<'a, crate::jobs::executor::JobRunOutcome>> {
         None

@@ -73,7 +73,7 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::purge_fence::{PurgeFenceError, fence_key};
-use aruna_operations::tasks::job_context::JobContext;
+use aruna_operations::jobs::context::JobContext;
 use aruna_operations::tasks::job_host::run_storage_purge;
 use aruna_operations::testing::read_value;
 use aruna_storage::{StorageHandle, storage};

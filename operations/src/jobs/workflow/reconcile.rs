@@ -612,7 +612,7 @@ mod tests {
     use crate::jobs::JOB_MAX_ATTEMPTS;
     use crate::jobs::runtime::JobsRuntime;
     use crate::jobs::store::test_calls::{insert_job, read_job_record, record_attempt_intent};
-    use crate::tasks::job_reconcile::ExternalReconciler;
+    use crate::jobs::context::ExternalReconciler;
     use crate::tasks::job_runner::ComputeReconciler;
     use crate::tests::workflow::{execution_spec, node_id};
     use aruna_compute::ExecutorRegistry;

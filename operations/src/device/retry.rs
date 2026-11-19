@@ -6,7 +6,7 @@ use aruna_core::time::unix_timestamp_millis;
 
 use super::publish_queue::{PublishEntry, PublishState};
 use super::sync::repository::{SyncUpload, UploadState};
-use crate::tasks::queue_backoff::retry_delay_ms;
+use crate::queue_backoff::retry_delay_ms;
 
 /// The retry view both device queue states expose.
 pub(crate) trait RetryView {

@@ -25,7 +25,7 @@ use crate::jobs::repository::test_support::{
     artifact, job_id, job_scope as scoped_job, local_scope, other_node, owner_node, realm,
 };
 use crate::replication::plaintext::HolderCheckOperation;
-use crate::tasks::job_context::JobContext;
+use crate::jobs::context::JobContext;
 use aruna_blob::archive::zip_date;
 use aruna_blob::archive::zip_entry;
 use aruna_core::archive_path::safe_zip_path;

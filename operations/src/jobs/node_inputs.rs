@@ -28,7 +28,7 @@ pub fn ingress_node(context: &DriverContext) -> Option<IngressNode> {
 
 /// This node as an offered launch sees it; `None` without a network, which leaves the offer
 /// undecided.
-pub(crate) fn launch_node(context: &DriverContext, launch: &LaunchFrame) -> Option<LaunchNode> {
+pub fn launch_node(context: &DriverContext, launch: &LaunchFrame) -> Option<LaunchNode> {
     let (local, realm_id) = context.node_and_realm()?;
     let limits = match &launch.envelope().record {
         JobFamilyRecord::Launch(intent) => offered_limits(context, intent),

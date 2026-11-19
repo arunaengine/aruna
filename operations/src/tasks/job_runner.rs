@@ -28,10 +28,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use super::job_context::{JobContext, PayloadHandler};
 use super::job_dispatch::dispatch_payload;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::effect_adapters::job::{JobHost, with_job_host};
+use crate::jobs::context::ExternalReconciler;
+use crate::jobs::context::{JobContext, PayloadHandler};
 use crate::jobs::executor::{JobRunOutcome, ProgressReporter, RangeTurns, run_cleanup};
 use crate::jobs::runtime::{Admission, JobShutdownReport, JobsRuntime, RecoveredAdmission};
 use crate::jobs::runtime_steps::{
@@ -52,7 +53,6 @@ use crate::jobs::workflow::reconcile::{
 };
 use crate::jobs::workflow::supervise::AbandonSessionOperation;
 use crate::jobs::{FLUSH_INTERVAL_MS, JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
-use crate::tasks::job_reconcile::ExternalReconciler;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -695,33 +695,38 @@ impl ComputeReconciler {
     }
 }
 
-#[async_trait::async_trait]
 impl ExternalReconciler for ComputeReconciler {
-    async fn reconcile_lost_attempt(&self, context: &DriverContext, record: JobRecord) {
-        let job_id = record.job_id;
-        if !matches!(record.payload, JobPayload::Execution(_)) {
-            return;
-        }
-        let holder = (self.context.net_handle.as_ref())
-            .map(|net| net.node_id())
-            .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[0u8; 32]).public());
-        let adopt = AdoptAttemptOperation::new(job_id, holder, run_wiring(&self.context));
-        let (scope, adopted) = match drive(adopt, context).await {
-            Ok(Adoption::Adopted { scope, record }) => (scope, record),
-            Ok(Adoption::Done) => return,
-            Err(error) => {
-                warn!(job_id = %job_id, %error, "Adoption failed");
+    fn reconcile_lost_attempt<'a>(
+        &'a self,
+        context: &'a DriverContext,
+        record: JobRecord,
+    ) -> futures_util::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let job_id = record.job_id;
+            if !matches!(record.payload, JobPayload::Execution(_)) {
                 return;
             }
-        };
-        let ids = (job_id, scope.token);
-        let settle = SettleAdoptedOperation::new(scope.clone(), adopted.clone());
-        let cancel = CancellationToken::new();
-        match under_lease(context, ids, cancel, settle).await {
-            Some(Ok(AdoptedEnd::Resume(phase))) => self.resume(scope, adopted, phase).await,
-            Some(Ok(AdoptedEnd::Settled)) => {}
-            Some(Err(error)) => warn!(job_id = %job_id, %error, "Adopted attempt failed"),
-            None => info!(job_id = %job_id, "Reconcile finalizer superseded; abandoning"),
-        }
+            let holder = (self.context.net_handle.as_ref())
+                .map(|net| net.node_id())
+                .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[0u8; 32]).public());
+            let adopt = AdoptAttemptOperation::new(job_id, holder, run_wiring(&self.context));
+            let (scope, adopted) = match drive(adopt, context).await {
+                Ok(Adoption::Adopted { scope, record }) => (scope, record),
+                Ok(Adoption::Done) => return,
+                Err(error) => {
+                    warn!(job_id = %job_id, %error, "Adoption failed");
+                    return;
+                }
+            };
+            let ids = (job_id, scope.token);
+            let settle = SettleAdoptedOperation::new(scope.clone(), adopted.clone());
+            let cancel = CancellationToken::new();
+            match under_lease(context, ids, cancel, settle).await {
+                Some(Ok(AdoptedEnd::Resume(phase))) => self.resume(scope, adopted, phase).await,
+                Some(Ok(AdoptedEnd::Settled)) => {}
+                Some(Err(error)) => warn!(job_id = %job_id, %error, "Adopted attempt failed"),
+                None => info!(job_id = %job_id, "Reconcile finalizer superseded; abandoning"),
+            }
+        })
     }
 }

@@ -12,7 +12,7 @@ use aruna_core::rows::{PrefixPages, done};
 use aruna_core::storage_entries::{graph_prune_entry, graph_prune_key};
 use aruna_core::types::{Key, KeySpace, Value};
 
-use crate::tasks::queue_backoff::{min_due_at, retry_delay_ms};
+use crate::queue_backoff::{min_due_at, retry_delay_ms};
 
 const PRUNE_PAGE: usize = 512;
 

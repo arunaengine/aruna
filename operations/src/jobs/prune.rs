@@ -433,7 +433,7 @@ pub(crate) mod tests {
     use crate::jobs::store::test_calls::read_job_record;
     use crate::jobs::store::test_calls::{claim_job, complete_job, transition_to_running};
     use crate::storage_read::iter_prefix_page;
-    use crate::tasks::job_context::PayloadHandler;
+    use crate::jobs::context::PayloadHandler;
     use crate::testing::test_context;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;

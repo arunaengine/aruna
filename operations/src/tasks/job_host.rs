@@ -18,7 +18,7 @@ use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use super::job_context::JobContext;
+use crate::jobs::context::JobContext;
 use crate::driver::{drive, node_routing};
 use crate::effect_adapters::job::{JobHost, with_job_host};
 use crate::jobs::backend_import::{BackendImportOperation, ImportJob};

@@ -88,8 +88,8 @@ use crate::metadata::projection::{
     DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
     ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation, max_clock_skew,
 };
-use crate::tasks::job_context::PayloadHandler;
-use crate::tasks::job_node::witness_node;
+use crate::jobs::context::PayloadHandler;
+use crate::jobs::node_inputs::witness_node;
 
 /// Replays the whole event log into the registry projection, one page at a time.
 async fn replay_event_log(
@@ -168,7 +168,7 @@ use crate::sync::reconcile::SyncTopicsOperation;
 use crate::sync::shard_placement::{
     DEFER_RETRY_AFTER, PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
 };
-use crate::tasks::queue_backoff::retry_delay_ms;
+use crate::queue_backoff::retry_delay_ms;
 use crate::tasks::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_task_timers,
 };

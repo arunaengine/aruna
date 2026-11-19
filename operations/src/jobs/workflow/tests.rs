@@ -21,7 +21,7 @@ use crate::jobs::store::test_calls::{
 };
 use crate::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::tasks::job_context::JobContext;
+use crate::jobs::context::JobContext;
 use crate::tasks::job_runner::{execution_host, resume_attempt as run_resume, run_execution_job};
 use crate::tasks::job_runner::{run_wiring, under_lease};
 use aruna_compute::ExecutorBackend;

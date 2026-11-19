@@ -20,7 +20,7 @@ use crate::s3::object::copy::{
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::PutObjectError;
-use crate::tasks::job_context::JobContext;
+use crate::jobs::context::JobContext;
 
 /// How often the bytes pulled so far reach the job's progress.
 const PROGRESS_TICK: Duration = Duration::from_secs(1);

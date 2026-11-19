@@ -10,7 +10,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{JobError, JobPayload, JobResultPayload};
 use aruna_core::time::unix_timestamp_millis;
 
-use super::job_context::JobContext;
+use crate::jobs::context::JobContext;
 use super::job_host::{run_backend_import, run_hosted, run_staging_job, run_storage_purge};
 use crate::driver::drive;
 use crate::jobs::executor::JobRunOutcome;

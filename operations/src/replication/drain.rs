@@ -54,7 +54,7 @@ use crate::notifications::watch::origin::EmitEventOperation;
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation, SyncMirrorError};
-use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
+use crate::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 use aruna_core::structs::storage::replication_queue::MemberTarget;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 use aruna_core::structs::storage::replication_queue::{

@@ -57,7 +57,7 @@ use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOper
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
-use aruna_operations::tasks::job_node::ingress_node;
+use aruna_operations::jobs::node_inputs::ingress_node;
 use std::cell::RefCell;
 use ulid::Ulid;
 

@@ -28,7 +28,7 @@ use crate::replication::incoming::stream::{
 use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 use crate::staging::native_source::PrepareReferenceOperation;
 use crate::sync::evicted::ReemitEvictedOperation;
-use crate::tasks::queue_backoff::retry_delay_ms;
+use crate::queue_backoff::retry_delay_ms;
 use crate::triggers::{PeerInput, peer_operation};
 use aruna_blob::blob::{InboundError, refuse_stream};
 use aruna_blob::native;
@@ -225,7 +225,7 @@ async fn peer_request(
                 .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
         }
         MetadataTransportMessage::ForwardLaunchOffer { launch } => {
-            let node = crate::tasks::job_node::launch_node(context, &launch);
+            let node = crate::jobs::node_inputs::launch_node(context, &launch);
             let serve = ServeLaunchOperation::new(peer, *launch, node);
             Ok(Box::pin(drive(serve, context.as_ref()))
                 .await
@@ -236,7 +236,7 @@ async fn peer_request(
             submission_id,
             request,
         } => {
-            let node = crate::tasks::job_node::ingress_node(context);
+            let node = crate::jobs::node_inputs::ingress_node(context);
             let admit = crate::jobs::lifecycle::admit_forwarded::AdmitForwardedOperation::new(
                 peer,
                 auth_token,
@@ -251,7 +251,7 @@ async fn peer_request(
             auth_token,
             request,
         } => {
-            let result = match crate::tasks::job_node::ingress_node(context) {
+            let result = match crate::jobs::node_inputs::ingress_node(context) {
                 Some(node) => {
                     let serve = crate::jobs::lifecycle::serve_inputs::ServeInputsOperation::new(
                         peer, auth_token, &node, *request,

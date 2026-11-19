@@ -58,7 +58,7 @@ use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_operations::tasks::job_context::JobContext;
+use aruna_operations::jobs::context::JobContext;
 use aruna_operations::tasks::rocrate_jobs::{run_export_job, run_rocrate_import};
 use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::replay_event_log;
