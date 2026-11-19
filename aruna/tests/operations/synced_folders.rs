@@ -24,6 +24,7 @@ use aruna_core::structs::{
     RemoteBinding, SyncBase, SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal,
 };
 use aruna_core::types::GroupId;
+use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
 use aruna_operations::device::sync::folders::{
@@ -33,7 +34,6 @@ use aruna_operations::device::sync::folders::{
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
-use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_operations::metadata::protocol::MetadataTransportMessage;
 use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, needs_view};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
@@ -894,7 +894,9 @@ async fn recovers_interrupted_bind() -> TestResult<()> {
     let device = realm.user_node();
     let server = realm.node(0);
     let root = tempfile::tempdir()?;
+    // Without the net handle no metadata request reaches the realm.
     let unanswered = std::sync::Arc::new(DriverContext {
+        net_handle: None,
         outbound_handle: None,
         graph_handle: None,
         task_handle: None,

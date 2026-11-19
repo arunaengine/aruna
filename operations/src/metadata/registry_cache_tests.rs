@@ -100,7 +100,7 @@ fn fill_stores_registry() {
     let sweep = IoCall::child(DeletedGraphsOperation::new());
     assert_eq!(fill.next(registry), Ok(Next::Call(sweep)));
     let deleted = HashSet::from([gone.graph_iri.clone()]);
-    let lifecycle = child(Ok::<_, MetadataError>((deleted, 1)));
+    let lifecycle = child(Ok::<_, MetadataError>((deleted, 1u64)));
     let store = MetadataEffect::StoreRegistry {
         records: vec![live.clone()],
         lifecycle: vec![

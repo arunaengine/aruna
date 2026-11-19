@@ -85,7 +85,7 @@ fn stale_replay_refused() {
     let mut check = WritePeerOperation::new(node(1), replay);
     check.first().unwrap();
     assert!(runs_child(check.next(realm_answer(Some(REALM)))));
-    let cutoff = child(Ok::<_, ArunaBearerError>(Some(11)));
+    let cutoff = child(Ok::<_, ArunaBearerError>(Some(11u64)));
     assert_eq!(check.next(cutoff), Err(PeerAuthRefusal::Unauthorized));
 }
 
@@ -101,7 +101,7 @@ fn replay_age_authoring() {
         let mut check = WritePeerOperation::new(node(1), token);
         check.first().unwrap();
         check.next(realm_answer(Some(REALM))).unwrap();
-        let answered = check.next(child(Ok::<_, ArunaBearerError>(Some(100))));
+        let answered = check.next(child(Ok::<_, ArunaBearerError>(Some(100u64))));
         assert_eq!(answered == Err(PeerAuthRefusal::Unauthorized), refused);
     }
 }
