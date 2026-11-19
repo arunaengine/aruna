@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use crate::UserId;
 use crate::alpn::Alpn;
-use crate::audit::AuditPageRequest;
 use crate::compute::SharedSecret;
 use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
@@ -798,7 +797,6 @@ pub enum NetEffect {
     DocumentSync(DocumentEffect),
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
-    AuditPage(Box<AuditPageEffect>),
     /// Signs one policy publication claim with this node's key, after the
     /// operation checked the authorizing user's realm-admin permission.
     PolicySign(Box<PolicyPublicationClaim>),
@@ -810,8 +808,6 @@ pub enum NetEffect {
     StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
     /// Signs one job record of an execution; only a claim naming this node as publisher.
     ExecutionSign(Box<crate::structs::execution::job::ExecutionClaim>),
-    /// Sends one plugin artifact chunk to a management node; answers `NetEvent::ArtifactStored`.
-    ArtifactStore(Box<crate::plugins::ArtifactStore>),
     /// Sends one notification request frame to a holder and reads its answer frame.
     Notification(Box<crate::structs::execution::notification::NotificationRequest>),
     /// Wakes the live inbox streams of these local recipients.
@@ -1275,15 +1271,6 @@ pub struct VaultFetchEffect {
 pub struct JobControlEffect {
     pub owner: NodeId,
     pub request: JobRequest,
-}
-
-/// The audit fan-out: one page request asked of every listed node. The adapter
-/// performs the frame round-trips concurrently and answers with one aggregated
-/// event, so an unreachable node cannot delay the others.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AuditPageEffect {
-    pub nodes: Vec<NodeId>,
-    pub request: AuditPageRequest,
 }
 
 /// Default wall-clock budget for a DHT read whose caller has no tighter

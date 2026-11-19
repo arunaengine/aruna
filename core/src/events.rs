@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::audit::AuditPageBatch;
 use crate::compute::{SecretBytes, SharedSecret};
 use crate::effects::{
     FrameBoundsError, JOB_PAGE_BYTES, JobRecordFrame, MAX_RECORD_PAGE, encoded_len,
@@ -485,7 +484,6 @@ pub enum NetEvent {
     JobControl(JobControlEvent),
     /// Milliseconds since each asked node's last heartbeat, or since this node started.
     HeartbeatSilence(std::collections::BTreeMap<NodeId, u64>),
-    AuditPages(AuditPageBatch),
     PolicyFetch(PolicyFetchEvent),
     PolicySign(PolicySignEvent),
     VaultFetch(VaultFetchEvent),
@@ -494,8 +492,6 @@ pub enum NetEvent {
     StatementSign(StatementSignEvent),
     ExecutionSign(ExecutionSignEvent),
     Error(NetError),
-    /// Whether the node holds the complete artifact after the chunk, or why it was not stored.
-    ArtifactStored(Result<bool, String>),
     /// The holder's answer frame, or why none came.
     Notification(
         Result<Box<crate::structs::execution::notification::NotificationTransportMessage>, String>,
@@ -1049,7 +1045,6 @@ impl Event {
                     DocumentSync,
                     Stream,
                     JobControl,
-                    AuditPages,
                     PolicyFetch,
                     PolicySign,
                     VaultFetch,
@@ -1058,7 +1053,6 @@ impl Event {
                     StatementSign,
                     ExecutionSign,
                     Error,
-                    ArtifactStored,
                     MetadataAnswer,
                     DocumentPeers,
                     GrantedRead,
