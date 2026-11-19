@@ -78,48 +78,39 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-    use aruna_core::types::TxnId;
     use aruna_storage::storage;
     use byteview::ByteView;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::tempdir;
 
-    /// Commits a transaction that the test opened and fails unless storage acknowledges it.
+    /// Writes one row in its own write transaction; the runner commits it when it is done.
     #[derive(Debug, PartialEq)]
-    struct CommitOutcome {
-        txn_id: TxnId,
-    }
+    struct CommitOutcome;
 
     impl Operation for CommitOutcome {
         type Output = ();
         type Error = IoError;
 
+        fn transaction(&self) -> TransactionMode {
+            TransactionMode::Write
+        }
+
         fn first(&mut self) -> Result<Next<()>, IoError> {
-            let commit = StorageEffect::CommitTransaction {
-                txn_id: self.txn_id,
-            };
-            Ok(Next::Call(IoCall::from(Effect::Storage(commit))))
+            let row = (
+                "default".to_string(),
+                ByteView::from(*b"commit-outcome"),
+                ByteView::from(*b"committed"),
+            );
+            Ok(Next::Call(IoCall::Write(vec![row])))
         }
 
         fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
-            match result {
-                IoResult::Event(event)
-                    if matches!(
-                        *event,
-                        Event::Storage(StorageEvent::TransactionCommitted { .. })
-                    ) =>
-                {
-                    Ok(Next::Done(()))
-                }
-                _ => Err(IoError::Unexpected {
-                    expected: "a committed transaction",
-                    got: "another storage answer",
-                }),
-            }
+            result.done()?;
+            Ok(Next::Done(()))
         }
     }
 
@@ -206,29 +197,11 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         };
-        let txn_id = match storage_handle
-            .send_storage_effect(StorageEffect::StartTransaction { read: false })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            other => panic!("unexpected transaction start: {other:?}"),
-        };
-        match storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: "default".to_string(),
-                key: ByteView::from(*b"commit-outcome"),
-                value: ByteView::from(*b"committed"),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected transaction write: {other:?}"),
-        }
+        // The operation's own commit is the managed effect whose refresh the actor holds.
         let task_context = context.clone();
         let mut task = tokio::spawn(async move {
             crate::driver::drive_until(
-                CommitOutcome { txn_id },
+                CommitOutcome,
                 &task_context,
                 tokio::time::Instant::now() + std::time::Duration::from_millis(100),
             )

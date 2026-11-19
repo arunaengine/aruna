@@ -74,7 +74,6 @@ const TAIL_PERIOD: Duration = Duration::from_millis(40);
 const PROBE_PERIOD: Duration = Duration::from_millis(500);
 const PROBE_POLL: Duration = Duration::from_millis(50);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
-const VISIBILITY_POLL: Duration = Duration::from_millis(200);
 const OUTBOX_SIZE: usize = 10_000;
 const EMIT_BATCH: usize = 100;
 const STORAGE_ROWS: usize = 100_000;
@@ -240,7 +239,7 @@ async fn measure_spread() -> Result<(), BoxError> {
     let newest = created.len().saturating_sub(SAMPLE_DOCS);
     let sample = pairs_of(&created[newest..]);
     let started = Instant::now();
-    let result = wait_for_visibility(&contexts(&nodes), &sample, VISIBILITY_POLL).await;
+    let result = wait_for_visibility(&contexts(&nodes), &sample).await;
     let seconds = started.elapsed().as_secs_f64();
     shutdown_nodes(nodes).await;
     result?;
@@ -288,7 +287,7 @@ async fn converge_all(realm_id: RealmId, nodes: &[TestNode]) -> Result<(usize, f
     .await?;
     let pairs = pairs_of(&created);
     let all = contexts(nodes);
-    wait_for_visibility(&all, &pairs, VISIBILITY_POLL).await?;
+    wait_for_visibility(&all, &pairs).await?;
     wait_empty_queues(&all).await?;
     Ok((pairs.len(), started.elapsed().as_secs_f64()))
 }
@@ -333,7 +332,7 @@ async fn sample_tail(realm_id: RealmId, nodes: &[TestNode]) -> Result<(), BoxErr
     let _ = done_tx.send(true);
     let pairs = pairs_of(&created?);
     let convergence = async {
-        wait_for_visibility(&all, &pairs, VISIBILITY_POLL).await?;
+        wait_for_visibility(&all, &pairs).await?;
         wait_empty_queues(&all).await?;
         Ok::<f64, String>(started.elapsed().as_secs_f64())
     };
