@@ -16,6 +16,7 @@ pub mod family;
 pub mod pages;
 pub mod project;
 pub mod prune;
+mod prune_family;
 pub mod reduce;
 pub mod transport;
 pub mod verify;
