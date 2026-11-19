@@ -1711,6 +1711,7 @@ mod tests {
         let handle = TaskHandle {
             command_tx,
             admission_closed: Arc::new(AtomicBool::new(false)),
+            pulls: Arc::default(),
         };
         let scheduler = tokio::spawn(async move {
             match command_rx.recv().await {
@@ -1741,6 +1742,7 @@ mod tests {
         let handle = TaskHandle {
             command_tx,
             admission_closed: Arc::new(AtomicBool::new(false)),
+            pulls: Arc::default(),
         };
         let scheduler = tokio::spawn(async move {
             match command_rx.recv().await {
@@ -1764,6 +1766,7 @@ mod tests {
         let handle = TaskHandle {
             command_tx,
             admission_closed: Arc::new(AtomicBool::new(false)),
+            pulls: Arc::default(),
         };
         let scheduler = tokio::spawn(async move {
             match command_rx.recv().await {

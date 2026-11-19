@@ -13,7 +13,7 @@ use aruna_core::events::{
     DhtEntry, DhtEvent, ExecutionSignEvent, JobControlEvent, MetadataAnswer, NetEvent,
     PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
 };
-use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
+use aruna_core::id::{DhtKeyId, hex_prefix};
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::execution::job::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
