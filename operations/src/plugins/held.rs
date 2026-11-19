@@ -499,7 +499,9 @@ impl Operation for ReplyShown {
         if self.injecting {
             let injected = result.child::<Injected, CallError>();
             let full = |injected: Injected| injected.released.exposure == ResponseExposure::Full;
-            return Ok(Next::Done(injected.is_ok_and(|injected| injected.is_ok_and(full))));
+            return Ok(Next::Done(
+                injected.is_ok_and(|injected| injected.is_ok_and(full)),
+            ));
         }
         let Ok(Ok(Some(plan))) = result.child::<Option<ReplyPlan>, CallError>() else {
             return Ok(Next::Done(false));

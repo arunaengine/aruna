@@ -546,7 +546,8 @@ impl Operation for ServePageOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<ServedPage>, PageReadError> {
         if self.admitted {
-            let page = result.value()?
+            let page = result
+                .value()?
                 .map(|row| stored_page(&row, &self.digest))
                 .transpose()?;
             return Ok(Next::Done(page.map(Box::new)));

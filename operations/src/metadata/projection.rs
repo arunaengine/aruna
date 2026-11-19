@@ -565,7 +565,8 @@ impl ProjectEventsOperation {
                         return Ok(Flow::Call(read_row(MATERIALIZATION_STATUS_KEYSPACE, key)));
                     }
                     (None, Some(result)) => {
-                        let status = result.value()?
+                        let status = result
+                            .value()?
                             .map(|bytes| decode::<MaterializationStatusRecord>(&bytes))
                             .transpose()?;
                         self.status_cache.insert(document_id, status.clone());
@@ -772,7 +773,8 @@ impl ProjectEventsOperation {
         answer: Option<IoResult>,
     ) -> Result<Flow, MetadataProjectionError> {
         let lifecycle = match answer {
-            Some(result) => result.value()?
+            Some(result) => result
+                .value()?
                 .and_then(|bytes| postcard::from_bytes::<MetadataLifecycleRecord>(&bytes).ok()),
             None => None,
         };
@@ -1020,7 +1022,8 @@ fn author_message_read(event: &MetadataEventRecord) -> IoCall {
 }
 
 fn message_value(result: IoResult) -> Result<Option<String>, MetadataProjectionError> {
-    result.value()?
+    result
+        .value()?
         .map(|bytes| decode::<String>(&bytes))
         .transpose()
 }
@@ -1049,7 +1052,9 @@ impl Operation for ProjectEventsOperation {
     fn next(&mut self, result: IoResult) -> ProjectTurn {
         if self.max_skew_ms.is_none() {
             // A node that never stored the setting keeps the default.
-            let stored = result.value()?.and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
+            let stored = result
+                .value()?
+                .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
             self.max_skew_ms = Some(stored.map_or(DEFAULT_SKEW_MS, u64::from_be_bytes));
             return Ok(Next::Call(metadata_call(MetadataEffect::CacheGeneration)));
         }

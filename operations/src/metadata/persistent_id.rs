@@ -50,7 +50,8 @@ impl Operation for MappingReadOperation {
         &mut self,
         result: IoResult,
     ) -> Result<Next<Option<PersistentIdMapping>>, PersistentIdError> {
-        let mapping = result.value()?
+        let mapping = result
+            .value()?
             .map(|bytes| PersistentIdMapping::from_bytes(bytes.as_ref()))
             .transpose()
             .map_err(PersistentIdError::Conversion)?;

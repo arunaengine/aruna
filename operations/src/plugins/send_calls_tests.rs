@@ -77,14 +77,20 @@ fn send_needs_whole() {
     let refused = narrowed.next(ready(ResponseExposure::Status));
     assert_eq!(refused.unwrap_err().error.kind, ErrorKind::Denied);
     let mut plain = send(None);
-    assert!(is_child(&plain.next(ready(ResponseExposure::Full))), "then the send");
+    assert!(
+        is_child(&plain.next(ready(ResponseExposure::Full))),
+        "then the send"
+    );
     assert_eq!(plain.phase, SendPhase::Send);
 }
 
 #[test]
 fn send_replays_reply() {
     let mut replay = send(Some(intent()));
-    assert!(is_child(&replay.next(ready(ResponseExposure::Full))), "the intent first");
+    assert!(
+        is_child(&replay.next(ready(ResponseExposure::Full))),
+        "the intent first"
+    );
     let stored = whole_text(&Response {
         status: 200,
         headers: Vec::new(),
@@ -135,7 +141,10 @@ fn download_needs_whole() {
     let refused = narrowed.next(ready(ResponseExposure::Status));
     assert_eq!(refused.unwrap_err().error.kind, ErrorKind::Denied);
     let mut full = transfer(download());
-    assert!(is_child(&full.next(ready(ResponseExposure::Full))), "the work starts");
+    assert!(
+        is_child(&full.next(ready(ResponseExposure::Full))),
+        "the work starts"
+    );
     let started = child_result(Ok::<_, CallFailure>("work".to_string()));
     assert_eq!(full.next(started), Ok(Next::Done("work".to_string())));
 }

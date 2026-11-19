@@ -99,7 +99,10 @@ mod operations {
             slot,
         };
         let held = Effect::Plugin(held);
-        assert_eq!(obtain.first(), Ok(Next::Call(IoCall::Effect(Box::new(held)))));
+        assert_eq!(
+            obtain.first(),
+            Ok(Next::Call(IoCall::Effect(Box::new(held))))
+        );
         obtain
     }
 
@@ -109,7 +112,10 @@ mod operations {
         let mut obtain = obtain(run_id);
         let value_id = Ulid::from_parts(1, 1);
         let held = plugin_answer(PluginEvent::Held(Some(value_id)));
-        assert!(is_child(&obtain.next(held)), "the release names the held value");
+        assert!(
+            is_child(&obtain.next(held)),
+            "the release names the held value"
+        );
         // The check passed again for the held value, so its fields come from the run.
         let released = child_result(Ok::<_, ReleaseFailure>(answer(1, None)));
         let Ok(Next::Call(IoCall::Effect(hold))) = obtain.next(released) else {
@@ -141,7 +147,9 @@ mod operations {
         let none = lost.next(plugin_answer(PluginEvent::Fields(None)));
         assert_eq!(none.unwrap_err().0.kind, ErrorKind::Unavailable);
         let mut refused = obtain(Ulid::from_parts(9, 3));
-        refused.next(plugin_answer(PluginEvent::Held(None))).unwrap();
+        refused
+            .next(plugin_answer(PluginEvent::Held(None)))
+            .unwrap();
         let rule: ReleaseFailure = ReleaseError::Refused(Refusal::Rule).into();
         let denied = refused.next(child_result(Err::<Released, _>(rule)));
         assert_eq!(denied.unwrap_err().0.kind, ErrorKind::Denied);

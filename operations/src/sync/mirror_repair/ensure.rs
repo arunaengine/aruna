@@ -170,7 +170,8 @@ fn bucket_read(bucket: &str) -> IoCall {
 
 /// The owning group of a local endpoint bucket; `side` names the endpoint in the error.
 fn bucket_group(result: IoResult, side: &str) -> Result<GroupId, SyncMirrorError> {
-    let bytes = result.value()?
+    let bytes = result
+        .value()?
         .ok_or_else(|| SyncMirrorError::Mirror(format!("{side} bucket not found")))?;
     Ok(BucketInfo::from_bytes(&bytes)?.group_id)
 }

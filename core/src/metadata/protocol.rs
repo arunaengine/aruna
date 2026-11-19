@@ -1041,7 +1041,7 @@ pub fn audit_frame_cap() -> usize {
     MAX_PAGE_BYTES.saturating_add(AUDIT_FRAME_OVERHEAD)
 }
 
-pub fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
+fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
     let Some(&last) = prefix.last() else {
         return Ok(None);
     };

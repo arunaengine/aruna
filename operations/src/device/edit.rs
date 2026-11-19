@@ -323,7 +323,8 @@ fn actor_call(document_id: Ulid) -> IoCall {
 }
 
 fn actor_answer(result: IoResult) -> Result<Option<MetadataActor>, DeviceEditError> {
-    result.value()?
+    result
+        .value()?
         .map(|bytes| postcard::from_bytes(&bytes).map_err(|_| DeviceEditError::Unavailable))
         .transpose()
 }

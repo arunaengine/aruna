@@ -687,7 +687,9 @@ impl Operation for DropBindingOperation {
             done(result)?;
             return Ok(Next::Done(()));
         }
-        let folder = result.value()?.and_then(|row| SyncedFolder::from_bytes(&row).ok());
+        let folder = result
+            .value()?
+            .and_then(|row| SyncedFolder::from_bytes(&row).ok());
         if !folder.is_some_and(|folder| matches!(folder.state, FolderState::Binding { .. })) {
             return Ok(Next::Done(()));
         }

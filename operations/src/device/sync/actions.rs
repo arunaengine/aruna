@@ -480,7 +480,10 @@ impl Operation for EntryActionOperation {
     fn next(&mut self, result: IoResult) -> EntryTurn {
         match self.step {
             EntryStep::Base => {
-                let row = outside_answer(result).and_then(IoResult::value).ok().flatten();
+                let row = outside_answer(result)
+                    .and_then(IoResult::value)
+                    .ok()
+                    .flatten();
                 let base = row.and_then(|bytes| SyncBase::from_bytes(&bytes).ok());
                 self.decide(base.ok_or(ActionError::NotFound)?)
             }

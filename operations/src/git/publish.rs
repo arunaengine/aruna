@@ -24,7 +24,9 @@ use super::records::Writes;
 use super::{GitError, records};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::load_config::config_unavailable;
-use crate::sync::outbox_record::{new_identified_record, outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox_record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
 
 type Document = MetadataRegistryRecord;
 type Row = (String, byteview::ByteView, byteview::ByteView);

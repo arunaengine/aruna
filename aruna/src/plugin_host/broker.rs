@@ -181,7 +181,6 @@ impl RunBroker {
         let place = (self.scope.realm_id, self.scope.local);
         object_path(place, self.scope.run.group_id, text)
     }
-
 }
 
 /// The secrets this broker held stay in the plugin host state only while it lives.

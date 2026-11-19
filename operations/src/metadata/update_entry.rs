@@ -109,7 +109,8 @@ impl ReadyBaseOperation {
     }
 
     fn status_read(&mut self, result: IoResult) -> BaseTurn {
-        let status = result.value()?
+        let status = result
+            .value()?
             .and_then(|bytes| postcard::from_bytes::<MaterializationStatusRecord>(&bytes).ok());
         let applied = status.is_some_and(|status| {
             status.state == MaterializationState::Materialized && status.event_id >= self.expected
@@ -153,7 +154,8 @@ impl ReadyBaseOperation {
     /// A marker of an applied batch is only a deferred lifecycle mint; any other one is a
     /// received change the graph has not applied.
     fn marker_read(&mut self, result: IoResult, keys: Vec<Key>, next: Option<Key>) -> BaseTurn {
-        let event = result.value()?
+        let event = result
+            .value()?
             .and_then(|bytes| postcard::from_bytes::<MetadataEventRecord>(&bytes).ok());
         let Some(MetadataEventPayload::ApplyBatch { batch, .. }) = event.map(|event| event.payload)
         else {

@@ -473,7 +473,9 @@ impl Operation for WithdrawOfferOperation {
         match self.step {
             WithdrawStep::Read => {
                 let bucket = &self.input.bucket;
-                let row = result.value()?.ok_or_else(|| OfferError::NotOffered(bucket.clone()))?;
+                let row = result
+                    .value()?
+                    .ok_or_else(|| OfferError::NotOffered(bucket.clone()))?;
                 self.group_id = Some(OfferedDirectory::from_bytes(&row)?.group_id);
                 self.step = WithdrawStep::Delete;
                 let row = (OFFERED_DIRECTORY_KEYSPACE.to_string(), offer_key(bucket));

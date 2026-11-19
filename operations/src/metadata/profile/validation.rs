@@ -811,7 +811,8 @@ impl Operation for StoredStatusOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, MetadataError> {
-        let status = result.value()?
+        let status = result
+            .value()?
             .map(|value| {
                 postcard::from_bytes(&value)
                     .map_err(aruna_core::errors::ConversionError::from)

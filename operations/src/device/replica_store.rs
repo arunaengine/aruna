@@ -137,7 +137,9 @@ impl Operation for CacheBudgetOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<u64>, IoError> {
-        let stored = result.value()?.and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
+        let stored = result
+            .value()?
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
         Ok(Next::Done(
             stored.map_or(DEFAULT_CACHE_BYTES, u64::from_be_bytes),
         ))

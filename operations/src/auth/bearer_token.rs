@@ -155,7 +155,8 @@ impl Operation for AccountDeactivatedOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, ArunaBearerError> {
-        let user = result.value()?
+        let user = result
+            .value()?
             .map(|bytes| User::from_bytes(&bytes))
             .transpose()
             .map_err(|_| ArunaBearerError::RevocationUnavailable)?;

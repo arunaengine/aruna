@@ -694,9 +694,11 @@ impl CreateCommitOperation {
             mapping_revision(&route, revision_id, create_event.occurred_at_ms),
         );
         let outbox_id = self.ids.mint(self.now_ms);
-        writes.extend(transition_entries(&route, &mapping, outbox_id).map_err(|error| {
-            aruna_core::errors::ConversionError::FromStrError(error.to_string())
-        })?);
+        writes.extend(
+            transition_entries(&route, &mapping, outbox_id).map_err(|error| {
+                aruna_core::errors::ConversionError::FromStrError(error.to_string())
+            })?,
+        );
         Ok(writes)
     }
 }

@@ -89,8 +89,8 @@ impl Operation for VersionHashOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
-        let version = (result.value()?)
-            .and_then(|row| postcard::from_bytes::<BlobVersion>(&row).ok());
+        let version =
+            (result.value()?).and_then(|row| postcard::from_bytes::<BlobVersion>(&row).ok());
         Ok(Next::Done(version.and_then(
             |version| match version.state {
                 BlobVersionState::Materialized { blob_hash, .. } => Some(blob_hash),

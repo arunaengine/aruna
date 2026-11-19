@@ -260,7 +260,8 @@ impl Describe {
     /// The next call, or the described changes once done.
     fn step(&mut self, result: IoResult) -> Result<Result<IoCall, Vec<KeyChange>>, FeedError> {
         if !self.reading_versions {
-            let view = (result.value()?
+            let view = (result
+                .value()?
                 .map(|value| DistributionView::from_bytes(&value))
                 .transpose())
             .map_err(|error| FeedError::Storage(error.to_string()))?;

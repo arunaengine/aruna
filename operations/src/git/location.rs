@@ -456,7 +456,8 @@ impl Operation for GroupDefaultOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<DatasetLocation>, GitError> {
-        let state = result.value()?
+        let state = result
+            .value()?
             .map(|bytes| decode_reducer_state(&bytes))
             .transpose()
             .map_err(|_| GitError::Unavailable)?;

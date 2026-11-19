@@ -395,7 +395,10 @@ impl Operation for ReadDocumentsOperation {
             // What this node applied to the realm configuration, as the reducer keeps it. A
             // device compares it with its own copy's and never accepts less.
             DocumentsStep::Clock => {
-                let state = outside_answer(result).and_then(IoResult::value).ok().flatten();
+                let state = outside_answer(result)
+                    .and_then(IoResult::value)
+                    .ok()
+                    .flatten();
                 let state =
                     state.and_then(|bytes| postcard::from_bytes::<AdminDocumentState>(&bytes).ok());
                 self.finish(state.map(|state| state.clock).unwrap_or_default())

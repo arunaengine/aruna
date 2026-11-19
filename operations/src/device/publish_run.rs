@@ -381,7 +381,8 @@ impl Operation for PublishRunOperation {
                 self.configured(config.map_err(unavailable)?)
             }
             PublishStep::Frozen => {
-                let frozen = result.value()?
+                let frozen = result
+                    .value()?
                     .map(|bytes| postcard::from_bytes(&bytes))
                     .transpose()
                     .map_err(unavailable)?;

@@ -16,7 +16,8 @@ use ulid::Ulid;
 use aruna_core::errors::StorageReadError;
 
 fn decoded<T: DeserializeOwned>(result: IoResult) -> Result<Option<T>, StorageReadError> {
-    result.value()?
+    result
+        .value()?
         .map(|bytes| postcard::from_bytes(&bytes).map_err(ConversionError::from))
         .transpose()
         .map_err(StorageReadError::Conversion)

@@ -203,7 +203,10 @@ impl ReadObject {
 
     fn missing(&self) -> CallError {
         let path = &self.path;
-        CallError(HostError::new(ErrorKind::NotFound, format!("no object at {path}")))
+        CallError(HostError::new(
+            ErrorKind::NotFound,
+            format!("no object at {path}"),
+        ))
     }
 
     fn too_large(&self) -> CallError {
