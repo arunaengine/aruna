@@ -11,15 +11,12 @@ use fjall::OptimisticTxDatabase;
 use crate::compaction::Compactor;
 use crate::errors::StorageLibError;
 
-use super::handle::{OpenDatabase, StorageHandle};
+use super::handle::{EFFECT_QUEUE_CAPACITY, OpenDatabase, QUEUE_CAPACITY, StorageHandle};
+use super::metrics::WorkerLifecycleGuard;
 use super::persistence::FjallPersistPolicy;
 use super::preimage::flush_empty;
 use super::rebuild::running_rebuild;
-use super::worker::FjallStorage;
-use super::{
-    BULK_POOL_THREADS, EFFECT_QUEUE_CAPACITY, QUEUE_CAPACITY, READ_POOL_THREADS, Store,
-    WorkerLifecycleGuard, spawn_read_pool,
-};
+use super::worker::{BULK_POOL_THREADS, FjallStorage, READ_POOL_THREADS, Store, spawn_read_pool};
 
 /// Block cache of the node database; Fjall's 32 MiB default rereads blocks on large scans.
 pub const CACHE_BYTES: u64 = 256 << 20;

@@ -13,8 +13,7 @@ use ulid::Ulid;
 
 use super::handle::StorageHandle;
 use super::persistence::FjallPersistPolicy;
-use super::worker::{FjallStorage, PoolItem};
-use super::{Store, Txn};
+use super::worker::{FjallStorage, PoolItem, Store, Txn};
 
 const SPACE: &str = "pooled_reads";
 
