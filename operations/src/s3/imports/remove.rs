@@ -783,8 +783,8 @@ mod tests {
 
     #[tokio::test]
     async fn keeps_mark_stored() {
-        use crate::driver::{DriverContext, drive};
         use aruna_core::handle::Handle as _;
+        use aruna_drivers::driver::{DriverContext, drive};
         let dir = tempfile::tempdir().unwrap();
         let storage_handle =
             aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
@@ -846,9 +846,9 @@ mod tests {
     async fn settles_move_intents() {
         // A removed rule's move intents are queued for settlement, with their data, before
         // they go; an upload's intent just goes.
-        use crate::driver::{DriverContext, drive};
         use aruna_core::handle::Handle as _;
         use aruna_core::structs::storage::backend_import::intent_key;
+        use aruna_drivers::driver::{DriverContext, drive};
         let dir = tempfile::tempdir().unwrap();
         let storage_handle =
             aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();

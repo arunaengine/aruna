@@ -941,7 +941,6 @@ impl Operation for KeepReferenceOperation {
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use crate::driver::{DriverContext, drive, node_routing};
     use crate::s3::object::get::{GetObjectOperation, MAX_AUTO_ADVANCES};
     #[allow(unused_imports)]
     pub(crate) use crate::testing_objects::{put_config, seed_bucket, with_blob};
@@ -955,6 +954,7 @@ pub(crate) mod test {
     use aruna_core::structs::execution::staging::PortableSourceDescriptor;
     use aruna_core::structs::storage::blob::{BlobHeadKey, BlobVersion, VersionKey};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_drivers::driver::{DriverContext, drive, node_routing};
     use futures_util::StreamExt;
     use std::collections::HashMap;
     use std::time::Duration;

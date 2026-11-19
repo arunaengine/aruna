@@ -24,8 +24,8 @@ use ulid::Ulid;
 
 use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
 use crate::connectors::repository::{connector_reference_key, connector_reference_write};
-use crate::driver::{DriverContext, drive};
-use crate::testing::test_context;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::test_context;
 
 /// A storage-only context with an open node vault for connector secrets.
 pub(crate) fn vault_context() -> (TempDir, DriverContext) {

@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
-use crate::testing::test_context;
 use crate::tests::s3::test_storage;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -19,6 +17,8 @@ use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, CurrentVersion
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::types::Value;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::test_context;
 use aruna_storage::storage;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};

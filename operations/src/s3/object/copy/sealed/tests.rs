@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::COPY_OWNER_KEYSPACE;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::bucket_metadata::RELEASE_TAG;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::storage::{self, StorageHandle};
 use tempfile::{TempDir, tempdir};
 
@@ -161,7 +161,7 @@ async fn pending_alias_shared() {
     assert_eq!(pointer.version_id, result.version_id);
     // The copy is a new version of the destination key, journaled with it.
     let page = crate::plugins::journal::journal_page(b'j', None, 10);
-    let (rows, _) = crate::driver::drive(page, &context).await.unwrap();
+    let (rows, _) = aruna_drivers::driver::drive(page, &context).await.unwrap();
     assert_eq!(rows.len(), 1);
     let uploaded = &rows[0].1;
     assert_eq!(uploaded.revision, result.version_id.to_string());
@@ -406,7 +406,6 @@ fn copy_skips_content() {
 async fn governed_copy_registered() {
     // A governed source copies like a plain write: gated, stored with the bucket default and
     // the source refs, and registered on this node.
-    use crate::driver::drive;
     use crate::placement::policy::GateOperation;
     use crate::s3::object::copy::test::{admits, seed_bucket};
     use crate::tests::policy::{seed_gate, subject};
@@ -414,6 +413,7 @@ async fn governed_copy_registered() {
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
     use aruna_core::managed_copy::{CopyRequest, validate_registration};
     use aruna_core::structs::storage::blob::ManagedCopyKey;
+    use aruna_drivers::driver::drive;
 
     let (_temp, context) = full_context().await;
     let realm_id = RealmId::from_bytes([3; 32]);

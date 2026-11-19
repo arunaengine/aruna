@@ -628,11 +628,11 @@ impl Operation for PartRecordWrite {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{BackendUpload, MultipartUploadStatus};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use tempfile::tempdir;
 

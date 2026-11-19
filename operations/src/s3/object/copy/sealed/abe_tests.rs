@@ -6,7 +6,6 @@ use super::*;
 use crate::abe::KeyError;
 use crate::abe::envelope::EnvelopeOperation;
 use crate::document_repository::GetConfigError;
-use crate::driver::drive;
 use crate::s3::abe_copies::{
     CompleteCopiesError, CompleteCopiesOperation, CopyEnvelopeOperation, CopyOutcome, copy_row,
 };
@@ -27,6 +26,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::transition::{
     EncryptionTransition, TransitionKind, TransitionTarget,
 };
+use aruna_drivers::driver::drive;
 
 struct Sealed {
     secret: SecretBytes,
@@ -690,7 +690,7 @@ async fn group_bytes(storage: &StorageHandle, sealed: &Sealed) -> u64 {
 /// The group's logical bytes after a full recount from the stored rows.
 async fn recounted_bytes(context: &DriverContext, sealed: &Sealed) -> u64 {
     use crate::node::usage_rebuild::RebuildStatsOperation;
-    crate::driver::drive(RebuildStatsOperation::new(), context)
+    aruna_drivers::driver::drive(RebuildStatsOperation::new(), context)
         .await
         .unwrap();
     group_bytes(&context.storage_handle, sealed).await

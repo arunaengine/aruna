@@ -140,7 +140,6 @@ impl From<BucketGuardError> for OfferedDirectoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
     use crate::staging::bucket_guard::BucketGuardOperation;
     use crate::staging::offer::list::ListOffersOperation;
@@ -152,6 +151,7 @@ mod tests {
         BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
     };
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
+    use aruna_drivers::driver::{DriverContext, drive};
     use futures_util::StreamExt;
 
     fn input(bucket: &str, root: &str) -> OfferDirectoryInput {
@@ -296,7 +296,7 @@ mod tests {
         let usage = group_usage(context, offer.group_id).await;
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 11));
 
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::node::usage_rebuild::RebuildStatsOperation::new(),
             context,
         )
@@ -330,7 +330,7 @@ mod tests {
         let usage = group_usage(context, offer.group_id).await;
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 4));
 
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::node::usage_rebuild::RebuildStatsOperation::new(),
             context,
         )

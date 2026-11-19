@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -13,6 +12,7 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
+use aruna_drivers::driver::DriverContext;
 use ulid::Ulid;
 
 /// The group owner may write everywhere in the group except below `denied`.

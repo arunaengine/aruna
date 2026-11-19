@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
 use crate::s3::object::put::PutObjectConfig;
 use crate::s3::object::put::PutObjectInput;
 use aruna_blob::blob::BlobHandler;
@@ -16,6 +15,7 @@ use aruna_core::structs::storage::blob::Backend;
 use aruna_core::structs::storage::blob::BackendConfig;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::types::GroupId;
+use aruna_drivers::driver::DriverContext;
 use aruna_net::NetHandle;
 use std::collections::HashMap;
 use ulid::Ulid;
@@ -23,7 +23,7 @@ use ulid::Ulid;
 /// `context` with a file system blob backend below `root` on the same storage.
 pub async fn with_blob(context: &DriverContext, root: &std::path::Path) -> DriverContext {
     let storage_handle = context.storage_handle.clone();
-    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let config = BackendConfig {

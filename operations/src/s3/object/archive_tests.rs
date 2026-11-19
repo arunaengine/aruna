@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use crate::testing_access::seed_access;
 use crate::tests::staging::{create_test_bucket, setup_driver_context};
@@ -15,6 +14,7 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
+use aruna_drivers::driver::{DriverContext, drive};
 use futures_util::StreamExt;
 use std::io::Read;
 

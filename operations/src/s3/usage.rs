@@ -876,7 +876,6 @@ impl Operation for MarkDirtyOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::node::realm_usage::{
         RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope,
     };
@@ -916,6 +915,7 @@ mod tests {
         usage_summary_key,
     };
     use aruna_core::types::TxnId;
+    use aruna_drivers::driver::{DriverContext, drive};
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;

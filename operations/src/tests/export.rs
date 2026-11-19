@@ -2,9 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::jobs::context::JobContext;
 use crate::jobs::export::ExportFailure;
 use crate::jobs::export::archive::recognize_entities;
 use crate::jobs::export::open::OpenCandidateOperation;
@@ -39,6 +36,9 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef, Blo
 use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo, VersionKey};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::Compression;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::driver::drive;
+use aruna_drivers::jobs::context::JobContext;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;
 use bytes::Bytes;

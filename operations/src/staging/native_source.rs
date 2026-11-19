@@ -719,10 +719,10 @@ fn head_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{ReferenceHandling, SyncMode, SyncStatusSnapshot};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::FjallStorage;
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
@@ -883,7 +883,7 @@ mod tests {
 
         let pending = aruna_core::plugin_runs::PENDING_ROW;
         let page = crate::plugins::journal::journal_page(pending, None, 10);
-        let (rows, _) = crate::driver::drive(page, &context).await.unwrap();
+        let (rows, _) = aruna_drivers::driver::drive(page, &context).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.resource, relationship.id.to_string());
         let transition = format!("sync_failed/{source}/{}/", relationship.id);

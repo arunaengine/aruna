@@ -829,7 +829,6 @@ mod tests {
         BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, CaptureRun, CloseRun,
         PolicyBulkOperation,
     };
-    use crate::driver::{DriverContext, drive};
     use crate::placement::policy::GateOperation;
     use crate::placement::policy::cache::cache_key;
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
@@ -865,6 +864,7 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::types::{GroupId, Key, Value};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;

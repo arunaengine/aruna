@@ -21,7 +21,7 @@ use super::access::LoadAccessOperation;
 use super::holder::AskHolderError;
 use super::*;
 use crate::distribution::test_record::{binding, record, secret};
-use crate::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 
 const BUCKET: &str = "bakta-db";
 

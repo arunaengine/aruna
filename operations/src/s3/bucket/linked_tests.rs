@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::job_pages::{
     JobAccessOperation, ProcessLinkedOperation, StillAdminOperation, StoreJobOperation,
 };
@@ -15,12 +14,13 @@ use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE};
 use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::linked_job::{LinkedTask, RemapPlan};
+use aruna_drivers::driver::{DriverContext, drive};
 use ulid::Ulid;
 
 async fn process_linked(
     context: &DriverContext,
 ) -> Result<Option<std::time::Duration>, crate::blob::migration::shared::MigrationError> {
-    let routing = crate::driver::node_routing(context);
+    let routing = aruna_drivers::driver::node_routing(context);
     drive(ProcessLinkedOperation::new(routing), context).await
 }
 

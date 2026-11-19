@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
-use crate::driver::drive;
 use crate::notifications::inbox::UpsertInboxOperation;
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -16,6 +14,8 @@ use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::driver::drive;
 use aruna_storage::storage::{FjallStorage, StorageHandle};
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;

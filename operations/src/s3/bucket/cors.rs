@@ -202,12 +202,12 @@ mod tests {
         DeleteCorsError, DeleteCorsOperation, GetCorsError, GetCorsOperation, PutCorsError,
         PutCorsOperation,
     };
-    use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::storage::blob::{BucketCorsConfiguration, BucketCorsRule, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::time::SystemTime;
     use tempfile::tempdir;

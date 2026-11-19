@@ -886,7 +886,6 @@ mod link_tests {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::s3::bucket::create::CreateBucketOperation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -900,6 +899,7 @@ mod test {
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::storage::usage::BucketCounters;
     use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot, sync_relationship_key};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::time::SystemTime;
     use tempfile::tempdir;

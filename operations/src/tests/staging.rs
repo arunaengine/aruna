@@ -4,10 +4,8 @@
 
 use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
 use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::BucketRules;
 use crate::groups::routing::SnapshotOperation;
-use crate::jobs::context::JobContext;
 use crate::placement::policy::GateOperation;
 use crate::replication::queue::LiveVersionInput;
 use crate::replication::queue::LiveVersionOperation;
@@ -38,6 +36,8 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::{DriverContext, drive, node_routing};
+use aruna_drivers::jobs::context::JobContext;
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use axum::body::Body;
@@ -65,7 +65,7 @@ pub async fn setup_driver_context() -> StagingTestContext {
 
     let storage_handle = storage::FjallStorage::open(temp_root).expect("storage must open");
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .expect("net handle must initialize");
     // Verified reads of references spool their bytes before they are served.
@@ -354,7 +354,7 @@ pub async fn serve(
 }
 
 pub struct Fixture {
-    pub driver: Arc<crate::driver::DriverContext>,
+    pub driver: Arc<aruna_drivers::driver::DriverContext>,
     pub spec: StagingJobSpec,
     pub _dir: tempfile::TempDir,
 }

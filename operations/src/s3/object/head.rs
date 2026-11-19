@@ -239,7 +239,6 @@ impl Operation for HeadObjectOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
@@ -262,6 +261,7 @@ mod tests {
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::MultipartObjectSummary;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::NetHandle;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -363,9 +363,10 @@ mod tests {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
-        let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
-            .await
-            .unwrap();
+        let net_handle =
+            NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
+                .await
+                .unwrap();
         let blob_handle = BlobHandler::new(
             BackendConfig {
                 backend_type: Backend::FileSystem,
@@ -478,9 +479,10 @@ mod tests {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
-        let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
-            .await
-            .unwrap();
+        let net_handle =
+            NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
+                .await
+                .unwrap();
         let blob_handle = BlobHandler::new(
             BackendConfig {
                 backend_type: Backend::FileSystem,
@@ -659,9 +661,10 @@ mod tests {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
-        let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
-            .await
-            .unwrap();
+        let net_handle =
+            NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
+                .await
+                .unwrap();
         let blob_handle = BlobHandler::new(
             BackendConfig {
                 backend_type: Backend::FileSystem,

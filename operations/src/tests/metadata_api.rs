@@ -12,7 +12,7 @@ use aruna_storage::storage;
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 
 pub(crate) const TEST_REALM_ID: RealmId = RealmId([7u8; 32]);
 

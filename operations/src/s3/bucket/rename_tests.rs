@@ -2,9 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::checked_rename::AuthorizedRenameOperation;
-use crate::testing::test_context;
 use crate::tests::records::node;
 use crate::tests::s3::test_storage;
 use aruna_core::effects::StorageEffect;
@@ -15,6 +13,8 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, ManagedCopyKey, ManagedCopyState,
 };
 use aruna_core::structs::storage::format::Compression;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::test_context;
 use std::time::SystemTime;
 
 pub(crate) const BUCKET: &str = "bucket";
