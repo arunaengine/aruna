@@ -355,3 +355,7 @@ impl Operation for EnsureGenesisOperation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "genesis_tests.rs"]
+pub(crate) mod tests;
