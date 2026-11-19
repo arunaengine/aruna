@@ -1124,7 +1124,7 @@ impl OperationsTaskHandler {
                 };
                 let retention_ms = self.rocrate_limits.artifact_retention_ms;
                 let now = unix_timestamp_millis();
-                let run = aruna_operations::s3::imports::schedule::RunDueOperation::new(
+                let run = aruna_operations::jobs::backend_import::schedule::RunDueOperation::new(
                     net_handle.node_id(),
                     retention_ms,
                     now,

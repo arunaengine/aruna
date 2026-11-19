@@ -8,7 +8,6 @@ pub mod cron;
 pub mod discovery;
 pub mod folders;
 pub mod remove;
-pub mod schedule;
 pub mod shared;
 
 use crate::groups::backends::RecordReadError;
