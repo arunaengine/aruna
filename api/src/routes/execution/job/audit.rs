@@ -9,7 +9,9 @@ use std::sync::Arc;
 use crate::jobs::family_report;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::family::{JobFamilyId, JobFamilyRecord, JobRecordEnvelope};
+use aruna_core::structs::execution::job::family::{
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
+};
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::lifecycle::family_reads::{

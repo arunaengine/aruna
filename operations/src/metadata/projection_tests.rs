@@ -130,8 +130,9 @@ fn stamped(mut event: MetadataEventRecord, config: &RealmConfigDocument) -> Meta
         group_id: Some(event.record.group_id),
         metadata_path: Some(event.record.document_path.as_str()),
     };
-    let (strategy, _) = aruna_core::placement::resolver::strategy_for_target(config, &target, context)
-        .expect("strategy resolves");
+    let (strategy, _) =
+        aruna_core::placement::resolver::strategy_for_target(config, &target, context)
+            .expect("strategy resolves");
     event.record.placement = aruna_core::placement::choose_origin_bucket(
         config,
         strategy,

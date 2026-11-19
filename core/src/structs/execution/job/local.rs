@@ -740,7 +740,7 @@ pub fn validate_transition(
 }
 
 fn in_process_transition(from: JobState, to: JobState) -> bool {
-    use JobState::*;
+    use super::identity::JobState::*;
     matches!(
         (from, to),
         (Queued, Claimed)
@@ -768,7 +768,7 @@ fn in_process_transition(from: JobState, to: JobState) -> bool {
 /// Fenced execution permits requeue only before attempt submission. `Indeterminate` requires evidence;
 /// permanent pre-attempt failures terminalize from Preparing or Ready.
 fn external_attempt_transition(from: JobState, to: JobState) -> bool {
-    use JobState::*;
+    use super::identity::JobState::*;
     matches!(
         (from, to),
         (Queued, Claimed)

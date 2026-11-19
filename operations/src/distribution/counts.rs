@@ -10,7 +10,9 @@ use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::PrefixPages;
 use aruna_core::structs::storage::distribution::MemberState;
-use aruna_core::structs::storage::distribution::snapshot::{DistributionSnapshot, DistributionView};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView,
+};
 use aruna_core::types::GroupId;
 use thiserror::Error;
 

@@ -11,8 +11,8 @@ use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE};
 use aruna_core::scheduling::{PlanCandidate, PlannedInput};
 use aruna_core::structs::execution::job::family::{
     CancelAuthority, JobFamilyId, JobFamilyRecord, JobProjection, JobRecordEnvelope, JobRecordKey,
-    JobRecordKind, LogicalJobSpec, LogicalJobState, PhysicalExecutionResult, PhysicalExecutionState,
-    ProjectedExecution, SubmissionId,
+    JobRecordKind, LogicalJobSpec, LogicalJobState, PhysicalExecutionResult,
+    PhysicalExecutionState, ProjectedExecution, SubmissionId,
 };
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::local::OutputObject;

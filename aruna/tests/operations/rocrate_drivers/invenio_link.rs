@@ -682,7 +682,8 @@ async fn full_slots_wait() -> Result<(), Box<dyn std::error::Error>> {
     let filler = fillers[0];
     let payload = JobPayload::ExportRoCrate(spec);
     let ctx = claim_context(&fixture, filler, payload).await?;
-    let error = aruna_core::structs::execution::job::local::JobError::retryable("freed".to_string());
+    let error =
+        aruna_core::structs::execution::job::local::JobError::retryable("freed".to_string());
     let now = unix_timestamp_millis();
     fail_job(&fixture.context, filler, ctx.claim_token, error, now).await?;
     due_now(&fixture, &link).await?;

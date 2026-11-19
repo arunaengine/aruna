@@ -16,7 +16,9 @@ use aruna_core::outbound::{xml_elements, xml_field};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BlobHeadKey;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
-use aruna_core::structs::storage::distribution::snapshot::{DistributionSnapshot, DistributionView};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView,
+};
 use aruna_core::structs::storage::distribution::upload::UploadTag;
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
 use serde::{Deserialize, Serialize};

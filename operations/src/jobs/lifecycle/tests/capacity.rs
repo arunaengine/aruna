@@ -374,7 +374,8 @@ fn accepts_copy_pin() {
     here.source_node_id = Some(local);
     assert!(!pin_matches(&captured, &here, ingress, local));
     let mut other_bytes = pin.clone();
-    other_bytes.content = aruna_core::structs::execution::job::input::InputContent::Blake3([6u8; 32]);
+    other_bytes.content =
+        aruna_core::structs::execution::job::input::InputContent::Blake3([6u8; 32]);
     assert!(!pin_matches(&captured, &other_bytes, ingress, local));
 }
 

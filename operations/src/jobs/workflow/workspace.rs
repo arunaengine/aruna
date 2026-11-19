@@ -14,7 +14,9 @@ use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
 use aruna_core::structs::execution::job::input::{
     InputSelection, InputSource, OutputDestination, OutputSelection,
 };
-use aruna_core::structs::execution::job::local::{AttemptControl, JobError, JobRecord, OutputObject};
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, JobError, JobRecord, OutputObject,
+};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{

@@ -17,8 +17,8 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
 use aruna_core::structs::execution::job::family::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LogicalJobSpec, RecordVerdict, SubmissionClaim,
-    SubmissionId,
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LogicalJobSpec, RecordVerdict,
+    SubmissionClaim, SubmissionId,
 };
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::JobPayload;

@@ -670,10 +670,12 @@ pub fn test_spec() -> aruna_core::structs::execution::job::input::StagingJobSpec
         ),
         strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
         items: Vec::new(),
-        prefixes: vec![aruna_core::structs::execution::job::input::StagingJobPrefix {
-            source_prefix: "refseq".to_string(),
-            target_prefix: String::new(),
-        }],
+        prefixes: vec![
+            aruna_core::structs::execution::job::input::StagingJobPrefix {
+                source_prefix: "refseq".to_string(),
+                target_prefix: String::new(),
+            },
+        ],
         checksum_manifest: None,
         table: None,
         mirrors: Vec::new(),

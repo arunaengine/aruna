@@ -225,21 +225,25 @@ fn refuses_shared_destination() {
         resources: Default::default(),
         executor_constraint: None,
         inputs: Vec::new(),
-        file_outputs: vec![aruna_core::structs::execution::job::input::OutputSelection {
-            container_path: "/out/result.txt".to_string(),
-            path_prefix: None,
-            destination: OutputDestination::S3 {
-                bucket: "shared".to_string(),
-                key: "result.txt".to_string(),
+        file_outputs: vec![
+            aruna_core::structs::execution::job::input::OutputSelection {
+                container_path: "/out/result.txt".to_string(),
+                path_prefix: None,
+                destination: OutputDestination::S3 {
+                    bucket: "shared".to_string(),
+                    key: "result.txt".to_string(),
+                },
+                destination_node_id: None,
+                name: None,
+                description: None,
             },
-            destination_node_id: None,
-            name: None,
-            description: None,
-        }],
-        workspace_outputs: vec![aruna_core::structs::execution::job::input::WorkspaceOutput {
-            container_path: "/result.txt".to_string(),
-            dest_key: "result.txt".to_string(),
-        }],
+        ],
+        workspace_outputs: vec![
+            aruna_core::structs::execution::job::input::WorkspaceOutput {
+                container_path: "/result.txt".to_string(),
+                dest_key: "result.txt".to_string(),
+            },
+        ],
         output_prefixes: Vec::new(),
         collision_policy: Default::default(),
     };

@@ -5,7 +5,6 @@
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
 use crate::id::NodeId;
 use crate::scheduling::inputs::{InputHolder, PlanRequest, ResolvedInput, TargetCandidate};
-use crate::scheduling::*;
 use crate::structs::execution::job::family::{EffectiveResources, SubmissionId};
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::compute_config::{LocationLink, RealmComputeConfig};

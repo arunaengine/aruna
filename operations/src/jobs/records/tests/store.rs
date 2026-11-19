@@ -124,7 +124,9 @@ async fn keeps_attempt_state() {
     let (_dir, context) = fixture(&family.config, family.holder.public()).await;
     let mut logical = aruna_core::structs::execution::job::local::JobRecord::new(
         family.job_id,
-        aruna_core::structs::execution::job::input::JobPayload::Execution(crate::tests::records::payload()),
+        aruna_core::structs::execution::job::input::JobPayload::Execution(
+            crate::tests::records::payload(),
+        ),
         crate::tests::records::user(),
         family.holder.public(),
         1_000,

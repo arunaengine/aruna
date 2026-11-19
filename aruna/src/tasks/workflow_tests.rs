@@ -847,8 +847,8 @@ async fn capture_failure_caps() {
 /// A run that exited 0 and captures one wildcard output.
 fn capture_spec(node: aruna_core::id::NodeId) -> ExecutionSpec {
     let mut spec = execution_spec();
-    spec.file_outputs
-        .push(aruna_core::structs::execution::job::input::OutputSelection {
+    spec.file_outputs.push(
+        aruna_core::structs::execution::job::input::OutputSelection {
             container_path: "/out/*".to_string(),
             path_prefix: Some("/out".to_string()),
             destination_node_id: Some(node),
@@ -858,7 +858,8 @@ fn capture_spec(node: aruna_core::id::NodeId) -> ExecutionSpec {
             },
             name: None,
             description: None,
-        });
+        },
+    );
     spec
 }
 

@@ -7,6 +7,7 @@ use crate::document_sync::storage::batch_write_to;
 use crate::document_sync::tests::runner::apply_admin_operation;
 use crate::document_sync::{DocumentSyncService, node_to_peer};
 use crate::test_support::test_endpoint;
+use ::irokle::Storage as _;
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     AdminRoleDefinition,
@@ -51,7 +52,6 @@ use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::persistence::FjallPersistPolicy;
 use byteview::ByteView;
 use irokle::PeerId;
-use ::irokle::Storage as _;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::path::Path;
