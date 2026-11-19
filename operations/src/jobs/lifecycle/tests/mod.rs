@@ -121,7 +121,11 @@ pub(super) async fn submit_external_job(
     };
     let submit = SubmitExternalOperation::new(
         submission,
-        ingress_node(context.node_and_realm(), context.fresh_heartbeats()),
+        ingress_node(
+            context.node_and_realm(),
+            context.fresh_heartbeats(),
+            unix_timestamp_millis(),
+        ),
     );
     drive(submit, context).await.map_err(placement_failure)
 }
@@ -151,7 +155,15 @@ pub(super) async fn admit_launch(
     context: &DriverContext,
     launch: LaunchFrame,
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {
-    let node = launch_node(context.node_and_realm(), &context.compute_limits(), &launch)?;
+    let (now_ms, execution_id) = (unix_timestamp_millis(), Ulid::generate());
+    let limits = context.compute_limits();
+    let node = launch_node(
+        context.node_and_realm(),
+        &limits,
+        &launch,
+        now_ms,
+        execution_id,
+    )?;
     drive(AdmitLaunchOperation::new(launch, node), context)
         .await
         .ok()

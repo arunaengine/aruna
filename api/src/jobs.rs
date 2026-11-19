@@ -432,7 +432,11 @@ pub(crate) async fn submit_external_job(
     };
     let submit = SubmitExternalOperation::new(
         submission,
-        ingress_node(context.node_and_realm(), context.fresh_heartbeats()),
+        ingress_node(
+            context.node_and_realm(),
+            context.fresh_heartbeats(),
+            unix_timestamp_millis(),
+        ),
     );
     drive(submit, context).await.map_err(placement_failure)
 }
