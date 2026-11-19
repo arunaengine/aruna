@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::compute;
 use super::jobs::LegacyInput;
 use super::{Rewrites, decode_error, rewritten};
 use crate::explorer::ExplorerError;
@@ -33,9 +34,10 @@ use ulid::Ulid;
 
 /// Where a stored envelope names its record variant: after the 32 bytes of the realm id.
 const VARIANT_AT: usize = 32;
-/// Variant indexes of `JobFamilyRecord::Spec` and `JobFamilyRecord::Launch`.
+/// Variant indexes of `JobFamilyRecord::Spec`, `JobFamilyRecord::Launch` and the receipt.
 const SPEC: u8 = 0;
 const LAUNCH: u8 = 3;
+const RECEIPT: u8 = 4;
 
 /// A row of a family keyspace: an envelope first, then fields alpha.134 stored the same way.
 pub(super) trait Held: Serialize + DeserializeOwned {
@@ -72,12 +74,13 @@ pub(super) struct Evidence {
     receipts: BTreeSet<(Ulid, [u8; 32], [u8; 32])>,
 }
 
-/// A spec or launch row: its envelope when it reads back unchanged in the current layout, and
-/// its envelope when it reads back unchanged in the alpha.134 layout.
+/// A spec, launch or receipt row: its envelope when it reads back unchanged in the current
+/// layout or in the alpha.134 layout, and its ids when it reads as alpha.206 stored it.
 pub(super) struct Candidate {
     key: Vec<u8>,
     current: Option<JobRecordEnvelope>,
     historical: Option<OldEnvelope>,
+    unnamed: Option<(SubmissionId, [u8; 32], JobId)>,
 }
 
 /// What the migration deletes: the families of old specs and launches, with their local runs.
@@ -105,12 +108,13 @@ pub(super) fn scan<T: Held>(
         if let Some(envelope) = &current {
             evidence.add(envelope);
         }
-        if matches!(value.get(VARIANT_AT), Some(&SPEC | &LAUNCH)) {
+        if matches!(value.get(VARIANT_AT), Some(&SPEC | &LAUNCH | &RECEIPT)) {
             let historical = exact::<(OldEnvelope, T::Tail)>(&value).map(|(old, _)| old);
             candidates.push(Candidate {
                 key: key.to_vec(),
                 current,
                 historical,
+                unnamed: compute::family_ids::<T::Tail>(&value),
             });
         }
     }
@@ -196,7 +200,8 @@ impl Removal {
         keyspace: &OptimisticTxKeyspace,
         rewrites: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ExplorerError> {
-        if self.is_empty() {
+        // An alpha.206 job record is always among the rewrites.
+        if self.is_empty() && rewrites.is_empty() {
             return Ok(());
         }
         let rewrites: BTreeMap<&[u8], &[u8]> = rewrites
@@ -214,7 +219,12 @@ impl Removal {
                 JobPayload::WriteRunCrate { for_job } => self.jobs.contains(for_job),
                 _ => false,
             };
-            if parent || self.jobs.contains(&record.job_id) || cleanups.contains(&record.job_id) {
+            let unnamed = compute::old_job(&stored).is_some();
+            if unnamed
+                || parent
+                || self.jobs.contains(&record.job_id)
+                || cleanups.contains(&record.job_id)
+            {
                 records.push(record);
             }
         }
@@ -316,6 +326,11 @@ impl Removal {
 
     /// Claims name a logical job; receipts name the physical job and execution on this node.
     fn record_jobs(&mut self, value: &[u8]) {
+        if let Some((physical_job_id, execution_id)) = compute::receipt_jobs(value) {
+            self.jobs.insert(physical_job_id);
+            self.executions.insert(execution_id);
+            return;
+        }
         let Ok(envelope) = postcard::from_bytes::<JobRecordEnvelope>(value) else {
             return;
         };
@@ -411,7 +426,7 @@ impl Candidate {
                     _ => None,
                 })
         };
-        let (submission_id, request_digest, job_id) = old.or_else(current)?;
+        let (submission_id, request_digest, job_id) = old.or(self.unnamed).or_else(current)?;
         let family = JobFamilyId {
             submission_id,
             request_digest,
@@ -421,7 +436,7 @@ impl Candidate {
 }
 
 /// `T` read from `value` when it encodes back to the same bytes.
-fn exact<T: Serialize + DeserializeOwned>(value: &[u8]) -> Option<T> {
+pub(super) fn exact<T: Serialize + DeserializeOwned>(value: &[u8]) -> Option<T> {
     let decoded = postcard::from_bytes::<T>(value).ok()?;
     let bytes = postcard::to_allocvec(&decoded).ok()?;
     (bytes == value).then_some(decoded)
@@ -651,7 +666,7 @@ mod tests {
     fn target() -> ExecutionTargetId {
         ExecutionTargetId {
             node_id: secret().public(),
-            backend: "docker".to_string(),
+            backend: "kubernetes".to_string(),
             executor_kind: "kubernetes".to_string(),
         }
     }
@@ -669,12 +684,12 @@ mod tests {
             env: Default::default(),
             resources: Default::default(),
             executor_constraint: None,
-            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
+            backend: None,
         }
     }
 
@@ -824,7 +839,7 @@ mod tests {
             subject_digest: [12u8; 32],
             accepted_at_ms: 3_000,
             config_generation: 0,
-            config_digest: [0; 32],
+            config_digest: [0u8; 32],
         };
         signed(JobFamilyRecord::Receipt(Box::new(receipt)))
     }

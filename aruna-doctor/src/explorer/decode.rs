@@ -1204,7 +1204,7 @@ mod tests {
             subject_digest: [9u8; 32],
             backend: "default".to_string(),
             config_generation: 0,
-            config_digest: [0; 32],
+            config_digest: [0u8; 32],
         };
         let decoded = decode_entry(
             JOB_RESERVATION_KEYSPACE,
