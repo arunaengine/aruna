@@ -85,50 +85,6 @@ impl RepositoryConnector {
     }
 }
 
-/// Credentials for a repository connector, split from the public record so the
-/// public projection never carries a secret.
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RepositoryConnectorSecret {
-    pub connector_id: Ulid,
-    pub secret_config: HashMap<String, String>,
-    pub updated_at: SystemTime,
-}
-
-/// Shows only the secret keys; the values are live credentials.
-impl fmt::Debug for RepositoryConnectorSecret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RepositoryConnectorSecret")
-            .field("connector_id", &self.connector_id)
-            .field("keys", &self.secret_config.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
-impl RepositoryConnectorSecret {
-    pub fn new(
-        connector_id: Ulid,
-        secret_config: HashMap<String, String>,
-        updated_at: SystemTime,
-    ) -> Option<Self> {
-        if secret_config.is_empty() {
-            return None;
-        }
-        Some(Self {
-            connector_id,
-            secret_config,
-            updated_at,
-        })
-    }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
-    }
-}
-
 /// Which records a harvest pulls from a connector, e.g. an OAI-PMH set and the
 /// requested metadata schema.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -376,6 +332,7 @@ pub struct HarvestJobSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structs::execution::source_connector::SourceConnectorSecret;
     use crate::structs::identity::realm::RealmId;
 
     fn user(seed: u8) -> UserId {
@@ -402,7 +359,7 @@ mod tests {
     // the connector secret split stays redacted
     #[test]
     fn debug_hides_secrets() {
-        let secret = RepositoryConnectorSecret::new(
+        let secret = SourceConnectorSecret::new(
             Ulid::from_bytes([1u8; 16]),
             HashMap::from([("token".to_string(), "canary-7f3a".to_string())]),
             SystemTime::UNIX_EPOCH,
@@ -428,7 +385,7 @@ mod tests {
             SystemTime::UNIX_EPOCH,
             user(3),
         );
-        let secret = RepositoryConnectorSecret::new(
+        let secret = SourceConnectorSecret::new(
             connector.connector_id,
             HashMap::from([("token".to_string(), "super-secret".to_string())]),
             SystemTime::UNIX_EPOCH,
@@ -453,7 +410,7 @@ mod tests {
     #[test]
     fn empty_secret_none() {
         assert!(
-            RepositoryConnectorSecret::new(
+            SourceConnectorSecret::new(
                 Ulid::from_bytes([4u8; 16]),
                 HashMap::new(),
                 SystemTime::UNIX_EPOCH,

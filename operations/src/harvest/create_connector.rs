@@ -11,9 +11,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::rows;
-use aruna_core::structs::execution::harvest::{
-    RepositoryConnector, RepositoryConnectorKind, RepositoryConnectorSecret,
-};
+use aruna_core::structs::execution::harvest::{RepositoryConnector, RepositoryConnectorKind};
+use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::types::GroupId;
 use thiserror::Error;
 
@@ -219,7 +218,7 @@ impl Operation for CreateConnectorOperation {
             now,
             self.input.created_by,
         );
-        let secret = RepositoryConnectorSecret::new(
+        let secret = SourceConnectorSecret::new(
             connector.connector_id,
             self.input.secret_config.clone(),
             now,

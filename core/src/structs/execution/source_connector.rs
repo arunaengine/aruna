@@ -169,6 +169,8 @@ impl SourceConnector {
     }
 }
 
+/// Credentials of a source or repository connector, split from the public record so the public
+/// projection never carries a secret.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceConnectorSecret {
     pub connector_id: Ulid,

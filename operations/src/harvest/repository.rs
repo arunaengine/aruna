@@ -10,9 +10,10 @@ use aruna_core::keyspaces::{
     HARVEST_SOURCE_KEYSPACE,
 };
 use aruna_core::structs::execution::harvest::{
-    HarvestProvenance, HarvestSource, RepositoryConnector, RepositoryConnectorSecret,
-    harvest_provenance_key, harvest_provenance_prefix,
+    HarvestProvenance, HarvestSource, RepositoryConnector, harvest_provenance_key,
+    harvest_provenance_prefix,
 };
+use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
 use ulid::Ulid;
@@ -131,8 +132,8 @@ pub fn parse_connector_read(event: Event) -> Result<Option<RepositoryConnector>,
 
 pub fn parse_secret_read(
     event: Event,
-) -> Result<Option<RepositoryConnectorSecret>, StorageReadError> {
-    parse_storage_read(event, RepositoryConnectorSecret::from_bytes)
+) -> Result<Option<SourceConnectorSecret>, StorageReadError> {
+    parse_storage_read(event, SourceConnectorSecret::from_bytes)
 }
 
 pub fn parse_source_read(event: Event) -> Result<Option<HarvestSource>, StorageReadError> {
@@ -147,7 +148,7 @@ pub fn parse_provenance_read(event: Event) -> Result<Option<HarvestProvenance>, 
 /// keeps the connector and its secret in one atomic batch.
 pub fn connector_writes(
     connector: &RepositoryConnector,
-    secret: Option<&RepositoryConnectorSecret>,
+    secret: Option<&SourceConnectorSecret>,
 ) -> Result<Vec<(String, Key, ByteView)>, ConversionError> {
     let mut writes = vec![(
         CONNECTOR_INDEX_KEYSPACE.to_string(),
