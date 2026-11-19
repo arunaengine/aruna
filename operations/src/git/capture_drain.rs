@@ -1,5 +1,5 @@
-//! Snapshots the graph each ready capture mark holds and deletes the mark only after the
-//! snapshot, so a crash never loses one.
+//! Snapshots the graph each ready capture mark holds, per document in materialization order,
+//! and deletes the mark only after the snapshot, so a crash never loses one.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -19,7 +19,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::GitError;
-use super::snapshot::{Source, capture};
+use super::snapshot::capture;
 use crate::metadata::record_reads::DocumentRecordOperation;
 
 /// Marks one page of the drain reads at most.
@@ -37,16 +37,22 @@ enum CaptureStep {
     Delete,
 }
 
-/// One drain run over every capture mark. A mark the finish has not made ready stays; a ready
-/// one gets the snapshot of the graph it holds and then goes. Answers when to run again after
-/// a failed snapshot.
+/// One drain run over every capture mark, per document in materialization order, so Git never
+/// gets an older graph after a newer one: the first mark not ready, or whose snapshot failed,
+/// stops its document. Answers when to run again after a failed snapshot.
 #[derive(Debug, PartialEq)]
 pub struct CaptureDrainOperation {
     node: GitNode,
     pages: PrefixPages,
+    /// Rows of the last page not gathered yet.
     marks: VecDeque<(Key, Value)>,
-    current: Option<(Key, Ulid)>,
-    graph: Source,
+    /// The document whose marks are gathered or taken.
+    document: Option<Ulid>,
+    gathered: Vec<(Key, CaptureMark)>,
+    /// The document's ready marks before its first open one, in materialization order.
+    taking: VecDeque<(Key, CaptureMark)>,
+    record: Option<MetadataRegistryRecord>,
+    current: Option<Key>,
     failed: bool,
     step: CaptureStep,
 }
@@ -67,8 +73,11 @@ impl CaptureDrainOperation {
                 CAPTURE_PAGE,
             ),
             marks: VecDeque::new(),
+            document: None,
+            gathered: Vec::new(),
+            taking: VecDeque::new(),
+            record: None,
             current: None,
-            graph: None,
             failed: false,
             step: CaptureStep::Page,
         }
@@ -76,50 +85,76 @@ impl CaptureDrainOperation {
 
     fn next_mark(&mut self) -> Turn {
         loop {
-            let Some((key, value)) = self.marks.pop_front() else {
-                if !self.pages.done() {
-                    self.step = CaptureStep::Page;
-                    return Ok(Next::Call(self.pages.call()));
-                }
+            if let Some((key, mark)) = self.taking.pop_front() {
+                let record = self.record.as_ref().ok_or(IoError::Unfinished)?;
+                let snapshot = capture(&self.node, record, Some((mark.event_id, mark.jsonld)));
+                self.current = Some(key);
+                self.step = CaptureStep::Capture;
+                return Ok(Next::Call(IoCall::child(snapshot)));
+            }
+            if let Some(turn) = self.gather() {
+                return turn;
+            }
+            if self.gathered.is_empty() {
                 return Ok(Next::Done(self.failed.then_some(CAPTURE_RETRY_AFTER)));
-            };
-            let Some(document_id) = mark_document(&key) else {
-                self.current = Some((key, Ulid::nil()));
-                return self.delete();
-            };
-            let mark = match CaptureMark::from_bytes(&value) {
-                Ok(mark) => mark,
-                Err(error) => {
-                    warn!(%document_id, %error, "Deleting an unreadable Git capture mark");
-                    self.current = Some((key, document_id));
-                    return self.delete();
-                }
-            };
-            // A job whose finish has not stored its graph yet keeps its mark.
-            if !mark.ready {
+            }
+            let mut gathered = std::mem::take(&mut self.gathered);
+            gathered.sort_by_key(|(_, mark)| (mark.materialized_at_ms, mark.event_id));
+            let open = gathered.iter().position(|(_, mark)| !mark.ready);
+            gathered.truncate(open.unwrap_or(gathered.len()));
+            if gathered.is_empty() {
                 continue;
             }
-            self.graph = Some((mark.event_id, mark.jsonld));
-            self.current = Some((key, document_id));
+            self.taking = gathered.into();
+            let document_id = self.document.ok_or(IoError::Unfinished)?;
             self.step = CaptureStep::Record;
-            let read = DocumentRecordOperation::new(document_id);
-            return Ok(Next::Call(IoCall::child(read)));
+            return Ok(Next::Call(IoCall::child(DocumentRecordOperation::new(document_id))));
         }
     }
 
-    /// A failed step keeps the mark for the next run.
+    /// Gathers the marks of one document, reading on across pages; answers a call while it
+    /// needs one, and nothing once the document's marks are all gathered.
+    fn gather(&mut self) -> Option<Turn> {
+        while let Some((key, value)) = self.marks.pop_front() {
+            let Some(document_id) = mark_document(&key) else {
+                return Some(self.delete(vec![key]));
+            };
+            if self.document != Some(document_id) && !self.gathered.is_empty() {
+                self.marks.push_front((key, value));
+                return None;
+            }
+            self.document = Some(document_id);
+            match CaptureMark::from_bytes(&value) {
+                Ok(mark) => self.gathered.push((key, mark)),
+                Err(error) => {
+                    warn!(%document_id, %error, "Deleting an unreadable Git capture mark");
+                    return Some(self.delete(vec![key]));
+                }
+            }
+        }
+        if self.pages.done() {
+            return None;
+        }
+        self.step = CaptureStep::Page;
+        Some(Ok(Next::Call(self.pages.call())))
+    }
+
+    /// A failed step keeps the mark and stops its document until the next run.
     fn kept(&mut self, error: impl std::fmt::Display) -> Turn {
-        let (_, document_id) = self.current.take().ok_or(IoError::Unfinished)?;
+        let document_id = self.document.unwrap_or_else(Ulid::nil);
         warn!(%document_id, %error, "The Git snapshot of a materialized document waits");
         self.failed = true;
+        self.current = None;
+        self.taking.clear();
         self.next_mark()
     }
 
-    fn delete(&mut self) -> Turn {
-        let (key, _) = self.current.take().ok_or(IoError::Unfinished)?;
+    fn delete(&mut self, keys: Vec<Key>) -> Turn {
         self.step = CaptureStep::Delete;
-        let row = (MATERIALIZATION_CAPTURE_KEYSPACE.to_string(), key);
-        Ok(Next::Call(IoCall::Delete(vec![row])))
+        let rows = keys
+            .into_iter()
+            .map(|key| (MATERIALIZATION_CAPTURE_KEYSPACE.to_string(), key));
+        Ok(Next::Call(IoCall::Delete(rows.collect())))
     }
 }
 
@@ -134,24 +169,28 @@ impl Operation for CaptureDrainOperation {
     fn next(&mut self, result: IoResult) -> Turn {
         match std::mem::replace(&mut self.step, CaptureStep::Page) {
             CaptureStep::Page => {
-                let rows = self.pages.take(result)?;
-                self.marks = rows.into_iter().collect();
+                self.marks.extend(self.pages.take(result)?);
                 self.next_mark()
             }
             CaptureStep::Record => {
                 match result.child::<Option<MetadataRegistryRecord>, StorageReadError>()? {
                     Ok(Some(record)) => {
-                        self.step = CaptureStep::Capture;
-                        let snapshot = capture(&self.node, &record, self.graph.take());
-                        Ok(Next::Call(IoCall::child(snapshot)))
+                        self.record = Some(record);
+                        self.next_mark()
                     }
                     // A deleted document has no snapshot to take.
-                    Ok(None) => self.delete(),
+                    Ok(None) => {
+                        let keys = self.taking.drain(..).map(|(key, _)| key).collect();
+                        self.delete(keys)
+                    }
                     Err(error) => self.kept(format!("{error:?}")),
                 }
             }
             CaptureStep::Capture => match result.child::<(), GitError>()? {
-                Ok(()) => self.delete(),
+                Ok(()) => {
+                    let key = self.current.take().ok_or(IoError::Unfinished)?;
+                    self.delete(vec![key])
+                }
                 Err(error) => self.kept(error),
             },
             CaptureStep::Delete => {
@@ -274,6 +313,88 @@ mod tests {
         let mut drain = CaptureDrainOperation::new(GitNode::default());
         drain.first().unwrap();
         assert_eq!(drain.next(marks(&mark("first", false))), Ok(Next::Done(None)));
+    }
+
+    fn ordered(event: Ulid, materialized_at_ms: u64, ready: bool) -> (Key, Value) {
+        let mark = CaptureMark {
+            materialized_at_ms,
+            event_id: event,
+            jsonld: event.to_string(),
+            ready,
+        };
+        mark_row(event, &mark)
+    }
+
+    fn snapshot_of(event: Ulid) -> Turn {
+        let graph = Some((event, event.to_string()));
+        let snapshot = capture(&GitNode::default(), &record(), graph);
+        Ok(Next::Call(IoCall::child(snapshot)))
+    }
+
+    fn deleted(event: Ulid) -> Turn {
+        let row = (
+            MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+            document_job_key(DOCUMENT, event),
+        );
+        Ok(Next::Call(IoCall::Delete(vec![row])))
+    }
+
+    fn found() -> IoResult {
+        child(Ok::<_, StorageReadError>(Some(record())))
+    }
+
+    const LATER: Ulid = Ulid::from_parts(3, 3);
+
+    // A document's marks go in the order their jobs materialized them, not by event: a late
+    // older event that materialized last is snapshotted last, so its graph stays on top.
+    #[test]
+    fn ordered_by_materialization() {
+        let mut drain = CaptureDrainOperation::new(GitNode::default());
+        drain.first().unwrap();
+        let rows = vec![ordered(EVENT, 20, true), ordered(LATER, 10, true)];
+        drain.next(IoResult::Page { rows, next: None }).unwrap();
+        assert_eq!(drain.next(found()), snapshot_of(LATER));
+        assert_eq!(drain.next(child(Ok::<(), GitError>(()))), deleted(LATER));
+        assert_eq!(drain.next(IoResult::Done), snapshot_of(EVENT));
+        assert_eq!(drain.next(child(Ok::<(), GitError>(()))), deleted(EVENT));
+        assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(None)));
+    }
+
+    // The first mark not ready stops its document: a later ready graph waits behind it.
+    #[test]
+    fn open_mark_stops() {
+        let mut drain = CaptureDrainOperation::new(GitNode::default());
+        drain.first().unwrap();
+        let rows = vec![ordered(EVENT, 10, false), ordered(LATER, 20, true)];
+        let page = IoResult::Page { rows, next: None };
+        assert_eq!(drain.next(page), Ok(Next::Done(None)));
+    }
+
+    // A failed snapshot stops its document too, so the next run retries it before any later
+    // graph of that document.
+    #[test]
+    fn failed_snapshot_stops() {
+        let mut drain = CaptureDrainOperation::new(GitNode::default());
+        drain.first().unwrap();
+        let rows = vec![ordered(EVENT, 10, true), ordered(LATER, 20, true)];
+        drain.next(IoResult::Page { rows, next: None }).unwrap();
+        assert_eq!(drain.next(found()), snapshot_of(EVENT));
+        let failed = child(Err::<(), _>(GitError::Unavailable));
+        assert_eq!(drain.next(failed), Ok(Next::Done(Some(CAPTURE_RETRY_AFTER))));
+    }
+
+    // Marks of one document that a page boundary splits are gathered before any is taken.
+    #[test]
+    fn pages_join_document() {
+        let mut drain = CaptureDrainOperation::new(GitNode::default());
+        drain.first().unwrap();
+        let first = vec![ordered(EVENT, 20, true)];
+        let after = Some(document_job_key(DOCUMENT, EVENT));
+        let page = drain.next(IoResult::Page { rows: first, next: after });
+        assert!(matches!(page, Ok(Next::Call(IoCall::Page { .. }))));
+        let rest = vec![ordered(LATER, 10, true)];
+        drain.next(IoResult::Page { rows: rest, next: None }).unwrap();
+        assert_eq!(drain.next(found()), snapshot_of(LATER));
     }
 
     // A mark that does not decode goes without a snapshot.
