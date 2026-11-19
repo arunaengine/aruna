@@ -482,6 +482,7 @@ impl ReplicationHarness {
                 Some(404),
                 "the object must be absent on the joiner, not merely forbidden"
             );
+            // Real time: the object must stay absent over the whole window, not at one look.
             tokio::time::sleep(interval).await;
         }
         Ok(())

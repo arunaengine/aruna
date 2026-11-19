@@ -5,7 +5,7 @@
 use crate::shared;
 
 use aruna_api::routes::credentials::CreateS3Response;
-use aruna_drivers::testing::poll_until;
+use aruna_clock::testing::poll_until;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;

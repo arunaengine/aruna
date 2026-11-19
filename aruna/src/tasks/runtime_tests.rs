@@ -6,6 +6,7 @@ use crate::tasks::runner::{
     claim_producer, finish_job, recover_stale_jobs, recover_until_stopped, run_job, shutdown_jobs,
     spawn_job, wait_for_terminal,
 };
+use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -25,7 +26,6 @@ use aruna_drivers::jobs::executor::RangeTurns;
 use aruna_drivers::jobs::runtime::*;
 use aruna_drivers::jobs::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
 use aruna_drivers::testing::import_record;
-use aruna_drivers::testing::poll_until;
 use aruna_drivers::testing::task_context;
 use aruna_operations::jobs::JOB_MAX_ATTEMPTS;
 use aruna_operations::jobs::runtime_steps::requeue_call;

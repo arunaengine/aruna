@@ -10,8 +10,13 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# The bounded poll for tests; only dev-dependencies enable it.
+test-hooks = ["dep:tokio"]
+
 [dependencies]
 aruna-core = { workspace = true }
+tokio = { workspace = true, optional = true }
 ulid = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]

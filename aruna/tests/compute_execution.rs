@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna::tasks::runner::{ComputeReconciler, run_execution_job};
+use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::docker::DockerBackend;
@@ -25,7 +26,6 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::ExternalReconciler;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_drivers::testing::poll_until;
 use aruna_operations::jobs::store::job_calls::{self, ClaimOutcome};
 use aruna_operations::jobs::store::{JobMutation, row_calls};
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};

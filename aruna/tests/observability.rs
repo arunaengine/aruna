@@ -207,10 +207,10 @@ async fn metrics_s3_label() -> TestResult<()> {
 /// by hand, so only launching the real binary can observe `main`'s startup
 /// order, its serving gate, and its restart outbox delta.
 mod process {
+    use aruna_clock::testing::poll_until;
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
-    use aruna_drivers::testing::poll_until;
     use aruna_storage::{FjallStorage, StorageHandle};
     use std::io::{Read, Seek, SeekFrom};
     use std::net::{TcpListener, UdpSocket};

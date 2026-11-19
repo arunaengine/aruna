@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::topology::init_logging;
+use aruna_clock::testing::poll_until;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -27,7 +28,6 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, Value};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_drivers::testing::poll_until;
 use aruna_operations::metadata::local_query::LocalQueryOperation;
 use aruna_operations::metadata::text_search::LocalSearchOperation;
 use aruna_storage::FjallStorage;

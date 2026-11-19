@@ -12,6 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aruna_core::structured_id::IdEnvironment;
 use ulid::Ulid;
 
+#[cfg(feature = "test-hooks")]
+pub mod testing;
+
 /// The 48 bits of a structured id's nonce.
 const NONCE_MASK: u64 = (1 << 48) - 1;
 

@@ -2678,11 +2678,9 @@ async fn sweep_drops_journals() {
         drained.remove(key).unwrap();
         drained.rotate_memtable_and_wait().unwrap();
     }
-    let cap = Instant::now() + Duration::from_secs(120);
-    while drained.table_count() > 0 {
-        assert!(Instant::now() < cap, "the keyspace never compacts away");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let empty = async || (drained.table_count() == 0).then_some(());
+    let compacted = aruna_clock::testing::poll_until(Duration::from_secs(120), empty).await;
+    assert!(compacted.is_some(), "the keyspace never compacts away");
     pending.inner().rotate_memtable_and_wait().unwrap();
     storage.compactor.sweep(db.clone());
     (jobs.try_recv().expect("sweep is queued").run)().unwrap();

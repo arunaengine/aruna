@@ -171,7 +171,7 @@ CLOCK_RE = re.compile(
 EFFECT_OP_RE = re.compile(r"\bimpl(?:\s*<[^{;]*?>)?\s+(?:[\w:]+::)?EffectOperation\s+for\b")
 PAUSE_RE = re.compile(r"\bstart_paused\b|\bpause\s*\(\s*\)")
 # The shared bounded poll helper; the one real sleep in tests the guard does not count.
-POLL_HELPER = ("drivers/src/testing.rs", "poll_until")
+POLL_HELPER = ("clock/src/testing.rs", "poll_until")
 SKIP_RE = re.compile(r"\be?println!\s*\([^;]*\)\s*;\s*(?:return\b|None\s*[},])")
 SPACE_RE = re.compile(r"\s+")
 COMMA_RE = re.compile(r"\s*,")

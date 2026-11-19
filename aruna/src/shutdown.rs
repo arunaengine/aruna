@@ -1033,6 +1033,7 @@ mod tests {
             .write_all(b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\n")
             .await
             .expect("session partial head");
+        // Real time: both servers must take the half-sent heads, and no state shows when.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut sequence = node_shutdown(shutdown.clone(), storage_handle.clone());
