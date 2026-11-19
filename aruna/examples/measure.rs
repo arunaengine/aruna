@@ -46,7 +46,7 @@ use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotifica
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_operations::testing::project_logged_events;
+use aruna_test_support::projection::project_logged_events;
 use aruna_storage::{FjallStorage, StorageHandle};
 use convergence::{NO_PROGRESS_TIMEOUT, wait_empty_queues, wait_for_visibility};
 use futures_util::StreamExt;

@@ -61,7 +61,8 @@ use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
 use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::{drain_projection_queue, schedule_projection_drain};
+use aruna_operations::testing::drain_projection_queue;
+use aruna_test_support::projection::schedule_projection_drain;
 use aruna_operations::testing::{process_graph_tombstones, prune_jobs_exist};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;

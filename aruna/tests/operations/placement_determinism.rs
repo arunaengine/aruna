@@ -33,7 +33,7 @@ use aruna_operations::realm::mutate_placement::{
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::testing::sync_topics;
+use aruna_test_support::documents::sync_topics;
 use ulid::Ulid;
 
 use crate::convergence;

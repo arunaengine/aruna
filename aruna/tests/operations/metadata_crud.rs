@@ -43,10 +43,8 @@ use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
 };
 use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::{
-    drain_projection_queue, project_create_events, project_logged_event, replay_event_log,
-    schedule_projection_drain,
-};
+use aruna_operations::testing::{drain_projection_queue, project_create_events};
+use aruna_test_support::projection::{project_logged_event, replay_event_log, schedule_projection_drain};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;

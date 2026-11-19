@@ -941,7 +941,7 @@ mod tests {
     }
 
     fn aruna_token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
-        aruna_operations::testing::token_claims(realm_id, user_id)
+        aruna_test_support::tokens::token_claims(realm_id, user_id)
     }
 
     fn sign_aruna_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {

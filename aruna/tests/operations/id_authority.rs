@@ -35,7 +35,7 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-use aruna_operations::testing::replay_event_log;
+use aruna_test_support::projection::replay_event_log;
 use ulid::Ulid;
 
 use topology::{TestNode, TestResult, Topology, wait_for_convergence, wait_until};

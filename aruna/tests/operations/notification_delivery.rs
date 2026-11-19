@@ -699,7 +699,7 @@ impl SettingRealm {
     async fn pull(&self, index: usize, from: usize) {
         let peers = vec![self.id(from)];
         let _ =
-            aruna_operations::testing::sync_topic(self.context(index), self.topic(), peers).await;
+            aruna_test_support::documents::sync_topic(self.context(index), self.topic(), peers).await;
     }
 
     /// Pulls on node `index` from every node in `from` until its setting satisfies `done`.

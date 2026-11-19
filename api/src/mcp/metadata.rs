@@ -1203,7 +1203,7 @@ mod authorization_tests {
             .await
             .unwrap();
         if drained.markers_examined == 0 {
-            aruna_operations::testing::replay_event_log(ctx.as_ref())
+            aruna_test_support::projection::replay_event_log(ctx.as_ref())
                 .await
                 .unwrap();
         }

@@ -1,31 +1,23 @@
-//! Builds storage driver contexts, raw storage reads and writes, and signed tokens for tests.
+//! Drives outbox reads and the projection, materialization and prune passes, and builds job ids,
+//! refreshes and group backends for tests.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::document::{DocumentOutboxRecord, DocumentReconcileResult};
+use aruna_core::document::DocumentOutboxRecord;
 use aruna_core::document_apply::ApplyError;
-use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structured_id::{BucketId, ClockHealthError, PlacementHandle};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
-use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::EncodePrivateKey;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
 use crate::metadata::deletion_guard::DeletionGuardOperation;
 use crate::sync::document_outbox::{
-    OutboxPagePlan, OutboxReadBatch, OutboxTailsOperation, OutboxTimerOperation, ReadOutboxPlan,
+    OutboxPagePlan, OutboxReadBatch, OutboxTailsOperation, ReadOutboxPlan,
 };
-use crate::sync::reconcile::SyncTopicsOperation;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
 
@@ -60,82 +52,6 @@ pub async fn read_outbox_tails(
     drive(OutboxTailsOperation::new(), &test_context(storage.clone())).await
 }
 
-/// Arms the outbox drain on `tasks` as a restarting node does.
-pub async fn restore_outbox_timers(storage: &StorageHandle, tasks: &TaskHandle) {
-    let mut context = test_context(storage.clone());
-    context.task_handle = Some(tasks.clone());
-    drive(OutboxTimerOperation::new(), &context)
-        .await
-        .expect("outbox timer restores");
-}
-
-fn context_realm(context: &DriverContext) -> RealmId {
-    *context
-        .net_handle
-        .as_ref()
-        .expect("the context has a net handle")
-        .realm_id()
-}
-
-/// Pulls `topics` from `peers` and reconciles them.
-pub async fn sync_topics(
-    context: &DriverContext,
-    topics: Vec<irokle::TopicId>,
-    peers: Vec<NodeId>,
-) -> Result<DocumentReconcileResult, ApplyError> {
-    let sync = SyncTopicsOperation::new(context_realm(context), topics, peers);
-    drive(sync, context).await
-}
-
-/// Pulls one topic from `peers` and reconciles it; a topic that cannot be fetched fails.
-pub async fn sync_topic(
-    context: &DriverContext,
-    topic: irokle::TopicId,
-    peers: Vec<NodeId>,
-) -> Result<DocumentReconcileResult, ApplyError> {
-    let sync = SyncTopicsOperation::single(context_realm(context), topic, peers);
-    drive(sync, context).await
-}
-
-/// Reconciles what `topics` already hold.
-pub async fn reconcile_topics(
-    context: &DriverContext,
-    topics: Vec<irokle::TopicId>,
-) -> Result<DocumentReconcileResult, ApplyError> {
-    let reconcile = ReconcileTopicsOperation::new(context_realm(context), topics);
-    drive(reconcile, context).await
-}
-
-/// An EdDSA bearer token of `claims` signed with `signing_key`.
-pub fn sign_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
-    let key_pem = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();
-    encode(
-        &Header::new(Algorithm::EdDSA),
-        claims,
-        &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
-    )
-    .unwrap()
-}
-
-/// Replays the whole event log into the registry projection.
-pub async fn replay_event_log(
-    context: &DriverContext,
-) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
-    use crate::metadata::projection::ReplayPageOperation;
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let mut after = None;
-    let mut projected = 0usize;
-    loop {
-        let page = ReplayPageOperation::new(after, local_node);
-        let (count, next) = aruna_drivers::driver::drive(page, context).await?;
-        projected = projected.saturating_add(count);
-        match next {
-            Some(next) => after = Some(next),
-            None => return Ok(projected),
-        }
-    }
-}
-
 /// Runs one pass of the pending projection drain.
 pub async fn drain_projection_queue(
     context: &DriverContext,
@@ -158,39 +74,6 @@ pub async fn project_create_events(
     use crate::metadata::projection::ProjectEventsOperation;
     let project = ProjectEventsOperation::new(events, local_node_id);
     aruna_drivers::driver::drive(project, context).await
-}
-
-/// Projects logged events by their document and event ids.
-pub async fn project_logged_events(
-    context: &DriverContext,
-    targets: impl IntoIterator<Item = (ulid::Ulid, ulid::Ulid)>,
-) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
-    use crate::metadata::projection::ProjectLoggedOperation;
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let project = ProjectLoggedOperation::new(targets, false, local_node);
-    Ok(aruna_drivers::driver::drive(project, context)
-        .await?
-        .projected)
-}
-
-/// Projects one logged event.
-pub async fn project_logged_event(
-    context: &DriverContext,
-    document_id: ulid::Ulid,
-    event_id: ulid::Ulid,
-) -> Result<(), crate::metadata::projection::MetadataProjectionError> {
-    project_logged_events(context, [(document_id, event_id)])
-        .await
-        .map(|_| ())
-}
-
-/// Wakes the projection drain after `after`.
-pub async fn schedule_projection_drain(
-    context: &DriverContext,
-    after: std::time::Duration,
-) -> Result<(), crate::metadata::projection::MetadataProjectionError> {
-    let wake = crate::metadata::projection::ProjectionWakeOperation::new(after);
-    aruna_drivers::driver::drive(wake, context).await
 }
 
 /// Runs one pass of the metadata materialization drain, as the drain task does.
@@ -295,26 +178,6 @@ pub fn reference_refresh(
             Default::default(),
             RealmId([9u8; 32]),
         ),
-    }
-}
-
-/// Claims of `user_id` issued by `realm_id`, valid for ten minutes from now.
-pub fn token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenClaims {
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
-    TokenClaims {
-        sub: user_id.to_string(),
-        iss: realm_id.to_string(),
-        iat: now,
-        exp: now + 600,
-        jti: ulid::Ulid::generate().to_string(),
-        sid: None,
-        session_kind: None,
-        restrictions: None,
-        issuer_pubkey: None,
-        delegation_signature: None,
-        name: None,
-        via: None,
-        auth_time: None,
     }
 }
 
