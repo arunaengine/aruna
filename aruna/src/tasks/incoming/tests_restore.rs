@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::harness::*;
+use super::support::*;
 use super::*;
 use crate::tasks::incoming::outbox::drive_sync_drain;
 use aruna_drivers::testing::{RecordingTaskHandler, freeze_clock};

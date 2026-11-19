@@ -180,7 +180,8 @@ async fn seed_user(state: &ServerState, actor: &Actor, user_id: UserId, name: &s
 async fn setup() -> Fixture {
     let storage_dir = tempfile::tempdir().unwrap();
     let metadata_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
     let realm = realm_id(5);
     let user_id = UserId::local(Ulid::from_bytes([200u8; 16]), realm);

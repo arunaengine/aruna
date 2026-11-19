@@ -376,7 +376,8 @@ mod tests {
     #[tokio::test]
     async fn kept_records_resume() {
         let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -432,7 +433,11 @@ mod tests {
     }
 
     /// Whether `key` holds a row in `key_space`.
-    async fn stored(storage: &aruna_storage::storage::handle::StorageHandle, key_space: &str, key: Vec<u8>) -> bool {
+    async fn stored(
+        storage: &aruna_storage::storage::handle::StorageHandle,
+        key_space: &str,
+        key: Vec<u8>,
+    ) -> bool {
         let read = StorageEffect::Read {
             key_space: key_space.to_string(),
             key: key.into(),
@@ -449,7 +454,8 @@ mod tests {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = Arc::new(DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

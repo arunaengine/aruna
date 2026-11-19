@@ -118,14 +118,9 @@ fn abe_master() {
             Attribute::Epoch(epoch),
             Attribute::Prefix(b"foo/".to_vec()),
         ];
-        let sealed = aruna_kpabe::envelope::seal(
-            &parameters,
-            &attrs,
-            &[8; 32],
-            b"envelope",
-            &mut SysRng,
-        )
-        .unwrap();
+        let sealed =
+            aruna_kpabe::envelope::seal(&parameters, &attrs, &[8; 32], b"envelope", &mut SysRng)
+                .unwrap();
         assert_eq!(
             aruna_kpabe::envelope::open(&parameters, &user, &sealed, b"envelope").is_ok(),
             epoch == 1

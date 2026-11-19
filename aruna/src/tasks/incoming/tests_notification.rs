@@ -2,11 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::harness::*;
+use super::support::*;
 use super::*;
 
 /// The outbox rows still waiting.
-async fn outbox_rows(storage: &aruna_storage::storage::handle::StorageHandle) -> Vec<(Key, ByteView)> {
+async fn outbox_rows(
+    storage: &aruna_storage::storage::handle::StorageHandle,
+) -> Vec<(Key, ByteView)> {
     let read = StorageEffect::Iter {
         key_space: aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
         prefix: None,
@@ -297,7 +299,9 @@ async fn write_notification_outbox(
     }
 }
 
-async fn read_inbox_records(storage: &aruna_storage::storage::handle::StorageHandle) -> Vec<NotificationRecord> {
+async fn read_inbox_records(
+    storage: &aruna_storage::storage::handle::StorageHandle,
+) -> Vec<NotificationRecord> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),

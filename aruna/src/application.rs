@@ -1227,9 +1227,10 @@ mod tests {
     #[tokio::test]
     async fn cancellation_requires_cleanup() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let storage_handle =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
-                .expect("storage opens");
+        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(
+            dir.path().to_str().expect("utf8 path"),
+        )
+        .expect("storage opens");
 
         let complete = node_shutdown(
             aruna_tasks::shutdown::Shutdown::new(),

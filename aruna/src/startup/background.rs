@@ -319,8 +319,10 @@ mod tests {
 
     async fn test_background() -> (Background, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("temp dir");
-        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
-            .expect("storage opens");
+        let storage = aruna_storage::storage::worker::FjallStorage::open(
+            temp.path().to_str().expect("utf8 path"),
+        )
+        .expect("storage opens");
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,

@@ -1624,7 +1624,10 @@ mod tests {
 
     fn context(root: &std::path::Path) -> DriverContext {
         DriverContext {
-            storage_handle: aruna_storage::storage::worker::FjallStorage::open(root.to_str().unwrap()).unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                root.to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,

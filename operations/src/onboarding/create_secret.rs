@@ -287,7 +287,8 @@ mod tests {
         enrolled: &[UserId],
     ) -> (tempfile::TempDir, DriverContext) {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
         config.quota = QuotaConfig {
             devices_per_user: cap,

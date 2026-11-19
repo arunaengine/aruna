@@ -5,7 +5,6 @@
 use crate::auth::RealmAuth;
 use crate::error::ServerResult;
 use crate::metadata::model::*;
-use crate::metadata::*;
 use crate::routes::metadata::documents::*;
 use crate::server::state::ServerState;
 use aruna_core::effects::{Effect, StorageEffect};

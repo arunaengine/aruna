@@ -16,8 +16,9 @@ use aruna_operations::metadata::create_document::mint_local_document;
 use std::cell::RefCell;
 use ulid::Ulid;
 
+use crate::convergence::wait_for_convergence;
 use crate::topology::create_document;
-use topology::{TestNode, TestResult, Topology, wait_for_convergence, wait_until};
+use topology::{TestNode, TestResult, Topology, wait_until};
 
 const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;

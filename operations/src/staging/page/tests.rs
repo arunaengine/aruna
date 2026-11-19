@@ -999,7 +999,9 @@ async fn page_needs_coordinator() {
 }
 
 /// Bytes of keys and values per keyspace in `handle`.
-async fn keyspace_bytes(handle: &aruna_storage::storage::handle::StorageHandle) -> HashMap<&'static str, usize> {
+async fn keyspace_bytes(
+    handle: &aruna_storage::storage::handle::StorageHandle,
+) -> HashMap<&'static str, usize> {
     let mut sizes = HashMap::new();
     for key_space in aruna_core::keyspaces::KEYSPACE_CATALOG {
         let iter = StorageEffect::Iter {

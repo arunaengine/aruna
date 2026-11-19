@@ -60,7 +60,10 @@ async fn metadata_query(base_url: &str, token: &str) -> TestResult<Value> {
     Ok(response.json().await?)
 }
 
-fn metadata_counts(seed: &shared::SeedNode, peer: iroh::PublicKey) -> aruna_net::connection_pool::PoolCounts {
+fn metadata_counts(
+    seed: &shared::SeedNode,
+    peer: iroh::PublicKey,
+) -> aruna_net::connection_pool::PoolCounts {
     seed.net.pool_counts_for(peer, Alpn::Metadata)
 }
 

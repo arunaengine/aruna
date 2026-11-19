@@ -379,8 +379,6 @@ pub(crate) async fn apply_admin_operation(
     Ok(())
 }
 
-pub(crate) use apply_admin_operation as apply_user_operation;
-
 pub(crate) async fn apply_distribution_operation(
     storage: &StorageHandle,
     target: DocumentTarget,

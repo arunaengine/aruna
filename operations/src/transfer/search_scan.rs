@@ -911,7 +911,7 @@ mod tests {
     pub(super) async fn setup() -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

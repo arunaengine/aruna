@@ -172,7 +172,8 @@ async fn setup_state() -> (Arc<ServerState>, TempDir) {
 /// A realm whose initial admin is claimed, so the realm admin path grants.
 async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
     let tempdir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,

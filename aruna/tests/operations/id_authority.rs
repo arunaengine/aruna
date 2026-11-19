@@ -33,7 +33,8 @@ use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperat
 use aruna_test_support::projection::replay_event_log;
 use ulid::Ulid;
 
-use topology::{TestNode, TestResult, Topology, wait_for_convergence, wait_until};
+use crate::convergence::wait_for_convergence;
+use topology::{TestNode, TestResult, Topology, wait_until};
 
 const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;

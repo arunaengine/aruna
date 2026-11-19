@@ -1072,7 +1072,9 @@ mod tests {
     async fn parked_job_wakes() {
         // A locked source parks the job without an attempt; the unlock makes it due again.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let context = test_context(storage.clone());
         let relationship = Ulid::from_parts(5, 5);
         let mut record = job(relationship);
@@ -1507,7 +1509,8 @@ mod tests {
         for (failed_page, job_count) in [(1, WAIT_PAGE + 1), (2, WAIT_PAGE + 1), (2, WAIT_PAGE)] {
             let dir = tempfile::tempdir().unwrap();
             let mut context = test_context(
-                aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
+                aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                    .unwrap(),
             );
             let tasks = aruna_tasks::TaskHandle::new();
             let (scheduled, mut drains) = tokio::sync::mpsc::unbounded_channel();

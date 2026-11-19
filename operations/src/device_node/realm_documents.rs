@@ -1448,8 +1448,9 @@ mod tests {
 
     async fn device(config: &RealmConfigDocument) -> (tempfile::TempDir, Arc<DriverContext>) {
         let dir = tempfile::tempdir().expect("temp dir");
-        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("path"))
-            .expect("storage opens");
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("path"))
+                .expect("storage opens");
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,

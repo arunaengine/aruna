@@ -83,7 +83,7 @@ mod test {
     pub async fn gets_user_access() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
-        let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
 
         let user_identity = Default::default();
         let access_key_id = UserAccess::build_access_key(&Ulid::generate().to_string()).unwrap();

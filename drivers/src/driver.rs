@@ -87,7 +87,7 @@ fn read_load_permille() -> Option<u32> {
 /// writes fail closed through the gate operation without an advertised subject.
 #[derive(Clone)]
 pub struct DriverContext {
-    pub storage_handle: storage::StorageHandle,
+    pub storage_handle: storage::handle::StorageHandle,
     pub net_handle: Option<NetHandle>,
     pub blob_handle: Option<BlobHandle>,
     pub graph_handle: Option<GraphHandle>,
@@ -100,7 +100,7 @@ pub struct DriverContext {
 
 impl DriverContext {
     /// A context with storage only, for work before or after the node's other planes run.
-    pub fn storage_only(storage_handle: storage::StorageHandle) -> Self {
+    pub fn storage_only(storage_handle: storage::handle::StorageHandle) -> Self {
         Self {
             storage_handle,
             net_handle: None,
@@ -367,11 +367,11 @@ pub(crate) fn managed_effect(effect: &Effect) -> bool {
 #[derive(Default)]
 struct TransactionTracker {
     states: BTreeMap<TxnId, TransactionState>,
-    owner: Option<storage::StorageHandle>,
+    owner: Option<storage::handle::StorageHandle>,
 }
 
 impl TransactionTracker {
-    fn new(owner: storage::StorageHandle) -> Self {
+    fn new(owner: storage::handle::StorageHandle) -> Self {
         Self {
             states: BTreeMap::new(),
             owner: Some(owner),
@@ -1686,7 +1686,7 @@ mod test {
     fn test_context() -> (tempfile::TempDir, DriverContext) {
         let directory = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -1711,7 +1711,7 @@ mod test {
         let root = directory.path().to_str().unwrap().to_string();
         let blob_root = format!("{root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
-        let storage_handle = storage::FjallStorage::open(&root).unwrap();
+        let storage_handle = storage::worker::FjallStorage::open(&root).unwrap();
         let net_handle =
             aruna_net::NetHandle::new(crate::testing::local_net(), storage_handle.clone())
                 .await
@@ -1764,7 +1764,7 @@ mod test {
 
     #[test]
     fn commit_failure_kept() {
-        let (handle, _receivers) = storage::StorageHandle::new();
+        let (handle, _receivers) = storage::handle::StorageHandle::new();
         let id = ulid::Ulid::generate();
         let mut tracker = TransactionTracker::new(handle.clone());
         tracker.observe(
@@ -1877,7 +1877,7 @@ mod test {
     async fn drive_commit_safe() {
         let directory = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -1903,7 +1903,7 @@ mod test {
     async fn drive_error_cleanup() {
         let directory = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -1975,7 +1975,7 @@ mod test {
         let temp_root = temp_dir.path().to_str().unwrap().to_string();
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
-        let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+        let storage_handle = storage::worker::FjallStorage::open(&temp_root).unwrap();
         let net_handle =
             aruna_net::NetHandle::new(crate::testing::local_net(), storage_handle.clone())
                 .await
@@ -2161,8 +2161,10 @@ mod test {
 
     /// A storage that forwards every effect to `real` and keeps the ids of the transactions
     /// it saw start.
-    fn started_ids(real: storage::StorageHandle) -> (storage::StorageHandle, Started) {
-        let (handle, receivers) = storage::StorageHandle::new();
+    fn started_ids(
+        real: storage::handle::StorageHandle,
+    ) -> (storage::handle::StorageHandle, Started) {
+        let (handle, receivers) = storage::handle::StorageHandle::new();
         let started = Arc::new(std::sync::Mutex::new(Vec::new()));
         for receiver in [receivers.foreground, receivers.bulk] {
             let (real, started) = (real.clone(), started.clone());
@@ -2438,7 +2440,7 @@ mod test {
         // Racing a timeout against the whole drive would drop the abort path.
         let directory = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -2479,7 +2481,7 @@ mod test {
     pub async fn test_driver() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
 
         let context = DriverContext {
             storage_handle,
@@ -2525,7 +2527,7 @@ mod test {
     async fn driver_preserves_fifo() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -2589,7 +2591,7 @@ mod test {
         let temp_root = temp_dir.path().to_str().unwrap().to_string();
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
-        let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+        let storage_handle = storage::worker::FjallStorage::open(&temp_root).unwrap();
         let net_handle =
             aruna_net::NetHandle::new(crate::testing::local_net(), storage_handle.clone())
                 .await
@@ -2660,7 +2662,8 @@ mod test {
                 runtime.block_on(async {
                     let random_path = tempdir().unwrap();
                     let storage_handle =
-                        storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+                        storage::worker::FjallStorage::open(random_path.path().to_str().unwrap())
+                            .unwrap();
                     let context = DriverContext {
                         storage_handle,
                         net_handle: None,
@@ -2690,7 +2693,7 @@ mod test {
     #[tokio::test]
     async fn bulk_skips_foreground() {
         // Background work on a bulk context never queues ahead of request effects.
-        let (storage_handle, receivers) = storage::StorageHandle::new();
+        let (storage_handle, receivers) = storage::handle::StorageHandle::new();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -2773,7 +2776,7 @@ mod test {
 
     /// A context whose storage has no worker, for groups that only use a fake dispatch.
     fn bare_context() -> DriverContext {
-        let (storage_handle, _) = storage::StorageHandle::new();
+        let (storage_handle, _) = storage::handle::StorageHandle::new();
         DriverContext {
             storage_handle,
             net_handle: None,
@@ -3469,7 +3472,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn hang_limit_answers() {
         // A storage handle without a worker never answers; its own request timeout is longer.
-        let (storage_handle, _receivers) = storage::StorageHandle::new();
+        let (storage_handle, _receivers) = storage::handle::StorageHandle::new();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

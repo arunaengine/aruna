@@ -406,7 +406,9 @@ mod tests {
     #[tokio::test]
     async fn background_prunes_stale() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let context = crate::distribution::test_store::context(&storage);
         let connector_id = Ulid::from_bytes([2; 16]);
         let mut writes: Vec<_> = (0..PRUNE_PAGE + 5)

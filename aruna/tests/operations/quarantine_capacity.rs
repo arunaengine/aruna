@@ -136,8 +136,10 @@ async fn list(ctx: &DriverContext, request: QuarantinePageRequest) -> Quarantine
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_blocks_releases() {
     let storage_dir = tempfile::tempdir().expect("storage dir");
-    let storage = aruna_storage::storage::worker::FjallStorage::open(storage_dir.path().to_str().expect("path"))
-        .expect("storage opens");
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
+        storage_dir.path().to_str().expect("path"),
+    )
+    .expect("storage opens");
     let realm_id = RealmId::from_bytes([31; 32]);
     let net = NetHandle::new(
         NetConfig {

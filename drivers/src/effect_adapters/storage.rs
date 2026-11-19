@@ -130,8 +130,9 @@ mod tests {
             txn_id: None,
         })));
         let directory = tempdir().unwrap();
-        let direct = storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
-        let (storage_handle, receivers) = storage::StorageHandle::new();
+        let direct =
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let (storage_handle, receivers) = storage::handle::StorageHandle::new();
         let receiver = receivers.foreground;
         drop(receivers.bulk);
         let committed = Arc::new(AtomicBool::new(false));
@@ -271,7 +272,7 @@ mod tests {
     async fn config_commit_reloads() {
         let directory = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let net_handle = aruna_net::NetHandle::new(
             aruna_net::config::NetConfig {
                 discovery_method: aruna_net::config::DiscoveryMethod::None,
@@ -336,7 +337,7 @@ mod tests {
         // dropped effect; the peer link is only a post-write side channel.
         let directory = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
