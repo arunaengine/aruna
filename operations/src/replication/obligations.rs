@@ -8,6 +8,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     NODE_STATE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
     REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
@@ -129,6 +130,7 @@ enum PassStep {
 #[derive(Debug, PartialEq)]
 pub(super) struct ProcessObligationsOperation {
     now_ms: u64,
+    ids: IdMint,
     step: PassStep,
     after: Option<Vec<u8>>,
     next: Option<Vec<u8>>,
@@ -149,6 +151,7 @@ impl ProcessObligationsOperation {
     pub(super) fn new() -> Self {
         Self {
             now_ms: 0,
+            ids: IdMint::default(),
             step: PassStep::Cursor,
             after: None,
             next: None,
@@ -261,7 +264,7 @@ impl ProcessObligationsOperation {
             }
             let members = match self.records.get(&obligation.bucket) {
                 Some(Some((binding, snapshot))) if !cursor.members_done => {
-                    member_jobs(binding, snapshot, &obligation, self.now_ms)
+                    member_jobs(binding, snapshot, &obligation, self.now_ms, &mut self.ids)
                 }
                 _ => Vec::new(),
             };
@@ -326,6 +329,10 @@ impl Operation for ProcessObligationsOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn first(&mut self) -> Turn<LiveRepairResult> {
@@ -832,6 +839,8 @@ fn relationship_jobs(
     upstream_sources: &[ArunaArn],
     page: &RelationshipPage,
     cursor: &mut LiveReplicationContinuation,
+    now_ms: u64,
+    ids: &mut IdMint,
 ) -> Option<Vec<BlobJobRecord>> {
     let mut jobs = Vec::with_capacity(REPLICATION_JOB_LIMIT);
     let mut found = false;
@@ -859,8 +868,8 @@ fn relationship_jobs(
             relationship.clone(),
             obligation.origin.as_ref(),
             upstream_sources,
-            aruna_core::time::unix_timestamp_millis(),
-            ulid::Ulid::generate(),
+            now_ms,
+            ids.mint(now_ms),
         );
         let job = job.map(|mut job| match obligation.reference_advance {
             Some(advance) => {
@@ -914,6 +923,8 @@ pub(super) struct WriteJobsOperation {
     cursor: LiveReplicationContinuation,
     queued: usize,
     step: LiveStep,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 fn no_progress() -> LiveRepairWrite {
@@ -941,6 +952,8 @@ impl WriteJobsOperation {
             cursor: obligation.continuation.clone().unwrap_or_default(),
             queued: 0,
             step: LiveStep::Inbound,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -991,6 +1004,8 @@ impl WriteJobsOperation {
                 &self.upstream_sources,
                 page,
                 &mut self.cursor,
+                self.now_ms,
+                &mut self.ids,
             );
             let Some(planned) = planned else {
                 return Ok(Next::Done(no_progress()));
@@ -1007,6 +1022,14 @@ impl WriteJobsOperation {
 impl Operation for WriteJobsOperation {
     type Output = LiveRepairWrite;
     type Error = BlobQueueError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Turn<LiveRepairWrite> {
         let obligation = &self.obligation;
