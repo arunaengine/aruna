@@ -123,6 +123,9 @@ pub enum TransactionMode {
     Write,
     /// Reads and pages run in one read-only snapshot; writes, deletes and syncs run on their own.
     ReadSnapshot,
+    /// As `ReadSnapshot`, with the snapshot that beginning a usage rebuild answers, so it holds
+    /// the rows exactly as the rebuild began.
+    UsageRebuild,
 }
 
 /// What the conflict retry does after a run lost a transaction conflict.

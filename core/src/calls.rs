@@ -13,6 +13,7 @@ use tracing::warn;
 
 use crate::effects::{Effect, EffectGroup, GroupForm, IterStart, StorageEffect, abort_effects};
 use crate::errors::StorageError;
+use crate::keyspaces::USAGE_STATS_KEYSPACE;
 use crate::events::{Event, GroupEvent, StorageEvent};
 use crate::operation::{
     AfterConflict, EffectOperation, HoldScope, Operation, Runnable, SubOperation, TransactionMode,
@@ -473,8 +474,14 @@ impl<P: Operation> CallRun<P> {
             }
             if self.txn_id.is_none() && in_mode(&mut call, self.mode) {
                 self.state = State::Starting(call);
-                let read = self.mode == TransactionMode::ReadSnapshot;
-                let start = StorageEffect::StartTransaction { read };
+                let start = match self.mode {
+                    TransactionMode::UsageRebuild => StorageEffect::BeginUsageRebuild {
+                        key_space: USAGE_STATS_KEYSPACE.to_string(),
+                    },
+                    mode => StorageEffect::StartTransaction {
+                        read: mode == TransactionMode::ReadSnapshot,
+                    },
+                };
                 return smallvec![Effect::Storage(start)];
             }
             return self.request(call);
@@ -778,7 +785,7 @@ fn in_mode(call: &mut IoCall, mode: TransactionMode) -> bool {
     let snapshot = match mode {
         TransactionMode::None => return false,
         TransactionMode::Write => false,
-        TransactionMode::ReadSnapshot => true,
+        TransactionMode::ReadSnapshot | TransactionMode::UsageRebuild => true,
     };
     match call {
         IoCall::Read(_) | IoCall::Page { .. } => true,

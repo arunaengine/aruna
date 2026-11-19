@@ -898,8 +898,8 @@ mod tests {
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
         UPLOAD_KEYSPACE,
     };
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::operation_check::{rejects_events, sample_events};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::operation_check::sample_events;
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
@@ -920,7 +920,6 @@ mod tests {
         SUMMARY_GLOBAL_KEY, global_shard_keys, usage_global_key, usage_snapshot_key,
         usage_summary_key,
     };
-    use aruna_core::types::TxnId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::path_context;
     use std::time::SystemTime;
@@ -2774,29 +2773,31 @@ mod tests {
         );
     }
 
-    // A state that expects no event must reject one instead of ignoring it.
+    // The swap after the walk takes only its write answer; any other event is refused.
     #[test]
     fn terminal_rejects_event() {
-        let rebuild = || {
+        let finishing = || {
             let mut rebuild = RebuildStatsOperation::new();
-            rebuild.start();
-            rebuild.step(Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: TxnId::generate(),
-            }));
+            rebuild.first().unwrap();
+            let walked = Ok::<_, RebuildStatsError>(UsageCounters::default());
+            let swap = rebuild.next(IoResult::Child(ChildOutcome::new(walked)));
+            assert!(matches!(swap, Ok(Next::Call(IoCall::Effect(_)))));
             rebuild
         };
-        for (_, effects, error) in rejects_events(rebuild, sample_events, |_| false) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(
-                    error,
-                    RebuildStatsError::InvalidStateEvent {
-                        state: RebuildStatsState::Error,
-                        ..
-                    } | RebuildStatsError::StorageError(_)
-                ),
-                "{error:?}"
+        for event in sample_events() {
+            if matches!(event, Event::Storage(StorageEvent::BatchWriteResult { .. })) {
+                continue;
+            }
+            let label = event.label();
+            let refused = finishing().next(IoResult::Event(Box::new(event)));
+            let finish = matches!(
+                refused,
+                Err(RebuildStatsError::InvalidStateEvent {
+                    state: RebuildStatsState::Finish,
+                    ..
+                })
             );
+            assert!(finish, "{label}: {refused:?}");
         }
     }
 }
