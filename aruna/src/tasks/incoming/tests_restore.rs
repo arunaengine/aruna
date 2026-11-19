@@ -4,6 +4,7 @@
 
 use super::harness::*;
 use super::*;
+use aruna_drivers::testing::freeze_clock;
 
 #[tokio::test]
 async fn restore_document_records() {

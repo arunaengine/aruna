@@ -182,11 +182,12 @@ impl OperationsInboundHandler {
 )]
 async fn serve_metadata_stream(
     context: &Arc<DriverContext>,
-    (budget, audit_slots): (&Arc<Semaphore>, &Arc<Semaphore>),
+    limits: (&Arc<Semaphore>, &Arc<Semaphore>),
     mut stream: BiStream,
     peer: NodeId,
     metadata_bytes: u64,
 ) -> Result<(), MetadataError> {
+    let (budget, audit_slots) = limits;
     let total_started = Instant::now();
     let read_started = Instant::now();
     let request = inbound_frames::read_request(&mut stream, budget).await?;

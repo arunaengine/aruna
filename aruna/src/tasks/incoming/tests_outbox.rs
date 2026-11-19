@@ -4,6 +4,7 @@
 
 use super::harness::*;
 use super::*;
+use aruna_drivers::testing::freeze_clock;
 
 #[test]
 fn admin_block_spans() {
