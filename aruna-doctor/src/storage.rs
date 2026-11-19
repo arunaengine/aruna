@@ -203,7 +203,6 @@ mod tests {
         snapshot_database,
     };
     use crate::tests::fixtures::env_lock;
-    use aruna_core::testing::EnvGuard;
     use aruna::config::load;
     use aruna_api::server::state::ServerState;
     use aruna_blob::blob::BlobHandler;
@@ -215,6 +214,7 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::testing::EnvGuard;
     use aruna_drivers::driver::{DriverContext, drive, node_routing};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};

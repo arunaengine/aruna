@@ -522,7 +522,6 @@ mod tests {
         load_oidc_providers, password_grant_body, request_oidc_token,
     };
     use crate::tests::fixtures::env_lock;
-    use aruna_core::testing::EnvGuard;
     use aruna::bootstrap::ensure_onboarding_secret;
     use aruna::inbound::initialize_net_holder;
     use aruna::tasks::incoming::start_task_queues;
@@ -540,6 +539,7 @@ mod tests {
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, TokenClaims};
     use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
     use aruna_core::structs::identity::user::User;
+    use aruna_core::testing::EnvGuard;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::realm::announce_presence::{
