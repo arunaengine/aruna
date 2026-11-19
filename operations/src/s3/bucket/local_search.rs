@@ -285,8 +285,10 @@ mod tests {
 
     #[test]
     fn foreign_position_retires() {
+        let mut forged = seal_position(b"bucket").unwrap();
+        *forged.last_mut().unwrap() ^= 1;
         let mut search = LocalBucketSearch::new(SearchBucketsInput {
-            start_after: Some(Key::from(vec![1, 2, 3])),
+            start_after: Some(Key::from(forged)),
             ..input()
         });
         let Ok(Next::Done(page)) = search.first() else {
