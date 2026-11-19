@@ -21,6 +21,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ABE_PENDING_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, PURGE_FENCE_KEYSPACE,
     S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
@@ -43,7 +44,7 @@ use aruna_core::structs::storage::multipart::{
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -141,6 +142,8 @@ pub struct CreateMultipartResult {
 
 #[derive(Debug, PartialEq)]
 pub struct CreateMultipartOperation {
+    now_ms: u64,
+    ids: IdMint,
     input: CreateMultipartInput,
     /// Chosen before the provider upload opens, so its cleanup row can name the record.
     upload_id: Ulid,
@@ -180,7 +183,9 @@ impl CreateMultipartOperation {
     pub fn new(input: CreateMultipartInput) -> Self {
         Self {
             input,
-            upload_id: Ulid::generate(),
+            upload_id: Ulid::nil(),
+            now_ms: 0,
+            ids: IdMint::default(),
             state: CreateMultipartState::ReadGateBucket,
             resolved: None,
             record: None,
@@ -273,7 +278,8 @@ impl CreateMultipartOperation {
         }
         let resolved = self.resolved()?;
         // Under an import rule the provider upload ends at the plain path its version id names.
-        let (bucket, key, id) = (&self.input.bucket, &self.input.key, Ulid::generate());
+        let id = self.ids.mint(self.now_ms);
+        let (bucket, key) = (&self.input.bucket, &self.input.key);
         // A folder object holds no bytes, so no upload can compose one.
         if key.ends_with('/') && self.input.routing.mapped(bucket) {
             return Err(CreateMultipartError::Unmapped);
@@ -378,7 +384,7 @@ impl CreateMultipartOperation {
         let envelope = AbeEffect::Envelope(EnvelopePlan {
             parameters,
             epoch,
-            write_id: Ulid::generate(),
+            write_id: self.ids.mint(self.now_ms),
             object_key: self.input.key.clone(),
             bucket_public: plan.public_key,
         });
@@ -568,7 +574,7 @@ impl CreateMultipartOperation {
             key: self.input.key.clone(),
             group_id: self.input.group_id,
             created_by: self.input.created_by,
-            created_at: SystemTime::now(),
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
             status: MultipartUploadStatus::Open,
             checksum_hint: self.input.checksum_hint.clone(),
             metadata: self.metadata.clone(),
@@ -666,6 +672,7 @@ impl Operation for CreateMultipartOperation {
     type Error = CreateMultipartError;
 
     fn first(&mut self) -> Turn {
+        self.upload_id = self.ids.mint(self.now_ms);
         // Routing is fallible, so it resolves before a transaction exists to abort.
         let routing = &self.input.routing;
         self.resolved = Some(resolve_backend(
@@ -745,6 +752,14 @@ impl Operation for CreateMultipartOperation {
             IoCall::from(Effect::Blob(abort))
         });
         calls.into_iter().collect()
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

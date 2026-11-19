@@ -344,12 +344,22 @@ async fn materialized_archive_changed() {
         );
         seed(&context.storage_handle, source_id, &source).await;
         let operation = SealedCopyOperation::new(input(&captured, source_id));
-        let version = operation.version_id;
         assert_eq!(
             drive(operation, &context).await,
             Err(SealedCopyError::SourceChanged)
         );
-        assert!(!owns(&context.storage_handle, &ArchiveKey::of(&captured), version).await);
+        // No owner row of the archive, the copy's included, was written.
+        let prefix = CopyOwner::prefix(&ArchiveKey::of(&captured)).into();
+        let storage = &context.storage_handle;
+        let page = aruna_storage::scan::iter_prefix_page(
+            storage,
+            COPY_OWNER_KEYSPACE,
+            Some(prefix),
+            None,
+            1,
+            None,
+        );
+        assert!(page.await.unwrap().0.is_empty());
         let head = BlobHeadKey::new("bucket", "copy").to_bytes().unwrap();
         assert!(
             get(&context.storage_handle, BLOB_HEAD_KEYSPACE, head)
@@ -498,8 +508,10 @@ fn copy_carries_hint() {
     use aruna_core::structs::storage::format::Compression;
 
     let mut operation = SealedCopyOperation::new(input(&sealed_location(), Ulid::generate()));
-    let minted = operation.version_id;
+    operation.stamp(5_000);
+    operation.seed(7);
     operation.first().unwrap();
+    let minted = aruna_core::id_mint::IdMint::new(7).mint(5_000);
     let info = BucketInfo {
         group_id: Ulid::from_bytes([2; 16]),
         created_at: SystemTime::UNIX_EPOCH,
