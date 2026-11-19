@@ -28,6 +28,7 @@ test-hooks = [
     "dep:aruna-tasks",
     "aruna-drivers/test-hooks",
     "aruna-net/test-hooks",
+    "aruna-storage/test-hooks",
 ]
 
 [dependencies]
