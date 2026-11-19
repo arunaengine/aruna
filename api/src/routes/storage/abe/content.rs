@@ -8,7 +8,7 @@ use crate::download::{self, AdmissionError};
 use crate::object_key::ObjectKey;
 use crate::rate_limit::LocalKey;
 use crate::routes::execution::jobs::range_request;
-use crate::routes::storage::relay::relay_stream;
+use crate::routes::storage::relay::{RestRead, holder_stream, missed_stream};
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::read::ReadObjectOperation;
 use axum::response::Response;
@@ -83,8 +83,15 @@ pub async fn content(
         sent.insert("x-aruna-object-key", value);
     }
     let path = version_path("/data/blobs/content", &query);
-    if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {
-        return relay_stream(&state, &holders, &path, bearer.as_ref(), sent).await;
+    let relayed = RestRead {
+        info: &info,
+        key: &query.key,
+        headers: &headers,
+        path: &path,
+        bearer: bearer.as_ref(),
+    };
+    if let Some(answer) = holder_stream(&state, &relayed, &sent).await? {
+        return Ok(answer);
     }
     let keyed = private.is_some();
     let range = range_request(&headers).map_err(|_| ServerError::BadRequest)?;
@@ -130,9 +137,9 @@ pub async fn content(
         result => result.map_err(read_error),
     };
     if matches!(result, Err(ServerError::NotFound))
-        && let Some(coordinator) = copy_miss(&state, &info, &query.key, &headers).await?
+        && let Some(answer) = missed_stream(&state, &relayed, &sent).await?
     {
-        return relay_stream(&state, &coordinator, &path, bearer.as_ref(), sent).await;
+        return Ok(answer);
     }
     let result = result?;
     let mut response = Response::new(download::body(result.blob, permit));
