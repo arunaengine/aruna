@@ -34,7 +34,7 @@ use super::entry::{EntryError, ReadEntry};
 use super::grants::InstallScope;
 use super::install::{pick_version, read_manifest};
 use super::rows::{Row, StoreError, read_call, values, write_rows};
-use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::secrets::node::{record_key, value_entry};
 use crate::secrets::owner::sealed_value;
@@ -307,6 +307,7 @@ enum ReleasePhase {
     Selecting,
     ReadingAccount(Box<Admitted>),
     ReadingPolicies(Box<Admitted>),
+    CompilingPolicies(Box<Admitted>),
     Auditing(Box<Admitted>),
     Opening(Box<Admitted>),
     Refusing(Refusal),
@@ -489,8 +490,18 @@ impl ReleaseSecret {
         result: IoResult,
     ) -> Result<Next<Released>, ReleaseFailure> {
         let group = Some(self.install()?.group_id);
-        let policies = read_policies(self.config.realm_id, group, result.values()?);
-        let policies = policies.map_err(|error| unavailable(error.to_string()))?;
+        let sets = read_policies(self.config.realm_id, group, result.values()?);
+        let sets = sets.map_err(|error| unavailable(error.to_string()))?;
+        self.phase = ReleasePhase::CompilingPolicies(admitted);
+        Ok(Next::Call(sets.compile()))
+    }
+
+    fn policies_compiled(
+        &mut self,
+        admitted: Box<Admitted>,
+        result: IoResult,
+    ) -> Result<Next<Released>, ReleaseFailure> {
+        let policies = compiled_policies(result).map_err(|error| unavailable(error.to_string()))?;
         let request = self.policy_request(&admitted)?;
         if policies.evaluate(&request).is_err() {
             return self.refuse(Refusal::Policy, Some(&admitted.selected));
@@ -542,6 +553,7 @@ impl Operation for ReleaseSecret {
             }
             ReleasePhase::ReadingAccount(admitted) => self.account_read(admitted, result),
             ReleasePhase::ReadingPolicies(admitted) => self.policies_read(admitted, result),
+            ReleasePhase::CompilingPolicies(admitted) => self.policies_compiled(admitted, result),
             ReleasePhase::Auditing(admitted) => {
                 let written = result.child::<(), StoreError>()?;
                 written.map_err(|error| unavailable(error.to_string()))?;

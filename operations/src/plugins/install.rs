@@ -41,7 +41,7 @@ use super::receiver::pick_receiver;
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
 use super::rules::{EnsureRules, RetireRules, RulesFailure};
 use super::settings::{SettingError, check_settings};
-use crate::auth::enforcement::{group_from_path, policy_reads, read_policies};
+use crate::auth::enforcement::{compiled_policies, group_from_path, policy_reads, read_policies};
 use crate::auth::permission_rules::{PermissionRules, read_rules, rule_reads};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -679,6 +679,7 @@ enum HolderPhase {
     Rules,
     Group,
     Policy,
+    Compile,
 }
 
 /// The pattern under check, with the access the pending policy read decides.
@@ -781,13 +782,25 @@ impl CheckHolder {
         }
     }
 
+    /// Compiles the request policy sets of the pending pattern.
+    fn compile_policies(&mut self, result: IoResult) -> Result<Next<()>, InstallError> {
+        let held = self.current.as_ref().ok_or(IoError::Unfinished)?;
+        let access = held.asked.as_ref().ok_or(IoError::Unfinished)?;
+        let group = group_from_path(&held.pattern);
+        let sets =
+            (read_policies(self.scope.realm_id, group, result.values()?)).map_err(|error| {
+                InstallError::NotHeld(format!("{} ({error})", what_held(held, access)))
+            })?;
+        self.phase = HolderPhase::Compile;
+        Ok(Next::Call(sets.compile()))
+    }
+
     fn policy_answer(&mut self, result: IoResult) -> Result<(), InstallError> {
         let held = self.current.as_mut().ok_or(IoError::Unfinished)?;
         let access = held.asked.take().ok_or(IoError::Unfinished)?;
         let extras = PolicyRequestExtras::operation(format!("plugin.{}", held.permission));
         let request = policy_request_with(&held.pattern, &access, Some(&self.auth), extras);
-        let group = group_from_path(&held.pattern);
-        (read_policies(self.scope.realm_id, group, result.values()?))
+        (compiled_policies(result))
             .and_then(|policies| policies.evaluate(&request))
             .map_err(|error| {
                 InstallError::NotHeld(format!("{} ({error})", what_held(held, &access)))
@@ -827,7 +840,8 @@ impl Operation for CheckHolder {
                 self.path_policies |= policies.any(|policy| policy.reads_path());
                 self.advance()
             }
-            HolderPhase::Policy => {
+            HolderPhase::Policy => self.compile_policies(result),
+            HolderPhase::Compile => {
                 self.policy_answer(result)?;
                 self.advance()
             }
