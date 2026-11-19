@@ -46,6 +46,7 @@ pub mod serve_inputs;
 pub mod stage;
 mod submission_rules;
 pub mod submit_external;
+pub mod task_job;
 pub mod updates;
 pub mod witness;
 pub mod witness_arm;
