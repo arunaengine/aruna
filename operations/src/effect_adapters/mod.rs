@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod audit;
 mod blob;
 mod compute;
 mod git;
@@ -106,25 +105,10 @@ async fn dispatch_unboxed(
             blob::dispatch_local_file(local_file_effect, context).await
         }
         Effect::Storage(storage_effect) => storage::dispatch_storage(storage_effect, context).await,
-        // Audit fan-out runs its frame I/O here for the same reason.
-        Effect::Net(NetEffect::AuditPage(audit)) => {
-            Box::pin(audit::dispatch_audit_page(*audit, context, deadline)).await
-        }
         Effect::Net(NetEffect::Heartbeat(effect)) => {
             Box::pin(net::dispatch_heartbeat(*effect, context)).await
         }
-        // A plugin artifact chunk travels over the metadata transport, which the runner holds.
-        Effect::Net(NetEffect::ArtifactStore(store)) => {
-            let stored = match context.metadata_handle.as_ref() {
-                Some(handle) => (handle
-                    .request_store_artifact(store.node_id, store.chunk)
-                    .await)
-                    .map_err(|error| format!("{error:?}")),
-                None => Err("no metadata transport on this node".to_string()),
-            };
-            Event::Net(NetEvent::ArtifactStored(stored))
-        }
-        // The metadata transport lives in the metadata handle the runner holds.
+        // Metadata requests travel as plain frames over the net handle.
         Effect::Net(NetEffect::MetadataRequest(request)) => {
             Box::pin(metadata::dispatch_request(*request, context)).await
         }
