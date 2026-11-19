@@ -412,7 +412,7 @@ fn audit_needs_caller() {
 }
 
 #[test]
-fn held_read_needs_holder() {
+fn held_needs_holder() {
     // A record read for a document this node does not hold answers unavailable.
     use super::held::{HeldAsk, HeldReadOperation};
     let document_id = ulid::Ulid::from_bytes([5u8; 16]);
