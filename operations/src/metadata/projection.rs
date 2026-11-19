@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -14,7 +13,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     COMMIT_MESSAGE_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE,
-    GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
+    GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE, NODE_STATE_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataEffect, MetadataError,
@@ -62,19 +62,37 @@ pub const PROJECTION_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Conflict resolution is last-writer-wins on wall-clock time, so an event stamped far ahead
 /// would win forever. Events beyond the configured skew are deferred until retry; operators must
 /// run NTP.
-const MAX_SKEW_SECS: u64 = 300;
+pub const DEFAULT_SKEW_MS: u64 = 300_000;
 
-/// The largest clock skew a projection accepts, from `MAX_CLOCK_SKEW_SECS`; read by the shells
-/// that start a projection.
-pub fn max_clock_skew() -> u64 {
-    static SKEW_MS: OnceLock<u64> = OnceLock::new();
-    *SKEW_MS.get_or_init(|| {
-        std::env::var("MAX_CLOCK_SKEW_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(MAX_SKEW_SECS)
-            .saturating_mul(1000)
-    })
+/// The row of `NODE_STATE_KEYSPACE` that holds the largest clock skew a projection accepts.
+const CLOCK_SKEW_KEY: &[u8] = b"max_clock_skew";
+
+/// Stores the largest clock skew a projection accepts; startup writes it each time the node
+/// starts.
+pub fn store_clock_skew(skew_ms: u64) -> StoreSkewOperation {
+    StoreSkewOperation(skew_ms)
+}
+
+#[derive(Debug, PartialEq)]
+pub struct StoreSkewOperation(u64);
+
+impl Operation for StoreSkewOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let row = (
+            NODE_STATE_KEYSPACE.to_string(),
+            CLOCK_SKEW_KEY.to_vec().into(),
+            self.0.to_be_bytes().to_vec().into(),
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        done(result)?;
+        Ok(Next::Done(()))
+    }
 }
 
 fn exceeds_clock_skew(event: &MetadataEventRecord, now_ms: u64, max_skew_ms: u64) -> bool {
@@ -272,7 +290,8 @@ enum Tail {
 pub struct ProjectEventsOperation {
     events: VecDeque<MetadataEventRecord>,
     local_node: Option<NodeId>,
-    max_skew_ms: u64,
+    /// The node's skew setting, read in the first step so one run uses one value.
+    max_skew_ms: Option<u64>,
     now_ms: u64,
     started: bool,
     cache_generation: Option<u64>,
@@ -309,16 +328,12 @@ enum Flow {
 }
 
 impl ProjectEventsOperation {
-    /// `max_skew_ms` comes from [`max_clock_skew`]; `local_node` is this node on the network.
-    pub fn new(
-        events: Vec<MetadataEventRecord>,
-        local_node: Option<NodeId>,
-        max_skew_ms: u64,
-    ) -> Self {
+    /// `local_node` is this node on the network.
+    pub fn new(events: Vec<MetadataEventRecord>, local_node: Option<NodeId>) -> Self {
         Self {
             events: events.into(),
             local_node,
-            max_skew_ms,
+            max_skew_ms: None,
             now_ms: 0,
             started: false,
             cache_generation: None,
@@ -385,7 +400,8 @@ impl ProjectEventsOperation {
     /// Starts one event, or defers it when it is stamped too far in the future.
     fn begin(&mut self, event: MetadataEventRecord) -> Option<Current> {
         let document_id = event.record.document_id;
-        if exceeds_clock_skew(&event, self.now_ms, self.max_skew_ms) {
+        let max_skew_ms = self.max_skew_ms.unwrap_or(DEFAULT_SKEW_MS);
+        if exceeds_clock_skew(&event, self.now_ms, max_skew_ms) {
             warn!(
                 event = "metadata.event.rejected",
                 reason = "clock_skew",
@@ -1024,10 +1040,19 @@ impl Operation for ProjectEventsOperation {
         if self.events.is_empty() {
             return Ok(Next::Done(0));
         }
-        Ok(Next::Call(metadata_call(MetadataEffect::CacheGeneration)))
+        Ok(Next::Call(read_row(
+            NODE_STATE_KEYSPACE,
+            CLOCK_SKEW_KEY.to_vec(),
+        )))
     }
 
     fn next(&mut self, result: IoResult) -> ProjectTurn {
+        if self.max_skew_ms.is_none() {
+            // A node that never stored the setting keeps the default.
+            let stored = value(result)?.and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
+            self.max_skew_ms = Some(stored.map_or(DEFAULT_SKEW_MS, u64::from_be_bytes));
+            return Ok(Next::Call(metadata_call(MetadataEffect::CacheGeneration)));
+        }
         if !self.generation_read {
             // The answer to the cache generation read; a node without the cache has none.
             if let Ok(Event::Metadata(MetadataEvent::CacheGeneration { generation })) =
@@ -1113,7 +1138,6 @@ pub struct ProjectLoggedOperation {
     targets: Vec<(Ulid, Ulid)>,
     delete_orphans: bool,
     local_node: Option<NodeId>,
-    max_skew_ms: u64,
     stage: LoggedStage,
     existing: usize,
     /// The projection that runs once the orphan markers are gone.
@@ -1141,7 +1165,6 @@ impl ProjectLoggedOperation {
         targets: impl IntoIterator<Item = (Ulid, Ulid)>,
         delete_orphans: bool,
         local_node: Option<NodeId>,
-        max_skew_ms: u64,
     ) -> Self {
         let mut seen = BTreeSet::new();
         let targets = targets
@@ -1152,7 +1175,6 @@ impl ProjectLoggedOperation {
             targets,
             delete_orphans,
             local_node,
-            max_skew_ms,
             stage: LoggedStage::Events,
             existing: 0,
             project: None,
@@ -1185,7 +1207,7 @@ impl ProjectLoggedOperation {
             events.push(event);
         }
         self.existing = events.len();
-        let project = ProjectEventsOperation::new(events, self.local_node, self.max_skew_ms);
+        let project = ProjectEventsOperation::new(events, self.local_node);
         if orphans.is_empty() {
             self.stage = LoggedStage::Project;
             return Ok(Next::Call(IoCall::child(project)));
@@ -1245,7 +1267,6 @@ impl Operation for ProjectLoggedOperation {
 #[derive(Debug, PartialEq)]
 pub struct DrainProjectionOperation {
     local_node: Option<NodeId>,
-    max_skew_ms: u64,
     stage: DrainStage,
     has_more: bool,
 }
@@ -1268,10 +1289,9 @@ pub struct PendingProjectionResult {
 type DrainTurn = Result<Next<PendingProjectionResult>, MetadataProjectionError>;
 
 impl DrainProjectionOperation {
-    pub fn new(local_node: Option<NodeId>, max_skew_ms: u64) -> Self {
+    pub fn new(local_node: Option<NodeId>) -> Self {
         Self {
             local_node,
-            max_skew_ms,
             stage: DrainStage::Page,
             has_more: false,
         }
@@ -1279,7 +1299,7 @@ impl DrainProjectionOperation {
 
     fn project(&mut self, targets: Vec<(Ulid, Ulid)>) -> DrainTurn {
         self.stage = DrainStage::Project;
-        let logged = ProjectLoggedOperation::new(targets, true, self.local_node, self.max_skew_ms);
+        let logged = ProjectLoggedOperation::new(targets, true, self.local_node);
         Ok(Next::Call(IoCall::child(logged)))
     }
 }
@@ -1341,17 +1361,15 @@ impl Operation for DrainProjectionOperation {
 pub struct ReplayPageOperation {
     after: Option<Key>,
     local_node: Option<NodeId>,
-    max_skew_ms: u64,
     next: Option<Key>,
     projecting: bool,
 }
 
 impl ReplayPageOperation {
-    pub fn new(after: Option<Key>, local_node: Option<NodeId>, max_skew_ms: u64) -> Self {
+    pub fn new(after: Option<Key>, local_node: Option<NodeId>) -> Self {
         Self {
             after,
             local_node,
-            max_skew_ms,
             next: None,
             projecting: false,
         }
@@ -1382,7 +1400,7 @@ impl Operation for ReplayPageOperation {
             .map(|(_, value)| decode::<MetadataEventRecord>(value))
             .collect::<Result<Vec<_>, _>>()?;
         self.projecting = true;
-        let project = ProjectEventsOperation::new(events, self.local_node, self.max_skew_ms);
+        let project = ProjectEventsOperation::new(events, self.local_node);
         Ok(Next::Call(IoCall::child(project)))
     }
 }

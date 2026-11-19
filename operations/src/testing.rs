@@ -162,12 +162,12 @@ pub fn sign_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
 pub async fn replay_event_log(
     context: &DriverContext,
 ) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
-    use crate::metadata::projection::{ReplayPageOperation, max_clock_skew};
+    use crate::metadata::projection::ReplayPageOperation;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let mut after = None;
     let mut projected = 0usize;
     loop {
-        let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
+        let page = ReplayPageOperation::new(after, local_node);
         let (count, next) = aruna_drivers::driver::drive(page, context).await?;
         projected = projected.saturating_add(count);
         match next {
@@ -184,9 +184,9 @@ pub async fn drain_projection_queue(
     crate::metadata::projection::PendingProjectionResult,
     crate::metadata::projection::MetadataProjectionError,
 > {
-    use crate::metadata::projection::{DrainProjectionOperation, max_clock_skew};
+    use crate::metadata::projection::DrainProjectionOperation;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let drain = DrainProjectionOperation::new(local_node, max_clock_skew());
+    let drain = DrainProjectionOperation::new(local_node);
     aruna_drivers::driver::drive(drain, context).await
 }
 
@@ -196,8 +196,8 @@ pub async fn project_create_events(
     events: Vec<aruna_core::metadata::MetadataEventRecord>,
     local_node_id: Option<aruna_core::NodeId>,
 ) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
-    use crate::metadata::projection::{ProjectEventsOperation, max_clock_skew};
-    let project = ProjectEventsOperation::new(events, local_node_id, max_clock_skew());
+    use crate::metadata::projection::ProjectEventsOperation;
+    let project = ProjectEventsOperation::new(events, local_node_id);
     aruna_drivers::driver::drive(project, context).await
 }
 
@@ -206,9 +206,9 @@ pub async fn project_logged_events(
     context: &DriverContext,
     targets: impl IntoIterator<Item = (ulid::Ulid, ulid::Ulid)>,
 ) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
-    use crate::metadata::projection::{ProjectLoggedOperation, max_clock_skew};
+    use crate::metadata::projection::ProjectLoggedOperation;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let project = ProjectLoggedOperation::new(targets, false, local_node, max_clock_skew());
+    let project = ProjectLoggedOperation::new(targets, false, local_node);
     Ok(aruna_drivers::driver::drive(project, context)
         .await?
         .projected)

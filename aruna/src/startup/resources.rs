@@ -18,6 +18,7 @@ use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_graph::{GraphHandle, GraphOptions};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::distribution::sharding::begin_range_rebuilds;
+use aruna_operations::metadata::projection::{DEFAULT_SKEW_MS, store_clock_skew};
 use aruna_operations::metadata::provenance::ForgetSpoolOperation;
 use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::usage_publish::PublishUsageOperation;
@@ -495,6 +496,10 @@ async fn fill(
     // The driver context and the monitoring refresher it feeds are owned before
     // the ops listener can fail to bind.
     acquired.driver_ctx = Some(driver_ctx.clone());
+    // Projections read the skew setting from storage; it is stored before any of them runs.
+    if let Err(error) = drive(store_clock_skew(clock_skew_env()), &driver_ctx).await {
+        warn!(%error, "The clock skew setting could not be stored");
+    }
 
     // Start ops before realm bootstrap so readiness reports startup failure.
     let ops_state = MonitoringState::with_recovery(
@@ -568,6 +573,13 @@ async fn fill(
     checkpoint(StartupStage::TaskQueues)?;
 
     Ok(())
+}
+
+/// The largest clock skew a projection accepts, from `MAX_CLOCK_SKEW_SECS` in seconds.
+fn clock_skew_env() -> u64 {
+    let seconds = std::env::var("MAX_CLOCK_SKEW_SECS").ok();
+    let seconds = seconds.and_then(|value| value.parse::<u64>().ok());
+    seconds.map_or(DEFAULT_SKEW_MS, |seconds| seconds.saturating_mul(1000))
 }
 
 /// Opens the node-managed bucket keys, then resumes the work that waited for them. A key that

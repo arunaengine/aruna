@@ -92,7 +92,7 @@ use aruna_operations::metadata::materialization_queue::{
 };
 use aruna_operations::metadata::projection::{
     DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
-    ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation, max_clock_skew,
+    ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation,
 };
 
 /// Replays the whole event log into the registry projection, one page at a time.
@@ -103,7 +103,7 @@ async fn replay_event_log(
     let mut after = None;
     let mut projected = 0usize;
     loop {
-        let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
+        let page = ReplayPageOperation::new(after, local_node);
         let (count, next) = aruna_drivers::driver::drive(page, context).await?;
         projected = projected.saturating_add(count);
         match next {
