@@ -17,6 +17,7 @@ use aruna_core::structs::execution::email::EmailPreference;
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::user::id::UserId;
+use tracing::warn;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::notifications::opt_in::EmailError;
@@ -64,9 +65,9 @@ enum RefreshState {
     Prune,
 }
 
-/// Drops the cached mail sender and realm secrets the realm config no longer names. A config read
-/// or prune that failed keeps the cache and ends in an error, so a caller that retries runs it
-/// again; a realm without a config has nothing to refresh.
+/// Drops the cached mail sender and realm secrets the realm config no longer names. A failed config
+/// read keeps the cache and ends in an error, so a caller that retries runs it again; a failed
+/// prune only warns, and a realm without a config has nothing to refresh.
 #[derive(Debug, PartialEq)]
 pub struct RefreshMailOperation {
     realm_id: Option<RealmId>,
@@ -130,13 +131,12 @@ impl Operation for RefreshMailOperation {
                 }
                 other => Err(unexpected_event("OutboundEvent::MailRefreshed", &other)),
             },
-            RefreshState::Prune => match result.child::<usize, RealmSecretError>()? {
-                Ok(_) => Ok(Next::Done(())),
-                Err(error) => {
-                    let error = StorageError::WriteError(error.to_string());
-                    Err(IoError::Storage(error))
+            RefreshState::Prune => {
+                if let Err(error) = result.child::<usize, RealmSecretError>()? {
+                    warn!(error = %error, "Pruning cached realm secrets failed");
                 }
-            },
+                Ok(Next::Done(()))
+            }
         }
     }
 }
