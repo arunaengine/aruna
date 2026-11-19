@@ -580,7 +580,6 @@ mod tests {
         StorageEvent, Value, audit_scope, decode_cursor, encode_cursor, encode_message,
         select_peers,
     };
-    use aruna_drivers::driver::DriverContext;
     use crate::metadata::audit_entry::{admin_refusal, audit_member};
     use crate::metadata::protocol::MetadataReadError;
     use crate::metadata::repository::{audit_entry, metadata_audit_key};
@@ -601,6 +600,7 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
     };
+    use aruna_drivers::driver::DriverContext;
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use std::collections::BTreeSet;

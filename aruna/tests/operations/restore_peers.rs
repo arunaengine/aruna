@@ -9,7 +9,6 @@ use aruna_operations::shard::recovery::RecoveryError;
 use aruna_operations::shard::recovery::RecoveryStop;
 use aruna_operations::shard::restore_plan::ShardRestoreCursor;
 use aruna_operations::tests::shard::flat_config;
-use irokle::TopicId;
 use std::sync::Arc;
 use std::time::Duration;
 
