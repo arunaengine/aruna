@@ -21,9 +21,9 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::data::identity::DataIdentity;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_plugins::broker::{Document, ErrorKind, FilePage, HostError, Listing};
-use aruna_plugins::connection::Method;
-use aruna_plugins::permission::Permission;
+use aruna_plugin_types::calls::{Document, ErrorKind, FilePage, HostError, Listing};
+use aruna_plugin_types::connection::Method;
+use aruna_plugin_types::permission::Permission;
 use craqle::GraphId;
 use oxrdf::Term;
 use serde_json::Value;
@@ -1194,7 +1194,9 @@ impl PrepareConnection {
     }
 }
 
-fn current_manifest(call: &ConfiguredCall) -> Result<aruna_plugins::manifest::Manifest, CallError> {
+fn current_manifest(
+    call: &ConfiguredCall,
+) -> Result<aruna_plugin_types::manifest::Manifest, CallError> {
     let install = &call.install;
     let plugin = pick_version(&call.config, &install.plugin, Some(&install.digest));
     let manifest = plugin.and_then(|plugin| read_manifest(&plugin));

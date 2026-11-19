@@ -1203,7 +1203,7 @@ impl Operation for InstalledDisplaysOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
+    use aruna_drivers::driver::{DriverContext, drive};
     use std::sync::Arc;
 
     async fn note_membership(

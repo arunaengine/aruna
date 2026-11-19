@@ -32,6 +32,7 @@ aruna-operations = { workspace = true }
 aruna-drivers = { workspace = true }
 aruna-storage = { workspace = true }
 aruna-outbound = { workspace = true }
+aruna-plugin-types = { workspace = true }
 aruna-plugins = { workspace = true, features = ["runtime"] }
 aruna-tasks = { workspace = true }
 irokle = { workspace = true }

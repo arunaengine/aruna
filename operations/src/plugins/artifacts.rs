@@ -11,7 +11,7 @@ use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugins::{ArtifactBytes, Chunk, PublishedPlugin};
 use aruna_core::realm_vault::FetchScope;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
+use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
 use thiserror::Error;
 use tracing::{debug, warn};
 

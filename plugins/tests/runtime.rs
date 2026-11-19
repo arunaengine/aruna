@@ -8,15 +8,18 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aruna_plugins::artifact::read_manifest;
+use aruna_plugin_types::artifact::read_manifest;
+use aruna_plugin_types::calls::{
+    Created, Document, Entry, ErrorKind, FilePage, HostError, Intent, JobStatus, Listing,
+    ObjectInfo, ObjectPage, Response,
+};
+use aruna_plugin_types::manifest::Manifest;
+use aruna_plugin_types::permission::Permission;
 use aruna_plugins::broker::{
-    Broker, CallContext, Created, Document, Entry, ErrorKind, FileChange, FilePage, HostError,
-    Intent, JobCopy, JobDownload, JobStatus, JobUpload, Listing, MetadataCreate, MetadataPatch,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
+    Broker, CallContext, FileChange, JobCopy, JobDownload, JobUpload, MetadataCreate,
+    MetadataPatch, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
-use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::Permission;
 use aruna_plugins::{
     CancellationToken, FailureKind, Invocation, InvokeError, Limit, Runtime, Trigger, WatchEvent,
 };
@@ -638,7 +641,7 @@ async fn narrow_requests_compile() {
         .permissions
         .optional
         .remove(&Permission::MetadataWrite);
-    let artifact = aruna_plugins::artifact::attach_manifest(component, &narrow).unwrap();
+    let artifact = aruna_plugin_types::artifact::attach_manifest(component, &narrow).unwrap();
     assert!(runtime().compile(&artifact).is_ok());
     let runtime = runtime();
     let compiled = runtime.compile(FIXTURE).unwrap();

@@ -84,9 +84,9 @@ use aruna_core::types::GroupId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::context::JobContext;
-use aruna_plugins::artifact::ArtifactDigest;
-use aruna_plugins::artifact::attach_manifest;
-use aruna_plugins::artifact::read_manifest;
+use aruna_plugin_types::artifact::ArtifactDigest;
+use aruna_plugin_types::artifact::attach_manifest;
+use aruna_plugin_types::artifact::read_manifest;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -618,7 +618,7 @@ pub fn echoed_sync() -> Vec<u8> {
 /// The runnable fixture with only its manual and `job_finished` triggers, so no timer or event
 /// of the test's own writes starts a run.
 pub fn job_guest() -> Vec<u8> {
-    use aruna_plugins::trigger::TriggerKind;
+    use aruna_plugin_types::trigger::TriggerKind;
     let (component, mut manifest) = bare();
     (manifest.connections, manifest.secrets) = (BTreeMap::new(), BTreeMap::new());
     let kept = [TriggerKind::Manual, TriggerKind::JobFinished];
@@ -627,7 +627,7 @@ pub fn job_guest() -> Vec<u8> {
 }
 
 /// The fixture's component without its manifest section, and that manifest.
-pub fn bare() -> (&'static [u8], aruna_plugins::manifest::Manifest) {
+pub fn bare() -> (&'static [u8], aruna_plugin_types::manifest::Manifest) {
     let manifest = read_manifest(FIXTURE).unwrap();
     let json = serde_json::to_vec(&manifest).unwrap();
     let mut content = Vec::new();

@@ -17,8 +17,8 @@ use aruna_core::plugins::{ReleaseRequest, Released};
 use aruna_core::secrets::Delivery;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_plugins::manifest::{Manifest, SecretKind};
-use aruna_plugins::trigger::TriggerKind;
+use aruna_plugin_types::manifest::{Manifest, SecretKind};
+use aruna_plugin_types::trigger::TriggerKind;
 use ulid::Ulid;
 
 use super::bound::{CheckNodeBinding, NodeCheckFailure, delivery_clash, vault_kind};

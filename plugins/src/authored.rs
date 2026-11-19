@@ -7,12 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::connection::{Connection, Method};
-use crate::manifest::{
+use aruna_plugin_types::connection::{Connection, Method};
+use aruna_plugin_types::manifest::{
     Manifest, ManifestError, Requests, SecretKind, SecretSlot, Setting, SettingKind,
 };
-use crate::permission::Permission;
-use crate::trigger::{Trigger, TriggerKind};
+use aruna_plugin_types::permission::Permission;
+use aruna_plugin_types::trigger::{Trigger, TriggerKind};
 
 /// The secret slot of the webhook's verifying secret.
 const WEBHOOK_SLOT: &str = "webhook";

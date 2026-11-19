@@ -20,7 +20,7 @@ use aruna_core::plugins::{ArtifactBytes, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
-use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
+use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::{TempDir, tempdir};
 

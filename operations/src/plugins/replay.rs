@@ -17,7 +17,7 @@ use aruna_core::plugin_runs::{
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
-use aruna_plugins::trigger::TriggerKind;
+use aruna_plugin_types::trigger::TriggerKind;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

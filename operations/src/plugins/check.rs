@@ -13,8 +13,8 @@ use aruna_core::plugin_runs::PluginRun;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
-use aruna_plugins::broker::{ErrorKind, HostError};
-use aruna_plugins::permission::Permission;
+use aruna_plugin_types::calls::{ErrorKind, HostError};
+use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
 
 use super::account::{read_user_call, read_user_result};

@@ -201,7 +201,7 @@ async fn drop_delivers_none() {
 async fn retry_redoes_undone() {
     // A call a person resolved as not done is made again by the retry; a settled one answers its
     // reply again.
-    use aruna_plugins::broker::Intent;
+    use aruna_plugin_types::calls::Intent;
 
     use crate::plugins::intents::{
         Begun, begin, intent_scan, resolved_rows, settled_row, unknown_row,

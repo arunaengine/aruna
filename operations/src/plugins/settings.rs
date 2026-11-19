@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::plugin_installs::MAX_SETTINGS;
-use aruna_plugins::manifest::{Manifest, Setting, SettingKind, https_origin};
+use aruna_plugin_types::manifest::{Manifest, Setting, SettingKind, https_origin};
 use serde_json::{Map, Value};
 use thiserror::Error;
 

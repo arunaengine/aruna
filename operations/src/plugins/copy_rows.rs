@@ -11,7 +11,7 @@ use aruna_core::keyspaces::PLUGIN_ARTIFACT_KEYSPACE;
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugins::{ArtifactBytes, Chunk, MAX_ARTIFACT};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
+use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
 
 use super::artifacts::ArtifactError;
 use super::copies::{Assembled, MemoryPermit, reserve};
@@ -829,7 +829,7 @@ struct HeldMemory(MemoryPermit);
 
 impl std::fmt::Debug for HeldMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HeldMemory({} MiB)", self.0.num_permits())
+        write!(f, "HeldMemory({} MiB)", self.0.mib())
     }
 }
 

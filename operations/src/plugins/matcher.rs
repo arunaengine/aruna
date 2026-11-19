@@ -14,7 +14,7 @@ use aruna_core::plugin_runs::{
     SourceKind, gap_key, outbox_key, source_key,
 };
 use aruna_core::types::GroupId;
-use aruna_plugins::trigger::TriggerKind;
+use aruna_plugin_types::trigger::TriggerKind;
 use ulid::Ulid;
 
 use super::grants::covers;

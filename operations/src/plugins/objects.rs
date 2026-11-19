@@ -11,7 +11,7 @@ use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
-use aruna_plugins::broker::{ErrorKind, HostError};
+use aruna_plugin_types::calls::{ErrorKind, HostError};
 use ulid::Ulid;
 
 use super::check::CallError;

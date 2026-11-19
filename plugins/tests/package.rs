@@ -4,10 +4,10 @@
 
 #![cfg(feature = "build")]
 
-use aruna_plugins::artifact::read_manifest;
-use aruna_plugins::manifest::{Manifest, ManifestError};
+use aruna_plugin_types::artifact::read_manifest;
+use aruna_plugin_types::manifest::{Manifest, ManifestError};
+use aruna_plugin_types::trigger::TriggerKind;
 use aruna_plugins::package::{BuildError, package};
-use aruna_plugins::trigger::TriggerKind;
 use wasm_encoder::{ComponentSection, CustomSection};
 use wasmparser::{Parser, Payload};
 use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};

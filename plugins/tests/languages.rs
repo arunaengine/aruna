@@ -12,13 +12,13 @@ use std::time::Duration;
 
 use tokio::time::{Instant, timeout_at};
 
-use aruna_plugins::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+use aruna_plugin_types::calls::{
+    Document, Entry, ErrorKind, HostError, Intent, Listing, ObjectInfo, ObjectPage, Response,
 };
+use aruna_plugin_types::permission::Permission;
+use aruna_plugins::broker::{Broker, CallContext, MetadataPatch, SendRequest, StatePut};
 use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
-use aruna_plugins::permission::Permission;
 use aruna_plugins::{
     CancellationToken, Compiled, FailureKind, Invocation, InvokeError, Runtime, Trigger,
 };

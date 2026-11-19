@@ -14,7 +14,7 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::secrets::{ResponseExposure, SecretFields};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_plugins::broker::{Field, HostError, Response};
+use aruna_plugin_types::calls::{Field, HostError, Response};
 use ulid::Ulid;
 
 use super::check::CallError;

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
-use aruna_plugins::broker::{ErrorKind, HostError};
+use aruna_plugin_types::calls::{ErrorKind, HostError};
 use serde_json::json;
 
 use super::*;

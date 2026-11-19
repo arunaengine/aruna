@@ -44,12 +44,15 @@ use aruna_operations::plugins::unavailable;
 use aruna_operations::plugins::work::RequestContext;
 use aruna_operations::plugins::work_calls::{JobOutputs, JobRow};
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use aruna_plugins::broker::{
-    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, JobCopy, JobDownload, JobStatus, JobUpload, Listing, MetadataCreate,
-    MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
+use aruna_plugin_types::calls::{
+    Created, Document, Entry, ErrorKind, Field, FilePage, HostError, Intent, JobStatus, Listing,
+    ObjectInfo, ObjectPage, Response,
 };
-use aruna_plugins::permission::Permission;
+use aruna_plugin_types::permission::Permission;
+use aruna_plugins::broker::{
+    Broker, CallContext, FileChange, JobCopy, JobDownload, JobUpload, MetadataCreate,
+    MetadataPatch, SendRequest, StatePut, StateRemove,
+};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -458,7 +461,7 @@ impl Broker for RunBroker {
         let checksums = expected(&download.checksums)?;
         let request = SendRequest {
             connection: download.service,
-            method: aruna_plugins::broker::Method::Get,
+            method: aruna_plugin_types::calls::Method::Get,
             path: download.path,
             query: download.query,
             headers: download.headers,
@@ -483,7 +486,7 @@ impl Broker for RunBroker {
     }
 
     async fn jobs_upload(&self, _cx: &CallContext, upload: JobUpload) -> Result<String, HostError> {
-        use aruna_plugins::broker::Method;
+        use aruna_plugin_types::calls::Method;
         if !matches!(upload.method, Method::Put | Method::Post) {
             let message = "an upload is sent with PUT or POST";
             return Err(HostError::new(ErrorKind::Invalid, message));

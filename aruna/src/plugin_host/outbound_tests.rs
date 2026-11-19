@@ -173,7 +173,8 @@ async fn oversized_rerun() {
     // A rerun of a send whose answer was too large answers the stored refusal and sends nothing.
     use crate::plugin_host::broker::RunBroker;
     use aruna_operations::plugins::check::RunScope;
-    use aruna_plugins::broker::{Broker, CallContext, ErrorKind, Intent, Method, SendRequest};
+    use aruna_plugin_types::calls::{ErrorKind, Intent, Method};
+    use aruna_plugins::broker::{Broker, CallContext, SendRequest};
     let fixture = Fixture::new().await;
     let install = install_artifact(&fixture, connected()).await;
     let mut run = queued(install.install_id, 1);
@@ -214,7 +215,8 @@ async fn oversized_rerun() {
 async fn undeclared_method() {
     use crate::plugin_host::broker::RunBroker;
     use aruna_operations::plugins::check::RunScope;
-    use aruna_plugins::broker::{Broker, CallContext, Method, SendRequest};
+    use aruna_plugin_types::calls::Method;
+    use aruna_plugins::broker::{Broker, CallContext, SendRequest};
     let fixture = Fixture::new().await;
     let install = install_artifact(&fixture, connected()).await;
     let mut run = queued(install.install_id, 1);
@@ -242,7 +244,7 @@ async fn undeclared_method() {
         intent: None,
     };
     let refused = broker.connection_send(&cx, request).await.unwrap_err();
-    assert_eq!(refused.kind, aruna_plugins::broker::ErrorKind::Invalid);
+    assert_eq!(refused.kind, aruna_plugin_types::calls::ErrorKind::Invalid);
     assert!(sender.asked.lock().unwrap().is_empty());
 }
 
@@ -383,7 +385,8 @@ async fn whole_answers_gated() {
     use crate::plugin_host::broker::RunBroker;
     use aruna_operations::plugins::check::RunScope;
     use aruna_operations::plugins::test_support::{bound, edit_config, hold_keys, secret_with};
-    use aruna_plugins::broker::{Broker, CallContext, ErrorKind, Method, SendRequest};
+    use aruna_plugin_types::calls::{ErrorKind, Method};
+    use aruna_plugins::broker::{Broker, CallContext, SendRequest};
     let fixture = Fixture::keyed().await;
     // A connection that reads whole answers with the bearer slot `api_key`.
     let install = bound(&fixture).await;

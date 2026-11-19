@@ -15,7 +15,7 @@ use aruna_core::plugin_installs::{BoundScope, PluginInstall};
 use aruna_core::plugins::{ReleaseError, ReleaseRequest, Released};
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_plugins::broker::{ErrorKind, HostError};
+use aruna_plugin_types::calls::{ErrorKind, HostError};
 use ulid::Ulid;
 
 use super::artifacts::managers;

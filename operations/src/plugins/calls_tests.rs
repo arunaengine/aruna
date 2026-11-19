@@ -16,8 +16,8 @@ use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::{HostError, JobStatus, ObjectPage};
-use aruna_plugins::manifest::Manifest;
+use aruna_plugin_types::calls::{HostError, JobStatus, ObjectPage};
+use aruna_plugin_types::manifest::Manifest;
 use serde_json::{Map, Value};
 use ulid::Ulid;
 

@@ -11,7 +11,6 @@ use aruna_core::plugin_runs::RUNS_PARALLEL;
 use aruna_core::plugin_runs::RunState;
 use aruna_core::plugin_runs::RunTrigger;
 use aruna_drivers::driver::drive;
-use aruna_operations::plugins::attempt::invocation;
 use aruna_operations::plugins::calls::*;
 use aruna_operations::plugins::grants::short_path;
 use aruna_operations::plugins::host_calls::call_intent;
@@ -19,7 +18,7 @@ use aruna_operations::plugins::intents::unknown_row;
 use aruna_operations::plugins::rows::StoreError;
 use aruna_operations::plugins::rows::write_rows;
 use aruna_operations::plugins::runs::event_run;
-use aruna_operations::plugins::runs::{admit, conclude, ended, read_run, save_run, unfinished};
+use aruna_operations::plugins::runs::{admit, conclude, read_run, save_run, unfinished};
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::queued;
 #[allow(unused_imports)]
@@ -27,7 +26,7 @@ pub(crate) use aruna_operations::plugins::test_support::{
     connected, created, echoed_sync, install_artifact, installed, job_guest, publish_artifact,
     scoped, secured, synced,
 };
-use aruna_plugins::broker::Intent;
+use aruna_plugin_types::calls::Intent;
 use aruna_plugins::{InvokeError, Trigger};
 use std::time::Duration;
 use ulid::Ulid;

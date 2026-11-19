@@ -264,7 +264,7 @@ async fn visible(
     install: &PluginInstall,
     bucket: &str,
     listed: Vec<(String, u64, String)>,
-) -> Vec<aruna_plugins::broker::ObjectInfo> {
+) -> Vec<aruna_plugin_types::calls::ObjectInfo> {
     let place = (broker.scope.realm_id, broker.scope.local);
     let visible = VisibleObjects::new(place, install, bucket, listed);
     drive(visible, &broker.ctx).await.unwrap()

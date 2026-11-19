@@ -237,7 +237,8 @@ async fn marked_source_refused() {
 async fn small_reads_unmarked() {
     // An unmarked object is read within the call's bound; a marked version is refused, whoever's
     // job wrote it.
-    use aruna_plugins::broker::{Broker, CallContext, ErrorKind};
+    use aruna_plugin_types::calls::ErrorKind;
+    use aruna_plugins::broker::{Broker, CallContext};
 
     use crate::plugin_host::broker::RunBroker;
     use aruna_operations::plugins::marks::{MARKED, Mark, mark_row};
@@ -296,7 +297,8 @@ async fn small_reads_unmarked() {
 async fn versioned_info() {
     // Information on a named version answers that version, with its own mark; the current one
     // is still answered without a version.
-    use aruna_plugins::broker::{Broker, CallContext, ErrorKind};
+    use aruna_plugin_types::calls::ErrorKind;
+    use aruna_plugins::broker::{Broker, CallContext};
 
     use crate::plugin_host::broker::RunBroker;
     use aruna_drivers::driver::drive;

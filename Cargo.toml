@@ -22,6 +22,7 @@ members = [
     "aruna-doctor",
     "cli",
     "plugins",
+    "plugin-types",
     "plugins/examples/elabftw",
     "plugins/examples/announcer/rust",
     "plugins/fixture",
@@ -56,6 +57,7 @@ aruna-operations = { path = "operations" }
 aruna-drivers = { path = "drivers" }
 aruna-outbound = { path = "outbound" }
 aruna-plugin = { path = "plugins/sdk" }
+aruna-plugin-types = { path = "plugin-types" }
 aruna-plugins = { path = "plugins", default-features = false }
 aruna-storage = { path = "storage" }
 aruna-tasks = { path = "tasks" }

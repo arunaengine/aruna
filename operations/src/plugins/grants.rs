@@ -11,9 +11,9 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permissi
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::types::GroupId;
-use aruna_plugins::broker::{ErrorKind, HostError};
-use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::{Grant, Permission};
+use aruna_plugin_types::calls::{ErrorKind, HostError};
+use aruna_plugin_types::manifest::Manifest;
+use aruna_plugin_types::permission::{Grant, Permission};
 use thiserror::Error;
 use ulid::Ulid;
 

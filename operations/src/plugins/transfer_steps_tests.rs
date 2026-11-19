@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::errors::StorageError;
-use aruna_plugins::broker::ErrorKind;
+use aruna_plugin_types::calls::ErrorKind;
 use serde_json::json;
 
 use super::*;

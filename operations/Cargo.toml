@@ -29,7 +29,7 @@ aruna-blob = { workspace = true }
 aruna-core = { workspace = true }
 aruna-drivers = { workspace = true, optional = true }
 aruna-graph = { workspace = true }
-aruna-plugins = { workspace = true, features = ["runtime"] }
+aruna-plugin-types = { workspace = true }
 aruna-storage = { workspace = true }
 aruna-net = { workspace = true }
 aruna-outbound = { workspace = true }

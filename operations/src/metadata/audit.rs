@@ -580,7 +580,7 @@ mod tests {
         StorageEvent, Value, audit_scope, decode_cursor, encode_cursor, encode_message,
         select_peers,
     };
-    use crate::driver::DriverContext;
+    use aruna_drivers::driver::DriverContext;
     use crate::metadata::audit_entry::{admin_refusal, audit_member};
     use crate::metadata::protocol::MetadataReadError;
     use crate::metadata::repository::{audit_entry, metadata_audit_key};
@@ -1377,7 +1377,7 @@ mod tests {
             &aruna_core::structs::identity::auth::Permission::WRITE,
             crate::auth::request_policy::PolicyRequestExtras::rest(),
         );
-        let result = crate::driver::drive(check, &context)
+        let result = aruna_drivers::driver::drive(check, &context)
             .await
             .map_err(admin_refusal);
         assert!(matches!(result, Err(MetadataReadError::Forbidden)));
@@ -1488,7 +1488,7 @@ mod tests {
             crate::testing::write_entries(&context.storage_handle, vec![row]).await;
         }
 
-        let first = crate::driver::drive(
+        let first = aruna_drivers::driver::drive(
             LocalPageOperation::new(realm_id, group_id, None, None, 2),
             &context,
         )
@@ -1497,7 +1497,7 @@ mod tests {
         assert_eq!(first.records.len(), 2);
         let cursor = first.next_start_after.expect("more records");
 
-        let second = crate::driver::drive(
+        let second = aruna_drivers::driver::drive(
             LocalPageOperation::new(realm_id, group_id, None, Some(cursor), 2),
             &context,
         )
@@ -1506,7 +1506,7 @@ mod tests {
         assert_eq!(second.records.len(), 1);
         assert_eq!(second.records[0].record.document_id, second_doc);
 
-        let filtered = crate::driver::drive(
+        let filtered = aruna_drivers::driver::drive(
             LocalPageOperation::new(realm_id, group_id, Some(second_doc), None, 50),
             &context,
         )
@@ -1514,7 +1514,7 @@ mod tests {
         .unwrap();
         assert_eq!(filtered.records.len(), 1);
 
-        let foreign = crate::driver::drive(
+        let foreign = aruna_drivers::driver::drive(
             LocalPageOperation::new(realm_id, Ulid::from_bytes([99u8; 16]), None, None, 50),
             &context,
         )
