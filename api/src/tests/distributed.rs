@@ -172,7 +172,7 @@ pub(crate) async fn node_state() -> Node {
 pub(crate) async fn hidden_link(node: &Node, key: &str) {
     use aruna_core::structs::storage::link::LinkTarget;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
-    use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
+    use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let target = LinkTarget {
         arn: VersionedObjectArn {
             realm_id: node.owner.realm_id,

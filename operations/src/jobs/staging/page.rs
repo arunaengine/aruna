@@ -32,7 +32,7 @@ use super::walk::{
 use super::{ItemFailure, PageFailure, StagingRun, committed, pinned};
 use crate::auth::permission_rules::PermissionRules;
 use crate::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
-use crate::staging::head_source::{
+use crate::s3::object::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
 use crate::staging::page::import::{

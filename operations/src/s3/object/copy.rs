@@ -20,10 +20,10 @@ use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use crate::s3::object::read::{ReadSourceOperation, TokenRead};
-use crate::s3::purge_fence::PurgeFenceError;
-use crate::staging::reference::{
+use crate::s3::object::reference::{
     MaterializeReferenceError, ReferenceWrite, WriteReferenceOperation,
 };
+use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};

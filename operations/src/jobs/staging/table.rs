@@ -57,15 +57,15 @@ use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, Ob
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use crate::s3::object::head_source::{
+    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
+};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use crate::s3::object::read::GetRoutedOperation;
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::s3::usage::QuotaGateError;
-use crate::staging::head_source::{
-    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
-};
 use crate::staging::page::rows::MAX_PAGE_ENTRIES;
 use crate::staging::read_source::{
     ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,

@@ -415,7 +415,7 @@ mod distributed {
     async fn hidden_link(members: &Members, key: &str) {
         use aruna_core::structs::storage::link::LinkTarget;
         use aruna_core::structs::storage::replication::VersionedObjectArn;
-        use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
+        use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
         let node = &members.nodes[0];
         let target = LinkTarget {
             arn: VersionedObjectArn {
@@ -637,7 +637,7 @@ async fn external_reference(node: &crate::tests::distributed::Node, key: &str) {
     use aruna_core::structs::execution::staging::{
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
-    use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
+    use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let descriptor = PortableSourceDescriptor {
         kind: SourceConnectorKind::Http,
         public_config: HashMap::new(),

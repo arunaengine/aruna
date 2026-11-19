@@ -2,18 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::ops::Range;
-
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::StagingSourceError;
-use aruna_core::events::{Event, NetEvent};
-use aruna_core::id_mint::IdMint;
-use aruna_core::native_reference::{
-    DelegatedBody, DelegatedReadEffect, NativeAuthority, NativeRange, NativeReferenceReject,
-    NativeReferenceRequest,
-};
+use aruna_core::native_reference::{NativeAuthority, NativeReferenceReject, NativeReferenceRequest};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -33,7 +25,6 @@ use ulid::Ulid;
 
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::distribution::delegate::{DelegationInput, unsigned_delegation};
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::peer_trust::is_sync_eligible;
@@ -67,97 +58,6 @@ fn request_operation(request: &NativeReferenceRequest) -> &'static str {
     match request.head {
         true => HEAD_OPERATION,
         false => READ_OPERATION,
-    }
-}
-
-/// One exact version read from the holder for a caller this node verified itself, bound by a
-/// D33 delegation to this operation, version and range.
-pub(crate) fn delegated_read(
-    ids: Option<Ids>,
-    caller: DelegationInput,
-    arn: &VersionedObjectArn,
-    range: Option<Range<u64>>,
-    head: bool,
-) -> DelegatedReadOperation {
-    DelegatedReadOperation {
-        now_ms: 0,
-        mint: IdMint::default(),
-        ids,
-        caller: Some(caller),
-        arn: arn.clone(),
-        range,
-        head,
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) struct DelegatedReadOperation {
-    ids: Option<Ids>,
-    caller: Option<DelegationInput>,
-    arn: VersionedObjectArn,
-    range: Option<Range<u64>>,
-    head: bool,
-    now_ms: u64,
-    mint: IdMint,
-}
-
-impl Operation for DelegatedReadOperation {
-    type Output = DelegatedBody;
-    type Error = StagingSourceError;
-
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
-
-    fn seed(&mut self, entropy: u128) {
-        self.mint = IdMint::new(entropy);
-    }
-
-    fn first(&mut self) -> Result<Next<DelegatedBody>, StagingSourceError> {
-        let range = NativeRange::checked(self.range.clone())?;
-        let operation = match self.head {
-            true => HEAD_OPERATION,
-            false => READ_OPERATION,
-        };
-        let arn = &self.arn;
-        let scope = GrantScope::Version(arn.clone());
-        let digest = read_grant::request_digest(
-            operation,
-            &scope,
-            range.map(|range| (range.start, range.end)),
-        )
-        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
-        let ids = self.ids.ok_or(StagingSourceError::HandleMissing)?;
-        let caller = self.caller.take().ok_or(IoError::Unfinished)?;
-        let input = DelegationInput {
-            target: arn.node_id,
-            operation: operation.to_string(),
-            bucket: arn.bucket.clone(),
-            key: arn.key.clone(),
-            request_digest: digest,
-            ..caller
-        };
-        let now = self.now_ms / 1000;
-        let nonce = self.mint.mint(self.now_ms).to_bytes();
-        let read = DelegatedReadEffect {
-            delegation: unsigned_delegation(ids, input, (now, nonce)),
-            version_id: arn.version,
-            head: self.head,
-            range,
-        };
-        let effect = Effect::Net(NetEffect::DelegatedRead(Box::new(read)));
-        Ok(Next::Call(IoCall::from(effect)))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<DelegatedBody>, StagingSourceError> {
-        match result.event()? {
-            Event::Net(NetEvent::DelegatedRead(answer)) => Ok(Next::Done(*answer?)),
-            other => Err(IoError::Unexpected {
-                expected: "Event::Net(NetEvent::DelegatedRead)",
-                got: other.label(),
-            }
-            .into()),
-        }
     }
 }
 

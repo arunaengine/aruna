@@ -26,7 +26,7 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::replication::queue::{
     BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult,
 };
-use crate::staging::reference::{
+use crate::s3::object::reference::{
     MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
     MaterializeReferenceResult,
 };

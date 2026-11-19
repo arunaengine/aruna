@@ -39,18 +39,18 @@ use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceR
 use aruna_operations::distribution::routing::{bound_view, route_read};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use aruna_operations::s3::object::head_source::HeadSourceError;
 use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
 use aruna_operations::s3::object::put::PutObjectError;
-use aruna_operations::staging::head_source::HeadSourceError;
+use aruna_operations::s3::object::reference::{
+    MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
+};
 use aruna_operations::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation,
 };
 use aruna_operations::staging::read_source::ReadSourceError;
-use aruna_operations::staging::reference::{
-    MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
-};
 use aruna_operations::staging::snapshot::{
     MaterializeSnapshotError, MaterializeSnapshotInput, stage_snapshot_blob,
 };

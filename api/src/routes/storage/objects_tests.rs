@@ -334,7 +334,6 @@ async fn unanswered_range_fails() {
 
 /// Writes a link at `key` in the test bucket to `target`, as the owner.
 async fn link(node: &Node, key: &str, target: aruna_core::structs::storage::link::LinkTarget) {
-    use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
     let write = ReferenceWrite {
         job_id: None,
         preassigned_version_id: None,
@@ -436,6 +435,7 @@ async fn hides_link_folders() {
 async fn merges_past_hidden() {
     // A local range that starts with more hidden entries than one request examines goes on
     // from this member's sealed cursor inside the merged cursor, then on to the peer's range.
+    use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     use aruna_operations::s3::object::visible::SCAN_BUDGET;
     let node = node_state().await;
     store(&node, &["a.md"]).await;
