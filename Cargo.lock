@@ -692,6 +692,8 @@ dependencies = [
  "oxrdf",
  "oxttl",
  "serde_json",
+ "spareval",
+ "spargebra",
  "tempfile",
  "tokio",
  "tracing",
