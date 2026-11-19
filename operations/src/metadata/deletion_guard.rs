@@ -85,12 +85,6 @@ fn rejects_deleted(effect: &MetadataEffect) -> bool {
 /// The answer `effect` gets on a deleted graph without running, or `None` when it still runs.
 fn deleted_answer(effect: &MetadataEffect, graph_iri: &str) -> Option<MetadataEvent> {
     match effect {
-        MetadataEffect::SyncBestEffort { graph_iri, peers } => {
-            Some(MetadataEvent::GraphSyncScheduled {
-                graph_iri: graph_iri.clone(),
-                peers: peers.clone(),
-            })
-        }
         MetadataEffect::ContainsGraph { graph_iri } => Some(MetadataEvent::ContainsGraphResult {
             graph_iri: graph_iri.clone(),
             exists: false,

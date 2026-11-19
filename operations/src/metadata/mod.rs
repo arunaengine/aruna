@@ -57,6 +57,7 @@ pub(crate) mod span_timing;
 pub mod stats;
 pub mod text_search;
 pub mod timestamp_sweep;
+pub mod topic_sync;
 pub mod update_document;
 pub mod update_entry;
 pub(crate) mod updated_page;

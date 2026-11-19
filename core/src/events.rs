@@ -536,6 +536,9 @@ pub enum NetEvent {
     Shard(Box<ShardNetEvent>),
     /// Whether sync topics took the requested peers.
     TopicPeers(Result<(), TopicPeerError>),
+    /// The asked peers a topic lacks, `None` without the topic's state here, or why it is
+    /// unreadable.
+    MissingTopicPeers(Result<Option<Vec<crate::NodeId>>, String>),
     /// This node's signature over a group deletion plan.
     DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
     /// The verified claims of a token named for revocation, or why it is invalid.
@@ -906,7 +909,8 @@ impl MetadataEvent {
                 EntityUpsertResult,
                 GraphPolicySet,
                 GraphPeerAdded,
-                GraphSyncScheduled,
+                GraphTopic,
+                TopicChanged,
                 GraphPolicyResult,
                 RoCrateExportResult,
                 RoCrateSummaryResult,
@@ -1070,6 +1074,7 @@ impl Event {
                     CursorSigned,
                     Shard,
                     TopicPeers,
+                    MissingTopicPeers,
                     DeletePlanSigned,
                     RevocationClaims,
                     Notification,

@@ -1101,6 +1101,8 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Shard(_)) => "shard",
         Effect::Net(NetEffect::EnsureTopics { .. }) => "ensure_topics",
         Effect::Net(NetEffect::AllowTopicPeers { .. }) => "allow_topic_peers",
+        Effect::Net(NetEffect::SyncTopic { .. }) => "sync_topic",
+        Effect::Net(NetEffect::MissingTopicPeers { .. }) => "missing_topic_peers",
         Effect::Net(NetEffect::RevocationClaims(_)) => "revocation_claims",
         Effect::Net(NetEffect::Notification(_)) => "notification",
         Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",

@@ -1350,7 +1350,21 @@ pub enum MetadataEffect {
         graph_iri: String,
         node_id: NodeId,
     },
-    SyncBestEffort {
+    /// The document sync topic of one graph, bound or derived; answers `GraphTopic`.
+    GraphTopic {
+        graph_iri: String,
+    },
+    /// Binds the graph to the sync topic this node already holds; answers `TopicChanged`.
+    BindTopic {
+        graph_iri: String,
+    },
+    /// Creates the graph's sync topic with `members`; answers `TopicChanged`.
+    MintTopic {
+        graph_iri: String,
+        members: std::collections::BTreeSet<NodeId>,
+    },
+    /// Adds `peers` to the graph's sync topic; answers `TopicChanged`.
+    AddTopicPeers {
         graph_iri: String,
         peers: Vec<NodeId>,
     },
@@ -1545,7 +1559,10 @@ impl MetadataEffect {
             MetadataEffect::UpsertContextualEntity { .. } => "upsert_contextual_entity",
             MetadataEffect::SetGraphPolicy { .. } => "set_graph_policy",
             MetadataEffect::AddGraphPeer { .. } => "add_graph_peer",
-            MetadataEffect::SyncBestEffort { .. } => "sync_best_effort",
+            MetadataEffect::GraphTopic { .. } => "graph_topic",
+            MetadataEffect::BindTopic { .. } => "bind_topic",
+            MetadataEffect::MintTopic { .. } => "mint_topic",
+            MetadataEffect::AddTopicPeers { .. } => "add_topic_peers",
             MetadataEffect::GetGraphPolicy { .. } => "get_graph_policy",
             MetadataEffect::ExportRoCrate { .. } => "export_rocrate",
             MetadataEffect::ExportRoCrateSummary { .. } => "export_rocrate_summary",
@@ -1599,7 +1616,10 @@ impl MetadataEffect {
             | MetadataEffect::UpsertContextualEntity { request } => Some(request.graph_iri.clone()),
             MetadataEffect::SetGraphPolicy { graph_iri, .. }
             | MetadataEffect::AddGraphPeer { graph_iri, .. }
-            | MetadataEffect::SyncBestEffort { graph_iri, .. }
+            | MetadataEffect::GraphTopic { graph_iri }
+            | MetadataEffect::BindTopic { graph_iri }
+            | MetadataEffect::MintTopic { graph_iri, .. }
+            | MetadataEffect::AddTopicPeers { graph_iri, .. }
             | MetadataEffect::GetGraphPolicy { graph_iri }
             | MetadataEffect::ExportRoCrate { graph_iri }
             | MetadataEffect::ExportRoCrateSummary { graph_iri }
@@ -1683,10 +1703,11 @@ pub enum MetadataEvent {
         graph_iri: String,
         node_id: NodeId,
     },
-    GraphSyncScheduled {
-        graph_iri: String,
-        peers: Vec<NodeId>,
+    GraphTopic {
+        topic: irokle::TopicId,
     },
+    /// The graph's sync topic binding or membership changed as asked.
+    TopicChanged,
     GraphPolicyResult {
         graph_iri: String,
         policy: MetadataGraphPolicy,

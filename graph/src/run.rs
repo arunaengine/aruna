@@ -24,6 +24,20 @@ use crate::persist::{
 };
 use crate::{CRAQLE_LATENCY, GraphHandle, GraphInner, SLOW_CALL};
 
+fn topic_failed(graph_iri: String, error: MetadataError) -> MetadataEvent {
+    MetadataEvent::Error {
+        graph_iri: Some(graph_iri),
+        error,
+    }
+}
+
+fn topic_changed(graph_iri: String, result: Result<(), MetadataError>) -> MetadataEvent {
+    match result {
+        Ok(()) => MetadataEvent::TopicChanged,
+        Err(error) => topic_failed(graph_iri, error),
+    }
+}
+
 impl GraphHandle {
     /// Runs one store or cache effect and answers with its event. A deleted graph leaves the
     /// caches, and a write that applied makes every cached query result stale.
@@ -42,8 +56,8 @@ impl GraphHandle {
         event
     }
 
-    /// The cache and scoped read arms answer here; the store effects run on the blocking pool.
-    /// Unscoped searches and best-effort sync need a read scope or the network and are refused.
+    /// The cache, scoped read and topic arms answer here; the store effects run on the blocking
+    /// pool.
     async fn run_store(&self, effect: MetadataEffect) -> MetadataEvent {
         let effect = match self.run_cache(effect) {
             Ok(event) => return event,
@@ -88,6 +102,24 @@ impl GraphHandle {
                     .profiles
                     .insert(profile_id, revision, Arc::new(shapes));
                 return MetadataEvent::ProfileShapes { shapes: None };
+            }
+            MetadataEffect::GraphTopic { graph_iri } => {
+                return match self.graph_topic(graph_iri.clone()).await {
+                    Ok(topic) => MetadataEvent::GraphTopic { topic },
+                    Err(error) => topic_failed(graph_iri, error),
+                };
+            }
+            MetadataEffect::BindTopic { graph_iri } => {
+                let bound = self.bind_topic(graph_iri.clone()).await.map(|_| ());
+                return topic_changed(graph_iri, bound);
+            }
+            MetadataEffect::MintTopic { graph_iri, members } => {
+                let minted = self.mint_topic(graph_iri.clone(), members).await;
+                return topic_changed(graph_iri, minted.map(|_| ()));
+            }
+            MetadataEffect::AddTopicPeers { graph_iri, peers } => {
+                let added = self.add_topic_peers(graph_iri.clone(), peers).await;
+                return topic_changed(graph_iri, added);
             }
             MetadataEffect::EnsureIndexes => {
                 return match self.ensure_query_indexes().await {
@@ -151,12 +183,6 @@ impl GraphHandle {
             effect => effect,
         };
         let graph_iri = effect.graph_iri();
-        if matches!(effect, MetadataEffect::SyncBestEffort { .. }) {
-            return MetadataEvent::Error {
-                graph_iri,
-                error: MetadataError::InvalidEffect,
-            };
-        }
         let inner = self.inner.clone();
         let span = debug_span!(
             "metadata.backend.blocking_task",
@@ -988,7 +1014,10 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::ExportRoCrateSummary { .. }
         | MetadataEffect::ExportRoCratePage { .. }
         | MetadataEffect::ExportVersioned { .. }) => export_effect(node, &auth, effect),
-        MetadataEffect::SyncBestEffort { .. }
+        MetadataEffect::GraphTopic { .. }
+        | MetadataEffect::BindTopic { .. }
+        | MetadataEffect::MintTopic { .. }
+        | MetadataEffect::AddTopicPeers { .. }
         | MetadataEffect::CheckStructure { .. }
         | MetadataEffect::CheckProfile { .. }
         | MetadataEffect::CachedShapes { .. }
