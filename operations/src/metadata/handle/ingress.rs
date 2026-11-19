@@ -447,17 +447,15 @@ impl MetadataHandle {
                                     .ok()
                                     .and_then(|mut documents| documents.remove(&local))
                                     .and_then(|document| document.urls.s3);
-                                super::super::api::preflight::references_preflight_local(
-                                    context.as_ref(),
-                                    *net.realm_id(),
-                                    net.node_id(),
-                                    auth,
-                                    *request,
-                                    endpoint,
-                                )
-                                .await
-                                .map(Box::new)
-                                .map_err(crate::forward::transport::read_error)
+                                let local = (*net.realm_id(), net.node_id());
+                                let preflight =
+                                    super::super::api::preflight_local::references_preflight_local(
+                                        local, auth, *request, endpoint,
+                                    );
+                                drive(preflight, context.as_ref())
+                                    .await
+                                    .map(Box::new)
+                                    .map_err(crate::forward::transport::read_error)
                             }
                             None => Err(MetadataReadError::Unavailable),
                         },

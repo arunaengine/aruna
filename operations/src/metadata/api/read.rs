@@ -13,7 +13,6 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::record_reads::DocumentRecordOperation;
 
 use crate::auth::enforcement::EnforcePolicyOperation;
-use crate::auth::request_authorization::AuthorizeOperation;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 
 /// The query a caller asked for, across the realm or on this node as its mode says.
@@ -116,57 +115,6 @@ pub(crate) async fn ensure_record_readable(
             Err(MetadataApiError::NotFound)
         }
         Err(other) => Err(other),
-    }
-}
-
-pub(crate) async fn can_read_record(
-    context: &DriverContext,
-    realm_id: RealmId,
-    auth: Option<&AuthContext>,
-    record: &MetadataRegistryRecord,
-) -> Result<bool, MetadataApiError> {
-    if record.public {
-        let allowed = drive(
-            EnforcePolicyOperation::new(
-                realm_id,
-                crate::auth::request_policy::policy_request_with(
-                    &record.permission_path,
-                    &Permission::READ,
-                    auth,
-                    crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
-                )
-                .clone(),
-            ),
-            context,
-        )
-        .await
-        .is_ok();
-        return Ok(allowed);
-    }
-    let Some(auth) = auth.cloned() else {
-        return Ok(false);
-    };
-    if auth.realm_id != realm_id {
-        return Ok(false);
-    }
-
-    match aruna_core::telemetry::time_stage(
-        "permission",
-        drive(
-            AuthorizeOperation::new(
-                realm_id,
-                &auth,
-                &record.permission_path,
-                &Permission::READ,
-                crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
-            ),
-            context,
-        ),
-    )
-    .await
-    {
-        Ok(()) => Ok(true),
-        Err(_) => Ok(false),
     }
 }
 

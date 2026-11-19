@@ -14,7 +14,7 @@ use crate::metadata::{
 };
 use crate::server::state::ServerState;
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::api::preflight::references_preflight as run_references_preflight;
+use aruna_operations::metadata::api::preflight_fanout::references_preflight as run_references_preflight;
 use aruna_operations::metadata::api::preflight_types::{
     MetadataIndexState, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,
     ReferenceTarget,
@@ -266,7 +266,6 @@ pub async fn metadata_reference_preflight(
         .s3
         .map(|interface| interface.base_url);
     let execution = run_references_preflight(
-        state.get_ctx().as_ref(),
         state.get_realm_id(),
         state.get_node_id(),
         ReferenceRequest {
@@ -280,9 +279,10 @@ pub async fn metadata_reference_preflight(
             target_nodes: None,
             allow_partial: request.allow_partial,
         },
-    )
-    .await
-    .map_err(map_api_error)?;
+    );
+    let execution = drive(execution, state.get_ctx().as_ref())
+        .await
+        .map_err(map_api_error)?;
     Ok((StatusCode::OK, Json(map_preflight_response(execution))))
 }
 
