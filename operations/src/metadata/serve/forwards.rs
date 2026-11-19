@@ -225,9 +225,13 @@ pub(crate) fn forward_call(
     Ok(Forward::Call(call, reply))
 }
 
-/// Whether `message` needs this node's view of the realm, which only a member admission does.
-pub fn needs_here(message: &Message) -> bool {
-    matches!(message, Message::ForwardAdmitMember { .. })
+/// Whether `message` needs this node's view of the realm and its storage routing: a member
+/// admission and a synced-folder pull do.
+pub fn needs_view(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::ForwardAdmitMember { .. } | Message::ForwardSyncPull { .. }
+    )
 }
 
 // The audit page served as the only member of a group, so the deadline bounds the caller check

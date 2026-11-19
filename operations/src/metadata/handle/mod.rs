@@ -16,9 +16,7 @@ use super::protocol::METADATA_IO_TIMEOUT;
 mod effects;
 pub(crate) mod frames;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
-pub use self::pull_serve::{accept_pull, pull_status};
 mod ingress;
-mod pull_serve;
 mod transport;
 
 const METADATA_CHUNK_SIZE: usize = 64 * 1024;
@@ -37,7 +35,6 @@ pub struct MetadataHandleOptions {}
 struct MetadataInner {
     net_handle: Option<NetHandle>,
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
-    sync_pulls: self::pull_serve::PullRegistry,
     #[cfg(feature = "test-hooks")]
     repair_hold: AtomicBool,
 }
@@ -65,7 +62,6 @@ impl MetadataHandle {
                 inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
                     super::protocol::INBOUND_FRAME_BYTES,
                 )),
-                sync_pulls: Default::default(),
                 #[cfg(feature = "test-hooks")]
                 repair_hold: AtomicBool::new(false),
             }),
@@ -92,11 +88,6 @@ impl MetadataHandle {
         self.inner
             .repair_hold
             .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// The device pulls this node is running.
-    pub(crate) fn sync_pulls(&self) -> &self::pull_serve::PullRegistry {
-        &self.inner.sync_pulls
     }
 }
 

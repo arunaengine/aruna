@@ -112,8 +112,7 @@ impl MetadataPhaseSource {
 
 pub use builtin::builtin_shapes;
 pub use handle::{
-    MetadataHandle, MetadataHandleOptions, accept_pull, export_rocrate_jsonld, pull_status,
-    send_metadata_effect,
+    MetadataHandle, MetadataHandleOptions, export_rocrate_jsonld, send_metadata_effect,
 };
 pub(crate) use message_kind::transport_message_kind;
 pub use protocol::{

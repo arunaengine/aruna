@@ -7,6 +7,7 @@ mod forwards;
 mod held;
 mod mirror;
 mod paths;
+mod pulls;
 mod reads;
 mod writes;
 
@@ -16,17 +17,20 @@ use aruna_core::heartbeat::Here;
 use aruna_core::operation::Operation;
 use aruna_core::realm_vault::RealmSecretRef;
 use aruna_core::structs::identity::realm::RealmId;
-use thiserror::Error;
+use aruna_core::structs::storage::routing::NodeRouting;
 
 use self::exports::{ExportAsk, ExportServeOperation};
 use self::forwards::{Forward, ForwardReply, forward_call};
 use self::held::{HeldAsk, HeldReadOperation};
 use self::mirror::{MirrorRequest, MirrorServeOperation};
 use self::paths::{PathAsk, PathReadOperation};
+use self::pulls::{PullAsk, PullServeOperation};
 use self::reads::{CallerReadOperation, ReadReply};
 use self::writes::WriteServeOperation;
 use crate::distribution::imports::{HandedImport, StagingSpecOperation};
+use crate::forward::transport::reject;
 use crate::metadata::api::export_types::ExportMetadataRequest;
+use crate::metadata::device_pull::SetListing;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::realm::promotion::{PromotionAnswer, PromotionRequest, ServePromotionOperation};
 use crate::realm_vault::{SecretAnswer, ServeRequest, ServeSecretOperation};
@@ -46,21 +50,14 @@ pub struct ServeNode {
     pub indexed: bool,
     /// The largest metadata document this node exports.
     pub metadata_bytes: u64,
-    /// This node's view of the realm, given only when [`needs_here`] asks for it.
+    /// This node's view of the realm, given only when [`needs_view`] asks for it.
     pub here: Option<Here>,
+    /// This node's storage routing, given only when [`needs_view`] asks for it.
+    pub routing: Option<NodeRouting>,
 }
 
 /// A reply and, for an export, the body sent after it.
 pub type ServedReply = (MetadataTransportMessage, Option<Vec<u8>>);
-
-#[derive(Debug, Error, PartialEq)]
-pub enum ServeError {
-    /// The request is one this operation does not answer.
-    #[error("the request is served elsewhere")]
-    Unserved(Box<MetadataTransportMessage>),
-    #[error(transparent)]
-    Io(#[from] IoError),
-}
 
 /// The child a request waits for, which names the reply its outcome becomes.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -117,7 +114,7 @@ impl RealmAsk {
 }
 
 impl Waiting {
-    fn answer(self, result: IoResult) -> Result<ServedReply, ServeError> {
+    fn answer(self, result: IoResult) -> Result<ServedReply, IoError> {
         let reply = match self {
             Self::Export => return Ok(result.child::<ServedReply, IoError>()??),
             Self::Reply => result.child::<MetadataTransportMessage, IoError>()??,
@@ -148,7 +145,7 @@ pub struct ServeRequestOperation {
     waiting: Option<Waiting>,
 }
 
-type ServeTurn = Result<Next<ServedReply>, ServeError>;
+type ServeTurn = Result<Next<ServedReply>, IoError>;
 
 impl ServeRequestOperation {
     pub fn new(peer: NodeId, node: ServeNode, message: MetadataTransportMessage) -> Self {
@@ -194,7 +191,7 @@ impl ServeRequestOperation {
 
 impl Operation for ServeRequestOperation {
     type Output = ServedReply;
-    type Error = ServeError;
+    type Error = IoError;
 
     fn first(&mut self) -> ServeTurn {
         let peer = self.peer;
@@ -213,6 +210,33 @@ impl Operation for ServeRequestOperation {
             Err(message) => message,
         };
         match message {
+            MetadataTransportMessage::ForwardSyncPull { auth_token, pull } => {
+                let serve = (self.peer, self.node.clone());
+                let pull = PullServeOperation::new(serve, auth_token, PullAsk::Pull(pull));
+                self.call(Waiting::Reply, IoCall::child(pull))
+            }
+            MetadataTransportMessage::ForwardPullStatus { auth_token, pull } => {
+                let serve = (self.peer, self.node.clone());
+                let poll = PullServeOperation::new(serve, auth_token, PullAsk::Status(pull));
+                self.call(Waiting::Reply, IoCall::child(poll))
+            }
+            MetadataTransportMessage::ForwardListVersions {
+                auth_token,
+                bucket,
+                prefix,
+                cursor,
+                limit,
+            } => {
+                let listing = SetListing {
+                    bucket,
+                    prefix,
+                    cursor,
+                    limit,
+                };
+                let serve = (self.peer, self.node.clone());
+                let list = PullServeOperation::new(serve, auth_token, PullAsk::List(listing));
+                self.call(Waiting::Reply, IoCall::child(list))
+            }
             MetadataTransportMessage::ForwardReadDocument {
                 auth_token,
                 config_digest,
@@ -376,7 +400,10 @@ impl Operation for ServeRequestOperation {
                     IoCall::child(ServeSecretOperation::new(realm_id, node, peer, request))
                 })
             }
-            message => Err(ServeError::Unserved(Box::new(message))),
+            _ => {
+                let unexpected = reject("unexpected metadata control message");
+                Ok(Next::Done((unexpected, None)))
+            }
         }
     }
 
@@ -393,4 +420,4 @@ impl Operation for ServeRequestOperation {
 #[path = "serve_tests.rs"]
 mod tests;
 
-pub use self::forwards::needs_here;
+pub use self::forwards::needs_view;

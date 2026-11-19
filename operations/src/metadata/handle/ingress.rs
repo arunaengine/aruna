@@ -16,38 +16,14 @@ use super::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, read_budget,
     write_body_at, write_message_at, write_stream_body, write_transport_message,
 };
+use crate::driver::node_routing;
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::reject;
 use crate::metadata::message_kind::transport_message_kind;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::serve::{ServeError, ServeNode, ServeRequestOperation, needs_here};
+use crate::metadata::serve::{ServeNode, ServeRequestOperation, needs_view};
 
 impl MetadataHandle {
-    async fn forward_request(
-        &self,
-        context: &Arc<DriverContext>,
-        peer: NodeId,
-        message: MetadataTransportMessage,
-    ) -> MetadataTransportMessage {
-        match message {
-            pull @ MetadataTransportMessage::ForwardSyncPull { .. } => {
-                Box::pin(async { super::pull_serve::serve_sync_pull(context, peer, pull).await })
-                    .await
-            }
-            poll @ MetadataTransportMessage::ForwardPullStatus { .. } => {
-                Box::pin(async { super::pull_serve::serve_pull_status(context, peer, poll).await })
-                    .await
-            }
-            listing @ MetadataTransportMessage::ForwardListVersions { .. } => {
-                Box::pin(async {
-                    super::pull_serve::serve_list_versions(context, peer, listing).await
-                })
-                .await
-            }
-            _ => unreachable!("request family routed incorrectly"),
-        }
-    }
-
     /// Reads one request frame from an inbound metadata stream under the shared frame budget
     /// and names it on the current span. Returns the deadline an audit request keeps.
     pub(crate) async fn read_request(
@@ -76,29 +52,19 @@ impl MetadataHandle {
         _audit_deadline: tokio::time::Instant,
         message: MetadataTransportMessage,
     ) -> (MetadataTransportMessage, Option<Vec<u8>>) {
+        let view = needs_view(&message);
         let serving = ServeNode {
             local: context.node_and_realm(),
             graph: context.graph_handle.is_some(),
             indexed: context.storage_handle.range_indexes().is_some(),
             metadata_bytes,
-            here: needs_here(&message).then(|| context.here()),
+            here: view.then(|| context.here()),
+            routing: view.then(|| node_routing(context)),
         };
         let serve = ServeRequestOperation::new(peer, serving, message);
-        let message = match drive(serve, context.as_ref()).await {
-            Ok(reply) => return reply,
-            Err(ServeError::Unserved(message)) => *message,
-            Err(ServeError::Io(error)) => return (reject(error.to_string()), None),
-        };
-        match message {
-            message @ (MetadataTransportMessage::ForwardSyncPull { .. }
-            | MetadataTransportMessage::ForwardPullStatus { .. }
-            | MetadataTransportMessage::ForwardListVersions { .. }) => {
-                (self.forward_request(context, peer, message).await, None)
-            }
-            _ => (
-                MetadataTransportMessage::Reject("unexpected metadata control message".to_string()),
-                None,
-            ),
+        match drive(serve, context.as_ref()).await {
+            Ok(reply) => reply,
+            Err(error) => (reject(error.to_string()), None),
         }
     }
 }

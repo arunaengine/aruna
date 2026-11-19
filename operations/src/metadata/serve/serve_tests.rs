@@ -18,6 +18,7 @@ fn local() -> ServeNode {
         indexed: false,
         metadata_bytes: 1024,
         here: None,
+        routing: None,
     }
 }
 
@@ -78,10 +79,11 @@ fn staging_spec_refused() {
 }
 
 #[test]
-fn other_request_unserved() {
+fn other_request_rejected() {
     let request = MetadataTransportMessage::SyncMirrorCreated;
     let mut serve = ServeRequestOperation::new(node(2), local(), request.clone());
-    assert_eq!(serve.first(), Err(ServeError::Unserved(Box::new(request))));
+    let unexpected = MetadataTransportMessage::Reject("unexpected metadata control message".into());
+    assert_eq!(reply(serve.first()), unexpected);
 }
 
 fn owner_read(realm: bool) -> CallerReadOperation {
