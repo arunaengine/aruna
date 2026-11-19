@@ -1,35 +1,29 @@
-//! Sends a GET or HEAD for a key range this member keeps no records of to a holder, chosen by
-//! free download slots, with a request-bound delegation (D33).
+//! Runs the member reads of S3 GET and HEAD requests and turns their answers into this node's,
+//! and sends the reads listings and copies address to one chosen member (D33).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
-
-// The holder checks the caller on its own path; a holder that fails is skipped for a while.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use aruna_core::NodeId;
-use aruna_core::holder_choice::{HolderChoiceOperation, pick};
+use aruna_core::member_read::MemberBody;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
-use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
-use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::distribution::guard::GuardError;
-use aruna_operations::distribution::resolve::key_holders;
-use aruna_operations::distribution::routing::route_read;
-use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
+use aruna_operations::distribution::status::node_reach;
 use aruna_operations::driver::drive;
-use futures_util::TryStreamExt;
-use http::{HeaderMap, Method};
+use aruna_operations::s3::object::member_read::{
+    MemberFailure, MemberKey, MemberRead, MemberReadOperation, MemberRefusal,
+};
+use aruna_operations::s3::object::range_list::DelegatedCaller;
+use http::HeaderMap;
 use s3s::dto::{
     ChecksumType, ETag, GetObjectOutput, HeadObjectOutput, StreamingBlob, Timestamp,
     TimestampFormat,
 };
-use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
+use s3s::{S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
 use ulid::Ulid;
 
-use super::list::unreachable;
-use super::{Forward, ForwardBody, ForwardRequest, header, passed_headers, passed_query};
+use super::{Forward, ForwardRequest, passed_headers, passed_query, refused_error, unix_secs};
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
 use crate::s3::service::ArunaS3Service;
@@ -41,12 +35,6 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Marks an answer a copy gave for ranges whose coordinator could not answer; it may be behind.
 pub(in crate::s3::service) const STALE_HEADER: &str = "x-aruna-stale";
-
-/// Where a GET or HEAD is answered; `Some` names the range a copy answered for.
-pub(crate) enum ReadAnswer {
-    Forwarded(reqwest::Response, Option<Ulid>),
-    Local(Option<Ulid>),
-}
 
 /// Adds the stale mark of `ranges` to an answer's headers.
 pub(in crate::s3::service) fn mark_stale(headers: &mut HeaderMap, ranges: &[Ulid]) {
@@ -78,119 +66,119 @@ pub(in crate::s3::service) fn stale_error(mut error: S3Error, range_id: Ulid) ->
     error
 }
 
-/// The read of one object the holder receives instead of this node.
-pub(in crate::s3::service) fn read_request(
-    method: Method,
-    operation: &'static str,
-    bucket: &str,
-    key: &str,
+/// The read of one object another member receives instead of this node.
+pub(in crate::s3::service) fn member_key(
+    head: bool,
+    (bucket, key, version): (&str, &str, Option<Ulid>),
     query: Option<&str>,
     headers: &HeaderMap,
-) -> ForwardRequest {
-    ForwardRequest {
-        method,
-        operation,
+) -> MemberKey {
+    MemberKey {
         bucket: bucket.to_string(),
         key: key.to_string(),
+        version,
+        head,
         query: passed_query(query),
         headers: passed_headers(headers, None),
-        body: ForwardBody::Empty,
     }
 }
 
-fn last_modified(response: &reqwest::Response) -> Option<Timestamp> {
-    header(response, "last-modified")
-        .and_then(|value| Timestamp::parse(TimestampFormat::HttpDate, &value).ok())
+/// The caller a read is delegated for.
+pub(crate) fn delegated_caller(user: &UserAccess) -> DelegatedCaller {
+    DelegatedCaller {
+        user_id: user.user_identity,
+        group_id: user.group_id,
+        credential_id: user.access_key.clone(),
+        restrictions: user.path_restrictions.clone(),
+        credential_expiry: unix_secs(user.expiry),
+    }
 }
 
-fn e_tag(response: &reqwest::Response) -> Option<ETag> {
-    header(response, "etag").and_then(|value| ETag::parse_http_header(value.as_bytes()).ok())
+fn last_modified(body: &MemberBody) -> Option<Timestamp> {
+    (body.header("last-modified"))
+        .and_then(|value| Timestamp::parse(TimestampFormat::HttpDate, value).ok())
+}
+
+fn e_tag(body: &MemberBody) -> Option<ETag> {
+    body.header("etag")
+        .and_then(|value| ETag::parse_http_header(value.as_bytes()).ok())
 }
 
 /// The user metadata the holder answered with.
-fn user_metadata(response: &reqwest::Response) -> Option<HashMap<String, String>> {
-    let metadata: HashMap<String, String> = response
-        .headers()
-        .iter()
+fn user_metadata(body: &MemberBody) -> Option<HashMap<String, String>> {
+    let metadata: HashMap<String, String> = (body.headers.iter())
         .filter_map(|(name, value)| {
-            let name = name.as_str().strip_prefix("x-amz-meta-")?;
-            Some((name.to_string(), value.to_str().ok()?.to_string()))
+            let name = name.strip_prefix("x-amz-meta-")?;
+            Some((name.to_string(), value.clone()))
         })
         .collect();
     (!metadata.is_empty()).then_some(metadata)
 }
 
-fn checksum_type(response: &reqwest::Response) -> Option<ChecksumType> {
-    header(response, "x-amz-checksum-type").map(ChecksumType::from)
+fn text(body: &MemberBody, name: &str) -> Option<String> {
+    body.header(name).map(str::to_string)
 }
 
-fn content_length(response: &reqwest::Response) -> Option<i64> {
-    header(response, "content-length").and_then(|value| value.parse().ok())
+fn checksum_type(body: &MemberBody) -> Option<ChecksumType> {
+    text(body, "x-amz-checksum-type").map(ChecksumType::from)
+}
+
+fn content_length(body: &MemberBody) -> Option<i64> {
+    body.header("content-length")
+        .and_then(|value| value.parse().ok())
 }
 
 /// The holder's GET answer as this node's, its body streamed through.
-pub(in crate::s3::service) fn forwarded_get(
-    response: reqwest::Response,
-) -> S3Response<GetObjectOutput> {
-    let status = response.status();
+pub(in crate::s3::service) fn forwarded_get(body: MemberBody) -> S3Response<GetObjectOutput> {
     // A ranged answer carries no full-object checksum, as in S3.
-    let partial = status == http::StatusCode::PARTIAL_CONTENT;
-    let checksum = |name| header(&response, name).filter(|_| !partial);
+    let partial = body.status == http::StatusCode::PARTIAL_CONTENT.as_u16();
+    let checksum = |name| text(&body, name).filter(|_| !partial);
     let output = GetObjectOutput {
-        accept_ranges: header(&response, "accept-ranges"),
+        accept_ranges: text(&body, "accept-ranges"),
         checksum_crc32: checksum("x-amz-checksum-crc32"),
         checksum_crc32c: checksum("x-amz-checksum-crc32c"),
         checksum_crc64nvme: checksum("x-amz-checksum-crc64nvme"),
         checksum_sha1: checksum("x-amz-checksum-sha1"),
         checksum_sha256: checksum("x-amz-checksum-sha256"),
-        checksum_type: checksum_type(&response).filter(|_| !partial),
-        content_length: content_length(&response),
-        content_range: header(&response, "content-range"),
-        content_type: header(&response, "content-type"),
-        e_tag: e_tag(&response),
-        last_modified: last_modified(&response),
-        metadata: user_metadata(&response),
-        version_id: header(&response, "x-amz-version-id"),
+        checksum_type: checksum_type(&body).filter(|_| !partial),
+        content_length: content_length(&body),
+        content_range: text(&body, "content-range"),
+        content_type: text(&body, "content-type"),
+        e_tag: e_tag(&body),
+        last_modified: last_modified(&body),
+        metadata: user_metadata(&body),
+        version_id: text(&body, "x-amz-version-id"),
         body: None,
         ..Default::default()
     };
-    let body = StreamingBlob::wrap(response.bytes_stream().map_err(std::io::Error::other));
     let output = GetObjectOutput {
-        body: Some(body),
+        body: Some(StreamingBlob::wrap(body.stream)),
         ..output
     };
-    match status {
-        http::StatusCode::PARTIAL_CONTENT => S3Response::with_status(output, status),
-        _ => S3Response::new(output),
+    match partial {
+        true => S3Response::with_status(output, http::StatusCode::PARTIAL_CONTENT),
+        false => S3Response::new(output),
     }
 }
 
 /// The holder's HEAD answer as this node's.
-pub(in crate::s3::service) fn forwarded_head(
-    response: &reqwest::Response,
-) -> S3Response<HeadObjectOutput> {
+pub(in crate::s3::service) fn forwarded_head(body: &MemberBody) -> S3Response<HeadObjectOutput> {
     S3Response::new(HeadObjectOutput {
-        accept_ranges: header(response, "accept-ranges"),
-        checksum_crc32: header(response, "x-amz-checksum-crc32"),
-        checksum_crc32c: header(response, "x-amz-checksum-crc32c"),
-        checksum_crc64nvme: header(response, "x-amz-checksum-crc64nvme"),
-        checksum_sha1: header(response, "x-amz-checksum-sha1"),
-        checksum_sha256: header(response, "x-amz-checksum-sha256"),
-        checksum_type: checksum_type(response),
-        content_length: content_length(response),
-        content_type: header(response, "content-type"),
-        e_tag: e_tag(response),
-        last_modified: last_modified(response),
-        metadata: user_metadata(response),
-        version_id: header(response, "x-amz-version-id"),
+        accept_ranges: text(body, "accept-ranges"),
+        checksum_crc32: text(body, "x-amz-checksum-crc32"),
+        checksum_crc32c: text(body, "x-amz-checksum-crc32c"),
+        checksum_crc64nvme: text(body, "x-amz-checksum-crc64nvme"),
+        checksum_sha1: text(body, "x-amz-checksum-sha1"),
+        checksum_sha256: text(body, "x-amz-checksum-sha256"),
+        checksum_type: checksum_type(body),
+        content_length: content_length(body),
+        content_type: text(body, "content-type"),
+        e_tag: e_tag(body),
+        last_modified: last_modified(body),
+        metadata: user_metadata(body),
+        version_id: text(body, "x-amz-version-id"),
         ..Default::default()
     })
-}
-
-/// Whether a holder other than the coordinator missed the object: a replica may not have the
-/// key's newest versions yet, while the coordinator owns its head.
-fn replica_miss(error: &S3Error, holder: &Forward, coordinator: NodeId) -> bool {
-    holder.node_id != coordinator && error.status_code() == Some(http::StatusCode::NOT_FOUND)
 }
 
 /// The caller a delegation carries: the Everyone principal has no credential, so the
@@ -215,206 +203,100 @@ async fn answer_within(
 }
 
 impl ArunaS3Service {
-    /// The holder a GET or HEAD of `key` goes to, with the range's coordinator, or `None` here.
-    /// Only a `pinned` version may come from a lagging copy. A delegated read is never sent on;
-    /// a current one is refused unless this node coordinates the range or a copy was asked.
-    pub(in crate::s3::service) async fn read_holder(
+    fn member_operation(
         &self,
-        extensions: &http::Extensions,
-        bucket: Option<&BucketInfo>,
-        (key, pinned): (&str, bool),
-    ) -> S3Result<Option<(Forward, NodeId)>> {
-        let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
-            return Ok(None);
-        };
-        if let Some(delegated) = extensions.get::<DelegatedRequest>() {
-            if !pinned
-                && !delegated.copy_read
-                && let Some(coordinator) = self.range_coordinator(binding, key).await?
-            {
-                return Err(guard_error(&GuardError::NotCoordinator {
-                    set_id: binding.set_id,
-                    range_id: coordinator.range_id,
-                    node_id: coordinator.node_id,
-                }));
+        user: &UserAccess,
+        binding: &aruna_core::structs::storage::distribution::DistributionBinding,
+        key: MemberKey,
+    ) -> MemberReadOperation {
+        let ids = self.state.node_and_realm();
+        MemberReadOperation::new(ids, delegated_caller(user), binding.clone(), key)
+    }
+
+    /// A member's failure as this node's answer; a copy's refusal is marked.
+    fn member_error(&self, failure: MemberFailure) -> S3Error {
+        let error = match failure.refusal {
+            MemberRefusal::Refused {
+                node_id,
+                status,
+                code,
+                message,
+            } => {
+                let status =
+                    (http::StatusCode::from_u16(status)).unwrap_or(http::StatusCode::BAD_GATEWAY);
+                refused_error(node_id, status, code, message)
             }
-            return Ok(None);
-        }
-        if !pinned {
-            let coordinator = self.range_coordinator(binding, key).await?;
-            return Ok(coordinator.map(|forward| {
-                let node_id = forward.node_id;
-                (forward, node_id)
-            }));
-        }
-        let (range_id, coordinator) =
-            match drive(route_read(binding, key, false), self.state.as_ref()).await {
-                Ok(ReadRoute::Holder { range_id, node_id }) => (range_id, node_id),
-                Ok(ReadRoute::Local { .. }) => return Ok(None),
-                Err(error) => return Err(guard_error(&error)),
-            };
-        let holders = drive(key_holders(binding.set_id, key), self.state.as_ref())
-            .await
-            .unwrap_or_default();
-        let choice = HolderChoiceOperation::new(&holders, unix_timestamp_millis());
-        let candidates = drive(choice, self.state.as_ref()).await.unwrap_or_default();
-        let seed = Ulid::generate().random();
-        let node_id = pick(candidates, seed).map_or(coordinator, |chosen| chosen.node_id);
-        let holder = Forward {
-            set_id: binding.set_id,
-            range_id,
-            node_id,
+            MemberRefusal::Unreachable {
+                set_id,
+                range_id,
+                node_id,
+                late,
+            } => {
+                let reach = match late {
+                    true => "not answering in time".to_string(),
+                    false => node_reach(&self.state.heard(), node_id).hint(),
+                };
+                let forward = Forward {
+                    set_id,
+                    range_id,
+                    node_id,
+                };
+                super::unreachable_error(&forward, &reach)
+            }
+            MemberRefusal::Route(error) => guard_error(&error),
+            MemberRefusal::Failed(reason) => {
+                s3_error!(InternalError, "Could not delegate the read: {reason}")
+            }
         };
-        Ok(Some((holder, coordinator)))
+        match failure.stale {
+            Some(range_id) => stale_error(error, range_id),
+            None => error,
+        }
     }
 
-    /// The coordinator of `key`'s range when another member coordinates it, or `None` when
-    /// this member does; a range this node fenced for a transfer is refused.
-    async fn range_coordinator(
-        &self,
-        binding: &DistributionBinding,
-        key: &str,
-    ) -> S3Result<Option<Forward>> {
-        let coordinator = drive(read_coordinator(binding, key), self.state.as_ref())
-            .await
-            .map_err(|error| guard_error(&error))?;
-        Ok(coordinator.map(|(range_id, node_id)| Forward {
-            set_id: binding.set_id,
-            range_id,
-            node_id,
-        }))
-    }
-
-    /// The coordinator a local miss goes on to, since a copy may lag behind it; a miss on a
-    /// range this node fenced is refused. A delegated read is never sent on.
-    pub(in crate::s3::service) async fn copy_miss(
+    /// Where a GET or HEAD of `key` is answered, read there when that is another member.
+    pub(in crate::s3::service) async fn member_read(
         &self,
         extensions: &http::Extensions,
+        user: &UserAccess,
         bucket: Option<&BucketInfo>,
-        key: &str,
+        key: MemberKey,
+    ) -> S3Result<MemberRead> {
+        let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
+            return Ok(MemberRead::Local(None));
+        };
+        let read = self.member_operation(user, binding, key);
+        let read = match extensions.get::<DelegatedRequest>() {
+            Some(delegated) => read.delegated(delegated.copy_read),
+            None => read,
+        };
+        let answer = drive(read, self.state.as_ref()).await;
+        answer.map_err(|failure| self.member_error(failure))
+    }
+
+    /// What a local `error` for `key` leaves: a missing key goes on to its coordinator, since
+    /// this copy may lag behind it. See [`MemberReadOperation::after_miss`].
+    pub(in crate::s3::service) async fn missed_read(
+        &self,
+        extensions: &http::Extensions,
+        (user, bucket): (&UserAccess, Option<&BucketInfo>),
+        key: MemberKey,
         error: &S3Error,
-    ) -> S3Result<Option<Forward>> {
+    ) -> S3Result<MemberRead> {
         let missing = matches!(
             error.code(),
             S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion
         );
         let binding = bucket.and_then(|bucket| bucket.distribution.as_ref());
         let Some(binding) = binding.filter(|_| missing) else {
-            return Ok(None);
+            return Ok(MemberRead::Local(None));
         };
-        let coordinator = self.range_coordinator(binding, key).await?;
-        match extensions.get::<DelegatedRequest>() {
-            Some(_) => Ok(None),
-            None => Ok(coordinator),
-        }
-    }
-
-    /// Answers a GET or HEAD of `key` at its holder, coordinator first. While the coordinator
-    /// or this node's fenced view cannot answer a current read, a copy answers, marked stale.
-    pub(in crate::s3::service) async fn answer_read(
-        &self,
-        extensions: &http::Extensions,
-        user: &UserAccess,
-        bucket: Option<&BucketInfo>,
-        (key, pinned): (&str, bool),
-        request: impl Fn() -> ForwardRequest,
-    ) -> S3Result<ReadAnswer> {
-        let error = match self.read_holder(extensions, bucket, (key, pinned)).await {
-            Ok(None) => return Ok(ReadAnswer::Local(None)),
-            Ok(Some(holder)) => match self.read_object(user, &holder, &request).await {
-                Ok(response) => return Ok(ReadAnswer::Forwarded(response, None)),
-                Err(error) => error,
-            },
-            Err(error) => error,
-        };
-        // A delegated read's refusal goes back to its sender, which asks the copies itself.
         let delegated = extensions.get::<DelegatedRequest>().is_some();
-        let binding = bucket.and_then(|bucket| bucket.distribution.as_ref());
-        let Some(binding) = binding.filter(|_| !pinned && !delegated && unreachable(&error)) else {
-            return Err(error);
-        };
-        let readers = drive(copy_readers(binding, key), self.state.as_ref()).await;
-        let (range_id, here, copies) = readers.map_err(|error| guard_error(&error))?;
-        if here {
-            return Ok(ReadAnswer::Local(Some(range_id)));
-        }
-        for node_id in copies {
-            let forward = Forward {
-                set_id: binding.set_id,
-                range_id,
-                node_id,
-            };
-            let mut copy_read = request();
-            (copy_read.headers).push((COPY_READ_HEADER.to_string(), "1".to_string()));
-            match self.forward_read(user, &forward, copy_read).await {
-                Ok(response) => return Ok(ReadAnswer::Forwarded(response, Some(range_id))),
-                Err(failed) if unreachable(&failed) => {}
-                Err(failed) => return Err(stale_error(failed, range_id)),
-            }
-        }
-        Err(error)
-    }
-
-    /// A GET of `key` for a caller another surface verified, answered as an S3 GET would be: a
-    /// current version by the range's coordinator, a pinned one by any holder of its records.
-    pub(crate) async fn member_get(
-        &self,
-        user: &UserAccess,
-        (bucket, info): (&str, &BucketInfo),
-        key: &str,
-        version: Option<Ulid>,
-    ) -> S3Result<ReadAnswer> {
-        let query = version.map(|version| format!("versionId={version}"));
-        let headers = HeaderMap::new();
-        let request = || {
-            read_request(
-                Method::GET,
-                "GetObject",
-                bucket,
-                key,
-                query.as_deref(),
-                &headers,
-            )
-        };
-        let pinned = (key, version.is_some());
-        (self.answer_read(&http::Extensions::new(), user, Some(info), pinned, request)).await
-    }
-
-    /// A HEAD of `key` answered as `member_get` answers a GET. A holder's HEAD miss has no
-    /// body to name its code, so it becomes the missing key a local miss is.
-    pub(crate) async fn member_head(
-        &self,
-        user: &UserAccess,
-        (bucket, info): (&str, &BucketInfo),
-        key: &str,
-    ) -> S3Result<ReadAnswer> {
-        let headers = HeaderMap::new();
-        let request = || read_request(Method::HEAD, "HeadObject", bucket, key, None, &headers);
-        let extensions = http::Extensions::new();
-        let answer = self.answer_read(&extensions, user, Some(info), (key, false), request);
-        answer.await.map_err(|error| match error.status_code() {
-            Some(http::StatusCode::NOT_FOUND) => s3s::s3_error!(NoSuchKey),
-            _ => error,
-        })
-    }
-
-    /// Sends a GET or HEAD to the chosen holder; a replica's miss goes on to the coordinator.
-    pub(in crate::s3::service) async fn read_object(
-        &self,
-        user: &UserAccess,
-        (holder, coordinator): &(Forward, NodeId),
-        request: impl Fn() -> ForwardRequest,
-    ) -> S3Result<reqwest::Response> {
-        match self.forward_read(user, holder, request()).await {
-            Err(error) if replica_miss(&error, holder, *coordinator) => {
-                let coordinator = Forward {
-                    node_id: *coordinator,
-                    ..holder.clone()
-                };
-                self.forward_read(user, &coordinator, request()).await
-            }
-            answer => answer,
-        }
+        let read = self
+            .member_operation(user, binding, key)
+            .after_miss(delegated);
+        let answer = drive(read, self.state.as_ref()).await;
+        answer.map_err(|failure| self.member_error(failure))
     }
 
     /// Sends one read to the chosen holder; a holder that fails is skipped for a while.
@@ -440,25 +322,32 @@ impl ArunaS3Service {
 
 #[cfg(test)]
 mod tests {
+    use super::super::list::unreachable;
     use super::*;
 
-    fn holder_answer(status: u16) -> reqwest::Response {
-        let response = http::Response::builder()
-            .status(status)
-            .header("content-length", "3")
-            .header("content-range", "bytes 0-2/10")
-            .header("etag", "\"abc\"")
-            .header("last-modified", "Sat, 24 Oct 2026 10:00:00 GMT")
-            .header("x-amz-version-id", "01JMETADATA0123456789ABCDE")
-            .header("x-amz-meta-origin", "spire")
-            .header(
+    fn holder_answer(status: u16) -> MemberBody {
+        let headers = [
+            ("content-length", "3"),
+            ("content-range", "bytes 0-2/10"),
+            ("etag", "\"abc\""),
+            ("last-modified", "Sat, 24 Oct 2026 10:00:00 GMT"),
+            ("x-amz-version-id", "01JMETADATA0123456789ABCDE"),
+            ("x-amz-meta-origin", "spire"),
+            (
                 "x-amz-checksum-sha256",
                 "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
-            )
-            .header("x-amz-checksum-type", "FULL_OBJECT")
-            .body("abc")
-            .unwrap();
-        reqwest::Response::from(response)
+            ),
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+        ];
+        let bytes = bytes::Bytes::from_static(b"abc");
+        let chunks = futures_util::stream::iter([Ok::<_, std::io::Error>(bytes)]);
+        MemberBody {
+            status,
+            headers: (headers.into_iter())
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            stream: aruna_core::stream::BackendStream::new(chunks),
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -472,7 +361,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(unreachable(&error));
-        let answer = answer_within(&forward, async { Ok(holder_answer(200)) }).await;
+        let answered = http::Response::builder().status(200).body("abc").unwrap();
+        let answered = async { Ok(reqwest::Response::from(answered)) };
+        let answer = answer_within(&forward, answered).await;
         assert_eq!(answer.unwrap().status(), 200);
     }
 
@@ -482,7 +373,7 @@ mod tests {
         headers.insert("range", "bytes=0-2".parse().unwrap());
         headers.insert("authorization", "AWS4-HMAC-SHA256 secret".parse().unwrap());
         let query = Some("versionId=01JMETADATA0123456789ABCDE&X-Amz-Signature=secret");
-        let request = read_request(Method::GET, "GetObject", "spire", "a.fa", query, &headers);
+        let request = member_key(false, ("spire", "a.fa", None), query, &headers);
         assert_eq!(
             request.query.as_deref(),
             Some("versionId=01JMETADATA0123456789ABCDE")
@@ -491,7 +382,6 @@ mod tests {
             request.headers,
             vec![("range".to_string(), "bytes=0-2".to_string())]
         );
-        assert!(matches!(request.body, ForwardBody::Empty));
     }
 
     #[test]
@@ -523,22 +413,6 @@ mod tests {
             output.checksum_type.as_ref().map(ChecksumType::as_str),
             Some("FULL_OBJECT")
         );
-    }
-
-    #[test]
-    fn miss_asks_coordinator() {
-        let node = |seed| iroh::SecretKey::from_bytes(&[seed; 32]).public();
-        let holder = Forward {
-            set_id: ulid::Ulid::from_bytes([1; 16]),
-            range_id: ulid::Ulid::from_bytes([2; 16]),
-            node_id: node(3),
-        };
-        let missing = s3s::s3_error!(NoSuchKey);
-        assert!(replica_miss(&missing, &holder, node(4)));
-        // The coordinator's own miss is final, and other errors are not a lagging copy.
-        assert!(!replica_miss(&missing, &holder, node(3)));
-        let denied = s3s::s3_error!(AccessDenied);
-        assert!(!replica_miss(&denied, &holder, node(4)));
     }
 
     #[test]

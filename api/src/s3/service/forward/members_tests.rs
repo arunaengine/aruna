@@ -1524,15 +1524,14 @@ async fn copy_read_marked() {
         range_id: snapshot.config.ranges[1].range_id,
         node_id: members.nodes[2].node_id(),
     };
-    let read = || {
-        super::reads::read_request(
-            Method::GET,
-            "GetObject",
-            BUCKET,
-            "k/1",
-            None,
-            &HeaderMap::new(),
-        )
+    let read = || super::ForwardRequest {
+        method: Method::GET,
+        operation: "GetObject",
+        bucket: BUCKET.to_string(),
+        key: "k/1".to_string(),
+        query: None,
+        headers: Vec::new(),
+        body: super::ForwardBody::Empty,
     };
     let service = &members.nodes[0].service;
     let error = service
