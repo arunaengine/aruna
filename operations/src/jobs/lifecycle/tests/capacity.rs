@@ -27,8 +27,8 @@ use crate::jobs::lifecycle::reservation::{
 use crate::jobs::lifecycle::stage::read_targets;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::replication::protocol::BaoReadTarget;
-use crate::storage_read::iter_prefix_page;
 use crate::tests::records::{Family, REALM, context, node};
+use aruna_storage::scan::iter_prefix_page;
 
 fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {

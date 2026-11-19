@@ -867,7 +867,7 @@ async fn file_keys(
     let mut keys: Vec<String> = row.and_then(|row| row.key).into_iter().collect();
     keys.extend(rule.aruna_key(path));
     // A pending write to the path names its key too.
-    let intents = aruna_operations::storage_read::iter_prefix_page(
+    let intents = aruna_storage::scan::iter_prefix_page(
         &context.storage_handle,
         aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE,
         Some(aruna_core::structs::storage::backend_import::intent_prefix(
@@ -890,7 +890,7 @@ async fn file_keys(
         keys.push(intent.key);
     }
     // A pending write to the path names its key too.
-    let intents = aruna_operations::storage_read::iter_prefix_page(
+    let intents = aruna_storage::scan::iter_prefix_page(
         &context.storage_handle,
         aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE,
         Some(aruna_core::structs::storage::backend_import::intent_prefix(

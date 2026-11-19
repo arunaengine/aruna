@@ -316,7 +316,7 @@ async fn commit_releases_owner() {
     assert_eq!(record.phase, GroupDeletePhase::Deleted);
     assert_eq!(record.event.as_deref(), Some(&deleted));
     assert_eq!(fixture.commit(vec![proof]).await.unwrap(), deleted);
-    let (outbox, _) = crate::storage_read::iter_prefix_page(
+    let (outbox, _) = aruna_storage::scan::iter_prefix_page(
         &fixture.context.storage_handle,
         SYNC_OUTBOX_KEYSPACE,
         None,

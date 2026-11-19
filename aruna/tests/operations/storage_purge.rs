@@ -1264,7 +1264,7 @@ async fn purge_releases_copies() {
     let mut released = releases(storage).await;
     released.sort_by_key(|file| file.backend_path.clone());
     assert_eq!(released, [location, copy]);
-    let (left, _) = aruna_operations::storage_read::iter_prefix_page(
+    let (left, _) = aruna_storage::scan::iter_prefix_page(
         storage,
         aruna_core::keyspaces::RENAMED_ROW_KEYSPACE,
         None,

@@ -667,7 +667,6 @@ mod tests {
     use crate::jobs::store::test_calls::insert_job;
     use crate::jobs::store::test_calls::park_job;
     use crate::jobs::store::test_calls::{claim_job, read_job_record};
-    use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::execution::job::JobPayload;
@@ -675,6 +674,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::HashIndex;
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_storage::scan::iter_prefix_page;
     use std::future::Future;
     use ulid::Ulid;
 

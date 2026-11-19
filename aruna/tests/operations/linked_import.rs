@@ -59,7 +59,7 @@ use aruna_operations::s3::imports::discovery::{
     AuthorizedPreviewOperation, FileOutcome, SetDiscoveryOperation,
 };
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_operations::storage_read::iter_prefix_page;
+use aruna_storage::scan::iter_prefix_page;
 use aruna_storage::storage;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

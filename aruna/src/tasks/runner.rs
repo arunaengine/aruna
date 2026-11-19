@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use super::job_dispatch::dispatch_payload;
+use super::dispatch::dispatch_payload;
 use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::effect_adapters::job::{JobHost, with_job_host};
 use aruna_operations::jobs::context::ExternalReconciler;

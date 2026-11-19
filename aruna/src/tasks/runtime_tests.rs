@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::tasks::job_runner::{handle_panic, run_job};
+use crate::tasks::runner::{handle_panic, run_job};
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;

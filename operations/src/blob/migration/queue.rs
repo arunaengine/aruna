@@ -2186,7 +2186,7 @@ mod tests {
         let scan = SourceScan::new("b", &record).unwrap();
         let counted = drive(ScanOperation(scan), &context).await;
         let reclaimed = drive(ReclaimUploadsOperation::new(&record), &context).await;
-        let (left, _) = crate::storage_read::iter_prefix_page(
+        let (left, _) = aruna_storage::scan::iter_prefix_page(
             storage,
             ABE_PENDING_KEYSPACE,
             None,

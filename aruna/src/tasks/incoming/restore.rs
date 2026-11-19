@@ -230,7 +230,7 @@ async fn install_task_handler(
 ) -> TaskQueues {
     let handler_context = context.clone();
     if context.compute_handle.is_some() {
-        jobs_runtime.set_reconciler(crate::tasks::job_runner::ComputeReconciler::new(
+        jobs_runtime.set_reconciler(crate::tasks::runner::ComputeReconciler::new(
             context.clone(),
             Arc::downgrade(&jobs_runtime),
         ));

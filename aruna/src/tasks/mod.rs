@@ -3,12 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub(crate) mod dispatch;
 pub mod incoming;
-pub(crate) mod job_dispatch;
 pub mod job_host;
-pub mod job_runner;
 pub mod metadata_sweeps;
 pub mod rocrate_jobs;
+pub mod runner;
 pub mod task_persistence;
 
 #[cfg(test)]

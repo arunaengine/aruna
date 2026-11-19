@@ -92,9 +92,7 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
         }
         JobPayload::StoragePurge(spec) => Box::pin(run_storage_purge(ctx, spec, false)).await,
         JobPayload::StoragePurgeFiles(spec) => Box::pin(run_storage_purge(ctx, spec, true)).await,
-        JobPayload::CopyObject(spec) => {
-            Box::pin(aruna_operations::jobs::copy::run_copy_job(ctx, spec)).await
-        }
+        JobPayload::CopyObject(spec) => Box::pin(super::job_host::run_copy_job(ctx, spec)).await,
         JobPayload::BackendImport(spec) => Box::pin(run_backend_import(ctx, spec)).await,
         JobPayload::RegisterIdentifiers(spec) => {
             let queued_at_ms = ctx.job_id.timestamp_ms();

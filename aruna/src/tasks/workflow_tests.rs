@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::tasks::job_runner::{execution_host, resume_attempt as run_resume, run_execution_job};
-use crate::tasks::job_runner::{run_wiring, under_lease};
+use crate::tasks::runner::{execution_host, resume_attempt as run_resume, run_execution_job};
+use crate::tasks::runner::{run_wiring, under_lease};
 use aruna_compute::ExecutorBackend;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::session::{Session, SessionConfig};

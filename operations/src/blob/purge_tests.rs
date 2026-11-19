@@ -209,7 +209,7 @@ async fn plans_until_ended() {
         .await
         .unwrap();
     let works = || async {
-        let page = crate::storage_read::iter_prefix_page(
+        let page = aruna_storage::scan::iter_prefix_page(
             &context.storage_handle,
             BLOB_CLEANUP_KEYSPACE,
             None,

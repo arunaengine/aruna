@@ -10,7 +10,7 @@ use crate::shared;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna::tasks::job_runner::{ComputeReconciler, run_execution_job};
+use aruna::tasks::runner::{ComputeReconciler, run_execution_job};
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::id::NodeId;

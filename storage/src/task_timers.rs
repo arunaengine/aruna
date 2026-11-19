@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
 use aruna_core::task::{PersistedTaskTimer, TaskEffect, TaskKey};
 use byteview::ByteView;

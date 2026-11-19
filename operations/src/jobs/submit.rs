@@ -850,7 +850,7 @@ mod tests {
     }
 
     async fn count_keyspace(context: &DriverContext, key_space: &str) -> usize {
-        crate::storage_read::iter_prefix_page(
+        aruna_storage::scan::iter_prefix_page(
             &context.storage_handle,
             key_space,
             None,

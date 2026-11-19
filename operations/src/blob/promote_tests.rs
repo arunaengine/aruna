@@ -886,7 +886,7 @@ pub(crate) mod received {
             BLOB_LOCATIONS_KEYSPACE,
             PATHS_INDEX_KEYSPACE,
         ] {
-            let (rows, _) = crate::storage_read::iter_prefix_page(
+            let (rows, _) = aruna_storage::scan::iter_prefix_page(
                 &context.storage_handle,
                 space,
                 None,

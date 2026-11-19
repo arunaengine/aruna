@@ -103,7 +103,7 @@ HEADER_EXCEPTIONS = {
     "blob/tests/fixtures/apache_table.html": "copied index page; the parser test needs its bytes",
     "blob/tests/fixtures/autoindex_nginx.html": "copied index page; the parser test needs its bytes",
     "blob/tests/fixtures/non_index.html": "copied page; the rejection test needs its bytes",
-    "operations/tests/fixtures/ELN_README.md": "copied fixture; its bytes must stay unchanged",
+    "aruna/tests/operations/fixtures/ELN_README.md": "copied fixture; its bytes must stay unchanged",
 }
 
 # Folders whose files carry no repository header, each with its reason.

@@ -258,7 +258,7 @@ async fn import(keys: Vec<String>, prefixes: &[(&str, &str)]) -> u64 {
     };
     assert_eq!(failed_items, 0);
     let prefix = ctx.job_id.to_bytes().to_vec().into();
-    let (rows, _) = crate::storage_read::iter_prefix_page(
+    let (rows, _) = aruna_storage::scan::iter_prefix_page(
         &ctx.driver.storage_handle,
         STAGING_STATE_KEYSPACE,
         Some(prefix),
