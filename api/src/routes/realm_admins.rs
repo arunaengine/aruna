@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aruna_core::UserId;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::realm::set_admin::{SetAdminConfig, SetAdminError, SetAdminOperation};
 use axum::Json;
 use axum::extract::{Path, State};

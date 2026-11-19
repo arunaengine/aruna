@@ -7,8 +7,8 @@ use crate::error::{ServerError, ServerSetupError};
 use crate::https::check_host;
 use crate::https::listener::CombinedListener;
 use crate::server::state::{PortalRuntimeState, ServerState};
+use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
-use aruna_operations::driver::drive;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -326,8 +326,8 @@ mod tests {
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_operations::document_repository::GetConfigOperation;
-    use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -369,7 +369,7 @@ mod tests {
                 NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
+                aruna_drivers::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

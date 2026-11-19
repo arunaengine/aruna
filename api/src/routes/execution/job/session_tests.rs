@@ -41,8 +41,8 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::format::Compression;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_storage::{FjallStorage, StorageHandle};
 use async_trait::async_trait;

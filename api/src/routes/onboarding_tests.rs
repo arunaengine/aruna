@@ -26,8 +26,8 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StaticRealmEndpoint,
 };
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::onboarding::finalize_bootstrap::BootstrapFinalizeError;
 use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
@@ -124,7 +124,7 @@ async fn setup_management_state() -> (
             NodeCapabilities::management_node(realm_signing_key).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );

@@ -11,8 +11,8 @@ use aruna_core::realm_vault::RealmVaultKey;
 use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
+use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
-use aruna_operations::driver::drive;
 use aruna_operations::notifications::email::{RefreshMailOperation, check_smtp};
 use aruna_operations::realm::set_email::{
     EmailInput, SetEmailConfig, SetEmailError, SetEmailOperation,

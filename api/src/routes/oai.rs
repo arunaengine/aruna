@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -17,7 +17,7 @@ use utoipa_axum::routes;
 
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::harvest::oai_pmh::mapping::jsonld_to_dc;
 use aruna_operations::harvest::oai_pmh::request::format_from;
 use aruna_operations::metadata::api::export_types::{

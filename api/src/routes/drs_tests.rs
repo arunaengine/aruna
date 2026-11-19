@@ -27,7 +27,7 @@ use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::{NodeId, UserId};
-use aruna_operations::testing::test_context;
+use aruna_drivers::testing::test_context;
 use axum::Extension;
 use axum::body::to_bytes;
 use axum::extract::{ConnectInfo, Path, State};

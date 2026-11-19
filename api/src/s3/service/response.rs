@@ -12,7 +12,7 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
 use aruna_core::user::validation::RESERVED_PREFIX;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::s3::multipart::complete::CompleteUploadResult;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteOutcome;
 use aruna_operations::s3::object::delete::{DeleteObjectError, DeleteObjectResult};

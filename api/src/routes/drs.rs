@@ -20,6 +20,7 @@ use aruna_core::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::{DriverContext, drive, drive_until};
 use aruna_operations::auth::error::token_grant;
 use aruna_operations::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_operations::distribution::resolve::{
@@ -29,7 +30,6 @@ use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, redeem_ticket, unsigned_ticket,
 };
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::{DriverContext, drive, drive_until};
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use aruna_operations::replication::protocol::LocationSummaryRequest;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};

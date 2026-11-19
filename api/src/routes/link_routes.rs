@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::job_service::cancel_owned_job;
 use aruna_core::repository::{LinkPatch, LinkStatus, RepositoryLink};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::repository::connector::ConnectorViewOperation;
 use aruna_operations::jobs::repository::invenio::remote::RemoteStateOperation;
 use aruna_operations::jobs::repository::link_queue::{

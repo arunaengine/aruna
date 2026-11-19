@@ -20,7 +20,7 @@ async fn snapshot_of(
     binding: &aruna_core::structs::storage::distribution::DistributionBinding,
 ) -> aruna_core::structs::storage::distribution::DistributionSnapshot {
     let view = aruna_operations::distribution::routing::bound_view(binding);
-    let view = aruna_operations::driver::drive(view, service.state.as_ref());
+    let view = aruna_drivers::driver::drive(view, service.state.as_ref());
     view.await.unwrap().head.snapshot
 }
 
@@ -375,7 +375,7 @@ async fn origin_of(
 ) -> Option<aruna_core::structs::storage::origin::VersionOrigin> {
     let node = &members.nodes[on];
     let local = (members.realm_id, node.node_id());
-    let view = aruna_operations::driver::drive(
+    let view = aruna_drivers::driver::drive(
         aruna_operations::s3::object::origin::ReadOriginOperation::new(local.0, BUCKET, key, None),
         &node.context,
     )
@@ -803,7 +803,7 @@ async fn hidden_link(members: &Members, on: usize, key: &str) {
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    aruna_operations::driver::drive(
+    aruna_drivers::driver::drive(
         WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
         &node.context,
     )
@@ -1369,7 +1369,7 @@ async fn upload_markers_tagged() {
     let mut plain = node.bucket().await;
     plain.distribution = None;
     let create = CreateBucketOperation::new("plain".to_string(), plain.clone());
-    aruna_operations::driver::drive(create, &node.context)
+    aruna_drivers::driver::drive(create, &node.context)
         .await
         .unwrap();
     let input = s3s::dto::CreateMultipartUploadInput {

@@ -22,7 +22,7 @@ use aruna_core::structs::execution::notification_watch::{
     parse_watch_path, watch_resource_path,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::notifications::dispatch::NotificationDispatchError;
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_MAX_IDS;

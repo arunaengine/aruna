@@ -13,7 +13,7 @@ use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::{MANAGEMENT_URL_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_tasks::TaskHandle;
@@ -388,7 +388,7 @@ async fn write_row(state: &ServerState, key_space: &str, key: Vec<u8>, value: Ve
 /// A device that is not the holder and knows the holder's address from its installation.
 async fn device_relay(holder_url: String, realm_id: RealmId) -> (TempDir, Router, String) {
     let (dir, storage) = test_storage();
-    let context = Arc::new(aruna_operations::testing::test_context(storage));
+    let context = Arc::new(aruna_drivers::testing::test_context(storage));
     let node_id = iroh::SecretKey::generate().public();
     let owner = UserId::local(Ulid::generate(), realm_id);
     let capabilities = NodeCapabilities::user_node(realm_id).unwrap();

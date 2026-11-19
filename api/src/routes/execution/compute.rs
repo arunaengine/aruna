@@ -13,9 +13,9 @@ use aruna_core::structs::placement::compute_config::{
     GroupComputeQuota, LocationLink, RealmComputeConfig,
 };
 use aruna_core::structs::placement::policy::document::policy_admin_path;
+use aruna_drivers::driver::drive;
+use aruna_drivers::driver::node_facts;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
-use aruna_operations::driver::drive;
-use aruna_operations::driver::node_facts;
 use aruna_operations::node::info::flows::{GroupDemandOperation, OperatorDrainOperation};
 use aruna_operations::realm::set_compute::{
     SetComputeConfig, SetComputeError, SetComputeOperation,

@@ -24,9 +24,9 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::StoredFormat;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::http::StatusCode;
@@ -134,7 +134,7 @@ async fn update_needs_write() {
     // The connector's group is another owner's; the caller only reads it.
     let shared = Ulid::generate();
     grant_reader(&state, user, shared).await;
-    let connector_id = aruna_operations::driver::drive(
+    let connector_id = aruna_drivers::driver::drive(
         aruna_operations::harvest::create_connector::CreateConnectorOperation::new(
             aruna_operations::harvest::create_connector::CreateConnectorInput {
                 group_id: shared,
@@ -446,7 +446,7 @@ async fn seed_upload(
         expires_at_ms,
         claimed_by: None,
     };
-    aruna_operations::driver::drive(
+    aruna_drivers::driver::drive(
         aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
         &state.get_ctx(),
     )

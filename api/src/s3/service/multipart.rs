@@ -4,7 +4,7 @@
 
 use super::ArunaS3Service;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use s3s::{S3Result, s3_error};
 

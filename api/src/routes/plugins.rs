@@ -9,8 +9,8 @@ use aruna_core::plugins::{MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::plugins::artifacts::ArtifactError;
 use aruna_operations::plugins::copies::{MemoryPermit, reserve};
 use aruna_operations::plugins::publish::{
@@ -292,7 +292,7 @@ mod tests {
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_operations::testing::test_context;
+    use aruna_drivers::testing::test_context;
     use ulid::Ulid;
 
     /// An upload whose body fails the test as soon as anything reads it.

@@ -26,8 +26,8 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_drivers::testing::test_context;
 use aruna_operations::sync::mirror_repair::{DrainRepairsOperation, SyncMirrorRecord};
-use aruna_operations::testing::test_context;
 use tempfile::TempDir;
 
 fn test_node(seed: u8) -> NodeId {
@@ -187,7 +187,7 @@ async fn decrypting_source(state: &ServerState, user: UserId) {
 #[tokio::test]
 async fn decrypting_copy_consent() {
     use crate::routes::storage::blobs::{ReplicateBlobRequest, replicate_blob};
-    use aruna_operations::driver::drive;
+    use aruna_drivers::driver::drive;
     use aruna_operations::replication::plaintext::{ConsentReadOperation, job_consent};
     use aruna_storage::scan::iter_prefix_page;
     let (_dir, state, auth, _) = test_state().await;
@@ -230,7 +230,7 @@ async fn decrypting_copy_consent() {
 
 #[tokio::test]
 async fn decrypting_sync_consent() {
-    use aruna_operations::driver::drive;
+    use aruna_drivers::driver::drive;
     use aruna_operations::replication::plaintext::ConsentReadOperation;
     let (_dir, state, auth, _) = test_state().await;
     decrypting_source(&state, auth.user_id).await;

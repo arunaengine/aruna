@@ -26,9 +26,9 @@ use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
 };
 use aruna_core::{NodeId, UserId};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::distribution::admit::{AdmitConfig, AdmitOperation};
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::get::GetBucketOperation;
 use tempfile::TempDir;

@@ -63,7 +63,7 @@ async fn fixture(limits: RoCrateLimits) -> Fixture {
         aruna_core::structs::identity::auth::NodeCapabilities::user_node(realm_id).unwrap(),
         false,
         None,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_drivers::jobs::runtime::JobsRuntime::new(),
     )
     .await
     .with_rocrate_limits(limits);

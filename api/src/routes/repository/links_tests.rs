@@ -15,7 +15,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
 use axum::Extension;
 use axum::http::StatusCode;
@@ -592,7 +592,7 @@ async fn unmet_link_findings() {
     let link = create(&linked, Some(linked.test.auth.clone()))
         .await
         .unwrap();
-    let mut stored = aruna_operations::driver::drive(
+    let mut stored = aruna_drivers::driver::drive(
         aruna_operations::jobs::repository::link_store::ReadLinkOperation::new(
             parse_document_id(&linked.document_id).unwrap(),
             Ulid::from_string(&link.link_id).unwrap(),
@@ -637,7 +637,7 @@ async fn admin_rights_limited() {
     let document_id = parse_document_id(&linked.document_id).unwrap();
     let link_id = Ulid::from_string(&link.link_id).unwrap();
     let context = linked.test.state.get_ctx();
-    let mut stored = aruna_operations::driver::drive(
+    let mut stored = aruna_drivers::driver::drive(
         aruna_operations::jobs::repository::link_store::ReadLinkOperation::new(
             document_id,
             link_id,

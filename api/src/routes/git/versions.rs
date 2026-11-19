@@ -8,7 +8,7 @@ use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::{CommitInfo, FileChange, FileChangeKind};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::git::GitError;
 use aruna_operations::git::changes::EntityChangeKind;
 use aruna_operations::git::changes::PropertyConflict;

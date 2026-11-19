@@ -34,7 +34,8 @@ use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::placement::record::{DocumentClass, PlacementScope};
 use aruna_core::structs::storage::usage::UsageCounters;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::test_context;
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
 use aruna_operations::placement::provision::AllocateBindingOperation;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
@@ -42,7 +43,6 @@ use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperat
 use aruna_operations::realm::get_nodes::RealmPresence;
 use aruna_operations::realm::mutate_placement::MutatePlacementError;
 use aruna_operations::realm::set_quota::SetQuotaError;
-use aruna_operations::testing::test_context;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use axum::body::Body;
@@ -435,7 +435,7 @@ async fn usage_counts_documents() {
             NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );
@@ -629,7 +629,7 @@ async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir
             NodeCapabilities::management_node(realm_signing_key).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );

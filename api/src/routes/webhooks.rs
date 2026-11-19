@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aruna_core::structs::execution::webhook::{WEBHOOK_EVENT, WebhookSubscription};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::notifications::webhook::{
     ReadWebhookOperation, RemoveWebhookOperation, SetWebhookOperation, WebhookError,
 };

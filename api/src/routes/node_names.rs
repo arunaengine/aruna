@@ -13,7 +13,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::NodeCoordinates;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::realm::node_name::{
     NameScope, NodeChange, NodeNameConfig, NodeNameError, NodeNameOperation,
 };

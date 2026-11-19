@@ -9,7 +9,7 @@ use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::notifications::dispatch::{InboxHolderOperation, NotificationDispatchError};
 use aruna_operations::notifications::holder::HolderRead;
 use aruna_operations::notifications::user_call::{

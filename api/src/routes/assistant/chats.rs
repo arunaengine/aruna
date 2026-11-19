@@ -9,11 +9,11 @@ use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{AssistantChatHead, AssistantChatTurn};
 use aruna_core::time::unix_timestamp_secs;
+use aruna_drivers::driver::drive;
 use aruna_operations::assistant::{
     ChatStoreError, DeleteChatOperation, ListChatOperation, ReadChatOperation, WriteChatOperation,
     WriteTurnOperation,
 };
-use aruna_operations::driver::drive;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

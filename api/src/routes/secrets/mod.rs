@@ -16,7 +16,7 @@ use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
 use aruna_core::secrets::{SecretFields, SecretKind, SecretName, SecretRecord, UseRule};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::secrets::owner::{
     OwnerChange, OwnerSecretError, OwnerSecretOperation, OwnerSecretsOperation,
 };

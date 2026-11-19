@@ -12,7 +12,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
-use aruna_operations::testing::test_context;
+use aruna_drivers::testing::test_context;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tempfile::TempDir;
