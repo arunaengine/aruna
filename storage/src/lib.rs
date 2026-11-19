@@ -6,6 +6,7 @@
 mod compaction;
 pub mod errors;
 pub mod key_index;
+pub mod queue_lag;
 pub mod snapshot;
 pub mod storage;
 pub mod task_timers;

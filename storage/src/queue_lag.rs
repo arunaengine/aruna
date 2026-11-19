@@ -13,10 +13,11 @@ use aruna_core::keyspaces::{
     REPLICATION_JOB_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use tracing::{info, warn};
 use ulid::Ulid;
+
+use crate::StorageHandle;
 
 const SCAN_SIZE: usize = 1_024;
 const SCAN_PAGE_LIMIT: usize = 8;

@@ -15,7 +15,7 @@ use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::shard::recovery::{RecoveryOutcome, RecoveryState, RecoveryStatus};
-use aruna_operations::tasks::queue_lag::{QueueLagReporter, QueueLagSnapshot};
+use aruna_storage::queue_lag::{QueueLagReporter, QueueLagSnapshot};
 use axum::Json;
 use axum::Router;
 use axum::extract::State;

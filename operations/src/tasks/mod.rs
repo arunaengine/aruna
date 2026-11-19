@@ -7,6 +7,5 @@ pub(crate) mod job_dispatch;
 pub mod job_host;
 pub mod job_runner;
 pub mod metadata_sweeps;
-pub mod queue_lag;
 pub mod rocrate_jobs;
 pub mod task_persistence;
