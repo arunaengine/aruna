@@ -238,7 +238,7 @@ pub async fn upload_rocrate(
             "RO-Crate upload capacity is temporarily exhausted".to_string(),
         ));
     };
-    let expires_at_ms = aruna_core::time::unix_timestamp_millis()
+    let expires_at_ms = aruna_clock::unix_timestamp_millis()
         .checked_add(state.rocrate_limits().upload_retention_ms)
         .ok_or_else(|| ServerError::InternalError("upload expiry overflow".to_string().into()))?;
     let owner_node_url = timeout_at(deadline, owner_node_url(&state))
@@ -647,7 +647,7 @@ async fn fast_source_check(
             } else {
                 false
             };
-            if !reclaimed && record.expires_at_ms <= aruna_core::time::unix_timestamp_millis() {
+            if !reclaimed && record.expires_at_ms <= aruna_clock::unix_timestamp_millis() {
                 return Err(ServerError::BadRequestReason("upload expired".to_string()));
             }
             if record.size > state.rocrate_limits().import_source_bytes {

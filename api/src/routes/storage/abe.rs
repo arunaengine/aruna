@@ -77,7 +77,7 @@ pub(crate) async fn drive_key(
 ) -> Result<KeyResult, KeyError> {
     let seed = Ulid::generate().to_bytes();
     let build = || {
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
         KeyOperation::new(bucket.clone(), auth.clone(), node, action.clone(), now)
     };
     drive_retry(build, context, &seed).await

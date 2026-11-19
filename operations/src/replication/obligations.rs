@@ -832,6 +832,7 @@ fn relationship_jobs(
     upstream_sources: &[ArunaArn],
     page: &RelationshipPage,
     cursor: &mut LiveReplicationContinuation,
+    now_ms: u64,
 ) -> Option<Vec<BlobJobRecord>> {
     let mut jobs = Vec::with_capacity(REPLICATION_JOB_LIMIT);
     let mut found = false;
@@ -859,7 +860,7 @@ fn relationship_jobs(
             relationship.clone(),
             obligation.origin.as_ref(),
             upstream_sources,
-            aruna_core::time::unix_timestamp_millis(),
+            now_ms,
             ulid::Ulid::generate(),
         );
         let job = job.map(|mut job| match obligation.reference_advance {
@@ -914,6 +915,7 @@ pub(super) struct WriteJobsOperation {
     cursor: LiveReplicationContinuation,
     queued: usize,
     step: LiveStep,
+    now_ms: u64,
 }
 
 fn no_progress() -> LiveRepairWrite {
@@ -941,6 +943,7 @@ impl WriteJobsOperation {
             cursor: obligation.continuation.clone().unwrap_or_default(),
             queued: 0,
             step: LiveStep::Inbound,
+            now_ms: 0,
         }
     }
 
@@ -991,6 +994,7 @@ impl WriteJobsOperation {
                 &self.upstream_sources,
                 page,
                 &mut self.cursor,
+                self.now_ms,
             );
             let Some(planned) = planned else {
                 return Ok(Next::Done(no_progress()));
@@ -1007,6 +1011,10 @@ impl WriteJobsOperation {
 impl Operation for WriteJobsOperation {
     type Output = LiveRepairWrite;
     type Error = BlobQueueError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Turn<LiveRepairWrite> {
         let obligation = &self.obligation;

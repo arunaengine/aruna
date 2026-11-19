@@ -195,7 +195,7 @@ fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Eve
 pub(super) fn note_contact(peer: NodeId, context: &DriverContext) -> Event {
     if let Some(net) = &context.net_handle {
         net.peer_contacts()
-            .note(peer, aruna_core::time::unix_timestamp_millis());
+            .note(peer, aruna_clock::unix_timestamp_millis());
     }
     Event::Net(NetEvent::PeerContact)
 }

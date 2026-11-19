@@ -16,13 +16,13 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use aruna_blob::egress::EgressGuard;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::{
     FederationError, RealmTotals, Registration, Signed, Withdrawal, valid_federation_url,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::time::unix_timestamp_secs;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};

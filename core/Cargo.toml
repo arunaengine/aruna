@@ -66,8 +66,5 @@ pbkdf2 = { workspace = true }
 argon2 = { workspace = true }
 x25519-dalek = { workspace = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-nix = { workspace = true }
-
 [dev-dependencies]
 proptest = { workspace = true }

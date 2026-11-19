@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::repository::{
     RemoteState, RepositoryCredential, RepositoryDestination, RepositoryLink, RepositoryQuery,
@@ -12,7 +13,6 @@ use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{JobError, JobId};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::persistent_id::RegisterIdentifiersOperation;

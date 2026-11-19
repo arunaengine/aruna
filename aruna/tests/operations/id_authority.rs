@@ -500,7 +500,7 @@ async fn owner_cannot_withdraw() -> TestResult<()> {
         document_id,
         owner,
         "test denial".to_string(),
-        aruna_core::time::unix_timestamp_millis(),
+        aruna_clock::unix_timestamp_millis(),
         Some(realm.bearer_for(owner)),
     )
     .await;
@@ -524,7 +524,7 @@ async fn owner_cannot_withdraw() -> TestResult<()> {
         never_created,
         owner,
         "test denial".to_string(),
-        aruna_core::time::unix_timestamp_millis(),
+        aruna_clock::unix_timestamp_millis(),
         Some(realm.bearer_for(owner)),
     )
     .await;
@@ -801,7 +801,7 @@ async fn mint_routed(
                 realm.realm_id,
                 document_id,
                 realm.user_id,
-                aruna_core::time::unix_timestamp_millis(),
+                aruna_clock::unix_timestamp_millis(),
                 Some(realm.bearer_token()),
             )
             .await
@@ -837,7 +837,7 @@ async fn withdraw_routed(
                 document_id,
                 realm.user_id,
                 "test administrator withdrawal".to_string(),
-                aruna_core::time::unix_timestamp_millis(),
+                aruna_clock::unix_timestamp_millis(),
                 Some(realm.bearer_token()),
             )
             .await

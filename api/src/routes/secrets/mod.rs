@@ -11,11 +11,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::compute::Secret;
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
 use aruna_core::secrets::{SecretFields, SecretKind, SecretName, SecretRecord, UseRule};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
 use aruna_operations::secrets::owner::{
     OwnerChange, OwnerSecretError, OwnerSecretOperation, OwnerSecretsOperation,

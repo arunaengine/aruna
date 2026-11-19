@@ -17,6 +17,7 @@ autotests = false
 test-hooks = []
 
 [dependencies]
+aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
 aruna-storage = { workspace = true }
 blake3 = { workspace = true }

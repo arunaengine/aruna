@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::metadata_calls::route_metadata_update;
 use aruna::tasks::incoming::OutboxDrainer;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
 use aruna_core::UserId;
@@ -33,7 +34,6 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::time::unix_timestamp_secs;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
@@ -139,7 +139,7 @@ async fn device_drain_publishes() -> Result<(), Box<dyn std::error::Error>> {
         "datasets/forwarded".to_string(),
         true,
         draft_crate(),
-        aruna_core::time::unix_timestamp_millis(),
+        aruna_clock::unix_timestamp_millis(),
     );
     drive(
         EnqueueDraftOperation::new(EnqueueDraftInput {
@@ -195,7 +195,7 @@ async fn drains_past_terminal() -> Result<(), Box<dyn std::error::Error>> {
             format!("datasets/queued-{index}"),
             true,
             draft_crate(),
-            aruna_core::time::unix_timestamp_millis(),
+            aruna_clock::unix_timestamp_millis(),
         );
         if index <= PUBLISH_PAGE_SIZE {
             entry.state = PublishState::Published {

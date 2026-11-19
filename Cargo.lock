@@ -323,6 +323,7 @@ dependencies = [
  "aruna-api",
  "aruna-blob",
  "aruna-cli",
+ "aruna-clock",
  "aruna-compute",
  "aruna-core",
  "aruna-drivers",
@@ -397,6 +398,7 @@ version = "3.0.0-alpha.207"
 dependencies = [
  "ahash",
  "aruna-blob",
+ "aruna-clock",
  "aruna-compute",
  "aruna-core",
  "aruna-drivers",
@@ -467,6 +469,7 @@ dependencies = [
 name = "aruna-blob"
 version = "3.0.0-alpha.207"
 dependencies = [
+ "aruna-clock",
  "aruna-core",
  "aruna-kpabe",
  "aruna-net",
@@ -548,9 +551,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-clock"
+version = "3.0.0-alpha.207"
+dependencies = [
+ "aruna-core",
+ "nix",
+ "ulid 3.0.0",
+]
+
+[[package]]
 name = "aruna-compute"
 version = "3.0.0-alpha.207"
 dependencies = [
+ "aruna-clock",
  "aruna-core",
  "async-trait",
  "blake3",
@@ -617,7 +630,6 @@ dependencies = [
  "iroh",
  "irokle",
  "md5",
- "nix",
  "opentelemetry",
  "oxrdf",
  "parking_lot",
@@ -653,6 +665,7 @@ dependencies = [
  "aruna",
  "aruna-api",
  "aruna-blob",
+ "aruna-clock",
  "aruna-core",
  "aruna-drivers",
  "aruna-net",
@@ -695,6 +708,7 @@ name = "aruna-drivers"
 version = "3.0.0-alpha.207"
 dependencies = [
  "aruna-blob",
+ "aruna-clock",
  "aruna-compute",
  "aruna-core",
  "aruna-graph",
@@ -780,6 +794,7 @@ dependencies = [
 name = "aruna-net"
 version = "3.0.0-alpha.207"
 dependencies = [
+ "aruna-clock",
  "aruna-core",
  "aruna-storage",
  "async-trait",
@@ -953,6 +968,7 @@ name = "aruna-registry"
 version = "3.0.0-alpha.207"
 dependencies = [
  "aruna-blob",
+ "aruna-clock",
  "aruna-core",
  "axum",
  "ed25519-dalek 3.0.0",
@@ -982,6 +998,7 @@ dependencies = [
 name = "aruna-storage"
 version = "3.0.0-alpha.207"
 dependencies = [
+ "aruna-clock",
  "aruna-core",
  "async-trait",
  "blake3",

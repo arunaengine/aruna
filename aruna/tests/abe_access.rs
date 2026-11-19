@@ -874,7 +874,7 @@ async fn abe_holders() -> TestResult<()> {
         let context: GrantContext = postcard::from_bytes(&bytes(&owned["records"][0]["record"]))?;
         let racing = KeyGrant { context: context.clone(), enc: [1; 32], ciphertext: vec![1; 16] };
         let auth = AuthContext { user_id: seed.user_id, realm_id: seed.realm_id, path_restrictions: None, session: None };
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
         let mut operation = KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), KeyAction::Publish(racing), now).into_machine();
         let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {
@@ -1535,7 +1535,7 @@ async fn abe_members() -> TestResult<()> {
             session: None,
         };
         let (node_id, plain_id) = (seed.net.node_id(), Ulid::from_string(&plain.group_id)?);
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
         let operation = MemberKeysOperation::new(auth, node_id, plain_id, vec![first], now);
         assert_eq!(drive(operation, &seed.context).await, Ok(Vec::new()));
 
@@ -2179,7 +2179,7 @@ async fn abe_epochs() -> TestResult<()> {
             session: None,
         };
         let node = seed.net.node_id();
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
         let action = KeyAction::Epoch { instant: false };
         let mut operation =
             KeyOperation::new(BUCKET.into(), auth.clone(), node, action.clone(), now)
@@ -2443,7 +2443,7 @@ async fn abe_rekey() -> TestResult<()> {
             caller: seed.user_id,
             key,
             duration: None,
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms: aruna_clock::unix_timestamp_millis(),
         };
         let secret = SharedSecret::new(SecretBytes::new(bucket_private.expose().to_vec()));
         drive(UnlockBucketOperation::new(input, secret), &seed.context).await?;
@@ -2531,7 +2531,7 @@ async fn publish_racing(
         path_restrictions: None,
         session: None,
     };
-    let now = aruna_core::time::unix_timestamp_millis();
+    let now = aruna_clock::unix_timestamp_millis();
     let action = KeyAction::Publish(grant);
     let mut operation =
         KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), action, now).into_machine();

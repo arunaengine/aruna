@@ -7,9 +7,9 @@ use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::{CreateSessionResponse, map_create_error, unix_rfc3339};
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::{RealmDescriptor, Signed};
 use aruna_core::handoff::{HandoffError, LoginHandoff};
-use aruna_core::time::unix_timestamp_secs;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigError;
 use aruna_operations::federation::login::{

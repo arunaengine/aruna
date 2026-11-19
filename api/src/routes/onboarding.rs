@@ -4,6 +4,7 @@
 
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_secs as now_timestamp;
 use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{
@@ -16,7 +17,6 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permiss
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, StaticRealmEndpoint,
 };
-use aruna_core::time::unix_timestamp_secs as now_timestamp;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};

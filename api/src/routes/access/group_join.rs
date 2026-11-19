@@ -182,7 +182,7 @@ async fn mutate(
                 auth,
                 group_id,
                 action,
-                now_ms: aruna_core::time::unix_timestamp_millis(),
+                now_ms: aruna_clock::unix_timestamp_millis(),
             }),
             &state.get_ctx(),
         )

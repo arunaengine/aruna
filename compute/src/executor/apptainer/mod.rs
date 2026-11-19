@@ -32,7 +32,7 @@ use super::staging::{StageLayout, StagePlan};
 use super::{
     BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, host_capabilities,
 };
-use aruna_core::time::unix_timestamp_millis;
+use aruna_clock::unix_timestamp_millis;
 
 mod runtime;
 #[cfg(feature = "slurm")]
