@@ -189,12 +189,7 @@ mod pure_tests {
     }
 
     fn auth_context(realm_id: RealmId, user_id: UserId) -> AuthContext {
-        AuthContext {
-            user_id,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(user_id, realm_id)
     }
 
     fn user(realm_id: RealmId, seed: u8, name: &str) -> User {

@@ -19,12 +19,7 @@ fn node() -> NodeId {
 }
 
 fn auth() -> AuthContext {
-    AuthContext {
-        user_id: UserId::nil(realm()),
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(UserId::nil(realm()), realm())
 }
 
 fn info() -> BucketInfo {

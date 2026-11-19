@@ -442,12 +442,7 @@ mod tests {
     }
 
     fn auth(actor: &Actor) -> AuthContext {
-        AuthContext {
-            user_id: actor.user_id,
-            realm_id: actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(actor.user_id, actor.realm_id)
     }
 
     fn quota_config(actor: &Actor, quota: QuotaConfig) -> SetQuotaConfig {

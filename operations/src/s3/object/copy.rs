@@ -1154,12 +1154,7 @@ pub(crate) mod test {
     }
 
     fn auth_context(user_id: UserId) -> AuthContext {
-        AuthContext {
-            user_id,
-            realm_id: user_id.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(user_id, user_id.realm_id)
     }
 
     async fn read_dest_version(

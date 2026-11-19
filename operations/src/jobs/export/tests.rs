@@ -1814,12 +1814,7 @@ async fn hash_lookup(
 }
 
 pub(super) fn realm_user() -> AuthContext {
-    AuthContext {
-        user_id: UserId::local(Ulid::from_parts(8, 8), realm()),
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(UserId::local(Ulid::from_parts(8, 8), realm()), realm())
 }
 
 pub(super) fn op_spec() -> ExportRoCrateSpec {

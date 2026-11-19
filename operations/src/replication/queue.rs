@@ -694,12 +694,7 @@ mod tests {
     }
 
     fn auth_context() -> AuthContext {
-        AuthContext {
-            user_id: user(),
-            realm_id: realm(),
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(user(), realm())
     }
 
     fn reference_advance() -> ReferenceAdvance {

@@ -107,12 +107,7 @@ async fn distributed_with(
 }
 
 fn owner(fixture: &Fixture) -> AuthContext {
-    AuthContext {
-        user_id: fixture.owner,
-        realm_id: fixture.realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(fixture.owner, fixture.realm_id)
 }
 
 impl Distributed {
