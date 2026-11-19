@@ -141,9 +141,7 @@ impl GraphHandle {
         let graph_iri = effect.graph_iri();
         if matches!(
             effect,
-            MetadataEffect::SearchGraphs { .. }
-                | MetadataEffect::SyncBestEffort { .. }
-                | MetadataEffect::CachedRecords
+            MetadataEffect::SyncBestEffort { .. } | MetadataEffect::CachedRecords
         ) {
             return MetadataEvent::Error {
                 graph_iri,
@@ -981,8 +979,7 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::ExportRoCrateSummary { .. }
         | MetadataEffect::ExportRoCratePage { .. }
         | MetadataEffect::ExportVersioned { .. }) => export_effect(node, &auth, effect),
-        MetadataEffect::SearchGraphs { .. }
-        | MetadataEffect::SyncBestEffort { .. }
+        MetadataEffect::SyncBestEffort { .. }
         | MetadataEffect::CheckStructure { .. }
         | MetadataEffect::CheckProfile { .. }
         | MetadataEffect::CachedShapes { .. }

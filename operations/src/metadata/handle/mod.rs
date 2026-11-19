@@ -4,7 +4,7 @@
 
 use crate::metadata::message_kind::MetadataRequestDelivery;
 use aruna_core::structs::storage::format::Compression;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 #[cfg(feature = "test-hooks")]
 use std::sync::atomic::AtomicBool;
@@ -43,12 +43,10 @@ use self::effects::metadata_graph_fence;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
 pub use self::lifecycle::{list_cached_group, list_cached_records, warm_caches};
 pub use self::pull_serve::{accept_pull, pull_status};
-pub use self::search::search_authorized_local;
 mod ingress;
 mod lifecycle;
 mod peer_auth;
 mod pull_serve;
-mod search;
 mod sync;
 mod transport;
 
@@ -305,11 +303,6 @@ struct LifecycleDeletedEntry {
 
 struct VisibilityFillResult {
     records: Arc<Vec<MetadataRegistryRecord>>,
-    store_accepted: bool,
-}
-
-struct LifecycleVisibilityRefresh {
-    deleted_graphs: HashSet<String>,
     store_accepted: bool,
 }
 

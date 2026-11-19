@@ -29,6 +29,7 @@ use aruna_core::types::{GroupId, Key, Value};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::local_query::LocalQueryOperation;
+use aruna_operations::metadata::text_search::LocalSearchOperation;
 use aruna_storage::FjallStorage;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -423,15 +424,10 @@ async fn search_graph_iris(
     query: &str,
     limit: usize,
 ) -> Result<Vec<String>, BoxError> {
-    let hits = aruna_operations::metadata::search_authorized_local(
-        &harness.context,
-        auth,
-        graph_iris,
-        query.to_string(),
-        limit,
-        None,
-    )
-    .await?;
+    let caller = (REALM, auth);
+    let search =
+        LocalSearchOperation::new(caller, (graph_iris, None), (query.to_string(), limit), None);
+    let hits = drive(search, &harness.context).await?;
     Ok(hits.into_iter().map(|hit| hit.graph_iri).collect())
 }
 
