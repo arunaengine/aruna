@@ -2612,54 +2612,29 @@ mod test {
             outbound_handle: None,
         };
 
-        let observed = drive(StagingDispatchOperation::new(), &context)
+        let observed = drive(StagingDispatchOperation, &context)
             .await
             .expect("staging source effect should be dispatched");
         assert!(observed);
     }
 
+    /// Runs itself as a child until the depth limit answers, and hands that event up.
     #[derive(Debug, PartialEq)]
-    struct RecursiveSubOperation {
-        observed: Option<Event>,
-    }
+    struct RecursiveSubOperation;
 
-    impl RecursiveSubOperation {
-        fn new() -> Self {
-            Self { observed: None }
-        }
-    }
-
-    impl EffectOperation for RecursiveSubOperation {
+    impl Operation for RecursiveSubOperation {
         type Output = Event;
-        type Error = Infallible;
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![Effect::SubOperation(boxed_suboperation(
-                RecursiveSubOperation::new(),
-                |result| match result {
-                    Ok(event) => event,
-                    Err(never) => match never {},
-                },
-            ))]
+        fn first(&mut self) -> Result<Next<Event>, IoError> {
+            Ok(Next::Call(IoCall::child(RecursiveSubOperation)))
         }
 
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            self.observed = Some(event);
-            smallvec::smallvec![]
-        }
-
-        fn is_complete(&self) -> bool {
-            self.observed.is_some()
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            Ok(self
-                .observed
-                .expect("recursive suboperation should produce an event"))
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
+        fn next(&mut self, result: IoResult) -> Result<Next<Event>, IoError> {
+            match result {
+                IoResult::Event(event) => Ok(Next::Done(*event)),
+                result => Ok(Next::Done(result.child::<Event, IoError>()??)),
+            }
         }
     }
 
@@ -2688,7 +2663,7 @@ mod test {
                         outbound_handle: None,
                     };
 
-                    let event = drive(RecursiveSubOperation::new(), &context)
+                    let event = drive(RecursiveSubOperation, &context)
                         .await
                         .expect("recursive suboperation should resolve to depth-limit event");
 
@@ -2857,41 +2832,34 @@ mod test {
     struct WindowRows {
         rest: Vec<Effect>,
         seen: Vec<(usize, Option<u8>)>,
-        closed: bool,
     }
 
-    impl EffectOperation for WindowRows {
-        type Output = ();
-        type Error = ();
+    impl Operation for WindowRows {
+        type Output = Vec<(usize, Option<u8>)>;
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
+        fn first(&mut self) -> Result<Next<Self::Output>, IoError> {
+            Ok(Next::Call(IoCall::Group(EffectGroup {
+                members: Vec::new(),
+                limit: 2,
+                form: GroupForm::Window,
+            })))
         }
 
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            match event {
-                Event::Group(GroupEvent::Member { index, result }) => {
+        fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
+            match result {
+                IoResult::Group(GroupEvent::Member { index, result }) => {
                     self.seen.push((index, read_seconds(&result)));
-                    self.rest.pop().into_iter().collect()
+                    match self.rest.pop() {
+                        Some(effect) => Ok(Next::Call(IoCall::from(effect))),
+                        None => Ok(Next::Wait),
+                    }
                 }
-                Event::Group(GroupEvent::Closed) => {
-                    self.closed = true;
-                    smallvec::smallvec![]
+                IoResult::Group(GroupEvent::Closed) => {
+                    Ok(Next::Done(std::mem::take(&mut self.seen)))
                 }
-                other => panic!("unexpected event {other:?}"),
+                other => panic!("unexpected result {other:?}"),
             }
-        }
-
-        fn is_complete(&self) -> bool {
-            self.closed
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            Ok(())
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
         }
     }
 
@@ -2902,11 +2870,12 @@ mod test {
         let dispatch = Box::new(slow_dispatch(flight.clone()));
         let mut run = GroupRun::new(dispatch, &context, 2, UNBOUNDED);
         run.add([slow_read(4), slow_read(1)]);
-        let mut operation = WindowRows {
+        let mut operation = CallRun::new(WindowRows {
             rest: vec![slow_read(1)],
             seen: Vec::new(),
-            closed: false,
-        };
+        });
+        // The opening window has no members; the group run above holds them.
+        assert_eq!(operation.start().len(), 1);
         let end = run_window(
             &mut ParentRun(&mut operation, None),
             &mut run,
@@ -2916,8 +2885,10 @@ mod test {
         .await;
         assert!(matches!(end, GroupEnd::Stepped(effects) if effects.is_empty()));
         // Member 1 frees its slot after one second, so member 2 runs before member 0 ends.
-        assert_eq!(operation.seen, [(1, Some(1)), (2, Some(1)), (0, Some(4))]);
-        assert!(operation.closed);
+        assert_eq!(
+            operation.finalize(),
+            Ok(vec![(1, Some(1)), (2, Some(1)), (0, Some(4))])
+        );
         assert_eq!(flight.peak.load(SeqCst), 2);
     }
 
@@ -2925,38 +2896,25 @@ mod test {
     #[derive(Debug, PartialEq)]
     struct OneGroup {
         members: Vec<Effect>,
-        results: Option<Vec<GroupResult>>,
     }
 
-    impl EffectOperation for OneGroup {
+    impl Operation for OneGroup {
         type Output = Vec<GroupResult>;
-        type Error = ();
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![Effect::Group(EffectGroup {
+        fn first(&mut self) -> Result<Next<Vec<GroupResult>>, IoError> {
+            Ok(Next::Call(IoCall::Group(EffectGroup {
                 members: std::mem::take(&mut self.members),
                 limit: 4,
                 form: GroupForm::All { deadline: None },
-            })]
+            })))
         }
 
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            if let Event::Group(GroupEvent::Finished { results }) = event {
-                self.results = Some(results);
+        fn next(&mut self, result: IoResult) -> Result<Next<Vec<GroupResult>>, IoError> {
+            match result {
+                IoResult::Group(GroupEvent::Finished { results }) => Ok(Next::Done(results)),
+                other => panic!("unexpected result {other:?}"),
             }
-            smallvec::smallvec![]
-        }
-
-        fn is_complete(&self) -> bool {
-            self.results.is_some()
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            self.results.ok_or(())
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
         }
     }
 
@@ -2973,7 +2931,6 @@ mod test {
                 Effect::Storage(StorageEffect::StartTransaction { read: false }),
                 Effect::Storage(read),
             ],
-            results: None,
         };
         let read = Event::Storage(StorageEvent::ReadResult {
             key: ByteView::from(*b"absent"),
@@ -2992,28 +2949,27 @@ mod test {
     struct HeldGroup {
         backend_id: ulid::Ulid,
         idle: Box<dyn Fn() -> bool + Send>,
-        idle_after: Option<bool>,
     }
 
     impl std::fmt::Debug for HeldGroup {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("HeldGroup")
-                .field("idle_after", &self.idle_after)
+                .field("backend_id", &self.backend_id)
                 .finish_non_exhaustive()
         }
     }
 
     impl PartialEq for HeldGroup {
         fn eq(&self, other: &Self) -> bool {
-            self.idle_after == other.idle_after
+            self.backend_id == other.backend_id
         }
     }
 
-    impl EffectOperation for HeldGroup {
+    impl Operation for HeldGroup {
         type Output = bool;
-        type Error = ();
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
+        fn first(&mut self) -> Result<Next<bool>, IoError> {
             let location = BackendLocation {
                 backend: BackendRef::Group(self.backend_id),
                 storage_class: None,
@@ -3029,28 +2985,15 @@ mod test {
                 blob_size: 1,
                 hashes: Default::default(),
             };
-            smallvec::smallvec![Effect::Group(EffectGroup {
+            Ok(Next::Call(IoCall::Group(EffectGroup {
                 members: vec![Effect::Blob(BlobEffect::Delete { location })],
                 limit: 1,
                 form: GroupForm::All { deadline: None },
-            })]
+            })))
         }
 
-        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
-            self.idle_after = Some((self.idle)());
-            smallvec::smallvec![]
-        }
-
-        fn is_complete(&self) -> bool {
-            self.idle_after.is_some()
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            self.idle_after.ok_or(())
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
+        fn next(&mut self, _: IoResult) -> Result<Next<bool>, IoError> {
+            Ok(Next::Done((self.idle)()))
         }
     }
 
@@ -3063,7 +3006,6 @@ mod test {
         let operation = HeldGroup {
             backend_id,
             idle: Box::new(move || probe.idle_generation(backend_id).is_some()),
-            idle_after: None,
         };
         // Removal needs an idle generation: the member ended, but its parent still holds.
         assert_eq!(drive(operation, &context).await, Ok(false));
@@ -3078,35 +3020,19 @@ mod test {
         conflicts: usize,
     }
 
-    impl<const RETRIES: u32> EffectOperation for Conflicted<RETRIES> {
+    impl<const RETRIES: u32> Operation for Conflicted<RETRIES> {
         type Output = usize;
-        type Error = StorageError;
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
-        }
-
-        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
-        }
-
-        fn is_complete(&self) -> bool {
-            true
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
+        fn first(&mut self) -> Result<Next<usize>, IoError> {
             match self.attempt < self.conflicts {
-                true => Err(StorageError::TransactionConflict),
-                false => Ok(self.attempt),
+                true => Err(IoError::Conflict),
+                false => Ok(Next::Done(self.attempt)),
             }
         }
 
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
-        }
-
-        fn is_conflict(error: &Self::Error) -> bool {
-            matches!(error, StorageError::TransactionConflict)
+        fn next(&mut self, _: IoResult) -> Result<Next<usize>, IoError> {
+            Err(IoError::Conflict)
         }
 
         fn conflict_retries() -> u32 {
@@ -3118,7 +3044,7 @@ mod test {
     async fn retried<const RETRIES: u32>(
         context: &DriverContext,
         conflicts: usize,
-    ) -> (Result<usize, StorageError>, usize) {
+    ) -> (Result<usize, IoError>, usize) {
         let mut built = 0;
         let build = || {
             built += 1;
@@ -3134,7 +3060,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn retry_reruns_conflict() {
         let context = bare_context();
-        let conflict = Err(StorageError::TransactionConflict);
+        let conflict = Err(IoError::Conflict);
         // The hook of the attempt after the last run is asked too, so one more is built.
         assert_eq!(retried::<3>(&context, 2).await, (Ok(2), 3));
         assert_eq!(
@@ -3223,8 +3149,8 @@ mod test {
         assert_eq!(tokio::time::Instant::now(), past);
     }
 
-    /// Logs its name at start, then spools a stream that ends once `gate` opens, or without a
-    /// gate ends at once when `finish` holds and otherwise stays open until the runner aborts.
+    /// Logs its name at start, then waits out `delay`, or spools a stream that ends once
+    /// `gate` opens; without either it ends at once when `finish` holds and otherwise fails.
     #[derive(Debug)]
     struct Holding {
         name: &'static str,
@@ -3234,7 +3160,6 @@ mod test {
         gate: Option<tokio::sync::oneshot::Receiver<()>>,
         delay: Option<Duration>,
         finish: bool,
-        done: bool,
     }
 
     impl Holding {
@@ -3247,64 +3172,53 @@ mod test {
                 gate: None,
                 delay: None,
                 finish: true,
-                done: false,
             }
         }
     }
 
     impl PartialEq for Holding {
         fn eq(&self, other: &Self) -> bool {
-            self.name == other.name && self.done == other.done
+            self.name == other.name
         }
     }
 
-    impl EffectOperation for Holding {
+    impl Operation for Holding {
         type Output = ();
-        type Error = ();
+        type Error = IoError;
 
         fn hold_scope(&self) -> Option<HoldScope> {
             self.scope
         }
 
-        fn start(&mut self) -> aruna_core::types::Effects {
+        fn first(&mut self) -> Result<Next<()>, IoError> {
             self.log.lock().unwrap().push(self.name);
             self.started.notify_one();
             if let Some(after) = self.delay {
-                return smallvec::smallvec![Effect::Delay(after)];
+                return Ok(Next::Call(IoCall::Delay(after)));
             }
             let Some(gate) = self.gate.take() else {
-                self.done = self.finish;
-                return smallvec::smallvec![];
+                // Waiting outside a window is refused, so a run that does not finish fails.
+                return match self.finish {
+                    true => Ok(Next::Done(())),
+                    false => Ok(Next::Wait),
+                };
             };
             let blob = futures_util::stream::once(async move {
                 let _ = gate.await;
                 Ok::<_, aruna_core::stream::StreamError>(bytes::Bytes::new())
             });
-            smallvec::smallvec![Effect::Blob(BlobEffect::SpoolHidden {
+            Ok(Next::Call(IoCall::from(Effect::Blob(BlobEffect::SpoolHidden {
                 namespace: ulid::Ulid::from_bytes([5u8; 16]),
                 name: self.name.to_string(),
                 created_by: aruna_core::UserId::default(),
                 max_bytes: None,
                 deadline: None,
                 blob: aruna_core::stream::BackendStream::new(blob),
-            })]
+            }))))
         }
 
-        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
-            self.done = true;
-            smallvec::smallvec![]
-        }
-
-        fn is_complete(&self) -> bool {
-            self.done
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            if self.done { Ok(()) } else { Err(()) }
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
+        fn next(&mut self, _: IoResult) -> Result<Next<()>, IoError> {
+            Ok(Next::Done(()))
         }
     }
 
@@ -3333,7 +3247,7 @@ mod test {
         other.scope = None;
         assert_eq!(drive(other, &context).await, Ok(()));
         let late = Holding::new("late", &log);
-        assert_eq!(drive_until(late, &context, Instant::now()).await, Err(()));
+        assert!(drive_until(late, &context, Instant::now()).await.is_err());
         // Paused time first runs every ready task, so the second run is parked on the hold
         // before the clock jumps an hour.
         tokio::time::pause();
@@ -3352,41 +3266,25 @@ mod test {
     #[derive(Debug, PartialEq)]
     struct HoldingParent {
         child: Option<Holding>,
-        done: bool,
     }
 
-    impl EffectOperation for HoldingParent {
+    impl Operation for HoldingParent {
         type Output = ();
-        type Error = ();
+        type Error = IoError;
 
         fn hold_scope(&self) -> Option<HoldScope> {
             Some(HoldScope::DocumentReconcile)
         }
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            let Some(child) = self.child.take() else {
-                return smallvec::smallvec![];
-            };
-            smallvec::smallvec![Effect::SubOperation(boxed_suboperation(child, |_| {
-                Event::Delayed
-            }))]
+        fn first(&mut self) -> Result<Next<()>, IoError> {
+            match self.child.take() {
+                Some(child) => Ok(Next::Call(IoCall::child(child))),
+                None => Ok(Next::Done(())),
+            }
         }
 
-        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
-            self.done = true;
-            smallvec::smallvec![]
-        }
-
-        fn is_complete(&self) -> bool {
-            self.done
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            if self.done { Ok(()) } else { Err(()) }
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
+        fn next(&mut self, _: IoResult) -> Result<Next<()>, IoError> {
+            Ok(Next::Done(()))
         }
     }
 
@@ -3397,7 +3295,6 @@ mod test {
         let log = Arc::default();
         let parent = HoldingParent {
             child: Some(Holding::new("child", &log)),
-            done: false,
         };
         let deadline = Instant::now() + Duration::from_secs(60);
         assert_eq!(drive_until(parent, &context, deadline).await, Ok(()));
@@ -3410,10 +3307,10 @@ mod test {
         let (_directory, context) = net_context().await;
         let log = Arc::default();
 
-        // Abort: no effects and never complete, so the runner aborts it.
+        // Failure: the run waits outside a window, which its call run refuses.
         let mut aborted = Holding::new("aborted", &log);
         aborted.finish = false;
-        assert_eq!(drive(aborted, &context).await, Err(()));
+        assert!(drive(aborted, &context).await.is_err());
         assert!(reconcile_free(&context));
 
         // Cancel: the caller drops the run while its spool waits.
@@ -3440,7 +3337,7 @@ mod test {
         started.notified().await;
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(6)).await;
-        assert_eq!(task.await.unwrap(), Err(()));
+        assert_eq!(task.await.unwrap(), Err(IoError::Aborted));
         tokio::time::resume();
         assert!(reconcile_free(&context));
     }
@@ -3449,32 +3346,21 @@ mod test {
     #[derive(Debug, PartialEq)]
     struct Sleeper {
         after: Duration,
-        woke: bool,
     }
 
-    impl EffectOperation for Sleeper {
+    impl Operation for Sleeper {
         type Output = ();
-        type Error = ();
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![Effect::Delay(self.after)]
+        fn first(&mut self) -> Result<Next<()>, IoError> {
+            Ok(Next::Call(IoCall::Delay(self.after)))
         }
 
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            self.woke = matches!(event, Event::Delayed);
-            smallvec::smallvec![]
-        }
-
-        fn is_complete(&self) -> bool {
-            self.woke
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            if self.woke { Ok(()) } else { Err(()) }
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
+        fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+            match result {
+                IoResult::Woke => Ok(Next::Done(())),
+                _ => Err(refused()),
+            }
         }
     }
 
@@ -3483,15 +3369,18 @@ mod test {
         let context = bare_context();
         let after = Duration::from_secs(30);
         let started = Instant::now();
-        let sleeper = Sleeper { after, woke: false };
+        let sleeper = Sleeper { after };
         assert_eq!(drive(sleeper, &context).await, Ok(()));
         assert_eq!(started.elapsed(), after);
 
         // A run deadline before the wake cuts the delay off like any other effect.
         let started = Instant::now();
         let deadline = started + Duration::from_secs(10);
-        let sleeper = Sleeper { after, woke: false };
-        assert_eq!(drive_until(sleeper, &context, deadline).await, Err(()));
+        let sleeper = Sleeper { after };
+        assert_eq!(
+            drive_until(sleeper, &context, deadline).await,
+            Err(IoError::Aborted)
+        );
         assert_eq!(started.elapsed(), Duration::from_secs(10));
     }
 
@@ -3500,32 +3389,18 @@ mod test {
     struct Echo {
         stamped: Option<u64>,
         seeded: bool,
-        woke: bool,
     }
 
-    impl EffectOperation for Echo {
+    impl Operation for Echo {
         type Output = bool;
-        type Error = ();
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![Effect::Delay(Duration::from_secs(1))]
+        fn first(&mut self) -> Result<Next<bool>, IoError> {
+            Ok(Next::Call(IoCall::Delay(Duration::from_secs(1))))
         }
 
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            self.woke = matches!(event, Event::Delayed);
-            smallvec::smallvec![]
-        }
-
-        fn is_complete(&self) -> bool {
-            self.woke
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            Ok(self.stamped.is_some() && self.seeded)
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
+        fn next(&mut self, _: IoResult) -> Result<Next<bool>, IoError> {
+            Ok(Next::Done(self.stamped.is_some() && self.seeded))
         }
 
         fn stamp(&mut self, now_ms: u64) {
@@ -3557,7 +3432,7 @@ mod test {
         let run = records
             .iter()
             .find_map(|record| match &record.entry {
-                Entry::Started { operation, .. } if operation.ends_with("::Echo") => {
+                Entry::Started { operation, .. } if operation.contains("::Echo>") => {
                     Some(record.run)
                 }
                 _ => None,
