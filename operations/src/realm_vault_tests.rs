@@ -346,6 +346,7 @@ mod settings {
                 &owner(),
                 id,
                 &secret,
+                &[7; 32],
             )
             .unwrap()
         });
