@@ -202,6 +202,8 @@ impl WorkRow {
 pub enum WorkError {
     #[error("the call started other work with other arguments")]
     Conflict,
+    #[error("the install has {0} unfinished tasks already")]
+    Limit(usize),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -261,8 +263,33 @@ pub fn reserve(
         account: install.account,
         proposed: Some(Box::new(proposed)),
         mark,
+        limit: None,
         phase: ReservePhase::Reading,
     })
+}
+
+impl ReserveWork {
+    /// A fresh row is refused while the install has `limit` unsettled tasks, counted in the same
+    /// transaction, so the row itself is the reservation.
+    pub fn limited(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Writes the new rows, deleting a former install's index first.
+    fn write(
+        &mut self,
+        rows: Vec<Row>,
+        former: Option<Ulid>,
+    ) -> Result<Next<(WorkRow, Reserve)>, WorkError> {
+        // A former install's index goes too, so no index row leads to the replacement.
+        let Some(former) = former else {
+            return Ok(Next::Call(IoCall::Write(rows)));
+        };
+        self.phase = ReservePhase::Deleting(rows);
+        let index = index_key(self.install_id, former);
+        Ok(Next::Call(delete_call(vec![(PLUGIN_WORK_KEYSPACE, index)])))
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -272,12 +299,15 @@ pub struct ReserveWork {
     account: UserId,
     proposed: Option<Box<WorkRow>>,
     mark: Option<Row>,
+    limit: Option<usize>,
     phase: ReservePhase,
 }
 
 #[derive(Debug, PartialEq)]
 enum ReservePhase {
     Reading,
+    /// The install's open tasks are counted before a fresh task row is written.
+    Counting(Scan, Vec<Row>, Option<Ulid>),
     /// A former install's index row is being deleted; the new rows follow.
     Deleting(Vec<Row>),
     Writing,
@@ -314,13 +344,32 @@ impl Operation for ReserveWork {
                     row(PLUGIN_WORK_KEYSPACE, self.key.clone(), encode(proposed)?),
                 ];
                 rows.extend(self.mark.take());
-                // A former install's index goes too, so no index row leads to the replacement.
-                let Some(former) = stored else {
-                    return Ok(Next::Call(IoCall::Write(rows)));
+                let former = stored.map(|former| former.work_id);
+                if self.limit.is_none() {
+                    return self.write(rows, former);
+                }
+                let prefix = [&[WORK_ROW][..], &self.install_id.to_bytes()].concat();
+                let scan = Scan::new(PLUGIN_WORK_KEYSPACE, prefix);
+                let ask = scan.ask();
+                self.phase = ReservePhase::Counting(scan, rows, former);
+                Ok(Next::Call(ask))
+            }
+            ReservePhase::Counting(mut scan, rows, former) => {
+                let Some(found) = scan.take(answer)? else {
+                    let ask = scan.ask();
+                    self.phase = ReservePhase::Counting(scan, rows, former);
+                    return Ok(Next::Call(ask));
                 };
-                self.phase = ReservePhase::Deleting(rows);
-                let index = index_key(self.install_id, former.work_id);
-                Ok(Next::Call(delete_call(vec![(PLUGIN_WORK_KEYSPACE, index)])))
+                let mut open = 0;
+                for (_, value) in found {
+                    let row = decode::<WorkRow>(&value)?;
+                    let task = row.kind == WorkKind::Recipe && row.account == self.account;
+                    open += usize::from(task && row.state != WorkState::Settled);
+                }
+                match self.limit {
+                    Some(limit) if open >= limit => Err(WorkError::Limit(limit)),
+                    _ => self.write(rows, former),
+                }
             }
             ReservePhase::Deleting(rows) => {
                 done(answer)?;

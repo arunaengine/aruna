@@ -340,6 +340,7 @@ impl PrepareWork {
                 let message = format!("this call started {what} with other arguments");
                 HostError::new(ErrorKind::Conflict, message)
             }
+            WorkError::Limit(_) => HostError::new(ErrorKind::Limit, error.to_string()),
             WorkError::Store(error) => unavailable(error.0),
         })
     }

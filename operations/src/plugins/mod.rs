@@ -54,6 +54,7 @@ pub mod sweep;
 pub mod task_change;
 pub mod task_row;
 pub mod task_send;
+pub mod task_start;
 pub mod tasks;
 pub mod transfer_steps;
 pub mod waiting;
