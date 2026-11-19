@@ -885,9 +885,16 @@ impl<'a> GroupRun<'a> {
             return Box::pin(std::future::ready((index, GroupResult::Unfinished)));
         }
         hold_backends(self.context, &member, holds);
+        // A started child applies the cut itself and then runs its cleanup, which a timeout here
+        // would drop. A child that ends at or past the cut still counts as unfinished.
+        let child = matches!(member, Effect::SubOperation(_));
         let dispatch = (self.dispatch)(member, self.stop.at);
         Box::pin(async move {
             let result = match cut_at {
+                Some(at) if child => {
+                    let event = dispatch.await;
+                    (Instant::now() < at).then_some(event)
+                }
                 Some(at) => tokio::time::timeout_at(at, dispatch).await.ok(),
                 None => Some(dispatch.await),
             };
@@ -2360,6 +2367,81 @@ mod test {
         let ids = started.lock().unwrap().clone();
         assert!(!ids.is_empty());
         assert!(all_closed(&context, &ids).await);
+    }
+
+    /// Runs a `PendingTxn` as the one member of a group and answers the group's results.
+    #[derive(Debug)]
+    struct GroupedChild {
+        aborted: Arc<std::sync::atomic::AtomicBool>,
+        ready: Arc<tokio::sync::Notify>,
+    }
+
+    impl PartialEq for GroupedChild {
+        fn eq(&self, _: &Self) -> bool {
+            true
+        }
+    }
+
+    impl Operation for GroupedChild {
+        type Output = Vec<GroupResult>;
+        type Error = IoError;
+
+        fn first(&mut self) -> Result<Next<Vec<GroupResult>>, IoError> {
+            let child = PendingTxn {
+                staged: false,
+                commit: false,
+                aborted: self.aborted.clone(),
+                ready: self.ready.clone(),
+            };
+            let IoCall::Child(child) = IoCall::child(child) else {
+                unreachable!("a child call holds its suboperation");
+            };
+            Ok(Next::Call(IoCall::Group(EffectGroup {
+                members: vec![Effect::SubOperation(child)],
+                limit: 1,
+                form: GroupForm::All { deadline: None },
+            })))
+        }
+
+        fn next(&mut self, result: IoResult) -> Result<Next<Vec<GroupResult>>, IoError> {
+            match result {
+                IoResult::Group(GroupEvent::Finished { results }) => Ok(Next::Done(results)),
+                _ => Err(refused()),
+            }
+        }
+    }
+
+    // A started group member cut by the run deadline still runs its cleanup to storage.
+    #[tokio::test(start_paused = true)]
+    async fn group_child_cleanup() {
+        tokio::time::resume();
+        let (_directory, context) = blob_context().await;
+        tokio::time::pause();
+        let _clock = freeze_clock();
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let operation = GroupedChild {
+            aborted: aborted.clone(),
+            ready: ready.clone(),
+        };
+        // Shorter than STORAGE_REQUEST_TIMEOUT so the advance below can only
+        // fire the drive deadline, never a tied storage request timeout.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            crate::driver::drive_until(operation, &task_context, deadline).await
+        });
+
+        ready.notified().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        // Real time again: auto-advance would fire the cleanup deadline while the storage
+        // worker threads still answer the member's cleanup.
+        tokio::time::resume();
+        // The member past the run deadline is unfinished, so the run itself expires.
+        assert_eq!(task.await.unwrap(), Err(IoError::Aborted));
+        assert!(aborted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(cleanup_row(&context).await, Some(ByteView::from(*b"ran")));
     }
 
     #[tokio::test(start_paused = true)]
