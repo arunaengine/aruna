@@ -11,11 +11,11 @@ pub(crate) fn metadata_read_request(
     permission_path: &str,
     auth: Option<&AuthContext>,
 ) -> aruna_core::request_policy::PolicyRequest {
-    crate::auth::request_policy::policy_request_with(
+    aruna_core::request_policy::policy_request_with(
         permission_path,
         &Permission::READ,
         auth,
-        crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
+        aruna_core::request_policy::PolicyRequestExtras::operation("metadata.read"),
     )
 }
 

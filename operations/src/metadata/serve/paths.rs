@@ -23,11 +23,11 @@ use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::path::{LocalPathOperation, LookupPathOperation};
 use crate::metadata::api::path_types::{MetadataLookupRequest, MetadataLookupResult};
 use crate::metadata::local_query::LocalQueryOperation;
-use crate::metadata::protocol::{
-    MetadataPathCandidate, MetadataPathResolution, MetadataReadError, MetadataTransportMessage,
-};
 use crate::metadata::read_peer::ReadPeerOperation;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::protocol::{
+    MetadataPathCandidate, MetadataPathResolution, MetadataReadError, MetadataTransportMessage,
+};
 
 /// The realm config read; a failed read is logged and counts as none.
 pub(super) fn read_config(result: IoResult) -> Result<Option<RealmConfigDocument>, IoError> {

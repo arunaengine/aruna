@@ -30,12 +30,12 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::audit::AUDIT_DEADLINE_SECS;
 use crate::metadata::audit_entry::ServeAuditOperation;
 use crate::metadata::persistent_id::forward::ServePidOperation;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage as Message};
 use crate::metadata::read_peer::ReadPeerOperation;
 use crate::placement::policy::transport::PolicyAnswer;
 use crate::placement::policy::{ApplyPolicyOperation, ServePolicyOperation};
 use crate::s3::bucket::forward::BucketForwardOperation;
 use crate::users::vault_route::{ApplyVaultOperation, ServeVaultOperation};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage as Message};
 
 /// How a forwarded request's child outcome becomes the reply.
 #[derive(Clone, Copy, Debug, PartialEq)]

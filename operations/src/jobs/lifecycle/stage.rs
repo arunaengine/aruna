@@ -18,7 +18,7 @@ use crate::jobs::records::pages::ServingNode;
 use crate::jobs::workflow::workspace::LOCKED_INPUT;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 /// The staged bytes of one input plus the size the caller writes with.
 #[derive(Debug, PartialEq)]

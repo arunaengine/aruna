@@ -41,9 +41,9 @@ use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::store_call::StoreCall;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
 use crate::staging::granted_read::GrantedReadOperation;
+use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};
 
 /// The creator as admitted: submissions refuse path restricted credentials.
 fn creator_auth(run: &RunIdentity) -> AuthContext {

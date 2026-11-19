@@ -26,7 +26,6 @@ use ulid::Ulid;
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::delegate::DelegationInput;
 use crate::jobs::read_access::SourceReadError;
 use crate::jobs::read_access::SourceReadOperation;
@@ -41,6 +40,7 @@ use crate::staging::native_source::delegated_read;
 use crate::staging::reference::{
     MaterializeReferenceError, ReferenceWrite, WriteReferenceOperation,
 };
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

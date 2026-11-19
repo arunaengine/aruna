@@ -16,6 +16,9 @@ use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
+use aruna_core::metadata::protocol::{
+    INBOUND_FRAME_BYTES, MetadataReadError, MetadataTransportMessage,
+};
 use aruna_core::native_reference::{NativeAuthority, NativeReferenceResponse};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
@@ -36,9 +39,6 @@ use aruna_operations::jobs::records::pages::ServePageOperation;
 use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use aruna_operations::metadata::after_sync::AfterSyncOperation;
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
-use aruna_operations::metadata::protocol::{
-    INBOUND_FRAME_BYTES, MetadataReadError, MetadataTransportMessage,
-};
 use aruna_operations::metadata::serve::{
     ServeNode, ServeRequestOperation, ServedReply, needs_view,
 };
@@ -1075,15 +1075,15 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_core::replication_protocol::{
+        LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
+    };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
-    use aruna_operations::replication::protocol::{
-        LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
-    };
     use aruna_storage::FjallStorage;
     use std::collections::HashMap;
     use tempfile::tempdir;

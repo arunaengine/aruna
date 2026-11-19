@@ -27,8 +27,8 @@ use super::coordinator::{
 };
 use crate::forward::authorize::{ForwardAuthError, ForwardedCallerOperation};
 use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer, peer_call, peer_reply};
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message};
 
 /// Each answer bounds itself in the transport; this only stops a request that never ends.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);

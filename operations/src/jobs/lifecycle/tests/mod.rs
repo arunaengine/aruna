@@ -31,7 +31,6 @@ use crate::jobs::lifecycle::cancel::{CancelFamilyOperation, PublishDeletionOpera
 use crate::jobs::lifecycle::family_reads::{
     FamilyLogOperation, FamilyReportOperation, FamilyStatusOperation, SessionJobOperation,
 };
-use crate::jobs::lifecycle::ids::SubmissionScope;
 use crate::jobs::lifecycle::launch_admit::{
     AcceptLaunchOperation, AdmitLaunchOperation, LaunchAnswer,
 };
@@ -41,6 +40,7 @@ use crate::jobs::node_inputs::{ingress_node, launch_node};
 use crate::jobs::records::audit::AuditPage;
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
 use crate::jobs::submit::SubmitJobError;
+use aruna_core::job_request::SubmissionScope;
 use aruna_drivers::driver::{DriverContext, drive};
 
 pub(super) fn resources() -> EffectiveResources {

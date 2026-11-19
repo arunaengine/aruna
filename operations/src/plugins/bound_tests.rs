@@ -287,12 +287,12 @@ mod operations {
 
     use super::*;
     use crate::document_repository::GetConfigError;
-    use crate::metadata::protocol::MetadataTransportMessage;
     use crate::plugins::entry::EntryError;
     use crate::plugins::fixtures::{
         self, config_result, is_child, is_effect, node, peer_says, peer_silent,
     };
     use crate::plugins::rows::tests::{child_result, values_result};
+    use aruna_core::metadata::protocol::MetadataTransportMessage;
 
     fn key() -> (SecretName, SecretKind) {
         let name = SecretName::try_from("key".to_string()).unwrap();

@@ -54,7 +54,7 @@
     "core_clocks": 0,
     "duplicate_groups": 1,
     "group_cycle_modules": 17,
-    "group_mutual_pairs": 17,
+    "group_mutual_pairs": 16,
     "mixed_files": 0,
     "pure_async_refs": 3,
     "runner_refs": 0,
@@ -62,6 +62,6 @@
     "state_clones": 2,
     "test_sleeps": 64,
     "trigger_arms": 6,
-    "upward_refs": 220
+    "upward_refs": 148
   }
 }

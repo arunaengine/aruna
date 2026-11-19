@@ -5,9 +5,9 @@
 use super::*;
 use crate::document_repository::GetConfigError;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::protocol::MetadataPathCandidate;
 use crate::s3::bucket::get::GetBucketError;
 use crate::tests::calls::{caller_of, child, node, runs_child};
+use aruna_core::metadata::protocol::MetadataPathCandidate;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
@@ -454,7 +454,7 @@ fn create_needs_path() {
     // A create whose path is only slashes is refused before any write check.
     use super::writes::WriteServeOperation;
     use crate::forward::authorize::ForwardAuthError;
-    use crate::metadata::create_document::CreateDocumentPayload;
+    use aruna_core::metadata::api::CreateDocumentPayload;
     let request = MetadataTransportMessage::ForwardCreateDocument {
         auth_token: None,
         config_digest: digest(1),

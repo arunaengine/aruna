@@ -15,10 +15,10 @@ use crate::forward::transport::{MetadataWriteError, write_error};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::id_mapping::{parse_mapping_read, read_mapping_effect};
 use crate::metadata::persistent_id::forward::{pid_authority_node, pid_error};
-use crate::metadata::protocol::{
+use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, PersistentIdOutcome, PersistentIdRequest,
 };
-use crate::realm::load_config::config_unavailable;
 
 #[derive(Debug, PartialEq)]
 enum PidStep {

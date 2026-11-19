@@ -3662,7 +3662,7 @@ async fn lookup_hides_private() {
     ];
     use aruna_operations::metadata::persistent_id::forward::{PidRouteOperation, outcome_mapping};
     let ctx = test.state.get_ctx();
-    let request = aruna_operations::metadata::PersistentIdRequest::AddIdentifiers {
+    let request = aruna_core::metadata::protocol::PersistentIdRequest::AddIdentifiers {
         identifiers,
         occurred_at_ms: aruna_clock::unix_timestamp_millis(),
     };

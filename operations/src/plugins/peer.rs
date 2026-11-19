@@ -17,7 +17,7 @@ use super::clock::ServeClock;
 use super::decide::ServeEvents;
 use super::secret_use::{ReleaseFailure, ServeRelease};
 use crate::forward::fetch::{peer_call, peer_reply};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, encode_message};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage, encode_message};
 
 /// Upper bound of one plugin request to another node.
 const PEER_TIMEOUT: Duration = Duration::from_secs(15);

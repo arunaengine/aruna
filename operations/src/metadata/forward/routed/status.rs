@@ -25,9 +25,10 @@ use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, encode_message};
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, encode_message, metadata_request,
+};
 
 type StatusTurn = Result<Next<ProfileValidationStatus>, MetadataApiError>;
 

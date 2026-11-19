@@ -13,6 +13,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REPLICATION_OBLIGATION_KEYSPACE;
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -34,7 +35,6 @@ use aruna_operations::device::sync::folders::{
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
-use aruna_operations::metadata::protocol::MetadataTransportMessage;
 use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, needs_view};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;

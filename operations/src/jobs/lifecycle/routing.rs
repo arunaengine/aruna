@@ -9,9 +9,9 @@ use aruna_core::structs::execution::job::{
     LogicalJobState, PhysicalExecutionState, ResultMessage, WorkspaceMode,
 };
 
-use super::ids::workspace_of;
 use crate::jobs::records::project::ProjectedFamily;
 use crate::jobs::route::JobRouteError;
+use aruna_core::job_request::workspace_of;
 
 /// Why a partial projection answers nothing: it reduced only part of its
 /// family, so its state, executions, and outputs are unknown, never absent.

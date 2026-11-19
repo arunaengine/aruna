@@ -38,12 +38,12 @@ use tracing::{debug, warn};
 
 use crate::document_repository::{config_of, realm_config};
 use crate::forward::transport::{peer_call_within, timed_answer};
-use crate::metadata::protocol::{
-    DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
-};
-use crate::metadata::transport_message_kind;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::node_name::NodeDisplays;
+use aruna_core::metadata::protocol::{
+    DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
+    transport_message_kind,
+};
 use aruna_core::structs::identity::realm::NodeRealm;
 
 /// Attempts in which every answering peer served a copy the marker does not

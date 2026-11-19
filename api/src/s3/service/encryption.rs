@@ -8,13 +8,13 @@ use crate::routes::storage::encryption::{EncryptionRequest, enable_bucket, too_l
 use crate::s3::auth::map_authorize_error;
 use crate::s3::error::IntoS3Error;
 use aruna_core::errors::BlobError;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::encryption::{BucketKeyError, EncryptionMode};
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::replication::plaintext::EncryptionCheckOperation;
 use aruna_operations::s3::bucket::encryption::EnableError;
 use aruna_operations::s3::bucket::get::GetBucketOperation;

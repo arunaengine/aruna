@@ -29,9 +29,10 @@ use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, encode_message};
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, encode_message, metadata_request,
+};
 
 type ReadTurn = Result<Next<MetadataRegistryRecord>, MetadataApiError>;
 

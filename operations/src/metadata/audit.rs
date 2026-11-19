@@ -26,8 +26,8 @@ use tracing::trace;
 use ulid::Ulid;
 
 use super::call_results::page_rows;
-use super::protocol::{MetadataTransportMessage, encode_message, metadata_request};
 use crate::forward::fetch::read_answer;
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_request};
 use aruna_core::placement::selector::select_top_peers;
 
 pub const AUDIT_PAGE_LIMIT: usize = MAX_AUDIT_RECORDS;
@@ -581,7 +581,6 @@ mod tests {
         select_peers,
     };
     use crate::metadata::audit_entry::{admin_refusal, audit_member};
-    use crate::metadata::protocol::MetadataReadError;
     use crate::metadata::repository::{audit_entry, metadata_audit_key};
     use aruna_core::UserId;
     use aruna_core::audit::AUDIT_KEY_BYTES;
@@ -590,6 +589,7 @@ mod tests {
     use aruna_core::events::{MetadataAnswer, NetEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::metadata::AuthToken;
+    use aruna_core::metadata::protocol::MetadataReadError;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -1375,7 +1375,7 @@ mod tests {
             &auth,
             &path,
             &aruna_core::structs::identity::auth::Permission::WRITE,
-            crate::auth::request_policy::PolicyRequestExtras::rest(),
+            aruna_core::request_policy::PolicyRequestExtras::rest(),
         );
         let result = aruna_drivers::driver::drive(check, &context)
             .await

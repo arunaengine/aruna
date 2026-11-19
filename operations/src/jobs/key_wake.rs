@@ -642,7 +642,7 @@ mod tests {
         use crate::jobs::store::test_calls::read_key_waits;
         use crate::jobs::workflow::workspace::LOCKED_INPUT;
         use crate::replication::bao_read::BaoReadError;
-        use crate::replication::protocol::BaoReadRefusal;
+        use aruna_core::replication_protocol::BaoReadRefusal;
         use aruna_core::structs::execution::job::JobError;
 
         // The input copy is not converted yet; the locked bucket key still parks the job.

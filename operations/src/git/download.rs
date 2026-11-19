@@ -29,9 +29,9 @@ use crate::distribution::resolve::{
 };
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
 use crate::s3::object::read::GetRoutedOperation;
+use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};
 
 type Document = MetadataRegistryRecord;
 

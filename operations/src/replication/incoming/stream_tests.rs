@@ -495,7 +495,7 @@ async fn foreign_reads_denied() {
     let local_node = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
     let other_node = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
     let target = |realm_id: RealmId, node_id: NodeId| {
-        crate::replication::protocol::BaoReadTarget::ExactVersion(
+        aruna_core::replication_protocol::BaoReadTarget::ExactVersion(
             aruna_core::structs::storage::replication::VersionedObjectArn {
                 realm_id,
                 node_id,
@@ -506,7 +506,7 @@ async fn foreign_reads_denied() {
         )
     };
     let request = |realm_id: RealmId, auth_context: AuthContext, target| {
-        crate::replication::protocol::BaoReadRequest {
+        aruna_core::replication_protocol::BaoReadRequest {
             auth_context,
             realm_id,
             target,

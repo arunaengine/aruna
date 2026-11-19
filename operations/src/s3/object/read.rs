@@ -49,11 +49,11 @@ use crate::distribution::source_keep::{KeepFirstOperation, KeepStart};
 use crate::distribution::source_plan::SourceKeep;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
-use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::lookup::{LookupError, summary_from_value};
+use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 type Turn<T> = Result<Next<T>, GetObjectError>;
 type Read = Result<GetObjectResult, GetObjectError>;

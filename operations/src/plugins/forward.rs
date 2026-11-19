@@ -40,7 +40,7 @@ use super::rows::{
     read_call, row as row_of, values,
 };
 use crate::metadata::deletion_guard::metadata_call;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 /// Forward rows of one install read for sending in one pass at most.
 const BATCH: usize = 100;

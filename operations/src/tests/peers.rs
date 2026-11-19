@@ -5,9 +5,8 @@
 use aruna_core::NodeId;
 use aruna_core::calls::IoResult;
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message};
 use std::time::Duration;
-
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 
 /// A metadata answer from `peer` with `result`.
 pub(crate) fn answer(peer: NodeId, result: Result<Vec<u8>, PeerRequestError>) -> IoResult {

@@ -34,8 +34,8 @@ use super::{ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, Metadata
 use crate::forward::fetch::{peer_call, peer_reply};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::local_query::LocalQueryOperation;
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
 use crate::metadata::query_cache::{RemoteKeyInput, credential_digest, remote_key};
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
 
 /// Where one partition query runs.
 #[derive(Clone, Debug, PartialEq)]

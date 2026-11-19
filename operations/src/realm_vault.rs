@@ -28,9 +28,9 @@ use ulid::Ulid;
 use crate::forward::fetch::{
     Answer, Budget, FetchError, Fetched, HolderFetchOperation, HolderRecord,
 };
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
 use crate::realm::mutate_placement::{is_management, node_kind};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 /// Cache rows read per page while pruning.
 const PRUNE_PAGE: usize = 256;

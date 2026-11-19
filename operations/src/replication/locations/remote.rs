@@ -3,14 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::LocationSummaryError;
-use crate::replication::protocol::{
-    LocationSummary, LocationSummaryRequest, VersionReplicationMessage,
-};
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::operation::Operation;
+use aruna_core::replication_protocol::{
+    LocationSummary, LocationSummaryRequest, VersionReplicationMessage,
+};
 use ulid::Ulid;
 
 type Step = Result<Next<LocationSummary>, LocationSummaryError>;
@@ -128,12 +128,12 @@ impl Operation for RemoteLocationOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::{LocationSummaryError, RemoteLocationOperation, Step};
-    use crate::replication::protocol::{LocationSummary, VersionReplicationMessage};
     use crate::tests::locations::{node_id, request};
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect};
     use aruna_core::events::{BlobEvent, Event};
     use aruna_core::operation::Operation;
+    use aruna_core::replication_protocol::{LocationSummary, VersionReplicationMessage};
     use ulid::Ulid;
 
     fn stream() -> Ulid {
@@ -186,7 +186,7 @@ mod pure_tests {
         let answer = LocationSummary {
             held: true,
             origin: aruna_core::structs::storage::blob::CopyOrigin::Sync { relationship_id },
-            compliance: crate::replication::protocol::CopyCompliance::Quarantined,
+            compliance: aruna_core::replication_protocol::CopyCompliance::Quarantined,
             ..LocationSummary::absent()
         };
         let response = VersionReplicationMessage::LocationSummaryResponse(answer.clone());

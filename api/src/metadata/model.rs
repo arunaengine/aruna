@@ -5,11 +5,11 @@
 use super::format_timestamp_ms;
 use crate::error::{ProfileFindingResponse, ValidationViolationResponse};
 use crate::routes::git::location::StorageLocationRequest;
+use aruna_core::metadata::protocol::MetadataPathWinner;
 use aruna_core::metadata::{
     ProfileValidationCompleteness, ProfileValidationState, ProfileValidationStatus,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_operations::metadata::MetadataPathWinner;
 use aruna_operations::metadata::profile::validation::MetadataProfilePreview;
 use aruna_operations::metadata::public_preview::RestrictedFilesPreview;
 use serde::{Deserialize, Serialize};

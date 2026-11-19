@@ -32,9 +32,10 @@ use crate::jobs::lifecycle::launch_admit::{
     AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided,
 };
 use crate::jobs::lifecycle::witness_arm::ArmFamilyOperation;
-use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
-use crate::metadata::transport_message_kind;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::protocol::{
+    JobPageReply, MetadataTransportMessage, transport_message_kind,
+};
 
 #[derive(Debug, PartialEq)]
 struct PageRequest {

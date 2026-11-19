@@ -4,8 +4,12 @@
 
 use super::hidden_token;
 use super::{
-    ARUNA_DATA_PREFIX, ApiQueryMode, AuthContext, ConversionError, Deserialize, HashSet, NodeId,
-    RealmConfigDocument, Serialize, Ulid,
+    ApiQueryMode, AuthContext, ConversionError, Deserialize, HashSet, NodeId, RealmConfigDocument,
+    Serialize,
+};
+use aruna_core::metadata::api::{
+    MetadataNodeFreshness, MetadataPreflightLocation, MetadataResolvedTarget,
+    MetadataVisibleReference,
 };
 
 pub(super) fn preflight_fingerprint(
@@ -73,83 +77,6 @@ impl std::fmt::Debug for ReferenceRequest {
             .field("allow_partial", &self.allow_partial)
             .finish()
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataPreflightLocation {
-    pub node_id: NodeId,
-    pub bucket: String,
-    pub key: String,
-    pub version_id: Ulid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataResolvedTarget {
-    /// The content w3id, or the `s3://` location IRI of a location target; it keys the target.
-    pub content_w3id: String,
-    /// All zeros for a location target; a node of an earlier build then finds no copy by it and
-    /// still looks up the target's IRIs.
-    pub content_hash: [u8; 32],
-    pub queried_iris: Vec<String>,
-    pub targeted_versions: Vec<MetadataPreflightLocation>,
-    pub removed_locations: Vec<MetadataPreflightLocation>,
-    #[serde(rename = "remove_all_resolvable_locations")]
-    pub remove_resolvable_locations: bool,
-}
-
-impl MetadataResolvedTarget {
-    /// The location IRI of a target named by its location, as its bytes were never read.
-    pub fn location(&self) -> Option<&str> {
-        (!self.content_w3id.starts_with(ARUNA_DATA_PREFIX)).then_some(self.content_w3id.as_str())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReferenceNodeRequest {
-    pub targets: Vec<MetadataResolvedTarget>,
-    pub limit: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataVisibleReference {
-    pub content_w3id: String,
-    pub document_id: String,
-    pub title: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataIndexState {
-    Current,
-    Pending,
-    Failed,
-    Mixed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataNodeFreshness {
-    pub node_id: NodeId,
-    pub index_state: MetadataIndexState,
-    #[serde(rename = "oldest_status_updated_at_ms")]
-    pub oldest_status_updated: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReferenceNodeTarget {
-    pub content_w3id: String,
-    pub hidden_references_exist: bool,
-    pub resolvable_location_found: bool,
-    #[serde(rename = "resolvable_location_after_operation")]
-    pub location_after_operation: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReferenceNodeExecution {
-    pub visible_references: Vec<MetadataVisibleReference>,
-    pub targets: Vec<ReferenceNodeTarget>,
-    pub freshness: MetadataNodeFreshness,
-    #[serde(rename = "path_style_endpoint_available")]
-    pub path_style_available: bool,
-    pub saturated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

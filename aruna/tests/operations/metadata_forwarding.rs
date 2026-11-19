@@ -24,6 +24,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::{
@@ -50,11 +51,10 @@ use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::groups::forward::{ForwardGroupError, ForwardGroupOperation};
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_forward_document, mint_local_document,
 };
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
-use aruna_operations::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
+use aruna_operations::metadata::update_document::UpdateDocumentError;
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };

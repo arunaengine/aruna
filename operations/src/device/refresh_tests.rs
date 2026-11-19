@@ -7,7 +7,7 @@ use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 
 use super::*;
-use crate::metadata::protocol::encode_message;
+use aruna_core::metadata::protocol::encode_message;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()

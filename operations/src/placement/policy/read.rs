@@ -27,7 +27,7 @@ use thiserror::Error;
 use aruna_core::placement::{PlacementResolveError, read_holder_sets};
 
 use crate::forward::fetch::{Answer, Budget, Fetched, HolderFetchOperation, HolderRecord};
-use crate::metadata::protocol::MetadataTransportMessage;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 
 /// Wall-clock budget one policy fetch may spend across its holders.
 pub const POLICY_FETCH_DEADLINE: Duration = Duration::from_secs(10);

@@ -44,9 +44,9 @@ use super::keep::{
 use super::purge_steps::{DropCopyOperation, PurgeError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectError, GetObjectResult, ResolvedObjectRange};
 use crate::s3::object::read::HolderFailures;
+use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 type Blob = BackendStream<Result<Bytes, StreamError>>;
 

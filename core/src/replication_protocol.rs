@@ -2,26 +2,25 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::object::get::MAX_AUTO_ADVANCES;
-use aruna_core::errors::ConversionError;
-use aruna_core::id::NodeId;
-use aruna_core::structs::checksum::ChecksumAlgorithm;
-use aruna_core::structs::checksum::Hasher;
-use aruna_core::structs::execution::source_access::SourceMetadata;
-use aruna_core::structs::execution::staging::VersionSourceBinding;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::policy::{MAX_REF_INPUT, PlacementPolicyRef, PlacementSubject};
-use aruna_core::structs::storage::blob::{BackendLocation, CopyOrigin};
-use aruna_core::structs::storage::distribution::{OriginalEpoch, Publication};
-use aruna_core::structs::storage::multipart::{
+use crate::errors::ConversionError;
+use crate::id::NodeId;
+use crate::structs::checksum::ChecksumAlgorithm;
+use crate::structs::checksum::Hasher;
+use crate::structs::execution::source_access::SourceMetadata;
+use crate::structs::execution::staging::VersionSourceBinding;
+use crate::structs::identity::auth::AuthContext;
+use crate::structs::identity::realm::RealmId;
+use crate::structs::placement::policy::{MAX_REF_INPUT, PlacementPolicyRef, PlacementSubject};
+use crate::structs::storage::blob::{BackendLocation, CopyOrigin};
+use crate::structs::storage::distribution::{OriginalEpoch, Publication};
+use crate::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
 };
-use aruna_core::structs::storage::replication::{
+use crate::structs::storage::replication::{
     ArunaArn, ReplicationItemKind, ReplicationNegotiationResult, VersionedObjectArn,
 };
-use aruna_core::structs::storage::replication_queue::{
-    ReferenceAdvance, ReplicationMode, SyncOrigin,
+use crate::structs::storage::replication_queue::{
+    MAX_AUTO_ADVANCES, ReferenceAdvance, ReplicationMode, SyncOrigin,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -44,10 +43,10 @@ pub struct VersionReplicationManifest {
     pub bucket: String,
     pub key: String,
     pub version_id: Ulid,
-    pub group_id: aruna_core::types::GroupId,
+    pub group_id: crate::types::GroupId,
     pub kind: ReplicationItemKind,
     pub created_at: std::time::SystemTime,
-    pub created_by: aruna_core::UserId,
+    pub created_by: crate::UserId,
     pub current_version: bool,
     pub current_version_generation: Option<u64>,
     pub auth_context: AuthContext,
@@ -78,9 +77,9 @@ pub struct VersionReplicationManifest {
     /// against its own record instead of a relationship or a writer's permissions.
     pub distribution: Option<Publication>,
     /// Where the version's content came from; every copy keeps it unchanged.
-    pub version_origin: Option<aruna_core::structs::storage::origin::VersionOrigin>,
+    pub version_origin: Option<crate::structs::storage::origin::VersionOrigin>,
     /// The sync hop the sender's version carries; a sync destination records its own.
-    pub version_hop: Option<aruna_core::structs::storage::origin::SyncHop>,
+    pub version_hop: Option<crate::structs::storage::origin::SyncHop>,
     /// The sender's own bucket and key of a sync delivery, which the destination's hop names.
     pub sync_source: Option<(String, String)>,
 }
@@ -262,7 +261,7 @@ pub enum BaoReadTarget {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BaoReadRequest {
     pub auth_context: AuthContext,
-    pub realm_id: aruna_core::structs::identity::realm::RealmId,
+    pub realm_id: crate::structs::identity::realm::RealmId,
     pub target: BaoReadTarget,
     pub expected_blake3: Option<[u8; 32]>,
     pub metadata_only: bool,
@@ -281,7 +280,7 @@ impl BaoReadRequest {
     pub fn validate(&self) -> Result<(), ConversionError> {
         if self.known_refs.len() > MAX_REF_INPUT {
             return Err(ConversionError::PlacementPolicyError(
-                aruna_core::structs::placement::policy::PlacementPolicyError::RefCount,
+                crate::structs::placement::policy::PlacementPolicyError::RefCount,
             ));
         }
         if PlacementPolicyRef::canonical_set(&self.known_refs)? != self.known_refs {
@@ -401,12 +400,12 @@ fn check_hash(
     digest: &[u8],
 ) -> Result<(), ConversionError> {
     let expected = match name {
-        aruna_core::structs::checksum::HASH_BLAKE3 => 32,
-        aruna_core::structs::checksum::HASH_MD5 => 16,
-        aruna_core::structs::checksum::HASH_SHA1 => 20,
-        aruna_core::structs::checksum::HASH_SHA256 => 32,
-        aruna_core::structs::checksum::HASH_CRC32 | aruna_core::structs::checksum::HASH_CRC32C => 4,
-        aruna_core::structs::checksum::HASH_CRC64NVME => 8,
+        crate::structs::checksum::HASH_BLAKE3 => 32,
+        crate::structs::checksum::HASH_MD5 => 16,
+        crate::structs::checksum::HASH_SHA1 => 20,
+        crate::structs::checksum::HASH_SHA256 => 32,
+        crate::structs::checksum::HASH_CRC32 | crate::structs::checksum::HASH_CRC32C => 4,
+        crate::structs::checksum::HASH_CRC64NVME => 8,
         _ => {
             return Err(ConversionError::FromStrError(
                 "replication manifest hash algorithm is unsupported".to_string(),
@@ -427,10 +426,10 @@ fn check_location(
     location: &BackendLocation,
 ) -> Result<(), ConversionError> {
     match &location.backend {
-        aruna_core::structs::storage::blob::BackendRef::Node(name) => {
+        crate::structs::storage::blob::BackendRef::Node(name) => {
             check_text(budget, name, MAX_VALUE_BYTES)?;
         }
-        aruna_core::structs::storage::blob::BackendRef::Group(_) => {}
+        crate::structs::storage::blob::BackendRef::Group(_) => {}
     }
     if let Some(storage_class) = &location.storage_class {
         check_text(budget, storage_class, MAX_VALUE_BYTES)?;
@@ -668,7 +667,7 @@ impl VersionReplicationMessage {
             Self::PlacementPolicyDenied { policy_ids } => {
                 if policy_ids.len() > MAX_REF_INPUT {
                     return Err(ConversionError::PlacementPolicyError(
-                        aruna_core::structs::placement::policy::PlacementPolicyError::RefCount,
+                        crate::structs::placement::policy::PlacementPolicyError::RefCount,
                     ));
                 }
                 None
@@ -690,15 +689,34 @@ pub struct VersionReplicationRequest {
     pub bucket: String,
     pub key: String,
     pub version_id: Ulid,
-    pub source_group_id: aruna_core::types::GroupId,
+    pub source_group_id: crate::types::GroupId,
     pub target_node_id: NodeId,
     pub auth_context: AuthContext,
     pub mode: ReplicationMode,
 }
 
+/// Reference records of one range, published by its coordinator to one member.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReferencePage {
+    pub bucket: String,
+    pub publication: Publication,
+    /// At most one record per key, each a reference with the page's publication.
+    pub manifests: Vec<VersionReplicationManifest>,
+}
+
+/// The member's answer to one page.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PageAnswer {
+    /// Committed in one transaction: `applied` records are stored, including replays of
+    /// stored ones. `single` names the versions the page left for single-record delivery.
+    Applied { applied: u32, single: Vec<Ulid> },
+    /// Nothing was written; with `retry` the same page may pass later.
+    Refused { reason: String, retry: bool },
+}
+
 #[cfg(test)]
 mod pure_tests {
-    use aruna_core::structs::storage::format::StoredFormat;
+    use crate::structs::storage::format::StoredFormat;
     use std::time::Duration;
 
     use super::{
@@ -707,23 +725,23 @@ mod pure_tests {
         MultipartObjectMetadata, ReferenceAdvance, SyncOrigin, VersionReplicationManifest,
         VersionReplicationMessage,
     };
-    use aruna_core::UserId;
-    use aruna_core::errors::ConversionError;
-    use aruna_core::structs::checksum::HASH_SHA256;
-    use aruna_core::structs::checksum::Hasher;
-    use aruna_core::structs::execution::source_access::SourceMetadata;
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-    use aruna_core::structs::execution::staging::{
+    use crate::UserId;
+    use crate::errors::ConversionError;
+    use crate::structs::checksum::HASH_SHA256;
+    use crate::structs::checksum::Hasher;
+    use crate::structs::execution::source_access::SourceMetadata;
+    use crate::structs::execution::source_connector::SourceConnectorKind;
+    use crate::structs::execution::staging::{
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
-    use aruna_core::structs::identity::auth::AuthContext;
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::policy::PlacementPolicyRef;
-    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
-    use aruna_core::structs::storage::multipart::{
+    use crate::structs::identity::auth::AuthContext;
+    use crate::structs::identity::realm::RealmId;
+    use crate::structs::placement::policy::PlacementPolicyRef;
+    use crate::structs::storage::blob::{BackendLocation, BackendRef};
+    use crate::structs::storage::multipart::{
         MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
     };
-    use aruna_core::structs::storage::replication::{ArunaArn, ReplicationItemKind};
+    use crate::structs::storage::replication::{ArunaArn, ReplicationItemKind};
     use std::collections::{BTreeMap, HashMap};
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -887,7 +905,7 @@ mod pure_tests {
             .unwrap(),
         );
         manifest.reference_metadata = Some(
-            aruna_core::structs::execution::source_access::SourceMetadata {
+            crate::structs::execution::source_access::SourceMetadata {
                 content_length: 42,
                 content_type: Some("text/plain".to_string()),
                 etag: Some("etag-1".to_string()),

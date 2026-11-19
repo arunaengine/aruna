@@ -25,9 +25,8 @@ use super::replica_store::{list_replicas, read_replica, store_replica};
 use crate::document_repository::{config_of, realm_config};
 use crate::forward::transport::{peer_call_within, timed_answer};
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::protocol::{GraphState, MetadataTransportMessage};
-use crate::metadata::transport_message_kind;
 use crate::realm::mutate_placement::node_kind;
+use aruna_core::metadata::protocol::{GraphState, MetadataTransportMessage, transport_message_kind};
 use aruna_core::structs::identity::realm::NodeRealm;
 
 /// Replicas one pass refreshes. The rest follow on the next beat, so a large

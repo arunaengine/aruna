@@ -17,7 +17,7 @@ use super::install::InstallCaller;
 use super::rows::tests::child_result;
 use super::work::tests::sample_install;
 use crate::document_repository::GetConfigError;
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message};
 
 pub(crate) fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()

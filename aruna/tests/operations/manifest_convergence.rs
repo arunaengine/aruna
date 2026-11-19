@@ -4,6 +4,7 @@
 
 use crate::metadata_calls::read_mapping;
 use aruna_core::document::{DocumentTarget, ShardManifest, ShardManifestEntry};
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::placement::{
     PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, strategy_for_target,
@@ -16,7 +17,7 @@ use aruna_core::{MetaResourceId, StructuredId};
 use aruna_core::{NodeId, UserId};
 use aruna_drivers::driver::drive;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use ulid::Ulid;

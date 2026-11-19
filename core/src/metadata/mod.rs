@@ -1,4 +1,5 @@
-//! Defines metadata auth tokens, crate events, raw revisions and validation records.
+//! Defines metadata auth tokens, crate events, raw revisions and validation records, and holds
+//! the payloads and messages nodes exchange about metadata.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -16,6 +17,9 @@ use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::metadata_registry::{MetadataAuditOperation, MetadataRegistryRecord};
 use crate::types::GroupId;
+
+pub mod api;
+pub mod protocol;
 
 pub const MAX_TOKEN_LEN: usize = 4096;
 

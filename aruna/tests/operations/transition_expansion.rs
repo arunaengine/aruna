@@ -6,10 +6,11 @@ use crate::topology;
 use aruna_drivers::driver::drive;
 
 use aruna_core::StructuredId;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::create_entry::CreateEntryOperation;
 use aruna_operations::testing::replay_event_log;

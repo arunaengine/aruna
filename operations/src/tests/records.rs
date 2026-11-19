@@ -32,8 +32,8 @@ use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::node_inputs::launch_node;
 use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::jobs::records::verify::FamilyView;
-use crate::metadata::protocol::MetadataTransportMessage;
 use aruna_core::effects::LaunchFrame;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_drivers::driver::{DriverContext, drive};
 
 pub const REALM: RealmId = RealmId([3u8; 32]);

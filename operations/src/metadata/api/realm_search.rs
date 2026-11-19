@@ -33,13 +33,13 @@ use super::search_types::{MetadataSearchExecution, MetadataSearchRequest};
 use super::{ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
 use crate::forward::fetch::{peer_call, peer_reply};
 use crate::metadata::profile::validation::equivalent_profile_iris;
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
 use crate::metadata::search_cursor::{
     MAX_PAGINATION_DEPTH, NodeSearchResult, SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE, SearchCursor,
     SearchCursorError, SearchWatermark, blank_signature, merge_search_hits, paginate,
     query_fingerprint, resume_fetch_limit,
 };
 use crate::metadata::text_search::LocalSearchOperation;
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
 
 /// Where one node's search runs.
 #[derive(Clone, Debug, PartialEq)]

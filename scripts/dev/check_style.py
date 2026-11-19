@@ -45,6 +45,7 @@ SMALL_DOMAINS = {
     "compute/src/executor/kubernetes": "grouped shared-prefix domain",
     "compute/src/session": "grouped shared-prefix domain",
     "core/src/compute": "grouped shared-prefix domain",
+    "core/src/metadata": "grouped shared-prefix domain",
     "core/src/structs/identity": "identity record scope; hoisting recreates identity_*",
     "core/src/structs/identity/user": "grouped shared-prefix domain",
     "core/src/structs/placement/policy": "grouped shared-prefix domain",

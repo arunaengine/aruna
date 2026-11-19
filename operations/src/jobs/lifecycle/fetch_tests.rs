@@ -16,9 +16,10 @@ use aruna_core::structs::execution::job::JobFamilyRecord;
 
 use super::FetchFamilyOperation;
 use crate::jobs::lifecycle::LifecycleError;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage, encode_message};
 use crate::tests::records::{Family, node};
+use aruna_core::metadata::protocol::{
+    JobPageReply, MetadataTransportMessage, encode_message, metadata_request,
+};
 
 fn fetch(family: &Family) -> FetchFamilyOperation {
     FetchFamilyOperation::new(

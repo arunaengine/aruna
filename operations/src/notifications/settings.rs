@@ -21,13 +21,12 @@ use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use tracing::warn;
 
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{
-    MetadataReadError, MetadataTransportMessage, decode_message, encode_message,
-};
 use crate::notifications::setting_rows::{ReadSettingOperation, SettingError};
 use crate::notifications::unexpected_event;
 use crate::realm_vault::{SecretAnswer, ServeRequest, ServeSecretOperation};
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 
 /// The first delay after no management node opened a secret; it doubles up to `BACKOFF_CAP_MS`.
 pub const BACKOFF_START_MS: u64 = 30_000;

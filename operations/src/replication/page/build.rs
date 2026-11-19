@@ -23,7 +23,7 @@ use thiserror::Error;
 
 use super::{PAGE_BYTES, PAGE_RECORDS};
 use crate::connectors::root_record::{hydrated, named_root};
-use crate::replication::protocol::VersionReplicationManifest;
+use aruna_core::replication_protocol::VersionReplicationManifest;
 use aruna_core::structs::storage::replication_queue::BlobJobRecord;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 

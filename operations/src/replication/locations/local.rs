@@ -4,12 +4,7 @@
 
 use super::LocationSummaryError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::realm::peer_trust::ensure_realm_peer;
-use crate::replication::protocol::{
-    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
-    VersionReplicationMessage,
-};
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
@@ -21,7 +16,13 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::managed_copy::{CopyRequest, read_effect, registration_for, serve_reads};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
+use aruna_core::replication_protocol::{
+    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
+    VersionReplicationMessage,
+};
+use aruna_core::request_policy::{
+    CompiledPolicySet, PolicyDecision, PolicyRequestExtras, policy_request_with,
+};
 use aruna_core::rows::read_row;
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::identity::auth::Permission;
@@ -644,15 +645,15 @@ impl Operation for LocationSummaryOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::{LocalSummary, LocationSummaryError, LocationSummaryOperation, SummaryState, Turn};
-    use crate::replication::protocol::{
-        CopyCompliance, LocationCopyStorage, VersionReplicationMessage,
-    };
     use crate::tests::locations::{node_id, realm_id, request};
     use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect};
     use aruna_core::events::{BlobEvent, Event};
     use aruna_core::operation::{Operation, TransactionMode};
+    use aruna_core::replication_protocol::{
+        CopyCompliance, LocationCopyStorage, VersionReplicationMessage,
+    };
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;

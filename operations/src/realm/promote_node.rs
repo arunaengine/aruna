@@ -21,12 +21,12 @@ use thiserror::Error;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{peer_call, peer_reply};
-use crate::metadata::protocol::{
-    MetadataReadError, MetadataTransportMessage, RealmKeyPem, encode_message,
-};
-use crate::metadata::transport_message_kind;
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
 use crate::realm::mutate_placement::{is_management, node_kind};
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, RealmKeyPem, encode_message,
+    transport_message_kind,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromoteNodeConfig {
@@ -277,10 +277,10 @@ fn request_owner(document: &RealmConfigDocument) -> Option<NodeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::protocol::decode_message;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::{Effect, NetEffect};
     use aruna_core::events::{Event, MetadataAnswer, NetEvent};
+    use aruna_core::metadata::protocol::decode_message;
     use aruna_core::structs::identity::realm::RealmId;
 
     /// Node ids in ascending order of `rank`, so a test knows which one owns database requests.

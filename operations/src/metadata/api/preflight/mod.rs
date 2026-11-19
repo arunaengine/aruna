@@ -5,15 +5,18 @@
 
 use super::hidden_token;
 use super::preflight_types::{
-    MetadataExcludedForm, MetadataIndexState, MetadataPreflightLocation, MetadataResolvedTarget,
-    MetadataStorageOperation, MetadataVisibleReference, ReferenceCoverage, ReferenceExecution,
-    ReferenceNodeExecution, ReferenceRequest, ReferenceTarget, ReferenceTargetExecution,
+    MetadataExcludedForm, MetadataStorageOperation, ReferenceCoverage, ReferenceExecution,
+    ReferenceRequest, ReferenceTarget, ReferenceTargetExecution,
 };
 use super::{
     ARUNA_DATA_PREFIX, ApiQueryMode, AuthContext, BTreeMap, BTreeSet, BlobVersion,
     BlobVersionState, HashMap, Key, MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutStats,
     MetadataSearchHit, NodeId, NodeSearchResult, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, RealmId,
     SearchCursor, SearchWatermark, Ulid, Value, VersionKey, paginate,
+};
+use aruna_core::metadata::api::{
+    MetadataIndexState, MetadataPreflightLocation, MetadataResolvedTarget, MetadataVisibleReference,
+    ReferenceNodeExecution,
 };
 
 use super::head_versions::HeadVersionsError;

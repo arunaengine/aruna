@@ -32,13 +32,14 @@ use super::selection::track_created;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-    CreateDocumentResult, mint_forward_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
+    mint_forward_document,
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::routed::write::ApplyBatchOperation;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::api::CreateDocumentPayload;
 
 /// Delay before a deferred pass looks for the realm again.
 pub const PUBLISH_DEFER_AFTER: Duration = Duration::from_secs(15);

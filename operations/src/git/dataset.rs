@@ -30,12 +30,12 @@ use super::project::author;
 use super::{GitError, GitNode, download, lfs, location, publish};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::s3::object::copy::{
     CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopyResultData,
     CopySourceConditions,
 };
+use aruna_core::request_policy::PolicyRequestExtras;
 
 type Document = MetadataRegistryRecord;
 

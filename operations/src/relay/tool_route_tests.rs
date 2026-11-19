@@ -8,7 +8,7 @@ use aruna_core::UserId;
 use ulid::Ulid;
 
 use crate::metadata::api::fanout_types::MetadataFanoutStats;
-use crate::s3::bucket::search::BucketSearchHit;
+use aruna_core::search::BucketSearchHit;
 
 use super::*;
 

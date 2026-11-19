@@ -15,8 +15,8 @@ use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 
 use crate::document_repository::read_row;
-use crate::metadata::protocol::{MetadataReadError, RealmKeyPem};
 use crate::realm::mutate_placement::{is_management, node_kind};
+use aruna_core::metadata::protocol::{MetadataReadError, RealmKeyPem};
 
 /// What a management node asks of the node it promotes.
 #[derive(Debug, PartialEq)]

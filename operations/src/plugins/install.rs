@@ -44,11 +44,11 @@ use super::rules::{EnsureRules, RetireRules, RulesFailure};
 use super::settings::{SettingError, check_settings};
 use crate::auth::enforcement::{compiled_policies, group_from_path, policy_reads, read_policies};
 use crate::auth::permission_rules::{PermissionRules, read_rules, rule_reads};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::users::service_account::check::{
     ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation,
 };
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum InstallError {

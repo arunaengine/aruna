@@ -19,7 +19,6 @@ use aruna_core::types::GroupId;
 use tracing::warn;
 
 use super::admit_here::{AcceptedSubmission, placement_failure};
-use super::ids::{RequestIdentity, SubmissionRequest};
 use super::resolve_inputs::{ResolveInputsOperation, ResolvedInputs};
 use super::submission_rules::{
     forwarded_request_fits, is_device, peer_refusal, pin_outputs, refusal_of,
@@ -27,13 +26,14 @@ use super::submission_rules::{
 use super::submit_external::IngressNode;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::pages::{LoadChainOperation, PageReadError, StoreEntriesOperation};
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::peer_acts_for;
+use aruna_core::job_request::{RequestIdentity, SubmissionRequest};
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Whether the caller may write in a group: its grants, then the request policies.
 #[derive(Debug, PartialEq)]
@@ -361,10 +361,10 @@ impl Operation for AdmitForwardedOperation {
 mod tests {
 
     use super::*;
-    use crate::jobs::lifecycle::ids::SubmissionScope;
     use crate::tests::records::{Family, REALM, local_ingress, node, payload, user};
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::job_request::SubmissionScope;
     use aruna_core::structs::execution::job::JobId;
     use ulid::Ulid;
 

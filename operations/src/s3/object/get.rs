@@ -18,6 +18,7 @@ use crate::s3::object::put::abe::keyed;
 use crate::s3::object::source::choice::{Candidate, choose_source};
 use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::id_mint::IdMint;
+use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
 use futures_util::StreamExt;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
@@ -73,10 +74,6 @@ const MAX_DRIFT_ATTEMPTS: u8 = 3;
 /// Minimum age of the current reference version before a read may mint another
 /// successor. Rate-limits a READ-only caller pointing at a source they control.
 pub const MIN_ADVANCE_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Hard bound on automatic successors per explicit binding: the interval only
-/// slows growth, this stops it. Only a WRITE or rebind starts a fresh count.
-pub const MAX_AUTO_ADVANCES: u16 = 100;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GetObjectState {

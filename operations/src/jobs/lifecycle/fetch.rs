@@ -14,9 +14,8 @@ use aruna_core::structs::placement::record::PlacementRef;
 use tracing::{debug, warn};
 
 use super::LifecycleError;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{
-    JobPageReply, MetadataTransportMessage, decode_message, encode_message,
+use aruna_core::metadata::protocol::{
+    JobPageReply, MetadataTransportMessage, decode_message, encode_message, metadata_request,
 };
 
 /// The holder that answered, if any, and the records of its page.
@@ -128,7 +127,7 @@ impl Operation for FetchFamilyOperation {
             Ok(other) => {
                 warn!(
                     peer = %peer,
-                    reply = crate::metadata::transport_message_kind(&other),
+                    reply = aruna_core::metadata::protocol::transport_message_kind(&other),
                     "Unexpected job record fetch reply"
                 );
                 Ok(self.ask())

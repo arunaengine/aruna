@@ -34,7 +34,6 @@ use ulid::Ulid;
 use super::repository::link_store::time_of;
 use super::repository::{JobScope, remote_answer, remote_call};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{AuthorizeCreateOperation, CreateScope};
 use crate::forward::transport::MetadataWriteError;
@@ -51,15 +50,16 @@ use crate::harvest::repository::{
 use crate::harvest::target_path::{HARVEST_PATH_BYTES, normalize_target_prefix};
 use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-    CreateDocumentResult, mint_document_for,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
+    mint_document_for,
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use crate::metadata::forward::routed::write::RouteDeleteOperation;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
-use crate::metadata::update_document::UpdateDocumentMutation;
 use aruna_core::jobs::JobRunOutcome;
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 /// Operationally generous at a typical page size, and small enough that a

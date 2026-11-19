@@ -3,19 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
-use aruna_core::compute::SessionMount;
-use aruna_core::compute::runtimes::{
+use crate::UserId;
+use crate::compute::SessionMount;
+use crate::compute::runtimes::{
     MOUNT_PATH_TAG, MOUNT_PREFIX_TAG, SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_RUNTIME_TAG,
     SESSION_TAG, SESSION_TAG_NOTEBOOK,
 };
-use aruna_core::errors::ConversionError;
-use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{
+use crate::errors::ConversionError;
+use crate::id::NodeId;
+use crate::structs::execution::job::{
     CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, SubmissionId, WorkspaceMode,
 };
-use aruna_core::structs::placement::policy::{MAX_SELECTOR_LABELS, PlacementPolicyRef};
-use aruna_core::structs::placement::record::LabelMatch;
+use crate::structs::placement::policy::{MAX_SELECTOR_LABELS, PlacementPolicyRef};
+use crate::structs::placement::record::LabelMatch;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -74,7 +74,7 @@ pub struct SubmissionRequest {
     pub output_policies: Vec<PlacementPolicyRef>,
     /// Inputs too large to travel inline: the lists are empty and the sender keeps the pages.
     /// The identity is always computed from the full lists.
-    pub input_pages: Option<aruna_core::structs::execution::job::PageManifest>,
+    pub input_pages: Option<crate::structs::execution::job::PageManifest>,
 }
 
 /// The replicated identity of one request.
@@ -261,7 +261,7 @@ pub fn effective_resources(spec: &ExecutionSpec) -> EffectiveResources {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::structs::execution::job::ComputeResources;
+    use crate::structs::execution::job::ComputeResources;
 
     use super::*;
 

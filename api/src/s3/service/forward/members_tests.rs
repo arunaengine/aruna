@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use http::{Extensions, HeaderMap, Method, Uri};
 use s3s::dto::{GetObjectInput, PutObjectInput, StreamingBlob};
 use s3s::{S3, S3Request};

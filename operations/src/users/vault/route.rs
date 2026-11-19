@@ -20,15 +20,15 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::read::LocalRecordsOperation;
-use super::write::{
-    AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended, VaultRefusal,
-};
+use super::write::{AppendVaultConfig, AppendVaultError, AppendVaultOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::routing::{ForwardHoldersOperation, HolderWriteError};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
-use crate::metadata::transport_message_kind;
 use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, WriteAuthError, transport_message_kind,
+};
+use aruna_core::structs::identity::user::vault::{VaultAppended, VaultRefusal};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum VaultRouteError {

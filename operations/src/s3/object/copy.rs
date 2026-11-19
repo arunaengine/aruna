@@ -949,7 +949,8 @@ impl Operation for KeepReferenceOperation {
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use crate::s3::object::get::{GetObjectOperation, MAX_AUTO_ADVANCES};
+    use crate::s3::object::get::GetObjectOperation;
+    use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
     #[allow(unused_imports)]
     pub(crate) use crate::testing_objects::{put_config, seed_bucket, with_blob};
     use crate::tests::policy::{seed_gate, subject};

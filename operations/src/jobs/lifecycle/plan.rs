@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use aruna_core::compute::{ExecutionTargetId, ExecutorCapability, NetworkAccess, StagingMode};
 use aruna_core::id::NodeId;
+use aruna_core::job_request;
 use aruna_core::scheduling::{
     ExecutionPlan, InputHolder, MAX_INPUT_HOLDERS, MAX_TARGET_SCAN, PlanRequest, Planner,
     ResolvedInput, TargetCandidate,
@@ -29,15 +30,14 @@ use tracing::debug;
 use ulid::Ulid;
 
 use super::advertised::{Advertised, AdvertisementsOperation};
-use super::ids;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{PolicyEvaluator, compiled_policies, policy_reads, read_policies};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::placement::policy::{PolicySetError, PolicySetResolver, Resolutions, ResolveMode};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
 use aruna_core::operation::Operation;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::types::Value;
 
 /// Tag that pins the container network mode, shared with the executor path.
@@ -57,7 +57,7 @@ pub enum PlanBuildError {
     #[error(transparent)]
     Plan(#[from] aruna_core::scheduling::PlanError),
     #[error(transparent)]
-    Request(#[from] ids::RequestError),
+    Request(#[from] job_request::RequestError),
 }
 
 impl From<IoError> for PlanBuildError {
@@ -159,7 +159,7 @@ impl BuildPlanOperation {
     /// The nodes a candidate may run on, then the request policy rows of the group.
     fn targets(&mut self) -> PlanNext {
         let spec = &self.round.spec;
-        let existing = ids::workspace_of(&spec.payload).0 == WorkspaceMode::Existing;
+        let existing = job_request::workspace_of(&spec.payload).0 == WorkspaceMode::Existing;
         let mut targets: Vec<NodeId> = self
             .documents
             .keys()
@@ -337,10 +337,10 @@ fn plan_request(
         admitted: true,
         resources: spec.resources,
         executor_constraint: spec.payload.executor_constraint.clone(),
-        required_labels: ids::required_labels(&spec.payload)?,
+        required_labels: job_request::required_labels(&spec.payload)?,
         staging: REALM_STAGING,
         network: network_access(spec),
-        session: ids::session_of(&spec.payload).is_some(),
+        session: job_request::session_of(&spec.payload).is_some(),
         inputs,
         output_policies,
         policies,
@@ -386,7 +386,7 @@ fn candidates(
     // Members come out of the map in node id byte order and every document's
     // backends are walked by kind: the canonical order pages must continue in.
     for (node_id, document) in documents {
-        if ids::workspace_of(&spec.payload).0 == WorkspaceMode::Existing
+        if job_request::workspace_of(&spec.payload).0 == WorkspaceMode::Existing
             && *node_id != spec.ingress_node_id
         {
             continue;

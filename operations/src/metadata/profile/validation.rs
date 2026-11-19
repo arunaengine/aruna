@@ -31,16 +31,16 @@ use super::rules::{
     DCTERMS_CONFORMS_TO, DX_PROFILE, EVALUATOR_NAME, data_graph, has_type, not_profiled_status,
     objects, profile_tags, stale_status, submission_profile_tag,
 };
-use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
 use crate::metadata::call_results::effect_event;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::forward::profile_export::ProfileExportOperation;
-use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::raw_events::{RawReadError, RawRevisionState};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::revision_read::{RawStateOperation, RawViewOperation, RawViewOutput};
 use aruna_core::errors::StorageReadError;
+use aruna_core::metadata::api::ExportMetadataResult;
+use aruna_core::metadata::protocol::MetadataReadError;
 
 const SH: &str = "http://www.w3.org/ns/shacl#";
 const SCHEMA_ENCODING_FORMAT: &str = "http://schema.org/encodingFormat";

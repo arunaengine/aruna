@@ -15,12 +15,12 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 
 use super::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
-use super::protocol::BaoReadRequest;
 use crate::placement::policy::{
     GateContext, GateContextError, GateOperation, PolicyGateError, PolicyGateOutcome,
     ReadPolicyError, gate_decision, union_refs, write_gate,
 };
 use crate::realm::mutate_placement::node_kind;
+use aruna_core::replication_protocol::BaoReadRequest;
 
 /// One teach-then-retry round. The source only ever teaches the refs it needs,
 /// so a second `Required` for the same set is a protocol dead end, not a loop.
@@ -240,9 +240,9 @@ impl Operation for LocalUserOperation {
 mod tests {
     use super::*;
     use crate::placement::policy::cache::PolicyCacheStats;
-    use crate::replication::protocol::BaoReadTarget;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::replication_protocol::BaoReadTarget;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::placement::policy::{PlacementDecision, PlacementSubject};
     use aruna_core::structs::storage::replication::VersionedObjectArn;
