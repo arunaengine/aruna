@@ -448,7 +448,9 @@ mod tests {
         ctx: &DriverContext,
         config: LocalExecutionConfig,
     ) -> Result<SubmitJobResult, LocalExecutionError> {
-        drive(crate::jobs::node_inputs::local_run(config, ctx), ctx).await
+        let limits = ctx.compute_limits();
+        let run = crate::jobs::node_inputs::local_run(config, &limits, ctx.node_and_realm());
+        drive(run, ctx).await
     }
 
     const REALM: RealmId = RealmId([3u8; 32]);

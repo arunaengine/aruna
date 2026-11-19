@@ -452,7 +452,7 @@ pub async fn serve_launch_offer(
     peer: NodeId,
     launch: LaunchFrame,
 ) -> MetadataTransportMessage {
-    let node = launch_node(context, &launch);
+    let node = launch_node(context.node_and_realm(), &context.compute_limits(), &launch);
     let serve = ServeLaunchOperation::new(peer, launch, node);
     drive(serve, context)
         .await

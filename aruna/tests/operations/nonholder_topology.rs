@@ -229,7 +229,10 @@ async fn submit_external_job(
         retention_ms,
         auth_token,
     };
-    let submit = SubmitExternalOperation::new(submission, ingress_node(context));
+    let submit = SubmitExternalOperation::new(
+        submission,
+        ingress_node(context.node_and_realm(), context.fresh_heartbeats()),
+    );
     drive(submit, context).await.map_err(placement_failure)
 }
 

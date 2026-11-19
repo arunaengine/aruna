@@ -264,7 +264,11 @@ async fn peer_request(
                 .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
         }
         MetadataTransportMessage::ForwardLaunchOffer { launch } => {
-            let node = aruna_operations::jobs::node_inputs::launch_node(context, &launch);
+            let node = aruna_operations::jobs::node_inputs::launch_node(
+                context.node_and_realm(),
+                &context.compute_limits(),
+                &launch,
+            );
             let serve = ServeLaunchOperation::new(peer, *launch, node);
             Ok(Box::pin(drive(serve, context.as_ref()))
                 .await
@@ -275,7 +279,10 @@ async fn peer_request(
             submission_id,
             request,
         } => {
-            let node = aruna_operations::jobs::node_inputs::ingress_node(context);
+            let node = aruna_operations::jobs::node_inputs::ingress_node(
+                context.node_and_realm(),
+                context.fresh_heartbeats(),
+            );
             let admit =
                 aruna_operations::jobs::lifecycle::admit_forwarded::AdmitForwardedOperation::new(
                     peer,
@@ -291,7 +298,10 @@ async fn peer_request(
             auth_token,
             request,
         } => {
-            let result = match aruna_operations::jobs::node_inputs::ingress_node(context) {
+            let result = match aruna_operations::jobs::node_inputs::ingress_node(
+                context.node_and_realm(),
+                context.fresh_heartbeats(),
+            ) {
                 Some(node) => {
                     let serve =
                         aruna_operations::jobs::lifecycle::serve_inputs::ServeInputsOperation::new(

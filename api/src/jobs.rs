@@ -32,11 +32,11 @@ use aruna_operations::jobs::lifecycle::submit_external::{
     ExternalSubmission, SubmitExternalOperation,
 };
 use aruna_operations::jobs::local_run::{LocalExecutionConfig, LocalExecutionError};
+use aruna_operations::jobs::node_inputs::{ingress_node, local_run};
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::jobs::node_inputs::{ingress_node, local_run};
 use ulid::Ulid;
 
 use crate::auth::{ValidatedBearer, require_owner, require_unrestricted_auth};
@@ -359,9 +359,12 @@ async fn local_submit(
         workspace_mode,
         retention_ms: state.rocrate_limits().artifact_retention_ms,
     };
-    let result = drive(local_run(config, &context), context.as_ref())
-        .await
-        .map_err(JobRequestError::from_local)?;
+    let result = drive(
+        local_run(config, &context.compute_limits(), context.node_and_realm()),
+        context.as_ref(),
+    )
+    .await
+    .map_err(JobRequestError::from_local)?;
     // A replay answers with the state the device already reduced for that job.
     let state = read_owned_job(&context, auth.user_id, result.job_id)
         .await
@@ -427,7 +430,10 @@ pub(crate) async fn submit_external_job(
         retention_ms,
         auth_token,
     };
-    let submit = SubmitExternalOperation::new(submission, ingress_node(context));
+    let submit = SubmitExternalOperation::new(
+        submission,
+        ingress_node(context.node_and_realm(), context.fresh_heartbeats()),
+    );
     drive(submit, context).await.map_err(placement_failure)
 }
 

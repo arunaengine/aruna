@@ -38,10 +38,10 @@ use crate::jobs::lifecycle::launch_admit::{
 };
 use crate::jobs::lifecycle::report::{AuditPaging, AuditRange, FamilyReport};
 use crate::jobs::lifecycle::submit_external::{ExternalSubmission, SubmitExternalOperation};
+use crate::jobs::node_inputs::{ingress_node, launch_node};
 use crate::jobs::records::audit::AuditPage;
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
 use crate::jobs::submit::SubmitJobError;
-use crate::jobs::node_inputs::{ingress_node, launch_node};
 
 pub(super) fn resources() -> EffectiveResources {
     EffectiveResources {
@@ -119,7 +119,10 @@ pub(super) async fn submit_external_job(
         retention_ms,
         auth_token,
     };
-    let submit = SubmitExternalOperation::new(submission, ingress_node(context));
+    let submit = SubmitExternalOperation::new(
+        submission,
+        ingress_node(context.node_and_realm(), context.fresh_heartbeats()),
+    );
     drive(submit, context).await.map_err(placement_failure)
 }
 
@@ -148,7 +151,7 @@ pub(super) async fn admit_launch(
     context: &DriverContext,
     launch: LaunchFrame,
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {
-    let node = launch_node(context, &launch)?;
+    let node = launch_node(context.node_and_realm(), &context.compute_limits(), &launch)?;
     drive(AdmitLaunchOperation::new(launch, node), context)
         .await
         .ok()
