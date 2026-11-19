@@ -27,6 +27,7 @@ use aruna_core::structs::storage::distribution::{KeyRange, OriginalEpoch};
 use aruna_core::types::TxnId;
 #[cfg(test)]
 use aruna_storage::storage::handle::StorageHandle;
+#[cfg(test)]
 use aruna_storage::storage::worker::FjallStorage;
 #[cfg(test)]
 use byteview::ByteView;

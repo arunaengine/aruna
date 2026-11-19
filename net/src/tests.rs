@@ -111,9 +111,10 @@ impl InboundEventHandler for RecordingEvictedHandler {
 
 async fn eviction_test_service() -> (TempDir, Arc<DocumentSyncService>) {
     let dir = tempfile::tempdir().expect("eviction service tempdir");
-    let storage =
-        aruna_storage::storage::worker::FjallStorage::open(dir.path().join("storage").to_str().expect("utf-8 path"))
-            .expect("storage opens");
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
+        dir.path().join("storage").to_str().expect("utf-8 path"),
+    )
+    .expect("storage opens");
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(iroh::SecretKey::from_bytes(&[123u8; 32]))
         .relay_mode(iroh::RelayMode::Disabled)

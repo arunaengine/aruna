@@ -897,7 +897,10 @@ async fn load_realm(
     }
 }
 
-async fn clear_space(storage: &aruna_storage::storage::handle::StorageHandle, key_space: &str) -> TestResult<()> {
+async fn clear_space(
+    storage: &aruna_storage::storage::handle::StorageHandle,
+    key_space: &str,
+) -> TestResult<()> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
 

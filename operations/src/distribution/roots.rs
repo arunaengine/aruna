@@ -298,7 +298,11 @@ mod tests {
         }
     }
 
-    async fn put(handle: &aruna_storage::storage::handle::StorageHandle, key: Vec<u8>, value: Vec<u8>) {
+    async fn put(
+        handle: &aruna_storage::storage::handle::StorageHandle,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) {
         let write = StorageEffect::Write {
             key_space: SOURCE_ROOT_KEYSPACE.to_string(),
             key: key.into(),

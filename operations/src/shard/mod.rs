@@ -150,7 +150,11 @@ mod tests {
         }
     }
 
-    async fn write_manifest_row(storage: &aruna_storage::storage::handle::StorageHandle, shard: u32, doc: u8) {
+    async fn write_manifest_row(
+        storage: &aruna_storage::storage::handle::StorageHandle,
+        shard: u32,
+        doc: u8,
+    ) {
         let target = aruna_core::document::DocumentTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([doc; 16]),
         };

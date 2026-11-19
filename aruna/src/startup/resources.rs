@@ -91,7 +91,10 @@ struct Acquired {
 }
 
 impl Acquired {
-    fn new(storage_handle: aruna_storage::storage::handle::StorageHandle, task_handle: TaskHandle) -> Self {
+    fn new(
+        storage_handle: aruna_storage::storage::handle::StorageHandle,
+        task_handle: TaskHandle,
+    ) -> Self {
         let jobs_runtime = JobsRuntime::new_paused();
         jobs_runtime.register_handler(Arc::new(PluginWorkHandler));
         Self {
@@ -1086,8 +1089,8 @@ mod tests {
         .expect("an accepted stop is not a failure");
         assert!(outcome.is_none());
 
-        let reopened =
-            aruna_storage::storage::worker::FjallStorage::open(&path).expect("cleanup released the store");
+        let reopened = aruna_storage::storage::worker::FjallStorage::open(&path)
+            .expect("cleanup released the store");
         let identity = crate::identity::IdentityStore::from_storage(reopened);
         assert!(
             identity.load().await.unwrap().is_none(),

@@ -67,12 +67,9 @@ impl DockerTestExt for DockerBackend {
         spec: &TaskSpec,
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
-        let image = aruna_compute::executor::ExecutorBackend::resolve_image(
-            self,
-            &spec.image,
-            cancel,
-        )
-        .await?;
+        let image =
+            aruna_compute::executor::ExecutorBackend::resolve_image(self, &spec.image, cancel)
+                .await?;
         let inputs = spec
             .inputs
             .iter()
