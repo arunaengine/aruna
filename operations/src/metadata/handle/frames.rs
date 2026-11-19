@@ -8,7 +8,7 @@ use aruna_net::streams::BiStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::protocol::{
+use crate::metadata::protocol::{
     AUDIT_FRAME, MAX_MESSAGE_SIZE, MetadataTransportMessage, POSTCARD_VARIANT_BYTES,
     STANDARD_FRAME, audit_frame_cap, decode_message, encode_message, frame_class, is_audit_variant,
     parse_variant,

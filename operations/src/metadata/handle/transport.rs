@@ -19,14 +19,14 @@ use tracing::{Span, field};
 use ulid::Ulid;
 
 use super::effects::record_query_counts;
+use super::frames::{
+    read_message, read_message_budget, read_message_cap, write_encoded_message, write_message,
+};
 use super::{
     METADATA_CHUNK_SIZE, METADATA_ENVELOPE_BYTES, METADATA_IO_TIMEOUT, MetadataHandle,
     MetadataInner, MetadataRequestError, PAGE_ANSWER_TIMEOUT,
 };
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::metadata::frames::{
-    read_message, read_message_budget, read_message_cap, write_encoded_message, write_message,
-};
 use crate::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, decode_message, encode_message, frame_class,
     response_cap,

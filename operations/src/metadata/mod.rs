@@ -17,7 +17,6 @@ pub(crate) mod data_links;
 pub mod delete_document;
 pub mod device_pull;
 pub mod forward;
-pub(crate) mod frames;
 pub mod get_document;
 pub mod global_entries;
 pub(crate) mod graph_deleted;

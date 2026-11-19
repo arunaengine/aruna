@@ -999,7 +999,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::metadata::frames::{read_message_budget, read_message_cap};
+    use crate::metadata::handle::frames::{read_message_budget, read_message_cap};
     use aruna_core::UserId;
     use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
     use aruna_core::metadata::MAX_TOKEN_LEN;
