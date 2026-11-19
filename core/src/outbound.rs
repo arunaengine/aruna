@@ -22,7 +22,7 @@ use crate::{NodeId, UserId};
 /// Bytes of a connection answer a call reads at most, headers and body together.
 pub const MAX_CONNECTION_ANSWER: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum OutboundEffect {
     /// Sends one POST through the egress screen and answers with its status.
     Post(Box<HttpPost>),
@@ -37,7 +37,7 @@ pub enum OutboundEffect {
     RefreshMail(Option<Ulid>),
     /// Lists one key range at the member that holds it.
     ListRange(Box<RangeListing>),
-    /// Sends one object read to another member and streams its answer.
+    /// Sends one request to another member and streams its answer.
     MemberFetch(Box<crate::member_read::MemberFetch>),
     /// Sends one request of a plugin connection and answers with what the service said.
     Connection(Box<ConnectionCall>),

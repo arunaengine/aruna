@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::{SecretBytes, SharedSecret};
-use aruna_core::egress::EgressPolicy;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::KeyRange;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -47,10 +46,6 @@ fn answer(status: &str, body: &str) -> String {
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
-}
-
-fn handle() -> OutboundHandle {
-    OutboundHandle::new(reqwest::Client::new(), EgressPolicy::loopback())
 }
 
 fn listing(base_url: String, access: RangeAccess) -> RangeListing {
@@ -122,9 +117,7 @@ async fn rest_page_read() {
         "etag":null,"last_modified":null,"content_type":null,"referenced":false,
         "content_id":null}],"prefixes":["db/x/"],"next_cursor":"more"}"#;
     let (base, seen) = server(answer("200 OK", body)).await;
-    let found = handle()
-        .list_range(listing(base, bearer()), &NoSigner)
-        .await;
+    let found = list_range(listing(base, bearer()), &NoSigner).await;
     let RangeAnswer::Page(page) = found else {
         panic!("a page is answered: {found:?}");
     };
@@ -140,9 +133,7 @@ async fn rest_page_read() {
 #[tokio::test]
 async fn rest_refusal_kept() {
     let (base, _) = server(answer("403 Forbidden", r#"{"error":"no"}"#)).await;
-    let found = handle()
-        .list_range(listing(base, bearer()), &NoSigner)
-        .await;
+    let found = list_range(listing(base, bearer()), &NoSigner).await;
     let RangeAnswer::Refused(refusal) = found else {
         panic!("a refusal is answered: {found:?}");
     };
@@ -155,9 +146,7 @@ async fn s3_page_read() {
         <ETag>e</ETag></Contents><CommonPrefixes><Prefix>db/x/</Prefix></CommonPrefixes>\
         <NextContinuationToken>tok</NextContinuationToken></ListBucketResult>";
     let (base, seen) = server(answer("200 OK", body)).await;
-    let found = handle()
-        .list_range(listing(base, delegated()), &KeySigner)
-        .await;
+    let found = list_range(listing(base, delegated()), &KeySigner).await;
     let RangeAnswer::Page(page) = found else {
         panic!("a page is answered: {found:?}");
     };
@@ -193,9 +182,7 @@ async fn s3_page_read() {
 async fn s3_refusal_kept() {
     let body = "<Error><Code>AccessDenied</Code><Message>no</Message></Error>";
     let (base, _) = server(answer("403 Forbidden", body)).await;
-    let found = handle()
-        .list_range(listing(base, delegated()), &KeySigner)
-        .await;
+    let found = list_range(listing(base, delegated()), &KeySigner).await;
     let RangeAnswer::Refused(refusal) = found else {
         panic!("a refusal is answered: {found:?}");
     };
@@ -205,12 +192,8 @@ async fn s3_refusal_kept() {
 
 #[tokio::test]
 async fn unsigned_delegation_silent() {
-    let found = handle()
-        .list_range(
-            listing("http://127.0.0.1:9".to_string(), delegated()),
-            &NoSigner,
-        )
-        .await;
+    let target = listing("http://127.0.0.1:9".to_string(), delegated());
+    let found = list_range(target, &NoSigner).await;
     assert_eq!(found, RangeAnswer::Silent);
 }
 

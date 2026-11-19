@@ -1,20 +1,86 @@
-//! One object read over the S3 endpoint of another member of a distributed bucket.
+//! One HTTP request to another member of the realm: what an operation composes, how its body
+//! travels and what the member answered.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::io;
+use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
+
+use bytes::Bytes;
+use futures::{Stream, stream};
 use ulid::Ulid;
 
 use crate::jobs::ByteStream;
+use crate::stream::BackendStream;
+use crate::structs::storage::distribution::delegation::{BodyTrailer, body_hasher};
 
 const VERSION_HEADER: &str = "x-amz-version-id";
 
-/// One GET or HEAD the operation composed; the outbound backend sends it as it is. Its headers
-/// carry a signed delegation and its url names the key, so neither shows in a `Debug` print.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberMethod {
+    Get,
+    Head,
+    Put,
+    Post,
+    Delete,
+}
+
+impl MemberMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+            Self::Put => "PUT",
+            Self::Post => "POST",
+            Self::Delete => "DELETE",
+        }
+    }
+}
+
+/// Reads the client's verified trailing checksum once a forwarded body ended.
+#[derive(Clone)]
+pub struct TrailerValue(pub Arc<dyn Fn() -> Option<String> + Send + Sync>);
+
+impl std::fmt::Debug for TrailerValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TrailerValue")
+    }
+}
+
+/// Equal only to itself: a reader has no comparable state.
+impl PartialEq for TrailerValue {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// The body a request sends.
+#[derive(Debug, PartialEq)]
+pub enum MemberSend {
+    Empty,
+    Bytes(Bytes),
+    /// Streams and ends with a trailer this node signs over its length and digest.
+    Framed {
+        stream: ByteStream,
+        nonce: [u8; 16],
+        checksum: Option<TrailerValue>,
+    },
+}
+
+/// One request the operation composed; the outbound backend sends it as it is. Its headers carry
+/// credentials and its url names the key, so neither shows in a `Debug` print.
+#[derive(PartialEq)]
 pub struct MemberFetch {
-    pub head: bool,
+    pub method: MemberMethod,
     pub url: String,
     pub headers: Vec<(String, String)>,
+    pub body: MemberSend,
+    /// How long the member may take to start its answer.
+    pub answer_limit: Option<Duration>,
+    /// Hands back a refusal like any other answer, its body streaming through.
+    pub any_status: bool,
 }
 
 impl std::fmt::Debug for MemberFetch {
@@ -23,7 +89,7 @@ impl std::fmt::Debug for MemberFetch {
     }
 }
 
-/// A member's successful answer: its status, its headers with lowercase names and its bytes.
+/// A member's answer: its status, its headers with lowercase names and its bytes.
 #[derive(Debug, PartialEq)]
 pub struct MemberBody {
     pub status: u16,
@@ -49,14 +115,59 @@ impl MemberBody {
 #[derive(Debug, PartialEq)]
 pub enum MemberAnswer {
     Body(MemberBody),
-    /// The member refused, with its status and the S3 error fields of its answer.
+    /// The member refused, with its status and the start of its answer.
     Refused {
         status: u16,
-        code: Option<String>,
-        message: String,
+        body: String,
     },
     /// The member could not be reached.
     Silent,
     /// The member did not start answering in time.
     Late,
+}
+
+/// Seals the trailer of a framed body with this node's key.
+pub trait TrailerSeal: Send + Sync {
+    fn seal(&self, trailer: &BodyTrailer, nonce: &[u8; 16]) -> Option<Vec<u8>>;
+}
+
+/// `body` followed by its sealed trailer, with the client's trailing checksum if any.
+pub fn framed_stream(
+    mut body: ByteStream,
+    nonce: [u8; 16],
+    checksum: Option<TrailerValue>,
+    seal: Arc<dyn TrailerSeal>,
+) -> ByteStream {
+    let mut hasher = body_hasher();
+    let mut length = 0u64;
+    let mut done = false;
+    BackendStream::new(stream::poll_fn(move |cx| {
+        if done {
+            return Poll::Ready(None);
+        }
+        match body.0.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                hasher.update(&bytes);
+                length += bytes.len() as u64;
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                done = true;
+                Poll::Ready(Some(Err(io::Error::other(error))))
+            }
+            Poll::Ready(None) => {
+                done = true;
+                let trailer = BodyTrailer {
+                    length,
+                    digest: *hasher.finalize().as_bytes(),
+                    checksum: checksum.as_ref().and_then(|value| (value.0)()),
+                };
+                Poll::Ready(Some(match seal.seal(&trailer, &nonce) {
+                    Some(bytes) => Ok(Bytes::from(bytes)),
+                    None => Err(io::Error::other("the body trailer could not be signed")),
+                }))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }))
 }

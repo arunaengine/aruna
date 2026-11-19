@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_blob::native::{body_stream, send_request};
+use std::sync::Arc;
+
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentSyncPublish;
@@ -14,12 +16,15 @@ use aruna_core::events::{
 };
 use aruna_core::handle::Handle;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent, HolderFacts};
+use aruna_core::member_read::{MemberFetch, TrailerSeal};
 use aruna_core::native_reference::{
     DelegatedBody, DelegatedReadEffect, GrantedBody, GrantedReadEffect, NativeAuthority,
     NativeReferenceRequest, NativeReferenceResponse,
 };
-use aruna_core::outbound::{OutboundEvent, RangeAnswer, RangeListing};
-use aruna_core::structs::storage::distribution::delegation::{Delegation, SignedDelegation};
+use aruna_core::outbound::{OutboundEvent, RangeListing};
+use aruna_core::structs::storage::distribution::delegation::{
+    BodyTrailer, Delegation, SignedDelegation,
+};
 use aruna_core::structs::storage::read_grant::SignedRequest;
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 use aruna_net::NetHandle;
@@ -46,14 +51,26 @@ impl ListingSigner for NodeSigner<'_> {
 
 /// Lists one key range through the outbound backend, signing with the net handle's key.
 pub(super) async fn dispatch_listing(listing: RangeListing, context: &DriverContext) -> Event {
-    let answer = match &context.outbound_handle {
-        Some(outbound) => {
-            let signer = NodeSigner(context.net_handle.as_ref());
-            outbound.list_range(listing, &signer).await
-        }
-        None => RangeAnswer::Silent,
-    };
+    let signer = NodeSigner(context.net_handle.as_ref());
+    let answer = aruna_outbound::list_range(listing, &signer).await;
     Event::Outbound(OutboundEvent::RangeListed(Box::new(answer)))
+}
+
+/// Seals the trailer of a framed member body with the net handle's key.
+struct NodeSeal(Option<NetHandle>);
+
+impl TrailerSeal for NodeSeal {
+    fn seal(&self, trailer: &BodyTrailer, nonce: &[u8; 16]) -> Option<Vec<u8>> {
+        let signature = self.0.as_ref()?.sign(&trailer.signing_bytes(nonce));
+        Some(trailer.encode(&signature).ok()?.to_vec())
+    }
+}
+
+/// Sends one request to another member through the outbound backend.
+pub(super) async fn dispatch_fetch(request: MemberFetch, context: &DriverContext) -> Event {
+    let seal = Arc::new(NodeSeal(context.net_handle.clone()));
+    let answer = aruna_outbound::fetch_member(request, seal).await;
+    Event::Outbound(OutboundEvent::MemberAnswered(Box::new(answer)))
 }
 
 /// Why signing fails on a node without a net handle, which holds the node key.

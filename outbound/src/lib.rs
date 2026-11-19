@@ -21,7 +21,8 @@ pub use connection::ConnectionSender;
 use connection::ScreenedSender;
 pub use mail::{MailBuilder, MailSender, SmtpMailer, valid_address};
 use mail::{MailProfiles, smtp_builder};
-pub use range_listing::ListingSigner;
+pub use member_read::fetch_member;
+pub use range_listing::{ListingSigner, list_range};
 pub use transfers::{
     OpenedDownload, TransferBody, TransferError, TransferMeter, UploadAnswer, UploadBody,
 };
@@ -35,8 +36,6 @@ pub struct OutboundHandle {
 
 struct Inner {
     http: reqwest::Client,
-    /// Reaches other members at the addresses the realm records publish.
-    members: reqwest::Client,
     policy: EgressPolicy,
     mail: MailProfiles,
     backoffs: Backoffs,
@@ -76,10 +75,6 @@ impl OutboundHandle {
         Self {
             inner: Arc::new(Inner {
                 http,
-                members: reqwest::Client::builder()
-                    .connect_timeout(range_listing::CONNECT_TIMEOUT)
-                    .build()
-                    .unwrap_or_default(),
                 policy,
                 mail: MailProfiles::new(builder),
                 backoffs: Backoffs::default(),
@@ -107,10 +102,11 @@ impl OutboundHandle {
                 OutboundEvent::MailRefreshed
             }
             OutboundEffect::ListRange(listing) => OutboundEvent::RangeListed(Box::new(
-                self.list_range(*listing, &range_listing::NoSigner).await,
+                list_range(*listing, &range_listing::NoSigner).await,
             )),
             OutboundEffect::MemberFetch(request) => {
-                OutboundEvent::MemberAnswered(Box::new(self.fetch_member(*request).await))
+                let seal = std::sync::Arc::new(member_read::NoSeal);
+                OutboundEvent::MemberAnswered(Box::new(fetch_member(*request, seal).await))
             }
             OutboundEffect::Connection(call) => OutboundEvent::ConnectionAnswered {
                 result: self.inner.connections.send(*call).await,

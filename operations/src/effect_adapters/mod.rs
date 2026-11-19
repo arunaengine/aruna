@@ -168,10 +168,11 @@ async fn dispatch_unboxed(
             Event::Net(NetEvent::LocalNode(node))
         }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
-        Effect::Outbound(OutboundEffect::ListRange(listing))
-            if context.outbound_handle.is_some() =>
-        {
+        Effect::Outbound(OutboundEffect::ListRange(listing)) => {
             net::dispatch_listing(*listing, context).await
+        }
+        Effect::Outbound(OutboundEffect::MemberFetch(request)) => {
+            net::dispatch_fetch(*request, context).await
         }
         Effect::Outbound(effect) => match context.outbound_handle.as_ref() {
             Some(outbound) => Event::Outbound(Box::pin(outbound.run(effect)).await),
