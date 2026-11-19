@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::connectors::{ResolveConnectorInput, resolve_connector_effect};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
@@ -74,14 +73,13 @@ impl Operation for HeadSourceOperation {
     type Error = HeadSourceError;
 
     fn first(&mut self) -> Result<Next<HeadSourceResult>, HeadSourceError> {
-        Ok(Next::Call(IoCall::from(resolve_connector_effect(
-            ResolveConnectorInput {
-                group_id: self.input.group_id,
-                connector_id: self.input.connector_id,
-                source_path: self.input.source_path.clone(),
-                allow_root: false,
-            },
-        ))))
+        let input = &self.input;
+        let call = super::resolve_call(
+            input.group_id,
+            input.connector_id,
+            input.source_path.clone(),
+        );
+        Ok(Next::Call(call))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<HeadSourceResult>, HeadSourceError> {

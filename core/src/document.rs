@@ -543,6 +543,14 @@ impl DocumentTarget {
         }
     }
 
+    /// A read of this document's stored row.
+    pub fn read_call(&self) -> crate::calls::IoCall {
+        crate::calls::IoCall::Read(vec![(
+            self.storage_keyspace().to_string(),
+            self.storage_key(),
+        )])
+    }
+
     pub fn storage_keyspace(&self) -> &'static str {
         match self {
             Self::Group { .. } => GROUP_KEYSPACE,

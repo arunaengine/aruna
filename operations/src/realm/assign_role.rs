@@ -14,7 +14,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::done;
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
@@ -342,17 +342,9 @@ impl Operation for RoleWrite {
     }
 
     fn first(&mut self) -> Result<Next<AssignedRoles>, AssignRolesError> {
-        let target = AdminDocumentTarget::Realm {
-            realm_id: self.input.realm_id,
-        };
-        let auth_key = (*self.input.realm_id.as_bytes()).into();
-        Ok(Next::Call(IoCall::Read(vec![
-            (AUTH_KEYSPACE.to_string(), auth_key),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        Ok(Next::Call(crate::realm::authorization_reads(
+            self.input.realm_id,
+        )))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<AssignedRoles>, AssignRolesError> {

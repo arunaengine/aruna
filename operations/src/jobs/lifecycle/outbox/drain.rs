@@ -173,10 +173,7 @@ impl Operation for DrainOutboxOperation {
         let config = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         };
-        Ok(Next::Call(IoCall::Read(vec![(
-            config.storage_keyspace().to_string(),
-            config.storage_key(),
-        )])))
+        Ok(Next::Call(config.read_call()))
     }
 
     fn next(&mut self, result: IoResult) -> Step {

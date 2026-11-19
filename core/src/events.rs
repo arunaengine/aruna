@@ -94,6 +94,19 @@ pub enum GroupResult {
     Refused,
 }
 
+impl GroupResult {
+    /// The result of a finished child member, or `None` for any other member or result type.
+    pub fn child_outcome<T: 'static, E: 'static>(self) -> Option<Result<T, E>> {
+        let GroupResult::Done(event) = self else {
+            return None;
+        };
+        match *event {
+            Event::Child(outcome) => outcome.take(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum SubOperationEvent {
     GroupWritten {

@@ -11,12 +11,12 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
-use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::done;
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
@@ -395,23 +395,8 @@ impl Operation for MemberRemoval {
     }
 
     fn first(&mut self) -> Result<Next<GroupAuthorizationDocument>, RemoveFromError> {
-        let target = AdminDocumentTarget::Group {
-            group_id: self.input.group_id,
-        };
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                AUTH_KEYSPACE.to_string(),
-                ByteView::from(self.input.group_id.to_bytes()),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-            (
-                REALM_CONFIG_KEYSPACE.to_string(),
-                ByteView::from(*self.input.actor.realm_id.as_bytes()),
-            ),
-        ])))
+        let reads = crate::groups::member_reads(self.input.group_id, self.input.actor.realm_id);
+        Ok(Next::Call(reads))
     }
 
     fn next(
