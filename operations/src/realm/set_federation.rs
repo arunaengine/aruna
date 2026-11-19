@@ -13,6 +13,7 @@ use aruna_core::federation::{
     AcceptedRealms, FederationSettings, LoginProvider, PUBLISH_SOON, RealmDescriptor,
     RegistrationMode, Signed,
 };
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{
@@ -197,6 +198,8 @@ struct FederationWrite {
     stage: Stage,
     document: Option<RealmConfigDocument>,
     deletes: Vec<(KeySpace, Key)>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl FederationWrite {
@@ -206,6 +209,8 @@ impl FederationWrite {
             stage: Stage::Read,
             document: None,
             deletes: Vec::new(),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -269,6 +274,7 @@ impl FederationWrite {
             AdminDocumentOperation::ConfigFederationSet {
                 settings: Box::new(settings),
             },
+            self.ids.mint(self.now_ms),
         )?;
         // Materialized reducer state keeps local and replicated conflict outcomes equal.
         apply_reducer_federation(&mut document, &reducer_state);
@@ -279,6 +285,7 @@ impl FederationWrite {
             admin_events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::ConfigDescriptionSet { description },
+                self.ids.mint(self.now_ms),
             )?);
             if !reducer_state
                 .conflicts
@@ -405,6 +412,14 @@ impl FederationWrite {
 impl Operation for FederationWrite {
     type Output = RealmConfigDocument;
     type Error = SetFederationError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

@@ -7,6 +7,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_POLICIES_PATH};
@@ -174,6 +175,8 @@ struct PoliciesWrite {
     document: Option<RealmConfigDocument>,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl PoliciesWrite {
@@ -184,6 +187,8 @@ impl PoliciesWrite {
             document: None,
             deletes: Vec::new(),
             marks: DueMarks::new(None, 0),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -244,6 +249,7 @@ impl PoliciesWrite {
             AdminDocumentOperation::ConfigPoliciesSet {
                 policies: self.config.policies.clone(),
             },
+            self.ids.mint(self.now_ms),
         )?;
         // Mirror the replicated overlay: a conflicted policies path leaves the
         // last agreed set in place instead of clobbering it with the input.
@@ -291,7 +297,12 @@ impl Operation for PoliciesWrite {
     type Output = RealmConfigDocument;
     type Error = SetPoliciesError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
         self.marks.stamp(now_ms);
     }
 

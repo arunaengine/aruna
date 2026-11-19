@@ -9,6 +9,7 @@ use aruna_core::admin_documents::{
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -215,6 +216,8 @@ struct RoleWrite {
     written: Option<AssignedRoles>,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl RoleWrite {
@@ -226,6 +229,8 @@ impl RoleWrite {
             written: None,
             deletes: Vec::new(),
             marks: DueMarks::new(None, 0),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -264,7 +269,13 @@ impl RoleWrite {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input, &role_ids)?;
+        let admin_events = apply_reducer_updates(
+            &mut reducer_state,
+            &self.input,
+            &role_ids,
+            &mut self.ids,
+            self.now_ms,
+        )?;
 
         let roles_before = auth_doc.roles.clone();
         let materialized_assignments = reducer_state.materialized_realm_assignments();
@@ -337,7 +348,12 @@ impl Operation for RoleWrite {
     type Output = AssignedRoles;
     type Error = AssignRolesError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
         self.marks.stamp(now_ms);
     }
 
@@ -395,6 +411,8 @@ fn apply_reducer_updates(
     state: &mut AdminDocumentState,
     input: &AssignRolesInput,
     role_ids: &[RoleId],
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut admin_events = Vec::new();
     for role_id in role_ids {
@@ -402,6 +420,7 @@ fn apply_reducer_updates(
             let event = state.apply_operation(
                 &input.actor,
                 AdminDocumentOperation::RealmRoleAdded { role_id: *role_id },
+                ids.mint(now_ms),
             )?;
             admin_events.push(event);
         }
@@ -411,6 +430,7 @@ fn apply_reducer_updates(
                 role_id: *role_id,
                 user_id: input.user_id,
             },
+            ids.mint(now_ms),
         )?;
         admin_events.push(event);
     }

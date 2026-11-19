@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::HashSet;
 
 use aruna_core::UserId;
@@ -185,6 +186,8 @@ struct SetAdminWrite {
     admins: HashSet<UserId>,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl SetAdminWrite {
@@ -196,6 +199,8 @@ impl SetAdminWrite {
             admins: HashSet::new(),
             deletes: Vec::new(),
             marks: DueMarks::new(None, 0),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -238,10 +243,11 @@ impl SetAdminWrite {
             .unwrap_or_else(|| AdminDocumentState::new(target));
         let mut admin_events = Vec::new();
         if should_seed_role(&reducer_state, role_id) {
-            admin_events.push(
-                reducer_state
-                    .apply_operation(actor, AdminDocumentOperation::RealmRoleAdded { role_id })?,
-            );
+            admin_events.push(reducer_state.apply_operation(
+                actor,
+                AdminDocumentOperation::RealmRoleAdded { role_id },
+                self.ids.mint(self.now_ms),
+            )?);
         }
         let user_id = self.config.user_id;
         let change = if self.config.admin {
@@ -249,7 +255,11 @@ impl SetAdminWrite {
         } else {
             AdminDocumentOperation::RealmAssignmentRemoved { role_id, user_id }
         };
-        admin_events.push(reducer_state.apply_operation(actor, change)?);
+        admin_events.push(reducer_state.apply_operation(
+            actor,
+            change,
+            self.ids.mint(self.now_ms),
+        )?);
 
         let roles_before = auth_doc.roles.clone();
         let assigned = reducer_state
@@ -325,7 +335,12 @@ impl Operation for SetAdminWrite {
     type Output = HashSet<UserId>;
     type Error = SetAdminError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
         self.marks.stamp(now_ms);
     }
 
