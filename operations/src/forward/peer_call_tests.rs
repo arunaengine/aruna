@@ -52,3 +52,14 @@ fn reports_missing_answer() {
     assert!(matches!(peer_answer(answered(Ok(vec![0xFF]))), Ok(Err(_))));
     assert!(peer_answer(IoResult::Done).is_err());
 }
+
+// Only the missing local handle counts as having no way to send the request.
+#[test]
+fn detects_missing_handle() {
+    let missing = PeerRequestError::Failed(aruna_core::metadata::MetadataError::HandleMissing);
+    assert!(no_peer_transport(&answered(Err(missing))));
+    assert!(!no_peer_transport(&answered(Err(
+        PeerRequestError::TimedOut
+    ))));
+    assert!(!no_peer_transport(&IoResult::Done));
+}

@@ -342,8 +342,10 @@ fn lag_failure_ends() {
 #[test]
 fn adds_copies_fills() {
     let mut source = copied_view(1);
+    // Only an admitted member that accepts publications is owed copies.
     for member in &mut source.head.snapshot.config.members {
         member.incarnation = Some(5);
+        member.state = MemberState::Ready;
     }
     let mut status = plain_status(&source);
     let range_id = status.ranges[0].range_id;
