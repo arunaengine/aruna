@@ -13,13 +13,16 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, METADATA_INDEX_KEYSPACE, prefix_upper_bound,
+    DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+    METADATA_INDEX_KEYSPACE, prefix_upper_bound,
 };
 use aruna_core::metadata::{
     IriIndexRecord, MaterializationState, MaterializationStatusRecord, MetadataError,
 };
 use aruna_core::operation::Operation;
-use aruna_core::storage_entries::{iri_object_prefix, iri_reference_entry, iri_reference_prefix};
+use aruna_core::storage_entries::{
+    iri_object_prefix, iri_reference_entry, iri_reference_prefix, materialization_status_key,
+};
 use aruna_core::structs::storage::data::link::document_key;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_storage::StorageHandle;
@@ -384,18 +387,31 @@ pub(crate) struct IriFreshness {
     pub oldest_status_updated: Option<u64>,
 }
 
-/// Materialization state of the given documents, one status read each; callers pass the
-/// documents a lookup returned, never the whole registry.
-pub(crate) async fn iri_index_freshness(
-    storage: &StorageHandle,
+/// The status rows of the given documents; callers pass the documents a lookup returned, never
+/// the whole registry.
+pub(crate) fn status_rows(registry_records: &[MetadataRegistryRecord]) -> Vec<(String, ByteView)> {
+    (registry_records.iter())
+        .map(|record| {
+            let key = materialization_status_key(record.document_id);
+            (MATERIALIZATION_STATUS_KEYSPACE.to_string(), key)
+        })
+        .collect()
+}
+
+/// Materialization state of the given documents from their [`status_rows`] values.
+pub(crate) fn iri_freshness(
     registry_records: &[MetadataRegistryRecord],
+    values: Vec<Option<ByteView>>,
 ) -> Result<IriFreshness, MetadataError> {
     let mut current = false;
     let mut pending = false;
     let mut failed = false;
     let mut oldest_status_updated = None;
-    for record in registry_records {
-        let status = read_materialization_status(storage, record.document_id).await?;
+    for (record, value) in registry_records.iter().zip(values) {
+        let status = value
+            .map(|bytes| postcard::from_bytes::<MaterializationStatusRecord>(&bytes))
+            .transpose()
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
         if let Some(status) = status.as_ref() {
             oldest_status_updated = Some(
                 oldest_status_updated.map_or(status.updated_at_ms, |oldest: u64| {
@@ -996,11 +1012,9 @@ mod tests {
         assert!(matches!(error, BacklinkError::Malformed(_)));
     }
 
-    #[tokio::test]
-    async fn freshness_of_documents() {
+    #[test]
+    fn freshness_of_documents() {
         // Only the documents passed in count; a pending one elsewhere does not.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let cursor = Ulid::from_parts(1, 1);
         let current = registry_record(Ulid::from_parts(4, 1), cursor);
         let pending = registry_record(Ulid::from_parts(4, 2), cursor);
@@ -1016,25 +1030,18 @@ mod tests {
             last_error: None,
             updated_at_ms: 5,
         };
-        let rows = LinkRows {
-            writes: vec![
-                materialization_status_entry(&status(&current, MaterializationState::Materialized))
-                    .unwrap(),
-                materialization_status_entry(&status(&pending, MaterializationState::Pending))
-                    .unwrap(),
-            ],
-            deletes: Vec::new(),
+        let value = |record, state| {
+            let bytes = postcard::to_allocvec(&status(record, state)).unwrap();
+            Some(ByteView::from(bytes))
         };
-        apply_rows(&storage, rows).await.unwrap();
-
-        let returned = iri_index_freshness(&storage, std::slice::from_ref(&current))
-            .await
-            .unwrap();
+        let materialized = value(&current, MaterializationState::Materialized);
+        let returned =
+            iri_freshness(std::slice::from_ref(&current), vec![materialized.clone()]).unwrap();
         assert_eq!(returned.state, IriFreshnessState::Current);
         assert_eq!(returned.oldest_status_updated, Some(5));
-        let both = iri_index_freshness(&storage, &[current, pending])
-            .await
-            .unwrap();
+        let values = vec![materialized, value(&pending, MaterializationState::Pending)];
+        let both = iri_freshness(&[current.clone(), pending.clone()], values).unwrap();
+        assert_eq!(status_rows(&[current, pending]).len(), 2);
         assert_eq!(both.state, IriFreshnessState::Mixed);
     }
 

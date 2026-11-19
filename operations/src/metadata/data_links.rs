@@ -13,8 +13,8 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    DATA_LINK_KEYSPACE, DEAD_LETTER_KEYSPACE, DISTRIBUTION_KEYSPACE, DOCUMENT_LINK_KEYSPACE,
-    MATERIALIZATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE, VERSION_INDEX_KEYSPACE,
+    DATA_LINK_KEYSPACE, DISTRIBUTION_KEYSPACE, DOCUMENT_LINK_KEYSPACE, S3_BUCKET_KEYSPACE,
+    VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::realm::RealmId;
@@ -515,17 +515,6 @@ async fn read_value(
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
     }
-}
-
-/// Queued and parked materializations on this node, each counted up to `cap`: postings of
-/// such documents may be missing or stale.
-pub(crate) async fn unsettled_documents(
-    storage: &StorageHandle,
-    cap: usize,
-) -> Result<(usize, usize), DataLinkError> {
-    let (pending, _) = iter_page(storage, MATERIALIZATION_JOB_KEYSPACE, None, None, cap).await?;
-    let (failed, _) = iter_page(storage, DEAD_LETTER_KEYSPACE, None, None, cap).await?;
-    Ok((pending.len(), failed.len()))
 }
 
 #[cfg(test)]
