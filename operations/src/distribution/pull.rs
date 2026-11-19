@@ -6,9 +6,8 @@
 // The read runs under the caller's authority on that holder; the bytes are then kept as the
 // member's data strategy says.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::{LazyLock, Mutex as StdMutex};
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -35,7 +34,6 @@ use aruna_core::structs::storage::distribution::{
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::types::Key;
 use bytes::Bytes;
-use futures_util::StreamExt;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -52,42 +50,45 @@ use crate::s3::object::read::HolderFailures;
 
 type Blob = BackendStream<Result<Bytes, StreamError>>;
 
-/// Kept copies being read, by backend path, with their reader counts.
-static PINS: LazyLock<StdMutex<HashMap<String, usize>>> = LazyLock::new(Default::default);
+/// Holds the kept copy at `backend_path` while `blob` streams, so eviction leaves its bytes to
+/// the hidden sweep, which spares them too while a read holds them.
+pub(crate) fn pin_call(backend_path: &str, blob: Blob) -> IoCall {
+    let pin = BlobEffect::PinRead {
+        backend_path: backend_path.to_string(),
+        blob,
+    };
+    IoCall::from(Effect::Blob(pin))
+}
 
-/// One read's hold on a kept copy: eviction leaves the bytes of a held copy to the hidden
-/// sweep, which spares them too while a read holds them.
-struct ReadPin(String);
-
-impl Drop for ReadPin {
-    fn drop(&mut self) {
-        let mut pins = PINS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(count) = pins.get_mut(&self.0) {
-            *count -= 1;
-            if *count == 0 {
-                pins.remove(&self.0);
-            }
-        }
+/// The held stream of a [`pin_call`].
+pub(crate) fn pinned(result: IoResult) -> Result<Blob, IoError> {
+    match result.event()? {
+        Event::Blob(BlobEvent::PinnedRead { blob }) => Ok(blob),
+        other => Err(IoError::Unexpected {
+            expected: "BlobEvent::PinnedRead",
+            got: other.label(),
+        }),
     }
 }
 
-/// Whether a read holds the kept copy at `backend_path`.
-pub fn pinned_path(backend_path: &str) -> bool {
-    let pins = PINS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    pins.contains_key(backend_path)
+/// Asks whether a read holds the kept copy at `backend_path`.
+pub(crate) fn held_call(backend_path: &str) -> IoCall {
+    let held = BlobEffect::ReadHeld {
+        backend_path: backend_path.to_string(),
+    };
+    IoCall::from(Effect::Blob(held))
 }
 
-/// `blob` of the kept copy at `location`, which stays held until the stream ends or drops.
-pub fn pinned_blob(location: &BackendLocation, blob: Blob) -> Blob {
-    let path = location.backend_path.clone();
-    let mut pins = PINS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    *pins.entry(path.clone()).or_default() += 1;
-    drop(pins);
-    let pin = ReadPin(path);
-    let held = blob.0.inspect(move |_| {
-        let _ = &pin;
-    });
-    BackendStream(Box::pin(held))
+/// The answer of a [`held_call`]; a node without a blob backend has no reads to hold a copy.
+pub(crate) fn held_answer(result: IoResult) -> Result<bool, IoError> {
+    match result.event()? {
+        Event::Blob(BlobEvent::ReadHeld { held }) => Ok(held),
+        Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => Ok(false),
+        other => Err(IoError::Unexpected {
+            expected: "BlobEvent::ReadHeld",
+            got: other.label(),
+        }),
+    }
 }
 
 /// How this member answers reads of the version's range.
@@ -388,6 +389,7 @@ enum PullStep {
     Spool,
     Fill,
     Kept,
+    Pin,
 }
 
 /// Reads the version through a holder per this member's strategy and range behaviour. No
@@ -556,10 +558,12 @@ impl Operation for PullThroughOperation {
             PullStep::Kept => match result.event()? {
                 Event::Blob(BlobEvent::ReadFinished { blob, .. }) => {
                     let location = self.location.take().ok_or(IoError::Unfinished)?;
-                    self.finish(pinned_blob(&location, blob))
+                    self.step = PullStep::Pin;
+                    Ok(Next::Call(pin_call(&location.backend_path, blob)))
                 }
                 _ => Err(GetObjectError::GetObjectFailed),
             },
+            PullStep::Pin => self.finish(pinned(result)?),
         }
     }
 }
@@ -751,6 +755,7 @@ impl Operation for FillOperation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KeepStep {
     Publish,
+    Held,
     Evicted,
     Unkept,
     Failed,
@@ -767,6 +772,8 @@ pub(super) struct KeepCopyOperation {
     claim: Vec<u8>,
     step: KeepStep,
     evicted: VecDeque<BackendLocation>,
+    /// The evicted copy whose readers are being asked about.
+    asked: Option<BackendLocation>,
     error: Option<KeepError>,
 }
 
@@ -784,15 +791,19 @@ impl KeepCopyOperation {
             copy: Some(copy),
             step: KeepStep::Publish,
             evicted: VecDeque::new(),
+            asked: None,
             error: None,
         }
     }
 
+    /// The next evicted copy no read holds is deleted; a held one is left to the sweep.
     fn next_evicted(&mut self) -> KeepTurn {
         match self.evicted.pop_front() {
             Some(location) => {
-                self.step = KeepStep::Evicted;
-                Ok(Next::Call(drop_call(location)))
+                let held = held_call(&location.backend_path);
+                self.asked = Some(location);
+                self.step = KeepStep::Held;
+                Ok(Next::Call(held))
             }
             None => Ok(Next::Done(true)),
         }
@@ -801,9 +812,7 @@ impl KeepCopyOperation {
     fn published(&mut self, published: Result<Published, KeepError>) -> KeepTurn {
         match published {
             Ok(Published::Kept { evicted }) => {
-                self.evicted = (evicted.into_iter())
-                    .filter(|copy| !pinned_path(&copy.backend_path))
-                    .collect();
+                self.evicted = evicted.into_iter().collect();
                 self.next_evicted()
             }
             Ok(Published::Unkept) => {
@@ -835,6 +844,14 @@ impl Operation for KeepCopyOperation {
     fn next(&mut self, result: IoResult) -> KeepTurn {
         match self.step {
             KeepStep::Publish => self.published(result.child::<Published, KeepError>()?),
+            KeepStep::Held => {
+                let location = self.asked.take().ok_or(IoError::Unfinished)?;
+                if held_answer(result)? {
+                    return self.next_evicted();
+                }
+                self.step = KeepStep::Evicted;
+                Ok(Next::Call(drop_call(location)))
+            }
             KeepStep::Evicted => {
                 result.child::<(), PurgeError>()?.ok();
                 self.next_evicted()
