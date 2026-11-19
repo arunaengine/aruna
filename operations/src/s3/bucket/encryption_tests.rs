@@ -400,7 +400,6 @@ fn revoked_enabler_refused() {
 
 #[test]
 fn oversized_copy_refused() {
-    use aruna_blob::blob::pithos::MAX_SIZE;
     use aruna_core::errors::BlobError;
     use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
     use aruna_core::structs::checksum::HASH_BLAKE3;
@@ -408,6 +407,7 @@ fn oversized_copy_refused() {
         BackendLocation, BackendRef, BlobVersion, VersionKey,
     };
     use aruna_core::structs::storage::format::{EncodingClass, StoredFormat};
+    use aruna_core::structs::storage::pithos::MAX_SIZE;
     use std::collections::HashMap;
 
     // A plain copy larger than any Pithos copy could never be moved by the encryption transition.

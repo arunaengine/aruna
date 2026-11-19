@@ -1666,7 +1666,7 @@ fn oversized_selection_refused() {
         })
         .collect();
     operation.read_parts(None).unwrap();
-    let limit = aruna_blob::blob::pithos::MAX_SIZE;
+    let limit = aruna_core::structs::storage::pithos::MAX_SIZE;
     let mut turn = Err(CompleteUploadError::InvalidOperationState);
     for start in (1..=10_000u16).step_by(PART_PAGE) {
         let end = (start as usize + PART_PAGE).min(10_001) as u16;
