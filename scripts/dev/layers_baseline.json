@@ -60,7 +60,7 @@
     "runner_refs": 0,
     "silent_skips": 0,
     "state_clones": 0,
-    "test_sleeps": 64,
+    "test_sleeps": 54,
     "trigger_arms": 6,
     "upward_refs": 148
   }
