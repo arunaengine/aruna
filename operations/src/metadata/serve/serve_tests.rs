@@ -249,7 +249,10 @@ fn relationship(source_bucket: &str) -> aruna_core::structs::sync_relationship::
         reference_handling: Default::default(),
         reference_serving: false,
         replicate_deletes: true,
-        created_by: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([8u8; 16]), realm_id),
+        created_by: aruna_core::user::id::UserId::local(
+            ulid::Ulid::from_bytes([8u8; 16]),
+            realm_id,
+        ),
         created_at: std::time::SystemTime::UNIX_EPOCH,
         state: SyncState::Enabled,
         status: SyncStatusSnapshot::default(),

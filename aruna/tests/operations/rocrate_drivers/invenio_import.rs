@@ -62,7 +62,10 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
     );
     // Adding identifiers needs WRITE on the document, also on the authority itself.
     let stranger = AuthContext {
-        user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_parts(7, 7), fixture.actor.realm_id),
+        user_id: aruna_core::user::id::UserId::local(
+            ulid::Ulid::from_parts(7, 7),
+            fixture.actor.realm_id,
+        ),
         realm_id: fixture.actor.realm_id,
         path_restrictions: None,
         session: None,

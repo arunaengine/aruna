@@ -415,12 +415,8 @@ async fn fill(
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        let install = InstallOnboardingOperation::new(
-            &ticket,
-            config.realm_id,
-            config.node_id,
-            now,
-        );
+        let install =
+            InstallOnboardingOperation::new(&ticket, config.realm_id, config.node_id, now);
         aruna_drivers::driver::drive(install, &context).await?;
         stopped(stop)?;
     }

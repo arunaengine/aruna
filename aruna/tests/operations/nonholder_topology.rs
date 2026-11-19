@@ -390,7 +390,11 @@ async fn origin_scoped_dedup() -> TestResult<()> {
 }
 
 /// Stores upload `[seed; 16]` of `owner` on `node`, which an import submission claims.
-async fn seed_upload(node: &TestNode, owner: aruna_core::user::id::UserId, seed: u8) -> TestResult<()> {
+async fn seed_upload(
+    node: &TestNode,
+    owner: aruna_core::user::id::UserId,
+    seed: u8,
+) -> TestResult<()> {
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     let location = BackendLocation {
         backend: BackendRef::node_default(),

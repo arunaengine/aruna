@@ -572,7 +572,9 @@ async fn open_prefix(node: &Node, pattern: &str) {
         role_id,
         name: "public".to_string(),
         permissions: std::collections::HashMap::from([(path, Permission::READ)]),
-        assigned_users: std::collections::HashSet::from([aruna_core::user::id::UserId::nil(realm_id)]),
+        assigned_users: std::collections::HashSet::from([aruna_core::user::id::UserId::nil(
+            realm_id,
+        )]),
     };
     document.roles.insert(role_id, role);
     let group = Group {

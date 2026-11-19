@@ -156,12 +156,13 @@ async fn resolves_session_alias() {
     aruna_test_support::jobs::insert_job(&ctx, &physical)
         .await
         .unwrap();
-    let auth = |user_id: aruna_core::user::id::UserId| aruna_core::structs::identity::auth::AuthContext {
-        user_id,
-        realm_id: REALM,
-        path_restrictions: None,
-        session: None,
-    };
+    let auth =
+        |user_id: aruna_core::user::id::UserId| aruna_core::structs::identity::auth::AuthContext {
+            user_id,
+            realm_id: REALM,
+            path_restrictions: None,
+            session: None,
+        };
     let query = || ReportQuery {
         expected_digest: None,
         last_key: None,

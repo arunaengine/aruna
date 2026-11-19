@@ -857,8 +857,10 @@ impl OperationsTaskHandler {
 }
 
 /// Sub-batches keyed by whether their records only sync and by their sorted peers.
-type PublishGroups =
-    BTreeMap<(bool, Vec<aruna_core::id::NodeId>), (Vec<aruna_core::id::NodeId>, Vec<DrainSubBatch>)>;
+type PublishGroups = BTreeMap<
+    (bool, Vec<aruna_core::id::NodeId>),
+    (Vec<aruna_core::id::NodeId>, Vec<DrainSubBatch>),
+>;
 
 impl OperationsTaskHandler {
     /// Groups records by peers into sub-batches. A record already published by this process

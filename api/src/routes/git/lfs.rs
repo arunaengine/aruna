@@ -54,7 +54,7 @@ pub async fn batch(
         return Err(ServerError::BadRequest);
     }
     drive(
-        git::repository(state.get_ctx().node_id(), &auth, id, permission.clone()),
+        git::access::repository(state.get_ctx().node_id(), &auth, id, permission.clone()),
         &state.get_ctx(),
     )
     .await

@@ -42,7 +42,8 @@ use crate::staging::offered_directory::{
 
 use download::ApplyDownloadsOperation;
 use folders::bind::RequestVersionsOperation;
-use folders::{FolderError, read_bound, store_progress};
+use folders::reads::read_bound;
+use folders::{FolderError, store_progress};
 use reconcile::{ReconcileError, ReconcileFolderOperation, ReconcileInput, ReconcilePlan};
 use repository::SYNC_PAGE_SIZE;
 

@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::placement::policy::gate::{
-    GateContext, GateContextError, GateOperation, PolicyGateError, PolicyGateOutcome, gate_decision,
-    union_refs, write_gate,
+    GateContext, GateContextError, GateOperation, PolicyGateError, PolicyGateOutcome,
+    gate_decision, union_refs, write_gate,
 };
 use crate::placement::policy::read::ReadPolicyError;
 use crate::s3::fence_store::FenceCheckOperation;

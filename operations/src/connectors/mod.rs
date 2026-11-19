@@ -16,4 +16,3 @@ pub mod resolver;
 pub mod root_record;
 pub mod secret_config;
 pub mod validation;
-

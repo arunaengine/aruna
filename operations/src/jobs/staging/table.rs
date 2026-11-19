@@ -46,7 +46,9 @@ use crate::connectors::get_connector::{
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation, PolicyGateError};
+use crate::placement::policy::gate::{
+    GateContext, GateContextError, GateOperation, PolicyGateError,
+};
 use crate::placement::policy::read::ReadPolicyError;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
 use crate::s3::object::head::{

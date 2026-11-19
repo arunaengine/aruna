@@ -141,9 +141,9 @@ fn locked_path_refused() {
     run.next(ran(GitEvent::Edited(Ok("new".to_string()))))
         .unwrap();
     let mut known = projection(&[(DRAFT, "old")]);
-    let other = aruna_core::user::id::UserId::nil(aruna_core::structs::identity::realm::RealmId::from_bytes(
-        [9; 32],
-    ));
+    let other = aruna_core::user::id::UserId::nil(
+        aruna_core::structs::identity::realm::RealmId::from_bytes([9; 32]),
+    );
     let lock = LfsLock {
         id: Ulid::from(1),
         path: "a.txt".to_string(),

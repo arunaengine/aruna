@@ -597,7 +597,9 @@ mod tests {
             directory.path().to_path_buf(),
             "helper".into(),
         ));
-        let actor = aruna_core::user::id::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let actor = aruna_core::user::id::UserId::nil(
+            aruna_core::structs::identity::realm::RealmId([1; 32]),
+        );
         let busy = ulid::Ulid::from(1);
         let held = store.locks.lock(busy).await;
         let waiting = (0..2)
@@ -625,7 +627,9 @@ mod tests {
     async fn layouts_stay_known() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = GitStore::new(directory.path().to_path_buf(), "helper".into());
-        let actor = aruna_core::user::id::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let actor = aruna_core::user::id::UserId::nil(
+            aruna_core::structs::identity::realm::RealmId([1; 32]),
+        );
         let id = ulid::Ulid::from(3);
         let repository = directory.path().join(format!("{id}.git"));
         let run = |args: &[&str]| {
@@ -682,7 +686,9 @@ mod tests {
         let helper = directory.path().join("helper");
         let store = GitStore::new(directory.path().join("git"), helper);
         let id = ulid::Ulid::from(7);
-        let actor = aruna_core::user::id::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let actor = aruna_core::user::id::UserId::nil(
+            aruna_core::structs::identity::realm::RealmId([1; 32]),
+        );
         let repository = directory.path().join("git").join(format!("{id}.git"));
         let config = || async {
             tokio::fs::metadata(repository.join("config"))
