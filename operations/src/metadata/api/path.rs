@@ -11,13 +11,13 @@ use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::operation::{Operation, boxed_suboperation};
 
 use super::super::forward::holder_reads::{AuthFailure, ReadDecision, reduce_holder_reads};
+use super::access::{ReadAccess, ReadAccessOperation};
 use super::list::{CandidateScan, CandidatesOperation};
 use super::path_types::select_path_holders;
 use super::path_types::{
     MetadataLookupRequest, MetadataLookupResult, PathHolderSelection, PathShardView,
 };
 use super::path_types::{merge_path_views, reduce_path_candidates};
-use super::read_access::{ReadAccess, ReadAccessOperation};
 use super::{
     AuthContext, AuthToken, DISTRIBUTED_QUERY_DEADLINE, GroupId, HashSet, MetaResourceId,
     MetadataApiError, MetadataPathCandidate, MetadataPathResolution, MetadataReadError,
@@ -651,7 +651,7 @@ mod call_tests {
     //! Drives the path operations through their children and holder answers without I/O.
 
     use super::*;
-    use crate::metadata::api::read_access::tests::{access_for, realm};
+    use crate::metadata::api::access::tests::{access_for, realm};
     use ulid::Ulid;
 
     fn group() -> GroupId {

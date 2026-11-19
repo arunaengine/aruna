@@ -12,7 +12,7 @@ use super::super::preflight::{
     plan_preflight_request, version_targets, visible_prefix,
 };
 use super::super::preflight_types::preflight_fingerprint;
-use super::super::search_fanout::resume_cursor;
+use super::super::realm_search::resume_cursor;
 use crate::driver::drive;
 
 // Documents not materialized yet have no postings, so their absence is never reported current.

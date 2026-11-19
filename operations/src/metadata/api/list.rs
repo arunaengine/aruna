@@ -14,12 +14,12 @@ use aruna_core::storage_entries::metadata_registry_prefix;
 use aruna_core::structs::identity::group::Group;
 use aruna_core::types::Key;
 
+use super::access::{ReadAccess, ReadAccessOperation, child_results, children, internal};
 use super::export::SummaryOperation;
 use super::list_types::{
     ESTIMATE_MIN_LIMIT, ListVisibleRequest, ListVisibleResult, ListedMetadataDocument,
     MetadataListOrder, check_policy_limit, effective_list_limit, merge_pending_records,
 };
-use super::read_access::{ReadAccess, ReadAccessOperation, child_results, children, internal};
 use super::{
     EVENT_LOG_KEYSPACE, Event, GroupId, HashMap, LIST_METADATA_SIZE, ListGroupOperation,
     MetadataApiError, MetadataEventRecord, MetadataRegistryRecord, PENDING_PROJECTION_KEYSPACE,
@@ -592,7 +592,7 @@ mod call_tests {
     //! Drives the listing operations through their cache, page, child and group answers without I/O.
 
     use super::*;
-    use crate::metadata::api::read_access::tests::{access_for, realm};
+    use crate::metadata::api::access::tests::{access_for, realm};
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::{GroupEvent, GroupResult};

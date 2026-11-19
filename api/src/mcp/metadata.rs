@@ -19,8 +19,8 @@ use aruna_operations::metadata::api::read::query_metadata;
 use aruna_operations::metadata::api::read_types::{
     DocumentQueryRequest, MetadataQueryRequest, MetadataReferencesRequest,
 };
+use aruna_operations::metadata::api::realm_search::search_metadata;
 use aruna_operations::metadata::api::references::ReferencesOperation;
-use aruna_operations::metadata::api::search_fanout::search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;

@@ -17,7 +17,7 @@ use aruna_operations::groups::search_groups::{SearchGroupsInput, SearchGroupsOpe
 use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use aruna_operations::metadata::api::object_search::search_objects;
-use aruna_operations::metadata::api::search_fanout::search_metadata as run_search_metadata;
+use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
     ObjectExecution, ObjectQueryMode, SearchQueryRequest,

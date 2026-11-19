@@ -30,7 +30,7 @@ use super::super::preflight_types::{
     MetadataResolvedTarget, ReferenceExecution, ReferenceNodeExecution, ReferenceNodeRequest,
     ReferenceRequest, preflight_fingerprint,
 };
-use super::super::search_fanout::{cursor_signers, resume_cursor};
+use super::super::realm_search::{cursor_signers, resume_cursor};
 use super::super::{
     ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MAX_PAGINATION_DEPTH, MetadataApiError,
     MetadataReadError, map_read_error,

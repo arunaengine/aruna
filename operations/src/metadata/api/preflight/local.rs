@@ -18,12 +18,12 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key};
 use ulid::Ulid;
 
+use super::super::access::{child_results, children};
 use super::super::list::PendingRecordsOperation;
 use super::super::preflight_types::{
     MetadataNodeFreshness, MetadataPreflightLocation, MetadataVisibleReference,
     ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,
 };
-use super::super::read_access::{child_results, children};
 use super::super::readable::RecordReadableOperation;
 use super::super::title::DocumentTitleOperation;
 use super::super::{MAX_PAGINATION_DEPTH, MetadataApiError, REGISTRY_CANDIDATE_LIMIT};

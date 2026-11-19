@@ -71,6 +71,7 @@ use aruna_core::placement::{
     registry_strategy, resolve_holders_limit, resolve_shard_holders,
 };
 
+pub(crate) mod access;
 mod bucket_page;
 pub mod bucket_search;
 mod distributed;
@@ -94,12 +95,11 @@ pub mod preflight;
 pub mod preflight_types;
 pub mod query_fanout;
 pub mod read;
-pub(crate) mod read_access;
 pub mod read_types;
 pub(crate) mod readable;
+pub mod realm_search;
 pub mod references;
 pub mod search;
-pub mod search_fanout;
 pub mod search_types;
 pub(crate) mod title;
 

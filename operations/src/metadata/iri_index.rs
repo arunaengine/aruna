@@ -31,7 +31,7 @@ use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::api::read_access::{child_results, children};
+use crate::metadata::api::access::{child_results, children};
 use crate::metadata::call_results::page_rows;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 use crate::metadata::record_reads::DocumentRecordOperation;
