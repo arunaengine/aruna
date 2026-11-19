@@ -1,19 +1,19 @@
-//! Ties the storage submodules together and re-exports the handle, worker and owner types.
+//! Ties the storage submodules together; the handle, worker and owner types are its public modules.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod handle;
+pub mod handle;
 #[cfg(debug_assertions)]
 mod ledger;
-mod lifecycle;
-mod metrics;
-mod owner;
-mod persistence;
+pub mod lifecycle;
+pub mod metrics;
+pub mod owner;
+pub mod persistence;
 mod policies;
 mod preimage;
 mod rebuild;
 mod records;
-mod sealing;
+pub mod sealing;
 mod shutdown;
 mod telemetry;
 #[cfg(test)]
@@ -32,17 +32,7 @@ mod tests_range;
 mod tests_rebuild;
 mod transactions;
 mod vault;
-mod worker;
-
-pub use handle::{
-    EffectHandle, EffectReceiver, EffectSender, ResponseSender, StorageHandle, StorageReceivers,
-};
-pub use lifecycle::CACHE_BYTES;
-pub use metrics::{InFlightGuard, StorageMetricsSnapshot};
-pub use owner::TransactionOwner;
-pub use persistence::FjallPersistPolicy;
-pub use sealing::{SEALED_KEYSPACES, row_aad};
-pub use worker::FjallStorage;
+pub mod worker;
 
 pub(in crate::storage) use handle::{
     CleanupEntry, CleanupKind, EFFECT_QUEUE_CAPACITY, MAX_TRANSACTION_CLEANUP, QUEUE_CAPACITY,

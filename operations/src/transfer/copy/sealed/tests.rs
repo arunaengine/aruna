@@ -10,7 +10,8 @@ use aruna_core::structs::storage::bucket_metadata::RELEASE_TAG;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_storage::storage::{self, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::{self};
 use tempfile::{TempDir, tempdir};
 
 const SOURCE: &str = "sealed";

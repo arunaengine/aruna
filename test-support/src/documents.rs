@@ -14,7 +14,7 @@ use aruna_operations::sync::document_outbox::{
     OutboxPagePlan, OutboxReadBatch, OutboxTailsOperation, OutboxTimerOperation, ReadOutboxPlan,
 };
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use aruna_tasks::TaskHandle;
 
 /// The outbox record stored at `key`.

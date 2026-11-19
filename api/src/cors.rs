@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::routes::federation::export::{GRANT_HEADER, INTENT_HEADER};
+use crate::routes::federation::export::INTENT_HEADER;
+use aruna_operations::federation::import::GRANT_HEADER;
 use axum::http::Method;
 use http::HeaderMap;
 use http::HeaderName;

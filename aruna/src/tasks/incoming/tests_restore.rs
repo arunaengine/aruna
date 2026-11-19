@@ -4,7 +4,8 @@
 
 use super::harness::*;
 use super::*;
-use aruna_drivers::testing::freeze_clock;
+use crate::tasks::incoming::outbox::drive_sync_drain;
+use aruna_drivers::testing::{RecordingTaskHandler, freeze_clock};
 
 #[tokio::test]
 async fn restore_document_records() {
@@ -426,10 +427,11 @@ async fn drain_reconcile_summary() {
     use aruna_core::structs::storage::usage::{
         NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, UsageCounters, global_shard_key, usage_global_key,
     };
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::NetHandle;
+    use aruna_net::config::NetConfig;
 
     async fn write_stat(
-        storage: &aruna_storage::StorageHandle,
+        storage: &aruna_storage::storage::handle::StorageHandle,
         key_space: &str,
         key: Vec<u8>,
         value: Vec<u8>,
@@ -554,7 +556,8 @@ async fn drain_reconcile_summary() {
 async fn drain_reconcile_config() {
     use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{SUMMARY_GLOBAL_KEY, UsageCounters};
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::NetHandle;
+    use aruna_net::config::NetConfig;
 
     let temp_dir = tempdir().expect("temp dir");
     let storage =
@@ -632,7 +635,7 @@ async fn drain_reconcile_config() {
     net.shutdown().await;
 }
 
-async fn restore_document_key(storage: &aruna_storage::StorageHandle) -> TaskKey {
+async fn restore_document_key(storage: &aruna_storage::storage::handle::StorageHandle) -> TaskKey {
     let task_handle = TaskHandle::new();
     let (seen_tx, mut seen_rx) = mpsc::channel(1);
     task_handle

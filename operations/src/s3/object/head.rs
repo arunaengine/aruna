@@ -369,7 +369,7 @@ mod tests {
     async fn current_version_read() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
-        let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
+        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(temp_root).unwrap();
         let net_handle =
             NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
                 .await
@@ -485,7 +485,7 @@ mod tests {
     async fn specific_version_read() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
-        let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
+        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(temp_root).unwrap();
         let net_handle =
             NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
                 .await
@@ -667,7 +667,7 @@ mod tests {
     async fn cached_metadata_returned() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
-        let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
+        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(temp_root).unwrap();
         let net_handle =
             NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
                 .await

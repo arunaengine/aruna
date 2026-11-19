@@ -5,7 +5,7 @@
 use super::*;
 use crate::auth::RealmAuth;
 use crate::error::ServerError;
-use crate::metadata::{CreateMetadataRequest, CreateScaffoldRequest};
+use crate::metadata::model::{CreateMetadataRequest, CreateScaffoldRequest};
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::tests::{TestState, setup_network_state};
 use crate::tests::metadata_fixtures::drain_metadata_background;

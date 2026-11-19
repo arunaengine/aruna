@@ -551,7 +551,8 @@ mod tests {
     use aruna_core::structs::storage::backend_import::BackendImportSpec;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use aruna_test_support::jobs::read_job_record;
     use byteview::ByteView;

@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 
 use crate::config::DiscoveryMethod;
 use crate::connection_pool::ConnectionPool;
-use crate::dht::DhtHandle;
+use crate::dht::handle::DhtHandle;
 use crate::discovery::{install_signed_endpoint, resolve_signed_endpoint};
 use crate::unique_peer_nodes;
 

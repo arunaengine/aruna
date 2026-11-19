@@ -24,7 +24,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use tempfile::TempDir;
 
 use crate::jobs::lifecycle::launch_checks::LocalCapabilityOperation;

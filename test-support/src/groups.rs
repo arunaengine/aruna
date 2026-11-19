@@ -39,7 +39,7 @@ pub struct Fixture {
 
 /// A storage-only context on a store opened at `path`, with an open vault.
 pub fn context(path: &std::path::Path) -> DriverContext {
-    let storage_handle = aruna_storage::FjallStorage::open(path.to_str().unwrap()).unwrap();
+    let storage_handle = aruna_storage::storage::worker::FjallStorage::open(path.to_str().unwrap()).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     DriverContext {
         storage_handle,

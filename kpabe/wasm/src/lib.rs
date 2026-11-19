@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_kpabe::{
-    Attribute, Envelope, MasterSecret, Policy, PublicParameters, SecretKey, UserKey,
-};
+use aruna_kpabe::envelope::Envelope;
+use aruna_kpabe::policy::{Attribute, Policy};
+use aruna_kpabe::scheme::{MasterSecret, PublicParameters, SecretKey, UserKey};
 use wasm_bindgen::prelude::wasm_bindgen;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -91,7 +91,8 @@ impl ScopedKey {
 impl ScopedKey {
     fn open(&self, envelope: &[u8], context: &[u8]) -> Result<SecretKey, String> {
         let envelope = Envelope::from_bytes(&self.parameters, envelope).map_err(refused)?;
-        aruna_kpabe::open(&self.parameters, &self.key, &envelope, context).map_err(refused)
+        aruna_kpabe::envelope::open(&self.parameters, &self.key, &envelope, context)
+            .map_err(refused)
     }
 }
 
@@ -130,7 +131,7 @@ fn derive_master(
     scalar[31] &= 127;
     scalar[31] |= 64;
     let seed = aruna_kpabe::derive_seed(&scalar[..], SEED_SALT, context).map_err(refused)?;
-    aruna_kpabe::setup_from_seed(seed.as_bytes(), context).map_err(refused)
+    aruna_kpabe::scheme::setup_from_seed(seed.as_bytes(), context).map_err(refused)
 }
 
 fn issue_scope(
@@ -148,7 +149,7 @@ fn issue_scope(
         return Err(REFUSED.into());
     }
     let policy = policy(context, kind, scope, epochs)?;
-    aruna_kpabe::issue(&derived, &master, &policy, &mut getrandom::SysRng).map_err(refused)
+    aruna_kpabe::scheme::issue(&derived, &master, &policy, &mut getrandom::SysRng).map_err(refused)
 }
 
 fn policy(context: &[u8], kind: &str, scope: &str, epochs: &[u64]) -> Result<Policy, String> {

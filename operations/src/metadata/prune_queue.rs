@@ -758,8 +758,8 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::FjallStorage;
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use aruna_test_support::metadata::{
         process_graph_tombstones, process_prune_batch, prune_jobs_exist,

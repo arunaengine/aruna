@@ -48,7 +48,8 @@ use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::connectors::create_connector::{
     SourceConnectorInput, SourceConnectorOperation,
 };
@@ -59,7 +60,8 @@ use aruna_operations::s3::object::put::{
 };
 use aruna_operations::testing::fresh_job_id;
 use aruna_operations::transfer::origin::ReadOriginOperation;
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_test_support::metadata::process_materialization_batch;
 use aruna_test_support::projection::replay_event_log;

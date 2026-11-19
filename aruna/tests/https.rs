@@ -492,7 +492,7 @@ async fn released(mut stream: tokio_rustls::client::TlsStream<TcpStream>) {
 
 fn shutdown_sequence(
     shutdown: Shutdown,
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     grace: Duration,
 ) -> NodeShutdown {
     NodeShutdown {
@@ -521,9 +521,9 @@ fn shutdown_sequence(
 /// A TLS S3 stack on fresh storage with one connection permit, stopped by `shutdown`.
 async fn drained_stack(
     shutdown: &Shutdown,
-) -> (TlsS3, aruna_storage::StorageHandle, tempfile::TempDir) {
+) -> (TlsS3, aruna_storage::storage::handle::StorageHandle, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
+    let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
         .expect("storage opens");
     let context = Arc::new(aruna_drivers::driver::DriverContext {
         storage_handle: storage.clone(),

@@ -287,7 +287,7 @@ mod tests {
     use crate::tests::fixtures::env_lock;
     use aruna::config::load;
     use aruna::inbound::initialize_net_holder;
-    use aruna::tasks::incoming::start_task_queues;
+    use aruna::tasks::incoming::restore::start_task_queues;
     use aruna_api::server::state::ServerState;
     use aruna_api::server::{Server, ServerConfig};
     use aruna_core::keys::generate_signing_key;
@@ -295,7 +295,8 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::testing::EnvGuard;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };

@@ -13,7 +13,8 @@ use aruna_core::outbound::{ConnectionAnswer, ConnectionCall, ConnectionError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_core::secrets::ResponseExposure;
-use aruna_outbound::{ConnectionSender, OutboundHandle};
+use aruna_outbound::OutboundHandle;
+use aruna_outbound::connection::ConnectionSender;
 use async_trait::async_trait;
 use ulid::Ulid;
 

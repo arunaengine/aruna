@@ -5,10 +5,13 @@
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerResult};
-use crate::metadata::{
+use crate::metadata::model::{
     ProfileCapabilitiesResponse, ProfilePreviewRequest, ProfilePreviewResponse,
-    ProfileValidationResponse, ensure_metadata_scope, forwarded_auth_token, map_api_error,
-    map_metadata_error, parse_document_id, serialize_jsonld_object,
+    ProfileValidationResponse,
+};
+use crate::metadata::{
+    ensure_metadata_scope, forwarded_auth_token, map_api_error, map_metadata_error,
+    parse_document_id, serialize_jsonld_object,
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};

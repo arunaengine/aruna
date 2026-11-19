@@ -215,7 +215,7 @@ mod tests {
 
     /// Stores the bound bucket "spire" of member 1, its record and these accounts and counters.
     async fn spire(
-        handle: &aruna_storage::storage::StorageHandle,
+        handle: &aruna_storage::storage::handle::StorageHandle,
         (snapshot, bytes): (DistributionSnapshot, Vec<u8>),
         accounts: Vec<(Ulid, Charge)>,
         counters: Vec<(Vec<u8>, RangeCounters)>,

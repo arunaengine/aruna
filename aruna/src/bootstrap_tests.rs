@@ -25,12 +25,13 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::notifications::watch::interest::PublishInterestOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_test_support::documents::read_outbox_records;
 use aruna_test_support::documents::reconcile_topics;
 use byteview::ByteView;
@@ -137,7 +138,7 @@ fn watch_target_cases() {
 }
 
 fn context_net(
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     net_handle: NetHandle,
 ) -> DriverContext {
     DriverContext {

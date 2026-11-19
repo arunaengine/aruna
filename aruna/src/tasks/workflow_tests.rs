@@ -5,8 +5,8 @@
 use crate::tasks::runner::{execution_host, resume_attempt as run_resume, run_execution_job};
 use crate::tasks::runner::{run_wiring, under_lease};
 use aruna_clock::unix_timestamp_millis;
-use aruna_compute::ExecutorBackend;
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::executor::ExecutorBackend;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_compute::session::{Session, SessionConfig};
 use aruna_core::UserId;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
@@ -29,6 +29,7 @@ use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::effect_adapters::job::with_job_host;
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
+use aruna_operations::jobs::workflow::*;
 use aruna_operations::jobs::workflow::attempt::{AttemptScope, RunWiring};
 use aruna_operations::jobs::workflow::credential::{
     MintCredentialOperation, RunIdentity, WorkspaceAccessOperation,
@@ -41,9 +42,9 @@ use aruna_operations::jobs::workflow::prepare::{
 use aruna_operations::jobs::workflow::recovery::RecoverSubmitOperation;
 use aruna_operations::jobs::workflow::settle::{ParkAttemptOperation, SettleScope};
 use aruna_operations::jobs::workflow::supervise::{SuperviseOperation, WalltimeAnchorOperation};
-use aruna_operations::jobs::workflow::*;
 use aruna_operations::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_test_support::jobs::{
     begin_external_running, claim_job, handoff_external_attempt, insert_job, mutate_job,
@@ -1059,7 +1060,7 @@ async fn finalize_renews_lease() {
 /// needs this node's key.
 async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_net::NetHandle) {
     let net = aruna_net::NetHandle::new(
-        aruna_net::NetConfig {
+        aruna_net::config::NetConfig {
             realm_id: aruna_core::structs::identity::realm::RealmId([1; 32]),
             ..aruna_drivers::testing::local_net()
         },
@@ -1929,7 +1930,7 @@ async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, dig
 }
 
 fn compute_context(storage: StorageHandle) -> Arc<DriverContext> {
-    let mut registry = aruna_compute::ExecutorRegistry::new();
+    let mut registry = aruna_compute::registry::ExecutorRegistry::new();
     registry.register(StubBackend::new(StubReconcile::NotFound));
     Arc::new(DriverContext {
         storage_handle: storage,
@@ -2006,7 +2007,7 @@ async fn drift_requeues_attempt() {
 #[tokio::test]
 async fn stored_site_starts() {
     // The exact stored generation and digest still admit the start.
-    use aruna_compute::ExecutorRegistry;
+    use aruna_compute::registry::ExecutorRegistry;
     use aruna_core::compute::ExecutorCapability;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
     use aruna_core::structs::placement::policy::PlacementSubject;

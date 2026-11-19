@@ -8,7 +8,7 @@ use aruna_core::effects::DhtGetOptions;
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use crossfire::{TrySendError, mpsc};
 use iroh::Endpoint;
 use tokio::sync::oneshot;
@@ -24,7 +24,7 @@ use super::storage::DhtClock;
 use crate::connection_pool::ConnectionPool;
 use crate::error::{NetError, Result};
 use crate::streams::PeerKinds;
-use crate::telemetry::{current_trace_context, duration_ms};
+use aruna_core::telemetry::{current_trace_context, duration_ms};
 
 #[derive(Debug)]
 pub(crate) struct DhtSpawnResources {

@@ -514,7 +514,7 @@ pub async fn set_realm_policies(
         SetPoliciesError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     })?;
-    crate::routes::storage::abe::epoch_due(&state, &auth, None).await;
+    crate::routes::storage::abe::records::epoch_due(&state, &auth, None).await;
 
     Ok((
         StatusCode::OK,
@@ -681,7 +681,7 @@ pub async fn set_group_policies(
         SetGroupError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     })?;
-    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
+    crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok((StatusCode::OK, Json(policies_response(&document.policies))))
 }

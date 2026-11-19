@@ -5,9 +5,9 @@
 use super::backend::{build_backend_path, build_part_path, rebuild_backend_path};
 use super::group::GROUP_WRITE_CHUNK;
 use super::io::compose_chunk;
+use super::registry::{BackendRegistry, NodeBackend};
 use super::{
-    BackendRegistry, BlobHandle, BlobHandler, ControlPlaneKind, NodeBackend,
-    control_plane::timeout_event,
+    BlobHandle, BlobHandler, ControlPlaneKind, control_plane::timeout_event,
     control_plane::{parse_replication_init, validate_init_ack, with_timeout},
 };
 use crate::messages::{MessageType, ReplicationMessage};
@@ -38,8 +38,9 @@ use aruna_core::structs::storage::group_backend::{
 };
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
 use aruna_core::{NodeId, UserId};
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_net::streams::BiStream;
-use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
+use aruna_net::{InboundEventHandler, NetHandle};
 use aruna_storage::storage;
 use async_trait::async_trait;
 use futures::TryStreamExt;
@@ -416,7 +417,7 @@ async fn connected_stream_pair() -> (NetHandle, tempfile::TempDir, NetHandle, te
 struct TestContext {
     _temp_dir: tempfile::TempDir,
     blob_handle: BlobHandle,
-    storage_handle: aruna_storage::storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
 }
 
 enum TestContextSetup<'a> {

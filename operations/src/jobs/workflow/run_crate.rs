@@ -2274,7 +2274,7 @@ mod tests {
         // The built-in shapes must accept what this generator writes.
         use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
         use aruna_core::profile_shapes::ProfileShapes;
-        use aruna_graph::ProfileShaclEngine;
+        use aruna_graph::shacl::ProfileShaclEngine;
 
         let (record, spec) = execution_record();
         // An input from a device carries its provenance entity, which the shapes must accept.

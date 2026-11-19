@@ -21,7 +21,7 @@ use aruna_core::types::{Key, Value};
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::device::sync::repository::{action_entry, base_entry, folder_entry};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::http::StatusCode;
 use ed25519_dalek::SigningKey;
@@ -136,12 +136,12 @@ async fn local_setup() -> (Fixture, tokio::sync::mpsc::UnboundedReceiver<TaskKey
     let path = dir.path().to_str().unwrap().to_string();
     let storage = FjallStorage::open(&path).unwrap();
     let net = aruna_net::NetHandle::new(
-        aruna_net::NetConfig {
+        aruna_net::config::NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             realm_id: realm_id(),
-            discovery_method: aruna_net::DiscoveryMethod::None,
-            relay_method: aruna_net::RelayMethod::None,
-            ..aruna_net::NetConfig::default()
+            discovery_method: aruna_net::config::DiscoveryMethod::None,
+            relay_method: aruna_net::config::RelayMethod::None,
+            ..aruna_net::config::NetConfig::default()
         },
         storage.clone(),
     )

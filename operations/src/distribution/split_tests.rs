@@ -13,7 +13,7 @@ use crate::distribution::test_store::{
 use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_core::structs::storage::distribution::accounting::RangeCounters;
 use aruna_drivers::driver::drive;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 
 fn set() -> Ulid {
     Ulid::from_bytes([5; 16])

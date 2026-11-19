@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_kpabe::{Attribute, frame_context, seal};
+use aruna_kpabe::envelope::seal;
+use aruna_kpabe::frame_context;
+use aruna_kpabe::policy::Attribute;
 use rand::{SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};
 

@@ -22,7 +22,7 @@ use s3s::dto::StreamingBlob;
 
 use super::visit::{range_unavailable, unavailable};
 use crate::error::ServerError;
-use crate::s3::service::delegated_caller;
+use crate::s3::service::forward::reads::delegated_caller;
 use crate::server::state::ServerState;
 
 /// What a visit sends other members about `info`'s bucket: the creator narrowed as `auth` is,

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna::inbound::{initialize_incoming_fixture, initialize_net_holder};
-use aruna::tasks::incoming::start_task_queues;
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
@@ -49,7 +49,8 @@ use aruna_core::types::GroupId;
 use aruna_core::{NodeId, StructuredId, UserId};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
@@ -68,7 +69,7 @@ use aruna_operations::realm::announce_presence::{
 };
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
 use aruna_test_support::documents::sync_topics;
@@ -1338,7 +1339,7 @@ pub async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
             node = %&node.node_id().to_string()[..8]
         );
         tracing::Instrument::instrument(
-            aruna::tasks::incoming::drive_sync_drain(node.context.clone()),
+            aruna::tasks::incoming::outbox::drive_sync_drain(node.context.clone()),
             span,
         )
     }))

@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::RealmAuth;
-use crate::metadata::{CreateMetadataRequest, CreateRoCrateRequest};
+use crate::metadata::model::{CreateMetadataRequest, CreateRoCrateRequest};
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::tests::TestState;
 use crate::tests::distributed::{bucket_info, write};

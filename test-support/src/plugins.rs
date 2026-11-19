@@ -55,7 +55,7 @@ use aruna_operations::s3::object::put::PutObjectOperation;
 use aruna_operations::secrets::SecretChange;
 use aruna_operations::secrets::owner::{OwnerChange, OwnerSecretOperation};
 use aruna_operations::testing_objects::put_config;
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
@@ -81,7 +81,7 @@ pub fn node_context(
     dir: &Path,
     wrap: impl FnOnce(StorageHandle) -> StorageHandle,
 ) -> DriverContext {
-    let storage = aruna_storage::FjallStorage::open(dir.to_str().unwrap()).unwrap();
+    let storage = aruna_storage::storage::worker::FjallStorage::open(dir.to_str().unwrap()).unwrap();
     DriverContext {
         storage_handle: wrap(storage),
         net_handle: None,

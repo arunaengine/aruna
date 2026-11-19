@@ -12,7 +12,8 @@ use aruna_core::structs::execution::job::{JobError, JobResultPayload, PluginWork
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
 use aruna_core::structs::storage::origin::VersionOrigin;
-use aruna_outbound::{OutboundHandle, TransferError, UploadBody};
+use aruna_outbound::OutboundHandle;
+use aruna_outbound::transfers::{TransferError, UploadBody};
 use ulid::Ulid;
 
 use super::plugin_work::{PROGRESS_TICK, key_wait, permanent, refused};

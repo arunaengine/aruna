@@ -22,7 +22,8 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
-use aruna_storage::{FjallPersistPolicy, FjallStorage};
+use aruna_storage::storage::persistence::FjallPersistPolicy;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_test_support::metadata::process_materialization_batch;
 use aruna_test_support::projection::replay_event_log;
 use tempfile::TempDir;

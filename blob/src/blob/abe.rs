@@ -30,7 +30,7 @@ impl BlobHandler {
                     let parameters = r.parameters.public()?;
                     let master = r.parameters.recompute(secret.bytes())?;
                     let policy = r.scope.policy(&r.parameters, &r.epochs)?;
-                    let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut rng)?;
+                    let key = aruna_kpabe::scheme::issue(&parameters, &master, &policy, &mut rng)?;
                     let aad = context.bytes()?;
                     let recipient = r
                         .recipient_public

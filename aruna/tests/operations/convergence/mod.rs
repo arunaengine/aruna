@@ -132,7 +132,7 @@ where
 /// Waits until every clone of `storage` is gone and its worker released the
 /// directory, so a restart on the same path does not find fjall locked. The
 /// deferred metadata persist thread keeps a clone until its flush loop ends.
-pub async fn wait_storage_released(storage: aruna_storage::StorageHandle) -> Result<(), String> {
+pub async fn wait_storage_released(storage: aruna_storage::storage::handle::StorageHandle) -> Result<(), String> {
     timeout(HANG_CAP, storage.close())
         .await
         .map_err(|_| "storage still held after shutdown".to_string())

@@ -632,7 +632,8 @@ mod tests {
     use aruna_core::structs::placement::record::{BindingScope, DocumentClass};
     use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
     use irokle::Storage;

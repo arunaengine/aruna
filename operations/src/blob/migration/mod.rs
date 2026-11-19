@@ -2074,7 +2074,7 @@ mod tests {
         // A compression pass waiting for its retry is finished once its bucket encrypts.
         use aruna_core::structs::storage::encryption::EncryptionMode;
         let temp = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let context = aruna_drivers::driver::DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
@@ -2140,7 +2140,7 @@ mod tests {
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::storage::blob::object_permission_path;
         let temp = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let context = aruna_drivers::testing::test_context(storage.clone());
         let (realm, group) = (RealmId::from_bytes([1; 32]), Ulid::from_parts(1, 1));
         let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
@@ -2194,7 +2194,7 @@ mod tests {
         // Versions with nothing to do do not use up a run; only the others count toward it, and
         // rows left go on at once while a failure pass waits for its retry.
         let temp = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let context = aruna_drivers::testing::test_context(storage.clone());
         let record = CompressionMigration::new(ZSTD, 1);
         let put = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
@@ -2248,7 +2248,7 @@ mod tests {
         // A run that used up its time stores its progress after the version it started, and
         // the next run goes on at once after it.
         let temp = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let context = aruna_drivers::testing::test_context(storage.clone());
         let record = CompressionMigration::new(ZSTD, 1);
         let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
@@ -2284,7 +2284,7 @@ mod tests {
         // Rows a run finished after its cursor count once: the next run of the same pass
         // passes over them, and a row of another pass or cursor is not trusted.
         let temp = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let context = aruna_drivers::testing::test_context(storage.clone());
         let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
         let row = |index: u64| VersionKey::new("b", format!("k{index}"), Ulid::from_parts(1, 1));
@@ -2328,7 +2328,7 @@ mod tests {
         // Rows ahead are stored with the progress: a run whose progress is lost leaves them as
         // they were, so the run that repeats it counts each row once.
         let temp = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let context = aruna_drivers::testing::test_context(storage.clone());
         let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
         let row = |index: u64| VersionKey::new("b", format!("k{index}"), Ulid::from_parts(1, 1));
@@ -2381,7 +2381,7 @@ mod tests {
         // The version a run left unfinished is deleted during the pause; the two versions of one
         // key it finished after it now open the next run and still count once.
         let temp = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let context = aruna_drivers::testing::test_context(storage.clone());
         let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
         let row = |at: u64| VersionKey::new("b", "k1", Ulid::from_parts(at, 1));
@@ -2424,7 +2424,7 @@ mod tests {
     async fn ends_aborted_rename() {
         // An aborted rename ends its move with its counts and keeps the request as the abort.
         let temp = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let context = aruna_drivers::testing::test_context(storage.clone());
         let mut record = CompressionMigration::new(Compression::Off, 7);
         (record.moving, record.migrated) = (true, 3);
@@ -2520,7 +2520,7 @@ mod tests {
         // runs it again until its intents are settled.
         use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
         let temp = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
         let context = aruna_drivers::testing::test_context(storage.clone());
         let group = Ulid::from_parts(1, 1);
         let rule = BackendImport {

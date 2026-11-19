@@ -440,7 +440,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
 
     use std::collections::BTreeSet;
@@ -822,12 +822,12 @@ mod tests {
                 .await;
         }
         let net = aruna_net::NetHandle::new(
-            aruna_net::NetConfig {
+            aruna_net::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
                 realm_id,
-                discovery_method: aruna_net::DiscoveryMethod::None,
-                relay_method: aruna_net::RelayMethod::None,
-                ..aruna_net::NetConfig::default()
+                discovery_method: aruna_net::config::DiscoveryMethod::None,
+                relay_method: aruna_net::config::RelayMethod::None,
+                ..aruna_net::config::NetConfig::default()
             },
             storage.clone(),
         )
@@ -1198,7 +1198,7 @@ mod tests {
     async fn rejects_oversized_mounts() {
         // Fifty patterns are the issuance cap, so twenty-five mounted buckets
         // still pass and the twenty-sixth must fail permanently.
-        let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
+        let (storage_handle, _receivers) = aruna_storage::storage::handle::StorageHandle::new();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

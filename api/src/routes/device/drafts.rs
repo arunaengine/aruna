@@ -18,9 +18,8 @@ use utoipa_axum::routes;
 use crate::auth::OwnerAuth;
 use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{
-    ProfilePreviewRequest, ProfilePreviewResponse, ensure_metadata_scope, forwarded_auth_token,
-};
+use crate::metadata::model::{ProfilePreviewRequest, ProfilePreviewResponse};
+use crate::metadata::{ensure_metadata_scope, forwarded_auth_token};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_drivers::driver::drive;

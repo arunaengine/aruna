@@ -46,7 +46,7 @@ use aruna_core::telemetry::duration_ms;
 use fjall::PersistMode;
 use tracing::Span;
 
-use super::FjallStorage;
+use super::worker::FjallStorage;
 
 impl FjallStorage {
     pub(super) fn sync_all(&self) -> StorageEvent {

@@ -1195,7 +1195,7 @@ mod tests {
     /// mapping test runs a real `NodeShutdown` sequence.
     fn node_shutdown(
         shutdown: aruna_tasks::shutdown::Shutdown,
-        storage_handle: aruna_storage::StorageHandle,
+        storage_handle: aruna_storage::storage::handle::StorageHandle,
         grace: std::time::Duration,
     ) -> NodeShutdown {
         NodeShutdown {
@@ -1228,7 +1228,7 @@ mod tests {
     async fn cancellation_requires_cleanup() {
         let dir = tempfile::tempdir().expect("temp dir");
         let storage_handle =
-            aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
                 .expect("storage opens");
 
         let complete = node_shutdown(

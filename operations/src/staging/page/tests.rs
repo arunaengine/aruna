@@ -999,7 +999,7 @@ async fn page_needs_coordinator() {
 }
 
 /// Bytes of keys and values per keyspace in `handle`.
-async fn keyspace_bytes(handle: &aruna_storage::StorageHandle) -> HashMap<&'static str, usize> {
+async fn keyspace_bytes(handle: &aruna_storage::storage::handle::StorageHandle) -> HashMap<&'static str, usize> {
     let mut sizes = HashMap::new();
     for key_space in aruna_core::keyspaces::KEYSPACE_CATALOG {
         let iter = StorageEffect::Iter {
@@ -1168,7 +1168,7 @@ async fn entry_sizes_measured() {
 /// Answers one storage or timer effect and counts the storage exchange.
 async fn exchange(
     effect: Effect,
-    handle: &aruna_storage::StorageHandle,
+    handle: &aruna_storage::storage::handle::StorageHandle,
     exchanges: &mut usize,
 ) -> Event {
     match effect {
@@ -1187,7 +1187,7 @@ async fn exchange(
 /// those of the reads it runs as children included.
 async fn count_exchanges(
     operation: PageImportOperation,
-    handle: &aruna_storage::StorageHandle,
+    handle: &aruna_storage::storage::handle::StorageHandle,
     process: u32,
 ) -> (usize, Result<PageImportResult, PageImportError>) {
     let mut operation = CallRun::new(operation);

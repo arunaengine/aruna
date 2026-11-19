@@ -16,12 +16,12 @@ use aruna_plugin_types::calls::{
     Document, Entry, ErrorKind, HostError, Intent, Listing, ObjectInfo, ObjectPage, Response,
 };
 use aruna_plugin_types::permission::Permission;
+use aruna_plugins::CancellationToken;
 use aruna_plugins::broker::{Broker, CallContext, MetadataPatch, SendRequest, StatePut};
+use aruna_plugins::host::wit::aruna::plugin::types::{FailureKind, Trigger};
 use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
-use aruna_plugins::{
-    CancellationToken, Compiled, FailureKind, Invocation, InvokeError, Runtime, Trigger,
-};
+use aruna_plugins::runtime::{Compiled, Invocation, InvokeError, Runtime};
 
 use common::{limits, require};
 

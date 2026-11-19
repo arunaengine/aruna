@@ -13,7 +13,8 @@ use aruna_core::handle::Handle;
 use aruna_core::keys::realm_presence_key;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_drivers::driver::DriverContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_tasks::TaskHandle;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -59,7 +60,7 @@ async fn metadata_query(base_url: &str, token: &str) -> TestResult<Value> {
     Ok(response.json().await?)
 }
 
-fn metadata_counts(seed: &shared::SeedNode, peer: iroh::PublicKey) -> aruna_net::PoolCounts {
+fn metadata_counts(seed: &shared::SeedNode, peer: iroh::PublicKey) -> aruna_net::connection_pool::PoolCounts {
     seed.net.pool_counts_for(peer, Alpn::Metadata)
 }
 
@@ -68,8 +69,8 @@ fn metadata_counts(seed: &shared::SeedNode, peer: iroh::PublicKey) -> aruna_net:
 async fn pool_settled(
     seed: &shared::SeedNode,
     peer: iroh::PublicKey,
-    before: &aruna_net::PoolCounts,
-) -> TestResult<aruna_net::PoolCounts> {
+    before: &aruna_net::connection_pool::PoolCounts,
+) -> TestResult<aruna_net::connection_pool::PoolCounts> {
     // Hang guard only; the pool answers within its connect timeout.
     handled(seed, peer, before, Duration::from_secs(60))
         .await?
@@ -79,9 +80,9 @@ async fn pool_settled(
 async fn handled(
     seed: &shared::SeedNode,
     peer: iroh::PublicKey,
-    before: &aruna_net::PoolCounts,
+    before: &aruna_net::connection_pool::PoolCounts,
     wait: Duration,
-) -> TestResult<Option<aruna_net::PoolCounts>> {
+) -> TestResult<Option<aruna_net::connection_pool::PoolCounts>> {
     let found = poll_until(wait, async || {
         let counts = metadata_counts(seed, peer);
         let moved = counts.dials > before.dials || counts.cooldown_hits > before.cooldown_hits;
@@ -98,8 +99,8 @@ async fn outage_query(
     seed: &shared::SeedNode,
     peer: iroh::PublicKey,
     token: &str,
-    before: &aruna_net::PoolCounts,
-) -> TestResult<(Value, aruna_net::PoolCounts)> {
+    before: &aruna_net::connection_pool::PoolCounts,
+) -> TestResult<(Value, aruna_net::connection_pool::PoolCounts)> {
     for _ in 0..6 {
         let query = metadata_query(&seed.base_url, token).await?;
         if let Some(counts) = handled(seed, peer, before, Duration::from_secs(10)).await? {

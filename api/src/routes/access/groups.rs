@@ -1648,7 +1648,7 @@ pub async fn add_group_member(
     .map_err(map_member_error)?;
     let members = vec![user_id];
     let key_requests =
-        crate::routes::storage::abe::member_requests(&state, &auth, group_id, members).await;
+        crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members).await;
 
     Ok((
         StatusCode::CREATED,
@@ -1734,7 +1734,7 @@ pub async fn remove_group_member(
     )
     .await
     .map_err(map_removal_error)?;
-    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
+    crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1785,7 +1785,7 @@ pub async fn leave_group(
     )
     .await
     .map_err(map_removal_error)?;
-    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
+    crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1941,11 +1941,11 @@ pub async fn create_group_role(
 
     // A DENY rule can narrow existing READ scopes.
     if narrows {
-        crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
+        crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
     }
     let members = assigned_users.into_iter().collect();
     let key_requests =
-        crate::routes::storage::abe::member_requests(&state, &auth, group_id, members).await;
+        crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members).await;
     let role = CreatedRoleResponse { role, key_requests };
     Ok((StatusCode::CREATED, Json(role)))
 }
@@ -2018,7 +2018,7 @@ pub async fn delete_group_role(
         }
         other => ServerError::InternalError(other.into()),
     })?;
-    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
+    crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -54,7 +54,7 @@ use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, bearer_auth, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::metadata::{MetadataRoCrateResponse, RoCrateExportParams};
+use crate::metadata::model::{MetadataRoCrateResponse, RoCrateExportParams};
 use crate::routes::execution::runs::run_answer;
 use crate::routes::metadata::rocrate::export_metadata_rocrate;
 use crate::routes::storage::origin::version_answer;

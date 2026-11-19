@@ -9,7 +9,7 @@ use crate::distribution::test_store::{
 };
 use aruna_core::structs::storage::distribution::accounting::{Cursor, Rebuild};
 use aruna_core::types::TxnId;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 
 fn change_of(update: &InventoryUpdate) -> &InventoryChange {
     update.queued.front().expect("a queued change")

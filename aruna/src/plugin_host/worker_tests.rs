@@ -22,7 +22,8 @@ use aruna_operations::plugins::rows::write_rows;
 use aruna_operations::plugins::runs::event_run;
 use aruna_operations::plugins::runs::{admit, conclude, read_run, save_run, unfinished};
 use aruna_plugin_types::calls::Intent;
-use aruna_plugins::{InvokeError, Trigger};
+use aruna_plugins::host::wit::aruna::plugin::types::Trigger;
+use aruna_plugins::runtime::InvokeError;
 use aruna_test_support::plugins::Fixture;
 #[allow(unused_imports)]
 use aruna_test_support::plugins::artifacts::installed;

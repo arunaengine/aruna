@@ -12,7 +12,7 @@ use aruna_core::structs::storage::distribution::on_use::{
 };
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_drivers::driver::drive;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use std::collections::HashMap;
 use std::time::SystemTime;
 

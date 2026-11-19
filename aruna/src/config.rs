@@ -18,18 +18,23 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::storage::backends::NodeBackendsConfig;
 use aruna_core::structs::storage::blob::BlobTimeoutConfig;
-use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config};
+use aruna_net::config::{DiscoveryMethod, RelayMethod, parse_endpoint_config};
+use irokle::net::IrohRuntimeConfig;
 
-use crate::identity::{
-    EnrollmentPlan, IdentityError, IdentityStore, bootstrap_node_state, onboarding_realm_endpoints,
-    plan_enrollment, refresh_onboarding_bootstrap,
+use crate::identity::enrollment::{
+    EnrollmentPlan, bootstrap_node_state, onboarding_realm_endpoints, plan_enrollment,
+    refresh_onboarding_bootstrap,
 };
+use crate::identity::{IdentityError, IdentityStore};
 use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
 use aruna_core::structs::identity::node_state::{
     BootOrigin, PersistedNodeState, PersistedNodeStatus,
 };
 use aruna_graph::MetadataSearchStorage;
-use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
+use aruna_storage::errors::StorageLibError;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
+use aruna_storage::storage::worker::FjallStorage;
 use byteview::ByteView;
 use iroh::EndpointAddr;
 use iroh::KeyParsingError;
@@ -753,7 +758,8 @@ mod tests {
         SetupError, normalize_root, outermost_roots, resolve_settings, validate_s3_profile,
         validate_wipe_roots,
     };
-    use crate::identity::{onboarding_realm_endpoints, persist_node_state};
+    use crate::identity::enrollment::onboarding_realm_endpoints;
+    use crate::identity::persist_node_state;
     use crate::settings::read_settings_from;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -764,8 +770,8 @@ mod tests {
         DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
         StaticRealmEndpoint,
     };
-    use aruna_net::{RelayMethod, format_endpoint_config};
-    use aruna_storage::FjallStorage;
+    use aruna_net::config::{RelayMethod, format_endpoint_config};
+    use aruna_storage::storage::worker::FjallStorage;
     use std::collections::BTreeMap;
     use tempfile::tempdir;
 

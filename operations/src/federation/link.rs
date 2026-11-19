@@ -524,7 +524,7 @@ mod tests {
     async fn context() -> (TempDir, DriverContext) {
         let dir = tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
                 .unwrap(),
             net_handle: None,
             blob_handle: None,

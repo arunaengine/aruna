@@ -12,7 +12,7 @@ use aruna_core::task::{PersistedTaskTimer, TaskEffect, TaskKey};
 use byteview::ByteView;
 use tracing::warn;
 
-use crate::StorageHandle;
+use crate::storage::handle::StorageHandle;
 
 /// Writes or deletes the durable row a timer effect implies; a timer that re-arms from other
 /// state, or lives in memory only, has none.

@@ -28,7 +28,7 @@ use aruna_core::structs::storage::distribution::{
 };
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use tempfile::TempDir;
 use ulid::Ulid;
 

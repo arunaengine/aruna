@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use ::irokle::net::IrohRuntimeConfig;
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_storage::FjallPersistPolicy;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
 use iroh::{EndpointAddr, TransportAddr};
+use ::irokle::net::IrohRuntimeConfig;
 
 #[derive(Clone)]
 pub struct NetConfig {

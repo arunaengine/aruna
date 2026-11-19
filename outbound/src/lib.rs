@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod backoff;
-mod connection;
-mod mail;
-mod member_read;
-mod range_listing;
-mod transfers;
+pub mod connection;
+pub mod mail;
+pub mod member_read;
+pub mod range_listing;
+pub mod transfers;
 
 use std::sync::Arc;
 
@@ -17,15 +17,12 @@ use aruna_core::outbound::{
 };
 
 use backoff::Backoffs;
-pub use connection::ConnectionSender;
+use connection::ConnectionSender;
 use connection::ScreenedSender;
-pub use mail::{MailBuilder, MailSender, SmtpMailer, check_smtp, valid_address};
+use mail::{MailBuilder, check_smtp, valid_address};
 use mail::{MailProfiles, smtp_builder};
-pub use member_read::fetch_member;
-pub use range_listing::{ListingSigner, list_range};
-pub use transfers::{
-    OpenedDownload, TransferBody, TransferError, TransferMeter, UploadAnswer, UploadBody,
-};
+use member_read::fetch_member;
+use range_listing::list_range;
 
 /// The outbound backend: one screened HTTP client, the mail sender of the current realm email
 /// profile and the delivery backoffs. Clones share all three.

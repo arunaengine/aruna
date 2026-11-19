@@ -7,7 +7,7 @@ use crate::blob_node::{
     BUCKET, TestContext, blob_files, content, progress, put, read, run, setup_context, version,
     write,
 };
-use aruna::tasks::incoming::start_task_queues;
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_clock::testing::poll_until;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

@@ -21,7 +21,7 @@ fn test_realm_id() -> RealmId {
 
 #[tokio::test]
 async fn storage_failure_internal() {
-    let (storage_handle, receivers) = aruna_storage::storage::StorageHandle::new();
+    let (storage_handle, receivers) = aruna_storage::storage::handle::StorageHandle::new();
     drop(receivers);
 
     let realm_id = test_realm_id();

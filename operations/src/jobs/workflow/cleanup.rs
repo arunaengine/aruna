@@ -277,8 +277,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
 
-    use aruna_compute::ExecutorBackend;
-    use aruna_compute::ExecutorRegistry;
+    use aruna_compute::executor::ExecutorBackend;
+    use aruna_compute::registry::ExecutorRegistry;
     use aruna_core::UserId;
     use aruna_core::compute::{
         AttemptRef, AttemptStatus, CancelEvidence, FenceContext, LogLimits, LogTails, NOBODY,
@@ -294,7 +294,8 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, UserAccess, VersionKey,
     };
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
     use ulid::Ulid;

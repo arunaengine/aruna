@@ -669,7 +669,8 @@ fn register_queue_metrics(metrics: &NodeMetrics) -> Arc<QueueMetrics> {
 mod tests {
     use super::*;
     use aruna_operations::shard::recovery::RecoveryError;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use axum::body::{Body, to_bytes};
     use http::Request;
     use tower::ServiceExt;

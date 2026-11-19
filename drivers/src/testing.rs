@@ -27,8 +27,9 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::task::TaskKey;
 use aruna_core::types::GroupId;
 use aruna_graph::GraphHandle;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_storage::StorageHandle;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_storage::storage::handle::StorageHandle;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use byteview::ByteView;
 use ulid::Ulid;
@@ -119,7 +120,7 @@ pub fn task_context(storage: StorageHandle) -> std::sync::Arc<DriverContext> {
 
 /// A storage-only driver context on a store opened at `root`.
 pub fn path_context(root: &str) -> DriverContext {
-    test_context(aruna_storage::FjallStorage::open(root).expect("open the test store"))
+    test_context(aruna_storage::storage::worker::FjallStorage::open(root).expect("open the test store"))
 }
 
 /// A storage-only driver context on a fresh temporary store.

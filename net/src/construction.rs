@@ -11,7 +11,7 @@ use aruna_core::id::NodeId;
 use aruna_core::metrics::NotificationWatchMetrics;
 use aruna_core::structs::NetworkDiagnosticsState;
 use aruna_core::structs::execution::notification_watch::WatchInterestTable;
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::endpoint::{QuicTransportConfig, VarInt, presets};
@@ -28,8 +28,7 @@ use crate::connection_pool::{ConnectionPool, ConnectionPoolOptions};
 use crate::connectivity::{
     PeerEvent, PeerManagerState, run_connectivity_manager, send_connectivity_event,
 };
-use crate::dht::DhtHandle;
-use crate::dht::handle::DhtSpawnResources;
+use crate::dht::handle::{DhtHandle, DhtSpawnResources};
 use crate::discovery::{local_endpoint_addr, read_persisted_peers, spawn_signed_publisher};
 use crate::document_sync::DocumentSyncService;
 use crate::effect_handlers::{self, NetEffectContext};

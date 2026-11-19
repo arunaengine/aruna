@@ -8,7 +8,7 @@ use crate::distribution::test_store::{apply, context, counters, install, open, r
 use aruna_core::calls::ChildOutcome;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_drivers::driver::drive;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 
 fn set() -> Ulid {
     Ulid::from_bytes([6; 16])

@@ -11,6 +11,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{checked_target, expand};
 use crate::encoding::{Reader, encode_key};
+use crate::envelope::{Envelope, open, seal};
+use crate::policy::{Attribute, Policy};
+use crate::scheme::{
+    Ciphertext, MasterSecret, PublicParameters, UserKey, decapsulate, encapsulate, issue,
+    setup_from_seed,
+};
 use crate::*;
 
 fn fixture() -> (PublicParameters, MasterSecret, StdRng) {
