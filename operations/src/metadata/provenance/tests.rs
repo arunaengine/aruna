@@ -280,9 +280,9 @@ fn unwritten_run_status() {
     assert_eq!(entity["description"], "metadata write access denied");
 
     // A crate that is still being written says so, not that the record is hidden.
-    let mut built = built(&output, "2026-10-27T12:00:00Z");
-    assert!(built.unwritten(&run, "pending", None));
-    let document = root(built);
+    let mut pending = built(&output, "2026-10-27T12:00:00Z");
+    assert!(pending.unwritten(&run, "pending", None));
+    let document = root(pending);
     let entity = node(&document, &format!("#run-{run_id}"));
     assert_eq!(entity["creativeWorkStatus"], "RunRecordPending");
     assert!(

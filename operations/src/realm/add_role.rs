@@ -13,8 +13,6 @@ use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::done;
-#[cfg(test)]
-use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };

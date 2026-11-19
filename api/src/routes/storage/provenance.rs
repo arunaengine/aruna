@@ -64,8 +64,6 @@ use crate::server::state::ServerState;
 const EXPORT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 /// The most time kept back for writing the root and closing the ZIP.
 const FINISH_WINDOW: Duration = Duration::from_secs(60);
-/// Why a walk ends when the caller's token no longer holds.
-const REVOKED: &str = "the token expired or was revoked";
 /// Bytes buffered between the walk and the client.
 const PIPE_BYTES: usize = 64 * 1024;
 /// A regular file readable by everyone, so an unpacked crate opens without a chmod.

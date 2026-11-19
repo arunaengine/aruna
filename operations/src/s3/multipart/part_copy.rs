@@ -452,7 +452,6 @@ mod test {
     };
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage;
     use std::collections::HashMap;
     use tempfile::TempDir;
 

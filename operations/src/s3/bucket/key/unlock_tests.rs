@@ -76,6 +76,7 @@ fn checked(caller: UserId, admins: &[UserId]) -> (UnlockIntent, IntentTurn) {
         record: None,
         ticket: None,
         intent: None,
+        ids: aruna_core::id_mint::IdMint::default(),
     };
     assert_eq!(operation.transaction(), TransactionMode::Write);
     operation.first().unwrap();
