@@ -1,12 +1,11 @@
-//! Frames a forwarded body with a trailer the issuing node signs over its length and digest,
-//! and checks that trailer on the coordinator before the write can commit (D33).
+//! Checks the trailer a forwarded body ends with, which the issuing node signs over its length
+//! and digest, on the coordinator before the write can commit (D33).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 // A body that was cut, extended or replaced fails the stream, so the write never commits.
 
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::Poll;
 
 use aruna_core::NodeId;
@@ -19,61 +18,10 @@ use std::collections::HashMap;
 
 use crate::s3::checksum::validate_trailer_headers;
 use crate::s3::util::map_checksum_algorithm;
-use aruna_operations::driver::DriverContext;
 use bytes::Bytes;
 use futures_core::Stream;
 use s3s::dto::StreamingBlob;
 use s3s::{S3Result, s3_error};
-
-/// Reads the client's verified trailing checksum value once the body ended.
-pub(super) type ChecksumValue = Arc<dyn Fn() -> Option<String> + Send + Sync>;
-
-/// Appends the signed trailer once `body` ends, with the client's trailing checksum if any.
-pub(super) fn frame_body(
-    mut body: StreamingBlob,
-    context: Arc<DriverContext>,
-    nonce: [u8; 16],
-    checksum: Option<ChecksumValue>,
-) -> StreamingBlob {
-    let mut hasher = body_hasher();
-    let mut length = 0u64;
-    let mut done = false;
-    StreamingBlob::wrap::<_, std::io::Error>(futures_util::stream::poll_fn(move |cx| {
-        if done {
-            return Poll::Ready(None);
-        }
-        match Pin::new(&mut body).poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                hasher.update(&bytes);
-                length += bytes.len() as u64;
-                Poll::Ready(Some(Ok(bytes)))
-            }
-            Poll::Ready(Some(Err(error))) => {
-                done = true;
-                Poll::Ready(Some(Err(std::io::Error::other(error))))
-            }
-            Poll::Ready(None) => {
-                done = true;
-                let trailer = BodyTrailer {
-                    length,
-                    digest: *hasher.finalize().as_bytes(),
-                    checksum: checksum.as_ref().and_then(|value| value()),
-                };
-                let signing = context.net_handle.as_ref();
-                let encoded = signing
-                    .map(|net| net.sign(&trailer.signing_bytes(&nonce)))
-                    .and_then(|signature| trailer.encode(&signature).ok());
-                Poll::Ready(Some(match encoded {
-                    Some(bytes) => Ok(Bytes::copy_from_slice(&bytes)),
-                    None => Err(std::io::Error::other(
-                        "the body trailer could not be signed",
-                    )),
-                }))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }))
-}
 
 /// Whose trailer a framed body must end with.
 #[derive(Clone, Debug)]

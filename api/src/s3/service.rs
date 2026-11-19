@@ -1080,14 +1080,14 @@ impl S3 for ArunaS3Service {
             .await?
         {
             let request = forward::ForwardRequest {
-                method: http::Method::PUT,
+                method: aruna_core::member_read::MemberMethod::Put,
                 operation: "PutObject",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: forward::passed_headers(&req.headers, req.input.content_length),
                 body: match req.input.body.take() {
-                    Some(body) => forward::ForwardBody::Stream(
+                    Some(body) => forward::stream_body(
                         body,
                         forward::trailer_checksum(trailer_algorithm, trailing_headers.clone()),
                     ),
@@ -1363,7 +1363,7 @@ impl S3 for ArunaS3Service {
                 }
                 CopyPath::Delegate => {
                     let request = forward::ForwardRequest {
-                        method: http::Method::PUT,
+                        method: aruna_core::member_read::MemberMethod::Put,
                         operation: "CopyObject",
                         bucket: dest_bucket,
                         key: dest_key,
@@ -1372,7 +1372,7 @@ impl S3 for ArunaS3Service {
                         body: forward::ForwardBody::Empty,
                     };
                     let response = self.forward_write(&user_access, &forward, request).await?;
-                    Self::delegated_copy(response).await
+                    self.delegated_copy(response).await
                 }
             };
         }
@@ -1474,7 +1474,7 @@ impl S3 for ArunaS3Service {
             .await?
         {
             let request = forward::ForwardRequest {
-                method: http::Method::POST,
+                method: aruna_core::member_read::MemberMethod::Post,
                 operation: "CreateMultipartUpload",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
@@ -1483,7 +1483,9 @@ impl S3 for ArunaS3Service {
                 body: forward::ForwardBody::Empty,
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
-            return Self::forwarded_create(response, req.input.bucket, req.input.key).await;
+            return self
+                .forwarded_create(response, req.input.bucket, req.input.key)
+                .await;
         }
         let checksum_hint = parse_checksum_hint(&req.input)?;
 
@@ -1613,14 +1615,14 @@ impl S3 for ArunaS3Service {
                 }
             });
             let request = forward::ForwardRequest {
-                method: http::Method::PUT,
+                method: aruna_core::member_read::MemberMethod::Put,
                 operation: "UploadPart",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: forward::passed_headers(&req.headers, req.input.content_length),
                 body: match body {
-                    Some(body) => forward::ForwardBody::Stream(
+                    Some(body) => forward::stream_body(
                         body,
                         forward::trailer_checksum(trailer_algorithm, trailing_headers.clone()),
                     ),
@@ -1813,7 +1815,7 @@ impl S3 for ArunaS3Service {
                 }
                 CopyPath::Delegate => {
                     let request = forward::ForwardRequest {
-                        method: http::Method::PUT,
+                        method: aruna_core::member_read::MemberMethod::Put,
                         operation: "UploadPartCopy",
                         bucket: req.input.bucket,
                         key: req.input.key,
@@ -1822,7 +1824,7 @@ impl S3 for ArunaS3Service {
                         body: forward::ForwardBody::Empty,
                     };
                     let response = self.forward_write(&user_access, &forward, request).await?;
-                    Self::delegated_part(response).await
+                    self.delegated_part(response).await
                 }
             };
         }
@@ -1897,7 +1899,7 @@ impl S3 for ArunaS3Service {
             headers.retain(|(name, _)| name != "content-type");
             headers.push(("content-type".to_string(), "application/xml".to_string()));
             let request = forward::ForwardRequest {
-                method: http::Method::POST,
+                method: aruna_core::member_read::MemberMethod::Post,
                 operation: "CompleteMultipartUpload",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
@@ -1906,7 +1908,7 @@ impl S3 for ArunaS3Service {
                 body: forward::ForwardBody::Known(bytes::Bytes::from(body)),
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
-            return Self::forwarded_complete(response).await;
+            return self.forwarded_complete(response).await;
         }
         // A forwarded completion lists exactly the parts the issuer bound.
         if let Some(delegated) = req.extensions.get::<DelegatedRequest>() {
@@ -2082,7 +2084,7 @@ impl S3 for ArunaS3Service {
             .await?
         {
             let request = forward::ForwardRequest {
-                method: http::Method::DELETE,
+                method: aruna_core::member_read::MemberMethod::Delete,
                 operation: "AbortMultipartUpload",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
@@ -2608,7 +2610,7 @@ impl S3 for ArunaS3Service {
             .await?
         {
             let request = forward::ForwardRequest {
-                method: http::Method::GET,
+                method: aruna_core::member_read::MemberMethod::Get,
                 operation: "ListParts",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
@@ -2617,7 +2619,9 @@ impl S3 for ArunaS3Service {
                 body: forward::ForwardBody::Empty,
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
-            return Self::forwarded_list(response, req.input.bucket, req.input.key).await;
+            return self
+                .forwarded_list(response, req.input.bucket, req.input.key)
+                .await;
         }
         let upload_id = self
             .upload_id(bucket_info, &req.input.key, &req.input.upload_id)
@@ -2841,7 +2845,7 @@ impl S3 for ArunaS3Service {
                 .await?
         {
             let request = forward::ForwardRequest {
-                method: http::Method::DELETE,
+                method: aruna_core::member_read::MemberMethod::Delete,
                 operation: "DeleteObject",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
