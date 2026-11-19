@@ -89,7 +89,8 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
         | StorageEffect::CommitTransaction { .. }
         | StorageEffect::AbortTransaction { .. }
         | StorageEffect::SyncAll
-        | StorageEffect::RealmOpen(_) => None,
+        | StorageEffect::RealmOpen(_)
+        | StorageEffect::CompilePolicies(_) => None,
     }
 }
 const STORAGE_EFFECT_THRESHOLD: Duration = Duration::from_millis(50);
@@ -295,7 +296,8 @@ impl FjallStorage {
             StorageEffect::VaultWrite { .. }
             | StorageEffect::VaultRead { .. }
             | StorageEffect::VaultDelete { .. }
-            | StorageEffect::RealmOpen(_) => StorageEvent::Error {
+            | StorageEffect::RealmOpen(_)
+            | StorageEffect::CompilePolicies(_) => StorageEvent::Error {
                 error: StorageError::InvalidEffect,
             },
             StorageEffect::BeginUsageRebuild { key_space } => self.begin_usage_rebuild(key_space),

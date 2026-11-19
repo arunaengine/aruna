@@ -7,6 +7,7 @@ mod lifecycle;
 mod metrics;
 mod owner;
 mod persistence;
+mod policies;
 mod preimage;
 mod rebuild;
 mod records;
