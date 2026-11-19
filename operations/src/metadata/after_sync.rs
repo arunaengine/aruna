@@ -47,9 +47,8 @@ pub enum AfterSyncError {
 }
 
 /// Projects the create events a reconcile applied, then queues prunes for deleted graphs. A
-/// failed projection arms the projection drain, which keeps it; it ends with an error only when
-/// that handover or the prunes failed, so a caller that retries runs it again. Its timings
-/// come from the runner's clock.
+/// failed projection arms the projection drain; only a failed handover or prune ends in an
+/// error, for a caller that retries. Its timings come from the runner's clock.
 #[derive(Debug, PartialEq)]
 pub struct AfterSyncOperation {
     node_id: Option<NodeId>,
