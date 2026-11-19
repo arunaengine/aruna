@@ -338,7 +338,7 @@ fn sweeps_stale_copies() {
 
 mod operations {
     use super::*;
-    use crate::plugins::fixtures::is_child;
+    use crate::plugins::fixtures::{is_child, is_effect, memory_answer};
     use crate::plugins::rows::tests::child_result;
 
     #[test]
@@ -349,13 +349,19 @@ mod operations {
         assert!(matches!(read.next(none), Ok(Next::Done(None))));
         let mut read = ReadLocal::new("d");
         read.first().unwrap();
-        let total = child_result(Ok::<Option<u64>, ArtifactError>(Some(3)));
-        assert!(is_child(&read.next(total)));
+        let total = || child_result(Ok::<Option<u64>, ArtifactError>(Some(3)));
+        assert!(is_effect(&read.next(total())));
+        assert!(is_child(&read.next(memory_answer(true))));
         let bytes = child_result(Ok::<_, ArtifactError>(vec![1u8, 2, 3]));
         let Ok(Next::Done(Some(copy))) = read.next(bytes) else {
             panic!("the bytes end the read");
         };
         assert_eq!(copy.bytes, [1, 2, 3]);
+        // A spent memory budget makes the node busy instead of reading the copy.
+        let mut busy = ReadLocal::new("d");
+        busy.first().unwrap();
+        busy.next(total()).unwrap();
+        assert_eq!(busy.next(memory_answer(false)), Err(ArtifactError::Busy));
     }
 
     fn keep() -> KeepChunk {
@@ -375,7 +381,8 @@ mod operations {
         assert_eq!(confirmed, Ok(Next::Done(true)));
         let mut last = keep();
         last.first().unwrap();
-        assert!(is_child(&last.next(stored(ChunkStored::AllHere))));
+        assert!(is_effect(&last.next(stored(ChunkStored::AllHere))));
+        assert!(is_child(&last.next(memory_answer(true))));
         let complete = child_result(Ok::<(), ArtifactError>(()));
         assert_eq!(last.next(complete), Ok(Next::Done(true)));
     }

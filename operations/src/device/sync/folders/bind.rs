@@ -14,7 +14,6 @@ use aruna_core::structs::{
     FolderState, RemoteBinding, SyncPageLimit, SyncRefusal, SyncVersionPage, SyncedFolder,
 };
 use aruna_core::task::TaskKey;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key};
 use tracing::warn;
 use ulid::Ulid;
@@ -125,7 +124,8 @@ pub fn bind_folder(input: BindFolderInput) -> BindFolderOperation {
             create_bucket: input.create_bucket,
         },
         created_by: input.user_id,
-        created_at_ms: unix_timestamp_millis(),
+        // The run sets the creation time from its stamp.
+        created_at_ms: 0,
         last_reconcile_ms: None,
         last_error: None,
         last_error_ms: None,
@@ -133,6 +133,7 @@ pub fn bind_folder(input: BindFolderInput) -> BindFolderOperation {
         list_cursor: None,
     };
     BindFolderOperation {
+        now_ms: 0,
         realm_id: input.realm_id,
         folder,
         step: BindStep::Root,
@@ -152,13 +153,19 @@ pub struct BindFolderOperation {
     realm_id: RealmId,
     folder: SyncedFolder,
     step: BindStep,
+    now_ms: u64,
 }
 
 impl Operation for BindFolderOperation {
     type Output = SyncedFolder;
     type Error = FolderError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<SyncedFolder>, FolderError> {
+        self.folder.created_at_ms = self.now_ms;
         Ok(Next::Call(IoCall::child(check_root(&self.folder.root))))
     }
 
@@ -476,6 +483,7 @@ impl Operation for RequestSyncOperation {
 /// keeps it for the next folder pass.
 pub fn finish_binding(folder_id: Ulid) -> FinishBindingOperation {
     FinishBindingOperation {
+        now_ms: 0,
         folder_id,
         step: FinishStep::Read,
         folder: None,
@@ -501,6 +509,7 @@ pub struct FinishBindingOperation {
     step: FinishStep,
     folder: Option<SyncedFolder>,
     failure: Option<FolderError>,
+    now_ms: u64,
 }
 
 type FinishTurn = Result<Next<SyncedFolder>, FolderError>;
@@ -557,7 +566,7 @@ impl FinishBindingOperation {
             Err(error) => {
                 let note = FolderChange::NoteError {
                     reason: error.to_string(),
-                    at_ms: unix_timestamp_millis(),
+                    at_ms: self.now_ms,
                 };
                 self.failure = Some(error);
                 self.change(note, FinishStep::Note)
@@ -573,6 +582,10 @@ impl FinishBindingOperation {
 impl Operation for FinishBindingOperation {
     type Output = SyncedFolder;
     type Error = FolderError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn hold_scope(&self) -> Option<HoldScope> {
         Some(super::super::folder_scope(self.folder_id))

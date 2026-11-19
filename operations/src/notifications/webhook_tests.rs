@@ -66,7 +66,12 @@ async fn set_webhook(
     url: String,
 ) -> Result<WebhookOutcome, WebhookError> {
     let now_ms = unix_timestamp_millis();
-    drive(SetWebhookOperation::new(owner, local, url, now_ms), context).await
+    let secret = SecretBytes::new(rand::random::<[u8; 32]>().to_vec());
+    drive(
+        SetWebhookOperation::new(owner, local, url, secret, now_ms),
+        context,
+    )
+    .await
 }
 
 async fn remove_webhook(
@@ -128,7 +133,7 @@ fn read_decodes_setting() {
 fn set_returns_secret() {
     let node = iroh::SecretKey::from_bytes(&[8; 32]).public();
     let secret = SecretBytes::new(vec![0xab; 32]);
-    let mut set = SetWebhookOperation::with_secret(user(), node, HOOK.to_string(), secret, 5);
+    let mut set = SetWebhookOperation::new(user(), node, HOOK.to_string(), secret, 5);
     assert!(matches!(set.first(), Ok(Next::Call(IoCall::Child(_)))));
     let bytes = stored(Some(HOOK)).to_bytes().unwrap();
     assert_eq!(
@@ -138,7 +143,8 @@ fn set_returns_secret() {
             secret: "ab".repeat(32),
         }))
     );
-    let mut invalid = SetWebhookOperation::new(user(), node, "not a url".to_string(), 5);
+    let secret = SecretBytes::new(vec![0xab; 32]);
+    let mut invalid = SetWebhookOperation::new(user(), node, "not a url".to_string(), secret, 5);
     assert_eq!(invalid.first(), Err(WebhookError::InvalidUrl));
 }
 

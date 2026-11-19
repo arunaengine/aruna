@@ -6,13 +6,13 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
 use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
-use ulid::Ulid;
 
 use crate::notifications::outbox_record::schedule_drain_effect;
 
@@ -42,17 +42,26 @@ pub struct EmitNotificationsInput {
 /// failed schedule is logged: the drain's own re-arm or the next emission picks the rows up.
 #[derive(Debug, PartialEq)]
 pub struct EmitNotificationsOperation {
-    writes: Vec<(KeySpace, Key, Value)>,
+    records: Vec<NotificationRecord>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl EmitNotificationsOperation {
-    /// Builds the outbox rows; each gets a new outbox id here, so `first` and `next` stay
-    /// deterministic.
     pub fn new(input: EmitNotificationsInput) -> Self {
-        let mut writes = Vec::with_capacity(input.records.len());
-        for record in input.records {
+        Self {
+            records: input.records,
+            now_ms: 0,
+            ids: IdMint::default(),
+        }
+    }
+
+    /// The outbox rows, each with a new outbox id.
+    fn writes(&mut self) -> Vec<(KeySpace, Key, Value)> {
+        let mut writes = Vec::with_capacity(self.records.len());
+        for record in std::mem::take(&mut self.records) {
             let outbox = NotificationOutboxRecord {
-                outbox_id: Ulid::generate(),
+                outbox_id: self.ids.mint(self.now_ms),
                 record,
             };
             match outbox_write_entry(&outbox) {
@@ -60,7 +69,7 @@ impl EmitNotificationsOperation {
                 Err(error) => warn!(%error, "Skipping unserializable notification outbox row"),
             }
         }
-        Self { writes }
+        writes
     }
 }
 
@@ -68,11 +77,20 @@ impl Operation for EmitNotificationsOperation {
     type Output = ();
     type Error = EmitNotificationsError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<()>, Self::Error> {
-        if self.writes.is_empty() {
+        let writes = self.writes();
+        if writes.is_empty() {
             return Ok(Next::Done(()));
         }
-        Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.writes))))
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, Self::Error> {
@@ -198,9 +216,13 @@ mod tests {
         let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
             records: vec![make_record(1, 2)],
         });
+        operation.stamp(7_000);
+        operation.seed(42);
+        let outbox_id = IdMint::new(42).mint(7_000);
         assert!(matches!(
             operation.first(),
-            Ok(Next::Call(IoCall::Write(writes))) if writes.len() == 1
+            Ok(Next::Call(IoCall::Write(writes)))
+                if writes.len() == 1 && writes[0].1 == notification_outbox_key(outbox_id)
         ));
         assert_eq!(
             operation.next(IoResult::Done),
@@ -288,7 +310,7 @@ mod tests {
 
         let rows = read_outbox_rows(&context).await;
         assert_eq!(rows.len(), 2);
-        let ids: std::collections::HashSet<Ulid> =
+        let ids: std::collections::HashSet<ulid::Ulid> =
             rows.iter().map(|(_, row)| row.outbox_id).collect();
         assert_eq!(ids.len(), 2);
         for (_, row) in &rows {

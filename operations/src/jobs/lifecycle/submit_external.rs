@@ -9,6 +9,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{ExecutionSpec, PageManifest, WorkspaceMode};
@@ -74,9 +75,10 @@ impl IngressNode {
         request: &SubmissionRequest,
         identity: &RequestIdentity,
         config: &RealmConfigDocument,
+        ids: &mut IdMint,
     ) -> Result<AdmitHereOperation, SubmitJobError> {
         let subject = identity.submission_id.0.as_slice();
-        let job_id = mint_configured_job(config, self.local, subject)?;
+        let job_id = mint_configured_job(config, self.local, subject, ids, self.now_ms)?;
         Ok(AdmitHereOperation::new(LocalAdmission {
             request: request.clone(),
             identity: *identity,
@@ -116,6 +118,7 @@ pub struct SubmitExternalOperation {
     submission: ExternalSubmission,
     node: Option<IngressNode>,
     labels: Vec<LabelMatch>,
+    ids: IdMint,
     step: SubmitStep,
 }
 
@@ -132,6 +135,7 @@ impl SubmitExternalOperation {
             submission,
             node,
             labels: Vec::new(),
+            ids: IdMint::default(),
             step: SubmitStep::Config,
         }
     }
@@ -256,7 +260,9 @@ impl SubmitExternalOperation {
         if !view.holds(node.local) {
             return self.forward(&request, &identity, &view);
         }
-        let admit = node.admission(&request, &identity, &config)?;
+        let mut mint = self.ids;
+        let admit = node.admission(&request, &identity, &config, &mut mint)?;
+        self.ids = mint;
         self.step = SubmitStep::Accept;
         Ok(Next::Call(IoCall::child(admit)))
     }
@@ -265,6 +271,10 @@ impl SubmitExternalOperation {
 impl Operation for SubmitExternalOperation {
     type Output = AcceptedSubmission;
     type Error = SubmitJobError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> SubmitNext {
         let submission = &mut self.submission;

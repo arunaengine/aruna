@@ -838,7 +838,7 @@ mod tests {
         assert!(body.contains("\"state\":\"pending\""), "{body}");
         assert!(body.contains("\"last_error_class\":null"), "{body}");
 
-        recovery.note_progress(3);
+        recovery.note_progress(3, 1_000);
         recovery.finish_pass(
             RecoveryOutcome::Partial,
             Some(RecoveryError::PeerUnavailable),
@@ -856,7 +856,7 @@ mod tests {
     async fn metrics_expose_recovery() {
         let (_temp, ctx) = fjall_ctx();
         let recovery = RecoveryStatus::new();
-        recovery.note_progress(2);
+        recovery.note_progress(2, 1_000);
         recovery.finish_pass(
             RecoveryOutcome::Partial,
             Some(RecoveryError::PeerUnavailable),

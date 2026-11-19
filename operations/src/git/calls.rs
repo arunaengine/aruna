@@ -288,7 +288,7 @@ impl StageTimes {
         self.now_ms = now_ms;
     }
 
-    pub(super) fn now_ms(&self) -> u64 {
+    pub(super) fn stamped(&self) -> u64 {
         self.now_ms
     }
 

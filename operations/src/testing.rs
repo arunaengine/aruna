@@ -8,10 +8,14 @@ use aruna_core::document_apply::ApplyError;
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::row_plan::PlanOperation;
+use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structured_id::{BucketId, ClockHealthError, PlacementHandle};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -328,6 +332,12 @@ impl aruna_tasks::InboundTaskHandler for RecordingTaskHandler {
     async fn handle_timer(&self, key: aruna_core::task::TaskKey) {
         let _ = self.seen.send(key).await;
     }
+}
+
+/// A fresh job id for `(handle, bucket)` at the current time, as a submit would mint it.
+pub fn fresh_job_id(handle: PlacementHandle, bucket: BucketId) -> Result<JobId, ClockHealthError> {
+    let mut ids = IdMint::new(ulid::Ulid::generate().random());
+    crate::jobs::submit::mint_job_id(handle, bucket, &mut ids, unix_timestamp_millis())
 }
 
 /// The graph handle a test installed on its context.

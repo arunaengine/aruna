@@ -182,7 +182,7 @@ impl PoliciesWrite {
             stage: Stage::Read,
             document: None,
             deletes: Vec::new(),
-            marks: DueMarks::new(None, aruna_core::time::unix_timestamp_millis()),
+            marks: DueMarks::new(None, 0),
         }
     }
 
@@ -289,6 +289,10 @@ impl PoliciesWrite {
 impl Operation for PoliciesWrite {
     type Output = RealmConfigDocument;
     type Error = SetPoliciesError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.marks.stamp(now_ms);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

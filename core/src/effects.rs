@@ -62,6 +62,8 @@ pub enum Effect {
     Group(EffectGroup),
     Session(Box<crate::compute::session::SessionEffect>),
     Outbound(crate::outbound::OutboundEffect),
+    /// The plugin host's node-wide state: call rates, the copy memory budget, unnamed accounts.
+    Plugin(crate::plugins::PluginEffect),
     /// Wakes the operation with `Event::Delayed` after this long on the runner's clock; never
     /// persisted. A run deadline that passes first cuts it off like any other effect.
     Delay(Duration),
@@ -492,6 +494,16 @@ pub enum BlobEffect {
     DeleteEmptyBucket {
         backend: BackendRef,
         bucket: String,
+    },
+    /// Holds the kept copy at `backend_path` while `blob` streams, so eviction leaves its bytes
+    /// to the hidden sweep; answered by `BlobEvent::PinnedRead`.
+    PinRead {
+        backend_path: String,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    /// Whether a read holds the kept copy at `backend_path`; answered by `BlobEvent::ReadHeld`.
+    ReadHeld {
+        backend_path: String,
     },
     /// One repository, provider or stored artifact call of a job or link; answers
     /// `BlobEvent::Remote`.

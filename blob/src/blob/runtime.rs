@@ -143,6 +143,8 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::EnsureBucket { .. } => (EffectClass::Control, "ensure_bucket"),
         BlobEffect::HeadBucket { .. } => (EffectClass::Control, "head_bucket"),
         BlobEffect::DeleteEmptyBucket { .. } => (EffectClass::Control, "delete_empty_bucket"),
+        BlobEffect::PinRead { .. } => (EffectClass::Control, "pin_read"),
+        BlobEffect::ReadHeld { .. } => (EffectClass::Control, "read_held"),
     }
 }
 
@@ -627,6 +629,7 @@ impl BlobHandler {
             group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
             frame_indexes: Arc::new(std::sync::Mutex::new(super::frames::IndexCache::new())),
             source_stats: Default::default(),
+            read_pins: Default::default(),
             reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             part_chains: Arc::default(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -847,6 +850,12 @@ impl BlobHandler {
                 self.clear_active(id);
                 BlobEvent::ReservationReleased { id }
             }
+            BlobEffect::PinRead { backend_path, blob } => BlobEvent::PinnedRead {
+                blob: self.read_pins.pin(backend_path, blob),
+            },
+            BlobEffect::ReadHeld { backend_path } => BlobEvent::ReadHeld {
+                held: self.read_pins.held(&backend_path),
+            },
             BlobEffect::CollectStream { blob } => BlobEvent::StreamCollected {
                 bytes: collect_stream(blob).await,
             },

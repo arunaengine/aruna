@@ -14,6 +14,7 @@ use aruna_core::document_apply::ApplyError;
 use aruna_core::effects::ShardNetEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::ShardNetEvent;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::fence::{fence_read, stored_generation};
@@ -873,6 +874,7 @@ struct ExpansionsOperation {
     pending: bool,
     /// Reversed, so the next start pops off the end.
     starts: Vec<RealmPlacementMutation>,
+    ids: IdMint,
 }
 
 impl ExpansionsOperation {
@@ -884,6 +886,7 @@ impl ExpansionsOperation {
             now_ms: 0,
             pending: false,
             starts: Vec::new(),
+            ids: IdMint::default(),
         }
     }
 
@@ -928,7 +931,7 @@ impl ExpansionsOperation {
                 continue;
             }
             let request = TransitionRequest {
-                transition_id: ulid::Ulid::generate(),
+                transition_id: self.ids.mint(self.now_ms),
                 strategy_id,
                 buckets,
                 target_map_epoch: epoch,
@@ -964,6 +967,10 @@ impl Operation for ExpansionsOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn first(&mut self) -> Result<Next<bool>, IoError> {

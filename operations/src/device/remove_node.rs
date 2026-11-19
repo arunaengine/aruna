@@ -18,7 +18,6 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group_delete::MembershipFence;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 
@@ -53,6 +52,7 @@ pub struct RemoveNodeOperation {
     config: RemoveNodeConfig,
     state: RemoveNodeState,
     document: Option<RealmConfigDocument>,
+    now_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,6 +102,7 @@ impl From<IoError> for RemoveNodeError {
 impl RemoveNodeOperation {
     pub fn new(config: RemoveNodeConfig) -> Self {
         Self {
+            now_ms: 0,
             config,
             state: RemoveNodeState::ReadCurrent,
             document: None,
@@ -216,7 +217,7 @@ impl RemoveNodeOperation {
         )?;
         // The stored document is derived from the reducer, exactly as the
         // replicated overlay derives it on every other node.
-        overlay_reducer_state(&mut document, &reducer_state, unix_timestamp_millis());
+        overlay_reducer_state(&mut document, &reducer_state, self.now_ms);
 
         let stale_conflict_deletes =
             stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
@@ -262,6 +263,10 @@ impl RemoveNodeOperation {
 impl Operation for RemoveNodeOperation {
     type Output = RealmConfigDocument;
     type Error = RemoveNodeError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<RealmConfigDocument>, RemoveNodeError> {
         Ok(Next::Call(self.read_current()))

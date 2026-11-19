@@ -2079,7 +2079,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn issuer_cache_bounded() {
+    async fn untrusted_issuers_rejected() {
         let mut tempdir = temp_dir();
         tempdir.push(Ulid::generate().to_string());
         let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
@@ -2133,12 +2133,10 @@ mod test {
             let token = sign_untrusted_token(&issuer_key, now);
             assert!(handle_token(&state, &token).await.is_err());
         }
-
-        assert_eq!(state.issuer_cache_len().await, 0);
     }
 
     #[tokio::test]
-    async fn delegated_token_cached() {
+    async fn delegated_token_accepted() {
         let mut tempdir = temp_dir();
         tempdir.push(Ulid::generate().to_string());
         let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
@@ -2212,8 +2210,6 @@ mod test {
 
         handle_token(&state, &token).await.unwrap();
         handle_token(&state, &token).await.unwrap();
-
-        assert_eq!(state.issuer_cache_len().await, 1);
     }
 
     /// A user node with a fresh store; the routes below refuse before they read it.

@@ -666,6 +666,8 @@ fn kept_row(key: &HiddenBlobKey, namespace: Ulid) -> Option<(&'static str, Vec<u
 
 #[derive(Debug, PartialEq)]
 enum ProtectStep {
+    /// Whether a read holds the kept copy of this namespace.
+    Held(Ulid),
     Kept(bool),
     Upload,
     UploadJob(Box<RoCrateUploadRecord>),
@@ -770,14 +772,9 @@ impl Operation for IsProtectedOperation {
         self.namespace = Some(namespace);
         if namespace == ATTACHMENT_NAMESPACE || namespace == CACHE_NAMESPACE {
             // An evicted copy a read still holds stays until the read ends.
-            if crate::distribution::pull::pinned_path(&self.key.backend_path) {
-                return Ok(Next::Done(true));
-            }
-            let Some((key_space, row_key)) = kept_row(&self.key, namespace) else {
-                return Ok(Next::Done(false));
-            };
-            self.step = ProtectStep::Kept(namespace == ATTACHMENT_NAMESPACE);
-            return Ok(Next::Call(read_row(key_space, row_key)));
+            self.step = ProtectStep::Held(namespace);
+            let held = crate::distribution::pull::held_call(&self.key.backend_path);
+            return Ok(Next::Call(held));
         }
         let key = namespace.to_bytes().to_vec();
         Ok(Next::Call(read_row(ROCRATE_UPLOAD_KEYSPACE, key)))
@@ -785,6 +782,16 @@ impl Operation for IsProtectedOperation {
 
     fn next(&mut self, result: IoResult) -> Turn<bool> {
         match std::mem::replace(&mut self.step, ProtectStep::Job) {
+            ProtectStep::Held(namespace) => {
+                if crate::distribution::pull::held_answer(result)? {
+                    return Ok(Next::Done(true));
+                }
+                let Some((key_space, row_key)) = kept_row(&self.key, namespace) else {
+                    return Ok(Next::Done(false));
+                };
+                self.step = ProtectStep::Kept(namespace == ATTACHMENT_NAMESPACE);
+                Ok(Next::Call(read_row(key_space, row_key)))
+            }
             ProtectStep::Kept(attachment) => self.kept_read(attachment, result.value()?),
             ProtectStep::Upload => self.upload_read(result.value()?),
             ProtectStep::UploadJob(record) => {

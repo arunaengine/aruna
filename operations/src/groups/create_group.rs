@@ -12,6 +12,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, OWNER_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
@@ -30,7 +31,6 @@ use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use thiserror::Error;
 use tracing::trace;
-use ulid::Ulid;
 
 use super::CONFLICT_RETRIES;
 use crate::groups::update_group::{MAX_NAME_LEN, normalize_group_name};
@@ -109,6 +109,8 @@ struct GroupCreate {
     /// Bucket the group's authorization rows publish onto, read inside the write transaction.
     fence: aruna_core::placement::fence::WriteFence,
     stage: Stage,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl GroupCreate {
@@ -120,6 +122,8 @@ impl GroupCreate {
             realm_config: None,
             fence: Default::default(),
             stage: Stage::Config,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -145,7 +149,7 @@ impl GroupCreate {
 
     /// A new group with its default roles, owned by the actor.
     fn prepare(&mut self) -> Group {
-        let group_id = Ulid::generate();
+        let group_id = self.ids.mint(self.now_ms);
         let auth_doc = GroupAuthorizationDocument::default_group_doc(
             self.config.actor.user_id,
             self.config.actor.realm_id,
@@ -330,6 +334,14 @@ impl GroupCreate {
 impl Operation for GroupCreate {
     type Output = CreatedGroup;
     type Error = CreateGroupError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

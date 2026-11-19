@@ -8,11 +8,11 @@ use aruna_core::document::{DocumentNetEvent, DocumentReconcileResult};
 use aruna_core::document_apply::ApplyError;
 use aruna_core::effects::ShardNetEffect;
 use aruna_core::events::ShardNetEvent;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use irokle::TopicId;
 use tracing::warn;
-use ulid::Ulid;
 
 use crate::metadata::after_sync::{AfterSyncOperation, MetadataTimings};
 use crate::node::summary_refresh::{RefreshUsageError, RefreshUsageOperation};
@@ -102,9 +102,10 @@ pub(crate) struct ApplyPulledOperation {
     /// The realm this node serves, when it runs a net transport.
     realm_id: Option<RealmId>,
     sync: Option<DocumentNetEvent>,
-    generation: Ulid,
     result: DocumentReconcileResult,
     stage: ApplyStage,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl ApplyPulledOperation {
@@ -113,9 +114,10 @@ impl ApplyPulledOperation {
             node_id,
             realm_id,
             sync: Some(sync),
-            generation: Ulid::generate(),
             result: DocumentReconcileResult::default(),
             stage: ApplyStage::Start,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -129,6 +131,14 @@ impl ApplyPulledOperation {
 impl Operation for ApplyPulledOperation {
     type Output = bool;
     type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> ApplyTurn {
         match self.sync.take().ok_or(IoError::Unfinished)? {
@@ -151,7 +161,7 @@ impl Operation for ApplyPulledOperation {
                     self.node_id,
                     self.realm_id,
                     &self.result.targets,
-                    self.generation,
+                    self.ids.mint(self.now_ms),
                 );
                 Ok(Next::Call(IoCall::child(refresh)))
             }
@@ -316,8 +326,11 @@ mod tests {
     #[test]
     fn followups_run_ordered() {
         let mut apply = ApplyPulledOperation::new(node(), Some(realm()), reconciled(1));
+        apply.stamp(1_000);
+        apply.seed(7);
         let targets = vec![DocumentTarget::RealmConfig { realm_id: realm() }];
-        let usage = RefreshUsageOperation::new(node(), Some(realm()), &targets, apply.generation);
+        let generation = ulid::Ulid::from_parts(1_000, 7);
+        let usage = RefreshUsageOperation::new(node(), Some(realm()), &targets, generation);
         assert_eq!(apply.first(), Ok(Next::Call(IoCall::child(usage))));
         // A failed refresh does not stop the ones after it.
         let failed = RefreshUsageError::Io(IoError::Aborted);

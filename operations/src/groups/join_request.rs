@@ -13,6 +13,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::join_request::{
     JoinDecision, JoinDecisionKind, JoinRequest, JoinRequestState, valid_message,
 };
@@ -189,6 +190,7 @@ struct JoinWrite {
     deny: bool,
     result: Option<JoinRequestState>,
     marks: DueMarks,
+    ids: IdMint,
 }
 
 impl JoinWrite {
@@ -203,6 +205,7 @@ impl JoinWrite {
             deny: false,
             result: None,
             marks,
+            ids: IdMint::default(),
         }
     }
 
@@ -256,7 +259,7 @@ impl JoinWrite {
                 }
                 AdminDocumentOperation::GroupJoinRequested {
                     request: JoinRequest {
-                        request_id: Ulid::generate(),
+                        request_id: self.ids.mint(self.input.now_ms),
                         group_id: self.input.group_id,
                         user_id: self.input.actor.user_id,
                         message,
@@ -473,6 +476,10 @@ fn normalized(value: &Option<String>) -> Option<String> {
 impl Operation for JoinWrite {
     type Output = JoinRequestState;
     type Error = GroupJoinError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

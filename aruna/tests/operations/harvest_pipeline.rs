@@ -38,8 +38,8 @@ use aruna_operations::harvest::repository::{
     read_source_effect, write_source_effect,
 };
 use aruna_operations::jobs::harvest::{HarvestJobOperation, harvest_outcome};
-use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
+use aruna_operations::testing::fresh_job_id;
 use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::replay_event_log;
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -79,7 +79,7 @@ impl Fixture {
         let shutdown = CancellationToken::new();
         let ctx = JobContext {
             driver: self.context.clone(),
-            job_id: mint_job_id(
+            job_id: fresh_job_id(
                 PlacementHandle::new(FIRST_GRANTABLE_HANDLE).expect("handle"),
                 BucketId::new(0).expect("bucket"),
             )

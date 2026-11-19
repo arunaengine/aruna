@@ -3,12 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::time::Instant;
-
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::injection::verify_request;
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall};
@@ -19,13 +16,15 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_plugin_types::manifest::{Manifest, SecretKind};
 use aruna_plugin_types::trigger::TriggerKind;
+use std::collections::VecDeque;
+use std::sync::Arc;
 use ulid::Ulid;
 
 use super::bound::{CheckNodeBinding, NodeCheckFailure, delivery_clash, vault_kind};
 use super::held::{AskRelease, HeldSecrets};
 use super::hooks::{DROPPED, HookError};
 use super::install::{InstallError, admin_answer, admin_call, pick_version, read_manifest};
-use super::rate::take_hook;
+use super::rate::{take_hook, taken};
 use super::receiver::lost_reason;
 use super::rows::StoreError;
 use super::runs::{RunError, admit, declared_trigger, enqueue_timer, new_run};
@@ -77,6 +76,7 @@ pub struct StartRun {
     install_id: Ulid,
     input: String,
     now_ms: u64,
+    ids: IdMint,
     phase: StartPhase,
 }
 
@@ -95,6 +95,7 @@ impl StartRun {
             install_id,
             input: input.to_string(),
             now_ms,
+            ids: IdMint::default(),
             phase: StartPhase::Config,
         }
     }
@@ -109,7 +110,11 @@ impl StartRun {
     }
 
     /// The run the form asks for, on a receiver that may start it.
-    fn new_manual(&self, config: &RealmConfigDocument) -> Result<PluginRun, StartError> {
+    fn new_manual(
+        &self,
+        config: &RealmConfigDocument,
+        run_id: Ulid,
+    ) -> Result<PluginRun, StartError> {
         let install = self.install(config)?;
         if let Some(reason) = lost_reason(config, install.receiver) {
             let receiver = install.receiver;
@@ -138,13 +143,17 @@ impl StartRun {
             input,
         };
         let handler = manual.as_str().to_string();
-        Ok(new_run(install, handler, trigger, self.now_ms))
+        Ok(new_run(install, handler, trigger, (run_id, self.now_ms)))
     }
 }
 
 impl Operation for StartRun {
     type Output = PluginRun;
     type Error = StartError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn hold_scope(&self) -> Option<HoldScope> {
         Some(HoldScope::PluginAdmissions)
@@ -166,7 +175,8 @@ impl Operation for StartRun {
             }
             StartPhase::Admin(config) => {
                 admin_answer(result)?;
-                let run = self.new_manual(&config)?;
+                let run_id = self.ids.mint(self.now_ms);
+                let run = self.new_manual(&config, run_id)?;
                 let queue = admit(run.clone());
                 self.phase = StartPhase::Admitting(Box::new(run));
                 Ok(Next::Call(IoCall::child(queue)))
@@ -260,7 +270,10 @@ pub struct VerifyHook {
     install_id: Ulid,
     request: Option<HookRequest>,
     now_ms: u64,
+    ids: IdMint,
     check: Option<HookCheck>,
+    /// The secret release asked once the request is counted within the install's rate.
+    rating: Option<ReleaseRequest>,
 }
 
 impl VerifyHook {
@@ -276,7 +289,9 @@ impl VerifyHook {
             install_id,
             request: Some(request),
             now_ms,
+            ids: IdMint::default(),
             check: None,
+            rating: None,
         }
     }
 
@@ -300,9 +315,6 @@ impl VerifyHook {
         if install.state != InstallState::Active {
             return Err(HookError::Paused(install.state.as_str()));
         }
-        if !take_hook(id, Instant::now()) {
-            return Err(HookError::Rate);
-        }
         let release = ReleaseRequest {
             install_id: id,
             slot: slot.clone(),
@@ -311,14 +323,13 @@ impl VerifyHook {
             held: None,
             run_id: None,
         };
-        let config = Arc::new(config);
-        let ask = AskRelease::new(config.clone(), self.local, release);
         self.check = Some(HookCheck {
-            config,
+            config: Arc::new(config),
             manifest: Box::new(manifest),
             slot,
         });
-        Ok(Next::Call(IoCall::child(ask)))
+        self.rating = Some(release);
+        Ok(Next::Call(take_hook(id, self.now_ms)))
     }
 
     fn released(
@@ -360,8 +371,9 @@ impl VerifyHook {
         let install = install.ok_or(HookError::NotFound)?;
         let handler = TriggerKind::Webhook.as_str().to_string();
         let trigger = RunTrigger::Webhook(request);
+        let run_id = self.ids.mint(self.now_ms);
         Ok(Next::Done(VerifiedHook {
-            run: new_run(install, handler, trigger, self.now_ms),
+            run: new_run(install, handler, trigger, (run_id, self.now_ms)),
             install_id: id,
             delivery_id,
         }))
@@ -372,12 +384,27 @@ impl Operation for VerifyHook {
     type Output = VerifiedHook;
     type Error = HookError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<VerifiedHook>, HookError> {
         let read = GetConfigOperation::new(self.realm_id);
         Ok(Next::Call(IoCall::child(read)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<VerifiedHook>, HookError> {
+        if let Some(release) = self.rating.take() {
+            if !taken(result)? {
+                return Err(HookError::Rate);
+            }
+            let config = (self.check.as_ref())
+                .ok_or(IoError::Unfinished)?
+                .config
+                .clone();
+            let ask = AskRelease::new(config, self.local, release);
+            return Ok(Next::Call(IoCall::child(ask)));
+        }
         let Some(check) = self.check.take() else {
             let config = result.child::<RealmConfigDocument, GetConfigError>()?;
             let config = config

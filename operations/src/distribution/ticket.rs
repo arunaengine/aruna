@@ -59,11 +59,12 @@ pub struct TicketInput {
     pub object_id: String,
 }
 
-/// The ticket `issuer` makes for one redirect; `now` is Unix seconds.
+/// The ticket `issuer` makes for one redirect; `now` is Unix seconds and `nonce` a fresh random
+/// value of the caller.
 pub fn unsigned_ticket(
     (issuer, realm_id): (NodeId, RealmId),
     input: TicketInput,
-    now: u64,
+    (now, nonce): (u64, [u8; 16]),
 ) -> Ticket {
     Ticket {
         realm_id,
@@ -75,7 +76,7 @@ pub fn unsigned_ticket(
         restrictions: input.restrictions,
         session: input.session,
         object_id: input.object_id,
-        nonce: rand::random(),
+        nonce,
         issued_at: now,
     }
 }

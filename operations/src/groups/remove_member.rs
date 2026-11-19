@@ -23,7 +23,6 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, KeySpace, RoleId};
 use byteview::ByteView;
 use std::collections::HashSet;
@@ -194,7 +193,7 @@ struct MemberRemoval {
 
 impl MemberRemoval {
     fn new(input: RemoveFromInput) -> Self {
-        let marks = DueMarks::new(Some(input.group_id), unix_timestamp_millis());
+        let marks = DueMarks::new(Some(input.group_id), 0);
         Self {
             input,
             stage: Stage::Read,
@@ -355,7 +354,7 @@ impl MemberRemoval {
                     realm_auth: None,
                     realm_id: self.input.actor.realm_id,
                 },
-                unix_timestamp_millis(),
+                self.marks.now(),
             );
             if let (false, Effect::SubOperation(child)) =
                 (records.is_empty(), emit_notifications_effect(records))
@@ -385,6 +384,10 @@ impl MemberRemoval {
 impl Operation for MemberRemoval {
     type Output = GroupAuthorizationDocument;
     type Error = RemoveFromError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.marks.stamp(now_ms);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

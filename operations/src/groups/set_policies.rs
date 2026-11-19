@@ -193,10 +193,7 @@ struct GroupPoliciesWrite {
 
 impl GroupPoliciesWrite {
     fn new(config: SetGroupConfig) -> Self {
-        let marks = DueMarks::new(
-            Some(config.group_id),
-            aruna_core::time::unix_timestamp_millis(),
-        );
+        let marks = DueMarks::new(Some(config.group_id), 0);
         Self {
             config,
             stage: Stage::Read,
@@ -333,6 +330,10 @@ impl GroupPoliciesWrite {
 impl Operation for GroupPoliciesWrite {
     type Output = GroupAuthorizationDocument;
     type Error = SetGroupError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.marks.stamp(now_ms);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

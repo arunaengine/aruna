@@ -8,6 +8,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicySignEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
@@ -194,6 +195,7 @@ struct PolicyWrite {
     stage: Stage,
     pending: Option<Box<PendingPublication>>,
     document: Option<PlacementPolicyDocument>,
+    ids: IdMint,
 }
 
 impl PolicyWrite {
@@ -203,6 +205,7 @@ impl PolicyWrite {
             stage: Stage::Read,
             pending: None,
             document: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -253,7 +256,7 @@ impl PolicyWrite {
             &verified,
             self.config.actor.node_id,
             self.config.auth_context.user_id,
-            Ulid::generate(),
+            self.ids.mint(self.config.created_at_ms),
             self.config.created_at_ms,
             config.digest()?,
         );
@@ -382,6 +385,10 @@ impl PolicyWrite {
 impl Operation for PolicyWrite {
     type Output = PlacementPolicyDocument;
     type Error = CreatePolicyError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

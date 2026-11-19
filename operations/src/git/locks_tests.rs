@@ -56,6 +56,8 @@ fn creating(path: &str) -> CreateLockOperation {
         step: CreateStep::Open,
         document: None,
         claim: None,
+        now_ms: 0,
+        mint: IdMint::default(),
     }
 }
 

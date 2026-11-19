@@ -9,6 +9,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::git::{
     GitChange, GitPackRecord, GitRecord, MAX_RECORDS, git_record_entry, record_change,
 };
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::GIT_PACK_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::placement::fence::WriteFence;
@@ -16,7 +17,6 @@ use aruna_core::placement::resolve_shard_holders;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use ulid::Ulid;
 
 use super::calls::{noted, written_call};
 use super::records::Writes;
@@ -280,6 +280,7 @@ pub struct PublishRecordOperation {
     fence: WriteFence,
     writes: Writes,
     pending: Option<GitPackRecord>,
+    mint: IdMint,
 }
 
 type PublishTurn = Result<Next<GitRecord>, GitError>;
@@ -293,6 +294,7 @@ impl PublishRecordOperation {
         (pack, extra): (Option<bytes::Bytes>, Vec<Row>),
     ) -> Self {
         Self {
+            mint: IdMint::default(),
             node,
             document: document.clone(),
             user_id,
@@ -320,7 +322,7 @@ impl PublishRecordOperation {
         let node_id = self.node.ok_or(GitError::Unavailable)?;
         let document = &self.document;
         let record = GitRecord {
-            event_id: Ulid::generate(),
+            event_id: self.mint.mint(self.now_ms),
             realm_id: document.realm_id,
             group_id: document.group_id,
             document_id: document.document_id,
@@ -387,6 +389,10 @@ impl PublishRecordOperation {
 impl Operation for PublishRecordOperation {
     type Output = GitRecord;
     type Error = GitError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;

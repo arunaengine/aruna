@@ -621,6 +621,7 @@ mod tests {
             "/notes".to_string(),
             false,
             "{}".to_string(),
+            aruna_core::time::unix_timestamp_millis(),
         )
     }
 

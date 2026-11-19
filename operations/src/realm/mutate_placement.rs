@@ -32,7 +32,6 @@ use aruna_core::structs::placement::transition::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::reserved_label;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace, Value};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -824,6 +823,7 @@ impl MutatePlacementOperation {
             pending: None,
             document: None,
             deletes: Vec::new(),
+            now_ms: 0,
         }
     }
 
@@ -914,6 +914,7 @@ struct PlacementWrite {
     pending: Option<Vec<Key>>,
     document: Option<RealmConfigDocument>,
     deletes: Vec<(KeySpace, Key)>,
+    now_ms: u64,
 }
 
 impl PlacementWrite {
@@ -969,7 +970,7 @@ impl PlacementWrite {
             mutation.validate(&document)?;
             let admin_event =
                 reducer_state.apply_operation(&self.actor, mutation.admin_operation(&document)?)?;
-            overlay_placement(&mut document, &reducer_state, unix_timestamp_millis());
+            overlay_placement(&mut document, &reducer_state, self.now_ms);
             admin_events.push(admin_event);
         }
 
@@ -1182,6 +1183,10 @@ impl PlacementWrite {
 impl Operation for PlacementWrite {
     type Output = RealmConfigDocument;
     type Error = MutatePlacementError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

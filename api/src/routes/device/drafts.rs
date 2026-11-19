@@ -218,6 +218,7 @@ async fn queue_draft(
         request.path,
         request.public,
         jsonld,
+        aruna_core::time::unix_timestamp_millis(),
     );
     let queued = drive(
         EnqueueDraftOperation::new(EnqueueDraftInput { entry }).with_fence(issued_at),

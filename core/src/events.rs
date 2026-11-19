@@ -57,6 +57,7 @@ pub enum Event {
     Group(GroupEvent),
     Session(Box<crate::compute::session::SessionAnswer>),
     Outbound(OutboundEvent),
+    Plugin(crate::plugins::PluginEvent),
     /// Answers `Effect::Delay` once its time passed.
     Delayed,
     /// The adapter of this effect kind did not answer within the runner's hang limit.
@@ -226,6 +227,13 @@ pub enum BlobEvent {
         blob: BackendStream<Result<Bytes, BackendStreamError>>,
     },
     HiddenDeleted,
+    /// The stream of a `BlobEffect::PinRead`, which holds the copy until it ends or drops.
+    PinnedRead {
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
+    ReadHeld {
+        held: bool,
+    },
     HiddenListed {
         entries: Vec<HiddenBlobEntry>,
         next_cursor: Option<Vec<u8>>,
@@ -973,6 +981,8 @@ impl Event {
                     HiddenRead,
                     LocalSpooled,
                     HiddenDeleted,
+                    PinnedRead,
+                    ReadHeld,
                     HiddenListed,
                     ConnectionEstablished,
                     ConnectionClosed,
@@ -1148,6 +1158,7 @@ impl Event {
             Event::Child(_) => "Event::Child",
             Event::Job(_) => "Event::Job",
             Event::Git(_) => "Event::Git",
+            Event::Plugin(_) => "Event::Plugin",
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(

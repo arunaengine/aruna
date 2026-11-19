@@ -17,10 +17,8 @@ use utoipa_axum::routes;
 use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_operations::device::replica::{
-    ReplicaOrigin, ReplicaRecord, SelectionError, cache_budget,
-};
-use aruna_operations::device::replica_store::{cache_usage, list_replicas};
+use aruna_operations::device::replica::{ReplicaOrigin, ReplicaRecord, SelectionError};
+use aruna_operations::device::replica_store::{cache_budget, cache_usage, list_replicas};
 use aruna_operations::device::selection::{deselect_document, select_document};
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -143,7 +141,10 @@ async fn list_documents(
         .ok()
         .ok_or(ServerError::ServiceUnavailable)?;
     Ok(Json(DeviceDocumentList {
-        cache_budget_bytes: cache_budget(),
+        cache_budget_bytes: drive(cache_budget(), &context)
+            .await
+            .ok()
+            .ok_or(ServerError::ServiceUnavailable)?,
         cache_used_bytes: drive(cache_usage(), &context)
             .await
             .ok()

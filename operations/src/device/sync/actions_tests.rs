@@ -67,6 +67,8 @@ fn action(input: ApplyActionInput) -> ApplyActionOperation {
         applied: 0,
         stale: 0,
         record: None,
+        now_ms: 0,
+        ids: IdMint::default(),
     }
 }
 

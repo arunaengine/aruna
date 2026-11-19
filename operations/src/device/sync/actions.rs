@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::{done, outside_answer, outside_call, read_row, value};
@@ -16,7 +17,6 @@ use aruna_core::structs::{
     SyncBase, SyncedFolder, WriteGuard,
 };
 use aruna_core::task::TaskKey;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use aruna_core::{NodeId, UserId};
 use thiserror::Error;
@@ -82,6 +82,8 @@ pub fn apply_action(
     input: ApplyActionInput,
 ) -> ApplyActionOperation {
     ApplyActionOperation {
+        now_ms: 0,
+        ids: IdMint::default(),
         realm_id: ids.map(|(_, realm_id)| realm_id),
         input,
         step: ActionStep::Folder,
@@ -116,11 +118,18 @@ pub struct ApplyActionOperation {
     applied: usize,
     stale: usize,
     record: Option<SyncActionRecord>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 type ActionTurn = Result<Next<SyncActionRecord>, ActionError>;
 
 impl ApplyActionOperation {
+    /// A fresh action id and the time of this step.
+    fn mint(&mut self) -> (Ulid, u64) {
+        (self.ids.mint(self.now_ms), self.now_ms)
+    }
+
     fn folder(&self) -> Result<SyncedFolder, IoError> {
         self.folder.clone().ok_or(IoError::Unfinished)
     }
@@ -175,6 +184,7 @@ impl ApplyActionOperation {
     }
 
     fn audit(&mut self) -> ActionTurn {
+        let minted = self.mint();
         let record = SyncActionRecord {
             entries: self.applied,
             outcome: match self.stale {
@@ -183,7 +193,7 @@ impl ApplyActionOperation {
                     reason: format!("{stale} entries changed since the owner saw them"),
                 },
             },
-            ..record_for(&self.input, ActionScope::AllPending)
+            ..record_for(&self.input, ActionScope::AllPending, minted)
         };
         let row = action_entry(&record).map_err(|_| ActionError::Unavailable)?;
         self.record = Some(record);
@@ -195,6 +205,14 @@ impl ApplyActionOperation {
 impl Operation for ApplyActionOperation {
     type Output = SyncActionRecord;
     type Error = ActionError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> ActionTurn {
         Ok(Next::Call(IoCall::child(read_bound(self.input.folder_id))))
@@ -237,14 +255,19 @@ impl Operation for ApplyActionOperation {
     }
 }
 
-fn record_for(input: &ApplyActionInput, scope: ActionScope) -> SyncActionRecord {
+/// The audit record of one action, with the id and time the run gives it.
+fn record_for(
+    input: &ApplyActionInput,
+    scope: ActionScope,
+    (action_id, at_ms): (Ulid, u64),
+) -> SyncActionRecord {
     SyncActionRecord {
-        action_id: Ulid::generate(),
+        action_id,
         folder_id: input.folder_id,
         kind: input.kind,
         scope,
         actor: input.actor,
-        at_ms: unix_timestamp_millis(),
+        at_ms,
         before: input.expected.as_ref().map(|expected| expected.blake3),
         after: None,
         outcome: ActionOutcome::Applied,
@@ -285,11 +308,18 @@ struct EntryActionOperation {
     base: Option<SyncBase>,
     version: Option<Ulid>,
     record: Option<SyncActionRecord>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 type EntryTurn = Result<Next<SyncActionRecord>, ActionError>;
 
 impl EntryActionOperation {
+    /// A fresh action id and the time of this step.
+    fn mint(&mut self) -> (Ulid, u64) {
+        (self.ids.mint(self.now_ms), self.now_ms)
+    }
+
     fn new(
         realm_id: Option<RealmId>,
         folder: SyncedFolder,
@@ -297,6 +327,8 @@ impl EntryActionOperation {
         relative: String,
     ) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             realm_id,
             folder,
             input,
@@ -316,7 +348,8 @@ impl EntryActionOperation {
         let scope = ActionScope::Entry {
             relative: self.relative.clone(),
         };
-        self.record = Some(record_for(&self.input, scope));
+        let minted = self.mint();
+        self.record = Some(record_for(&self.input, scope, minted));
         match self.input.kind {
             ActionKind::Replace => self.replace(base),
             ActionKind::KeepLocal => self.keep_local(&base),
@@ -375,7 +408,8 @@ impl EntryActionOperation {
         let mut rows = self.cleared_rows(&cleared)?;
         // A download-only folder keeps the owner's bytes without publishing them.
         if self.folder.mode != FolderMode::DownloadOnly
-            && let Some(upload) = queued_upload(self.folder.folder_id, &self.relative, base)
+            && let Some(upload) =
+                queued_upload(self.folder.folder_id, &self.relative, base, self.now_ms)
         {
             rows.push(upload_entry(&upload).map_err(|_| ActionError::Unavailable)?);
         }
@@ -429,6 +463,14 @@ impl EntryActionOperation {
 impl Operation for EntryActionOperation {
     type Output = SyncActionRecord;
     type Error = ActionError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> EntryTurn {
         let key = base_key(self.folder.folder_id, &self.relative);
@@ -504,9 +546,8 @@ fn pending_version(entry: &EntryState) -> Option<Ulid> {
 
 /// The outbox row that publishes the bytes the last observation saw. An entry
 /// whose local side was never observed has nothing to publish yet.
-fn queued_upload(folder_id: Ulid, relative: &str, base: &SyncBase) -> Option<SyncUpload> {
+fn queued_upload(folder_id: Ulid, relative: &str, base: &SyncBase, now: u64) -> Option<SyncUpload> {
     let local = base.local.as_ref()?;
-    let now = unix_timestamp_millis();
     Some(SyncUpload {
         folder_id,
         relative: relative.to_string(),
@@ -558,11 +599,11 @@ mod pure_tests {
             version_id: Some(Ulid::from_bytes([3u8; 16])),
         };
         let folder_id = Ulid::from_bytes([1u8; 16]);
-        let upload = queued_upload(folder_id, "note.txt", &base(Some(local))).expect("a row");
+        let upload = queued_upload(folder_id, "note.txt", &base(Some(local)), 7).expect("a row");
         assert_eq!(upload.fingerprint, "4-1");
         assert_eq!(upload.blake3, Some([7u8; 32]));
         assert_eq!(upload.local_version, Some(Ulid::from_bytes([3u8; 16])));
         assert!(!upload.deleted);
-        assert!(queued_upload(folder_id, "note.txt", &base(None)).is_none());
+        assert!(queued_upload(folder_id, "note.txt", &base(None), 7).is_none());
     }
 }

@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_RUNS_KEYSPACE};
 use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::plugin_installs::PluginInstall;
@@ -620,10 +621,10 @@ pub(crate) fn new_run(
     install: &PluginInstall,
     handler: String,
     trigger: RunTrigger,
-    due_ms: u64,
+    (run_id, due_ms): (Ulid, u64),
 ) -> PluginRun {
     PluginRun {
-        run_id: Ulid::generate(),
+        run_id,
         install_id: install.install_id,
         group_id: install.group_id,
         plugin: install.plugin.clone(),
@@ -656,6 +657,7 @@ pub(crate) fn enqueue_timer(
         handler,
         interval_ms,
         now_ms,
+        ids: IdMint::default(),
         key: timer_key(install.install_id),
         phase: TimerPhase::Reading,
     }
@@ -667,6 +669,7 @@ pub struct EnqueueTimer {
     handler: String,
     interval_ms: u64,
     now_ms: u64,
+    ids: IdMint,
     key: Vec<u8>,
     phase: TimerPhase,
 }
@@ -681,6 +684,10 @@ enum TimerPhase {
 impl Operation for EnqueueTimer {
     type Output = bool;
     type Error = StoreError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn hold_scope(&self) -> Option<HoldScope> {
         Some(HoldScope::PluginAdmissions)
@@ -716,7 +723,8 @@ impl Operation for EnqueueTimer {
                     occurrence_ms: occurrence,
                 };
                 let handler = std::mem::take(&mut self.handler);
-                let run = new_run(&self.install, handler, trigger, self.now_ms);
+                let run_id = self.ids.mint(self.now_ms);
+                let run = new_run(&self.install, handler, trigger, (run_id, self.now_ms));
                 row.last_due_ms = occurrence;
                 let admission = Admission::new(run);
                 let ask = admission.ask();
@@ -811,18 +819,19 @@ pub(crate) fn declared_trigger(
     read_manifest(&plugin).ok()?.triggers.remove(&kind)
 }
 
-/// A run of the install's handler for the event's kind, due at `now_ms`, or `None` when the
-/// manifest has no trigger of that kind.
+/// Run `run_id` of the install's handler for the event's kind, due at `now_ms`, or `None` when
+/// the manifest has no trigger of that kind.
 pub fn event_run(
     config: &RealmConfigDocument,
     install: &PluginInstall,
     event: &SourceEvent,
-    now_ms: u64,
+    (run_id, now_ms): (Ulid, u64),
 ) -> Option<PluginRun> {
     let kind = event_trigger(event.kind);
     declared_trigger(config, install, kind)?;
     let trigger = RunTrigger::Event(event.clone());
-    Some(new_run(install, kind.as_str().to_string(), trigger, now_ms))
+    let handler = kind.as_str().to_string();
+    Some(new_run(install, handler, trigger, (run_id, now_ms)))
 }
 
 #[cfg(test)]

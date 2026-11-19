@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
@@ -97,6 +97,7 @@ pub struct UpdateRepositoryOperation {
     input: UpdateConnectorInput,
     stage: Stage,
     view: Option<ConnectorView>,
+    now_ms: u64,
 }
 
 impl UpdateRepositoryOperation {
@@ -105,6 +106,7 @@ impl UpdateRepositoryOperation {
             input,
             stage: Stage::Read,
             view: None,
+            now_ms: 0,
         }
     }
 
@@ -124,7 +126,7 @@ impl UpdateRepositoryOperation {
         {
             return Err(UpdateConnectorError::SecretEndpoint);
         }
-        let now = SystemTime::now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         let connector = RepositoryConnector {
             name: self.input.name.clone(),
             kind: self.input.kind,
@@ -162,6 +164,10 @@ impl UpdateRepositoryOperation {
 impl Operation for UpdateRepositoryOperation {
     type Output = ConnectorView;
     type Error = UpdateConnectorError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, UpdateConnectorError> {
         validate_connector(

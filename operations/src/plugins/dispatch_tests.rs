@@ -220,6 +220,7 @@ mod operations {
     use super::*;
     use crate::plugins::bound::NodeCheckFailure;
     use crate::plugins::fixtures::{self, config_result, is_child};
+    use crate::plugins::rate::tests::rate_answer;
     use crate::plugins::rows::tests::child_result;
     use crate::users::service_account::check::ServiceCheckError;
     use aruna_core::plugin_installs::SecretBinding;
@@ -257,12 +258,15 @@ mod operations {
     #[test]
     fn start_queues_run() {
         let mut run = start("{}", 3);
+        run.seed(7);
         assert_eq!(run.hold_scope(), Some(HoldScope::PluginAdmissions));
         assert!(is_child(&checked(&mut run)));
         let Ok(Next::Done(queued)) = run.next(child_result(Ok::<(), RunError>(()))) else {
             panic!("the admission ends the start");
         };
         assert_eq!(queued.install_id, fixtures::install().install_id);
+        // The run id comes from the runner's entropy at the start's time.
+        assert_eq!(queued.run_id, Ulid::from_parts(5_000, 7));
     }
 
     #[test]
@@ -334,7 +338,10 @@ mod operations {
         let mut hook = VerifyHook::new(place, install.install_id, hook_request(), 5_000);
         hook.first().unwrap();
         let config = fixtures::config(&install, webhook("header"));
-        assert!(is_child(&hook.next(config_result(config))));
+        // The request is counted against the install's webhook rate before its secret is asked.
+        let counted = hook.next(config_result(config));
+        assert!(matches!(counted, Ok(Next::Call(IoCall::Effect(_)))));
+        assert!(is_child(&hook.next(rate_answer(true))));
         let gone = ReleaseFailure(ReleaseError::Unavailable("no".into()));
         let answer = hook.next(child_result(Err::<Released, _>(gone)));
         assert!(matches!(answer, Err(HookError::Unavailable(_))));

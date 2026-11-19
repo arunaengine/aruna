@@ -28,7 +28,12 @@ const SOURCE: &str = "/realm/g/group/data/node/in/a.txt";
 const TARGET: &str = "/realm/g/group/data/node/out/a.txt";
 
 pub(crate) fn proposed(install: &PluginInstall, digest: u8) -> WorkRow {
-    let mut row = WorkRow::reserved(install, WorkKind::Copy, Ulid::generate(), 1);
+    let mut row = WorkRow::reserved(
+        install,
+        WorkKind::Copy,
+        (Ulid::generate(), Ulid::generate()),
+        1,
+    );
     row.source = Some(SOURCE.into());
     row.target = Some(TARGET.into());
     row.digest = [digest; 32];
@@ -642,7 +647,12 @@ fn found(key: &[u8], row: &WorkRow) -> [IoResult; 2] {
 #[test]
 fn lookup_follows_index() {
     let install_id = Ulid::from_parts(1, 1);
-    let mut row = WorkRow::reserved(&sample_install(install_id), WorkKind::Copy, Ulid::nil(), 1);
+    let mut row = WorkRow::reserved(
+        &sample_install(install_id),
+        WorkKind::Copy,
+        (Ulid::nil(), Ulid::generate()),
+        1,
+    );
     row.work_id = Ulid::from_parts(2, 2);
     let mut lookup = WorkLookup::new(install_id, row.work_id);
     let index = index_key(install_id, row.work_id);
@@ -676,7 +686,7 @@ fn send_boundary_decides() {
     let mut row = WorkRow::reserved(
         &sample_install(install_id),
         WorkKind::Upload,
-        Ulid::nil(),
+        (Ulid::nil(), Ulid::generate()),
         1,
     );
     row.boundary = Some(SendBoundary::Sending { attempt: 1 });
@@ -791,7 +801,12 @@ pub(crate) fn sample_install(install_id: Ulid) -> PluginInstall {
 #[test]
 fn change_applies_once() {
     let install_id = Ulid::from_parts(1, 1);
-    let row = WorkRow::reserved(&sample_install(install_id), WorkKind::Copy, Ulid::nil(), 1);
+    let row = WorkRow::reserved(
+        &sample_install(install_id),
+        WorkKind::Copy,
+        (Ulid::nil(), Ulid::generate()),
+        1,
+    );
     let mut plan = UpdateWork {
         lookup: WorkLookup::new(install_id, row.work_id),
         change: Some(WorkChange::Dispatched(job(1))),
@@ -832,7 +847,12 @@ fn change_applies_once() {
 #[test]
 fn listed_by_index() {
     let install_id = Ulid::from_parts(1, 1);
-    let row = WorkRow::reserved(&sample_install(install_id), WorkKind::Copy, Ulid::nil(), 1);
+    let row = WorkRow::reserved(
+        &sample_install(install_id),
+        WorkKind::Copy,
+        (Ulid::nil(), Ulid::generate()),
+        1,
+    );
     let mut plan = ListWork {
         page: Some(page_call(PLUGIN_WORK_KEYSPACE, Vec::new(), None, 2)),
         indexes: Vec::new(),

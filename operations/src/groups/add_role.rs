@@ -24,7 +24,6 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, KeySpace};
 use byteview::ByteView;
 use std::collections::HashSet;
@@ -72,6 +71,7 @@ pub struct AddRoleOperation {
     guard: Option<aruna_core::plugin_installs::InstallGuard>,
     step: Step,
     added: Option<AddedRole>,
+    now_ms: u64,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -188,6 +188,7 @@ impl AddRoleOperation {
             guard: None,
             step: Step::Check,
             added: None,
+            now_ms: 0,
         }
     }
 
@@ -276,7 +277,7 @@ impl AddRoleOperation {
                         realm_auth: None,
                         realm_id: self.input.actor.realm_id,
                     },
-                    unix_timestamp_millis(),
+                    self.now_ms,
                 )
             })
             .collect::<Vec<_>>();
@@ -293,6 +294,10 @@ impl AddRoleOperation {
 impl Operation for AddRoleOperation {
     type Output = (Group, GroupAuthorizationDocument);
     type Error = AddRoleError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<(Group, GroupAuthorizationDocument)>, AddRoleError> {
         self.input.validate()?;
@@ -361,7 +366,7 @@ struct RoleAddition {
 
 impl RoleAddition {
     fn new(input: AddRoleConfig, guard: Option<aruna_core::plugin_installs::InstallGuard>) -> Self {
-        let marks = DueMarks::new(Some(input.group_id), unix_timestamp_millis());
+        let marks = DueMarks::new(Some(input.group_id), 0);
         Self {
             input,
             guard,
@@ -519,6 +524,10 @@ impl RoleAddition {
 impl Operation for RoleAddition {
     type Output = AddedRole;
     type Error = AddRoleError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.marks.stamp(now_ms);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
