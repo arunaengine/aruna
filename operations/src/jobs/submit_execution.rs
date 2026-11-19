@@ -9,8 +9,8 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    ExecutionSpec, JobId, JobPayload, MAX_EXECUTION_OUTPUTS, OutputDestination, WorkspaceMode,
-    user_dedup_key,
+    ExecutionSpec, InputSource, JobId, JobPayload, MAX_EXECUTION_OUTPUTS, MAX_INLINE_BYTES,
+    OutputDestination, WorkspaceMode, plugin_tag, user_dedup_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::{
@@ -48,6 +48,17 @@ pub(crate) fn validate_execution(
             "input {} needs a container path",
             input.dest_key
         )));
+    }
+    // Only the plugin host writes bytes into a spec, and only a few.
+    let inline = (spec.inputs.iter()).filter_map(|input| match &input.source {
+        InputSource::Inline { bytes } => Some(bytes.len()),
+        InputSource::S3 { .. } => None,
+    });
+    let (count, bytes) = inline.fold((0, 0usize), |(count, sum), len| (count + 1, sum + len));
+    if (count > 0 && plugin_tag(&spec.tags).is_none()) || bytes > MAX_INLINE_BYTES {
+        return Err(SubmitJobError::InvalidWorkspace(
+            "inline inputs are for plugin tasks only, at most 64 KiB together".to_string(),
+        ));
     }
     // One bound governs declaration, expansion, the local result, and the
     // immutable output record, so a valid success is always publishable.

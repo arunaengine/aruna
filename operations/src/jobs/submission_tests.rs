@@ -242,6 +242,52 @@ fn refuses_pathless_input() {
 }
 
 #[test]
+fn bounds_inline_inputs() {
+    use aruna_core::structs::execution::job::{InputMode, InputSelection, InputSource};
+    let inline = |bytes: usize| InputSelection {
+        source: InputSource::Inline {
+            bytes: vec![b'a'; bytes],
+        },
+        source_node_id: None,
+        dest_key: "/in/samples.tsv".to_string(),
+        mode: InputMode::Snapshot,
+        container_path: Some("/in/samples.tsv".to_string()),
+        name: None,
+        description: None,
+    };
+    let mut spec = ExecutionSpec {
+        group_id: Ulid::from_bytes([3u8; 16]),
+        name: None,
+        description: None,
+        tags: Default::default(),
+        image: "alpine:3".to_string(),
+        entrypoint: None,
+        command: Vec::new(),
+        workdir: None,
+        env: Default::default(),
+        resources: Default::default(),
+        executor_constraint: None,
+        inputs: vec![inline(16)],
+        file_outputs: Vec::new(),
+        workspace_outputs: Vec::new(),
+        output_prefixes: Vec::new(),
+        collision_policy: Default::default(),
+    };
+    // Without the plugin host's tags nobody may put bytes into a spec.
+    assert!(validate_execution(&mut spec.clone(), WorkspaceMode::None, None).is_err());
+    let work = "aruna-engine.org/plugin-work".to_string();
+    spec.tags.insert(work, Ulid::nil().to_string());
+    assert!(validate_execution(&mut spec.clone(), WorkspaceMode::None, None).is_ok());
+    spec.inputs = vec![inline(64 * 1024)];
+    assert!(validate_execution(&mut spec.clone(), WorkspaceMode::None, None).is_ok());
+    spec.inputs[0].dest_key = "/in/a".to_string();
+    let mut second = inline(1);
+    second.dest_key = "/in/b".to_string();
+    spec.inputs.push(second);
+    assert!(validate_execution(&mut spec, WorkspaceMode::None, None).is_err());
+}
+
+#[test]
 fn refuses_shared_destination() {
     // An explicit output inside the workspace bucket and a workspace output
     // naming the same key would reserve one version twice.
