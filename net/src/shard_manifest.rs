@@ -9,7 +9,6 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{ShardManifest, ShardManifestEntry};
-use aruna_core::storage_entries::sync_revision_key;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use irokle::Storage as _;
@@ -22,6 +21,8 @@ use tracing::debug;
 use crate::NetHandle;
 use crate::streams::BiStream;
 
+pub use aruna_core::document::{ShardTransportMessage, manifest_entry_digest};
+
 /// How long one read or write of a shard manifest exchange may take.
 pub const SHARD_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -33,15 +34,6 @@ pub const MAX_REQUEST_SIZE: usize = 128;
 /// A shard manifest can carry one entry per document held in the shard; 16 MiB
 /// bounds a large response while still refusing a hostile oversized frame.
 pub const MAX_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
-
-/// New-holder request: give me your paged manifest for this shard.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
-pub enum ShardTransportMessage {
-    ManifestRequest {
-        realm_id: RealmId,
-        placement: PlacementRef,
-    },
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ShardManifestPage {
@@ -344,33 +336,6 @@ impl ManifestAssembler {
             updated_at_ms: metadata.updated_at_ms,
         }))
     }
-}
-
-/// A digest of the entries that does not depend on their order.
-pub fn manifest_entry_digest(entries: &[ShardManifestEntry]) -> [u8; 32] {
-    let mut encoded_entries: Vec<Vec<u8>> = entries.iter().map(canonical_entry_bytes).collect();
-    encoded_entries.sort();
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&(encoded_entries.len() as u64).to_be_bytes());
-    for encoded in encoded_entries {
-        hasher.update(&(encoded.len() as u64).to_be_bytes());
-        hasher.update(&encoded);
-    }
-    *hasher.finalize().as_bytes()
-}
-
-fn canonical_entry_bytes(entry: &ShardManifestEntry) -> Vec<u8> {
-    let target_key = sync_revision_key(&entry.target);
-    let target_key = target_key.as_ref();
-    let mut bytes = Vec::with_capacity(4 + target_key.len() + 8 + 16 + 32 + 8);
-    bytes.extend_from_slice(&(target_key.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(target_key);
-    bytes.extend_from_slice(&entry.revision.generation.to_be_bytes());
-    bytes.extend_from_slice(&entry.revision.event_id.to_bytes());
-    bytes.extend_from_slice(entry.revision.actor.as_bytes());
-    bytes.extend_from_slice(&entry.revision.updated_at_ms.to_be_bytes());
-    bytes
 }
 
 fn validate_manifest_response(

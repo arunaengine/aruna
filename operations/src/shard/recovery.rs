@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use aruna_core::time::unix_timestamp_millis;
-use tokio_util::sync::CancellationToken;
 
 /// Remote-recovery lifecycle. A locally safe node keeps serving while this is
 /// [`RecoveryState::Degraded`].
@@ -238,16 +237,25 @@ impl RecoveryStatus {
 }
 
 /// Asks a running recovery to stop at its next step; restore work stops between units.
-#[derive(Clone, Debug, Default)]
-pub struct RecoveryStop(CancellationToken);
+#[derive(Clone, Default)]
+pub struct RecoveryStop(Option<Arc<dyn Fn() -> bool + Send + Sync>>);
 
 impl RecoveryStop {
-    pub fn new(token: CancellationToken) -> Self {
-        Self(token)
+    /// `stopped` answers whether the node asked recovery to stop, such as a cancelled token.
+    pub fn new(stopped: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(stopped)))
     }
 
     pub(crate) fn requested(&self) -> bool {
-        self.0.is_cancelled()
+        self.0.as_ref().is_some_and(|stopped| stopped())
+    }
+}
+
+impl std::fmt::Debug for RecoveryStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RecoveryStop")
+            .field(&self.requested())
+            .finish()
     }
 }
 

@@ -2,10 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::document::{DocumentSyncRevision, DocumentTarget};
+use aruna_core::document::{DocumentSyncRevision, DocumentTarget, manifest_entry_digest};
 use aruna_core::errors::StorageError;
 use aruna_core::types::Value;
-use aruna_net::shard_manifest::manifest_entry_digest;
 use ulid::Ulid;
 
 use super::*;

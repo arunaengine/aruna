@@ -56,9 +56,7 @@ mod topics;
 use self::cursor::*;
 
 const PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
-// Matches irokle's 1024-topic wire batches; the worst-case data stream sends
-// three messages per topic, staying under the peer's 4096-message stream cap.
-pub const BATCH_TOPIC_LIMIT: usize = 1_024;
+pub use aruna_core::document::BATCH_TOPIC_LIMIT;
 const OUTBOUND_PEER_LIMIT: usize = 8;
 const SYNC_FANOUT_DOMAIN: &[u8] = b"aruna-document-sync-fanout-v1";
 const SYNC_FANOUT_KEYSPACE: &str = "document-sync-fanout";
