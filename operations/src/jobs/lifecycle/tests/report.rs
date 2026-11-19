@@ -12,10 +12,10 @@ use aruna_core::structs::identity::auth::AuthContext;
 use ulid::Ulid;
 
 use super::{family_audit, family_report};
-use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::report::{AuditPaging, AuditRange};
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::tests::records::{Family, REALM, context, user_auth};
+use aruna_drivers::driver::{DriverContext, drive};
 
 async fn append(context: &DriverContext, family: &Family, envelope: JobRecordEnvelope) {
     let record = JobRecordFrame::new(envelope).expect("bounded record");

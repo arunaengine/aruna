@@ -461,8 +461,8 @@ mod tests {
     use super::super::inventory::CollectOutputsOperation;
     use super::super::outputs::{input_refs, uncaptured_input};
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::s3::access::get::GetAccessOperation;
+    use aruna_drivers::driver::{DriverContext, drive};
 
     fn run_of(
         context: &DriverContext,

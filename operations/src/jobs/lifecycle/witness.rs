@@ -216,9 +216,9 @@ impl Operation for WitnessDrainOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::tests::records::{Family, context};
     use aruna_core::calls::ChildOutcome;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::scan::iter_prefix_page;
 
     fn child<T, E>(result: Result<T, E>) -> IoResult

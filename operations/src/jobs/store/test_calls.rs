@@ -17,12 +17,12 @@ use super::mutation::{MutateJobOperation, NoGuard};
 use super::park_wake::AwaitOutcome;
 use super::*;
 use super::{job_calls, row_calls};
-use crate::driver::DriverContext;
-use crate::driver::drive;
 use aruna_core::structs::execution::job::KeyWait;
 use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::types::TxnId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::driver::drive;
 use std::collections::BTreeMap;
 
 pub async fn adopt_external_attempt(

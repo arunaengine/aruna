@@ -7,7 +7,6 @@ use super::reads::{
     StoredIntentsOperation, TrailOperation, exact_of, version_row,
 };
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::jobs::blob_request::BlobRequest;
 use crate::jobs::import_listing::{ListingNote, NoteError, NoteListingOperation};
 use crate::jobs::page_intents::PageIntentsOperation;
@@ -23,6 +22,7 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::backend_import::intent_key;
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, VersionKey};
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_drivers::driver::{DriverContext, drive};
 
 #[test]
 fn mapped_discovery_owned() {
@@ -194,7 +194,7 @@ fn classifies_put_errors() {
 #[tokio::test]
 async fn notes_listing_guarded() {
     let (_directory, storage) = crate::tests::s3::test_storage();
-    let context = crate::testing::test_context(storage);
+    let context = aruna_drivers::testing::test_context(storage);
     let rule = BackendImport {
         import_id: Ulid::from_parts(4, 4),
         group_id: Ulid::from_parts(3, 3),
@@ -320,7 +320,7 @@ async fn notes_listing_guarded() {
 async fn retires_move_intents() {
     // A move tags with its attempt id; its intents of the version go wherever the file is.
     let (_directory, storage) = crate::tests::s3::test_storage();
-    let context = crate::testing::test_context(storage);
+    let context = aruna_drivers::testing::test_context(storage);
     let (import_id, id, attempt) = (
         Ulid::from_parts(4, 4),
         Ulid::from_parts(5, 5),
@@ -401,7 +401,7 @@ fn keeps_alias_row() {
 #[tokio::test]
 async fn hides_literal_alias() {
     let (_directory, storage) = crate::tests::s3::test_storage();
-    let context = crate::testing::test_context(storage);
+    let context = aruna_drivers::testing::test_context(storage);
     let rule = recovery_rule("{dir}{id}_{name}");
     let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
     let spec = BackendImportSpec {
@@ -463,7 +463,7 @@ async fn hides_literal_alias() {
 async fn reads_key_trail() {
     use aruna_core::structs::storage::delete_audit::{BlobAuditKind, trail_key};
     let (_directory, storage) = crate::tests::s3::test_storage();
-    let context = crate::testing::test_context(storage);
+    let context = aruna_drivers::testing::test_context(storage);
     let rule = recovery_rule("{dir}{name}");
     let id = Ulid::from_parts(1_000, 1);
     let deleted = || trail_of(&context, &rule, 5, "in/a.csv", id);
@@ -496,7 +496,7 @@ async fn reads_key_trail() {
 #[tokio::test]
 async fn classifies_exact_versions() {
     let (_directory, storage) = crate::tests::s3::test_storage();
-    let context = crate::testing::test_context(storage);
+    let context = aruna_drivers::testing::test_context(storage);
     let id = Ulid::from_parts(9, 9);
     let exact = || async {
         let found = exact_version(&context, "bucket", "in/a.csv", id).await;
@@ -537,7 +537,7 @@ async fn reads_committed_md5() {
     use aruna_core::structs::storage::blob::BlobLocationKey;
     use aruna_core::structs::storage::format::EncodingClass;
     let (_directory, storage) = crate::tests::s3::test_storage();
-    let context = crate::testing::test_context(storage);
+    let context = aruna_drivers::testing::test_context(storage);
     let row = ImportedObject::written(Ulid::from_parts(6, 6), "in/a.csv".to_string(), 4, None);
     let listed = object("e1");
     let md5 = || committed_md5(&context, "bucket", "in/a.csv", &row, &listed);
@@ -629,7 +629,7 @@ async fn finds_copy_candidates() {
     // Only versions a file of this size and ETag could hold are hashed against: on the
     // rule's storage, of a linked encoding, of the size and not refuted by the ETag.
     let (_directory, storage) = crate::tests::s3::test_storage();
-    let context = crate::testing::test_context(storage);
+    let context = aruna_drivers::testing::test_context(storage);
     let rule = recovery_rule(aruna_core::structs::storage::backend_import::DEFAULT_PATTERN);
     let ours = BackendRef::Group(rule.backend_id);
     let other = BackendRef::Group(Ulid::from_parts(6, 6));
@@ -945,7 +945,7 @@ fn chooses_identity() {
 #[tokio::test]
 async fn reads_write_claims() {
     let (_directory, storage) = crate::tests::s3::test_storage();
-    let context = crate::testing::test_context(storage);
+    let context = aruna_drivers::testing::test_context(storage);
     let rule = recovery_rule("{dir}{id}_{name}");
     let (open, done) = (
         claim(&rule, "in/a.csv", false),

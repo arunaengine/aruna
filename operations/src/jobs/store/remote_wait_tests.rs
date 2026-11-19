@@ -12,9 +12,9 @@ use aruna_core::{NodeId, structs::execution::job::JobId};
 use ulid::Ulid;
 
 use super::{OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation};
-use crate::driver::{DriverContext, drive};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::WAKE_PAGE;
+use aruna_drivers::driver::{DriverContext, drive};
 
 fn waiter() -> NodeId {
     iroh::SecretKey::from_bytes(&[2; 32]).public()

@@ -424,16 +424,13 @@ impl Operation for PruneTimerOperation {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::jobs::JOB_PRUNE_PAGE;
     use crate::jobs::JOB_RETENTION_MS;
-    use crate::jobs::context::PayloadHandler;
     use crate::jobs::store::job_calls::ClaimOutcome;
     use crate::jobs::store::test_calls::insert_job;
     use crate::jobs::store::test_calls::put_job_entry;
     use crate::jobs::store::test_calls::read_job_record;
     use crate::jobs::store::test_calls::{claim_job, complete_job, transition_to_running};
-    use crate::testing::test_context;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::handle::Handle;
@@ -451,6 +448,9 @@ pub(crate) mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::TaskEvent;
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::jobs::context::PayloadHandler;
+    use aruna_drivers::testing::test_context;
     use aruna_storage::FjallStorage;
     use aruna_storage::scan::iter_prefix_page;
     use byteview::ByteView;
@@ -695,7 +695,7 @@ pub(crate) mod tests {
     async fn expired_job_pruned() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
         insert_job(
             &context,
@@ -717,7 +717,7 @@ pub(crate) mod tests {
     async fn staging_rows_pruned() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([3u8; 16]);
         let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
         insert_job(&context, &terminal_record(job_id, finished))
@@ -756,7 +756,7 @@ pub(crate) mod tests {
     async fn unexpired_job_retained() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         insert_job(
             &context,
             &terminal_record(JobId::from_bytes([2u8; 16]), unix_timestamp_millis()),
@@ -776,7 +776,7 @@ pub(crate) mod tests {
     async fn expired_tombstone_pruned() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([8u8; 16]);
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         drive(
@@ -799,7 +799,7 @@ pub(crate) mod tests {
     async fn rocrate_retention_prunes() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([6u8; 16]);
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let limits = RoCrateLimits {
@@ -889,7 +889,7 @@ pub(crate) mod tests {
         // parent carries the fence state `authorize_cleanup` reads, so it is kept.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([4u8; 16]);
         let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
         insert_job(&context, &execution_record(job_id, finished))
@@ -916,7 +916,7 @@ pub(crate) mod tests {
     async fn finished_cleanup_prunes() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([5u8; 16]);
         let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
         insert_job(&context, &execution_record(job_id, finished))
@@ -944,7 +944,7 @@ pub(crate) mod tests {
     async fn restore_arms_timer() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         insert_job(
             &context,
             &terminal_record(JobId::from_bytes([3u8; 16]), unix_timestamp_millis()),

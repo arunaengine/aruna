@@ -345,11 +345,11 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::jobs::store::test_calls::insert_job;
     use crate::jobs::store::test_calls::read_output_record as read_stored;
     use crate::jobs::store::test_calls::{read_attempt_control, reserve_output_commits};
     use aruna_core::structs::execution::job::JobId;
+    use aruna_drivers::driver::{DriverContext, drive};
 
     const TOKEN: Ulid = Ulid(0x5EA1);
 
@@ -422,9 +422,12 @@ mod tests {
             claim_token: TOKEN,
             lease_expires_ms: 10_000,
         });
-        insert_job(&crate::testing::test_context(storage.clone()), &record)
-            .await
-            .unwrap();
+        insert_job(
+            &aruna_drivers::testing::test_context(storage.clone()),
+            &record,
+        )
+        .await
+        .unwrap();
         let context = DriverContext {
             storage_handle: storage,
             net_handle: Some(net.clone()),

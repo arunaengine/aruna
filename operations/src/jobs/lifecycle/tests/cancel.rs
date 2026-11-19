@@ -16,7 +16,6 @@ use aruna_core::structs::identity::auth::AuthContext;
 use super::admission_race::{commit_receipt, commit_with, config, envelope, rows, seed};
 use super::terminal::{node_context, physical, reserve_execution, seed_family};
 use super::{admit_launch, cancel_family};
-use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
@@ -24,6 +23,7 @@ use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::store::test_calls::read_job_record;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::tests::records::{Family, REALM, serve_job_record, user};
+use aruna_drivers::driver::{DriverContext, drive};
 
 fn auth(user_id: UserId) -> AuthContext {
     AuthContext {

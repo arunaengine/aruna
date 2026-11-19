@@ -11,9 +11,6 @@ use super::sources::{
 };
 use super::*;
 use crate::blob::permission_paths::MAX_HASH_ALIASES;
-use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::jobs::context::JobContext;
 use crate::jobs::repository::test_support::{
     artifact, job_id, job_scope as scoped_job, local_scope, other_node, owner_node, realm,
 };
@@ -33,6 +30,9 @@ use aruna_core::stream::StreamError;
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::blob::HashIndex;
 use aruna_core::structs::storage::format::StoredFormat;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::driver::drive;
+use aruna_drivers::jobs::context::JobContext;
 use bytes::Bytes;
 use futures_util::io::AsyncWriteExt;
 use serde_json::Value as JsonValue;

@@ -183,7 +183,6 @@ impl Operation for WakeUnlockedOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::jobs::key_locks::{KeyCheckError, LockedInputsOperation, ParkLockedOperation};
     use crate::jobs::store::job_calls::ClaimOutcome;
     use crate::jobs::store::test_calls::insert_job;
@@ -201,6 +200,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, HashIndex, VersionKey};
     use aruna_core::structs::storage::encryption::BucketEncryption;
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_drivers::driver::{DriverContext, drive};
     use byteview::ByteView;
     use ulid::Ulid;
 
@@ -333,11 +333,11 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_archive_wakes() {
-        use crate::driver::drive;
         use crate::jobs::store::remote_wait::{OwedWakesOperation, WaitRowOperation};
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
         use aruna_core::structs::identity::auth::AuthContext;
+        use aruna_drivers::driver::drive;
 
         let dir = tempfile::tempdir().unwrap();
         let context = DriverContext {

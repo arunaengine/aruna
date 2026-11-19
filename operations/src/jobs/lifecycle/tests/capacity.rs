@@ -15,7 +15,6 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use ulid::Ulid;
 
 use super::resources;
-use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
@@ -29,6 +28,7 @@ use crate::jobs::lifecycle::stage::read_targets;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::replication::protocol::BaoReadTarget;
 use crate::tests::records::{Family, REALM, context, node};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
 
 fn envelope(max_concurrent: u32) -> ResourceEnvelope {

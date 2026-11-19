@@ -687,9 +687,9 @@ impl Operation for ViewEntryOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::encryption::EncryptionMode;
+    use aruna_drivers::driver::drive;
     use ulid::Ulid;
 
     fn entry(key: &str) -> ViewEntry {
@@ -1028,7 +1028,7 @@ mod tests {
         use aruna_core::structs::storage::format::Compression;
 
         let (_directory, storage) = crate::tests::s3::test_storage();
-        let context = crate::testing::test_context(storage);
+        let context = aruna_drivers::testing::test_context(storage);
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let group_id = Ulid::from_parts(2, 2);
         let local = entry("a").captured.source_node_id;

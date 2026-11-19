@@ -300,13 +300,13 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::driver::{DriverContext, drive};
-    use crate::jobs::context::JobContext;
     use crate::jobs::store::test_calls::{insert_job, record_attempt_intent};
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;
     use aruna_core::jobs::ProgressReporter;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::jobs::context::JobContext;
 
     async fn run_terminal_cleanup(
         ctx: &JobContext,
@@ -630,7 +630,7 @@ mod tests {
     async fn revoke_failure_cleans() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let access_key = "malformed-access";
         let _ = storage
             .send_storage_effect(StorageEffect::Write {
@@ -696,7 +696,7 @@ mod tests {
     async fn revoked_revoke_stable() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let mut access = user_access("revoked-access");
         let revoked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         access.revoked_at = Some(revoked_at);
@@ -721,7 +721,7 @@ mod tests {
     async fn cleanup_uses_kind() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let docker = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
         let slurm = StubBackend::new(ExecutorKind::Slurm, vec![Ok(())]);
         let ctx = job_context(storage.clone(), &[docker.clone(), slurm.clone()]);
@@ -742,7 +742,7 @@ mod tests {
     async fn cleanup_retry_succeeds() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let backend = StubBackend::new(
             ExecutorKind::Docker,
             vec![Err(BackendError::Unavailable("down".to_string())), Ok(())],

@@ -9,7 +9,6 @@ use super::job_calls::{
 };
 use super::store_call::RowBatch;
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::jobs::store::test_calls::{
     adopt_external_attempt, begin_external_running, cancel_running_job, claim_job,
     complete_execution, complete_job, defer_job, delete_finished_run, exhaust_job, fail_job,
@@ -36,6 +35,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::TxnId;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::tempdir;
@@ -202,7 +202,7 @@ async fn schedule_keys(context: &DriverContext) -> Vec<Key> {
 #[tokio::test]
 async fn adopt_spares_live() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0x77; 16]);
     let mut record = queued_record(job_id);
     record.execution_class = JobExecutionClass::ExternalAttempt;
@@ -362,7 +362,7 @@ async fn handoff_releases_preintent() {
     // Shutdown while staging: no attempt intent exists yet, so the lease
     // must be released instead of failing with MissingControl.
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0x21; 16]);
     let mut record = queued_record(job_id);
     record.execution_class = JobExecutionClass::ExternalAttempt;
@@ -389,7 +389,7 @@ async fn handoff_releases_preintent() {
 #[tokio::test]
 async fn claim_moves_index() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([9u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
 
@@ -416,7 +416,7 @@ async fn claim_moves_index() {
 #[tokio::test]
 async fn exhausted_job_cancels() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let mut record = queued_record(JobId::from_bytes([0x44; 16]));
     record.state = JobState::Indeterminate;
     record.locally_exhausted = true;
@@ -474,7 +474,7 @@ fn claim_row_moves() {
 #[tokio::test]
 async fn claim_transition_bounded() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([2u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
 
@@ -488,7 +488,7 @@ async fn claim_transition_bounded() {
 #[tokio::test]
 async fn report_freezes() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0x42; 16]);
     insert_job(&context, &rocrate_record(job_id)).await.unwrap();
     let ClaimOutcome::Claimed(claimed) = claim_job(&context, job_id, node_id(3), 2_000)
@@ -586,7 +586,7 @@ async fn other_write_untouched() {
 #[tokio::test]
 async fn zombie_rejected() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([1u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
     claim_job(&context, job_id, node_id(3), 5_000)
@@ -619,7 +619,7 @@ async fn zombie_rejected() {
 #[tokio::test]
 async fn stale_checkpoint_rejected() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([2u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
     let ClaimOutcome::Claimed(record) = claim_job(&context, job_id, node_id(3), 5_000)
@@ -665,7 +665,7 @@ async fn stale_checkpoint_rejected() {
 #[tokio::test]
 async fn requeue_backs_off() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([4u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
     claim_job(&context, job_id, node_id(3), 5_000)
@@ -694,7 +694,7 @@ async fn requeue_backs_off() {
 #[tokio::test]
 async fn deferral_keeps_attempt() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0x44u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
     let ClaimOutcome::Claimed(record) = claim_job(&context, job_id, node_id(3), 5_000)
@@ -735,7 +735,7 @@ async fn deferral_keeps_attempt() {
 #[tokio::test]
 async fn success_clears_error() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0x45u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
     let claim = |now| claim_job(&context, job_id, node_id(3), now);
@@ -778,7 +778,7 @@ async fn success_clears_error() {
 #[tokio::test]
 async fn finish_clears_pause() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let paused = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(60));
     for (seed, cancel) in [(0x46u8, false), (0x47u8, true)] {
         let job_id = JobId::from_bytes([seed; 16]);
@@ -812,7 +812,7 @@ async fn finish_clears_pause() {
 #[tokio::test]
 async fn undecided_never_retries() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0x48u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
     let ClaimOutcome::Claimed(record) = claim_job(&context, job_id, node_id(3), 5_000)
@@ -844,7 +844,7 @@ async fn undecided_never_retries() {
 #[tokio::test]
 async fn retry_resets_progress() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([12u8; 16]);
     let mut record = queued_record(job_id);
     record.progress.current = 1;
@@ -869,7 +869,7 @@ async fn retry_resets_progress() {
 #[tokio::test]
 async fn requeue_exhausts() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([6u8; 16]);
     let mut record = queued_record(job_id);
     record.attempts = JOB_MAX_ATTEMPTS - 1;
@@ -897,7 +897,7 @@ async fn requeue_exhausts() {
 #[tokio::test]
 async fn permanent_cap_fails() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xD4; 16]);
     let mut record = queued_record(job_id);
     record.attempts = JOB_MAX_ATTEMPTS - 1;
@@ -930,7 +930,7 @@ async fn permanent_cap_fails() {
 #[tokio::test]
 async fn exhausted_stops_sweep() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xD5; 16]);
     let mut record = queued_record(job_id);
     record.attempts = JOB_MAX_ATTEMPTS - 1;
@@ -959,7 +959,7 @@ async fn exhausted_stops_sweep() {
 #[tokio::test]
 async fn cleanup_retries_forever() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xC5; 16]);
     let mut record = JobRecord::new(
         job_id,
@@ -996,7 +996,7 @@ async fn cleanup_retries_forever() {
 #[tokio::test]
 async fn import_exhausts() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xC7; 16]);
     let mut record = rocrate_record(job_id);
     record.attempts = JOB_MAX_ATTEMPTS - 1;
@@ -1023,7 +1023,7 @@ async fn import_exhausts() {
 async fn release_keeps_attempts() {
     // Lease hand-back preserves attempts but resets execution progress.
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xA1; 16]);
     let token = Ulid::generate();
     let mut record = running_record(job_id, token, 60_000);
@@ -1050,7 +1050,7 @@ async fn release_keeps_attempts() {
 #[tokio::test]
 async fn release_guards_token() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xB2; 16]);
     insert_job(&context, &running_record(job_id, Ulid::generate(), 60_000))
         .await
@@ -1071,7 +1071,7 @@ async fn release_guards_token() {
 #[tokio::test]
 async fn cancel_before_claim() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([7u8; 16]);
     let mut record = queued_record(job_id);
     record.cancel_requested = true;
@@ -1089,7 +1089,7 @@ async fn cancel_before_claim() {
 #[tokio::test]
 async fn cancel_terminal_noop() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([8u8; 16]);
     let mut record = queued_record(job_id);
     record.state = JobState::Succeeded;
@@ -1108,7 +1108,7 @@ async fn cancel_terminal_noop() {
 #[tokio::test]
 async fn terminal_clears_dedup() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([5u8; 16]);
     let mut record = queued_record(job_id);
     record.dedup_key = Some(b"dedup".to_vec());
@@ -1152,7 +1152,7 @@ async fn terminal_clears_dedup() {
 #[tokio::test]
 async fn malformed_retained() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([3u8; 16]);
     batch_write(
         &context,
@@ -1271,7 +1271,7 @@ async fn fence_attempt(context: &DriverContext, job_id: JobId, token: Ulid) -> A
 #[tokio::test]
 async fn revived_lease_kept() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([2u8; 16]);
     insert_job(&context, &running_record(job_id, Ulid::generate(), 10_000))
         .await
@@ -1301,7 +1301,7 @@ async fn revived_lease_kept() {
 #[tokio::test]
 async fn sweep_skips_requeued() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([11u8; 16]);
     let mut record = queued_record(job_id);
     record.attempts = 1;
@@ -1330,7 +1330,7 @@ async fn sweep_skips_requeued() {
 #[tokio::test]
 async fn reclaim_not_eligible() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([2u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
     claim_job(&context, job_id, node_id(3), 5_000)
@@ -1348,7 +1348,7 @@ async fn reclaim_not_eligible() {
 #[tokio::test]
 async fn filter_scans_pages() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
     let make = |seq: u64, state: JobState| {
         let mut record = JobRecord::new(
@@ -1404,7 +1404,7 @@ async fn filter_scans_pages() {
 #[tokio::test]
 async fn internal_jobs_hidden() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
     let job_id = JobId::from_bytes([0xC1; 16]);
     let record = JobRecord::new(
@@ -1453,7 +1453,7 @@ async fn internal_jobs_hidden() {
 #[tokio::test]
 async fn cleanup_jobs_hidden() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
     let job_id = JobId::from_bytes([0xC7; 16]);
     let record = JobRecord::new(
@@ -1504,7 +1504,7 @@ async fn cleanup_jobs_hidden() {
 #[tokio::test]
 async fn terminal_enqueues_cleanup() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
     let job_id = JobId::from_bytes([0xC9; 16]);
     let token = Ulid::from_bytes([0xCA; 16]);
@@ -1593,7 +1593,7 @@ async fn run_delete_rules() {
     // Only the caller's finished run is removed, with its list entry; a
     // running run, a foreign one and a system job stay untouched.
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
     let other = UserId::new(Ulid::from_bytes([4u8; 16]), RealmId([1u8; 32]));
     let run = |seed: u8, state: JobState| {
@@ -1719,7 +1719,7 @@ async fn session_skips_crate() {
     // run of the same shape still queues the crate job.
     use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
     for (seed, session) in [(0xD1u8, true), (0xD3u8, false)] {
         let job_id = JobId::from_bytes([seed; 16]);
@@ -1799,7 +1799,7 @@ async fn session_skips_crate() {
 #[tokio::test]
 async fn dedup_delete_guarded() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_a = JobId::from_bytes([1u8; 16]);
     let job_b = JobId::from_bytes([2u8; 16]);
     let token = Ulid::generate();
@@ -1845,7 +1845,7 @@ async fn dedup_delete_guarded() {
 #[tokio::test]
 async fn external_never_requeued() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xE0; 16]);
     let mut record = execution_record(job_id, Ulid::generate(), JobState::Running);
     record.claim.as_mut().unwrap().lease_expires_ms = 1;
@@ -1876,7 +1876,7 @@ async fn external_never_requeued() {
 #[tokio::test]
 async fn park_sweep_budget() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xE4; 16]);
     let token = Ulid::generate();
     let mut record = execution_record(job_id, token, JobState::Running);
@@ -1939,7 +1939,7 @@ async fn park_sweep_budget() {
 #[tokio::test]
 async fn park_spends_attempt() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xE5; 16]);
     let token = Ulid::generate();
     let mut record = execution_record(job_id, token, JobState::Running);
@@ -1989,7 +1989,7 @@ async fn park_spends_attempt() {
 #[tokio::test]
 async fn cap_sites_result() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let swept = JobId::from_bytes([0xE6; 16]);
     let token = Ulid::generate();
     let mut record = execution_record(swept, token, JobState::Ready);
@@ -2035,7 +2035,7 @@ async fn cap_sites_result() {
 #[tokio::test]
 async fn preintent_requeues() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xE3; 16]);
     let mut record = execution_record(job_id, Ulid::generate(), JobState::Ready);
     record.claim.as_mut().unwrap().lease_expires_ms = 1;
@@ -2057,7 +2057,7 @@ async fn preintent_requeues() {
 #[tokio::test]
 async fn attempt_intent_persists() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xA0; 16]);
     let token = Ulid::generate();
     insert_job(&context, &running_record(job_id, token, 10_000))
@@ -2088,7 +2088,7 @@ async fn attempt_intent_persists() {
 #[tokio::test]
 async fn cancel_blocks_intent() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xA1; 16]);
     let token = Ulid::generate();
     let mut record = running_record(job_id, token, 10_000);
@@ -2116,7 +2116,7 @@ async fn cancel_blocks_intent() {
 #[tokio::test]
 async fn cancel_blocks_running() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xA2; 16]);
     let token = Ulid::generate();
     insert_job(&context, &execution_record(job_id, token, JobState::Ready))
@@ -2175,7 +2175,7 @@ fn plain_intent(job_id: JobId) -> AttemptIntent {
 async fn launch_marks_executed() {
     // The launch row joins the epoch's guarded commit and counts only once the job runs.
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xB1; 16]);
     let token = Ulid::generate();
     insert_job(&context, &execution_record(job_id, token, JobState::Ready))
@@ -2214,7 +2214,7 @@ async fn stale_launch_refused() {
     // A claimant whose token lost writes no launch facts; an accepted attempt counts as executed
     // even when a cancellation keeps it from running.
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xB2; 16]);
     let token = Ulid::generate();
     insert_job(&context, &execution_record(job_id, token, JobState::Ready))
@@ -2264,7 +2264,7 @@ async fn running_backfills_start() {
     // Kubernetes and Apptainer accept an attempt before reporting a start
     // time; without a start the walltime cap would have no anchor.
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xA9; 16]);
     let token = Ulid::generate();
     insert_job(&context, &execution_record(job_id, token, JobState::Ready))
@@ -2288,7 +2288,7 @@ async fn running_backfills_start() {
 #[tokio::test]
 async fn cancel_blocks_completion() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xA3; 16]);
     let token = Ulid::generate();
     insert_job(
@@ -2328,7 +2328,7 @@ async fn cancel_blocks_completion() {
 #[tokio::test]
 async fn success_wins_cancel() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xA4; 16]);
     let token = Ulid::generate();
     insert_job(
@@ -2380,7 +2380,7 @@ async fn success_wins_cancel() {
 async fn output_record_cas() {
     // A replay may confirm the same digest, but a later write cannot replace it.
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xA8; 16]);
     let token = Ulid::generate();
     insert_job(
@@ -2426,7 +2426,7 @@ async fn success_needs_record() {
     // Without a durable output record naming the same digest, the storage
     // mutation itself refuses to publish Succeeded.
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xA7; 16]);
     let token = Ulid::generate();
     insert_job(
@@ -2480,7 +2480,7 @@ async fn success_needs_record() {
 #[tokio::test]
 async fn external_live_skipped() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0xE2; 16]);
     let mut record = running_record(job_id, Ulid::generate(), 10_000);
     record.execution_class = JobExecutionClass::ExternalAttempt;

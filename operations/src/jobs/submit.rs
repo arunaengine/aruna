@@ -654,7 +654,6 @@ impl Operation for SubmitJobOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::jobs::store::test_calls::read_job_record;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -667,6 +666,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
     use aruna_core::structs::storage::backend_import::BackendImportSpec;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
     use byteview::ByteView;
@@ -822,7 +822,7 @@ mod tests {
         import.source = ImportRoCrateSource::Upload { upload_id };
         let record =
             crate::jobs::import::upload::tests::upload_record(spec.created_by, upload_id, expires);
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
             context,
         )
@@ -1152,7 +1152,7 @@ mod tests {
         let mut first = rocrate_spec(4, Some(b"first".to_vec()));
         let upload_id = seed_upload(&ctx, &mut first, 3, 2_000).await;
         let created = drive(operation(first.clone()), &ctx).await.unwrap();
-        let stored = crate::driver::drive(
+        let stored = aruna_drivers::driver::drive(
             crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
             &ctx,
         )
@@ -1160,7 +1160,7 @@ mod tests {
         .map_err(|error| error.0);
         assert_eq!(stored.unwrap().unwrap().claimed_by, Some(created.job_id));
         let owner = first.created_by;
-        let reclaimed = crate::driver::drive_retry(
+        let reclaimed = aruna_drivers::driver::drive_retry(
             || {
                 crate::jobs::import::upload::ClaimUploadOperation::new(
                     upload_id,
