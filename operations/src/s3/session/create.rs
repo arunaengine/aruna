@@ -263,6 +263,14 @@ impl Operation for CreateS3Operation {
     fn expected_error(error: &Self::Error) -> bool {
         error.expected()
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +333,17 @@ mod tests {
         };
         assert_eq!(credentials.secret_access_key.expose(), "s".repeat(30));
         assert_eq!(credentials.session_token.expose(), "t".repeat(64));
+    }
+
+    #[test]
+    fn key_from_run() {
+        // The key id comes from the run's time and entropy, so two runs never share it.
+        let mut create = operation();
+        create.mint_key = true;
+        create.stamp(5_000);
+        create.seed(9);
+        create.first().unwrap();
+        assert_eq!(create.key_id, IdMint::new(9).mint(5_000).to_string());
     }
 
     #[test]
