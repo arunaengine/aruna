@@ -34,7 +34,7 @@ use byteview::ByteView;
 use std::time::Duration;
 use ulid::Ulid;
 
-use crate::storage_read::{parse_storage_iter, parse_storage_read};
+use crate::storage_read::parse_storage_read;
 use aruna_core::placement::{registry_placement, resolve_shard_holders};
 use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::identity::realm::RealmConfigDocument;

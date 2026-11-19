@@ -398,7 +398,7 @@ pub(crate) fn apply_recovery_pass(
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct PhaseOutcome {
+pub struct PhaseOutcome {
     pub(crate) progress: bool,
     pub(crate) error: Option<RecoveryError>,
 }

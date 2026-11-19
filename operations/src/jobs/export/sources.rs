@@ -308,7 +308,7 @@ pub(super) fn local_bucket(candidate: Option<&ExportCandidate>) -> Option<String
 
 /// What a hash lookup added to an entity's candidates.
 #[derive(Debug, PartialEq)]
-pub(super) struct HashFound {
+pub struct HashFound {
     pub(super) candidates: Vec<ExportCandidate>,
     pub(super) denied: bool,
     /// Holder discovery could not be asked.
@@ -813,7 +813,7 @@ impl Operation for ResolveEntityOperation {
 
 /// The resolved entities and what the lookups learned.
 #[derive(Debug, PartialEq)]
-pub(super) struct Resolved {
+pub struct Resolved {
     pub(super) entities: Vec<ExportEntity>,
     pub(super) aliases: AliasState,
 }

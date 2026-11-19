@@ -45,7 +45,7 @@ pub(super) enum ResolveResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(super) struct ExportCandidate {
+pub struct ExportCandidate {
     pub(super) source: CandidateSource,
     pub(super) report_source: ExportReportSource,
     pub(super) resolved_version: Option<Ulid>,

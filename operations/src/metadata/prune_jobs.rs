@@ -18,7 +18,7 @@ const PRUNE_PAGE: usize = 512;
 
 /// The due jobs in due order with their keys, whether more may be due, and the next due time.
 #[derive(Debug, PartialEq)]
-pub(crate) struct DuePrune {
+pub struct DuePrune {
     pub jobs: Vec<(Vec<u8>, GraphPruneRecord)>,
     pub has_more_due: bool,
     pub next_due_ms: Option<u64>,
