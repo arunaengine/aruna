@@ -35,9 +35,11 @@ use crate::auth::enforcement::{policy_reads, read_policies};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::placement::policy::{PolicySetError, PolicySetResolver, Resolutions, ResolveMode};
+use crate::plugins::screen::{ScreenError, ScreenTask, named_install, tagged};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
 use aruna_core::operation::Operation;
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::types::Value;
 
 /// Tag that pins the container network mode, shared with the executor path.
@@ -86,6 +88,7 @@ enum PlanStep {
     Policies,
     PolicyRows,
     Grant(NodeId),
+    Screen,
 }
 
 /// Builds and runs one planning round: the advertisement of every member, the pinned inputs
@@ -155,9 +158,17 @@ impl BuildPlanOperation {
         Ok(Next::Call(IoCall::child(resolve)))
     }
 
-    /// The nodes a candidate may run on, then the request policy rows of the group.
+    /// The nodes a candidate may run on, then the request policy rows of the group. A plugin
+    /// task passes the replicated task check instead of group WRITE: its account holds only
+    /// the scoped grants.
     fn targets(&mut self) -> PlanNext {
         let spec = &self.round.spec;
+        if tagged(&spec.payload).is_some() {
+            let config = std::sync::Arc::new(self.round.config.clone());
+            let task = (&spec.payload, spec.created_by, spec.ingress_node_id);
+            self.step = PlanStep::Screen;
+            return Ok(Next::Call(IoCall::child(ScreenTask::new(config, task))));
+        }
         let existing = ids::workspace_of(&spec.payload).0 == WorkspaceMode::Existing;
         let mut targets: Vec<NodeId> = self
             .documents
@@ -226,7 +237,13 @@ impl BuildPlanOperation {
         let policies = std::mem::take(&mut self.policies);
         let request = plan_request(&round.spec, inputs, output_policies, policies, round.now_ms)?;
         let mut planner = Planner::new(&request, &round.config.compute)?;
-        let scan = candidates(round, &self.documents, &self.allowed, &mut planner)?;
+        let pinned = plugin_target(&round.config, &round.spec);
+        let scan = candidates(
+            round,
+            &self.documents,
+            (&self.allowed, pinned),
+            &mut planner,
+        )?;
         debug!(
             pages = scan.pages,
             scanned = scan.scanned,
@@ -277,6 +294,13 @@ impl Operation for BuildPlanOperation {
                 let values = row_values(result)?;
                 self.judge_policies(values);
                 self.grant()
+            }
+            PlanStep::Screen => {
+                // Only the install's receiver may run the task, and only while it passes.
+                if let Ok(install) = result.child::<PluginInstall, ScreenError>()? {
+                    self.allowed.insert(install.receiver, true);
+                }
+                self.finish()
             }
             PlanStep::Grant(node) => {
                 let values = row_values(result)?;
@@ -363,10 +387,18 @@ struct Scan {
 /// One candidate per advertised backend, screened in pages of at most
 /// [`MAX_TARGET_SCAN`]. A document may only describe a backend, never its own
 /// standing; eligibility is decided by the planner over the whole scan.
+/// For a plugin task, the only node it may run on: its install's receiver, or `None` when the
+/// install is gone. `None` for an ordinary job.
+fn plugin_target(config: &RealmConfigDocument, spec: &LogicalJobSpec) -> Option<Option<NodeId>> {
+    let tagged = tagged(&spec.payload)?;
+    let install = tagged.and_then(|tagged| named_install(config, tagged));
+    Some(install.ok().map(|install| install.receiver))
+}
+
 fn candidates(
     round: &PlanRound,
     documents: &BTreeMap<NodeId, NodeInfoDocument>,
-    allowed: &BTreeMap<NodeId, bool>,
+    (allowed, pinned): (&BTreeMap<NodeId, bool>, Option<Option<NodeId>>),
     planner: &mut Planner<'_>,
 ) -> Result<Scan, PlanBuildError> {
     let (config, spec, excluded) = (&round.config, &round.spec, &round.excluded);
@@ -381,6 +413,10 @@ fn candidates(
         if ids::workspace_of(&spec.payload).0 == WorkspaceMode::Existing
             && *node_id != spec.ingress_node_id
         {
+            continue;
+        }
+        // A plugin task runs only on its install's receiver, whichever holder plans it.
+        if pinned.is_some_and(|pinned| pinned != Some(*node_id)) {
             continue;
         }
         let Some(kind) = node_kind(config, *node_id) else {
@@ -689,7 +725,7 @@ mod tests {
         let scan = candidates(
             &round(config, &spec, &[]),
             &read,
-            &BTreeMap::new(),
+            (&BTreeMap::new(), None),
             &mut planner,
         )
         .expect("every page continues the scan");
@@ -739,7 +775,7 @@ mod tests {
         let scan = candidates(
             &round(&config, &spec, &[]),
             &read,
-            &BTreeMap::new(),
+            (&BTreeMap::new(), None),
             &mut planner,
         )
         .expect("every page continues the scan");
@@ -774,7 +810,7 @@ mod tests {
         let scan = candidates(
             &round(&config, &spec, &excluded),
             &read,
-            &BTreeMap::new(),
+            (&BTreeMap::new(), None),
             &mut planner,
         )
         .expect("every page continues the scan");

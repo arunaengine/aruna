@@ -50,6 +50,7 @@ use crate::jobs::records::pages::{
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::submit::{mint_configured_job, schedule_drain_effect};
+use crate::plugins::screen::tagged;
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -182,6 +183,9 @@ pub(crate) fn classify(error: &LifecycleError) -> CommitVerdict {
         | LifecycleError::Store(_)
         | LifecycleError::IdempotencyConflict { .. }
         | LifecycleError::QuotaDenied(_)
+        | LifecycleError::AdmissionClosed
+        // The next offer's task check refuses an ended task for good.
+        | LifecycleError::TaskEnded
         | LifecycleError::NotFinished
         | LifecycleError::UnexpectedEvent { .. } => CommitVerdict::Faulted,
     }
@@ -749,6 +753,9 @@ impl AdmitLaunchOperation {
             subject_digest: prepared.subject_digest,
             record: Box::new(prepared.record),
             now_ms: node.now_ms,
+            fence: tagged(&spec.payload)
+                .and_then(Result::ok)
+                .map(|task| (task.install_id, task.work_id)),
         };
         let commit = CommitReceiptOperation::new(config, intent);
         self.call(AdmitStep::Commit, IoCall::child(commit))

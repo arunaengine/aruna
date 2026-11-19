@@ -115,6 +115,7 @@ pub(super) fn config(
         subject_digest: receipt.subject_digest,
         record: Box::new(record),
         now_ms: 4_000,
+        fence: None,
     }
 }
 

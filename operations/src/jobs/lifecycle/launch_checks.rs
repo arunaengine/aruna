@@ -36,6 +36,9 @@ use crate::placement::policy::{
     GateContext, GateContextError, GateOperation, PolicySetError, PolicySetResolver, Resolutions,
     ResolveMode,
 };
+use crate::plugins::screen::{AdmitTask, ScreenError, ScreenTask, tagged};
+use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::structs::execution::job::JobFamilyId;
 
 /// What a check answers: the capability that runs the launch, or why this target refuses it.
 pub(crate) type Verdict = Result<ExecutorCapability, LaunchDecline>;
@@ -221,6 +224,9 @@ pub(crate) enum CheckError {
     Io(#[from] IoError),
     #[error("the governed-data gate is unavailable: {0}")]
     Gate(String),
+    /// A plugin task's work is not adopted yet, or its install cannot be checked now.
+    #[error("{0}")]
+    Task(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -228,6 +234,7 @@ enum CheckStep {
     Capability,
     Gate,
     Grant,
+    Task,
     Policies,
 }
 
@@ -304,6 +311,24 @@ impl LaunchChecksOperation {
         evaluator.evaluate(&request).is_ok()
     }
 
+    /// A plugin task passes the receiver's task check instead of group WRITE: its install, its
+    /// account, the grants and the work row that adopted this launch's family.
+    fn task(&mut self) -> CheckNext {
+        let spec = &self.check.spec;
+        let config = std::sync::Arc::new(self.check.config.clone());
+        let screen = ScreenTask::new(
+            config,
+            (&spec.payload, spec.created_by, spec.ingress_node_id),
+        );
+        let family = JobFamilyId {
+            submission_id: spec.submission_id,
+            request_digest: spec.request_digest,
+        };
+        let admit = AdmitTask::new(screen, (self.check.local, family));
+        self.step = CheckStep::Task;
+        Ok(Next::Call(IoCall::child(admit)))
+    }
+
     /// Checks every pin against the stored spec, then resolves the policies it names. Refs of
     /// an input this target cannot resolve yet are enforced again when the bytes are staged.
     fn policies(&mut self) -> CheckNext {
@@ -372,6 +397,7 @@ impl Operation for LaunchChecksOperation {
                         Ok(Next::Done(Err(LaunchDecline::Draining)))
                     }
                     Err(error) => Err(CheckError::Gate(error.to_string())),
+                    Ok(_) if tagged(&self.check.spec.payload).is_some() => self.task(),
                     Ok(_) => self.grant(),
                 }
             }
@@ -386,6 +412,14 @@ impl Operation for LaunchChecksOperation {
                 }
                 self.policies()
             }
+            CheckStep::Task => match result.child::<PluginInstall, ScreenError>()? {
+                Ok(_) => self.policies(),
+                // A launch before its work is adopted is asked again, never declined for good.
+                Err(error @ (ScreenError::Pending | ScreenError::Unavailable(_))) => {
+                    Err(CheckError::Task(error.to_string()))
+                }
+                Err(_) => Ok(Next::Done(Err(LaunchDecline::Unauthorized))),
+            },
             CheckStep::Policies => {
                 let policies = result.child::<Resolutions, PolicySetError>()?;
                 let policies = policies.unwrap_or_default();
