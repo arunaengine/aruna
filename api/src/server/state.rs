@@ -25,6 +25,7 @@ use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_operations::metadata::api::node_fanout::DiscoveryOperation;
 use aruna_operations::node::api_state::{LoadStateOperation, SaveStateOperation, StateError};
 use aruna_operations::onboarding::issue_ticket::{
     IssueSyncInput, IssueSyncOperation, TICKET_TTL_SECS,
@@ -558,12 +559,12 @@ impl ServerState {
     }
 
     pub async fn load_realm_nodes(&self) -> Vec<NodeId> {
-        aruna_operations::metadata::api::preflight::load_realm_nodes(
-            self.driver_ctx.as_ref(),
-            self.identity.realm_id,
-            self.identity.node_id,
-        )
-        .await
+        let (realm_id, node_id) = (self.identity.realm_id, self.identity.node_id);
+        let discovery = DiscoveryOperation::new(realm_id, node_id);
+        match drive(discovery, self.driver_ctx.as_ref()).await {
+            Ok(discovery) => discovery.nodes,
+            Err(_) => vec![node_id],
+        }
     }
 
     pub async fn get_oidc_provider(

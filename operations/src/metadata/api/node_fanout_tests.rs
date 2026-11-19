@@ -223,3 +223,66 @@ fn deadline_bounds_peers() {
         }
     );
 }
+
+/// More realm nodes than the fanout cap, this node first.
+fn many_nodes() -> Vec<NodeId> {
+    (0..=QUERY_MAX_NODES as u8)
+        .map(|index| node(60 + index))
+        .collect()
+}
+
+fn capped(skip: Vec<NodeId>, partial: bool) -> NodeFanoutOperation<Numbers> {
+    let nodes = many_nodes();
+    let scope = MetadataFanoutScope::new(
+        Some(ApiQueryMode::Distributed),
+        Some(nodes.clone()),
+        partial,
+    )
+    .with_skip(skip);
+    let label = MetadataFanoutOperation::BucketSearch;
+    let mut fanout =
+        NodeFanoutOperation::new((realm(), nodes[0]), scope, label, Numbers, map_read_error);
+    fanout.stamp(1_000);
+    fanout
+}
+
+/// The nodes a capped fanout asked, answered each with a number.
+fn asked(fanout: &mut NodeFanoutOperation<Numbers>) -> Vec<NodeId> {
+    let members = group(fanout.first()).members.len();
+    let FanoutStage::Nodes(nodes) = &fanout.stage else {
+        panic!("expected the node group");
+    };
+    assert_eq!(nodes.len(), members);
+    nodes.clone()
+}
+
+#[test]
+fn capped_fanout_incomplete() {
+    // A cut node set must not reach a caller that refused partial results as complete.
+    let mut fanout = capped(Vec::new(), false);
+    let nodes = asked(&mut fanout);
+    let answers = nodes.iter().map(|_| answer(Ok(1))).collect();
+    assert!(matches!(
+        fanout.next(finished(answers)),
+        Err(MetadataApiError::ServiceUnavailable)
+    ));
+}
+
+#[test]
+fn names_capped_nodes() {
+    // The nodes the cap leaves out are named, and skipping the asked ones reaches them next.
+    let mut fanout = capped(Vec::new(), true);
+    let first = asked(&mut fanout);
+    assert_eq!(first.len(), QUERY_MAX_NODES);
+    let answers = first.iter().map(|_| answer(Ok(1))).collect();
+    let Ok(Next::Done((_, stats))) = fanout.next(finished(answers)) else {
+        panic!("expected a partial answer");
+    };
+    let [left_out] = stats.omitted[..] else {
+        panic!("one node is left out: {:?}", stats.omitted);
+    };
+    assert!(!first.contains(&left_out));
+    let mut next = capped(first, true);
+    let second = asked(&mut next);
+    assert!(second.contains(&left_out));
+}

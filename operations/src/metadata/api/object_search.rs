@@ -19,12 +19,11 @@ use tracing::Span;
 
 use super::distributed_types::record_object_result;
 use super::fanout_types::{
-    MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats, RealmNodeDiscovery,
-    fanout_bearer,
+    MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats, fanout_bearer,
 };
 use super::node_fanout::{
-    DiscoveryOperation, FanoutParts, NodeCalls, NodeFanoutOperation, child_part, member_child,
-    peer_answer, peer_request,
+    FanoutParts, NodeCalls, NodeFanoutOperation, child_part, discovery_answer, discovery_call,
+    member_child, peer_answer, peer_request,
 };
 use super::path_types::deduplicate_fanout_nodes;
 use super::search::{
@@ -409,17 +408,12 @@ impl Operation for ObjectSearchOperation {
             (None, _, Some(nodes)) => self.fresh((deduplicate_fanout_nodes(nodes), false)),
             (None, _, None) => {
                 self.stage = ObjectStage::Discovery;
-                let discovery = DiscoveryOperation::new(self.realm_id, self.local_node);
-                let member = Effect::SubOperation(boxed_suboperation(discovery, |result| {
-                    Event::Child(ChildOutcome::new(result))
-                }));
-                Ok(Next::Call(IoCall::Group(EffectGroup {
-                    members: vec![member],
-                    limit: 1,
-                    form: GroupForm::All {
-                        deadline: Some(self.remaining()),
-                    },
-                })))
+                let wait = self.remaining();
+                Ok(Next::Call(discovery_call(
+                    self.realm_id,
+                    self.local_node,
+                    wait,
+                )))
             }
         }
     }
@@ -438,17 +432,8 @@ impl Operation for ObjectSearchOperation {
                 self.resumed(&raw, &signers)
             }
             ObjectStage::Discovery => {
-                let found = match result {
-                    IoResult::Group(GroupEvent::Finished { results }) => results
-                        .into_iter()
-                        .next()
-                        .and_then(member_child::<RealmNodeDiscovery, MetadataApiError>),
-                    _ => None,
-                };
-                match found {
-                    Some(Ok(discovery)) => self.fresh((discovery.nodes, discovery.failed)),
-                    _ => self.fresh((vec![self.local_node], true)),
-                }
+                let discovery = discovery_answer(result, self.local_node);
+                self.fresh((discovery.nodes, discovery.failed))
             }
             ObjectStage::Fanout(partitions) => {
                 let parts = result.child::<FanoutParts<SearchNodePage>, MetadataApiError>()??;

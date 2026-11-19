@@ -63,14 +63,14 @@ enum DiscoveryStage {
 /// An unreadable config, a failed or late presence lookup, or invalid node ids leave this node
 /// alone and mark the discovery as failed.
 #[derive(Debug, PartialEq)]
-pub(crate) struct DiscoveryOperation {
+pub struct DiscoveryOperation {
     realm_id: RealmId,
     local_node: NodeId,
     stage: DiscoveryStage,
 }
 
 impl DiscoveryOperation {
-    pub(crate) fn new(realm_id: RealmId, local_node: NodeId) -> Self {
+    pub fn new(realm_id: RealmId, local_node: NodeId) -> Self {
         Self {
             realm_id,
             local_node,
@@ -163,6 +163,34 @@ impl Operation for DiscoveryOperation {
                 Ok(Next::Done(self.discovered(&config, presence)))
             }
         }
+    }
+}
+
+/// The realm's discovery as one group member bounded by `wait`.
+pub(super) fn discovery_call(realm_id: RealmId, local_node: NodeId, wait: Duration) -> IoCall {
+    IoCall::Group(EffectGroup {
+        members: vec![child_member(DiscoveryOperation::new(realm_id, local_node))],
+        limit: 1,
+        form: GroupForm::All {
+            deadline: Some(wait),
+        },
+    })
+}
+
+/// The discovery a [`discovery_call`] answered; one that failed or ran late leaves this node
+/// alone and marks the discovery as failed.
+pub(super) fn discovery_answer(result: IoResult, local_node: NodeId) -> RealmNodeDiscovery {
+    let found = match result {
+        IoResult::Group(GroupEvent::Finished { results }) => (results.into_iter().next())
+            .and_then(member_child::<RealmNodeDiscovery, MetadataApiError>),
+        _ => None,
+    };
+    match found {
+        Some(Ok(discovery)) => discovery,
+        _ => RealmNodeDiscovery {
+            nodes: vec![local_node],
+            failed: true,
+        },
     }
 }
 

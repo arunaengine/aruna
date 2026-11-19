@@ -21,7 +21,7 @@ use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::MetadataApiError;
-use aruna_operations::metadata::api::preflight::load_realm_nodes;
+use aruna_operations::metadata::api::node_fanout::DiscoveryOperation;
 use aruna_operations::metadata::api::read::query_metadata as run_query_metadata;
 use aruna_operations::metadata::api::read_types::{ApiQueryMode, MetadataQueryRequest};
 use aruna_operations::metadata::api::search_fanout::search_metadata as run_search_metadata;
@@ -84,7 +84,9 @@ use tempfile::TempDir;
 
 async fn state_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
     let ctx = state.get_ctx();
-    Ok(load_realm_nodes(ctx.as_ref(), state.get_realm_id(), state.get_node_id()).await)
+    let discovery = DiscoveryOperation::new(state.get_realm_id(), state.get_node_id());
+    let discovery = drive(discovery, ctx.as_ref()).await;
+    Ok(discovery.map_or_else(|_| vec![state.get_node_id()], |discovery| discovery.nodes))
 }
 
 pub(crate) struct TestState {

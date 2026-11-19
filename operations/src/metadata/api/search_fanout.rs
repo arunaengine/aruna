@@ -9,9 +9,9 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::cursor::SEARCH_CURSOR_CONTEXT;
-use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
-use aruna_core::events::{Event, GroupEvent, NetEvent};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::metadata::{AuthToken, MetadataEffect, MetadataEvent, MetadataSearchHit};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::rows::event;
@@ -26,7 +26,7 @@ use super::fanout_types::{
     fanout_bearer,
 };
 use super::node_fanout::{
-    DiscoveryOperation, FanoutParts, NodeCalls, NodeFanoutOperation, member_child,
+    FanoutParts, NodeCalls, NodeFanoutOperation, discovery_answer, discovery_call,
 };
 use super::path_types::{deduplicate_fanout_nodes, select_fanout_nodes};
 use super::search_types::{MetadataSearchExecution, MetadataSearchRequest};
@@ -333,32 +333,15 @@ impl MetadataSearchOperation {
         discovery: Option<RealmNodeDiscovery>,
     ) -> Result<Next<MetadataSearchExecution>, MetadataApiError> {
         let raw = self.request.cursor.as_deref().unwrap_or_default();
-        let cursor = SearchCursor::decode(raw, &signers)
-            .map_err(|error| MetadataApiError::InvalidCursor(error.to_string()))?;
-        if cursor.fingerprint != self.fingerprint {
-            return Err(MetadataApiError::InvalidCursor(
-                SearchCursorError::QueryMismatch.to_string(),
-            ));
-        }
-        self.watermark = Some(cursor.payload.watermark.clone());
-        self.resume = cursor.resume_positions();
-        // Keep resumed nodes in the bounded selection so remaining hits are not silently
-        // discarded when discovery changes.
-        let mut nodes = match (self.request.target_nodes.as_ref(), self.mode()) {
-            (Some(nodes), _) => select_fanout_nodes(nodes, self.local_node, &self.fingerprint),
-            (None, ApiQueryMode::Local) => vec![self.local_node],
-            (None, ApiQueryMode::Distributed) => (discovery.as_ref()).map_or_else(
-                || vec![self.local_node],
-                |discovery| discovery.nodes.clone(),
-            ),
-        };
-        for node_id in self.resume.keys() {
-            if !nodes.contains(node_id) {
-                nodes.push(*node_id);
-            }
-        }
-        let failed = discovery.is_some_and(|discovery| discovery.failed);
-        self.fanout(Some(deduplicate_fanout_nodes(nodes)), failed)
+        let asked = (
+            self.request.target_nodes.as_deref(),
+            self.mode(),
+            self.local_node,
+        );
+        let resumed = resume_cursor((raw, &signers), self.fingerprint, asked, discovery)?;
+        self.watermark = Some(resumed.watermark);
+        self.resume = resumed.resume;
+        self.fanout(Some(resumed.nodes), resumed.discovery_failed)
     }
 
     fn fanout(
@@ -463,17 +446,12 @@ impl Operation for MetadataSearchOperation {
             (ApiQueryMode::Distributed, Some(nodes)) => nodes,
             (ApiQueryMode::Distributed, None) => {
                 self.stage = SearchStage::Discovery;
-                let discovery = DiscoveryOperation::new(self.realm_id, self.local_node);
-                let member = Effect::SubOperation(boxed_suboperation(discovery, |result| {
-                    Event::Child(ChildOutcome::new(result))
-                }));
-                return Ok(Next::Call(IoCall::Group(EffectGroup {
-                    members: vec![member],
-                    limit: 1,
-                    form: GroupForm::All {
-                        deadline: Some(self.remaining()),
-                    },
-                })));
+                let wait = self.remaining();
+                return Ok(Next::Call(discovery_call(
+                    self.realm_id,
+                    self.local_node,
+                    wait,
+                )));
             }
         };
         signers.push(self.local_node);
@@ -487,28 +465,9 @@ impl Operation for MetadataSearchOperation {
         match std::mem::replace(&mut self.stage, SearchStage::Start) {
             SearchStage::Start => Err(MetadataApiError::Internal("search not started".to_string())),
             SearchStage::Discovery => {
-                let found = match result {
-                    IoResult::Group(GroupEvent::Finished { results }) => results
-                        .into_iter()
-                        .next()
-                        .and_then(member_child::<RealmNodeDiscovery, MetadataApiError>),
-                    _ => None,
-                };
-                let discovery = match found {
-                    Some(Ok(discovery)) => discovery,
-                    _ => RealmNodeDiscovery {
-                        nodes: vec![self.local_node],
-                        failed: true,
-                    },
-                };
-                let mut signers = discovery.nodes.clone();
-                signers.push(self.local_node);
-                let nodes =
-                    select_fanout_nodes(&discovery.nodes, self.local_node, &self.fingerprint);
-                let discovery = RealmNodeDiscovery {
-                    nodes,
-                    failed: discovery.failed,
-                };
+                let discovery = discovery_answer(result, self.local_node);
+                let (signers, discovery) =
+                    cursor_signers(discovery, self.local_node, &self.fingerprint);
                 self.resumed(signers, Some(discovery))
             }
             SearchStage::Fanout => {
@@ -539,6 +498,69 @@ impl Operation for MetadataSearchOperation {
             }
         }
     }
+}
+
+/// What a signed search cursor resumes: its watermark, each node's position, and the nodes to
+/// ask, which keep every node it resumes.
+pub(super) struct Resumed {
+    pub(super) watermark: SearchWatermark,
+    pub(super) resume: HashMap<NodeId, u32>,
+    pub(super) nodes: Vec<NodeId>,
+    pub(super) discovery_failed: bool,
+}
+
+/// Reads `raw`, signed by one of `signers` for `fingerprint`, and picks the nodes to ask: the
+/// requested ones, this node alone in local mode, or the discovered ones.
+pub(super) fn resume_cursor(
+    (raw, signers): (&str, &[NodeId]),
+    fingerprint: [u8; 32],
+    (requested, mode, local_node): (Option<&[NodeId]>, ApiQueryMode, NodeId),
+    discovery: Option<RealmNodeDiscovery>,
+) -> Result<Resumed, MetadataApiError> {
+    let cursor = SearchCursor::decode(raw, signers)
+        .map_err(|error| MetadataApiError::InvalidCursor(error.to_string()))?;
+    if cursor.fingerprint != fingerprint {
+        return Err(MetadataApiError::InvalidCursor(
+            SearchCursorError::QueryMismatch.to_string(),
+        ));
+    }
+    let resume = cursor.resume_positions();
+    // Keep resumed nodes in the bounded selection so remaining hits are not silently
+    // discarded when discovery changes.
+    let mut nodes = match (requested, mode) {
+        (Some(nodes), _) => select_fanout_nodes(nodes, local_node, &fingerprint),
+        (None, ApiQueryMode::Local) => vec![local_node],
+        (None, ApiQueryMode::Distributed) => (discovery.as_ref())
+            .map_or_else(|| vec![local_node], |discovery| discovery.nodes.clone()),
+    };
+    for node_id in resume.keys() {
+        if !nodes.contains(node_id) {
+            nodes.push(*node_id);
+        }
+    }
+    Ok(Resumed {
+        watermark: cursor.payload.watermark.clone(),
+        resume,
+        nodes: deduplicate_fanout_nodes(nodes),
+        discovery_failed: discovery.is_some_and(|discovery| discovery.failed),
+    })
+}
+
+/// The nodes that may have signed a cursor, the whole realm since a capped fanout may omit the
+/// signer, and the bounded selection of the discovered nodes to ask.
+pub(super) fn cursor_signers(
+    discovery: RealmNodeDiscovery,
+    local_node: NodeId,
+    fingerprint: &[u8; 32],
+) -> (Vec<NodeId>, RealmNodeDiscovery) {
+    let mut signers = discovery.nodes.clone();
+    signers.push(local_node);
+    let nodes = select_fanout_nodes(&discovery.nodes, local_node, fingerprint);
+    let selected = RealmNodeDiscovery {
+        nodes,
+        failed: discovery.failed,
+    };
+    (signers, selected)
 }
 
 #[cfg(test)]
