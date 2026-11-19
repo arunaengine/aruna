@@ -70,7 +70,8 @@ fn expect<T>(
     take: impl FnOnce(NotificationTransportMessage) -> Result<T, NotificationTransportMessage>,
 ) -> Result<T, String> {
     match answer.map_err(|error| error.0)? {
-        NotificationTransportMessage::Reject(reason) => Err(reason),
+        NotificationTransportMessage::Reject(reason)
+        | NotificationTransportMessage::Unavailable(reason) => Err(reason),
         other => take(other).map_err(|_| "unexpected notification response".to_string()),
     }
 }

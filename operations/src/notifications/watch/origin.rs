@@ -19,7 +19,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::notifications::client::{HolderRequestOperation, RemoteError, events_delivered};
+use crate::notifications::client::{HolderRequestOperation, RemoteError};
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::unexpected_event;
 use crate::notifications::watch::digest::{InterestError, InterestOperation};
@@ -83,6 +83,8 @@ impl EmitWatchOperation {
             }
             Err(error) => {
                 warn!(%error, "Failed to scan local watch subscriptions while emitting event");
+                // A realm without a config holds no watches here; any other failure may pass.
+                self.unsettled |= !matches!(error, GetConfigError::DocumentNotFound);
                 self.deliver()
             }
         }
@@ -104,6 +106,7 @@ impl EmitWatchOperation {
             }
             Err(error) => {
                 warn!(%error, "Failed to scan local watch subscriptions while emitting event");
+                self.unsettled = true;
                 self.config = None;
                 return self.deliver();
             }
@@ -115,6 +118,7 @@ impl EmitWatchOperation {
             Ok(held) => held,
             Err(error) => {
                 warn!(%error, "Failed to scan local watch subscriptions while emitting event");
+                self.unsettled = true;
                 self.config = None;
                 return self.deliver();
             }
@@ -240,12 +244,16 @@ impl Operation for EmitWatchOperation {
                 self.next_holder()
             }
             EmitState::Forward(holder) => {
-                let answer = result.child::<NotificationTransportMessage, RemoteError>()?;
-                // A holder that answered, even with a refusal, settles; one not reached does not.
-                let unreached = answer.is_err();
-                if let Err(error) = events_delivered(answer) {
-                    warn!(holder = %holder, %error, "Failed to forward watch event to remote holder");
-                    self.unsettled |= unreached;
+                // Only an ack or a lasting refusal settles the holder; anything else is retried.
+                match result.child::<NotificationTransportMessage, RemoteError>()? {
+                    Ok(NotificationTransportMessage::WatchEventsAck { .. }) => {}
+                    Ok(NotificationTransportMessage::Reject(reason)) => {
+                        warn!(holder = %holder, %reason, "A remote holder refused the watch event");
+                    }
+                    other => {
+                        warn!(%holder, answer = ?other, "Watch event not forwarded; retried");
+                        self.unsettled = true;
+                    }
                 }
                 self.next_holder()
             }

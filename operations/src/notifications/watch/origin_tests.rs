@@ -6,6 +6,7 @@
 use super::*;
 use crate::tests::locations::node_id;
 use crate::tests::notifications::user;
+use aruna_core::errors::StorageError;
 use aruna_core::structs::execution::notification::InboxWriteOutcome;
 use aruna_core::structs::execution::notification_watch::{
     WatchEventDetail, WatchEventKind, WatchEventMask, WatchSubscription, watch_resource_path,
@@ -68,6 +69,35 @@ fn remote_forward_only() {
     assert_eq!(emit.state, EmitState::Forward(node_id(2)));
     let failed = child::<NotificationTransportMessage, _>(Err(RemoteError("down".into())));
     assert_eq!(emit.next(failed), Ok(Next::Done(false)));
+}
+
+/// A holder that cannot take the event now, or answers anything but an ack, leaves it open.
+#[test]
+fn unavailable_reply_unsettled() {
+    for answer in [
+        NotificationTransportMessage::Unavailable("busy".into()),
+        NotificationTransportMessage::WatchDeleted,
+    ] {
+        let mut emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), vec![node_id(2)]);
+        emit.first().unwrap();
+        let unread = child::<RealmConfigDocument, _>(Err(GetConfigError::DocumentNotFound));
+        emit.next(unread).unwrap();
+        let answer = child::<_, RemoteError>(Ok(answer));
+        assert_eq!(emit.next(answer), Ok(Next::Done(false)));
+    }
+}
+
+/// A local discovery that failed, here the config read, leaves the event open even when every
+/// remote holder took it.
+#[test]
+fn failed_discovery_unsettled() {
+    let mut emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), vec![node_id(2)]);
+    emit.first().unwrap();
+    let failed = GetConfigError::StorageError(StorageError::Timeout);
+    emit.next(child::<RealmConfigDocument, _>(Err(failed))).unwrap();
+    let acked = NotificationTransportMessage::WatchEventsAck { written: 1 };
+    let acked = child::<_, RemoteError>(Ok(acked));
+    assert_eq!(emit.next(acked), Ok(Next::Done(false)));
 }
 
 /// A holder that refuses the event settles it: a refusal does not pass on a later run.

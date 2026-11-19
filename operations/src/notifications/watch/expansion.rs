@@ -57,6 +57,8 @@ impl From<IoError> for ExpandError {
             IoError::Conflict | IoError::Storage(StorageError::TransactionConflict) => {
                 Self::Conflict
             }
+            // A full queue or a timeout passes on a later delivery; only a lasting fault is fatal.
+            IoError::Storage(error) if error.is_transient() => Self::Io(IoError::Storage(error)),
             IoError::Storage(error) => Self::Fatal(error.to_string()),
             error => Self::Io(error),
         }
