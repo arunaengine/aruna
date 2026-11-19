@@ -13,7 +13,7 @@ use aruna_core::operation::Operation;
 use aruna_core::types::Key;
 use tracing::warn;
 
-use crate::metadata::after_sync::{AfterSyncOperation, MetadataTimings};
+use crate::metadata::after_sync::{AfterSyncError, AfterSyncOperation, MetadataTimings};
 use crate::node::summary_refresh::{RefreshUsageError, RefreshUsageOperation};
 use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
@@ -111,11 +111,7 @@ impl AppliedDrainOperation {
             AppliedStep::Mail => IoCall::child(RefreshMailOperation::applied(targets)),
             AppliedStep::Metadata => {
                 let result = std::mem::take(&mut applied.result);
-                IoCall::child(AfterSyncOperation::new(
-                    Some(applied.node_id),
-                    result,
-                    false,
-                ))
+                IoCall::child(AfterSyncOperation::new(Some(applied.node_id), result))
             }
         };
         self.step = DrainStep::Run(step);
@@ -176,7 +172,7 @@ impl Operation for AppliedDrainOperation {
                     AppliedStep::Interest => error_text(result.child::<(), IoError>()?),
                     AppliedStep::Mail => error_text(result.child::<(), IoError>()?),
                     AppliedStep::Metadata => {
-                        error_text(result.child::<MetadataTimings, IoError>()?)
+                        error_text(result.child::<MetadataTimings, AfterSyncError>()?)
                     }
                 };
                 if let Some(error) = failure {
@@ -263,7 +259,7 @@ mod tests {
             targets: targets(),
             ..DocumentReconcileResult::default()
         };
-        IoCall::child(AfterSyncOperation::new(Some(node()), result, false))
+        IoCall::child(AfterSyncOperation::new(Some(node()), result))
     }
 
     // The follow-ups run in order and each is stored once it succeeded; the row goes last.
@@ -297,7 +293,7 @@ mod tests {
         assert_eq!(turn, progress(realm_id, AppliedStep::Metadata));
         assert_eq!(drain.next(IoResult::Done), Ok(Next::Call(after_sync())));
         let timings = MetadataTimings::default();
-        let turn = drain.next(child::<_, IoError>(Ok(timings)));
+        let turn = drain.next(child::<_, AfterSyncError>(Ok(timings)));
         assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
         assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(None)));
     }
@@ -323,7 +319,8 @@ mod tests {
         let failed = RefreshUsageError::Io(IoError::Aborted);
         let turn = drain.next(child::<(), _>(Err(failed)));
         assert_eq!(turn, Ok(Next::Call(after_sync())));
-        let turn = drain.next(child::<MetadataTimings, _>(Err(IoError::Aborted)));
+        let aborted = AfterSyncError::Io(IoError::Aborted);
+        let turn = drain.next(child::<MetadataTimings, _>(Err(aborted)));
         assert_eq!(turn, Ok(Next::Done(Some(APPLIED_RETRY_AFTER))));
     }
 
@@ -336,7 +333,7 @@ mod tests {
         let row = applied(Some(realm()), AppliedStep::Metadata);
         assert_eq!(drain.next(queued(&row)), Ok(Next::Call(after_sync())));
         let timings = MetadataTimings::default();
-        let turn = drain.next(child::<_, IoError>(Ok(timings)));
+        let turn = drain.next(child::<_, AfterSyncError>(Ok(timings)));
         assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
     }
 

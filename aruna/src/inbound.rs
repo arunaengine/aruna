@@ -525,7 +525,7 @@ async fn reconcile_inbound_topics(
     if let Err(error) = drive(refresh, context).await {
         warn!(%error, "Watch interest refresh stopped after a document sync");
     }
-    let after = AfterSyncOperation::new(Some(net_handle.node_id()), targets, true);
+    let after = AfterSyncOperation::new(Some(net_handle.node_id()), targets);
     let timings = drive(after, context).await.unwrap_or_default();
     info!(
         event = "pipeline.reconcile.summary",

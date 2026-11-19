@@ -201,12 +201,18 @@ fn events_wake_recipients() {
         }))
     );
 
-    let mut failed =
-        WatchEventsOperation::new(peer_input(), vec![watch_event(user(1, 2).realm_id)]);
-    failed.state = EventsState::Expand;
+    // An expansion that may pass later answers unavailable, so the sender keeps the events;
+    // only a fatal one is refused.
+    let expanding = || {
+        let events = vec![watch_event(user(1, 2).realm_id)];
+        let mut operation = WatchEventsOperation::new(peer_input(), events);
+        operation.state = EventsState::Expand;
+        operation
+    };
     let conflict = child::<ExpandOutcome, _>(Err(ExpandError::Conflict));
-    assert_eq!(
-        rejected(failed.next(conflict)),
-        ExpandError::Conflict.to_string()
-    );
+    let reason = ExpandError::Conflict.to_string();
+    let unavailable = NotificationTransportMessage::Unavailable(reason);
+    assert_eq!(expanding().next(conflict), Ok(Next::Done(unavailable)));
+    let fatal = child::<ExpandOutcome, _>(Err(ExpandError::Fatal("cap".to_string())));
+    assert_eq!(rejected(expanding().next(fatal)), "cap");
 }

@@ -6,7 +6,6 @@ use super::super::fixtures::{actor, child, config_target, config_topic, realm};
 use super::*;
 use crate::document::DocumentEvent;
 use crate::structs::sync_quarantine::SyncQuarantineIdentity;
-use ulid::Ulid;
 
 type Answer = Result<Next<DocumentReconcileResult>, ApplyError>;
 
@@ -203,45 +202,32 @@ fn writes_batch_cursor() {
     assert_eq!(result.targets, vec![config_target()]);
 }
 
-// A pull that queues follow-ups stores what a batch applied before its cursor moves, so a crash
-// between the two never loses them, and gives the creates plan the row for accepted creates.
+// A pull that queues follow-ups hands its node to each batch and to the creates plan, which
+// store them with each apply; the cursor then moves without a separate follow-up write.
 #[test]
 fn queues_followups_first() {
-    let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+    let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
+    let node = FollowUpNode {
+        node_id,
+        realm_id: realm(),
+    };
     let pass = ReconcileTopicsOperation::new(realm(), vec![config_topic()]);
-    let mut pass = pass.queuing_followups(node);
-    pass.stamp(1_000);
-    pass.seed(7);
+    let mut pass = pass.queuing_followups(node_id);
     pass.first().unwrap();
     pass.next(child(work(&[config_topic()]))).unwrap();
     pass.next(IoResult::Values(vec![None])).unwrap();
-    pass.next(batch_answer(Some(batch()))).unwrap();
+    let apply = ApplyBatchOperation::new(config_topic(), realm(), Vec::new(), Vec::new());
+    let apply = Ok(Next::Call(IoCall::child(apply.queuing(Some(node)))));
+    assert_eq!(pass.next(batch_answer(Some(batch()))), apply);
     let outcome = BatchOutcome {
         applied_targets: vec![config_target()],
         ..BatchOutcome::default()
     };
-    let mut applied = AppliedSync {
-        id: Ulid::from_parts(1_000, 7),
-        node_id: node,
-        realm_id: Some(realm()),
-        result: DocumentReconcileResult {
-            targets: vec![config_target()],
-            ..DocumentReconcileResult::default()
-        },
-        next: AppliedStep::Usage,
-    };
-    let row = applied_sync_entry(&applied).unwrap();
-    assert_eq!(
-        pass.next(child(outcome)),
-        Ok(Next::Call(IoCall::Write(vec![row])))
-    );
-    assert_eq!(pass.next(IoResult::Done), cursor_write());
+    assert_eq!(pass.next(child(outcome)), cursor_write());
     let deferred = DeferredTopics::new();
     assert_eq!(pass.next(IoResult::Done), deferred_write(&deferred));
-    applied.id = Ulid(applied.id.0 + 1);
-    applied.result = DocumentReconcileResult::default();
     let plan = CreateBatchPlan::new(Vec::new(), Vec::new(), Vec::new()).unwrap();
-    let plan = plan.queuing(Some(applied));
+    let plan = plan.queuing(Some(node));
     assert_eq!(pass.next(IoResult::Done), Ok(Next::Call(plan_call(plan))));
 }
 

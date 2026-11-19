@@ -496,6 +496,9 @@ pub enum NotificationTransportMessage {
     WatchEventsAck {
         written: u32,
     },
+    /// The holder could not take the request now and stored nothing; the sender keeps it and
+    /// tries again later, unlike after a `Reject`.
+    Unavailable(String),
 }
 
 impl NotificationTransportMessage {
@@ -518,6 +521,7 @@ impl NotificationTransportMessage {
             NotificationTransportMessage::WatchList { .. } => "watch_list",
             NotificationTransportMessage::DeliverWatchEvents { .. } => "deliver_watch_events",
             NotificationTransportMessage::WatchEventsAck { .. } => "watch_events_ack",
+            NotificationTransportMessage::Unavailable(_) => "unavailable",
         }
     }
 }

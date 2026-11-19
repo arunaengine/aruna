@@ -9,8 +9,8 @@ use aruna_core::document::{DocumentReconcileResult, DocumentTarget};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use aruna_core::operation::Operation;
-use aruna_core::task::TaskKey;
-use tracing::{error, warn};
+use thiserror::Error;
+use tracing::error;
 
 use crate::metadata::projection::{
     LoggedProjection, MetadataProjectionError, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
@@ -34,13 +34,24 @@ enum SyncStage {
     Prune,
 }
 
-/// Projects the create events a reconcile applied, then queues prunes for deleted graphs. With
-/// `retry`, a failed projection arms the projection drain; otherwise it is only logged. Its
-/// timings come from the runner's clock.
+/// Why the metadata work after a sync must run again. A failed projection is not one: the
+/// projection drain takes it over, as its pending markers stay stored.
+#[derive(Debug, Error, PartialEq)]
+pub enum AfterSyncError {
+    #[error("the projection retry was not scheduled: {0:?}")]
+    Wake(MetadataProjectionError),
+    #[error("deleted metadata graphs were not queued for pruning: {0:?}")]
+    Prune(MetadataGraphError),
+    #[error(transparent)]
+    Io(#[from] IoError),
+}
+
+/// Projects the create events a reconcile applied, then queues prunes for deleted graphs. A
+/// failed projection arms the projection drain; only a failed handover or prune ends in an
+/// error, for a caller that retries. Its timings come from the runner's clock.
 #[derive(Debug, PartialEq)]
 pub struct AfterSyncOperation {
     node_id: Option<NodeId>,
-    retry: bool,
     targets: Vec<DocumentTarget>,
     events: Vec<MetadataEventRecord>,
     tombstones: Vec<GraphLifecycleRecord>,
@@ -54,7 +65,7 @@ pub struct AfterSyncOperation {
 }
 
 impl AfterSyncOperation {
-    pub fn new(node_id: Option<NodeId>, result: DocumentReconcileResult, retry: bool) -> Self {
+    pub fn new(node_id: Option<NodeId>, result: DocumentReconcileResult) -> Self {
         let DocumentReconcileResult {
             targets,
             metadata_create_events,
@@ -62,7 +73,6 @@ impl AfterSyncOperation {
         } = result;
         Self {
             node_id,
-            retry,
             targets,
             events: metadata_create_events,
             tombstones: metadata_graph_tombstones,
@@ -123,15 +133,17 @@ fn elapsed(from_ms: u64, to_ms: u64) -> Duration {
     Duration::from_millis(to_ms.saturating_sub(from_ms))
 }
 
+type SyncTurn = Result<Next<MetadataTimings>, AfterSyncError>;
+
 impl Operation for AfterSyncOperation {
     type Output = MetadataTimings;
-    type Error = IoError;
+    type Error = AfterSyncError;
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
     }
 
-    fn first(&mut self) -> Result<Next<MetadataTimings>, IoError> {
+    fn first(&mut self) -> SyncTurn {
         self.started_ms = self.now_ms;
         match self.project() {
             Some(call) => Ok(Next::Call(call)),
@@ -139,33 +151,25 @@ impl Operation for AfterSyncOperation {
         }
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<MetadataTimings>, IoError> {
+    fn next(&mut self, result: IoResult) -> SyncTurn {
         match self.stage {
             SyncStage::Project => {
                 let Some(projection) = self.projected(result)? else {
                     return Ok(self.prune());
                 };
-                if !self.retry {
-                    warn!(error = ?projection, "Failed to project restored metadata create events");
-                    return Ok(self.prune());
-                }
-                error!(error = ?projection, "Failed to project metadata create events after inbound document sync reconciliation");
+                error!(error = ?projection, "Create events not projected; handed to the drain");
                 self.stage = SyncStage::Wake;
                 let wake = ProjectionWakeOperation::new(PROJECTION_RETRY_AFTER);
                 Ok(Next::Call(IoCall::child(wake)))
             }
             SyncStage::Wake => {
-                if let Err(error) = result.child::<(), MetadataProjectionError>()? {
-                    warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to schedule metadata projection retry");
-                }
+                let woken = result.child::<(), MetadataProjectionError>()?;
+                woken.map_err(AfterSyncError::Wake)?;
                 Ok(self.prune())
             }
             SyncStage::Prune => {
-                if let Err(error) =
-                    result.child::<TombstoneProcessingResult, MetadataGraphError>()?
-                {
-                    warn!(error = ?error, "Failed to prune deleted metadata graphs");
-                }
+                let pruned = result.child::<TombstoneProcessingResult, MetadataGraphError>()?;
+                pruned.map_err(AfterSyncError::Prune)?;
                 self.timings.prune = elapsed(self.pruning_ms, self.now_ms);
                 Ok(Next::Done(self.timings))
             }
@@ -178,7 +182,7 @@ mod tests {
     use super::*;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
-    use aruna_core::task::PersistedTaskTimer;
+    use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_drivers::driver::DriverContext;
     use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
@@ -226,18 +230,7 @@ mod tests {
             metadata_graph_tombstones: Vec::new(),
         };
 
-        aruna_drivers::driver::drive(
-            AfterSyncOperation::new(None, result.clone(), false),
-            &context,
-        )
-        .await
-        .unwrap();
-        assert!(
-            read_timer(&storage, &TaskKey::DrainProjectionQueue)
-                .await
-                .is_none()
-        );
-        aruna_drivers::driver::drive(AfterSyncOperation::new(None, result, true), &context)
+        aruna_drivers::driver::drive(AfterSyncOperation::new(None, result), &context)
             .await
             .unwrap();
         let timer = read_timer(&storage, &TaskKey::DrainProjectionQueue)
@@ -264,7 +257,7 @@ mod tests {
 
     #[test]
     fn nothing_projected_prunes() {
-        let mut after = AfterSyncOperation::new(None, empty(), true);
+        let mut after = AfterSyncOperation::new(None, empty());
         after.stamp(10);
         assert!(matches!(after.first(), Ok(Next::Call(IoCall::Child(_)))));
         assert_eq!(after.stage, SyncStage::Prune);
@@ -281,6 +274,8 @@ mod tests {
         );
     }
 
+    // A failed projection is handed to the projection drain; only a failed handover or prune
+    // ends in an error, so the applied drain runs the follow-up again instead of dropping it.
     #[test]
     fn failed_projection_retries() {
         let mut result = empty();
@@ -288,18 +283,24 @@ mod tests {
             document_id: ulid::Ulid::from_parts(1, 1),
             event_id: ulid::Ulid::from_parts(2, 2),
         }];
-        let failed = || {
-            child(Err::<LoggedProjection, _>(
-                MetadataProjectionError::PlacementFenced,
-            ))
-        };
-        let mut retried = AfterSyncOperation::new(None, result.clone(), true);
-        retried.first().unwrap();
-        retried.next(failed()).unwrap();
-        assert_eq!(retried.stage, SyncStage::Wake);
-        let mut logged = AfterSyncOperation::new(None, result, false);
-        logged.first().unwrap();
-        logged.next(failed()).unwrap();
-        assert_eq!(logged.stage, SyncStage::Prune);
+        let failed = child(Err::<LoggedProjection, _>(
+            MetadataProjectionError::PlacementFenced,
+        ));
+        let mut after = AfterSyncOperation::new(None, result);
+        after.first().unwrap();
+        after.next(failed).unwrap();
+        assert_eq!(after.stage, SyncStage::Wake);
+        let unscheduled = child(Err::<(), _>(MetadataProjectionError::PlacementFenced));
+        let failed = AfterSyncError::Wake(MetadataProjectionError::PlacementFenced);
+        assert_eq!(after.next(unscheduled), Err(failed));
+    }
+
+    #[test]
+    fn failed_prune_errs() {
+        let mut after = AfterSyncOperation::new(None, empty());
+        after.first().unwrap();
+        let error = || MetadataGraphError::UnexpectedEvent("down".to_string());
+        let pruned = after.next(child(Err::<TombstoneProcessingResult, _>(error())));
+        assert_eq!(pruned, Err(AfterSyncError::Prune(error())));
     }
 }

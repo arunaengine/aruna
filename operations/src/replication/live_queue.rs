@@ -163,9 +163,9 @@ impl Operation for CompletePutOperation {
     }
 }
 
-/// Queues continuous sync for one committed version or delete marker and wakes the drain; every
-/// committed write runs it. A failure or an unset drain timer only warns, since the durable
-/// obligation remains for repair.
+/// Queues continuous sync for one committed version or delete marker and wakes the drain. A
+/// failure only warns, since the durable obligation remains for repair; the queue itself warns
+/// about an unset drain timer.
 #[derive(Debug, PartialEq)]
 pub struct QueueLiveOperation {
     input: LiveVersionInput,
@@ -189,23 +189,15 @@ impl Operation for QueueLiveOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         let input = &self.input;
         let (bucket, key, version_id) = (&input.bucket, &input.key, input.version_id);
-        match result.child::<bool, IoError>()? {
-            Ok(true) => {}
-            Ok(false) => warn!(
-                bucket,
-                key,
-                version_id = %version_id,
-                delete_marker = input.delete_marker,
-                "Live replication obligation persisted but drain scheduling was not acknowledged"
-            ),
-            Err(error) => warn!(
+        if let Err(error) = result.child::<bool, IoError>()? {
+            warn!(
                 error = %error,
                 bucket,
                 key,
                 version_id = %version_id,
                 delete_marker = input.delete_marker,
                 "Failed to queue live replication after committed write; durable obligation remains for repair"
-            ),
+            );
         }
         Ok(Next::Done(()))
     }
@@ -308,14 +300,6 @@ mod tests {
         // The committed write stands, so the failure ends in a warning only.
         let failed = Err::<bool, _>(IoError::Storage(StorageError::Timeout));
         let turn = queueing().next(IoResult::Child(ChildOutcome::new(failed)));
-        assert_eq!(turn, Ok(Next::Done(())));
-    }
-
-    #[test]
-    fn unarmed_drain_warns() {
-        // The obligation is stored without its drain timer: the write stands and repair runs it.
-        let unarmed = Ok::<_, IoError>(false);
-        let turn = queueing().next(IoResult::Child(ChildOutcome::new(unarmed)));
         assert_eq!(turn, Ok(Next::Done(())));
     }
 

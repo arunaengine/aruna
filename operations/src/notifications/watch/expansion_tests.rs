@@ -222,3 +222,13 @@ fn drain_defers_failures() {
     })));
     assert_eq!(empty.next(none), Ok(Next::Done(())));
 }
+
+// A full storage queue or a timeout passes later, so the delivery is retried; a lasting fault
+// such as a missing key is fatal.
+#[test]
+fn storage_faults_retry() {
+    let full = IoError::Storage(StorageError::QueueFull);
+    assert_eq!(ExpandError::from(full.clone()), ExpandError::Io(full));
+    let missing = ExpandError::from(IoError::Storage(StorageError::KeyNotFound));
+    assert!(matches!(missing, ExpandError::Fatal(_)));
+}

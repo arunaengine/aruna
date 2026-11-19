@@ -332,7 +332,12 @@ impl WatchEventsOperation {
     fn expanded(&mut self, outcome: Result<ExpandOutcome, ExpandError>) -> AnswerTurn {
         let outcome = match outcome {
             Ok(outcome) => outcome,
-            Err(error) => return reject(error.to_string()),
+            Err(ExpandError::Fatal(reason)) => return reject(reason),
+            // Nothing was stored: the sender keeps the events and delivers them again.
+            Err(error) => {
+                let reason = error.to_string();
+                return Ok(Next::Done(NotificationTransportMessage::Unavailable(reason)));
+            }
         };
         let recipients = outcome.inbox.recipients;
         let written = outcome.inbox.written as u32;

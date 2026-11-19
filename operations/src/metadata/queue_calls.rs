@@ -390,12 +390,42 @@ fn commit_writes_first() {
     assert!(CommitFinishOperation::is_conflict(&conflict));
 }
 
-// The capture mark holds the revision the job displays, so the drain snapshots that graph.
-#[test]
-fn mark_holds_revision() {
+fn marking() -> MaterializationJobOperation {
     let job_ids = (job_key(), job(1));
     let cache = RawStateCache::default();
     let mut operation = MaterializationJobOperation::new(job_ids, None, cache, GitNode::default());
+    operation.stamp(40);
+    operation.event = Some(event());
+    operation
+}
+
+fn materialized(raw_revision: Option<MetadataRawRevision>) -> MaterializedCreateEvent {
+    let state_write = (
+        RAW_REVISION_KEYSPACE.to_string(),
+        Key::from(vec![1]),
+        Value::from(vec![2]),
+    );
+    MaterializedCreateEvent {
+        raw_revision,
+        raw_state_write: state_write,
+        validation_write: None,
+    }
+}
+
+fn mark_write(mark: &CaptureMark) -> MaterializationTurn<ProcessedMaterializationJob> {
+    let value = Value::from(mark.to_bytes().unwrap());
+    let row = (
+        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+        Key::from(sidecar_key()),
+        value,
+    );
+    Ok(Next::Call(IoCall::Write(vec![row])))
+}
+
+// The capture mark holds the graph the job displays, and when it materialized it, so the drain
+// snapshots that graph in order; it waits until a finish makes it ready.
+#[test]
+fn mark_holds_revision() {
     let revision = MetadataRawRevision {
         jsonld: "{}".to_string(),
         winning_event_id: ids().1,
@@ -403,24 +433,83 @@ fn mark_holds_revision() {
         dataset_digest: None,
         merged: None,
     };
-    let state_write = (
-        RAW_REVISION_KEYSPACE.to_string(),
-        Key::from(vec![1]),
-        Value::from(vec![2]),
-    );
-    let materialized = MaterializedCreateEvent {
-        raw_revision: Some(revision.clone()),
-        raw_state_write: state_write,
-        validation_write: None,
+    let mark = CaptureMark {
+        materialized_at_ms: 40,
+        event_id: ids().1,
+        jsonld: "{}".to_string(),
+        ready: false,
     };
-    let value = Value::from(postcard::to_allocvec(&Some(revision)).unwrap());
-    let mark = (
+    let written = marking().mark(materialized(Some(revision)));
+    assert_eq!(written, mark_write(&mark));
+}
+
+// A job without a displayed revision, as a scaffold, exports the graph it made for its mark.
+#[test]
+fn scaffold_mark_exported() {
+    let mut operation = marking();
+    let graph_iri = event().record.graph_iri;
+    let export = MetadataEffect::ExportRoCrate {
+        graph_iri: graph_iri.clone(),
+    };
+    assert_eq!(operation.mark(materialized(None)), Ok(graph_call(export)));
+    let jsonld = "{\"name\":\"scaffold\"}".to_string();
+    let exported = MetadataEvent::RoCrateExportResult {
+        graph_iri,
+        jsonld: jsonld.clone(),
+    };
+    let exported = IoResult::Event(Box::new(Event::Metadata(exported)));
+    let mark = CaptureMark {
+        materialized_at_ms: 40,
+        event_id: ids().1,
+        jsonld,
+        ready: false,
+    };
+    assert_eq!(operation.next(exported), mark_write(&mark));
+}
+
+// The finish that stores a job's graph makes its capture mark ready; a job that stored none
+// drops its mark, so the drain never waits on it.
+#[test]
+fn finish_readies_mark() {
+    let capture = CaptureMark {
+        materialized_at_ms: 40,
+        event_id: ids().1,
+        jsonld: "{}".to_string(),
+        ready: false,
+    };
+    let status = materialization_success_status(&job(1), &event(), None, 50);
+    let mut stored = CompletedMaterializationJob::without_rows(job_key(), sidecar_key(), None);
+    stored.status = Some(status);
+    stored.capture = Some(capture.clone());
+    let mut commit =
+        CommitFinishOperation::new(vec![FinishedMaterializationJob::Completed(stored)]);
+    commit.first().unwrap();
+    let written = commit.next(IoResult::Values(vec![None]));
+    let Ok(Next::Call(IoCall::Write(writes))) = written else {
+        panic!("expected the finish writes, got {written:?}");
+    };
+    let ready = CaptureMark {
+        ready: true,
+        ..capture.clone()
+    };
+    let row = (
         MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
         Key::from(sidecar_key()),
-        value,
+        Value::from(ready.to_bytes().unwrap()),
     );
-    let written = operation.mark(materialized);
-    assert_eq!(written, Ok(Next::Call(IoCall::Write(vec![mark]))));
+    assert!(writes.contains(&row));
+
+    let mut unstored = CompletedMaterializationJob::without_rows(job_key(), sidecar_key(), None);
+    unstored.capture = Some(capture);
+    let mut commit =
+        CommitFinishOperation::new(vec![FinishedMaterializationJob::Completed(unstored)]);
+    commit.first().unwrap();
+    let deleted = commit.next(IoResult::Values(vec![None]));
+    let Ok(Next::Call(IoCall::Delete(deletes))) = deleted else {
+        panic!("expected the finish deletes, got {deleted:?}");
+    };
+    let mark = (MATERIALIZATION_CAPTURE_KEYSPACE.to_string(), Key::from(sidecar_key()));
+    assert!(deletes.contains(&mark));
 }
 
 fn drain_result(turn: MaterializationTurn<MetadataDrainResult>) -> MetadataDrainResult {

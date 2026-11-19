@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use crate::effects::Effect;
+use crate::errors::ConversionError;
 use crate::git_state::{Ancestry, Projection, ProjectionInputs};
 use crate::id::NodeId;
 use crate::keyspaces::GIT_RECORD_KEYSPACE;
@@ -860,6 +861,28 @@ pub struct GitNode {
 impl GitNode {
     pub fn node(&self) -> Option<NodeId> {
         self.ids.map(|(node_id, _)| node_id)
+    }
+}
+
+/// A materialized graph waiting for its Git snapshot, stored under its job's document and event.
+/// A document's marks are captured in the order their jobs materialized them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureMark {
+    pub materialized_at_ms: u64,
+    /// The event whose graph the snapshot shows, and that graph as JSON-LD.
+    pub event_id: Ulid,
+    pub jsonld: String,
+    /// Set by the finish that stored the job's rows; until then the mark waits.
+    pub ready: bool,
+}
+
+impl CaptureMark {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
