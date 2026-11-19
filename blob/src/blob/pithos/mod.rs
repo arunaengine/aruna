@@ -38,9 +38,9 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
-pub use aruna_core::structs::storage::pithos::MAX_SIZE;
-pub(super) use aruna_core::structs::storage::pithos::{BASE_SHARE, BLOCK_MEMORY, WORKING_SET};
-use aruna_core::structs::storage::pithos::{MAX_PIECES, MIN_BLOCK};
+use aruna_core::structs::storage::pithos::{
+    BASE_SHARE, BLOCK_MEMORY, MAX_PIECES, MAX_SIZE, MIN_BLOCK, WORKING_SET,
+};
 
 /// Path of the one file in the archive of an object.
 pub const OBJECT_PATH: &str = "object";

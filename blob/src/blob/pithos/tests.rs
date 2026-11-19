@@ -1155,7 +1155,8 @@ async fn framed_reads_pin() {
 
 #[tokio::test]
 async fn over_budget_refused() {
-    use crate::blob::pithos::{WORKING_SET, budget_permits, working_set};
+    use crate::blob::pithos::{budget_permits, working_set};
+    use aruna_core::structs::storage::pithos::WORKING_SET;
 
     // A 5 TiB working set exceeds the node budget: refused, never clipped.
     let context = setup_two_backends().await;
@@ -1170,7 +1171,7 @@ async fn over_budget_refused() {
 
 #[tokio::test]
 async fn oversized_seal_refused() {
-    use crate::blob::pithos::MAX_SIZE;
+    use aruna_core::structs::storage::pithos::MAX_SIZE;
 
     // A sealed copy larger than every copy that can be re-encoded is refused before writing.
     let context = setup_two_backends().await;
