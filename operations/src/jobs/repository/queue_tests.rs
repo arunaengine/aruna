@@ -519,9 +519,15 @@ fn timer_arms_earliest() {
         (id_key(link().link_id), queued(NOW_MS + 9_000)),
         (id_key(Ulid::nil()), queued(NOW_MS + 2_000)),
     ];
-    assert_eq!(operation.next(queue_page(rows)), Ok(Next::Call(change_probe())));
+    assert_eq!(
+        operation.next(queue_page(rows)),
+        Ok(Next::Call(change_probe()))
+    );
     let expected: IoCall = schedule_drain(Duration::from_millis(2_000)).into();
-    assert_eq!(operation.next(queue_page(Vec::new())), Ok(Next::Call(expected)));
+    assert_eq!(
+        operation.next(queue_page(Vec::new())),
+        Ok(Next::Call(expected))
+    );
     let armed = crate::jobs::repository::test_support::event(Event::Task(TaskEvent::Error {
         key: None,
         message: "late".into(),
@@ -542,7 +548,10 @@ fn change_probe() -> IoCall {
 fn empty_queue_idle() {
     let mut operation = LinkTimerOperation::new();
     operation.first().unwrap();
-    assert_eq!(operation.next(queue_page(Vec::new())), Ok(Next::Call(change_probe())));
+    assert_eq!(
+        operation.next(queue_page(Vec::new())),
+        Ok(Next::Call(change_probe()))
+    );
     assert_eq!(operation.next(queue_page(Vec::new())), Ok(Next::Done(())));
 }
 

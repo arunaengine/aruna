@@ -1642,7 +1642,10 @@ async fn finish_keeps_newer() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     finish_chunk(&context, finished).await.unwrap();
 
-    assert_eq!(stored_status(&storage, document_id).await, Some(newer_status));
+    assert_eq!(
+        stored_status(&storage, document_id).await,
+        Some(newer_status)
+    );
 
     let (jobs, _, _) = scan_due_jobs(
         &storage,

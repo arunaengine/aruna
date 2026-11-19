@@ -76,7 +76,7 @@ impl From<IoError> for PublishError {
 
 /// The entry of a checked artifact and the realm config it was checked against.
 #[derive(Debug, PartialEq)]
-pub struct PublishPlan {
+struct PublishPlan {
     config: RealmConfigDocument,
     entry: PublishedPlugin,
 }
@@ -155,7 +155,7 @@ impl Operation for PublishPlugin {
 
 /// What a checked publish does next.
 #[derive(Debug, PartialEq)]
-pub enum PublishStep {
+enum PublishStep {
     /// The identical version is already published.
     Known(PublishedPlugin),
     Store(Box<PublishPlan>),
@@ -163,7 +163,7 @@ pub enum PublishStep {
 
 /// Checks `artifact` for a realm admin on this management node and writes nothing.
 #[derive(Debug, PartialEq)]
-pub struct CheckPublish {
+struct CheckPublish {
     actor: Actor,
     auth: AuthContext,
     entry: PublishedPlugin,
@@ -171,7 +171,7 @@ pub struct CheckPublish {
 }
 
 impl CheckPublish {
-    pub fn new(
+    fn new(
         actor: &Actor,
         auth: &AuthContext,
         artifact: &[u8],
@@ -242,7 +242,7 @@ impl Operation for CheckPublish {
 /// Copies a locally stored artifact to the other management nodes and writes the entry once a
 /// majority holds it durably; otherwise nothing is published.
 #[derive(Debug, PartialEq)]
-pub struct FinishPublish {
+struct FinishPublish {
     actor: Actor,
     auth: AuthContext,
     plan: PublishPlan,
@@ -251,7 +251,7 @@ pub struct FinishPublish {
 }
 
 impl FinishPublish {
-    pub fn new(actor: Actor, auth: AuthContext, plan: PublishPlan, artifact: Bytes) -> Self {
+    fn new(actor: Actor, auth: AuthContext, plan: PublishPlan, artifact: Bytes) -> Self {
         Self {
             actor,
             auth,

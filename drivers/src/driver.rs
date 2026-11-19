@@ -593,15 +593,6 @@ fn expire(executable: &mut dyn Drive, queue: &mut VecDeque<Effect>, state: &mut 
     }
 }
 
-/// How often the effect loop re-reads the deadline. The suboperation loop
-/// re-checks every effect; the parent marks expiry once and then dispatches its
-/// cleanup effects under the cleanup deadline.
-#[derive(Clone, Copy)]
-enum ExpiryRecheck {
-    Once,
-    EveryEffect,
-}
-
 /// The effect-loop half of an operation, shared by parent operations and
 /// suboperations. Finalization stays with each entry point because a parent
 /// yields a typed result while a suboperation yields an event.
@@ -1045,7 +1036,6 @@ async fn drive_effects(
     context: &DriverContext,
     depth: usize,
     deadline: Option<tokio::time::Instant>,
-    expiry_recheck: ExpiryRecheck,
     expiry_log: Option<&str>,
 ) -> RunState {
     let mut queue: VecDeque<Effect> = executable.start().into_iter().collect();
@@ -1061,11 +1051,8 @@ async fn drive_effects(
                 warn!(%txn_id, "Skipping abort after an unknown commit outcome");
                 continue;
             }
-            let recheck = match expiry_recheck {
-                ExpiryRecheck::Once => !state.expired,
-                ExpiryRecheck::EveryEffect => true,
-            };
-            if recheck
+            // The run deadline applies once; after it, cleanup runs under the cleanup deadline.
+            if !state.expired
                 && deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
                 && !managed_effect(&effect)
             {
@@ -1119,8 +1106,9 @@ async fn drive_effects(
                 };
                 event
             } else if let Some(deadline) = deadline {
-                let managed = managed_effect(&effect);
-                // Managed effects own their timeout and must not be canceled here.
+                // Managed effects own their timeout, and a child applies this deadline itself and
+                // then runs its cleanup; cutting either here would drop that work.
+                let managed = managed_effect(&effect) || matches!(effect, Effect::SubOperation(_));
                 let dispatch: BoxFuture<'_, Event> = Box::pin(dispatch_bounded(
                     effect,
                     context,
@@ -1205,14 +1193,7 @@ pub(crate) fn drive_suboperation<'a>(
             let scope = operation.hold_scope();
             let _hold = take_hold(context, scope).await;
             let mut run = SubRun(operation.as_mut(), None);
-            let effects = drive_effects(
-                &mut run,
-                context,
-                depth,
-                deadline,
-                ExpiryRecheck::EveryEffect,
-                None,
-            );
+            let effects = drive_effects(&mut run, context, depth, deadline, None);
             let mut state = holding(scope, effects).await;
 
             let record = run.1;
@@ -1334,7 +1315,6 @@ async fn machine_until<P: Operation>(
         context,
         0,
         Some(deadline),
-        ExpiryRecheck::Once,
         Some(type_name::<CallRun<P>>()),
     );
     let mut state = holding(scope, effects).await;
@@ -1407,7 +1387,7 @@ async fn drive_machine<P: Operation>(
     // nested effect-loop futures otherwise stack up in one caller's future.
     let mut state = Box::pin(holding(
         scope,
-        drive_effects(&mut run, context, 0, None, ExpiryRecheck::Once, None),
+        drive_effects(&mut run, context, 0, None, None),
     ))
     .await;
     let record = run.1;
@@ -2217,7 +2197,8 @@ mod test {
     }
 
     /// Stages a row in a write transaction and waits on a spool that never ends: before the
-    /// commit, or after it when `commit` holds. Its cleanup sets `aborted`.
+    /// commit, or after it when `commit` holds. Its cleanup sets `aborted` and writes the row
+    /// `nested-cleanup`.
     #[derive(Debug)]
     struct PendingTxn {
         staged: bool,
@@ -2267,7 +2248,7 @@ mod test {
         fn abort(&mut self) -> Vec<IoCall> {
             self.aborted
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            Vec::new()
+            vec![IoCall::Write(vec![row(b"nested-cleanup", b"ran")])]
         }
     }
 
@@ -2316,6 +2297,19 @@ mod test {
         assert!(transaction_reopens(&context).await);
     }
 
+    /// The row the cleanup of `PendingTxn` writes.
+    async fn cleanup_row(context: &DriverContext) -> Option<ByteView> {
+        let read = StorageEffect::Read {
+            key_space: "default".to_string(),
+            key: ByteView::from(*b"nested-cleanup"),
+            txn_id: None,
+        };
+        match context.storage_handle.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => panic!("unexpected storage event {other:?}"),
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn nested_deadline_cleanup() {
         tokio::time::resume();
@@ -2342,12 +2336,13 @@ mod test {
         ready.notified().await;
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_secs(6)).await;
-        // The parent's own deadline ends it while the child still cleans up.
-        assert_eq!(task.await.unwrap(), Err(IoError::Aborted));
-        // Real time again: auto-advance would fire the request timeouts of the
-        // storage roundtrips below before the worker thread can answer.
+        // Real time again: auto-advance would fire the cleanup deadline while the storage
+        // worker threads still answer the child's cleanup.
         tokio::time::resume();
+        // The child applies the deadline, runs its cleanup, and the parent ends on its answer.
+        assert_eq!(task.await.unwrap(), Ok(()));
         assert!(aborted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(cleanup_row(&context).await, Some(ByteView::from(*b"ran")));
 
         let ids = started.lock().unwrap().clone();
         assert!(!ids.is_empty());
@@ -2385,6 +2380,7 @@ mod test {
         // storage roundtrips below before the worker thread can answer.
         tokio::time::resume();
         assert!(!aborted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(cleanup_row(&context).await, None);
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {

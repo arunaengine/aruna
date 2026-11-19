@@ -179,6 +179,17 @@ enum ReadPhase {
     Collect,
 }
 
+/// The bytes of an object a plugin read. Its `Debug` text names only their count, so a run
+/// record never keeps the object's content.
+#[derive(PartialEq)]
+pub struct ObjectBytes(pub Vec<u8>);
+
+impl std::fmt::Debug for ObjectBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} bytes", self.0.len())
+    }
+}
+
 /// The bytes of the object at the full path `path` below the install's group data, the current
 /// or the given version, under the read grants; one larger than `max_bytes` is for a task.
 #[derive(Debug, PartialEq)]
@@ -219,16 +230,16 @@ impl ReadObject {
 }
 
 impl Operation for ReadObject {
-    type Output = Vec<u8>;
+    type Output = ObjectBytes;
     type Error = CallError;
 
-    fn first(&mut self) -> Result<Next<Vec<u8>>, CallError> {
+    fn first(&mut self) -> Result<Next<ObjectBytes>, CallError> {
         let read = Permission::ObjectsRead;
         let check = GrantedCall::target(&self.scope, read, &self.path);
         Ok(Next::Call(IoCall::child(check)))
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<Vec<u8>>, CallError> {
+    fn next(&mut self, result: IoResult) -> Result<Next<ObjectBytes>, CallError> {
         match std::mem::replace(&mut self.phase, ReadPhase::Get) {
             ReadPhase::Grant => {
                 let granted = result.child::<Granted, CallError>()??;
@@ -280,7 +291,7 @@ impl Operation for ReadObject {
             }
             ReadPhase::Collect => match result.event()? {
                 Event::Blob(BlobEvent::StreamCollected { bytes: Ok(bytes) }) => {
-                    Ok(Next::Done(bytes))
+                    Ok(Next::Done(ObjectBytes(bytes)))
                 }
                 Event::Blob(BlobEvent::StreamTooLarge { .. }) => Err(self.too_large()),
                 Event::Blob(BlobEvent::StreamCollected { bytes: Err(error) }) => {

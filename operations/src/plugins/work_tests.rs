@@ -263,7 +263,10 @@ fn prune_keeps_held() {
     assert_eq!(prune.now(), 50, "both steps use the start");
     let is_child = |next: &PruneNext| matches!(next, Ok(Next::Call(IoCall::Child(_))));
     assert!(is_child(&prune.first()), "the due jobs come first");
-    let due = vec![due_work(1), due_work(2)];
+    let due = DueJobs {
+        jobs: vec![due_work(1), due_work(2)],
+        after: None,
+    };
     let read = IoResult::Child(ChildOutcome::new(Ok::<_, PruneError>(due)));
     assert!(is_child(&prune.next(read)));
     assert_eq!(prune.phase, KeepPhase::Holds(job(1)));
@@ -287,10 +290,43 @@ fn prune_keeps_held() {
 }
 
 #[test]
+fn held_front_continues() {
+    // Held jobs fill a whole window, so the check goes on after it before anything is pruned.
+    let mut prune = PruneKeepingWork::new(1);
+    prune.first().unwrap();
+    let after = Some(Key::from(b"window".to_vec()));
+    let jobs = (1..=4).map(due_work).collect();
+    let window = Ok::<_, PruneError>(DueJobs { jobs, after });
+    prune
+        .next(IoResult::Child(ChildOutcome::new(window)))
+        .unwrap();
+    for _ in 1..=4 {
+        assert!(matches!(prune.phase, KeepPhase::Holds(_)));
+        let held = IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>(true)));
+        prune.next(held).unwrap();
+    }
+    assert_eq!(prune.phase, KeepPhase::Due, "the next window comes first");
+    let window = Ok::<_, PruneError>(DueJobs {
+        jobs: vec![due_work(5)],
+        after: None,
+    });
+    prune
+        .next(IoResult::Child(ChildOutcome::new(window)))
+        .unwrap();
+    let settled = IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>(false)));
+    prune.next(settled).unwrap();
+    assert_eq!(prune.phase, KeepPhase::Prune);
+}
+
+#[test]
 fn prune_refuses_failure() {
     let mut prune = PruneKeepingWork::new(10);
     prune.first().unwrap();
-    let read = IoResult::Child(ChildOutcome::new(Ok::<_, PruneError>(vec![due_work(1)])));
+    let due = DueJobs {
+        jobs: vec![due_work(1)],
+        after: None,
+    };
+    let read = IoResult::Child(ChildOutcome::new(Ok::<_, PruneError>(due)));
     prune.next(read).unwrap();
     let failed = Err::<bool, _>(StoreError("down".into()));
     let failed = prune.next(IoResult::Child(ChildOutcome::new(failed)));

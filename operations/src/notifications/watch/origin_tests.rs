@@ -152,7 +152,10 @@ fn event_reads_holders() {
     );
     let found = holders_answer(Some((node_id(1), vec![node_id(2)])));
     assert!(matches!(emit.next(found), Ok(Next::Call(IoCall::Child(_)))));
-    assert_eq!(emit.next(child::<bool, IoError>(Ok(true))), Ok(Next::Done(true)));
+    assert_eq!(
+        emit.next(child::<bool, IoError>(Ok(true))),
+        Ok(Next::Done(true))
+    );
 
     let mut failed = EmitEventOperation::new(event);
     failed.first().unwrap();
