@@ -37,6 +37,7 @@ use crate::metadata::protocol::metadata_read_error;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::metadata::read_peer::{PeerReader, ReadPeerOperation, SearchPeerOperation};
 use crate::metadata::search_cursor::MAX_PAGINATION_DEPTH;
+use crate::metadata::serve::{ServeError, ServeRequestOperation};
 use crate::metadata::text_search::LocalSearchOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::LocalBucketSearch;
@@ -1139,6 +1140,12 @@ impl MetadataHandle {
         audit_deadline: tokio::time::Instant,
         message: MetadataTransportMessage,
     ) -> (MetadataTransportMessage, Option<Vec<u8>>) {
+        let serve = ServeRequestOperation::new(peer, context.node_and_realm(), message);
+        let message = match drive(serve, context.as_ref()).await {
+            Ok(reply) => return reply,
+            Err(ServeError::Unserved(message)) => *message,
+            Err(ServeError::Io(error)) => return (reject(error.to_string()), None),
+        };
         match message {
             message @ (MetadataTransportMessage::QueryGraphs { .. }
             | MetadataTransportMessage::SearchGraphs { .. }
@@ -1152,198 +1159,6 @@ impl MetadataHandle {
             | MetadataTransportMessage::SearchObjects { .. }
             | MetadataTransportMessage::ReleaseHolder { .. }) => {
                 (self.bucket_request(context, peer, message).await, None)
-            }
-            MetadataTransportMessage::LookupIdentifier {
-                auth_token,
-                kind,
-                value,
-                endpoint,
-            } => {
-                let result = match self.read_caller(context, peer, auth_token, false).await {
-                    Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => {
-                            use crate::metadata::identifier_lookup::{
-                                IdentifierLookupOperation, IdentifierQuery,
-                            };
-                            let query = IdentifierQuery {
-                                kind,
-                                value,
-                                endpoint,
-                            };
-                            let lookup =
-                                IdentifierLookupOperation::new(*net_handle.realm_id(), auth, query);
-                            drive(lookup, context.as_ref())
-                                .await
-                                .map_err(|_| MetadataReadError::Unavailable)
-                        }
-                        None => Err(MetadataReadError::Unavailable),
-                    },
-                    Err(error) => Err(error),
-                };
-                (MetadataTransportMessage::IdentifierMatches { result }, None)
-            }
-            MetadataTransportMessage::DataLinks {
-                auth_token,
-                request,
-            } => {
-                let result = match self.read_caller(context, peer, auth_token, false).await {
-                    Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => {
-                            use crate::metadata::api::links::local::LinksLocalOperation;
-                            let realm_id = *net_handle.realm_id();
-                            let links = LinksLocalOperation::new(realm_id, auth, *request);
-                            drive(links, context.as_ref())
-                                .await
-                                .map(Box::new)
-                                .map_err(crate::forward::transport::read_error)
-                        }
-                        None => Err(MetadataReadError::Unavailable),
-                    },
-                    Err(error) => Err(error),
-                };
-                (MetadataTransportMessage::DataLinkResults { result }, None)
-            }
-            MetadataTransportMessage::BucketOwner { auth_token, bucket } => {
-                let result = match self.read_caller(context, peer, auth_token, false).await {
-                    Ok(Some(_)) => crate::driver::drive(
-                        crate::s3::bucket::get::GetBucketOperation::new(bucket),
-                        context.as_ref(),
-                    )
-                    .await
-                    .map(|info| info.group_id)
-                    .map_err(|error| match error {
-                        crate::s3::bucket::get::GetBucketError::NotFound => {
-                            MetadataReadError::NotFound
-                        }
-                        _ => MetadataReadError::Unavailable,
-                    }),
-                    Ok(None) => Err(MetadataReadError::Unauthorized),
-                    Err(error) => Err(error),
-                };
-                (MetadataTransportMessage::BucketOwnerResult { result }, None)
-            }
-            MetadataTransportMessage::SetPreview {
-                auth_token,
-                set_id,
-                limit,
-            } => {
-                let result = match self.read_caller(context, peer, auth_token, false).await {
-                    Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => {
-                            use crate::metadata::api::links::local::SetPreviewOperation;
-                            let scope = (*net_handle.realm_id(), auth);
-                            let preview = SetPreviewOperation::new(scope, set_id, None, limit);
-                            drive(preview, context.as_ref())
-                                .await
-                                .map(Box::new)
-                                .map_err(crate::forward::transport::read_error)
-                        }
-                        None => Err(MetadataReadError::Unavailable),
-                    },
-                    Err(error) => Err(error),
-                };
-                (MetadataTransportMessage::SetPreviewResults { result }, None)
-            }
-            MetadataTransportMessage::StagingSpec {
-                transfer_id,
-                job_id,
-            } => {
-                let job = (transfer_id, job_id);
-                let spec = crate::distribution::imports::StagingSpecOperation::new(peer, job);
-                let result = crate::driver::drive(spec, context).await.map(Box::new);
-                (MetadataTransportMessage::StagingSpecResult { result }, None)
-            }
-            MetadataTransportMessage::ReferencePage { page } => {
-                let serve = crate::replication::page::deliver::ServePageOperation::new(
-                    context.node_and_realm(),
-                    peer,
-                    *page,
-                );
-                let answer = crate::driver::drive(serve, context).await;
-                let answer =
-                    answer.unwrap_or_else(|error| crate::replication::page::PageAnswer::Refused {
-                        reason: error.to_string(),
-                        retry: true,
-                    });
-                (
-                    MetadataTransportMessage::ReferencePageAnswer { answer },
-                    None,
-                )
-            }
-            MetadataTransportMessage::HandRealmKey { key } => {
-                let request = crate::realm::promotion::PromotionRequest::HandKey(key);
-                let result = match context.net_handle.as_ref() {
-                    Some(net) => {
-                        let serve = crate::realm::promotion::ServePromotionOperation::new(
-                            *net.realm_id(),
-                            net.node_id(),
-                            peer,
-                            request,
-                        );
-                        crate::driver::drive(serve, context.as_ref())
-                            .await
-                            .and_then(|answer| answer)
-                    }
-                    None => Err(MetadataReadError::Unavailable),
-                }
-                .map(|_| ());
-                (MetadataTransportMessage::RealmKeyStored { result }, None)
-            }
-            MetadataTransportMessage::RealmSecret { entry, revision } => {
-                let request = aruna_core::realm_vault::RealmSecretRef { entry, revision };
-                let request = crate::realm_vault::ServeRequest::Secret(request);
-                let result = match context.net_handle.as_ref() {
-                    Some(net) => {
-                        let serve = crate::realm_vault::ServeSecretOperation::new(
-                            *net.realm_id(),
-                            net.node_id(),
-                            peer,
-                            request,
-                        );
-                        crate::driver::drive(serve, context.as_ref())
-                            .await
-                            .and_then(|answer| answer)
-                    }
-                    None => Err(MetadataReadError::Unavailable),
-                };
-                (MetadataTransportMessage::RealmSecretResult { result }, None)
-            }
-            MetadataTransportMessage::OpenSetting { target, bytes } => {
-                let bytes = bytes.expose().to_vec();
-                let request = crate::realm_vault::ServeRequest::Setting { target, bytes };
-                let result = match context.net_handle.as_ref() {
-                    Some(net) => {
-                        let serve = crate::realm_vault::ServeSecretOperation::new(
-                            *net.realm_id(),
-                            net.node_id(),
-                            peer,
-                            request,
-                        );
-                        crate::driver::drive(serve, context.as_ref())
-                            .await
-                            .and_then(|answer| answer)
-                    }
-                    None => Err(MetadataReadError::Unavailable),
-                };
-                (MetadataTransportMessage::OpenSettingResult { result }, None)
-            }
-            MetadataTransportMessage::PromotionCheck => {
-                let request = crate::realm::promotion::PromotionRequest::Check;
-                let result = match context.net_handle.as_ref() {
-                    Some(net) => {
-                        let serve = crate::realm::promotion::ServePromotionOperation::new(
-                            *net.realm_id(),
-                            net.node_id(),
-                            peer,
-                            request,
-                        );
-                        crate::driver::drive(serve, context.as_ref())
-                            .await
-                            .and_then(|answer| answer)
-                    }
-                    None => Err(MetadataReadError::Unavailable),
-                };
-                (MetadataTransportMessage::PromotionReady { result }, None)
             }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
