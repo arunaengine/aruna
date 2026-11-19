@@ -735,6 +735,13 @@ pub enum MetadataTransportMessage {
             MetadataReadError,
         >,
     },
+    /// A holder asks a launch's target whether it ever accepted the signed launch it carries.
+    ForwardClosureQuery {
+        launch: Box<LaunchFrame>,
+    },
+    ForwardedClosureQuery {
+        answer: aruna_core::events::ClosureAnswer,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.

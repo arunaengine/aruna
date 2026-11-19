@@ -487,6 +487,8 @@ pub const WITNESS_DEADLINE_KEYSPACE: &str = "job_witness_deadlines";
 pub const DEADLINE_INDEX_KEYSPACE: &str = "job_witness_deadline_index";
 /// Bounded explain record of the plan a witness stored before it launched.
 pub const PLAN_EXPLAIN_KEYSPACE: &str = "job_plan_explains";
+/// Launches without a receipt that their target answered as closed, by family and launch id.
+pub const LAUNCH_CLOSURE_KEYSPACE: &str = "job_launch_closures";
 pub const ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
 /// The single row recording what this node could not resolve when it departed.
 pub const COMPUTE_DEPARTURE_KEYSPACE: &str = "compute_departure";
@@ -819,6 +821,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     WITNESS_DEADLINE_KEYSPACE,
     DEADLINE_INDEX_KEYSPACE,
     PLAN_EXPLAIN_KEYSPACE,
+    LAUNCH_CLOSURE_KEYSPACE,
     ARTIFACT_TOMBSTONE_KEYSPACE,
     COMPUTE_DEPARTURE_KEYSPACE,
     JOB_STATE_KEYSPACE,

@@ -20,6 +20,7 @@ mod advertised;
 pub mod alias;
 pub mod cancel;
 pub mod chain;
+pub mod closure;
 pub mod family_reads;
 mod fetch;
 mod forward;

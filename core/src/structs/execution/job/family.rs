@@ -302,10 +302,20 @@ pub struct LaunchIntent {
 /// How long after its creation a target may still accept a launch, counted on the target's clock.
 pub const LAUNCH_WINDOW_MS: u64 = 60 * 60 * 1000;
 
+/// Extra time a holder waits after the launch window before it asks the target, for clock skew.
+pub const CLOCK_MARGIN_MS: u64 = 10 * 60 * 1000;
+
 impl LaunchIntent {
     /// Whether the launch window passed at `now_ms` on the clock of the node that decides.
     pub fn expired(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.created_at_ms) > LAUNCH_WINDOW_MS
+    }
+
+    /// The time from which a holder asks the target whether it ever accepted this launch.
+    pub fn closure_due(&self) -> u64 {
+        (self.created_at_ms)
+            .saturating_add(LAUNCH_WINDOW_MS)
+            .saturating_add(CLOCK_MARGIN_MS)
     }
 }
 
