@@ -886,7 +886,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .await
     };
-    use aruna_operations::jobs::repository::RecordReference::{Doi, Url};
+    use aruna_operations::jobs::repository::invenio::query::RecordReference::{Doi, Url};
     let version_doi = first.identifier.clone().ok_or("v1 has no DOI")?;
     assert_eq!(resolve(Doi(version_doi.to_uppercase())).await?, first.id);
     let concept = second.concept_identifier.clone().ok_or("no concept DOI")?;
