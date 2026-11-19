@@ -20,6 +20,7 @@ use aruna_core::types::{Key, Value};
 use tracing::{debug, warn};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::node::fence::LiftFenceOperation;
 
 /// The node-local row holding the wall time at which this node last caught up.
 pub const LAST_CONTACT_KEY: &[u8] = b"last_contact";
@@ -44,6 +45,8 @@ enum CatchUpStep {
     /// The realm config is read again for management nodes the sync revealed.
     Reload,
     Contact,
+    /// Caught up: the start fence is lifted once the executions of a closed interval are marked.
+    Lift,
 }
 
 type CatchUpNext = Result<Next<CatchUpOutcome>, IoError>;
@@ -244,6 +247,14 @@ impl Operation for CatchUpOperation {
                 result.done()?;
                 if !self.unanswered.is_empty() {
                     debug!(unanswered = ?self.unanswered, "Caught up without every management node");
+                }
+                self.step = CatchUpStep::Lift;
+                let lift = LiftFenceOperation::new(self.local, self.realm_id);
+                Ok(Next::Call(IoCall::child(lift)))
+            }
+            CatchUpStep::Lift => {
+                if let Err(error) = result.child::<bool, IoError>()? {
+                    warn!(error = %error, "The start fence was not lifted");
                 }
                 self.finish(true)
             }

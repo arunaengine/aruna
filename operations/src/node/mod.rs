@@ -6,6 +6,7 @@ pub mod api_state;
 pub mod catch_up;
 pub mod contacts;
 pub mod counter_check;
+pub mod fence;
 pub mod heartbeat;
 pub mod info;
 pub mod realm_usage;

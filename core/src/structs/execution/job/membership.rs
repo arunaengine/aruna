@@ -46,6 +46,20 @@ pub fn membership(
     }
 }
 
+/// The local executions whose node left the realm: every interval of `local` open at the clock
+/// a reservation cites has a removal. Their work is cancelled and never resubmitted.
+pub fn left_executions<'a, T>(
+    local: NodeId,
+    reservations: impl IntoIterator<Item = (T, &'a AdminDocumentClock)>,
+    intervals: &[NodeInterval],
+    clock: &AdminDocumentClock,
+) -> Vec<T> {
+    (reservations.into_iter())
+        .filter(|(_, cited)| membership(local, cited, intervals, clock) == Membership::Left)
+        .map(|(execution, _)| execution)
+        .collect()
+}
+
 /// Executions and launches of one family whose node left the realm, as this node sees it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NotRun {

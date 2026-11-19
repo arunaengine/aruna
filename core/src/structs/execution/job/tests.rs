@@ -2224,6 +2224,18 @@ fn membership_names_intervals() {
     assert_eq!(at(5, &readded), Membership::Open);
 }
 
+// Only an execution whose every interval at its cited clock closed has left; one admitted after
+// a re-add, or one this node cannot judge yet, keeps running.
+#[test]
+fn cancels_left_executions() {
+    let local = node_id(9);
+    let intervals = [interval(local, 1, &[3]), interval(local, 5, &[])];
+    let (old, new, unknown) = (config_clock(2), config_clock(5), config_clock(7));
+    let reservations = [(1, &old), (2, &new), (3, &unknown)];
+    let left = left_executions(local, reservations, &intervals, &config_clock(6));
+    assert_eq!(left, [1]);
+}
+
 /// The sample launch and receipt, both citing realm config clock 2.
 fn cited_records() -> Vec<JobRecordEnvelope> {
     let launch = LaunchIntent {

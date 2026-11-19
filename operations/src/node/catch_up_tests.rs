@@ -102,7 +102,10 @@ fn counts_answering_managers() {
         operation.next(config(RealmNodeKind::Server, &[2, 3])),
         contact()
     );
-    assert_eq!(operation.next(IoResult::Done), outcome(true, vec![node(3)]));
+    let lift = IoCall::child(LiftFenceOperation::new(node(1), REALM));
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Call(lift)));
+    let lifted = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(true)));
+    assert_eq!(operation.next(lifted), outcome(true, vec![node(3)]));
 }
 
 // Without a counted round, or with targets not applied yet, the node has not caught up.
