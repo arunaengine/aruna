@@ -8,23 +8,20 @@
 // state is kept on disk, so an export holds no more in memory than the record it reads.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 
-use self::spool::{Spool, SpoolResult};
-pub use self::spool::{scratch_dir, scratch_file, scratch_name};
+pub use self::workspace::Workspace;
+use self::workspace::{ENTITY, LABEL, PART, QUEUE, decode_hop, encode_hop};
 
 use aruna_core::structs::storage::data::identity::text_values;
+use aruna_core::structs::storage::release::{RELEASE_INCOMPLETE, RELEASE_MEMBERSHIP};
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use serde_json::{Map, Value, json};
+use ulid::Ulid;
 
 const CRATE_CONTEXT: &str = "https://w3id.org/ro/crate/1.2/context";
 const CRATE_SPEC: &str = "https://w3id.org/ro/crate/1.2";
 /// Marks a folder as a nested crate (RO-Crate 1.2).
 const NESTED_CRATE: &str = "https://w3id.org/ro/crate";
-
-/// Marks an entity whose release membership could not be checked everywhere.
-pub const RELEASE_MEMBERSHIP: &str = "https://w3id.org/aruna/terms/release-membership";
-pub const RELEASE_INCOMPLETE: &str = "Release membership could not be checked everywhere";
 
 /// What a hop reads next.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,46 +50,98 @@ pub struct CrateFile {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Debug)]
-pub struct ProvenanceCrate {
-    /// The entities, the id each asked id became, the root's parts and the links to read.
-    spool: Spool,
+/// What an export keeps between its steps besides its rows: the export's row prefix, what it
+/// is about, and how far it got.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportState {
+    pub(super) export: Ulid,
     start: String,
     published: String,
     hidden: usize,
     stopped: Option<String>,
+    /// Links queued so far, which numbers the next one.
+    pushed: u64,
+    /// What the export asked its caller to read last.
+    awaiting: Option<Awaiting>,
 }
 
-impl ProvenanceCrate {
-    /// A crate about `start`, published at `published` (an ISO 8601 date-time).
-    pub fn new(start: &str, published: &str) -> Result<Self, fjall::Error> {
-        Ok(Self {
-            spool: Spool::open()?,
+/// What an export waits for its caller to read.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Awaiting {
+    Dataset,
+    Hop(Hop),
+    /// The crate document of a run that answered.
+    RunCrate(Hop),
+}
+
+impl ExportState {
+    /// An export about `start`, published at `published` (an ISO 8601 date-time), whose rows
+    /// are kept under `export`.
+    pub fn new(export: Ulid, start: &str, published: &str) -> Self {
+        Self {
+            export,
             start: start.to_string(),
             published: published.to_string(),
             hidden: 0,
             stopped: None,
-        })
+            pushed: 0,
+            awaiting: None,
+        }
+    }
+
+    /// The id the export's rows are kept under.
+    pub fn export(&self) -> Ulid {
+        self.export
+    }
+
+    /// Ends the walk when a step could not keep its rows; the first reason is kept.
+    pub fn lost(&mut self) {
+        let reason = "the export could not keep its working state";
+        self.stopped.get_or_insert_with(|| reason.to_string());
+    }
+}
+
+/// One crate being assembled: the export's state and the rows the current step sees.
+#[derive(Debug, PartialEq)]
+pub struct ProvenanceCrate {
+    state: ExportState,
+    /// The entities, the id each asked id became, the root's parts and the links to read.
+    rows: Workspace,
+}
+
+impl ProvenanceCrate {
+    pub fn new(state: ExportState, rows: Workspace) -> Self {
+        Self { state, rows }
+    }
+
+    pub(super) fn state(&mut self) -> &mut ExportState {
+        &mut self.state
+    }
+
+    pub fn into_parts(self) -> (ExportState, Workspace) {
+        (self.state, self.rows)
     }
 
     /// Queues links to read after every one queued before.
     pub fn push(&mut self, hops: impl IntoIterator<Item = Hop>) {
         for hop in hops {
-            let pushed = self.spool.push(&hop);
-            self.keep(pushed);
+            self.state.pushed += 1;
+            let name = self.state.pushed.to_be_bytes();
+            self.rows.put(QUEUE, &name, encode_hop(&hop));
         }
     }
 
-    /// The next link to read, if any.
+    /// The next link to read, if any, taken off the queue.
     pub fn pop(&mut self) -> Option<Hop> {
-        let popped = self.spool.pop();
-        self.keep(popped).flatten()
+        let (key, bytes) = self.rows.next_queued()?;
+        self.rows.delete(key);
+        Some(decode_hop(&bytes))
     }
 
     /// The first hop of a version start.
     pub fn version_start(&self) -> Hop {
         Hop {
-            target: Target::Version(self.start.clone()),
+            target: Target::Version(self.state.start.clone()),
             from: "./".to_string(),
             property: "mainEntity",
             digest: None,
@@ -388,8 +437,8 @@ impl ProvenanceCrate {
             (_, true, _) => asked.clone(),
             (_, false, Some(digest)) if !is_location(digest) => digest.clone(),
             _ => {
-                self.hidden += 1;
-                format!("#hidden-{}", self.hidden)
+                self.state.hidden += 1;
+                format!("#hidden-{}", self.state.hidden)
             }
         };
         self.set_label(&asked, &id);
@@ -415,41 +464,33 @@ impl ProvenanceCrate {
 
     /// Marks the crate incomplete without ending the walk; the first reason is kept.
     pub fn incomplete(&mut self, reason: &str) {
-        self.stopped.get_or_insert_with(|| reason.to_string());
+        self.state.stopped.get_or_insert_with(|| reason.to_string());
     }
 
     /// Ends the walk early; the crate says it is incomplete and why.
     pub fn stop(&mut self, reason: &str) {
-        self.stopped = Some(reason.to_string());
+        self.state.stopped = Some(reason.to_string());
     }
 
-    /// Writes the root `ro-crate-metadata.json` one entity at a time; ends early with
-    /// `Interrupted` once `stop` says so.
-    pub fn write_root(
-        mut self,
-        out: &mut impl Write,
-        stop: &dyn Fn() -> bool,
-    ) -> std::io::Result<()> {
-        let check = || match stop() {
-            true => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
-            false => Ok(()),
-        };
+    /// The start of the root `ro-crate-metadata.json`: the context, the descriptor and the root
+    /// without its parts, up to the open part list.
+    pub fn root_head(&mut self) -> String {
         let mut root = entity("./", "Dataset");
         root.insert(
             "name".into(),
-            json!(format!("Provenance of {}", self.start)),
+            json!(format!("Provenance of {}", self.state.start)),
         );
         root.insert(
             "description".into(),
             json!("Where the data came from, as far as the exporting user may read it."),
         );
-        root.insert("datePublished".into(), json!(self.published));
+        root.insert("datePublished".into(), json!(self.state.published));
         for (key, value) in self.get("./").into_iter().flatten() {
             if key != "@id" {
                 root.insert(key, value);
             }
         }
-        let status = match &self.stopped {
+        let status = match &self.state.stopped {
             None => "Complete".to_string(),
             Some(reason) => format!("Incomplete: {reason}"),
         };
@@ -460,28 +501,13 @@ impl ProvenanceCrate {
             "conformsTo": { "@id": CRATE_SPEC },
             "about": { "@id": "./" }
         });
-        let failed = std::io::Error::other;
-        write!(out, "{{\"@context\":{},\"@graph\":[", json!(CRATE_CONTEXT))?;
-        serde_json::to_writer(&mut *out, &descriptor)?;
         // The root object without its closing brace, so its parts follow as they are read.
-        let root = serde_json::to_string(&root)?;
-        write!(out, ",{},\"hasPart\":[", &root[..root.len() - 1])?;
-        for (index, part) in self.spool.parts().enumerate() {
-            check()?;
-            let part = part.map_err(failed)?;
-            let separator = if index == 0 { "" } else { "," };
-            write!(out, "{separator}{}", json!({ "@id": part }))?;
-        }
-        out.write_all(b"]}")?;
-        for entity in self.spool.entities() {
-            check()?;
-            let entity = entity.map_err(failed)?;
-            if entity["@id"] != "./" {
-                out.write_all(b",")?;
-                serde_json::to_writer(&mut *out, &entity)?;
-            }
-        }
-        out.write_all(b"]}")
+        let root = Value::Object(root).to_string();
+        format!(
+            "{{\"@context\":{},\"@graph\":[{descriptor},{},\"hasPart\":[",
+            json!(CRATE_CONTEXT),
+            &root[..root.len() - 1]
+        )
     }
 
     fn unversioned(&mut self, from: &str, id: &str) {
@@ -524,35 +550,24 @@ impl ProvenanceCrate {
         }
     }
 
-    /// A failed read or write of the working state leaves the crate incomplete.
-    fn keep<T>(&mut self, result: SpoolResult<T>) -> Option<T> {
-        match result {
-            Ok(value) => Some(value),
-            Err(_) => {
-                self.incomplete("the export could not keep its working state");
-                None
-            }
-        }
-    }
-
     fn label(&mut self, asked: &str) -> Option<String> {
-        let label = self.spool.label(asked);
-        self.keep(label).flatten()
+        let value = self.rows.get(LABEL, asked.as_bytes())?;
+        Some(String::from_utf8_lossy(&value).into_owned())
     }
 
     fn set_label(&mut self, asked: &str, id: &str) {
-        let set = self.spool.set_label(asked, id);
-        self.keep(set);
+        self.rows
+            .put(LABEL, asked.as_bytes(), id.as_bytes().to_vec());
     }
 
     fn get(&mut self, id: &str) -> Option<Map<String, Value>> {
-        let found = self.spool.entity(id);
-        self.keep(found).flatten()
+        let value = self.rows.get(ENTITY, id.as_bytes())?;
+        serde_json::from_slice(&value).ok()
     }
 
     fn put(&mut self, id: &str, entity: &Map<String, Value>) {
-        let put = self.spool.put_entity(id, entity);
-        self.keep(put);
+        let bytes = serde_json::to_vec(entity).unwrap_or_default();
+        self.rows.put(ENTITY, id.as_bytes(), bytes);
     }
 
     /// Stores an entity only when none of its id is stored yet.
@@ -563,10 +578,28 @@ impl ProvenanceCrate {
     }
 
     fn add_part(&mut self, id: &str) {
-        let added = self.spool.add_part(id);
-        self.keep(added);
+        self.rows.put(PART, id.as_bytes(), Vec::new());
     }
 }
+
+/// One part of the root's part list; `first` leaves out the separator.
+pub fn part_piece(first: bool, id: &[u8]) -> String {
+    let separator = if first { "" } else { "," };
+    let id = String::from_utf8_lossy(id);
+    format!("{separator}{}", json!({ "@id": id }))
+}
+
+/// Closes the root's part list and the root.
+pub const PARTS_END: &str = "]}";
+
+/// One stored entity as the next graph member; the root itself is written with its head.
+pub fn entity_piece(bytes: &[u8]) -> Option<String> {
+    let entity: Value = serde_json::from_slice(bytes).unwrap_or_default();
+    (entity["@id"] != "./").then(|| format!(",{entity}"))
+}
+
+/// Closes the graph and the document.
+pub const GRAPH_END: &str = "]}";
 
 fn entity(id: &str, kind: &str) -> Map<String, Value> {
     let mut map = Map::new();
@@ -652,7 +685,13 @@ fn inputs(run_crate: &Value) -> Vec<(String, Option<String>)> {
     found
 }
 
-mod spool;
+mod export;
+mod workspace;
+
+pub use self::export::{
+    ExportAnswer, ExportAsk, ExportStep, ExportStepOperation, ForgetSpoolOperation, Read,
+    RootCursor, RootPageOperation,
+};
 
 #[cfg(test)]
 mod tests;

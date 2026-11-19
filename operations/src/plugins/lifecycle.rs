@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -115,6 +116,8 @@ struct CommitChange {
     expected: u64,
     next: Option<PluginInstall>,
     action: AdminAuditAction,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl CommitChange {
@@ -129,6 +132,8 @@ impl CommitChange {
             expected: current.revision,
             next: Some(next),
             action,
+            ids: IdMint::default(),
+            now_ms: 0,
         })
     }
 }
@@ -137,9 +142,19 @@ impl Operation for CommitChange {
     type Output = PluginInstall;
     type Error = InstallError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<PluginInstall>, InstallError> {
         let next = self.next.as_ref().ok_or(IoError::Unfinished)?;
-        let audit = self.caller.audit(self.action, next);
+        let audit = self
+            .caller
+            .audit(self.ids.mint(self.now_ms), self.action, next);
         let write = self.caller.write(Some(self.expected), next, Some(audit));
         Ok(Next::Call(write))
     }
@@ -411,6 +426,8 @@ pub struct SetPaused {
     install_id: Ulid,
     paused: bool,
     written: Option<Box<PluginInstall>>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl SetPaused {
@@ -420,6 +437,8 @@ impl SetPaused {
             install_id,
             paused,
             written: None,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -465,6 +484,14 @@ impl Operation for SetPaused {
     type Output = PluginInstall;
     type Error = InstallError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn hold_scope(&self) -> Option<HoldScope> {
         Some(HoldScope::PluginInstall(self.install_id))
     }
@@ -486,7 +513,7 @@ impl Operation for SetPaused {
             ),
             false => (self.resumed(&loaded)?, AdminAuditAction::PluginResumed),
         };
-        let audit = self.caller.audit(action, &next);
+        let audit = self.caller.audit(self.ids.mint(self.now_ms), action, &next);
         let expected = Some(loaded.current.revision);
         let write = self.caller.write(expected, &next, Some(audit));
         self.written = Some(Box::new(next));
@@ -510,6 +537,8 @@ pub struct RemoveInstall {
     caller: InstallCaller,
     install_id: Ulid,
     phase: RemovePhase,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl RemoveInstall {
@@ -518,6 +547,8 @@ impl RemoveInstall {
             caller,
             install_id,
             phase: RemovePhase::Load,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -527,7 +558,7 @@ impl RemoveInstall {
         Next::Call(IoCall::child(teardown))
     }
 
-    fn delete(&self, removing: &PluginInstall) -> IoCall {
+    fn delete(&mut self, removing: &PluginInstall) -> IoCall {
         let action = AdminAuditAction::PluginRemoved;
         IoCall::child(InstallEntryOperation::new(InstallEntryConfig {
             actor: self.caller.actor.clone(),
@@ -536,7 +567,10 @@ impl RemoveInstall {
             group_id: removing.group_id,
             expected: Some(removing.revision),
             install: None,
-            audit: Some(self.caller.audit(action, removing)),
+            audit: Some(
+                self.caller
+                    .audit(self.ids.mint(self.now_ms), action, removing),
+            ),
             proven: Default::default(),
         }))
     }
@@ -545,6 +579,14 @@ impl RemoveInstall {
 impl Operation for RemoveInstall {
     type Output = PluginInstall;
     type Error = InstallError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn hold_scope(&self) -> Option<HoldScope> {
         Some(HoldScope::PluginInstall(self.install_id))

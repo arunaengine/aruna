@@ -225,7 +225,7 @@ async fn abe_read() -> TestResult<()> {
         let key = aruna_kpabe::issue(&parameters,&master,&policy,&mut SysRng)?;
         let aad = context.bytes()?;
         assert_eq!(aad,bytes(&proposal["aad"]));
-        let sealed = key.seal(|plain|seal_to(&user_public,GRANT_PURPOSE,&aad,plain).map_err(|_|aruna_kpabe::Error))?;
+        let sealed = key.seal(|plain|seal_to(&user_public,GRANT_PURPOSE,&aad,plain, &mut aruna_core::key_seal::SeedRng::new(&[7; 32])).map_err(|_|aruna_kpabe::Error))?;
         let grant_route = format!("{request_route}/{request_id}/grant");
         let mut forged = context.clone(); forged.request.epochs = vec![2];
         let response = client.post(&grant_route).bearer_auth(&token).json(&json!({
@@ -564,7 +564,14 @@ async fn abe_restart_child() -> TestResult<()> {
     let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
     let aad = context.bytes()?;
     let sealed = key.seal(|plain| {
-        seal_to(&user_public, GRANT_PURPOSE, &aad, plain).map_err(|_| aruna_kpabe::Error)
+        seal_to(
+            &user_public,
+            GRANT_PURPOSE,
+            &aad,
+            plain,
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )
+        .map_err(|_| aruna_kpabe::Error)
     })?;
     let grant_route = format!("{request_route}/{}/grant", context.request.request_id);
     let response = client.post(&grant_route).bearer_auth(&token).json(&json!({
@@ -810,7 +817,7 @@ async fn abe_holders() -> TestResult<()> {
         let issued = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
         let seal = |record: &Value| -> TestResult<Value> {
             let context: GrantContext = postcard::from_bytes(&bytes(record))?;
-            let sealed = issued.seal(|plain| seal_to(&reader_public, GRANT_PURPOSE, &context.bytes().unwrap(), plain).map_err(|_| aruna_kpabe::Error))?;
+            let sealed = issued.seal(|plain| seal_to(&reader_public, GRANT_PURPOSE, &context.bytes().unwrap(), plain, &mut aruna_core::key_seal::SeedRng::new(&[7; 32])).map_err(|_| aruna_kpabe::Error))?;
             Ok(submission(record, sealed.enc, &sealed.ciphertext))
         };
         let grant_route = format!("{requests}/{request_id}/grant");
@@ -874,7 +881,7 @@ async fn abe_holders() -> TestResult<()> {
         let context: GrantContext = postcard::from_bytes(&bytes(&owned["records"][0]["record"]))?;
         let racing = KeyGrant { context: context.clone(), enc: [1; 32], ciphertext: vec![1; 16] };
         let auth = AuthContext { user_id: seed.user_id, realm_id: seed.realm_id, path_restrictions: None, session: None };
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
         let mut operation = KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), KeyAction::Publish(racing), now).into_machine();
         let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {
@@ -1535,7 +1542,7 @@ async fn abe_members() -> TestResult<()> {
             session: None,
         };
         let (node_id, plain_id) = (seed.net.node_id(), Ulid::from_string(&plain.group_id)?);
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
         let operation = MemberKeysOperation::new(auth, node_id, plain_id, vec![first], now);
         assert_eq!(drive(operation, &seed.context).await, Ok(Vec::new()));
 
@@ -1891,8 +1898,14 @@ fn sealed_grant(record: &Value, bucket_private: &SecretBytes) -> TestResult<KeyG
     let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
     let recipient = r.recipient_public.unwrap();
     let sealed = key.seal(|plain| {
-        seal_to(&recipient, GRANT_PURPOSE, &context.bytes().unwrap(), plain)
-            .map_err(|_| aruna_kpabe::Error)
+        seal_to(
+            &recipient,
+            GRANT_PURPOSE,
+            &context.bytes().unwrap(),
+            plain,
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )
+        .map_err(|_| aruna_kpabe::Error)
     })?;
     Ok(KeyGrant {
         context,
@@ -2179,7 +2192,7 @@ async fn abe_epochs() -> TestResult<()> {
             session: None,
         };
         let node = seed.net.node_id();
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
         let action = KeyAction::Epoch { instant: false };
         let mut operation =
             KeyOperation::new(BUCKET.into(), auth.clone(), node, action.clone(), now)
@@ -2443,7 +2456,7 @@ async fn abe_rekey() -> TestResult<()> {
             caller: seed.user_id,
             key,
             duration: None,
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms: aruna_clock::unix_timestamp_millis(),
         };
         let secret = SharedSecret::new(SecretBytes::new(bucket_private.expose().to_vec()));
         drive(UnlockBucketOperation::new(input, secret), &seed.context).await?;
@@ -2531,7 +2544,7 @@ async fn publish_racing(
         path_restrictions: None,
         session: None,
     };
-    let now = aruna_core::time::unix_timestamp_millis();
+    let now = aruna_clock::unix_timestamp_millis();
     let action = KeyAction::Publish(grant);
     let mut operation =
         KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), action, now).into_machine();

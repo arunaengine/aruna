@@ -12,6 +12,7 @@ use crate::job_calls::put_purge_checkpoint;
 use crate::job_calls::{claim_job, complete_job, fail_job, transition_to_running};
 use aruna::tasks::job_host::run_storage_purge;
 use aruna_blob::blob::BlobHandler;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -43,7 +44,6 @@ use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::storage::storage_purge::{
     StoragePurgeCheckpoint, StoragePurgeScope, StoragePurgeSpec,
 };
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
@@ -377,7 +377,7 @@ async fn scoped_fence_isolates() {
                 object_size: None,
                 created_by: context.user_id,
                 quota_ceiling: None,
-                now_ms: aruna_core::time::unix_timestamp_millis(),
+                now_ms: aruna_clock::unix_timestamp_millis(),
             }),
             &context.driver,
         )

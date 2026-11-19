@@ -30,7 +30,7 @@ use ulid::Ulid;
 use super::ids;
 use super::plan::{REALM_STAGING, network_access};
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::auth::enforcement::{PolicySets, compiled_policies, policy_reads, read_policies};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::placement::policy::{
     GateContext, GateContextError, GateOperation, PolicySetError, PolicySetResolver, Resolutions,
@@ -235,6 +235,7 @@ enum CheckStep {
     Gate,
     Grant,
     Task,
+    RequestPolicies,
     Policies,
 }
 
@@ -289,19 +290,22 @@ impl LaunchChecksOperation {
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn granted(&self, mut rows: Vec<Option<Value>>) -> bool {
+    /// The group's request policy sets when the submitter's grants allow the launch.
+    fn granted(&self, mut rows: Vec<Option<Value>>) -> Option<PolicySets> {
         let check = self.grant_check();
-        let Ok(split) = check.reads().map(|reads| reads.len()) else {
-            return false;
-        };
+        let split = check.reads().map(|reads| reads.len()).ok()?;
         let policies = rows.split_off(split.min(rows.len()));
         let spec = &self.check.spec;
-        let Ok(evaluator) = read_policies(spec.realm_id, Some(spec.group_id), policies) else {
+        let sets = read_policies(spec.realm_id, Some(spec.group_id), policies).ok()?;
+        check.allowed(rows).unwrap_or(false).then_some(sets)
+    }
+
+    /// Whether the compiled request policies allow the launch.
+    fn policies_allow(&self, result: IoResult) -> bool {
+        let check = self.grant_check();
+        let Ok(evaluator) = compiled_policies(result) else {
             return false;
         };
-        if !check.allowed(rows).unwrap_or(false) {
-            return false;
-        }
         let request = policy_request_with(
             &check.path,
             &Permission::WRITE,
@@ -407,7 +411,14 @@ impl Operation for LaunchChecksOperation {
                     let expected = "IoResult::Values";
                     return Err(IoError::Unexpected { expected, got }.into());
                 };
-                if !self.granted(rows) {
+                let Some(sets) = self.granted(rows) else {
+                    return Ok(Next::Done(Err(LaunchDecline::Unauthorized)));
+                };
+                self.step = CheckStep::RequestPolicies;
+                Ok(Next::Call(sets.compile()))
+            }
+            CheckStep::RequestPolicies => {
+                if !self.policies_allow(result) {
                     return Ok(Next::Done(Err(LaunchDecline::Unauthorized)));
                 }
                 self.policies()

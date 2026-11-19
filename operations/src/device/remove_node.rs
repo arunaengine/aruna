@@ -8,6 +8,7 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -18,7 +19,6 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group_delete::MembershipFence;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 
@@ -53,6 +53,8 @@ pub struct RemoveNodeOperation {
     config: RemoveNodeConfig,
     state: RemoveNodeState,
     document: Option<RealmConfigDocument>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,9 +104,11 @@ impl From<IoError> for RemoveNodeError {
 impl RemoveNodeOperation {
     pub fn new(config: RemoveNodeConfig) -> Self {
         Self {
+            now_ms: 0,
             config,
             state: RemoveNodeState::ReadCurrent,
             document: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -213,10 +217,11 @@ impl RemoveNodeOperation {
                 // A publisher is never removed here, so no set needs a cutoff yet.
                 cutoffs: Vec::new(),
             },
+            self.ids.mint(self.now_ms),
         )?;
         // The stored document is derived from the reducer, exactly as the
         // replicated overlay derives it on every other node.
-        overlay_reducer_state(&mut document, &reducer_state, unix_timestamp_millis());
+        overlay_reducer_state(&mut document, &reducer_state, self.now_ms);
 
         let stale_conflict_deletes =
             stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
@@ -263,6 +268,14 @@ impl Operation for RemoveNodeOperation {
     type Output = RealmConfigDocument;
     type Error = RemoveNodeError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<RealmConfigDocument>, RemoveNodeError> {
         Ok(Next::Call(self.read_current()))
     }
@@ -305,9 +318,7 @@ mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
     use aruna_core::UserId;
-    use aruna_core::document::DocumentTarget;
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
     use aruna_drivers::driver::{DriverContext, drive};
     use ulid::Ulid;
@@ -325,22 +336,7 @@ mod tests {
     }
 
     async fn seed(ctx: &DriverContext, actor: &Actor, document: &RealmConfigDocument) {
-        let target = DocumentTarget::RealmConfig {
-            realm_id: actor.realm_id,
-        };
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: target.storage_keyspace().to_string(),
-                key: target.storage_key(),
-                value: document.to_bytes(actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::tests::realm::seed_config(ctx, actor, document).await;
     }
 
     fn realm_with_device(realm_id: RealmId, actor: &Actor, owner: UserId) -> RealmConfigDocument {

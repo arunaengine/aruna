@@ -57,6 +57,7 @@
     "mixed_files": 4,
     "pure_async_refs": 75,
     "runner_refs": 6,
+    "core_clocks": 38,
     "silent_skips": 9,
     "state_clones": 5,
     "test_sleeps": 64,

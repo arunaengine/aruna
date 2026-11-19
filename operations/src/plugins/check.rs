@@ -22,7 +22,7 @@ use super::grants::{InstallScope, accesses, covers, parse_grants, patterns_for};
 use super::rows::StoreError;
 use super::unavailable;
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::enforcement::{group_from_path, policy_reads, read_policies};
+use crate::auth::enforcement::{compiled_policies, group_from_path, policy_reads, read_policies};
 use crate::auth::error::{AuthorizeError, check_error};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -182,6 +182,7 @@ pub(crate) struct Authorize {
     accesses: VecDeque<Access>,
     current: Option<CheckPermissionsConfig>,
     rules_read: bool,
+    compiling: bool,
 }
 
 impl Authorize {
@@ -222,6 +223,7 @@ impl Authorize {
             accesses: accesses.into(),
             current: None,
             rules_read: false,
+            compiling: false,
         }
     }
 
@@ -244,6 +246,7 @@ impl Authorize {
             .map_err(|error| refusal(check_error(error)))?;
         self.current = Some(config);
         self.rules_read = false;
+        self.compiling = false;
         Ok(Next::Call(IoCall::Read(reads)))
     }
 }
@@ -258,6 +261,16 @@ impl Operation for Authorize {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, CallError> {
         let config = self.current.as_ref().ok_or(IoError::Unfinished)?;
+        if self.compiling {
+            let extras = PolicyRequestExtras::operation(format!("plugin.{}", self.permission));
+            let auth = Some(&config.auth_context);
+            let request =
+                policy_request_with(&self.target, &config.required_permission, auth, extras);
+            (compiled_policies(result))
+                .and_then(|policies| policies.evaluate(&request))
+                .map_err(|error| refusal(error.into()))?;
+            return self.advance();
+        }
         let values = result.values()?;
         if !self.rules_read {
             let allowed = config.allowed(values);
@@ -268,14 +281,11 @@ impl Operation for Authorize {
             let reads = policy_reads(self.realm(), group_from_path(&self.target));
             return Ok(Next::Call(IoCall::Read(reads)));
         }
-        let extras = PolicyRequestExtras::operation(format!("plugin.{}", self.permission));
-        let auth = Some(&config.auth_context);
-        let request = policy_request_with(&self.target, &config.required_permission, auth, extras);
         let group = group_from_path(&self.target);
-        (read_policies(self.realm(), group, values))
-            .and_then(|policies| policies.evaluate(&request))
-            .map_err(|error| refusal(error.into()))?;
-        self.advance()
+        let sets =
+            (read_policies(self.realm(), group, values)).map_err(|error| refusal(error.into()))?;
+        self.compiling = true;
+        Ok(Next::Call(sets.compile()))
     }
 }
 

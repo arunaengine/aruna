@@ -9,6 +9,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::structs::storage::backends::ImportRoot;
@@ -18,9 +19,8 @@ use aruna_core::structs::storage::group_backend::{
 };
 use aruna_core::types::GroupId;
 use std::collections::{BTreeMap, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::groups::fence::GroupWriteOperation;
 
@@ -108,6 +108,8 @@ pub struct CreateBackendOperation {
     state: CreateState,
     record: Option<GroupStorage>,
     secret: Option<GroupStorageSecret>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl CreateBackendOperation {
@@ -117,6 +119,8 @@ impl CreateBackendOperation {
             state: CreateState::Probe,
             record: None,
             secret: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -136,6 +140,14 @@ impl Operation for CreateBackendOperation {
     type Output = GroupStorage;
     type Error = CreateBackendError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> CreateTurn {
         let normalized = validate_backend_input(
             &self.input.name,
@@ -146,8 +158,8 @@ impl Operation for CreateBackendOperation {
         let (kind, roots) = (self.input.kind, &self.input.import_roots);
         check_import_root(kind, &normalized.public, self.input.group_id, roots)?;
 
-        let now = SystemTime::now();
-        let backend_id = Ulid::generate();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+        let backend_id = self.ids.mint(self.now_ms);
         let record = GroupStorage {
             backend_id,
             group_id: self.input.group_id,

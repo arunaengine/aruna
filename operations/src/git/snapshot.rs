@@ -255,7 +255,7 @@ impl UpdateOperation {
     }
 
     fn with_digest(&mut self, digest: Option<[u8; 32]>) -> UpdateTurn {
-        let due = self.leading()? || overdue(self.stages.now_ms(), &self.document);
+        let due = self.leading()? || overdue(self.stages.stamped(), &self.document);
         let Some(digest) = digest.filter(|_| due) else {
             self.source = None;
             return self.fold();

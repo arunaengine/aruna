@@ -321,18 +321,7 @@ mod pure_tests {
     }
 
     fn policy(seed: u8) -> VerifiedPolicy {
-        let policy = PlacementPolicy::new(
-            Ulid::from_bytes([seed; 16]),
-            "residency".to_string(),
-            vec![PlacementSelector {
-                node_id: None,
-                location: Some("eu-west".to_string()),
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
-        )
-        .expect("policy is valid");
-        VerifiedPolicy::verify(policy).expect("policy verifies")
+        crate::tests::policy::residency(seed, "eu-west")
     }
 
     fn stored(policies: Vec<PlacementPolicyRef>) -> BucketInfo {

@@ -112,12 +112,7 @@ impl Operation for RecentOperation {
 
 /// Remote holders serve a pack to the user who stored it.
 pub fn author(user_id: UserId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id: user_id.realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, user_id.realm_id)
 }
 
 /// What the pending call of a projection answers.

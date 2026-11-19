@@ -30,6 +30,7 @@ use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ABE_PENDING_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, COPY_OWNER_KEYSPACE, NODE_SUBJECT_KEYSPACE,
@@ -78,7 +79,6 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
-use aruna_core::time::unix_timestamp_millis;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -298,6 +298,8 @@ pub struct CompleteUploadResult {
 /// `finalizing` set, in one write transaction.
 #[derive(Debug, PartialEq)]
 pub struct CompleteUploadOperation {
+    now_ms: u64,
+    ids: IdMint,
     state: CompleteUploadState,
     input: CompleteUploadInput,
     /// This instance is the finalize child.
@@ -394,6 +396,8 @@ pub struct CompleteUploadOperation {
 impl CompleteUploadOperation {
     pub fn new(input: CompleteUploadInput) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             state: CompleteUploadState::Init,
             input,
             finalizing: false,
@@ -1236,7 +1240,7 @@ impl Operation for CompleteUploadOperation {
         for work in works {
             match work.to_bytes() {
                 Ok(value) => {
-                    let key = cleanup_key(&work);
+                    let key = cleanup_key(&work, self.ids.mint(self.now_ms));
                     let row = (BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into());
                     calls.push(IoCall::Write(vec![row]));
                 }
@@ -1248,15 +1252,23 @@ impl Operation for CompleteUploadOperation {
         }
         calls
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 }
 
 /// The key of a cleanup row: a reconciled object by its id, so a second one replaces it.
-fn cleanup_key(work: &BlobCleanupWork) -> Key {
+fn cleanup_key(work: &BlobCleanupWork, fresh: Ulid) -> Key {
     match work {
         BlobCleanupWork::ReconcileWrite { location, .. } => {
             location.ulid.to_bytes().to_vec().into()
         }
-        _ => Ulid::generate().to_bytes().to_vec().into(),
+        _ => fresh.to_bytes().to_vec().into(),
     }
 }
 

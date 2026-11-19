@@ -50,13 +50,7 @@ pub async fn send(handle: &StorageHandle, effect: Effect) -> Event {
 }
 
 pub async fn begin(handle: &StorageHandle) -> TxnId {
-    match handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => panic!("unexpected storage event: {other:?}"),
-    }
+    handle.begin_write().await
 }
 
 /// True when the commit succeeded, false on a conflict.
@@ -190,7 +184,7 @@ pub async fn stage_usage(
     txn_id: TxnId,
     update: &mut UsageCounterUpdate,
 ) -> Result<(), UsageUpdateError> {
-    let mut next = Some(update.start_calls());
+    let mut next = Some(update.start_calls(ulid::Ulid::from_parts(1, 1)));
     while let Some(call) = next {
         let answer = run_staged(handle, txn_id, call).await?;
         next = update.step_calls(answer)?;

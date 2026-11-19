@@ -8,18 +8,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::share::{ShareAction, ShareMode, ShareTarget, ShareUses};
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
-use aruna_storage::storage::FjallStorage;
 
 fn context(dir: &tempfile::TempDir) -> DriverContext {
-    DriverContext {
-        storage_handle: FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    }
+    crate::testing::path_context(dir.path().to_str().unwrap())
 }
 
 async fn save(context: &DriverContext, link: ShareLink) {

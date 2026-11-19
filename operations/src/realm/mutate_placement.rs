@@ -7,17 +7,16 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
-    DOCUMENT_STATE_KEYSPACE, EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    PENDING_PROJECTION_KEYSPACE,
+    EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, overlay_placement};
 use aruna_core::rows::{PrefixPages, done, values};
 use aruna_core::storage_entries::{
-    conflict_write_entries, pending_projection_target, reducer_state_entry, reducer_state_key,
-    stale_conflict_deletes,
+    conflict_write_entries, pending_projection_target, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -34,7 +33,6 @@ use aruna_core::structs::placement::transition::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::reserved_label;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace, Value};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -826,6 +824,8 @@ impl MutatePlacementOperation {
             pending: None,
             document: None,
             deletes: Vec::new(),
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -916,6 +916,8 @@ struct PlacementWrite {
     pending: Option<Vec<Key>>,
     document: Option<RealmConfigDocument>,
     deletes: Vec<(KeySpace, Key)>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl PlacementWrite {
@@ -969,9 +971,12 @@ impl PlacementWrite {
         for mutation in &self.mutations {
             mutation.authorize(&document, &self.actor)?;
             mutation.validate(&document)?;
-            let admin_event =
-                reducer_state.apply_operation(&self.actor, mutation.admin_operation(&document)?)?;
-            overlay_placement(&mut document, &reducer_state, unix_timestamp_millis());
+            let admin_event = reducer_state.apply_operation(
+                &self.actor,
+                mutation.admin_operation(&document)?,
+                self.ids.mint(self.now_ms),
+            )?;
+            overlay_placement(&mut document, &reducer_state, self.now_ms);
             admin_events.push(admin_event);
         }
 
@@ -1185,23 +1190,21 @@ impl Operation for PlacementWrite {
     type Output = RealmConfigDocument;
     type Error = MutatePlacementError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
 
     fn first(&mut self) -> PlacementTurn {
-        let document = self.document_ref();
-        let target = self.admin_target();
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                document.storage_keyspace().to_string(),
-                document.storage_key(),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        let reads = crate::realm::document_reads(self.document_ref(), &self.admin_target());
+        Ok(Next::Call(reads))
     }
 
     fn next(&mut self, result: IoResult) -> PlacementTurn {

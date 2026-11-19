@@ -18,7 +18,6 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_core::structs::{FolderState, SyncedFolder};
 use aruna_core::task::TaskKey;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use ulid::Ulid;
 
@@ -421,6 +420,7 @@ struct AbortUploadsOperation {
     left: usize,
     queue: VecDeque<MultipartUpload>,
     aborting: bool,
+    now_ms: u64,
 }
 
 type AbortTurn = Result<Next<()>, FolderError>;
@@ -428,6 +428,7 @@ type AbortTurn = Result<Next<()>, FolderError>;
 impl AbortUploadsOperation {
     fn new(bucket: String, limit: usize) -> Self {
         Self {
+            now_ms: 0,
             bucket,
             left: limit,
             queue: VecDeque::new(),
@@ -463,7 +464,7 @@ impl AbortUploadsOperation {
             bucket: upload.bucket,
             key: upload.key,
             upload_id: upload.upload_id,
-            now_ms: unix_timestamp_millis(),
+            now_ms: self.now_ms,
         });
         if resume {
             abort = abort.resuming_abort();
@@ -475,6 +476,10 @@ impl AbortUploadsOperation {
 impl Operation for AbortUploadsOperation {
     type Output = ();
     type Error = FolderError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> AbortTurn {
         self.list()

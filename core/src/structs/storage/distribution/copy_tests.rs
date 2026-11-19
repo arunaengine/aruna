@@ -6,11 +6,9 @@
 use ulid::Ulid;
 
 use super::*;
-use crate::structs::storage::distribution::presets::shard_layout;
 use crate::structs::storage::distribution::split::split_ids;
 use crate::structs::storage::distribution::{
-    DistributionConfig, DistributionRequest, DistributionSettings, KeyRange, ReadRoute, SetRoot,
-    TransferRole, next_snapshot,
+    DistributionRequest, KeyRange, ReadRoute, TransferRole, next_snapshot,
 };
 
 fn secret(seed: u8) -> iroh::SecretKey {
@@ -28,35 +26,7 @@ fn member(seed: u8) -> Ulid {
 /// Two shards split at "m" without copies: member 1 coordinates the lower one, member 2 the
 /// upper one, both admitted and active.
 fn active() -> DistributionSnapshot {
-    let root = SetRoot {
-        publisher: secret(1).public(),
-        owner_group: Ulid::from_bytes([90; 16]),
-        nonce: [7; 16],
-    };
-    let nodes = [
-        (member(1), secret(1).public()),
-        (member(2), secret(2).public()),
-    ];
-    let layout = shard_layout(root.set_id(), &nodes, &["m".to_string()], 0).unwrap();
-    let create = DistributionRequest::Create {
-        root: root.clone(),
-        config: DistributionConfig {
-            bucket: "spire".to_string(),
-            owner_group: root.owner_group,
-            node_set: None,
-            members: layout.members,
-            ranges: layout.ranges,
-            settings: DistributionSettings::default(),
-        },
-    };
-    let mut head = next_snapshot(realm(), None, &create).unwrap();
-    for seed in [1, 2] {
-        let intent = head.member(member(seed)).unwrap().intent;
-        let statement = Statement::admit(realm(), head.set_id(), member(seed), 5, intent);
-        let request = DistributionRequest::Statement(Box::new(statement.sign(&secret(seed))));
-        head = next_snapshot(realm(), Some(&head), &request).unwrap();
-    }
-    next_snapshot(realm(), Some(&head), &DistributionRequest::Activate).unwrap()
+    crate::tests::distribution::active()
 }
 
 fn fill(range: &KeyRange, seed: u8) -> RangeFill {

@@ -12,6 +12,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, COPY_OWNER_KEYSPACE, MANAGED_COPY_KEYSPACE,
@@ -114,6 +115,8 @@ fn parsed<T>(
 /// Moves one version of a bucket in a transition to a copy in the target format.
 #[derive(Debug, PartialEq)]
 pub struct RewriteVersionOperation {
+    now_ms: u64,
+    ids: IdMint,
     version_key: VersionKey,
     transition: EncryptionTransition,
     now: SystemTime,
@@ -144,6 +147,8 @@ pub struct RewriteVersionOperation {
 impl RewriteVersionOperation {
     pub fn new(version_key: VersionKey, transition: EncryptionTransition, now: SystemTime) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             version_key,
             transition,
             now,
@@ -447,6 +452,14 @@ impl Operation for RewriteVersionOperation {
         self.lease = None;
         self.owns_row = false;
         self.leave()
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 #[path = "../rewrite/rows.rs"]

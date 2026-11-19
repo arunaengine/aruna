@@ -21,7 +21,6 @@ use aruna_core::structs::execution::job::{
     JobRecordKind, LogicalJobState, SubmissionId,
 };
 use aruna_core::structs::storage::node_info::AdvertisementEpoch;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 
@@ -67,6 +66,7 @@ pub struct DemandSnapshotOperation {
     /// The family whose spec is being read.
     family: Option<JobFamilyId>,
     state: DemandState,
+    now_ms: u64,
 }
 
 impl DemandSnapshotOperation {
@@ -80,6 +80,7 @@ impl DemandSnapshotOperation {
             full: false,
             family: None,
             state: DemandState::Page,
+            now_ms: 0,
         }
     }
 
@@ -109,7 +110,7 @@ impl DemandSnapshotOperation {
                     return Ok(Next::Call(IoCall::child(ProjectFamilyOperation::new(
                         ProjectFamilyConfig {
                             family: FamilyRef::Family(family),
-                            now_ms: unix_timestamp_millis(),
+                            now_ms: self.now_ms,
                             rebuild: false,
                         },
                     ))));
@@ -181,6 +182,10 @@ impl DemandSnapshotOperation {
 impl Operation for DemandSnapshotOperation {
     type Output = ComputeDemandSnapshot;
     type Error = DemandError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Step {
         self.page()
@@ -314,13 +319,19 @@ mod tests {
     #[test]
     fn stale_cache_projects() {
         let mut operation = DemandSnapshotOperation::new(AdvertisementEpoch::default());
+        operation.stamp(1_700_000_000_000);
         operation.first().expect("projection page");
         let key = Key::from([7u8; 64].as_slice());
         let stale = Value::from(&[0xff][..]);
-        assert!(matches!(
+        let project = ProjectFamilyOperation::new(ProjectFamilyConfig {
+            family: FamilyRef::Family(projection_family(&key).unwrap()),
+            now_ms: 1_700_000_000_000,
+            rebuild: false,
+        });
+        assert_eq!(
             operation.next(page(vec![(key, stale)])),
-            Ok(Next::Call(IoCall::Child(_)))
-        ));
+            Ok(Next::Call(IoCall::child(project)))
+        );
     }
 
     #[test]

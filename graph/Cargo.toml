@@ -28,5 +28,6 @@ tracing = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
+aruna-core = { workspace = true, features = ["test-hooks"] }
 iroh = { workspace = true }
 tempfile = { workspace = true }

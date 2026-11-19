@@ -6,11 +6,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{EVENTS_QUEUED, PluginRun, RunTrigger};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::{
     CancellationToken, FailureKind, Field, Invocation, InvokeError, Supervisor, Trigger,
@@ -150,7 +150,8 @@ impl Worker {
     /// Follows this node's plugin task families: settles, adopts, resends and proves absence.
     async fn follow_tasks(&self) -> Result<usize, String> {
         let fresh = self.ctx.fresh_heartbeats();
-        let Some(node) = ingress_node(self.ctx.node_and_realm(), fresh) else {
+        let Some(node) = ingress_node(self.ctx.node_and_realm(), fresh, unix_timestamp_millis())
+        else {
             return Ok(0);
         };
         let settled = drive(SettleTasks::new(node), &self.ctx).await;

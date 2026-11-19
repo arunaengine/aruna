@@ -25,8 +25,15 @@ async fn config_preserves_holders() -> TestResult<()> {
     let path = "datasets/pinned";
     let origin = realm.leading_node(group_id, path);
     let origin_id = origin.node_id();
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let placement = realm
         .origin_placement(origin, group_id, document_id, path)
         .expect("a Management node holds buckets");
@@ -96,6 +103,8 @@ async fn config_preserves_holders() -> TestResult<()> {
         &realm.actor(second_origin),
         group_id,
         second_path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
     )?
     .as_ulid();
     let stamped = realm

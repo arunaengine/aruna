@@ -43,9 +43,9 @@ fn make_provider(
         secret: EncryptedS3Secret::empty(),
         models: Vec::new(),
         default_model: None,
-        created_at: aruna_core::time::unix_timestamp_secs(),
+        created_at: aruna_clock::unix_timestamp_secs(),
         status: AssistantProviderStatus::Ready,
-        token_obtained_at: Some(aruna_core::time::unix_timestamp_secs()),
+        token_obtained_at: Some(aruna_clock::unix_timestamp_secs()),
         login_expires_at: None,
         login_interval_seconds: None,
     };
@@ -56,6 +56,7 @@ fn make_provider(
                 api_key: api_key.map(Secret::new),
                 ..AssistantProviderSecret::empty()
             },
+            [3; 24],
         )
         .unwrap();
     provider
@@ -65,6 +66,7 @@ fn make_provider(
                 "x-custom".to_string(),
                 Secret::new("custom-value"),
             )])),
+            [3; 24],
         )
         .unwrap();
     provider
@@ -172,7 +174,7 @@ async fn chatgpt_models_get() {
     secret.access_token = Some(Secret::new("access"));
     secret.account_id = Some(Secret::new("account"));
     provider
-        .encrypt_secret(state.credential_encryption_key(), &secret)
+        .encrypt_secret(state.credential_encryption_key(), &secret, [3; 24])
         .unwrap();
 
     let models = fetch_models(&state, &provider).await.unwrap();
@@ -360,7 +362,7 @@ async fn refreshes_after_401() {
     secret.refresh_token = Some(Secret::new("refresh-token"));
     secret.account_id = Some(Secret::new("account-id"));
     provider
-        .encrypt_secret(state.credential_encryption_key(), &secret)
+        .encrypt_secret(state.credential_encryption_key(), &secret, [3; 24])
         .unwrap();
     let provider_id = provider.provider_id.clone();
     drive(

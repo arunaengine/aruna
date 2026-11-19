@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
@@ -13,7 +14,6 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, BlobCleanupWork, CopyOwner};
 use aruna_core::types::{Key, Value};
-use ulid::Ulid;
 
 use crate::blob::reclaim::{ReclaimBlobError, ReclaimVerdict};
 use crate::s3::usage::{StoredDelta, UsageCounterUpdate};
@@ -33,6 +33,8 @@ type Step = Result<Next<ReclaimVerdict>, ReclaimBlobError>;
 /// Decides one pending archive inside one transaction: owners, marker and free commit together.
 #[derive(Debug, PartialEq)]
 pub struct ReclaimPendingOperation {
+    now_ms: u64,
+    ids: IdMint,
     archive: ArchiveKey,
     grace: Duration,
     now: SystemTime,
@@ -45,6 +47,8 @@ pub struct ReclaimPendingOperation {
 impl ReclaimPendingOperation {
     pub fn new(archive: ArchiveKey, grace: Duration, now: SystemTime) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             archive,
             grace,
             now,
@@ -113,7 +117,7 @@ impl ReclaimPendingOperation {
         self.state = State::QueueCleanup;
         let row = (
             BLOB_CLEANUP_KEYSPACE.to_string(),
-            Ulid::generate().to_bytes().to_vec().into(),
+            self.ids.mint(self.now_ms).to_bytes().to_vec().into(),
             work.into(),
         );
         Ok(Next::Call(IoCall::Write(vec![row])))
@@ -128,7 +132,7 @@ impl ReclaimPendingOperation {
         };
         let mut update = UsageCounterUpdate::for_stored(stored);
         self.state = State::UpdateUsage;
-        let call = update.start_calls().into_call();
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.usage = Some(update);
         Ok(Next::Call(call))
     }
@@ -190,6 +194,14 @@ impl Operation for ReclaimPendingOperation {
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 }
 
 #[cfg(test)]
@@ -202,15 +214,10 @@ mod tests {
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use aruna_drivers::driver::{DriverContext, drive};
     use std::collections::HashMap;
+    use ulid::Ulid;
 
     async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        let effect = StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        };
-        context.storage_handle.send_storage_effect(effect).await;
+        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     async fn present(context: &DriverContext, key_space: &str, key: Vec<u8>) -> bool {

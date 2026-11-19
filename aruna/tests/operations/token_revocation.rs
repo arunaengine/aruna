@@ -86,7 +86,7 @@ async fn peer_denies_token() -> TestResult<()> {
             expires_at,
             token_owner: user_id,
             admission: RevokeTokenAdmission::SelfService,
-            now: aruna_core::time::unix_timestamp_secs(),
+            now: aruna_clock::unix_timestamp_secs(),
         }),
         nodes[0].context.as_ref(),
     )
@@ -139,7 +139,7 @@ async fn peer_applies_cutoff() -> TestResult<()> {
     let nodes = build_realm_nodes(realm_id, 2).await?;
     let user_id = UserId::local(Ulid::generate(), realm_id);
     let other_id = UserId::local(Ulid::generate(), realm_id);
-    let now = aruna_core::time::unix_timestamp_secs();
+    let now = aruna_clock::unix_timestamp_secs();
     let cutoff = now + 1;
     let (older, _) = mint_token_at(&signing_key, realm_id, user_id, now);
     let (newer, _) = mint_token_at(&signing_key, realm_id, user_id, cutoff);
@@ -301,6 +301,7 @@ async fn seed_sync_topic(
                 .ok_or("realm config has no placement entry")?
                 .clone(),
         },
+        ulid::Ulid::generate(),
     )?;
 
     match nodes[1]

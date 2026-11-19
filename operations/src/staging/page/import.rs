@@ -14,6 +14,7 @@ use crate::staging::page::rows::{
 };
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
@@ -50,6 +51,8 @@ type PageNext = Result<Next<PageImportResult>, PageImportError>;
 
 #[derive(Debug, PartialEq)]
 pub struct PageImportOperation {
+    now_ms: u64,
+    ids: IdMint,
     input: PageImportInput,
     step: PageStep,
     guards: Option<PageGuards>,
@@ -63,6 +66,8 @@ pub struct PageImportOperation {
 impl PageImportOperation {
     pub fn new(input: PageImportInput) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             input,
             step: PageStep::Guards,
             guards: None,
@@ -150,7 +155,8 @@ impl PageImportOperation {
                 prepared.rows
             }
             _ if self.prepare => {
-                let rows = page_rows(&self.input, guards, versions.clone())?;
+                let mint = (&mut self.ids, self.now_ms);
+                let rows = page_rows(&self.input, guards, versions.clone(), mint)?;
                 let result = rows.result.clone();
                 let guards = guards.clone();
                 self.prepared = Some(PreparedRows {
@@ -161,7 +167,7 @@ impl PageImportOperation {
                 // The read snapshot ends without writes.
                 return Ok(Next::Done(result));
             }
-            _ => page_rows(&self.input, guards, versions)?,
+            _ => page_rows(&self.input, guards, versions, (&mut self.ids, self.now_ms))?,
         };
         if rows.result.registered > 0 {
             let usage = UsageCounterUpdate::for_group(self.input.group_id, rows.delta)
@@ -176,7 +182,7 @@ impl PageImportOperation {
     fn update_usage(&mut self) -> PageNext {
         match self.usage.as_mut().filter(|usage| !usage.is_noop()) {
             Some(usage) => {
-                let call = usage.start_calls().into_call();
+                let call = usage.start_calls(self.ids.mint(self.now_ms)).into_call();
                 self.call(PageStep::Usage, call)
             }
             None => self.finish(),
@@ -284,6 +290,14 @@ impl Operation for PageImportOperation {
             false => TransactionMode::Write,
         }
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 }
 
 /// Builds a page's rows in a read snapshot ahead of the page's turn, so the turn only reads,
@@ -316,6 +330,14 @@ impl PreparePageOperation {
 impl Operation for PreparePageOperation {
     type Output = PreparedRows;
     type Error = PageImportError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.0.stamp(now_ms);
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.0.seed(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<PreparedRows>, PageImportError> {
         let next = self.0.first()?;

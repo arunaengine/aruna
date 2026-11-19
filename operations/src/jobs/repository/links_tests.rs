@@ -11,9 +11,7 @@ use aruna_core::keyspaces::{
 use aruna_core::repository::{LinkFailure, LinkRemote, RepositoryRecord};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 const NOW_MS: u64 = 1_700_000_000_000;
 
@@ -22,13 +20,7 @@ fn now() -> SystemTime {
 }
 
 fn job(nonce: u64) -> JobId {
-    JobId::from_parts(
-        1_700_000_000_000,
-        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
-        BucketId::new(0).unwrap(),
-        nonce,
-    )
-    .unwrap()
+    aruna_core::testing::job_at(1_700_000_000_000, nonce)
 }
 
 fn link() -> RepositoryLink {
@@ -62,7 +54,7 @@ fn link() -> RepositoryLink {
 fn secret(link_id: Ulid) -> RepositoryCredential {
     let link = link();
     RepositoryCredential::seal_link(
-        &CredentialEncryptionKey::derive(&[1; 32]),
+        (&CredentialEncryptionKey::derive(&[1; 32]), [3; 24]),
         link.created_by,
         link.group_id,
         link.connector_id,

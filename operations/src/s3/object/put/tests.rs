@@ -31,18 +31,7 @@ fn count_files(path: &Path) -> usize {
 }
 
 async fn read_value(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        panic!("unexpected storage read result");
-    };
-    value
+    crate::testing::read_value(&context.storage_handle, key_space, key).await
 }
 
 fn test_location(created_by: UserId) -> BackendLocation {
@@ -137,16 +126,7 @@ pub(super) fn asked(turn: &Turn) -> &Effect {
 
 /// The cleanup rows among `calls`, in order.
 pub(super) fn cleanup_works(calls: &[IoCall]) -> Vec<BlobCleanupWork> {
-    let rows = calls.iter().filter_map(|call| match call {
-        IoCall::Write(rows) => Some(rows),
-        _ => None,
-    });
-    rows.flatten()
-        .map(|(space, _, value)| {
-            assert_eq!(space, BLOB_CLEANUP_KEYSPACE);
-            BlobCleanupWork::from_bytes(value.as_ref()).unwrap()
-        })
-        .collect()
+    crate::tests::s3::cleanup_works(calls)
 }
 
 /// `calls` delete the written blob through a rollback child, and nothing else.
@@ -305,7 +285,8 @@ fn quota_error_cleans() {
         group_id,
         UsageDelta::default(),
     ));
-    child.usage_update.as_mut().unwrap().start_calls();
+    let generation = Ulid::from_parts(1, 1);
+    child.usage_update.as_mut().unwrap().start_calls(generation);
     let turn = child.handle_usage_update(values(vec![None]));
     assert!(matches!(turn, Err(PutObjectError::UsageUpdateError(_))));
 
@@ -1678,7 +1659,11 @@ fn writer_reads_trail() {
     let writer = || {
         let config = put_config(realm_id, group_id, iroh::SecretKey::generate().public());
         let output = hashed(test_location(config.user_id));
-        let mut child = publishing(config, output);
+        // The run starts late enough that the version id bounds the trail read.
+        let mut operation = PutObjectOperation::new(config);
+        operation.stamp(1_000);
+        let mut child = publisher(operation, output.clone());
+        child.output = Some(output);
         // The version is not registered, so the trail is read before the head moves, in the
         // incarnation the bucket's creation row names.
         let turn = child.history_read(None);
@@ -2395,7 +2380,7 @@ mod decisions {
     use super::*;
     use crate::placement::policy::PolicyCacheStats;
     use aruna_core::structs::placement::policy::{
-        PlacementDecision, PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
+        PlacementDecision, PlacementSubject, VerifiedPolicy,
     };
     use std::collections::BTreeMap;
 
@@ -2411,18 +2396,7 @@ mod decisions {
 
     /// A rule that admits exactly one location.
     fn policy(location: &str) -> VerifiedPolicy {
-        let policy = PlacementPolicy::new(
-            Ulid::from_bytes([1u8; 16]),
-            "residency".to_string(),
-            vec![PlacementSelector {
-                node_id: None,
-                location: Some(location.to_string()),
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
-        )
-        .expect("policy is valid");
-        VerifiedPolicy::verify(policy).expect("policy verifies")
+        crate::tests::policy::residency(1, location)
     }
 
     fn gate(location: &str) -> GateContext {

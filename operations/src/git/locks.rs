@@ -5,6 +5,7 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::git::{GitChange, GitRecord, LfsLock, valid_path};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -67,6 +68,8 @@ pub fn create(
     path: String,
 ) -> CreateLockOperation {
     CreateLockOperation {
+        now_ms: 0,
+        mint: IdMint::default(),
         node,
         auth: auth.clone(),
         id,
@@ -88,6 +91,8 @@ pub struct CreateLockOperation {
     step: CreateStep,
     document: Option<Document>,
     claim: Option<Ulid>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 type CreateTurn = Result<Next<LockOutcome>, GitError>;
@@ -101,6 +106,14 @@ impl CreateLockOperation {
 impl Operation for CreateLockOperation {
     type Output = LockOutcome;
     type Error = GitError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> CreateTurn {
         if !valid_path(&self.path) {
@@ -124,7 +137,7 @@ impl Operation for CreateLockOperation {
                     }));
                 }
                 let document = self.document.as_ref().ok_or(IoError::Unfinished)?;
-                let claim = Ulid::generate();
+                let claim = self.mint.mint(self.now_ms);
                 let change = GitChange::Lock {
                     id: claim,
                     path: self.path.clone(),

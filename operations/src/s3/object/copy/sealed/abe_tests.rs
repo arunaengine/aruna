@@ -115,13 +115,16 @@ async fn sealed(storage: &StorageHandle) -> (Sealed, Ulid, ObjectEnvelope) {
         None,
     );
     seed(storage, source_id, &version).await;
-    let (envelope, _) = create_envelope(EnvelopePlan {
-        parameters,
-        epoch: 1,
-        write_id: Ulid::generate(),
-        object_key: SOURCE.to_string(),
-        bucket_public: public,
-    })
+    let (envelope, _) = create_envelope(
+        EnvelopePlan {
+            parameters,
+            epoch: 1,
+            write_id: Ulid::generate(),
+            object_key: SOURCE.to_string(),
+            bucket_public: public,
+        },
+        &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+    )
     .unwrap();
     let source = VersionKey::new("bucket", SOURCE, source_id);
     let rows = (&HashMap::new(), u64::MAX);
@@ -148,7 +151,11 @@ async fn run<O: Runnable<K>, K>(
     unlocked: Option<&Sealed>,
     race: Race,
 ) -> Result<O::Output, O::Error> {
+    // Each run gets its own entropy, as the runner gives it, so two copies mint distinct ids.
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(7);
     let mut operation = operation.into_machine();
+    let entropy = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    operation.seed(u128::from(entropy));
     let mut effects: Vec<Effect> = operation.start().into_iter().collect();
     while !operation.is_complete() {
         let effect = effects.remove(0);
@@ -182,7 +189,13 @@ async fn run<O: Runnable<K>, K>(
                             object_key,
                             bucket_public: sealed.public,
                         };
-                        let envelope = copy_envelope(&source, &sealed.secret, plan).unwrap();
+                        let envelope = copy_envelope(
+                            &source,
+                            &sealed.secret,
+                            plan,
+                            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+                        )
+                        .unwrap();
                         BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope)))
                     }
                     None => match check_copy(&source, object_key) {
@@ -838,7 +851,7 @@ async fn locked_unrepresentable_refused() {
         object_key: wide.clone(),
         bucket_public: sealed.public,
     };
-    create_envelope(plan).unwrap();
+    create_envelope(plan, &mut aruna_core::key_seal::SeedRng::new(&[7; 32])).unwrap();
     set_epoch(storage, &sealed.location, 128).await;
     for (dest, error) in [
         ("a/".repeat(60), AbeError::Limit),

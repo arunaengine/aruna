@@ -6,7 +6,9 @@
 use hpke::aead::AesGcm256;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::X25519HkdfSha256;
+use hpke::rand_core::{CryptoRng, TryCryptoRng, TryRng};
 use hpke::{Deserializable, OpModeR, OpModeS, Serializable};
+use std::convert::Infallible;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -38,20 +40,57 @@ impl std::fmt::Debug for SealedSecret {
     }
 }
 
-/// Seals `plain` to `public` with a fresh ephemeral key from the system RNG.
+/// A random stream from a secret 32-byte seed, as unpredictable as the seed. One stream serves
+/// every key and seal of one call, so none of them repeats.
+pub struct SeedRng(blake3::OutputReader);
+
+impl SeedRng {
+    pub fn new(seed: &[u8; 32]) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key("aruna seed rng v1");
+        hasher.update(seed);
+        Self(hasher.finalize_xof())
+    }
+}
+
+impl TryRng for SeedRng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        let mut bytes = [0u8; 4];
+        self.0.fill(&mut bytes);
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        let mut bytes = [0u8; 8];
+        self.0.fill(&mut bytes);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
+        self.0.fill(dst);
+        Ok(())
+    }
+}
+
+impl TryCryptoRng for SeedRng {}
+
+/// Seals `plain` to `public` with an ephemeral key drawn from `rng`, which must be secret.
 pub fn seal_to(
     public: &[u8; 32],
     info: &[u8],
     aad: &[u8],
     plain: &[u8],
+    rng: &mut impl CryptoRng,
 ) -> Result<SealedSecret, KeySealError> {
     let public = public_key(public)?;
-    let sealed = hpke::single_shot_seal::<AesGcm256, HkdfSha256, Kem>(
+    let sealed = hpke::single_shot_seal_with_rng::<AesGcm256, HkdfSha256, Kem>(
         &OpModeS::Base,
         &public,
         info,
         plain,
         aad,
+        rng,
     );
     sealed_secret(sealed)
 }
@@ -247,7 +286,15 @@ mod tests {
     #[test]
     fn binds_seal_context() {
         let vector = vector();
-        let sealed = seal_to(&vector.public, b"purpose a", b"object a", b"secret").unwrap();
+        let mut rng = SeedRng::new(&[7; 32]);
+        let sealed = seal_to(
+            &vector.public,
+            b"purpose a",
+            b"object a",
+            b"secret",
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(
             open_sealed(&vector.private, &sealed, b"purpose a", b"object a")
                 .unwrap()

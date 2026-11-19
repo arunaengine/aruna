@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_blob::blob::BlobHandler;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -27,7 +28,6 @@ use aruna_core::structs::storage::multipart::{
     MultipartUploadStatus,
 };
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_net::NetHandle;
 use aruna_net::dht::storage::decode_entries;
@@ -221,7 +221,7 @@ async fn complete_upload(
             object_size,
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms: aruna_clock::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -335,7 +335,7 @@ async fn completion_persists_parts() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms: aruna_clock::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -568,7 +568,7 @@ async fn rejects_missing_checksum() {
             object_size: Some(8),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms: aruna_clock::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -750,7 +750,7 @@ async fn completion_retains_path() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms: aruna_clock::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -1192,7 +1192,7 @@ async fn abort_removes_parts() {
             bucket: "bucket-a".to_string(),
             key: "abort.bin".to_string(),
             upload_id,
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms: aruna_clock::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -1369,7 +1369,7 @@ async fn delete_removes_metadata() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms: aruna_clock::unix_timestamp_millis(),
         }),
         &context.driver,
     )

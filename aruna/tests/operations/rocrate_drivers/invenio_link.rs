@@ -7,7 +7,6 @@ use super::driven::list_links;
 use super::driven::seal_link_token;
 use super::remote::{RemoteServer, remote};
 use super::*;
-use crate::job_calls::submit_export_job;
 use crate::job_calls::{complete_job, fail_job};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
@@ -16,9 +15,11 @@ use aruna_core::repository::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange};
 use aruna_operations::jobs::submit::SubmitJobError;
+use aruna_operations::jobs::submit_local::SubmitLocalOperation;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
@@ -599,13 +600,11 @@ async fn queued_push_recovers() -> Result<(), Box<dyn std::error::Error>> {
         document_id: link.document_id,
         limits: link.limits.clone(),
     };
-    let orphan = submit_export_job(
-        &fixture.context,
-        spec,
-        fixture.actor.node_id,
-        Some(link.push_key(event, false)),
-    )
-    .await?;
+    let (owner, serving) = (fixture.actor.node_id, fixture.context.node_and_realm());
+    let key = Some(link.push_key(event, false));
+    let submit =
+        SubmitLocalOperation::rocrate_export(spec, owner, key, serving, unix_timestamp_millis());
+    let orphan = drive(submit, &fixture.context).await?;
     let stored = fixture
         .context
         .storage_handle
@@ -655,8 +654,15 @@ async fn full_slots_wait() -> Result<(), Box<dyn std::error::Error>> {
     let mut fillers = Vec::new();
     for slot in 0..link.limits.max_active_jobs {
         let key = Some(format!("filler-{slot}"));
-        let job = submit_export_job(&fixture.context, spec.clone(), fixture.actor.node_id, key);
-        match job.await {
+        let (owner, serving) = (fixture.actor.node_id, fixture.context.node_and_realm());
+        let submit = SubmitLocalOperation::rocrate_export(
+            spec.clone(),
+            owner,
+            key,
+            serving,
+            unix_timestamp_millis(),
+        );
+        match drive(submit, &fixture.context).await {
             Ok(job) => fillers.push(job.job_id),
             Err(SubmitJobError::ActiveJobLimit { .. }) => break,
             Err(error) => return Err(error.into()),

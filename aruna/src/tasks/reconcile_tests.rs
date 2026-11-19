@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::time::unix_timestamp_millis;
+use aruna_clock::unix_timestamp_millis;
 
 use super::workflow_fixtures::{execution_spec, node_id};
 use crate::tasks::runner::ComputeReconciler;
@@ -28,7 +28,7 @@ use tempfile::tempdir;
 use ulid::Ulid;
 
 fn job_id() -> JobId {
-    aruna_operations::jobs::submit::mint_job_id(
+    aruna_operations::testing::fresh_job_id(
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
         BucketId::new(0).unwrap(),
     )

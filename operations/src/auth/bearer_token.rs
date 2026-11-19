@@ -6,8 +6,7 @@ use crate::auth::error::ArunaBearerError;
 use crate::document_repository::read_row;
 use aruna_core::UserId;
 use aruna_core::auth::{
-    KEY_CACHE_CAPACITY, KEY_CACHE_TTL, REALMS_LIST_KEY, REVOCATION_GRACE_SECS, bearer_token_hash,
-    valid_token_lifetime,
+    REALMS_LIST_KEY, REVOCATION_GRACE_SECS, bearer_token_hash, valid_token_lifetime,
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
@@ -28,12 +27,8 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
-use lru::LruCache;
 use std::collections::{BTreeSet, HashSet};
-use std::num::NonZeroUsize;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
 use tracing::warn;
 
 impl From<IoError> for ArunaBearerError {
@@ -322,8 +317,6 @@ pub struct TokenChecks {
 pub enum IssuerKeys {
     /// Built again for every token.
     Uncached,
-    /// Kept in this process cache.
-    Cached(Arc<IssuerKeyCache>),
     /// Checked once and kept by the net handle.
     Net,
 }
@@ -380,10 +373,9 @@ impl DecodeTokenOperation {
             (Some(issuer_pubkey), true) => issuer_pubkey,
             _ => &unverified.iss,
         };
-        // Only trusted realm or delegated issuers may populate a bounded cache;
+        // Only trusted realm or delegated issuers may reach the net handle's bounded key cache;
         // untrusted issuers are verified with an ephemeral key that is discarded.
         let key = match (&self.checks.keys, issuer_trusted(&trusted, &unverified)) {
-            (IssuerKeys::Cached(keys), Ok(())) => keys.get_or_insert(issuer)?,
             (IssuerKeys::Net, Ok(())) => {
                 let key = issuer_bytes(issuer)?;
                 self.trusted = trusted;
@@ -591,82 +583,6 @@ fn raw_decoding_key(issuer_pubkey: [u8; 32]) -> Result<DecodingKey, ArunaBearerE
 fn checked_key(result: IoResult) -> bool {
     let answer = aruna_core::rows::event(result);
     matches!(answer, Ok(Event::Net(NetEvent::IssuerKey(true))))
-}
-
-/// Bounded, TTL + LRU cache of issuer decoding keys keyed by base64 public key.
-pub struct IssuerKeyCache {
-    entries: Mutex<LruCache<String, CachedIssuerKey>>,
-    ttl: Duration,
-}
-
-#[derive(Clone)]
-struct CachedIssuerKey {
-    key: DecodingKey,
-    inserted_at: Instant,
-}
-
-impl std::fmt::Debug for IssuerKeyCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IssuerKeyCache").finish_non_exhaustive()
-    }
-}
-
-/// Two caches are the same only when they are one cache.
-impl PartialEq for IssuerKeyCache {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self, other)
-    }
-}
-
-impl Default for IssuerKeyCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl IssuerKeyCache {
-    pub fn new() -> Self {
-        Self::with_limits(KEY_CACHE_CAPACITY, KEY_CACHE_TTL)
-    }
-
-    pub fn with_limits(capacity: usize, ttl: Duration) -> Self {
-        let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
-        Self {
-            entries: Mutex::new(LruCache::new(capacity)),
-            ttl,
-        }
-    }
-
-    fn entries(&self) -> std::sync::MutexGuard<'_, LruCache<String, CachedIssuerKey>> {
-        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    pub fn get_or_insert(&self, issuer_pubkey: &str) -> Result<DecodingKey, ArunaBearerError> {
-        let mut entries = self.entries();
-        if let Some(entry) = entries.get(issuer_pubkey).cloned() {
-            if entry.inserted_at.elapsed() < self.ttl {
-                return Ok(entry.key);
-            }
-            entries.pop(issuer_pubkey);
-        }
-        let key = bearer_decoding_key(issuer_pubkey)?;
-        entries.put(
-            issuer_pubkey.to_string(),
-            CachedIssuerKey {
-                key: key.clone(),
-                inserted_at: Instant::now(),
-            },
-        );
-        Ok(key)
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries().is_empty()
-    }
 }
 
 #[cfg(test)]

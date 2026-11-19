@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::document::{
     DocumentOutboxEvent, DocumentOutboxRecord, DocumentSyncPublish, DocumentTarget,
@@ -20,7 +21,6 @@ use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_tasks::shutdown::Shutdown;
@@ -32,6 +32,9 @@ use tracing::{debug, error, info, warn};
 /// The unverified data link posting the next pass continues after; a restart begins again at
 /// the start.
 static UNVERIFIED_CURSOR: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// Where range maintenance goes on; a restart begins again at the start.
+static RANGE_CURSORS: std::sync::Mutex<Option<MaintainCursors>> = std::sync::Mutex::new(None);
 
 #[cfg(debug_assertions)]
 struct OutboxBarrier {
@@ -69,6 +72,7 @@ use aruna_operations::device::sync::{
     UPLOAD_DEFER_AFTER,
 };
 use aruna_operations::device::sync_note::{NoteSyncOperation, SyncNote};
+use aruna_operations::distribution::sharding::MaintainCursors;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::forward::realm::RelayAdminOperation;
 use aruna_operations::jobs::JOB_PRUNE_PAGE;
@@ -92,8 +96,9 @@ use aruna_operations::metadata::materialization_queue::{
 };
 use aruna_operations::metadata::projection::{
     DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
-    ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation, max_clock_skew,
+    ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation,
 };
+use aruna_operations::replication::catch_up::CatchUpCursors;
 
 /// Replays the whole event log into the registry projection, one page at a time.
 async fn replay_event_log(
@@ -103,7 +108,7 @@ async fn replay_event_log(
     let mut after = None;
     let mut projected = 0usize;
     loop {
-        let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
+        let page = ReplayPageOperation::new(after, local_node);
         let (count, next) = aruna_drivers::driver::drive(page, context).await?;
         projected = projected.saturating_add(count);
         match next {
@@ -263,6 +268,9 @@ pub(crate) struct OperationsTaskHandler {
     // Queued bucket the next migration run resumes after. Loss on restart is fine: the
     // next run starts at the head of the queue.
     migration_cursor: std::sync::Mutex<Option<Key>>,
+    // Where the replication drain's bootstrap work goes on. Loss on restart is fine: the
+    // next drain starts at the first set and range.
+    catch_up: std::sync::Mutex<CatchUpCursors>,
     wake_cursor: std::sync::Mutex<Option<Key>>,
     // Rotation state of the bounded outbox drain. Loss on restart is fine: the
     // next rotation opens at the head.
@@ -407,6 +415,7 @@ impl OperationsTaskHandler {
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             reclaim_cursor: std::sync::Mutex::new(None),
             migration_cursor: std::sync::Mutex::new(None),
+            catch_up: std::sync::Mutex::default(),
             wake_cursor: std::sync::Mutex::new(None),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             published_records: std::sync::Mutex::new(BTreeSet::new()),
@@ -978,7 +987,8 @@ impl OperationsTaskHandler {
                     warn!("Cannot record a timed bucket lock without net handle");
                     return;
                 };
-                let operation = LockBucketOperation::timed(ticket, net_handle.node_id());
+                let now_ms = aruna_core::time::unix_timestamp_millis();
+                let operation = LockBucketOperation::timed(ticket, net_handle.node_id(), now_ms);
                 if let Err(error) = drive(operation, &self.context).await {
                     warn!(error = %error, "Timed bucket lock failed");
                 }
@@ -1055,18 +1065,23 @@ impl OperationsTaskHandler {
             TaskKey::MaintainRanges => Box::pin(async move {
                 use aruna_operations::distribution::sharding::{maintain_ranges, maintain_retry};
                 let context = &self.context;
+                let kept = (RANGE_CURSORS.lock().ok()).and_then(|cursors| cursors.clone());
                 let mut after = match aruna_drivers::driver::drive(
                     maintain_ranges(
                         context.node_and_realm(),
                         &context.fresh_heartbeats(),
                         context.here().capacity,
+                        kept.unwrap_or_default(),
                     ),
                     context,
                 )
                 .await
                 {
                     Ok(pass) => {
-                        let (after, imports) = pass.finish();
+                        let (after, imports, cursors) = pass.finish();
+                        if let Ok(mut kept) = RANGE_CURSORS.lock() {
+                            *kept = Some(cursors);
+                        }
                         for start in imports {
                             let started =
                                 aruna_operations::jobs::handed_imports::StartKeptOperation::new(

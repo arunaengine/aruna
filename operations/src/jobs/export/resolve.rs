@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::replication::plaintext::{HolderCheckOperation, PlaintextError};
@@ -116,6 +116,7 @@ pub(super) enum LocalSource {
 enum ResolveStep {
     Bucket,
     Authorization,
+    Policies,
     Version,
     Location,
 }
@@ -223,12 +224,18 @@ impl ResolveLocalOperation {
             .ok_or_else(|| retryable("the check was lost"))?;
         let split = check.reads().map_err(retryable)?.len();
         let policies = rows.split_off(split.min(rows.len()));
-        let evaluator =
-            read_policies(self.auth.realm_id, self.group_id, policies).map_err(retryable)?;
+        let sets = read_policies(self.auth.realm_id, self.group_id, policies).map_err(retryable)?;
         let allowed = check.allowed(rows).or_else(denied)?;
         if !allowed {
             return Ok(Next::Done(ResolveResult::Denied));
         }
+        self.step = ResolveStep::Policies;
+        Ok(Next::Call(sets.compile()))
+    }
+
+    /// Runs the request policies once their sets are compiled.
+    fn policies(&mut self, result: IoResult) -> ResolveNext {
+        let evaluator = compiled_policies(result).map_err(retryable)?;
         let request = policy_request_with(
             &self.permission_path,
             &Permission::READ,
@@ -358,6 +365,7 @@ impl Operation for ResolveLocalOperation {
                 };
                 self.authorized(rows)
             }
+            ResolveStep::Policies => self.policies(result),
             ResolveStep::Version => {
                 let [value] = values::<1>(result)?;
                 self.version(value)
@@ -403,6 +411,7 @@ enum OpenStep {
     Version,
     Location,
     Authorization,
+    Policies,
     Serve,
     Encryption,
     Holder,
@@ -531,10 +540,19 @@ impl OpenLocalOperation {
         let split = check.reads().map_err(retryable)?.len();
         let policies = rows.split_off(split.min(rows.len()));
         let group_id = Some(self.candidate.group_id);
-        let evaluator = read_policies(self.auth.realm_id, group_id, policies).map_err(retryable)?;
+        let sets = read_policies(self.auth.realm_id, group_id, policies).map_err(retryable)?;
         if !check.allowed(rows).or_else(denied)? {
             return Ok(Next::Done(LocalOpen::Denied));
         }
+        self.check = Some(check);
+        self.step = OpenStep::Policies;
+        Ok(Next::Call(sets.compile()))
+    }
+
+    /// Runs the request policies once their sets are compiled.
+    fn policies(&mut self, result: IoResult) -> OpenNext {
+        let check = (self.check.take()).ok_or_else(|| retryable("the check was lost"))?;
+        let evaluator = compiled_policies(result).map_err(retryable)?;
         let request = policy_request_with(
             &check.path,
             &Permission::READ,
@@ -658,6 +676,7 @@ impl Operation for OpenLocalOperation {
                 self.location(value)
             }
             OpenStep::Authorization => self.authorized(rows(result)?),
+            OpenStep::Policies => self.policies(result),
             OpenStep::Serve => match self.served(rows(result)?) {
                 true => self.encryption(),
                 false => Ok(Next::Done(LocalOpen::Denied)),
@@ -702,14 +721,7 @@ impl Operation for OpenLocalOperation {
 }
 
 fn rows(result: IoResult) -> Result<Vec<Option<Value>>, ResolveError> {
-    match result {
-        IoResult::Values(values) => Ok(values),
-        other => Err(IoError::Unexpected {
-            expected: "IoResult::Values",
-            got: other.label(),
-        }
-        .into()),
-    }
+    result.values().map_err(Into::into)
 }
 
 #[cfg(test)]

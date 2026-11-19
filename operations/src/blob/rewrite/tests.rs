@@ -124,9 +124,12 @@ fn ended(step: Step) -> Result<(RewriteOutcome, Vec<IoCall>), RewriteError> {
     }
 }
 
+/// The rewrite of one version, seeded as the runner would, so the ids it mints are not nil.
 fn operation(transition: EncryptionTransition) -> RewriteVersionOperation {
     let key = VersionKey::new("b", "k", Ulid::from_bytes([2; 16]));
-    RewriteVersionOperation::new(key, transition, SystemTime::UNIX_EPOCH)
+    let mut operation = RewriteVersionOperation::new(key, transition, SystemTime::UNIX_EPOCH);
+    operation.seed(7);
+    operation
 }
 
 fn lease(old: &BackendLocation) -> ReadLease {
@@ -434,7 +437,11 @@ mod envelopes {
             _ => None,
         };
         if let Some(plan) = plan {
-            let (envelope, _) = create_envelope(EnvelopePlan { epoch, ..plan }).unwrap();
+            let (envelope, _) = create_envelope(
+                EnvelopePlan { epoch, ..plan },
+                &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+            )
+            .unwrap();
             let created = BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope)));
             step = operation.next(event(Event::Blob(created)));
         }
@@ -624,7 +631,9 @@ mod envelopes {
             object_key: object.to_string(),
             bucket_public: [2; 32],
         };
-        create_envelope(plan).unwrap().0
+        create_envelope(plan, &mut aruna_core::key_seal::SeedRng::new(&[7; 32]))
+            .unwrap()
+            .0
     }
 
     fn written<'a>(writes: &'a [(String, Key, Value)], space: &str) -> Option<&'a Value> {

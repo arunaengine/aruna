@@ -150,12 +150,7 @@ fn storage_error(error: impl std::fmt::Display) -> GrantError {
 
 /// The context a stored grant is checked under: its consenting user, without a session.
 pub fn grant_principal(user_id: UserId, realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, realm_id)
 }
 
 /// READ on the document and the deny-only `federation.export` policies for `audience`.

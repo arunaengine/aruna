@@ -7,6 +7,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::WATCH_INTEREST_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification_watch::{
@@ -38,8 +39,8 @@ pub(crate) fn schedule_publish_effect() -> Effect {
 /// Dirty marker written in the same transaction as a subscription row change,
 /// so the debounced publisher knows which realm's digest to rebuild. The value
 /// is a generation id; a marker is only cleared if its generation still matches.
-pub(crate) fn dirty_marker_write(realm_id: RealmId) -> (KeySpace, Key, Value) {
-    let generation = ByteView::from(Ulid::generate().to_bytes().to_vec());
+pub(crate) fn dirty_marker_write(realm_id: RealmId, generation: Ulid) -> (KeySpace, Key, Value) {
+    let generation = ByteView::from(generation.to_bytes().to_vec());
     (
         WATCH_INTEREST_KEYSPACE.to_string(),
         ByteView::from(interest_dirty_key(realm_id)),
@@ -107,6 +108,8 @@ enum InterestStep {
 pub struct InterestOperation {
     step: InterestStep,
     state: InterestState,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl InterestOperation {
@@ -130,6 +133,8 @@ impl InterestOperation {
         Self {
             step,
             state: InterestState::Mark,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -146,11 +151,20 @@ impl Operation for InterestOperation {
     type Output = bool;
     type Error = InterestError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         let call = match self.step {
             InterestStep::Mark(realm_id) => {
                 self.state = InterestState::Mark;
-                IoCall::Write(vec![dirty_marker_write(realm_id)])
+                let generation = self.ids.mint(self.now_ms);
+                IoCall::Write(vec![dirty_marker_write(realm_id, generation)])
             }
             InterestStep::Publish => return Ok(self.schedule(true)),
             InterestStep::Restore => {
@@ -249,7 +263,10 @@ mod call_tests {
     #[test]
     fn mark_then_publish() {
         let mut mark = InterestOperation::mark(REALM);
-        assert!(matches!(mark.first(), Ok(Next::Call(IoCall::Write(rows))) if rows.len() == 1));
+        mark.stamp(7_000);
+        mark.seed(42);
+        let marker = dirty_marker_write(REALM, IdMint::new(42).mint(7_000));
+        assert_eq!(mark.first(), Ok(Next::Call(IoCall::Write(vec![marker]))));
         assert_eq!(mark.next(IoResult::Done), Ok(scheduled()));
     }
 

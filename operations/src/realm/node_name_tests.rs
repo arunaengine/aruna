@@ -29,12 +29,7 @@ fn actor() -> Actor {
 }
 
 fn auth(user_id: UserId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id: REALM,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, REALM)
 }
 
 /// Management node 1 serves; node 2 is a server, node 3 a device of user 3.
@@ -88,6 +83,9 @@ fn drive_write(
         ));
     }
     let mut write = operation.write();
+    // Each write after the stored state runs with other entropy, as the runner gives it, so its
+    // event ids differ from the stored ones.
+    write.seed((stored.map_or(0, |state| state.applied_event_ids.len()) as u128 + 1) << 32);
     assert_eq!(write.transaction(), TransactionMode::Write);
     assert!(matches!(write.first(), Ok(Next::Call(IoCall::Read(_)))));
     let state = stored.map(|state| postcard::to_allocvec(state).unwrap().into());
@@ -159,7 +157,9 @@ fn write_keeps_newer() {
         node_id: node(3),
         display_name: Some("laptop".to_string()),
     };
-    elsewhere.apply_operation(&actor(), laptop).unwrap();
+    elsewhere
+        .apply_operation(&actor(), laptop, ulid::Ulid::generate())
+        .unwrap();
     let mut operation = NodeNameOperation::new(config(
         node(2),
         Some("store"),

@@ -106,13 +106,13 @@ impl RestartNoticeOperation {
             node_id: self.node_id,
             group_id: bucket.group_id,
         };
-        let mut record = NotificationRecord::new(
+        let record = NotificationRecord::new(
+            stable_id(self.boot_id, &[b"notice", &subject]),
             holder,
             NotificationClass::Direct,
             kind,
             self.boot_id.timestamp_ms(),
         );
-        record.notification_id = stable_id(self.boot_id, &[b"notice", &subject]);
         NotificationOutboxRecord {
             outbox_id: stable_id(self.boot_id, &[b"outbox", &subject]),
             record,

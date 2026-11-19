@@ -2150,7 +2150,9 @@ mod tests {
             object_key: "k".to_string(),
             bucket_public: [4; 32],
         };
-        create_envelope(plan).unwrap().0
+        create_envelope(plan, &mut aruna_core::key_seal::SeedRng::new(&[7; 32]))
+            .unwrap()
+            .0
     }
 
     #[tokio::test]

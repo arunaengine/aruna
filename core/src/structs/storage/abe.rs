@@ -6,9 +6,10 @@ use super::blob::ArchiveKey;
 use super::encryption::{BucketKeyRef, generate_key, public_key_of};
 use crate::NodeId;
 use crate::compute::{SecretBytes, SharedSecret};
-use crate::key_seal::{SealedSecret, open_sealed, seal_to};
+use crate::key_seal::{SealedSecret, SeedRng, open_sealed, seal_to};
 use crate::structs::identity::realm::RealmId;
 use aruna_kpabe::{Attribute, MasterSecret, PublicParameters, frame_context, setup_from_seed};
+use hpke::rand_core::CryptoRng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -270,9 +271,13 @@ pub struct EnvelopePlan {
     pub bucket_public: [u8; 32],
 }
 
-pub fn create_envelope(plan: EnvelopePlan) -> Result<(ObjectEnvelope, SharedSecret), AbeError> {
-    let (public_key, private) = generate_key().map_err(|_| AbeError::Crypto)?;
-    Ok((seal_envelope(plan, public_key, &private)?, private))
+/// A new envelope for `plan` around a fresh object key; `rng` must be secret.
+pub fn create_envelope(
+    plan: EnvelopePlan,
+    rng: &mut impl CryptoRng,
+) -> Result<(ObjectEnvelope, SharedSecret), AbeError> {
+    let (public_key, private) = generate_key(rng).map_err(|_| AbeError::Crypto)?;
+    Ok((seal_envelope(plan, public_key, &private, rng)?, private))
 }
 
 /// A new envelope for `plan` around the object key that `source`'s recovery wrap opens.
@@ -280,6 +285,7 @@ pub fn copy_envelope(
     source: &ObjectEnvelope,
     bucket: &SecretBytes,
     plan: EnvelopePlan,
+    rng: &mut impl CryptoRng,
 ) -> Result<ObjectEnvelope, AbeError> {
     let bucket: &[u8; 32] = bucket.expose().try_into().map_err(|_| AbeError::Crypto)?;
     let sealed = SealedSecret {
@@ -290,25 +296,27 @@ pub fn copy_envelope(
         .map_err(|_| AbeError::WrongKey)?;
     let private = SharedSecret::new(SecretBytes::new(opened.to_vec()));
     check_object(private.bytes(), source)?;
-    seal_envelope(plan, source.context.public_key, &private)
+    seal_envelope(plan, source.context.public_key, &private, rng)
 }
 
 /// Fails if no envelope for a copy of `source` to `object_key` fits, even at the widest epoch.
+/// The trial envelope is dropped, so a fixed write id and seed serve it.
 pub fn check_copy(source: &ObjectEnvelope, object_key: String) -> Result<(), AbeError> {
     let plan = EnvelopePlan {
         parameters: source.context.parameters.clone(),
         epoch: u64::MAX,
-        write_id: Ulid::generate(),
+        write_id: Ulid::from_parts(1, 1),
         object_key,
         bucket_public: source.context.public_key,
     };
-    create_envelope(plan).map(drop)
+    create_envelope(plan, &mut SeedRng::new(&[0; 32])).map(drop)
 }
 
 fn seal_envelope(
     plan: EnvelopePlan,
     public_key: [u8; 32],
     private: &SharedSecret,
+    rng: &mut impl CryptoRng,
 ) -> Result<ObjectEnvelope, AbeError> {
     let context = EnvelopeContext {
         parameters: plan.parameters,
@@ -328,10 +336,10 @@ fn seal_envelope(
         &context.attributes()?,
         scalar,
         &bytes,
-        &mut SysRng,
+        rng,
     )?
     .to_bytes()?;
-    let recovery = seal_to(&plan.bucket_public, RECOVERY_PURPOSE, &bytes, scalar)
+    let recovery = seal_to(&plan.bucket_public, RECOVERY_PURPOSE, &bytes, scalar, rng)
         .map_err(|_| AbeError::Crypto)?;
     let envelope = ObjectEnvelope {
         context,
@@ -403,6 +411,7 @@ impl EnvelopeArchive {
     }
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 pub use getrandom::SysRng;
 
 #[derive(Debug, PartialEq)]

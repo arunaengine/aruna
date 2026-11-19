@@ -130,7 +130,7 @@ pub async fn request_tracing_middleware(
     let status_code = response.status().as_u16();
     emit_request_completed(&span, "http", status_code, started);
     let route_key = format!("{method} {route}");
-    HTTP_LATENCY.record(&route_key, elapsed);
+    HTTP_LATENCY.record(&route_key, elapsed, Instant::now());
     let metrics = state.metrics();
     metrics
         .http_requests

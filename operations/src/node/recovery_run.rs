@@ -189,7 +189,7 @@ impl RecoveryOperation {
         if self.stop.requested() {
             return Ok(Next::Done(()));
         }
-        self.status.begin_pass();
+        self.status.begin_pass(self.now_ms);
         self.pass = RecoveryPass::default();
         self.stage = RecoveryStage::Restore;
         let RecoveryConfig {
@@ -334,14 +334,14 @@ impl RecoveryOperation {
                 error,
             } => {
                 match progress {
-                    true => self.status.note_progress(topics_remaining),
+                    true => self.status.note_progress(topics_remaining, self.now_ms),
                     false => self.status.set_remaining(topics_remaining),
                 }
                 self.status.finish_pass(RecoveryOutcome::Partial, error);
                 self.begin_pass()
             }
             RecoveryDecision::Converged => {
-                self.status.note_progress(0);
+                self.status.note_progress(0, self.now_ms);
                 self.status.finish_pass(RecoveryOutcome::Success, None);
                 info!(
                     event = "startup.recovery.complete",
@@ -358,7 +358,7 @@ impl RecoveryOperation {
             } => {
                 let topics_remaining = failure.unresolved_topics.len() as u64;
                 if progress {
-                    self.status.note_progress(topics_remaining);
+                    self.status.note_progress(topics_remaining, self.now_ms);
                     self.attempts = 0;
                 } else if enumerated {
                     self.status.set_remaining(topics_remaining);

@@ -6,6 +6,7 @@ use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::{
     GraphLifecycleRecord, GraphPruneRecord, MetadataDeleteRecord, MetadataEffect, MetadataError,
@@ -28,7 +29,6 @@ use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::MetadataPhaseSource;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::id_mapping::{MappingRoute, mapping_route_for, tombstone_transition};
 use crate::metadata::repository::{audit_entry, lifecycle_revision_entries, schedule_prune_drain};
@@ -101,8 +101,10 @@ pub struct DeleteDocumentOperation {
     fence: WriteFence,
     /// Registry and persistent id rows deleted once the writes are sent.
     deletes: Vec<(KeySpace, Key)>,
-    /// Phase-time and identity sampling; production keeps the defaults.
-    phase_source: MetadataPhaseSource,
+    /// The runner's time of the current step.
+    now_ms: u64,
+    /// The fresh ids of this run.
+    ids: IdMint,
     stage: DeleteStage,
 }
 
@@ -121,20 +123,14 @@ impl DeleteDocumentOperation {
             mapping: None,
             fence: WriteFence::default(),
             deletes: Vec::new(),
-            phase_source: MetadataPhaseSource::default(),
+            now_ms: 0,
+            ids: IdMint::new(0),
             stage: DeleteStage::Record,
         }
     }
 
-    /// Replaces the phase-time and identity source so a test can fix a trace.
-    pub(crate) fn with_phase_source(mut self, phase_source: MetadataPhaseSource) -> Self {
-        self.phase_source = phase_source;
-        self
-    }
-
     pub(crate) fn fresh_copy(&self) -> Self {
         Self::new(self.actor.clone(), self.group_id, self.document_id)
-            .with_phase_source(self.phase_source)
     }
 
     fn record(&self) -> Result<&MetadataRegistryRecord, DeleteDocumentError> {
@@ -240,10 +236,9 @@ impl DeleteDocumentOperation {
     /// Every row the delete writes, with the deletes kept for the next call.
     fn write_all(&mut self) -> DeleteTurn {
         let record = self.record()?.clone();
-        // Sample the phase once: the tombstone time and the prune job's creation share this
-        // delete's single wall-clock reading.
-        let deleted_at_ms = self.phase_source.now_ms();
-        let event_id = self.phase_source.next_id();
+        // The tombstone, the prune job, the audit row and the persistent id share one time.
+        let deleted_at_ms = self.now_ms;
+        let event_id = self.ids.mint(self.now_ms);
         let tombstone = GraphLifecycleRecord::deleted(
             record.graph_iri.clone(),
             record.realm_id,
@@ -268,13 +263,13 @@ impl DeleteDocumentOperation {
             self.actor.node_id,
             self.document_placement_ref,
         )?);
-        let occurred_at_ms = self.phase_source.now_ms();
-        let audit_id = self.phase_source.next_id();
+        let occurred_at_ms = self.now_ms;
+        let audit_id = self.ids.mint(self.now_ms);
         writes.push(audit_entry(
             &self.audit_record(&record, occurred_at_ms),
             audit_id,
         )?);
-        let outbox_id = self.phase_source.next_id();
+        let outbox_id = self.ids.mint(self.now_ms);
         for outbox in [
             self.lifecycle_outbox(&record, &lifecycle)?,
             self.graph_outbox(&record, &tombstone, outbox_id)?,
@@ -290,7 +285,7 @@ impl DeleteDocumentOperation {
                 Some(mapping),
                 &self.mapping_route,
                 self.document_id,
-                self.phase_source.now_ms(),
+                self.now_ms,
             ),
         };
         match transition {
@@ -436,6 +431,14 @@ impl Operation for DeleteDocumentOperation {
         TransactionMode::Write
     }
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> DeleteTurn {
         let key = metadata_registry_key(self.group_id, self.document_id);
         let read = vec![(METADATA_INDEX_KEYSPACE.to_string(), key)];
@@ -551,13 +554,19 @@ mod call_tests {
         1_700_000_000_000
     }
 
+    const ENTROPY: u128 = 0x7a;
+
+    /// The first id the pinned run mints.
     fn fixed_id() -> Ulid {
-        Ulid::from_bytes([0x7a; 16])
+        IdMint::new(ENTROPY).mint(fixed_ms())
     }
 
     fn operation(actor: &Actor, record: &MetadataRegistryRecord) -> DeleteDocumentOperation {
-        DeleteDocumentOperation::new(actor.clone(), record.group_id, record.document_id)
-            .with_phase_source(MetadataPhaseSource::fixed(fixed_ms, fixed_id))
+        let mut delete =
+            DeleteDocumentOperation::new(actor.clone(), record.group_id, record.document_id);
+        delete.stamp(fixed_ms());
+        delete.seed(ENTROPY);
+        delete
     }
 
     /// Answers the registry read with `record` and the config read with `config` and
@@ -842,7 +851,10 @@ mod call_tests {
             None,
             None,
         ));
+        // The runner stamps and seeds a retry like any run; pinned inputs give the same rows.
         let mut retried = operation(&actor, &stored).fresh_copy();
+        retried.stamp(fixed_ms());
+        retried.seed(ENTROPY);
         let second = written(after_reads(&mut retried, &stored, None, None));
         assert_eq!(first, second);
     }

@@ -232,6 +232,7 @@ async fn install_bucket(state: &ServerState, bucket: &str, group_id: Ulid, creat
 
 fn direct_record(recipient: UserId, seed: u8) -> NotificationRecord {
     NotificationRecord::new(
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         NotificationKind::AddedToGroup {
@@ -243,12 +244,7 @@ fn direct_record(recipient: UserId, seed: u8) -> NotificationRecord {
 }
 
 fn auth_for(user_id: UserId, realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, realm_id)
 }
 
 fn bearer() -> Extension<Option<ValidatedBearer>> {
@@ -733,6 +729,7 @@ fn response_maps_links() {
 
     let request_id = Ulid::generate();
     let joined = notification_response(&NotificationRecord::new(
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         NotificationKind::GroupJoinRequested {
@@ -748,6 +745,7 @@ fn response_maps_links() {
     assert_eq!(joined.group_id, Some(group_id.to_string()));
     assert_eq!(joined.actor_user_id, Some(actor.to_string()));
     let added = notification_response(&NotificationRecord::new(
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         NotificationKind::AddedToGroup {
@@ -761,6 +759,7 @@ fn response_maps_links() {
     assert_eq!(added.member_user_id, None);
 
     let removed = notification_response(&NotificationRecord::new(
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         NotificationKind::RemovedFromGroup {
@@ -773,6 +772,7 @@ fn response_maps_links() {
     assert_eq!(removed.actor_user_id, Some(actor.to_string()));
 
     let member_added = notification_response(&NotificationRecord::new(
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         NotificationKind::GroupMemberAdded {
@@ -787,6 +787,7 @@ fn response_maps_links() {
     assert_eq!(member_added.actor_user_id, Some(actor.to_string()));
 
     let onboarded = notification_response(&NotificationRecord::new(
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         NotificationKind::NodeOnboarded {
@@ -801,6 +802,7 @@ fn response_maps_links() {
 
     let document_id = Ulid::generate();
     let metadata_created = notification_response(&NotificationRecord::new(
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Transient,
         NotificationKind::MetadataCreated {
@@ -822,6 +824,7 @@ fn response_maps_links() {
     assert_eq!(metadata_created.actor_user_id, Some(actor.to_string()));
 
     let data_uploaded = notification_response(&NotificationRecord::new(
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Transient,
         NotificationKind::DataUploaded {

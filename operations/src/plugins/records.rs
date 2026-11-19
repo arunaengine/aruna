@@ -9,6 +9,7 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::target_placement_ref;
@@ -125,6 +126,8 @@ enum Phase {
 pub struct InstallEntryOperation {
     config: InstallEntryConfig,
     phase: Phase,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl InstallEntryOperation {
@@ -132,6 +135,8 @@ impl InstallEntryOperation {
         Self {
             config,
             phase: Phase::Auth,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -238,7 +243,11 @@ impl InstallEntryOperation {
             install_id: self.config.install_id,
             install: self.config.install.clone().map(Box::new),
         };
-        let event = reducer_state.apply_operation(&self.config.actor, operation)?;
+        let event = reducer_state.apply_operation(
+            &self.config.actor,
+            operation,
+            self.ids.mint(self.now_ms),
+        )?;
         document.installs = reducer_state.materialized_installs();
         let document_target = self.document();
         let placement = target_placement_ref(&document, &document_target, Default::default());
@@ -274,6 +283,14 @@ impl InstallEntryOperation {
 impl Operation for InstallEntryOperation {
     type Output = Option<PluginInstall>;
     type Error = RecordError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

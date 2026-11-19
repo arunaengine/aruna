@@ -4,10 +4,9 @@
 
 use std::sync::Arc;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::secrets::SecretRecord;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::time::unix_timestamp_millis;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_drivers::driver::drive;
 use aruna_operations::secrets::SecretChange;
 use aruna_operations::secrets::node::{
@@ -22,11 +21,10 @@ use utoipa_axum::routes;
 
 use super::{
     CreateSecretRequest, ReplaceSecretRequest, RotateSecretRequest, SecretListQuery, SecretPage,
-    SecretView, change_error, create_change, expected, page, parse_name, replace_change,
-    rotate_change, view,
+    SecretView, change_error, create_change, delete_change, expected, manager, page, parse_name,
+    replace_change, rotate_change, stored_view, view,
 };
 use crate::auth::UnrestrictedAuth;
-use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -39,13 +37,6 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
             delete_node_secret
         ))
         .routes(routes!(rotate_node_secret))
-}
-
-/// Realm admins manage the secrets of every node, each on the node it lives on.
-async fn manager(state: &Arc<ServerState>, auth: AuthContext) -> ServerResult<AuthContext> {
-    let path = policy_admin_path(state.get_realm_id());
-    ensure_permission(state, &auth, path, Permission::WRITE).await?;
-    Ok(auth)
 }
 
 async fn change(
@@ -232,10 +223,7 @@ pub async fn replace_node_secret(
 ) -> ServerResult<Json<SecretView>> {
     let auth = manager(&state, auth).await?;
     let change_request = replace_change(parse_name(&name)?, request, expected(&headers)?);
-    let stored = change(&state, &auth, change_request).await?;
-    stored
-        .map(|info| Json(view(info)))
-        .ok_or(ServerError::NotFound)
+    stored_view(change(&state, &auth, change_request).await?)
 }
 
 #[utoipa::path(
@@ -276,10 +264,7 @@ pub async fn rotate_node_secret(
 ) -> ServerResult<Json<SecretView>> {
     let auth = manager(&state, auth).await?;
     let change_request = rotate_change(parse_name(&name)?, request, expected(&headers)?);
-    let stored = change(&state, &auth, change_request).await?;
-    stored
-        .map(|info| Json(view(info)))
-        .ok_or(ServerError::NotFound)
+    stored_view(change(&state, &auth, change_request).await?)
 }
 
 #[utoipa::path(
@@ -310,10 +295,6 @@ pub async fn delete_node_secret(
     headers: HeaderMap,
 ) -> ServerResult<StatusCode> {
     let auth = manager(&state, auth).await?;
-    let delete = SecretChange::Delete {
-        name: parse_name(&name)?,
-        expected: expected(&headers)?,
-    };
-    change(&state, &auth, delete).await?;
+    change(&state, &auth, delete_change(&name, &headers)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -12,7 +12,7 @@ use aruna_core::structs::execution::job::record_rows::{OutboxEntry, to_bytes};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::{Key, Value};
 
-use super::DrainOutboxOperation;
+use super::{DrainOutboxOperation, scan};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::outbox::OUTBOX_DRAIN_BATCH;
 use crate::tests::records::{Family, REALM, actor, node};
@@ -44,15 +44,6 @@ fn cursor_read() -> Step {
         NODE_STATE_KEYSPACE.to_string(),
         cursor_key(),
     )])))
-}
-
-fn scan(after: Option<Key>, limit: usize) -> Step {
-    Ok(Next::Call(IoCall::Page {
-        space: FAMILY_OUTBOX_KEYSPACE.to_string(),
-        prefix: Key::from(Vec::new()),
-        after,
-        limit,
-    }))
 }
 
 fn page(keys: Vec<Key>, next: Option<Key>) -> IoResult {

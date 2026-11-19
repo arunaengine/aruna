@@ -110,6 +110,7 @@ impl CompleteUploadOperation {
     /// The release of the assembled file, committed with the version that reads the older one.
     pub(super) fn dedup_release(
         &self,
+        key: Ulid,
     ) -> Option<Result<(String, Key, Value), aruna_core::errors::ConversionError>> {
         let written = self.dedup.as_ref()?;
         let target = self.plain.as_ref()?;
@@ -119,7 +120,7 @@ impl CompleteUploadOperation {
             version_id: self.version_id?,
             version: self.plain_version.clone()?,
         };
-        let key = Ulid::generate().to_bytes().to_vec().into();
+        let key = key.to_bytes().to_vec().into();
         Some(work.to_bytes().map(|value| {
             let space = BLOB_CLEANUP_KEYSPACE.to_string();
             (space, key, value.into())

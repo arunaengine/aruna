@@ -45,13 +45,7 @@ where
 
 /// The child result a group member answered with, when it has these types.
 pub(super) fn member_child<T: 'static, E: 'static>(member: GroupResult) -> Option<Result<T, E>> {
-    let GroupResult::Done(event) = member else {
-        return None;
-    };
-    match *event {
-        Event::Child(outcome) => outcome.take(),
-        _ => None,
-    }
+    member.child_outcome()
 }
 
 #[derive(Debug, PartialEq)]

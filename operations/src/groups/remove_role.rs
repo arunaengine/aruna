@@ -9,6 +9,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
@@ -189,6 +190,8 @@ struct RoleRemoval {
     outbox: bool,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl RoleRemoval {
@@ -196,10 +199,7 @@ impl RoleRemoval {
         input: RemoveGroupConfig,
         guard: Option<aruna_core::plugin_installs::InstallGuard>,
     ) -> Self {
-        let marks = DueMarks::new(
-            Some(input.group_id),
-            aruna_core::time::unix_timestamp_millis(),
-        );
+        let marks = DueMarks::new(Some(input.group_id), 0);
         Self {
             input,
             guard,
@@ -210,6 +210,8 @@ impl RoleRemoval {
             outbox: false,
             deletes: Vec::new(),
             marks,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -272,7 +274,8 @@ impl RoleRemoval {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
+        let admin_events =
+            apply_reducer_updates(&mut reducer_state, &self.input, &mut self.ids, self.now_ms)?;
         materialize_role_removal(
             &mut group,
             &mut auth_doc,
@@ -367,6 +370,15 @@ impl Operation for RoleRemoval {
     type Output = RemovedRole;
     type Error = RemoveGroupError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.marks.stamp(now_ms);
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -422,12 +434,15 @@ impl Operation for RoleRemoval {
 fn apply_reducer_updates(
     state: &mut AdminDocumentState,
     input: &RemoveGroupConfig,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let event = state.apply_operation(
         &input.actor,
         AdminDocumentOperation::GroupRoleRemoved {
             role_id: input.role_id,
         },
+        ids.mint(now_ms),
     )?;
     Ok(vec![event])
 }
@@ -460,85 +475,26 @@ pub mod test {
     use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_storage::storage;
-    use aruna_tasks::TaskHandle;
-    use tempfile::{TempDir, tempdir};
+    use aruna_net::NetHandle;
+    use tempfile::TempDir;
     use ulid::Ulid;
 
     use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
-    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::remove_role::{
         RemoveGroupConfig, RemoveGroupError, RemoveGroupOperation, RoleRemoval,
     };
-    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_drivers::driver::{DriverContext, drive};
 
     async fn test_context() -> (DriverContext, NetHandle, TempDir) {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
-        let net_handle = NetHandle::new(
-            NetConfig {
-                bind_addr: "127.0.0.1:0".parse().unwrap(),
-                discovery_method: DiscoveryMethod::None,
-                relay_method: RelayMethod::None,
-                ..NetConfig::default()
-            },
-            storage_handle.clone(),
-        )
-        .await
-        .unwrap();
-        let task_handle = TaskHandle::new();
-
-        let context = DriverContext {
-            storage_handle,
-            net_handle: Some(net_handle.clone()),
-            graph_handle: None,
-            task_handle: Some(task_handle),
-            compute_handle: None,
-            outbound_handle: None,
-            blob_handle: None,
-        };
-        (context, net_handle, random_path)
+        crate::tests::groups::net_context().await
     }
 
     async fn setup_group(context: &DriverContext) -> (Actor, Group, GroupAuthorizationDocument) {
-        let realm_id = RealmId([0u8; 32]);
-        let user_id = UserId::local(Ulid::generate(), realm_id);
-        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let actor = Actor {
-            node_id,
-            user_id,
-            realm_id,
-        };
-
-        let realm_operation = CreateRealmOperation::new(CreateRealmConfig {
-            actor: actor.clone(),
-            realm_description: "Test realm".to_string(),
-            oidc_providers: Vec::new(),
-            node_location: None,
-            node_weight: None,
-            node_labels: Default::default(),
-        });
-        drive(realm_operation, context).await.unwrap();
-
-        let group_operation = CreateGroupOperation::new(CreateGroupConfig {
-            actor: actor.clone(),
-            display_name: "Test group".to_string(),
-            owner_cap: None,
-        });
-        let (group, auth_doc) = drive(group_operation, context).await.unwrap();
-        (actor, group, auth_doc)
+        crate::tests::groups::setup_group(context).await
     }
 
     fn auth_context(actor: &Actor) -> AuthContext {
-        AuthContext {
-            user_id: actor.user_id,
-            realm_id: actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(actor.user_id, actor.realm_id)
     }
 
     #[test]

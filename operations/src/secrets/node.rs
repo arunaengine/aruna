@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -59,6 +60,7 @@ pub struct NodeSecretOperation {
     queue: VecDeque<IoCall>,
     notices: bool,
     result: Option<Option<SecretRecord>>,
+    ids: IdMint,
 }
 
 pub fn record_key(name: &SecretName) -> Vec<u8> {
@@ -105,6 +107,7 @@ impl NodeSecretOperation {
             queue: VecDeque::new(),
             notices: false,
             result: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -124,7 +127,7 @@ impl NodeSecretOperation {
             input.change,
             input.actor,
             input.now_ms,
-            input.write_id,
+            (input.write_id, self.ids.mint(input.now_ms)),
         )?;
         let mut audit = applied.audit.entries()?;
         if let (Some(info), Some(auth)) = (&applied.info, auth) {
@@ -137,6 +140,7 @@ impl NodeSecretOperation {
                 Some(input.node_id),
                 input.actor,
                 input.now_ms,
+                &mut self.ids,
             )?;
             self.notices = !notices.is_empty();
             audit.extend(notices);
@@ -187,6 +191,10 @@ impl From<aruna_core::secrets::SecretError> for NodeSecretError {
 impl Operation for NodeSecretOperation {
     type Output = Option<SecretRecord>;
     type Error = NodeSecretError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, NodeSecretError> {
         let input = self.input.as_ref().ok_or(IoError::Unfinished)?;

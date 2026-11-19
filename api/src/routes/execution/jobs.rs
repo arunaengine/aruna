@@ -1415,7 +1415,7 @@ async fn artifact_response(
     download: bool,
 ) -> ServerResult<Response> {
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
-    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let now_ms = aruna_clock::unix_timestamp_millis();
     // A destination realm reads with an export grant, only here on the owner node.
     let grant = crate::routes::federation::export::grant_header(&headers)?;
     let (user_id, auth_token) = match (auth, grant) {

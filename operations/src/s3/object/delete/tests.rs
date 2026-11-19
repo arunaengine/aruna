@@ -1152,7 +1152,7 @@ impl aruna_core::operation::Operation for ApplyUsage {
     type Error = crate::s3::usage::UsageUpdateError;
 
     fn first(&mut self) -> Result<aruna_core::calls::Next<()>, Self::Error> {
-        let call = self.0.start_calls().into_call();
+        let call = self.0.start_calls(Ulid::from_parts(1, 1)).into_call();
         Ok(aruna_core::calls::Next::Call(call))
     }
 

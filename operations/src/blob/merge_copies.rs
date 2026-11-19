@@ -3,8 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::{HashMap, VecDeque};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
@@ -150,6 +151,8 @@ enum StageStep {
 /// the end, so an outcome other than `Done` leaves the transaction empty.
 #[derive(Debug, PartialEq)]
 struct UnifyStageOperation {
+    now_ms: u64,
+    ids: IdMint,
     bucket: String,
     rules: Vec<BackendImport>,
     found: Duplicate,
@@ -174,6 +177,8 @@ impl UnifyStageOperation {
         fence: Option<JobFence>,
     ) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             bucket: bucket.to_string(),
             rules,
             found,
@@ -538,7 +543,8 @@ impl UnifyStageOperation {
                 .collect();
             id_named(&rules, &copy.backend_path, version)
         });
-        let row = release(copy, work.provider, work.owner, named)?;
+        let key = self.ids.mint(self.now_ms);
+        let row = release(copy, work.provider, (work.owner, named), (self.now_ms, key))?;
         self.writes.push(row);
         self.changed += 1;
         self.next_copy()
@@ -554,7 +560,7 @@ impl UnifyStageOperation {
             let bytes = i128::from(keep.stored_size());
             if let Some(stored) = StoredDelta::of_copy(keep, 1, bytes) {
                 let mut update = UsageCounterUpdate::for_stored(stored);
-                let call = update.start_calls().into_call();
+                let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
                 return self.call(StageStep::Usage(Box::new(update)), call);
             }
         }
@@ -629,6 +635,14 @@ impl Operation for UnifyStageOperation {
             }
         }
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 }
 
 /// The release of `copy` at its backend version, or of a file its version's id names, or else
@@ -636,8 +650,8 @@ impl Operation for UnifyStageOperation {
 fn release(
     copy: &BackendLocation,
     provider: Option<Value>,
-    owner: Option<(Ulid, Ulid)>,
-    named: bool,
+    (owner, named): (Option<(Ulid, Ulid)>, bool),
+    (now_ms, key): (u64, Ulid),
 ) -> Result<Row, MigrationError> {
     let provider = provider.or_else(|| named.then(|| Value::from(Vec::new())));
     let Some(provider) = provider else {
@@ -645,7 +659,7 @@ fn release(
         let candidate =
             ReclaimCandidateKey::new(location.backend, location.encoding, location.blake3_hash);
         let value = ReclaimCandidate {
-            enqueued_at: SystemTime::now(),
+            enqueued_at: SystemTime::UNIX_EPOCH + Duration::from_millis(now_ms),
         };
         let key = candidate.to_bytes().into();
         return Ok((
@@ -661,7 +675,7 @@ fn release(
         version_id,
         version: String::from_utf8(provider.to_vec()).map_err(MigrationError::failed)?,
     };
-    let key = Ulid::generate().to_bytes().to_vec().into();
+    let key = key.to_bytes().to_vec().into();
     Ok((
         BLOB_CLEANUP_KEYSPACE.to_string(),
         key,

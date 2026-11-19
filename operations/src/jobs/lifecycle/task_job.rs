@@ -7,6 +7,7 @@
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{ExecutionSpec, WorkspaceMode};
@@ -52,17 +53,21 @@ pub fn task_targets(
 
 /// The call that sends a prepared task to exactly `targets`, in their order: admitted here when
 /// this node is the one target and holds the family, else forwarded with the install account
-/// vouched for by this node. Answers an `AcceptedSubmission`.
+/// vouched for by this node; `ids` mints the alias of an admission here. Answers an
+/// `AcceptedSubmission`.
 pub fn send_task_job(
     submission: &TaskSubmission,
     (config, node): (&RealmConfigDocument, &IngressNode),
     token: AuthToken,
+    ids: &mut IdMint,
 ) -> Result<IoCall, SubmitJobError> {
     let (request, identity) = (&submission.request, &submission.identity);
     let here =
         submission.targets == [node.local] && family_view(config, identity)?.holds(node.local);
     if here {
-        return Ok(IoCall::child(node.admission(request, identity, config)?));
+        return Ok(IoCall::child(
+            node.admission(request, identity, config, ids)?,
+        ));
     }
     let holders = (submission.targets.iter())
         .copied()

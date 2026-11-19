@@ -256,13 +256,14 @@ impl NotificationRecord {
     }
 
     pub fn new(
+        notification_id: Ulid,
         recipient: UserId,
         class: NotificationClass,
         kind: NotificationKind,
         created_at_ms: u64,
     ) -> Self {
         Self {
-            notification_id: Ulid::generate(),
+            notification_id,
             recipient,
             class,
             kind,
@@ -676,7 +677,13 @@ mod tests {
                 actor_user_id: user(1, 6),
             },
         ] {
-            let record = NotificationRecord::new(recipient, NotificationClass::Direct, kind, 1234);
+            let record = NotificationRecord::new(
+                ulid::Ulid::generate(),
+                recipient,
+                NotificationClass::Direct,
+                kind,
+                1234,
+            );
             let bytes = record.to_bytes().unwrap();
             assert_eq!(NotificationRecord::from_bytes(&bytes).unwrap(), record);
         }
@@ -731,8 +738,20 @@ mod tests {
     fn prune_index_expiry() {
         let r = user(1, 2);
         let t = 1_000_000u64;
-        let transient = NotificationRecord::new(r, NotificationClass::Transient, added(3), t);
-        let direct = NotificationRecord::new(r, NotificationClass::Direct, added(3), t);
+        let transient = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            r,
+            NotificationClass::Transient,
+            added(3),
+            t,
+        );
+        let direct = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            r,
+            NotificationClass::Direct,
+            added(3),
+            t,
+        );
         let kt = notification_prune_key(&transient);
         let kd = notification_prune_key(&direct);
         assert!(kt < kd);
@@ -766,7 +785,13 @@ mod tests {
     #[test]
     fn write_entries_index() {
         let r = user(1, 2);
-        let record = NotificationRecord::new(r, NotificationClass::Direct, added(3), 1000);
+        let record = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            r,
+            NotificationClass::Direct,
+            added(3),
+            1000,
+        );
 
         let writes = inbox_write_entries(&record).unwrap();
         assert_eq!(writes.len(), 2);
@@ -800,6 +825,7 @@ mod tests {
     #[test]
     fn expires_at_saturates() {
         let record = NotificationRecord::new(
+            ulid::Ulid::generate(),
             user(1, 2),
             NotificationClass::Direct,
             NotificationKind::NodeOnboarded {
@@ -911,6 +937,7 @@ mod tests {
             size_bytes: 1,
         };
         let deleted = NotificationRecord::new(
+            ulid::Ulid::generate(),
             recipient,
             NotificationClass::Direct,
             NotificationKind::BucketDeleted {
@@ -921,7 +948,13 @@ mod tests {
             100,
         );
         let notice = |recipient, kind, at| {
-            NotificationRecord::new(recipient, NotificationClass::Direct, kind, at)
+            NotificationRecord::new(
+                ulid::Ulid::generate(),
+                recipient,
+                NotificationClass::Direct,
+                kind,
+                at,
+            )
         };
         assert!(deleted.purges(&notice(recipient, upload("raw", node_id), 100)));
         // Later notices belong to a new bucket of the name; others name another bucket or user.

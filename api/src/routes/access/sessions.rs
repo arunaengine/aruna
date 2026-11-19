@@ -9,11 +9,11 @@ use crate::routes::access::credentials::{
     CreatePathRestriction, build_credential_restrictions, serialize_restrictions,
 };
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission, SessionKind,
 };
 use aruna_core::structs::identity::user::session::UserSession;
-use aruna_core::time::unix_timestamp_secs;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::create_token::CreateTokenError;
 use aruna_operations::session::{

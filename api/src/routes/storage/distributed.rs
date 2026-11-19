@@ -430,7 +430,7 @@ fn phase_name(phase: SetPhase, deletion: Option<&DeletionStatus>) -> &'static st
 }
 
 pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse {
-    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let now_ms = aruna_clock::unix_timestamp_millis();
     let members = status
         .members
         .into_iter()

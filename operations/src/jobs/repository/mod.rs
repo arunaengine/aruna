@@ -231,20 +231,22 @@ pub fn ensure_supported(
     Err(not_supported(action.name()))
 }
 
-/// Seals a user's token for the connector's endpoint, and for `link_id` when a link keeps it.
+/// Seals a user's token for the connector's endpoint, and for `link_id` when a link keeps it;
+/// `nonce` must never repeat under the node's credential key.
 pub fn seal_token(
     scope: &NodeScope,
     user: aruna_core::UserId,
     view: &ConnectorView,
     link_id: Option<Ulid>,
     token: &str,
+    nonce: [u8; 24],
 ) -> Result<RepositoryCredential, TransferError> {
     let key = scope
         .credential_key
         .as_ref()
         .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?;
     Ok(RepositoryCredential::seal_link(
-        key,
+        (key, nonce),
         user,
         view.connector.group_id,
         view.connector.connector_id,

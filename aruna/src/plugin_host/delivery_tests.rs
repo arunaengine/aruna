@@ -5,6 +5,7 @@
 use crate::plugin_host::plugin_work::run_plugin_work;
 use crate::plugin_host::worker::Worker;
 use crate::plugin_host::worker::tests::worker_on;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::PluginRun;
@@ -16,7 +17,6 @@ use aruna_core::plugin_runs::StateWrite;
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::admin_audit::AdminAuditAction;
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::store::row_calls;
@@ -66,7 +66,7 @@ const PAD: &str = "pad";
 
 fn audit(fixture: &Fixture, action: AdminAuditAction) -> AdminAuditRecord {
     let actor = fixture.actor.user_id;
-    AdminAuditRecord::new(action, actor, actor)
+    AdminAuditRecord::new(Ulid::from_parts(1, 1), action, actor, actor)
 }
 
 /// Runs every due run to its end.

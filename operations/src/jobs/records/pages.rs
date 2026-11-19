@@ -606,14 +606,7 @@ mod tests {
     }
 
     fn answer(peer: NodeId, result: Result<Vec<u8>, PeerRequestError>) -> IoResult {
-        let answer = MetadataAnswer {
-            peer,
-            elapsed: Duration::ZERO,
-            result,
-        };
-        IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
-            answer,
-        )))))
+        crate::tests::peers::answer(peer, result)
     }
 
     fn page_answer(page: Option<InputPage>) -> Vec<u8> {

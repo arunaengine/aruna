@@ -838,7 +838,7 @@ mod tests {
             replicate_delete_markers: false,
             mode: ReplicationMode::OnDemand,
         };
-        BlobJobRecord::new_relationship(input, None, relationship_id, 1_000)
+        BlobJobRecord::new_relationship(input, None, relationship_id, 1_000, Ulid::generate())
     }
 
     async fn store(storage: &StorageHandle, job: &BlobJobRecord) -> Vec<u8> {

@@ -6,7 +6,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::policy::attachment::PolicyRefMode;
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
 use aruna_core::structs::placement::policy::{
@@ -19,7 +19,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::records::HeadAliasContext;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
@@ -93,10 +92,6 @@ pub struct PolicyMutationOperation {
 }
 
 impl PolicyMutationOperation {
-    pub fn new(config: PolicyMutationConfig) -> Self {
-        Self::new_with_version(config, Ulid::generate())
-    }
-
     /// Pins the successor id, for a caller that resumes its own mutation.
     pub fn new_with_version(config: PolicyMutationConfig, successor_version_id: Ulid) -> Self {
         Self {
@@ -116,12 +111,8 @@ impl PolicyMutationOperation {
     }
 
     fn authorize(&mut self, state: MutationState, path: String) -> MutationTurn {
-        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: self.config.auth_context.clone(),
-            path,
-            required_permission: Permission::WRITE,
-        });
-        self.call(state, IoCall::child(check))
+        let check = super::write_check(self.config.auth_context.clone(), path);
+        self.call(state, check)
     }
 
     /// A failed check counts as a denial.
@@ -260,6 +251,9 @@ mod pure_tests {
     use aruna_core::structs::storage::blob::CurrentVersionPointer;
     use std::time::UNIX_EPOCH;
 
+    /// The successor id a test mutation is pinned to.
+    const SUCCESSOR: Ulid = Ulid::from_parts(9, 9);
+
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])
     }
@@ -369,7 +363,8 @@ mod pure_tests {
     fn denies_non_admin() {
         // Neither realm-configuration write nor admin write on the object's group leaves
         // nothing to open.
-        let mut operation = PolicyMutationOperation::new(config(&[policy(1)]));
+        let mut operation =
+            PolicyMutationOperation::new_with_version(config(&[policy(1)]), SUCCESSOR);
         assert!(is_child(&operation.first()));
         assert!(is_child(&operation.next(authorized(false))));
         assert_eq!(
@@ -381,7 +376,8 @@ mod pure_tests {
     #[test]
     fn failed_check_denies() {
         // A check that cannot run never falls through to the group check.
-        let mut operation = PolicyMutationOperation::new(config(&[policy(1)]));
+        let mut operation =
+            PolicyMutationOperation::new_with_version(config(&[policy(1)]), SUCCESSOR);
         operation.first().unwrap();
         let failed = Err::<bool, _>(AuthorizationError::DocNotFound);
         assert_eq!(
@@ -394,7 +390,10 @@ mod pure_tests {
     fn accepts_group_admin() {
         // The bucket's own group administers its objects' rules.
         let policy = owned(1, group_id());
-        let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
+        let mut operation = PolicyMutationOperation::new_with_version(
+            config(std::slice::from_ref(&policy)),
+            SUCCESSOR,
+        );
         operation.first().unwrap();
         operation.next(authorized(false)).unwrap();
         operation.next(authorized(true)).unwrap();
@@ -406,7 +405,10 @@ mod pure_tests {
     fn refuses_foreign_owner() {
         // A rule another group owns never governs this object.
         let policy = owned(1, Ulid::from_bytes([9u8; 16]));
-        let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
+        let mut operation = PolicyMutationOperation::new_with_version(
+            config(std::slice::from_ref(&policy)),
+            SUCCESSOR,
+        );
         operation.first().unwrap();
         operation.next(authorized(true)).unwrap();
         assert_eq!(
@@ -420,7 +422,8 @@ mod pure_tests {
     #[test]
     fn refuses_unresolved_ref() {
         // An unauthenticated ref must not reach a mint transaction.
-        let mut operation = PolicyMutationOperation::new(config(&[policy(1)]));
+        let mut operation =
+            PolicyMutationOperation::new_with_version(config(&[policy(1)]), SUCCESSOR);
         operation.first().unwrap();
         operation.next(authorized(true)).unwrap();
         let unresolved = crate::tests::policy::unresolved_set(policy(1).policy_ref());
@@ -435,18 +438,24 @@ mod pure_tests {
         // An authorized caller with an authenticated ref reaches the mint, and the mint owns
         // the assigned successor id.
         let policy = policy(1);
-        let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
+        let mut operation = PolicyMutationOperation::new_with_version(
+            config(std::slice::from_ref(&policy)),
+            SUCCESSOR,
+        );
         operation.first().unwrap();
         operation.next(authorized(true)).unwrap();
         assert!(is_child(&operation.next(resolved(&policy))));
-        assert!(!operation.successor_version_id().is_nil());
+        assert_eq!(operation.successor_version_id(), SUCCESSOR);
     }
 
     #[test]
     fn mint_failure_surfaces() {
         // The mint's typed error reaches the caller; the child cleans up after itself.
         let policy = policy(1);
-        let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
+        let mut operation = PolicyMutationOperation::new_with_version(
+            config(std::slice::from_ref(&policy)),
+            SUCCESSOR,
+        );
         operation.first().unwrap();
         operation.next(authorized(true)).unwrap();
         operation.next(resolved(&policy)).unwrap();

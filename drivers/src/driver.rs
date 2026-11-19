@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_blob::blob::{BlobHandle, GroupHold};
+use aruna_clock::unix_timestamp_millis;
 use aruna_compute::ExecutorRegistry;
 use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
@@ -17,7 +18,6 @@ use aruna_core::operation::SubOperation;
 use aruna_core::operation::{AfterConflict, EffectOperation, HoldScope, Runnable};
 use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, TxnId};
 use aruna_graph::GraphHandle;
 use aruna_net::NetHandle;
@@ -35,6 +35,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
+use crate::clock;
 use crate::effect_adapters;
 use crate::recorder;
 
@@ -640,7 +641,7 @@ trait Drive: Send {
 
 /// The runner's clock for one event delivery, recording the event when the run is recorded.
 fn delivery(record: Option<u64>, event: &Event) -> u64 {
-    let now = unix_timestamp_millis();
+    let now = clock::stamp_time();
     if let Some(run) = record {
         recorder::event(run, now, event);
     }
@@ -653,10 +654,11 @@ struct ParentRun<'a, O: EffectOperation>(&'a mut O, Option<u64>);
 
 impl<O: EffectOperation> Drive for ParentRun<'_, O> {
     fn start(&mut self) -> Effects {
-        let now = unix_timestamp_millis();
+        let entropy = clock::next_entropy();
+        let now = clock::stamp_time();
         self.1 = recorder::begin(type_name::<O>(), now, || format!("{:?}", self.0));
         self.0.stamp(now);
-        self.0.seed(rand::random());
+        self.0.seed(entropy);
         self.0.start()
     }
 
@@ -685,11 +687,12 @@ struct SubRun<'a>(&'a mut dyn SubOperation, Option<u64>);
 
 impl Drive for SubRun<'_> {
     fn start(&mut self) -> Effects {
-        let now = unix_timestamp_millis();
+        let entropy = clock::next_entropy();
+        let now = clock::stamp_time();
         let name = type_name_of_val(&*self.0);
         self.1 = recorder::begin(name, now, || format!("{:?}", self.0));
         self.0.stamp(now);
-        self.0.seed(rand::random());
+        self.0.seed(entropy);
         self.0.start()
     }
 
@@ -733,7 +736,9 @@ fn refused_member(effect: &Effect) -> bool {
             | StorageEffect::VaultWrite { txn_id, .. }
             | StorageEffect::VaultRead { txn_id, .. }
             | StorageEffect::VaultDelete { txn_id, .. } => txn_id.is_some(),
-            StorageEffect::SyncAll | StorageEffect::RealmOpen(_) => false,
+            StorageEffect::SyncAll
+            | StorageEffect::RealmOpen(_)
+            | StorageEffect::CompilePolicies(_) => false,
         },
         _ => false,
     }

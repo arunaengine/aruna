@@ -4,6 +4,7 @@
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
@@ -59,12 +60,13 @@ impl Change {
     fn writes(
         &self,
         replication: Option<&WatchReplication>,
+        generation: Ulid,
     ) -> Result<Vec<(KeySpace, Key, Value)>, String> {
         let mut writes = Vec::with_capacity(4);
         if let Change::Create(subscription) = self {
             writes.push(watch_write_entry(subscription).map_err(|error| error.to_string())?);
         }
-        writes.push(dirty_marker_write(self.owner().realm_id));
+        writes.push(dirty_marker_write(self.owner().realm_id, generation));
         if let Some(replication) = replication {
             let target = watch_subscription_target(self.owner(), self.watch_id());
             let revision = sync_revision_entry(&target, &replication.revision)
@@ -95,13 +97,16 @@ struct WatchRowsOperation {
     change: Change,
     replication: Option<WatchReplication>,
     state: RowsState,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl WatchRowsOperation {
     fn write(&mut self) -> Result<Next<bool>, WatchSubscriptionError> {
+        let generation = self.ids.mint(self.now_ms);
         let writes = self
             .change
-            .writes(self.replication.as_ref())
+            .writes(self.replication.as_ref(), generation)
             .map_err(WatchSubscriptionError::Storage)?;
         self.state = RowsState::Write;
         Ok(Next::Call(IoCall::Write(writes)))
@@ -111,6 +116,14 @@ impl WatchRowsOperation {
 impl Operation for WatchRowsOperation {
     type Output = bool;
     type Error = WatchSubscriptionError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         let call = match &self.change {
@@ -192,6 +205,8 @@ impl StoreWatchOperation {
             change: self.change.clone(),
             replication: self.replication.clone(),
             state: RowsState::Count,
+            now_ms: 0,
+            ids: IdMint::default(),
         };
         Next::Call(IoCall::child(rows))
     }
@@ -246,14 +261,21 @@ pub struct CreateWatchOperation {
 
 impl CreateWatchOperation {
     pub fn new(
+        watch_id: Ulid,
         local: aruna_core::NodeId,
         owner: UserId,
         (path_prefix, event_mask): (String, WatchEventMask),
         authorization: WatchAuthorizationBinding,
         now_ms: u64,
     ) -> Result<Self, WatchSubscriptionError> {
-        let subscription =
-            validated_subscription(owner, path_prefix, event_mask, now_ms, authorization)?;
+        let subscription = validated_subscription(
+            watch_id,
+            owner,
+            path_prefix,
+            event_mask,
+            now_ms,
+            authorization,
+        )?;
         let replication = watch_upsert_replication(local, &subscription)?;
         Ok(Self {
             subscription,
@@ -317,7 +339,13 @@ mod call_tests {
 
     fn subscription() -> WatchSubscription {
         let mask = WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]);
-        WatchSubscription::new(user(1, 2), "meta/x".to_string(), mask, 1_000)
+        WatchSubscription::new(
+            ulid::Ulid::generate(),
+            user(1, 2),
+            "meta/x".to_string(),
+            mask,
+            1_000,
+        )
     }
 
     fn rows(change: Change) -> WatchRowsOperation {
@@ -325,6 +353,8 @@ mod call_tests {
             change,
             replication: None,
             state: RowsState::Count,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -436,6 +466,7 @@ mod call_tests {
         let binding = WatchAuthorizationBinding::default();
         let new = || {
             CreateWatchOperation::new(
+                Ulid::from_parts(4, 4),
                 local,
                 user(1, 2),
                 (prefix.clone(), mask),

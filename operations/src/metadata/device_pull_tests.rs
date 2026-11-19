@@ -2,12 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::SystemTime;
-
 use super::*;
 use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
-use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 
 fn realm() -> RealmId {
@@ -19,12 +16,7 @@ fn node(seed: u8) -> NodeId {
 }
 
 fn auth() -> AuthContext {
-    AuthContext {
-        user_id: UserId::nil(realm()),
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(UserId::nil(realm()), realm())
 }
 
 fn request(deleted: bool) -> SyncPull {
@@ -46,17 +38,7 @@ fn request(deleted: bool) -> SyncPull {
 }
 
 fn bucket() -> BucketInfo {
-    BucketInfo {
-        group_id: Ulid::from_parts(3, 3),
-        created_at: SystemTime::UNIX_EPOCH,
-        created_by: UserId::nil(realm()),
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Off,
-        distribution: None,
-    }
+    crate::tests::s3::bucket_info(Ulid::from_parts(3, 3), UserId::nil(realm()))
 }
 
 fn child<T, E>(result: Result<T, E>) -> IoResult

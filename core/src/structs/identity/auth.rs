@@ -232,6 +232,16 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
+    /// The context of `user_id` acting in `realm_id`, without path restrictions or a session.
+    pub fn new(user_id: UserId, realm_id: RealmId) -> Self {
+        Self {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
     /// A user of another realm, or a session opened through a login of another realm.
     pub fn federated(&self) -> bool {
         self.user_id.realm_id != self.realm_id

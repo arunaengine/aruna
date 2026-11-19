@@ -554,6 +554,7 @@ pub struct CaptureOutputsOperation {
     inherited: Vec<PlacementPolicyRef>,
     queue: VecDeque<(OutputSelection, (NodeId, String, String))>,
     outputs: Vec<OutputObject>,
+    now_ms: u64,
     step: CaptureStep,
 }
 
@@ -571,6 +572,7 @@ impl CaptureOutputsOperation {
             inherited: Vec::new(),
             queue: VecDeque::new(),
             outputs: Vec::new(),
+            now_ms: 0,
             step: CaptureStep::Reserve,
         }
     }
@@ -628,6 +630,7 @@ impl CaptureOutputsOperation {
                 self.scope.run.job_id,
                 self.destinations.clone(),
                 std::mem::take(&mut self.hints),
+                self.now_ms,
             );
             return self.call(CaptureStep::Reserve, IoCall::child(reserve));
         };
@@ -699,6 +702,10 @@ impl CaptureOutputsOperation {
 impl Operation for CaptureOutputsOperation {
     type Output = Vec<OutputObject>;
     type Error = JobError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> CaptureNext {
         self.resolve_next()

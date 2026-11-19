@@ -372,8 +372,6 @@ mod pure_tests {
     use aruna_core::errors::StorageError;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
-    use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector};
-    use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -384,18 +382,7 @@ mod pure_tests {
     }
 
     fn policy(seed: u8, location: &str) -> VerifiedPolicy {
-        let policy = PlacementPolicy::new(
-            Ulid::from_bytes([seed; 16]),
-            "residency".to_string(),
-            vec![PlacementSelector {
-                node_id: None,
-                location: Some(location.to_string()),
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
-        )
-        .expect("policy is valid");
-        VerifiedPolicy::verify(policy).expect("policy verifies")
+        crate::tests::policy::residency(seed, location)
     }
 
     fn document(policy: &VerifiedPolicy) -> PlacementPolicyDocument {

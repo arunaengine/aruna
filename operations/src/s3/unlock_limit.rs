@@ -6,6 +6,7 @@
 use crate::s3::bucket::key::rows::{SettingsError, authority_keys, keyless, parse_authority};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::realm::RealmId;
@@ -14,7 +15,6 @@ use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketA
 use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
 use thiserror::Error;
-use ulid::Ulid;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UnlockLimitError {
@@ -63,6 +63,7 @@ pub struct UnlockLimitInput {
 
 #[derive(Debug, PartialEq)]
 pub struct UnlockLimitOperation {
+    ids: IdMint,
     input: UnlockLimitInput,
     /// The settings written; the write answer follows.
     settings: Option<BucketEncryption>,
@@ -71,6 +72,7 @@ pub struct UnlockLimitOperation {
 impl UnlockLimitOperation {
     pub fn new(input: UnlockLimitInput) -> Self {
         Self {
+            ids: IdMint::default(),
             input,
             settings: None,
         }
@@ -101,7 +103,7 @@ impl UnlockLimitOperation {
         }
         settings.max_unlock_ms = self.input.max_unlock_ms;
         let record = BucketAuditRecord {
-            event_id: Ulid::generate(),
+            event_id: self.ids.mint(self.input.now_ms),
             bucket_id,
             at_ms: self.input.now_ms,
             action: AuditAction::ModeChange,
@@ -152,6 +154,10 @@ impl Operation for UnlockLimitOperation {
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +168,7 @@ mod tests {
     use aruna_core::structs::storage::encryption::EncryptionMode;
     use aruna_core::structs::storage::format::Compression;
     use std::time::SystemTime;
+    use ulid::Ulid;
 
     fn caller() -> UserId {
         UserId::new(Ulid::from_bytes([5; 16]), RealmId::from_bytes([1; 32]))

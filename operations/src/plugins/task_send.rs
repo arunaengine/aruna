@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
@@ -112,6 +113,7 @@ pub struct SendTask {
     node: IngressNode,
     admit_by: u64,
     phase: SendPhase,
+    mint: IdMint,
 }
 
 type SendNext = Result<Next<()>, CallError>;
@@ -131,6 +133,7 @@ impl SendTask {
             node,
             admit_by: 0,
             phase: SendPhase::Task,
+            mint: IdMint::default(),
         }
     }
 
@@ -254,7 +257,7 @@ impl SendTask {
             session: None,
         };
         let token = AuthToken::Internal(auth);
-        let send = send_task_job(&submission, (&config, &self.node), token);
+        let send = send_task_job(&submission, (&config, &self.node), token, &mut self.mint);
         let send = send.map_err(prepare_error)?;
         self.phase = SendPhase::Send(submission.identity.family(), marked);
         Ok(Next::Call(send))
@@ -264,6 +267,10 @@ impl SendTask {
 impl Operation for SendTask {
     type Output = ();
     type Error = CallError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> SendNext {
         let (install_id, work_id) = self.ids();

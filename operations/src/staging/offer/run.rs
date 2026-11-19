@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
@@ -261,6 +261,7 @@ struct RegisterBucketOperation {
     input: OfferDirectoryInput,
     step: RegisterStep,
     created_at: Option<SystemTime>,
+    now_ms: u64,
 }
 
 type RegisterTurn = Result<Next<()>, OfferError>;
@@ -268,6 +269,7 @@ type RegisterTurn = Result<Next<()>, OfferError>;
 impl RegisterBucketOperation {
     fn new(input: OfferDirectoryInput) -> Self {
         Self {
+            now_ms: 0,
             input,
             step: RegisterStep::Rows,
             created_at: None,
@@ -313,6 +315,10 @@ impl Operation for RegisterBucketOperation {
     type Output = ();
     type Error = OfferError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> RegisterTurn {
         let key = offer_key(&self.input.bucket);
         Ok(Next::Call(IoCall::Read(vec![
@@ -322,7 +328,7 @@ impl Operation for RegisterBucketOperation {
     }
 
     fn next(&mut self, result: IoResult) -> RegisterTurn {
-        let now = SystemTime::now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         match self.step {
             RegisterStep::Rows => {
                 let [offer, bucket] = values::<2>(result)?;

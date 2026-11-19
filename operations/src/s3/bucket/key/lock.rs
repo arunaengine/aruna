@@ -10,6 +10,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::BUCKET_HOLDER_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
@@ -17,9 +18,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, HolderOrigin, KeyTicket, UnlockStatus,
 };
-use aruna_core::structs::storage::key_audit::{
-    AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
-};
+use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{GroupId, Value};
 use aruna_core::{NodeId, UserId};
@@ -32,10 +31,10 @@ fn lock_record(
     ticket: KeyTicket,
     actor: Option<UserId>,
     node_id: NodeId,
-    at_ms: u64,
+    (at_ms, event_id): (u64, Ulid),
 ) -> BucketAuditRecord {
     BucketAuditRecord {
-        event_id: next_event_id(at_ms),
+        event_id,
         bucket_id: ticket.key.bucket_id,
         at_ms,
         action: match actor {
@@ -94,20 +93,7 @@ impl From<IoError> for LockError {
     }
 }
 
-impl From<AuditError> for LockError {
-    fn from(error: AuditError) -> Self {
-        match error {
-            AuditError::Conversion(error) => Self::Conversion(error),
-            AuditError::Storage(error) => Self::Storage(error),
-            AuditError::NotAuditTimer => Self::NotFinished,
-            AuditError::Unexpected(received) => Self::InvalidStateEvent {
-                state: "WriteAudit".to_string(),
-                expected: "the audit retry timer's answer",
-                received,
-            },
-        }
-    }
-}
+crate::s3::bucket::audit_retry::audit_failure!(LockError, "WriteAudit");
 
 type LockTurn = Result<Next<LockResult>, LockError>;
 
@@ -141,6 +127,7 @@ pub struct LockBucketOperation {
     /// Timer effects still to send, one at a time, and the timer the running one names.
     timers: VecDeque<(Effect, TaskKey)>,
     waiting: Option<TaskKey>,
+    ids: IdMint,
 }
 
 impl LockBucketOperation {
@@ -154,11 +141,12 @@ impl LockBucketOperation {
             records: Vec::new(),
             timers: VecDeque::new(),
             waiting: None,
+            ids: IdMint::default(),
         }
     }
 
-    /// The node's own lock of one timed session, after its deadline passed.
-    pub fn timed(session: KeyTicket, node_id: NodeId) -> Self {
+    /// The node's own lock of one timed session at `now_ms`, after its deadline passed.
+    pub fn timed(session: KeyTicket, node_id: NodeId, now_ms: u64) -> Self {
         let mut operation = Self::new(LockInput {
             bucket: String::new(),
             group_id: Ulid::nil(),
@@ -166,7 +154,7 @@ impl LockBucketOperation {
             node_id,
             caller: None,
             session: Some(session),
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms,
         });
         operation.bucket_id = Some(session.key.bucket_id);
         operation
@@ -240,7 +228,8 @@ impl LockBucketOperation {
         let (actor, node_id, now_ms) = (self.input.caller, self.input.node_id, self.input.now_ms);
         self.records = (self.locked.iter())
             .map(|ticket| {
-                let mut record = lock_record(*ticket, actor, node_id, now_ms);
+                let mut record =
+                    lock_record(*ticket, actor, node_id, (now_ms, self.ids.mint(now_ms)));
                 record.sequence = Some(sequence);
                 record
             })
@@ -335,6 +324,10 @@ impl LockBucketOperation {
 impl Operation for LockBucketOperation {
     type Output = LockResult;
     type Error = LockError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> LockTurn {
         if self.input.caller.is_none() && self.bucket_id.is_some() {
@@ -507,7 +500,7 @@ mod tests {
     #[test]
     fn locks_named_session() {
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let mut operation = LockBucketOperation::timed(ticket(2), node);
+        let mut operation = LockBucketOperation::timed(ticket(2), node, 1_000);
         // The node locks by session alone, without reading the bucket.
         let turn = operation.first();
         let lock = BlobEffect::LockKey {

@@ -65,7 +65,8 @@ fn recipe() -> serde_json::Value {
 fn ingress(node: &TestNode) -> IngressNode {
     let context = &node.context;
     let fresh = context.fresh_heartbeats();
-    ingress_node(context.node_and_realm(), fresh).expect("a test node serves a network")
+    let now = unix_timestamp_millis();
+    ingress_node(context.node_and_realm(), fresh, now).expect("a test node serves a network")
 }
 
 /// A realm whose group installed a plugin with one task, seen by every node's task check.

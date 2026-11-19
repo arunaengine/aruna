@@ -71,7 +71,7 @@ fn capture_of(selection: OutputSelection, until_stop: bool) -> CaptureOutputsOpe
 }
 
 fn reserve_call(destinations: Vec<(NodeId, String, String)>) -> Next<Vec<OutputObject>> {
-    let reserve = reserve_output_commits(job(), destinations, BTreeMap::new());
+    let reserve = reserve_output_commits(job(), destinations, BTreeMap::new(), 0);
     Next::Call(IoCall::child(reserve))
 }
 

@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::repository::{
     RemoteState, RepositoryCredential, RepositoryDestination, RepositoryLink, RepositoryQuery,
@@ -12,7 +13,6 @@ use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{JobError, JobId};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::persistent_id::RegisterIdentifiersOperation;
@@ -119,7 +119,14 @@ pub(super) async fn seal_credential(
 ) -> Result<RepositoryCredential, TransferError> {
     let connector = ConnectorViewOperation::new(destination.group_id, destination.connector_id);
     let view = drive(connector, context).await?;
-    seal_token(&context.node_scope(), auth.user_id, &view, None, token)
+    seal_token(
+        &context.node_scope(),
+        auth.user_id,
+        &view,
+        None,
+        token,
+        [3; 24],
+    )
 }
 
 pub(super) async fn seal_link_token(
@@ -131,7 +138,14 @@ pub(super) async fn seal_link_token(
     token: &str,
 ) -> Result<RepositoryCredential, TransferError> {
     let view = drive(ConnectorViewOperation::new(group_id, connector_id), context).await?;
-    seal_token(&context.node_scope(), user, &view, Some(link_id), token)
+    seal_token(
+        &context.node_scope(),
+        user,
+        &view,
+        Some(link_id),
+        token,
+        [3; 24],
+    )
 }
 
 pub(super) async fn search(

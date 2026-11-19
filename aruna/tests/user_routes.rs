@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::shared::oidc::spawn_oidc_provider;
 use aruna::inbound::initialize_incoming_fixture;
 use aruna::tasks::incoming::start_task_queues;
 use aruna_api::auth::{OidcValidator, handle_token};
@@ -42,11 +43,7 @@ use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOpera
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
-use axum::Json;
-use axum::Router;
-use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::get;
 use base64::Engine;
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
@@ -61,13 +58,6 @@ use ulid::Ulid;
 
 #[path = "user_merge.rs"]
 mod merge;
-
-#[derive(Clone)]
-struct OidcProviderState {
-    issuer: String,
-    jwks_uri: String,
-    jwks: serde_json::Value,
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TestOidcClaims {
@@ -94,59 +84,6 @@ struct TestNode {
     realm_admin_id: UserId,
     net: NetHandle,
     server_task: JoinHandle<()>,
-}
-
-async fn oidc_discovery(State(state): State<OidcProviderState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "issuer": state.issuer,
-        "jwks_uri": state.jwks_uri,
-    }))
-}
-
-async fn oidc_jwks(State(state): State<OidcProviderState>) -> Json<serde_json::Value> {
-    Json(state.jwks)
-}
-
-async fn spawn_oidc_provider(
-    issuer: &str,
-    kid: &str,
-    signing_key: &SigningKey,
-) -> (OidcProviderConfig, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let jwks_uri = format!("http://{addr}/jwks.json");
-    let discovery_url = format!("http://{addr}/.well-known/openid-configuration");
-    let jwks = serde_json::json!({
-        "keys": [{
-            "kty": "OKP",
-            "alg": "EdDSA",
-            "use": "sig",
-            "kid": kid,
-            "crv": "Ed25519",
-            "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
-        }]
-    });
-    let router = Router::new()
-        .route("/.well-known/openid-configuration", get(oidc_discovery))
-        .route("/jwks.json", get(oidc_jwks))
-        .with_state(OidcProviderState {
-            issuer: issuer.to_string(),
-            jwks_uri: jwks_uri.clone(),
-            jwks,
-        });
-    let task = tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-
-    (
-        OidcProviderConfig {
-            id: "main".to_string(),
-            issuer: issuer.to_string(),
-            audience: "aruna-api".to_string(),
-            discovery_url,
-        },
-        task,
-    )
 }
 
 fn sign_oidc_token(
@@ -200,7 +137,7 @@ fn sign_aruna_token(
     user_id: UserId,
     restrictions: Option<Vec<PathRestriction>>,
 ) -> String {
-    let now = aruna_core::time::unix_timestamp_secs();
+    let now = aruna_clock::unix_timestamp_secs();
     let claims = TokenClaims {
         sub: user_id.to_string(),
         iss: node.realm_id.to_string(),
@@ -420,7 +357,7 @@ async fn register_via_oidc(
     name: &str,
     onboarding_secret: Option<String>,
 ) -> (RegisterUserResponse, String) {
-    let login = Some(aruna_core::time::unix_timestamp_secs());
+    let login = Some(aruna_clock::unix_timestamp_secs());
     let oidc_token = sign_oidc_token(issuer, kid, signing_key, subject, Some(name), login);
     let register = reqwest::Client::new()
         .post(format!("{}/api/v1/access/users/register", node.base_url))
@@ -1116,7 +1053,7 @@ async fn burned_secret_recovers() {
             enrollment_id: decoded.enrollment_id,
             secret_hash: decoded.secret_hash(),
             node_id: UserId::local(Ulid::generate(), node.realm_id).to_string(),
-            now: aruna_core::time::unix_timestamp_secs(),
+            now: aruna_clock::unix_timestamp_secs(),
         }),
         node.context.as_ref(),
     )
@@ -1548,7 +1485,7 @@ async fn foreign_realm_unimplemented() {
     }
     let token = drive(
         CreateTokenOperation::new(CreateTokenConfig {
-            time: aruna_core::time::unix_timestamp_secs(),
+            time: aruna_clock::unix_timestamp_secs(),
             expiry: None,
             user_id: foreign_user_id,
             realm_id: foreign_realm_id,
@@ -1803,7 +1740,7 @@ async fn provider_login_time() {
     .await;
 
     // The token keeps the provider's login time, or none, never the exchange time.
-    let old_login = aruna_core::time::unix_timestamp_secs() - 3600;
+    let old_login = aruna_clock::unix_timestamp_secs() - 3600;
     for auth_time in [Some(old_login), None] {
         let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", None, auth_time);
         let response = reqwest::Client::new()

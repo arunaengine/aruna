@@ -8,7 +8,7 @@ use aruna_core::compute::SecretBytes;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
-use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::realm_vault::{
     RealmSecretRef, RealmVaultEntry, RealmVaultError, RealmVaultKey, RealmVaultPurpose,
@@ -17,19 +17,17 @@ use aruna_core::realm_vault::{
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace, Value};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{info, warn};
-use ulid::Ulid;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -188,6 +186,9 @@ struct EmailWrite {
     stage: Stage,
     profile: Option<Option<RealmEmailProfile>>,
     deletes: Vec<(KeySpace, Key)>,
+    now_ms: u64,
+    ids: IdMint,
+    entropy: u128,
 }
 
 impl EmailWrite {
@@ -197,6 +198,9 @@ impl EmailWrite {
             stage: Stage::Read,
             profile: None,
             deletes: Vec::new(),
+            now_ms: 0,
+            ids: IdMint::default(),
+            entropy: 0,
         }
     }
 
@@ -214,7 +218,7 @@ impl EmailWrite {
 
     /// The vault writes and the profile write, in that order, so a receiver sees the record first.
     fn email_writes(
-        &self,
+        &mut self,
         state: &AdminDocumentState,
     ) -> Result<(Vec<AdminDocumentOperation>, Option<RealmEmailProfile>), SetEmailError> {
         let (current, live) = (
@@ -228,7 +232,8 @@ impl EmailWrite {
             .filter(|entry| entry.purpose == RealmVaultPurpose::SmtpPassword)
             .collect();
         let mut writes = Vec::new();
-        let profile = match &self.config.profile {
+        let config = Arc::clone(&self.config);
+        let profile = match &config.profile {
             None => None,
             Some(input) => {
                 let password = self.password(input, current.as_ref(), &mut writes)?;
@@ -236,7 +241,7 @@ impl EmailWrite {
                     stale.remove(&password.entry);
                 }
                 let profile = RealmEmailProfile {
-                    revision: Ulid::generate(),
+                    revision: self.ids.mint(self.now_ms),
                     host: input.host.trim().to_string(),
                     port: input.port,
                     tls: input.tls,
@@ -244,7 +249,7 @@ impl EmailWrite {
                     from: input.from.trim().to_string(),
                     password,
                     changed_by: self.config.actor.user_id,
-                    changed_at_ms: unix_timestamp_millis(),
+                    changed_at_ms: self.now_ms,
                 };
                 if !profile.valid() {
                     return Err(SetEmailError::InvalidProfile {
@@ -269,7 +274,7 @@ impl EmailWrite {
 
     /// Seals a new password under a new revision, or keeps the stored one for the same username.
     fn password(
-        &self,
+        &mut self,
         input: &EmailInput,
         current: Option<&RealmEmailProfile>,
         writes: &mut Vec<AdminDocumentOperation>,
@@ -285,14 +290,17 @@ impl EmailWrite {
                 .map(Some)
                 .ok_or(SetEmailError::PasswordRequired),
             (Some(_), Some(secret)) => {
-                let entry = (current.and_then(|current| current.password))
-                    .map(|password| password.entry)
-                    .unwrap_or_else(|| {
-                        RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, Ulid::generate())
-                    });
-                let revision = Ulid::generate();
+                let entry = match current.and_then(|current| current.password) {
+                    Some(password) => password.entry,
+                    None => {
+                        let id = self.ids.mint(self.now_ms);
+                        RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, id)
+                    }
+                };
+                let revision = self.ids.mint(self.now_ms);
                 let realm_id = self.config.actor.realm_id;
-                let sealed = (self.config.vault_key).seal(&realm_id, entry, revision, secret)?;
+                let vault_key = &self.config.vault_key;
+                let sealed = vault_key.seal(&realm_id, (entry, revision), secret, self.entropy)?;
                 writes.push(AdminDocumentOperation::ConfigVaultSet {
                     entry,
                     record: Some(RealmVaultRecord {
@@ -300,7 +308,7 @@ impl EmailWrite {
                         revision,
                         sealed,
                         changed_by: self.config.actor.user_id,
-                        changed_at_ms: unix_timestamp_millis(),
+                        changed_at_ms: self.now_ms,
                     }),
                 });
                 Ok(Some(RealmSecretRef { entry, revision }))
@@ -344,7 +352,11 @@ impl EmailWrite {
                 let revision = record.as_ref().map(|record| record.revision);
                 info!(?entry, ?revision, user = %self.config.actor.user_id, "Vault entry set");
             }
-            events.push(reducer_state.apply_operation(&self.config.actor, operation)?);
+            events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                operation,
+                self.ids.mint(self.now_ms),
+            )?);
         }
         document.email = reducer_state.materialized_realm_email();
         document.vault = reducer_state.materialized_realm_vault();
@@ -392,6 +404,15 @@ impl Operation for EmailWrite {
     type Output = Option<RealmEmailProfile>;
     type Error = SetEmailError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+        self.entropy = entropy;
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -401,18 +422,8 @@ impl Operation for EmailWrite {
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, SetEmailError> {
-        let document = self.document_ref();
-        let target = self.admin_target();
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                document.storage_keyspace().to_string(),
-                document.storage_key(),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        let reads = crate::realm::document_reads(self.document_ref(), &self.admin_target());
+        Ok(Next::Call(reads))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetEmailError> {

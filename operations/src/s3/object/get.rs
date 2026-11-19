@@ -17,6 +17,7 @@ use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
 use crate::s3::object::put::abe::keyed;
 use crate::s3::object::source::choice::{Candidate, choose_source};
 use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
+use aruna_core::id_mint::IdMint;
 use futures_util::StreamExt;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
@@ -345,7 +346,8 @@ pub struct GetObjectOperation {
     /// Publisher-attested predecessor lineage for the successor.
     reference_advance: Option<ReferenceAdvance>,
     /// Injected wall clock for the advance interval check; tests set it.
-    now_override: Option<SystemTime>,
+    /// The runner clock of the current step.
+    now_ms: u64,
     metadata: HashMap<String, String>,
     source_metadata: Option<SourceMetadata>,
     source_binding: Option<VersionSourceBinding>,
@@ -411,7 +413,7 @@ impl GetObjectOperation {
             restrictions: None,
             reference_creator: None,
             reference_advance: None,
-            now_override: None,
+            now_ms: 0,
             metadata: HashMap::new(),
             source_metadata: None,
             source_binding: None,
@@ -1317,7 +1319,9 @@ impl GetObjectOperation {
             binding,
             creator,
             metadata: self.metadata.clone(),
-            now: self.now_override.unwrap_or_else(SystemTime::now),
+            now: SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
+            now_ms: 0,
+            ids: IdMint::default(),
             step: AdvanceStep::ReadBucket,
             pointer: None,
             released_bytes: 0,
@@ -1393,7 +1397,7 @@ impl GetObjectOperation {
         // successor promises, so the served bytes are checked against it.
         let observation = self.advance_observation.clone();
         let observation = observation.ok_or(GetObjectError::GetObjectFailed)?;
-        self.last_refresh = Some(SystemTime::now());
+        self.last_refresh = Some(SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms));
         self.serve_reference_source(observation, true)
     }
 
@@ -1528,7 +1532,7 @@ impl GetObjectOperation {
             key: self.input.key.clone(),
             version_id,
             metadata: None,
-            refreshed_at: self.now_override.unwrap_or_else(SystemTime::now),
+            refreshed_at: SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
             node_id: self.input.node_id,
             auth_context: self.auth_context(),
         };
@@ -1713,6 +1717,10 @@ impl Operation for GetObjectOperation {
     fn transaction(&self) -> TransactionMode {
         TransactionMode::ReadSnapshot
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 }
 
 /// How a reference advance ended.
@@ -1742,6 +1750,8 @@ enum AdvanceStep {
 /// write transaction that rechecks the head and the durable advance bounds.
 #[derive(Debug, PartialEq)]
 struct AdvanceReference {
+    now_ms: u64,
+    ids: IdMint,
     input: GetObjectInput,
     auth_context: AuthContext,
     /// The version the drifted read headed; the head must still name it.
@@ -1828,7 +1838,7 @@ impl AdvanceReference {
             .clone()
             .ok_or(GetObjectError::GetObjectFailed)?;
 
-        let new_version_id = Ulid::generate();
+        let new_version_id = self.ids.mint(self.now_ms);
         // The successor of a governed reference keeps its predecessor's refs:
         // an automatic advance must never relax an attachment.
         let successor = BlobVersion::reference(
@@ -1891,7 +1901,7 @@ impl AdvanceReference {
         if update.is_noop() {
             return self.committed();
         }
-        let call = update.start_calls().into_call();
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.usage = Some(update);
         self.read(AdvanceStep::UpdateUsage, call)
     }
@@ -1938,6 +1948,14 @@ impl Operation for AdvanceReference {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

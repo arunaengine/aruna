@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 
@@ -310,7 +311,7 @@ pub enum ClaimOutcome {
 /// Claim a queued job, or cancel it directly if it never ran and is cancel-requested. Only a
 /// claim won here returns a token; an already claimed job is not eligible.
 pub fn claim_job(job_id: JobId, holder_node_id: NodeId, now_ms: u64) -> StoreCall<ClaimOutcome> {
-    let mutate = move |record: &mut JobRecord| {
+    let mutate = move |record: &mut JobRecord, claim_token: Ulid| {
         if record.state != JobState::Queued {
             return Ok(JobMutation::Skip);
         }
@@ -324,16 +325,22 @@ pub fn claim_job(job_id: JobId, holder_node_id: NodeId, now_ms: u64) -> StoreCal
         record.state = JobState::Claimed;
         record.claim = Some(JobClaim {
             holder_node_id,
-            claim_token: Ulid::generate(),
+            claim_token,
             lease_expires_ms: now_ms.saturating_add(JOB_LEASE_MS),
         });
         Ok(JobMutation::Persist)
     };
-    change_mapped(job_id, mutate, |record, persisted| match persisted {
-        false => ClaimOutcome::NotEligible,
-        true if record.state == JobState::Claimed => ClaimOutcome::Claimed(record),
-        true => ClaimOutcome::CancelledFresh(record),
-    })
+    let build = move |token| {
+        ChangeJobOperation::new(job_id, move |record: &mut JobRecord| mutate(record, token))
+    };
+    let map = |(record, persisted): (JobRecord, bool)| {
+        Ok(match persisted {
+            false => ClaimOutcome::NotEligible,
+            true if record.state == JobState::Claimed => ClaimOutcome::Claimed(record),
+            true => ClaimOutcome::CancelledFresh(record),
+        })
+    };
+    StoreCall::minted(now_ms, build, map, JOB_EXHAUSTED)
 }
 
 #[derive(Debug, PartialEq)]
@@ -778,19 +785,25 @@ pub fn reserve_output_commits(
     job_id: JobId,
     destinations: Vec<(NodeId, String, String)>,
     hints: BTreeMap<(NodeId, String), SetHint>,
+    now_ms: u64,
 ) -> StoreCall<AttemptControl> {
-    control_of(
-        job_id,
-        move |_: &mut JobRecord, control: &mut AttemptControl| {
+    let build = move |first: Ulid| {
+        let (destinations, hints) = (destinations.clone(), hints.clone());
+        let edit = move |_: &mut JobRecord, control: &mut AttemptControl| {
+            let mut ids = IdMint::new(first.random());
             let mint = |(node_id, bucket, _): &(NodeId, String, String)| {
-                mint_version(hints.get(&(*node_id, bucket.clone())).copied())
+                let hint = hints.get(&(*node_id, bucket.clone())).copied();
+                mint_version(ids.mint(first.timestamp_ms()), hint)
             };
             match control.reserve_outputs(&destinations, mint) {
                 true => Ok(JobMutation::Persist),
                 false => Ok(JobMutation::Skip),
             }
-        },
-    )
+        };
+        MutateControlOperation::new(job_id, Vec::new(), edit)
+    };
+    let map = |changed: ControlChange| Ok(changed.control);
+    StoreCall::minted(now_ms, build, map, ATTEMPT_EXHAUSTED)
 }
 
 pub fn authorize_cleanup(
@@ -858,7 +871,7 @@ pub fn adopt_external_attempt(
     holder_node_id: NodeId,
     now_ms: u64,
 ) -> StoreCall<AdoptOutcome> {
-    let mutate = move |record: &mut JobRecord, control: &mut AttemptControl| {
+    let mutate = move |record: &mut JobRecord, control: &mut AttemptControl, claim_token: Ulid| {
         if record.state.is_terminal() {
             return Ok(JobMutation::Skip);
         }
@@ -870,7 +883,6 @@ pub fn adopt_external_attempt(
             return Ok(JobMutation::Skip);
         }
         record.updated_at_ms = now_ms;
-        let claim_token = Ulid::generate();
         record.claim = Some(JobClaim {
             holder_node_id,
             claim_token,
@@ -880,14 +892,19 @@ pub fn adopt_external_attempt(
         control.bound_token = Some(claim_token);
         Ok(JobMutation::Persist)
     };
-    let build = move || MutateControlOperation::new(job_id, Vec::new(), mutate.clone());
+    let build = move |token| {
+        let edit = move |record: &mut JobRecord, control: &mut AttemptControl| {
+            mutate(record, control, token)
+        };
+        MutateControlOperation::new(job_id, Vec::new(), edit)
+    };
     let map = |changed: ControlChange| {
         Ok(match changed.persisted {
             true => AdoptOutcome::Adopted(changed.record, changed.control),
             false => AdoptOutcome::Skipped,
         })
     };
-    StoreCall::of(build, map, ATTEMPT_EXHAUSTED)
+    StoreCall::minted(now_ms, build, map, ATTEMPT_EXHAUSTED)
 }
 
 /// Make this execution's signed output record durable and name its digest on the attempt
@@ -938,6 +955,7 @@ pub struct HandoffOperation {
     job_id: JobId,
     token: Ulid,
     now_ms: u64,
+    ids: IdMint,
     step: HandoffStep,
 }
 
@@ -947,13 +965,15 @@ pub fn handoff_external_attempt(job_id: JobId, token: Ulid, now_ms: u64) -> Hand
         job_id,
         token,
         now_ms,
+        ids: IdMint::default(),
         step: HandoffStep::Control,
     }
 }
 
 impl HandoffOperation {
-    fn rotate(&self) -> StoreCall<ControlChange> {
+    fn rotate(&mut self) -> StoreCall<ControlChange> {
         let (token, now_ms) = (self.token, self.now_ms);
+        let fresh = self.ids.mint(now_ms);
         change_control(
             self.job_id,
             Vec::new(),
@@ -965,7 +985,7 @@ impl HandoffOperation {
                     return Ok(JobMutation::Skip);
                 }
                 if let Some(claim) = record.claim.as_mut() {
-                    claim.claim_token = Ulid::generate();
+                    claim.claim_token = fresh;
                     claim.lease_expires_ms = now_ms;
                 }
                 bump_generation(control)?;
@@ -980,6 +1000,10 @@ impl HandoffOperation {
 impl Operation for HandoffOperation {
     type Output = ReleaseOutcome;
     type Error = JobMutationError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<ReleaseOutcome>, JobMutationError> {
         Ok(Next::Call(IoCall::child(self.rotate())))
@@ -1024,12 +1048,17 @@ pub fn record_attempt_intent(
     launch: Option<LaunchRecord>,
     now_ms: u64,
 ) -> StoreCall<AttemptCommit> {
-    let execution_id = execution_id.unwrap_or_else(Ulid::generate);
-    let build = move || {
+    let build = move |fresh| {
         let ids = (job_id, token);
+        let execution_id = execution_id.unwrap_or(fresh);
         RecordIntentOperation::new(ids, draft.clone(), execution_id, launch.clone(), now_ms)
     };
-    StoreCall::of(build, Ok, "attempt commit exhausted conflict retries")
+    StoreCall::minted(
+        now_ms,
+        build,
+        Ok,
+        "attempt commit exhausted conflict retries",
+    )
 }
 
 /// Removes a finished run of `user_id` from this node in one transaction: its row, list index

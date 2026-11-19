@@ -44,7 +44,7 @@ use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::blob::promote::{PromoteError, PromotePendingOperation, Promotion};
 use crate::blob::unlocked::DropReceivedOperation;
 use crate::distribution::held::{HeldElsewhere, PullRequest};
-use crate::distribution::pull::{PullThroughOperation, Pulled, pinned_blob};
+use crate::distribution::pull::{PullThroughOperation, Pulled, pin_call, pinned};
 use crate::distribution::source_keep::{KeepFirstOperation, KeepStart};
 use crate::distribution::source_plan::SourceKeep;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
@@ -73,6 +73,8 @@ enum RoutedStep {
     Pull,
     User(Box<RoutedRead>),
     Holders,
+    /// The read of a kept copy, whose stream the blob backend holds while it is read.
+    Pin(Box<GetObjectResult>),
 }
 
 /// Reads an object, continuing at the realm's holders when a User node has the record but not
@@ -178,9 +180,11 @@ impl GetRoutedOperation {
             }
             Err(error) => return Err(error),
         };
-        if let Some(location) = (read.location.as_ref()).filter(|location| kept_copy(location)) {
+        let kept = (read.location.as_ref()).filter(|location| kept_copy(location));
+        if let Some(path) = kept.map(|location| location.backend_path.clone()) {
             let empty = BackendStream(Box::pin(futures_util::stream::empty()));
-            read.blob = pinned_blob(location, std::mem::replace(&mut read.blob, empty));
+            let blob = std::mem::replace(&mut read.blob, empty);
+            return self.call(RoutedStep::Pin(Box::new(read)), pin_call(&path, blob));
         }
         Ok(Next::Done(read))
     }
@@ -248,6 +252,11 @@ impl Operation for GetRoutedOperation {
                 }
                 let holders = HolderReadOperation::new(*read, false);
                 self.call(RoutedStep::Holders, IoCall::child(holders))
+            }
+            RoutedStep::Pin(read) => {
+                let mut read = *read;
+                read.blob = pinned(result)?;
+                Ok(Next::Done(read))
             }
             RoutedStep::Holders => {
                 let found = result.child::<HolderRead, GetObjectError>()??;

@@ -11,6 +11,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::METADATA_ACTOR_KEYSPACE;
 use aruna_core::metadata::{
     MetadataActor, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
@@ -99,6 +100,8 @@ pub fn apply_local_edit(
         record: replica.record.as_deref().cloned(),
         pending: None,
         batch: None,
+        now_ms: 0,
+        ids: IdMint::default(),
     }
 }
 
@@ -113,6 +116,8 @@ pub struct ApplyEditOperation {
     record: Option<MetadataRegistryRecord>,
     pending: Option<(MetadataActor, Ulid)>,
     batch: Option<MetadataBatch>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 type EditTurn = Result<Next<MetadataRegistryRecord>, DeviceEditError>;
@@ -128,8 +133,8 @@ impl ApplyEditOperation {
 
     /// Picks the next dot of this device's actor and plans the edit without changing the graph.
     fn plan(&mut self, current: Option<MetadataActor>) -> EditTurn {
+        let mut draft_id = self.ids.mint(self.now_ms);
         let record = self.record()?;
-        let mut draft_id = Ulid::generate();
         if let Some(current) = &current
             && draft_id <= current.last_event_id
         {
@@ -178,6 +183,7 @@ impl ApplyEditOperation {
             self.record()?,
             batch.clone(),
             authored,
+            self.now_ms,
         );
         let enqueue = EnqueueDraftOperation::new(EnqueueDraftInput { entry })
             .with_actor(actor)
@@ -222,6 +228,14 @@ impl Operation for ApplyEditOperation {
     fn hold_scope(&self) -> Option<HoldScope> {
         let record = self.record.as_ref()?;
         Some(HoldScope::DocumentWrite(record.document_id))
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn first(&mut self) -> EditTurn {
@@ -568,6 +582,7 @@ mod tests {
             MetadataBatchSource::UpsertDataEntity {
                 jsonld: "{}".to_string(),
             },
+            aruna_core::time::unix_timestamp_millis(),
         );
         entry.state = state;
         entry
@@ -786,6 +801,7 @@ mod tests {
                 "queued".to_string(),
                 false,
                 "{}".to_string(),
+                aruna_core::time::unix_timestamp_millis(),
             );
             let (key_space, key, value) = publish_entry(&entry).unwrap();
             assert!(matches!(
@@ -861,6 +877,7 @@ mod tests {
             "notes".to_string(),
             false,
             "{}".to_string(),
+            aruna_core::time::unix_timestamp_millis(),
         );
         assert!(matches!(create.kind, PublishKind::Create));
         assert!(!replays_edit(&create));

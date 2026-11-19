@@ -6,6 +6,7 @@ use crate::topology;
 
 use std::collections::{HashMap, HashSet};
 
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::document::DocumentTarget;
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::node_state::ReadInfoOperation;
@@ -14,7 +15,6 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::node_info::NodeUrls;
-use aruna_core::time::unix_timestamp_secs;
 use aruna_drivers::driver::drive;
 use aruna_drivers::driver::node_facts;
 use aruna_operations::auth::revoke_token::{

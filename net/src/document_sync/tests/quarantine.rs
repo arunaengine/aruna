@@ -125,18 +125,21 @@ async fn quarantine_retains_families() {
     // Same family, invalid then valid: an unusable path prefix, a delete
     // signed by a node that is not the revision's actor, then a good upsert.
     let invalid_watch = WatchSubscription::new(
+        ulid::Ulid::generate(),
         owner,
         "/leading-slash".to_string(),
         WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
         1,
     );
     let deleted_watch = WatchSubscription::new(
+        ulid::Ulid::generate(),
         owner,
         "deleted".to_string(),
         WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
         1,
     );
     let valid_watch = WatchSubscription::new(
+        ulid::Ulid::generate(),
         owner,
         "documents".to_string(),
         WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),

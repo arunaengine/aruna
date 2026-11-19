@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod oidc;
+
 use aruna::bootstrap::{
     fetch_core_documents, prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
     wait_for_placement,
@@ -855,7 +857,7 @@ async fn spawn_seed_at(
             realm_id,
             net.node_id(),
             SubjectTrigger::Reconcile(mode),
-            aruna_core::time::unix_timestamp_millis(),
+            aruna_clock::unix_timestamp_millis(),
         );
         drive(sync, context.as_ref())
             .await
@@ -1341,4 +1343,24 @@ async fn load_env_config(
 
     let settings = read_settings_from(&env)?;
     Ok(resolve_settings(settings).await?)
+}
+
+/// A seed node with S3, a group named `group_name` and a client with that group's credentials.
+pub(crate) async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client)> {
+    let seed = spawn_complete_seed().await?;
+    let admin_token = create_bearer_token(
+        seed.context.as_ref(),
+        seed.user_id,
+        seed.realm_id,
+        seed.capabilities.clone(),
+    )
+    .await?;
+    let group = create_group_http(&seed.base_url, &admin_token, group_name).await?;
+    let credentials = create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
+    let endpoint = seed
+        .s3
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
+    let client = s3_client(endpoint, &credentials);
+    Ok((seed, client))
 }

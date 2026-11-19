@@ -13,11 +13,8 @@ use aruna_core::keyspaces::{
     STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{BackendLocation, BlobCleanupWork, BlobLocationKey};
-use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::format::{EncodingClass, StoredFormat};
-use aruna_core::structs::storage::group_backend::{
-    GroupBackendKind, GroupStorage, GroupStorageSecret,
-};
+use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_core::types::Key;
 use tempfile::tempdir;
@@ -246,16 +243,5 @@ async fn holding_backend_survives() {
 }
 
 fn record(backend_id: Ulid, disabled: bool) -> GroupStorage {
-    GroupStorage {
-        backend_id,
-        group_id: Ulid::from_bytes([1u8; 16]),
-        name: "tenant".to_string(),
-        kind: GroupBackendKind::S3,
-        public_config: HashMap::new(),
-        created_at: SystemTime::UNIX_EPOCH,
-        updated_at: SystemTime::UNIX_EPOCH,
-        created_by: Default::default(),
-        disabled,
-        cleanup: CleanupStrategy::Retain,
-    }
+    aruna_operations::testing::group_storage(backend_id, disabled)
 }

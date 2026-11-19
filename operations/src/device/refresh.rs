@@ -15,7 +15,6 @@ use aruna_core::placement::read_holder_sets;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::time::unix_timestamp_millis;
 use rand::seq::SliceRandom;
 use tracing::debug;
 use ulid::Ulid;
@@ -111,6 +110,7 @@ struct PlannedRefreshOperation {
     budget: Duration,
     step: PlannedStep,
     refusal: Option<SyncRefusal>,
+    now_ms: u64,
 }
 
 type Refreshing = Result<Next<RefreshOutcome>, IoError>;
@@ -119,6 +119,7 @@ impl PlannedRefreshOperation {
     fn new(plan: RefreshPlan, replica: ReplicaRecord) -> Self {
         let holders = holders_for(&plan, replica.document_id).into();
         Self {
+            now_ms: 0,
             plan,
             replica,
             holders,
@@ -156,7 +157,7 @@ impl PlannedRefreshOperation {
 
     fn install(&mut self, state: GraphState) -> Refreshing {
         let replica = self.replica.clone();
-        let install = InstallGraphOperation::new(replica, state, unix_timestamp_millis());
+        let install = InstallGraphOperation::new(replica, state, self.now_ms);
         self.step = PlannedStep::Install;
         Ok(Next::Call(IoCall::child(install)))
     }
@@ -201,6 +202,10 @@ impl PlannedRefreshOperation {
 impl Operation for PlannedRefreshOperation {
     type Output = RefreshOutcome;
     type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Refreshing {
         self.ask_next()

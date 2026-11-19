@@ -11,6 +11,7 @@ use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{FEDERATION_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -25,7 +26,6 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Key, KeySpace};
 use aruna_core::user::validation::{
     UserAttributeError, counted_attributes, is_reserved_attribute, validate_attribute_count,
@@ -336,6 +336,8 @@ pub(crate) struct UserWrite {
     written: Option<UserWritten>,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl UserWrite {
@@ -350,7 +352,9 @@ impl UserWrite {
             deactivating: false,
             written: None,
             deletes: Vec::new(),
-            marks: DueMarks::new(None, current_timestamp_ms()),
+            marks: DueMarks::new(None, 0),
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -462,7 +466,8 @@ impl UserWrite {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(admin_target));
-        let mut admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
+        let mut admin_events =
+            apply_reducer_updates(&mut reducer_state, &self.input, &mut self.ids, self.now_ms)?;
         let subject_claims = match self.input.subject.as_ref() {
             Some(_) if !self.input.system => return Err(UpdateUserError::Unauthorized),
             Some(subject) => {
@@ -493,6 +498,7 @@ impl UserWrite {
                 AdminDocumentOperation::SubjectIdAdded {
                     subject_id: subject.clone(),
                 },
+                self.ids.mint(self.now_ms),
             )?);
         }
         let previous_document_revision = revision_value
@@ -514,10 +520,13 @@ impl UserWrite {
             self.fence.add(realm_id, config, [placement]);
         }
         let generation = self.fence.generation(&realm_id, &placement);
+        let event_id = self.ids.mint(self.now_ms);
         let document_revision = local_sync_change(
             previous_document_revision.as_ref(),
             &self.input.actor,
             placement,
+            self.now_ms,
+            event_id,
         );
 
         let bytes = user.reconcile_bytes(Some(&current), &self.input.actor)?;
@@ -609,6 +618,15 @@ impl Operation for UserWrite {
     type Output = UserWritten;
     type Error = UpdateUserError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.marks.stamp(now_ms);
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -664,8 +682,9 @@ pub(crate) fn local_sync_change(
     previous_change: Option<&DocumentChange>,
     actor: &Actor,
     placement: PlacementRef,
+    updated_at_ms: u64,
+    event_id: Ulid,
 ) -> DocumentChange {
-    let updated_at_ms = current_timestamp_ms();
     let minimum_generation = previous_change
         .map(|change| change.current.generation.saturating_add(1))
         .unwrap_or_default();
@@ -673,7 +692,7 @@ pub(crate) fn local_sync_change(
         base: previous_change.map(|change| change.current),
         current: DocumentSyncRevision {
             generation: updated_at_ms.max(minimum_generation),
-            event_id: Ulid::generate(),
+            event_id,
             actor: actor.node_id,
             updated_at_ms,
         },
@@ -685,10 +704,12 @@ pub(crate) fn local_sync_change(
 fn apply_reducer_updates(
     state: &mut AdminDocumentState,
     input: &UpdateUserInput,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut events = Vec::new();
     for operation in admin_document_operations(input) {
-        events.push(state.apply_operation(&input.actor, operation)?);
+        events.push(state.apply_operation(&input.actor, operation, ids.mint(now_ms))?);
     }
 
     Ok(events)
@@ -883,7 +904,7 @@ mod pure_tests {
     use aruna_core::errors::AuthorizationError;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::operation::{Operation, TransactionMode};
-    use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
+    use aruna_core::reducer::{AdminConflict, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key, sync_revision_key};
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::realm::RealmId;
@@ -909,12 +930,7 @@ mod pure_tests {
     }
 
     fn auth_context(realm_id: RealmId, user_id: UserId) -> AuthContext {
-        AuthContext {
-            user_id,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(user_id, realm_id)
     }
 
     fn input(realm_id: RealmId, caller_id: UserId, user_id: UserId) -> UpdateUserInput {
@@ -970,19 +986,7 @@ mod pure_tests {
     }
 
     fn conflict(path: &str, first_seed: u8, second_seed: u8) -> AdminConflict {
-        AdminConflict {
-            path: path.to_string(),
-            values: vec![
-                AdminConflictValue {
-                    value: Some(format!("value-{first_seed}")),
-                    dot: dot(first_seed),
-                },
-                AdminConflictValue {
-                    value: Some(format!("value-{second_seed}")),
-                    dot: dot(second_seed),
-                },
-            ],
-        }
+        aruna_core::testing::admin_conflict(path, first_seed, second_seed)
     }
 
     fn conflict_state(user_id: UserId) -> AdminDocumentState {
@@ -1091,7 +1095,9 @@ mod pure_tests {
             let config = AdminDocumentTarget::RealmConfig { realm_id };
             let mut state = AdminDocumentState::new(config);
             let pin = AdminDocumentOperation::MergeCoordinatorSet { node_id };
-            state.apply_operation(&local, pin).unwrap();
+            state
+                .apply_operation(&local, pin, ulid::Ulid::generate())
+                .unwrap();
             reducer_state_entry(&state).unwrap().2
         };
         for (coordinator, refused) in [(other, true), (local.node_id, false)] {
@@ -1228,8 +1234,14 @@ mod pure_tests {
             placement: PlacementRef::NIL,
         };
         let previous = Some(postcard::to_allocvec(&previous_revision).unwrap().into());
-        let (_, turn) = read_user(request, &stored_user(user_id), vec![None, previous, None]);
-        let writes = writes(turn);
+        // The run's stamp is the revision's time and, above the previous one, its generation.
+        let mut operation = write(request);
+        operation.stamp(5_000);
+        operation.first().unwrap();
+        let owner = actor(realm_id, user_id);
+        let stored = stored_user(user_id).to_bytes(&owner).unwrap().into();
+        let rows = vec![Some(stored), None, previous, None];
+        let writes = writes(operation.next(IoResult::Values(rows)));
         let updated = User::from_bytes(row(&writes, USER_KEYSPACE)).unwrap();
         assert_eq!(updated.name, "Alice Updated");
 
@@ -1247,7 +1259,8 @@ mod pure_tests {
         assert_eq!(revision.base, Some(previous_revision.current));
         assert_eq!(revision.current.actor, expected_actor.node_id);
         assert!(revision.current.generation > previous_revision.current.generation);
-        assert!(revision.current.updated_at_ms > 0);
+        assert_eq!(revision.current.generation, 5_000);
+        assert_eq!(revision.current.updated_at_ms, 5_000);
         assert_eq!(revision.kind, DocumentChangeKind::Upsert);
     }
 
@@ -1258,8 +1271,12 @@ mod pure_tests {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let original = stored_user(user_id);
-        let mut record =
-            AdminAuditRecord::new(AdminAuditAction::AccountDeactivated, user_id, user_id);
+        let mut record = AdminAuditRecord::new(
+            Ulid::from_parts(1, 1),
+            AdminAuditAction::AccountDeactivated,
+            user_id,
+            user_id,
+        );
         record.group_id = Some(Ulid::from_bytes([4u8; 16]));
         let mut operation = write(input(realm_id, user_id, user_id));
         operation.audit = Some(record.clone());

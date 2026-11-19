@@ -8,6 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{BOOTSTRAP_KEYSPACE, INVENTORY_KEYSPACE, REPLICATION_JOB_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::AuthContext;
@@ -94,6 +95,7 @@ type Step = Result<Next<PageProgress>, BootstrapError>;
 #[derive(Debug, PartialEq)]
 pub struct BootstrapPage {
     config: PageConfig,
+    ids: IdMint,
     state: PageState,
     cursor: BootstrapCursor,
     /// The cursor row as read, which the store checks before it writes.
@@ -106,6 +108,7 @@ impl BootstrapPage {
         let cursor = BootstrapCursor::start(config.intent, config.now_ms);
         Self {
             config,
+            ids: IdMint::default(),
             state: PageState::ReadCursor,
             cursor,
             seen: None,
@@ -208,7 +211,7 @@ impl BootstrapPage {
         self.write(writes)
     }
 
-    fn job(&self, key: String, version_id: Ulid, marker: bool) -> BlobJobRecord {
+    fn job(&mut self, key: String, version_id: Ulid, marker: bool) -> BlobJobRecord {
         let config = &self.config;
         let input = ReplicateScopeInput {
             bucket: config.bucket.clone(),
@@ -218,7 +221,8 @@ impl BootstrapPage {
             replicate_delete_markers: true,
             mode: ReplicationMode::Live,
         };
-        BlobJobRecord::new(input, Some(marker), config.now_ms).with_member(MemberTarget {
+        let job_id = self.ids.mint(config.now_ms);
+        BlobJobRecord::new(input, Some(marker), config.now_ms, job_id).with_member(MemberTarget {
             set_id: config.set_id,
             member_id: config.member_id,
         })
@@ -254,6 +258,10 @@ impl BootstrapPage {
 impl Operation for BootstrapPage {
     type Output = PageProgress;
     type Error = BootstrapError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Step {
         let read = IoCall::Read(vec![(BOOTSTRAP_KEYSPACE.to_string(), self.key().into())]);

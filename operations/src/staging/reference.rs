@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::VecDeque;
 use std::time::SystemTime;
 
@@ -265,6 +266,8 @@ type WriteNext = Result<Next<(Ulid, bool)>, MaterializeReferenceError>;
 /// anything changed: the same binding with the same observation at the head is kept.
 #[derive(Debug, PartialEq)]
 pub struct WriteReferenceOperation {
+    now_ms: u64,
+    ids: IdMint,
     write: ReferenceWrite,
     now: SystemTime,
     fresh: Ulid,
@@ -283,6 +286,8 @@ impl WriteReferenceOperation {
     /// `now` stamps the version and `fresh` names it unless the bucket's set hints another id.
     pub fn new(write: ReferenceWrite, now: SystemTime, fresh: Ulid) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             write,
             now,
             fresh,
@@ -517,7 +522,7 @@ impl WriteReferenceOperation {
         }
         match self.usage.as_mut() {
             Some(usage) => {
-                let call = usage.start_calls().into_call();
+                let call = usage.start_calls(self.ids.mint(self.now_ms)).into_call();
                 self.call(WriteState::Usage, call)
             }
             None => self.finish((self.version_id, true)),
@@ -655,6 +660,14 @@ impl Operation for WriteReferenceOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 
@@ -905,19 +918,7 @@ mod tests {
         key_space: &str,
         key: Vec<u8>,
     ) -> Option<aruna_core::types::Value> {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                txn_id: None,
-            })
-            .await
-        else {
-            panic!("unexpected storage read result");
-        };
-
-        value
+        crate::testing::read_value(&context.storage_handle, key_space, key).await
     }
 
     async fn read_usage_counters(context: &DriverContext, key: Vec<u8>) -> UsageCounters {

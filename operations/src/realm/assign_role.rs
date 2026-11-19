@@ -9,12 +9,13 @@ use aruna_core::admin_documents::{
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
+use aruna_core::id_mint::IdMint;
+use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::done;
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
@@ -215,6 +216,8 @@ struct RoleWrite {
     written: Option<AssignedRoles>,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl RoleWrite {
@@ -225,7 +228,9 @@ impl RoleWrite {
             narrowed: false,
             written: None,
             deletes: Vec::new(),
-            marks: DueMarks::new(None, aruna_core::time::unix_timestamp_millis()),
+            marks: DueMarks::new(None, 0),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -264,7 +269,13 @@ impl RoleWrite {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input, &role_ids)?;
+        let admin_events = apply_reducer_updates(
+            &mut reducer_state,
+            &self.input,
+            &role_ids,
+            &mut self.ids,
+            self.now_ms,
+        )?;
 
         let roles_before = auth_doc.roles.clone();
         let materialized_assignments = reducer_state.materialized_realm_assignments();
@@ -337,22 +348,23 @@ impl Operation for RoleWrite {
     type Output = AssignedRoles;
     type Error = AssignRolesError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.marks.stamp(now_ms);
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<AssignedRoles>, AssignRolesError> {
-        let target = AdminDocumentTarget::Realm {
-            realm_id: self.input.realm_id,
-        };
-        let auth_key = (*self.input.realm_id.as_bytes()).into();
-        Ok(Next::Call(IoCall::Read(vec![
-            (AUTH_KEYSPACE.to_string(), auth_key),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        Ok(Next::Call(crate::realm::authorization_reads(
+            self.input.realm_id,
+        )))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<AssignedRoles>, AssignRolesError> {
@@ -391,6 +403,8 @@ fn apply_reducer_updates(
     state: &mut AdminDocumentState,
     input: &AssignRolesInput,
     role_ids: &[RoleId],
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut admin_events = Vec::new();
     for role_id in role_ids {
@@ -398,6 +412,7 @@ fn apply_reducer_updates(
             let event = state.apply_operation(
                 &input.actor,
                 AdminDocumentOperation::RealmRoleAdded { role_id: *role_id },
+                ids.mint(now_ms),
             )?;
             admin_events.push(event);
         }
@@ -407,6 +422,7 @@ fn apply_reducer_updates(
                 role_id: *role_id,
                 user_id: input.user_id,
             },
+            ids.mint(now_ms),
         )?;
         admin_events.push(event);
     }
@@ -440,9 +456,7 @@ pub mod test {
         AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::reducer::{
-        AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
-    };
+    use aruna_core::reducer::{AdminAttributeVersion, AdminConflict, AdminDocumentState};
     use aruna_core::storage_entries::reducer_conflict_key;
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
@@ -476,19 +490,8 @@ pub mod test {
         add_seed: u8,
         remove_seed: u8,
     ) -> AdminConflict {
-        AdminConflict {
-            path: assignment_path(role_id, user_id),
-            values: vec![
-                AdminConflictValue {
-                    value: Some(user_id.to_string()),
-                    dot: dot(add_seed),
-                },
-                AdminConflictValue {
-                    value: None,
-                    dot: dot(remove_seed),
-                },
-            ],
-        }
+        let path = assignment_path(role_id, user_id);
+        crate::tests::groups::assignment_conflict(path, user_id, add_seed, remove_seed)
     }
 
     fn conflicted_reducer_state(

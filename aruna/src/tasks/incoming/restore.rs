@@ -581,7 +581,7 @@ impl OperationsTaskHandler {
 impl OperationsTaskHandler {
     pub(super) async fn drain_projection_queue(&self) {
         let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
-        let drain = DrainProjectionOperation::new(local_node, max_clock_skew());
+        let drain = DrainProjectionOperation::new(local_node);
         match drive(drain, &self.context).await {
             Ok(result) if result.has_more => {
                 self.reschedule_timer(TaskKey::DrainProjectionQueue, std::time::Duration::ZERO)
@@ -604,12 +604,21 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_replication_queue(&self) {
+        // A failed drain leaves the cursors where they were.
+        let cursors = (self.catch_up.lock())
+            .map(|cursors| cursors.clone())
+            .unwrap_or_default();
         let drain = ProcessBatchOperation::new(
             MetadataPages,
             node_routing(&self.context),
             self.context.node_and_realm(),
-        );
-        match drive(drain, &self.context).await {
+        )
+        .with_catch_up(cursors);
+        let drained = drive(drain, &self.context).await;
+        if let (Ok(result), Ok(mut cursors)) = (drained.as_ref(), self.catch_up.lock()) {
+            *cursors = result.catch_up.clone();
+        }
+        match drained {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainReplicationQueue, Duration::ZERO)
                     .await;

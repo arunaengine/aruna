@@ -1430,6 +1430,7 @@ async fn caps_flooding_origin() {
                     token_owner: flooder.user_id,
                 },
                 &mut index,
+                ulid::Ulid::generate(),
             )
             .expect("seeded revocation applies");
     }
@@ -1944,6 +1945,7 @@ async fn join_authority_replication() {
             AdminDocumentOperation::GroupJoinRequested {
                 request: request.clone(),
             },
+            ulid::Ulid::generate(),
         )
         .unwrap();
     assert!(matches!(
@@ -1992,6 +1994,7 @@ async fn join_authority_replication() {
                     role_ids: BTreeSet::from([role_id]),
                 },
             },
+            ulid::Ulid::generate(),
         )
         .unwrap();
     let previous = read_reducer_state(&storage, &reducer.target)

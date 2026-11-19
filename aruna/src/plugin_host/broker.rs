@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
 use aruna_core::outbound::{ConnectionAnswer, ConnectionError};
 use aruna_core::plugin_installs::PluginInstall;
@@ -13,7 +14,6 @@ use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::job::UploadForm;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::metadata::api::export_types::RoCrateExportView;
@@ -545,7 +545,7 @@ impl Broker for RunBroker {
             ordinal: task.intent.ordinal,
         };
         let fresh = self.ctx.fresh_heartbeats();
-        let node = ingress_node(self.ctx.node_and_realm(), fresh)
+        let node = ingress_node(self.ctx.node_and_realm(), fresh, unix_timestamp_millis())
             .ok_or_else(|| unavailable("this node serves no network"))?;
         let call = NativeCall::task(&self.scope, call_intent(&task.intent), request, node);
         let started = drive(call, &self.ctx).await;

@@ -16,7 +16,7 @@ use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use super::state::{
     ControlRecord, LaunchRecord, PayloadRecord, ProcessRecord, StatusRecord, read_json, write_json,
 };
-use aruna_core::time::unix_timestamp_millis;
+use aruna_clock::unix_timestamp_millis;
 
 const LOG_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 

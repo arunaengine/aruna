@@ -87,6 +87,7 @@ mod tests {
             "/notes".to_string(),
             false,
             "{}".to_string(),
+            aruna_core::time::unix_timestamp_millis(),
         );
         let (_, key, value) = publish_entry(&entry).unwrap();
         let mut list = ListDraftsOperation::new();
@@ -131,6 +132,7 @@ mod tests {
                 format!("/notes/{index}"),
                 false,
                 "{}".to_string(),
+                aruna_core::time::unix_timestamp_millis(),
             );
             queued.push(entry.draft_id);
             drive(

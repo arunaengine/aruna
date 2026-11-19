@@ -7,8 +7,8 @@ use super::{
     sign_claims, spawn_oidc_provider, spawn_test_node,
 };
 use aruna_api::routes::access::users::GetUserResponse;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::time::unix_timestamp_secs;
 use aruna_wire::users::GetTokenResponse;
 use axum::http::StatusCode;
 use ed25519_dalek::SigningKey;

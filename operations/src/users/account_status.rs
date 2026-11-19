@@ -8,6 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::rows::done;
@@ -96,6 +97,10 @@ pub struct AccountStatusOperation {
     guard: Option<aruna_core::plugin_installs::InstallGuard>,
     /// Marks a deactivation as the plugin install's own, not an administrator's.
     by_install: bool,
+    now_ms: u64,
+    ids: IdMint,
+    /// The id of this run's audit row, minted when the run starts.
+    audit_id: ulid::Ulid,
 }
 
 impl AccountStatusOperation {
@@ -106,6 +111,9 @@ impl AccountStatusOperation {
             owner_group: None,
             guard: None,
             by_install: false,
+            now_ms: 0,
+            ids: IdMint::default(),
+            audit_id: ulid::Ulid::nil(),
         }
     }
 
@@ -249,8 +257,8 @@ impl AccountStatusOperation {
             true => AdminAuditAction::AccountReactivated,
             false => AdminAuditAction::AccountDeactivated,
         };
-        let mut record =
-            AdminAuditRecord::new(action, self.config.actor.user_id, self.config.target);
+        let (actor, target) = (self.config.actor.user_id, self.config.target);
+        let mut record = AdminAuditRecord::new(self.audit_id, action, actor, target);
         record.group_id = self.owner_group;
         record
     }
@@ -296,7 +304,16 @@ impl Operation for AccountStatusOperation {
     type Output = ();
     type Error = AccountStatusError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Turn {
+        self.audit_id = self.ids.mint(self.now_ms);
         // Federated callers never change account status; local admins may cut them off.
         if self.config.auth_context.user_id.realm_id != self.config.actor.realm_id {
             return Err(AccountStatusError::Unauthorized);

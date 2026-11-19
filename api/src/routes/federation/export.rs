@@ -11,12 +11,12 @@ use crate::jobs::job_urls;
 use crate::metadata::{SubmitExportResponse, load_document_record, parse_document_id};
 use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::{RealmDescriptor, Signed};
 use aruna_core::structs::execution::job::{
     ExportRoCrateSpec, ExportSelection, JobId, JobPayload, JobState,
 };
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::time::unix_timestamp_secs;
 use aruna_core::transfer::{
     ExportGrant, GrantError, ImportIntent, TransferError, check_remote, intent_digest,
 };
@@ -447,7 +447,7 @@ pub async fn push_export(
         return Err(transfer_refused(TransferError::Unbound));
     }
     let size = grant.payload.artifact_size;
-    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let now_ms = aruna_clock::unix_timestamp_millis();
     let (_, read) =
         read_artifact_routed(&context, auth.user_id, job_id, now_ms, Some(0..size), None)
             .await
