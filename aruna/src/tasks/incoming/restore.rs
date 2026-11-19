@@ -376,6 +376,10 @@ impl TaskQueues {
         if stopped() {
             return;
         }
+        // Watch events queued before a restart leave once the drain runs.
+        handler
+            .reschedule_timer(TaskKey::DrainWatchEvents, Duration::ZERO)
+            .await;
         if context.blob_handle.is_some() {
             let arm = ArmSweepOperation::new(TaskKey::SweepHiddenBlobs);
             if let Err(error) = drive(arm, &context).await {
