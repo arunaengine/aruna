@@ -27,7 +27,6 @@ use aruna_storage::key_index::RangeIndexes;
 use ulid::Ulid;
 
 use super::contact::PeerContacts;
-use super::materialization_queue::metadata_graph_fence;
 use super::query_cache::MetadataQueryCache;
 use crate::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeyCache, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
@@ -39,6 +38,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::TokenClaims;
 
 mod effects;
+use self::effects::metadata_graph_fence;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
 pub use self::lifecycle::{list_cached_group, list_cached_records, warm_caches};
 pub use self::pull_serve::{accept_pull, pull_status};

@@ -2,18 +2,35 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use aruna_core::events::Event;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults};
 use aruna_core::telemetry::{record_elapsed_ms, record_error};
+use tokio::sync::Semaphore;
 use tracing::{Instrument, Span, debug_span, field};
 
+use super::MetadataHandle;
 use super::lifecycle::{effect_rejects_deleted, list_local_records, metadata_graph_deleted};
 use super::search::list_visible_graphs;
-use super::{MetadataHandle, metadata_graph_fence};
 use crate::driver::DriverContext;
 use crate::metadata::query_cache::{CacheStamp, CachedQuery, QueryCacheKey};
+
+const GRAPH_FENCE_SHARDS: usize = 32;
+
+// Craqle already serializes same-graph writes internally. This bounded fence
+// extends that ordering over the lifecycle read performed by the Aruna handle.
+static METADATA_GRAPH_FENCES: LazyLock<[Semaphore; GRAPH_FENCE_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| Semaphore::new(1)));
+
+pub(crate) fn metadata_graph_fence(graph_iri: &str) -> &'static Semaphore {
+    let hash = blake3::hash(graph_iri.as_bytes());
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&hash.as_bytes()[..8]);
+    let shard = u64::from_be_bytes(prefix) as usize;
+    &METADATA_GRAPH_FENCES[shard % GRAPH_FENCE_SHARDS]
+}
 
 /// Runs one metadata effect on this node's graph store and answers with its event.
 pub async fn send_metadata_effect(context: &DriverContext, effect: MetadataEffect) -> Event {

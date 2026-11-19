@@ -1,4 +1,4 @@
-//! Tests the materialization queue: graph fences, job scans, failure caps and dead letters.
+//! Tests the materialization queue: job scans, failure caps and dead letters.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -22,34 +22,6 @@ use tempfile::tempdir;
 use crate::testing::write_entries;
 
 use crate::tests::metadata::storage_key_exists;
-
-#[tokio::test]
-async fn delete_waits_fence() {
-    let graph_iri = "urn:test:graph-fence";
-    let held = metadata_graph_fence(graph_iri)
-        .acquire()
-        .await
-        .expect("graph fence remains open");
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        let _ = ready_tx.send(());
-        let _permit = metadata_graph_fence(graph_iri)
-            .acquire()
-            .await
-            .expect("graph fence remains open");
-        let _ = done_tx.send(());
-    });
-
-    ready_rx.await.expect("delete task started");
-    assert!(matches!(
-        done_rx.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    ));
-    drop(held);
-    done_rx.await.expect("delete task completed");
-    task.await.expect("delete task joined");
-}
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()

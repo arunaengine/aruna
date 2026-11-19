@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
@@ -35,7 +34,6 @@ use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
@@ -69,20 +67,6 @@ const REQUEUE_PAGE_SIZE: usize = 256;
 // Jobs per finish transaction. Small enough that a failed commit costs little,
 // large enough that a full batch commits in a handful of transactions.
 const MATERIALIZATION_FINISH_CHUNK: usize = 256;
-const GRAPH_FENCE_SHARDS: usize = 32;
-
-// Craqle already serializes same-graph writes internally. This bounded fence
-// extends that ordering over the lifecycle read performed by the Aruna handle.
-static METADATA_GRAPH_FENCES: LazyLock<[Semaphore; GRAPH_FENCE_SHARDS]> =
-    LazyLock::new(|| std::array::from_fn(|_| Semaphore::new(1)));
-
-pub(crate) fn metadata_graph_fence(graph_iri: &str) -> &'static Semaphore {
-    let hash = blake3::hash(graph_iri.as_bytes());
-    let mut prefix = [0u8; 8];
-    prefix.copy_from_slice(&hash.as_bytes()[..8]);
-    let shard = u64::from_be_bytes(prefix) as usize;
-    &METADATA_GRAPH_FENCES[shard % GRAPH_FENCE_SHARDS]
-}
 
 pub const MATERIALIZATION_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const MATERIALIZATION_RETRY_AFTER: Duration = Duration::from_secs(1);
