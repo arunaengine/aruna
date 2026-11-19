@@ -188,11 +188,89 @@ fn change_pages() -> PrefixPages {
 }
 
 #[derive(Debug, PartialEq)]
-enum DrainStep {
-    Changes,
+enum ChangeStep {
+    Page,
     Queued(Vec<Key>),
     Written(Vec<Key>),
     Cleared,
+}
+
+/// Queues the push checks of the documents metadata marked as changed, then deletes the marks.
+/// Changes whose checks cannot be queued stay for the next run.
+#[derive(Debug, PartialEq)]
+pub struct QueueChangesOperation {
+    pages: PrefixPages,
+    step: ChangeStep,
+}
+
+impl QueueChangesOperation {
+    pub fn new() -> Self {
+        Self {
+            pages: change_pages(),
+            step: ChangeStep::Page,
+        }
+    }
+
+    fn clear(&mut self, keys: Vec<Key>) -> Turn<()> {
+        self.step = ChangeStep::Cleared;
+        let rows = keys.into_iter().map(|key| (LINK_CHANGE_KEYSPACE.to_string(), key));
+        Ok(Next::Call(IoCall::Delete(rows.collect())))
+    }
+}
+
+impl Default for QueueChangesOperation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Operation for QueueChangesOperation {
+    type Output = ();
+    type Error = LinkError;
+
+    fn first(&mut self) -> Turn<()> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        match std::mem::replace(&mut self.step, ChangeStep::Page) {
+            ChangeStep::Page => {
+                let rows = self.pages.take(result)?;
+                let keys: Vec<Key> = rows.into_iter().map(|(key, _)| key).collect();
+                if keys.is_empty() {
+                    return Ok(Next::Done(()));
+                }
+                let documents: BTreeSet<Ulid> =
+                    keys.iter().filter_map(|key| link_change_document(key)).collect();
+                self.step = ChangeStep::Queued(keys);
+                child(IoCall::child(QueueRowsOperation::new(documents)))
+            }
+            ChangeStep::Queued(keys) => {
+                let rows = result.child::<Vec<(String, Key, Value)>, LinkError>()??;
+                if rows.is_empty() {
+                    return self.clear(keys);
+                }
+                self.step = ChangeStep::Written(keys);
+                Ok(Next::Call(IoCall::Write(rows)))
+            }
+            ChangeStep::Written(keys) => {
+                result.done()?;
+                self.clear(keys)
+            }
+            ChangeStep::Cleared => {
+                result.done()?;
+                if self.pages.done() {
+                    return Ok(Next::Done(()));
+                }
+                Ok(Next::Call(self.pages.call()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DrainStep {
+    Changes,
     Page,
     Removed,
     Check(Ulid, Value),
@@ -200,11 +278,10 @@ enum DrainStep {
 }
 
 /// Queues the checks of changed documents, runs every due check and returns the wait until the
-/// next one. Changes whose checks cannot be queued stay for the next run.
+/// next one.
 #[derive(Debug, PartialEq)]
 pub struct DrainLinksOperation {
     scope: NodeScope,
-    changes: PrefixPages,
     pages: PrefixPages,
     rows: VecDeque<(Key, Value)>,
     next_due: Option<u64>,
@@ -217,7 +294,6 @@ impl DrainLinksOperation {
     pub fn new(scope: NodeScope) -> Self {
         Self {
             scope,
-            changes: change_pages(),
             pages: queue_pages(),
             rows: VecDeque::new(),
             next_due: None,
@@ -230,12 +306,6 @@ impl DrainLinksOperation {
     fn queue_page(&mut self) -> Turn<Option<Duration>> {
         self.step = DrainStep::Page;
         Ok(Next::Call(self.pages.call()))
-    }
-
-    fn clear(&mut self, keys: Vec<Key>) -> Turn<Option<Duration>> {
-        self.step = DrainStep::Cleared;
-        let rows = keys.into_iter().map(|key| (LINK_CHANGE_KEYSPACE.to_string(), key));
-        Ok(Next::Call(IoCall::Delete(rows.collect())))
     }
 
     fn started(&self) -> u64 {
@@ -281,47 +351,16 @@ impl Operation for DrainLinksOperation {
     }
 
     fn first(&mut self) -> Turn<Option<Duration>> {
-        Ok(Next::Call(self.changes.call()))
+        child(IoCall::child(QueueChangesOperation::new()))
     }
 
     fn next(&mut self, result: IoResult) -> Turn<Option<Duration>> {
         match std::mem::replace(&mut self.step, DrainStep::Page) {
             DrainStep::Changes => {
-                let rows = self.changes.take(result)?;
-                let keys: Vec<Key> = rows.into_iter().map(|(key, _)| key).collect();
-                if keys.is_empty() {
-                    return self.queue_page();
+                if let Err(error) = result.child::<(), LinkError>()? {
+                    warn!(%error, "Failed to queue the link checks of changed documents");
                 }
-                let documents: BTreeSet<Ulid> =
-                    keys.iter().filter_map(|key| link_change_document(key)).collect();
-                self.step = DrainStep::Queued(keys);
-                child(IoCall::child(QueueRowsOperation::new(documents)))
-            }
-            DrainStep::Queued(keys) => {
-                let queued = result.child::<Vec<(String, Key, Value)>, LinkError>()?;
-                match queued {
-                    Ok(rows) if rows.is_empty() => self.clear(keys),
-                    Ok(rows) => {
-                        self.step = DrainStep::Written(keys);
-                        Ok(Next::Call(IoCall::Write(rows)))
-                    }
-                    Err(error) => {
-                        warn!(%error, "Failed to queue the link checks of changed documents");
-                        self.queue_page()
-                    }
-                }
-            }
-            DrainStep::Written(keys) => {
-                result.done()?;
-                self.clear(keys)
-            }
-            DrainStep::Cleared => {
-                result.done()?;
-                if self.changes.done() {
-                    return self.queue_page();
-                }
-                self.step = DrainStep::Changes;
-                Ok(Next::Call(self.changes.call()))
+                self.queue_page()
             }
             DrainStep::Page => {
                 self.rows = self.pages.take(result)?.into();
@@ -1009,77 +1048,6 @@ impl Operation for PushRevisionOperation {
                 Ok(Next::Done(
                     record.map(|record| (record.last_event_id, None)),
                 ))
-            }
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum DeletedStep {
-    Rows,
-    Write,
-    Timer,
-}
-
-/// Queues checks for the links of the deleted document behind `graph_iri`; each check then
-/// removes its link and token.
-#[derive(Debug, PartialEq)]
-pub(crate) struct QueueDeletedOperation {
-    scope: NodeScope,
-    graph_iri: String,
-    step: DeletedStep,
-}
-
-impl QueueDeletedOperation {
-    pub(crate) fn new(scope: NodeScope, graph_iri: String) -> Self {
-        Self {
-            scope,
-            graph_iri,
-            step: DeletedStep::Rows,
-        }
-    }
-}
-
-impl Operation for QueueDeletedOperation {
-    type Output = ();
-    type Error = LinkError;
-
-    fn first(&mut self) -> Turn<()> {
-        let document_id = self
-            .graph_iri
-            .rsplit('/')
-            .next()
-            .and_then(|id| Ulid::from_string(id).ok())
-            .filter(|id| MetadataRegistryRecord::graph_iri_for(*id) == self.graph_iri);
-        match document_id {
-            Some(document_id) => child(IoCall::child(QueueRowsOperation::new([document_id]))),
-            None => Ok(Next::Done(())),
-        }
-    }
-
-    fn next(&mut self, result: IoResult) -> Turn<()> {
-        match self.step {
-            DeletedStep::Rows => {
-                let rows = result.child::<Vec<(String, Key, Value)>, LinkError>()??;
-                if rows.is_empty() {
-                    return Ok(Next::Done(()));
-                }
-                self.step = DeletedStep::Write;
-                Ok(Next::Call(IoCall::Write(rows)))
-            }
-            DeletedStep::Write => {
-                result.done()?;
-                if !self.scope.has_tasks {
-                    return Ok(Next::Done(()));
-                }
-                self.step = DeletedStep::Timer;
-                child(IoCall::child(LinkTimerOperation::new()))
-            }
-            DeletedStep::Timer => {
-                if let Err(error) = result.child::<(), LinkError>()? {
-                    warn!(%error, "Failed to arm the repository link queue");
-                }
-                Ok(Next::Done(()))
             }
         }
     }

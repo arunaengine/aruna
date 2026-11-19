@@ -102,14 +102,14 @@ fn drain() -> DrainLinksOperation {
     let mut operation = DrainLinksOperation::new(local_scope());
     operation.stamp(NOW_MS);
     operation.first().unwrap();
-    operation.next(queue_page(Vec::new())).unwrap();
+    operation.next(child::<(), LinkError>(Ok(()))).unwrap();
     operation
 }
 
-// A changed document gets its checks queued, then its change row goes before the queue is read.
+// A changed document gets its checks queued, then its change row goes.
 #[test]
-fn drain_queues_changes() {
-    let mut operation = DrainLinksOperation::new(local_scope());
+fn changes_queue_checks() {
+    let mut operation = QueueChangesOperation::new();
     assert_eq!(operation.first(), Ok(Next::Call(change_pages().call())));
     let (_, key, value) = link_change_entry(link().document_id, NOW_MS);
     let queue = operation.next(queue_page(vec![(key.clone(), value)]));
@@ -121,18 +121,22 @@ fn drain_queues_changes() {
     let change = (LINK_CHANGE_KEYSPACE.to_string(), key);
     let clear = operation.next(IoResult::Done);
     assert_eq!(clear, Ok(Next::Call(IoCall::Delete(vec![change]))));
-    let page = operation.next(IoResult::Done);
-    assert_eq!(page, Ok(Next::Call(queue_pages().call())));
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
 }
 
 // Changes whose checks cannot be queued stay, and the due checks still run.
 #[test]
 fn failed_changes_stay() {
-    let mut operation = DrainLinksOperation::new(local_scope());
-    operation.first().unwrap();
+    let mut changes = QueueChangesOperation::new();
+    changes.first().unwrap();
     let (_, key, value) = link_change_entry(link().document_id, NOW_MS);
-    operation.next(queue_page(vec![(key, value)])).unwrap();
+    changes.next(queue_page(vec![(key, value)])).unwrap();
     let failed = child::<Vec<(String, Key, Value)>, _>(Err(LinkError::NoRevision));
+    assert_eq!(changes.next(failed), Err(LinkError::NoRevision));
+    let mut operation = DrainLinksOperation::new(local_scope());
+    let queue = IoCall::child(QueueChangesOperation::new());
+    assert_eq!(operation.first(), Ok(Next::Call(queue)));
+    let failed = child::<(), _>(Err(LinkError::NoRevision));
     let page = operation.next(failed);
     assert_eq!(page, Ok(Next::Call(queue_pages().call())));
 }
@@ -501,38 +505,6 @@ fn scaffold_uses_registry() {
     );
     assert_eq!(operation.next(no_record()), Ok(Next::Done(None)));
     assert_eq!(revision_event(None), Err(LinkError::NoRevision));
-}
-
-#[test]
-fn foreign_iri_ignored() {
-    let mut operation = QueueDeletedOperation::new(scope(), "urn:other".into());
-    assert_eq!(operation.first(), Ok(Next::Done(())));
-}
-
-#[test]
-fn deletion_arms_timer() {
-    let document = link().document_id;
-    let iri = MetadataRegistryRecord::graph_iri_for(document);
-    let mut operation = QueueDeletedOperation::new(scope(), iri);
-    assert_eq!(
-        operation.first(),
-        Ok(Next::Call(IoCall::child(QueueRowsOperation::new([
-            document
-        ]))))
-    );
-    let row = queue_row(link().link_id, &entry(1)).unwrap();
-    let write = operation
-        .next(child::<_, LinkError>(Ok(vec![row.clone()])))
-        .unwrap();
-    assert_eq!(write, Next::Call(IoCall::Write(vec![row])));
-    assert_eq!(
-        operation.next(IoResult::Done),
-        Ok(Next::Call(IoCall::child(LinkTimerOperation::new())))
-    );
-    assert_eq!(
-        operation.next(child::<(), LinkError>(Ok(()))),
-        Ok(Next::Done(()))
-    );
 }
 
 #[test]

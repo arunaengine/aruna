@@ -17,9 +17,12 @@ use aruna_core::metadata::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::repository::remote::NodeScope;
-use aruna_core::rows::PrefixPages;
+use aruna_core::repository::{link_change_entry, schedule_drain};
+use aruna_core::rows::{PrefixPages, outside_answer, outside_call};
 use aruna_core::storage_entries::graph_prune_entry;
 use aruna_core::structs::storage::data::link::document_key;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::task::TaskEvent;
 use aruna_core::types::{Key, KeySpace};
 use byteview::ByteView;
 use thiserror::Error;
@@ -27,8 +30,6 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::prune_jobs::{DuePrune, DuePruneOperation, RescheduleOperation};
-use crate::jobs::repository::link_queue::QueueDeletedOperation;
-use crate::jobs::repository::links::LinkError;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::repository::schedule_prune_drain;
@@ -465,6 +466,7 @@ enum BatchStage {
     Lifecycle,
     Prune,
     Links,
+    Armed,
     Reschedule,
     Finish,
 }
@@ -555,6 +557,21 @@ impl PruneBatchOperation {
         self.next_group()
     }
 
+    /// Queues a change for the deleted document behind the graph, so the link drain queues the
+    /// checks that remove its links and tokens.
+    fn links(&mut self) -> BatchTurn {
+        let graph_iri = self.graph_iri();
+        let document_id = (graph_iri.rsplit('/').next())
+            .and_then(|id| Ulid::from_string(id).ok())
+            .filter(|id| MetadataRegistryRecord::graph_iri_for(*id) == graph_iri);
+        let Some(document_id) = document_id else {
+            return self.complete();
+        };
+        self.stage = BatchStage::Links;
+        let change = link_change_entry(document_id, self.now_ms);
+        Ok(Next::Call(outside_call(IoCall::Write(vec![change]))))
+    }
+
     fn reschedule(&mut self, error: String) -> BatchTurn {
         let Some((graph_iri, jobs)) = self.current.as_ref() else {
             return self.next_group();
@@ -635,26 +652,34 @@ impl Operation for PruneBatchOperation {
                 ))))
             }
             BatchStage::Prune => match result.child::<bool, MetadataError>()? {
-                Ok(_) => {
-                    // A retry after a failed link queueing finds the graph already pruned, so it
-                    // queues again.
-                    self.stage = BatchStage::Links;
-                    Ok(Next::Call(IoCall::child(QueueDeletedOperation::new(
-                        self.scope.clone(),
-                        self.graph_iri(),
-                    ))))
-                }
+                // A retry after a failed link queueing finds the graph already pruned, so it
+                // queues again.
+                Ok(_) => self.links(),
                 Err(MetadataError::HandleMissing) => {
                     self.reschedule("metadata handle missing".to_string())
                 }
                 Err(error) => self.reschedule(error.to_string()),
             },
-            BatchStage::Links => match result.child::<(), LinkError>()? {
+            BatchStage::Links => match outside_answer(result).and_then(IoResult::done) {
+                Ok(()) if self.scope.has_tasks => {
+                    self.stage = BatchStage::Armed;
+                    Ok(Next::Call(IoCall::from(schedule_drain(Duration::ZERO))))
+                }
                 Ok(()) => self.complete(),
                 Err(error) => {
                     self.reschedule(format!("queueing the repository links failed: {error}"))
                 }
             },
+            BatchStage::Armed => {
+                match result.event() {
+                    Ok(Event::Task(TaskEvent::Error { message, .. })) => {
+                        warn!(%message, "Failed to arm the repository link queue")
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "Failed to arm the repository link queue"),
+                }
+                self.complete()
+            }
             BatchStage::Reschedule => {
                 result.child::<(), IoError>()??;
                 self.next_group()
@@ -734,7 +759,6 @@ mod tests {
     use aruna_core::storage_entries::{graph_lifecycle_entry, registry_write_entries};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::FjallStorage;
     use aruna_storage::StorageHandle;
@@ -814,6 +838,46 @@ mod tests {
 
     fn storage_context(storage: &StorageHandle) -> DriverContext {
         aruna_drivers::testing::test_context(storage.clone())
+    }
+
+    fn pruned_batch(graph_iri: String) -> PruneBatchOperation {
+        let mut batch = PruneBatchOperation::new(NodeScope {
+            node: None,
+            credential_key: None,
+            has_blob: false,
+            has_tasks: true,
+        });
+        let job = GraphPruneRecord::new(graph_iri.clone(), 5);
+        batch.current = Some((graph_iri, vec![(vec![1], job)]));
+        batch.now_ms = 5;
+        batch.stage = BatchStage::Prune;
+        batch
+    }
+
+    fn pruned() -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(Ok::<_, MetadataError>(true)))
+    }
+
+    // A pruned dataset queues a change for its links, then arms the link drain.
+    #[test]
+    fn deletion_queues_links() {
+        let document_id = Ulid::from_parts(9, 9);
+        let mut batch = pruned_batch(MetadataRegistryRecord::graph_iri_for(document_id));
+        let change = link_change_entry(document_id, 5);
+        let write = outside_call(IoCall::Write(vec![change]));
+        assert_eq!(batch.next(pruned()), Ok(Next::Call(write)));
+        let written = Ok::<_, IoError>(IoResult::Done);
+        let written = IoResult::Child(aruna_core::calls::ChildOutcome::new(written));
+        let drain = IoCall::from(schedule_drain(Duration::ZERO));
+        assert_eq!(batch.next(written), Ok(Next::Call(drain)));
+    }
+
+    // A graph that names no dataset queues no change.
+    #[test]
+    fn foreign_graph_ignored() {
+        let mut batch = pruned_batch("urn:other".to_string());
+        let job = (PRUNE_JOB_KEYSPACE.to_string(), ByteView::from(vec![1]));
+        assert_eq!(batch.next(pruned()), Ok(Next::Call(IoCall::Delete(vec![job]))));
     }
 
     #[tokio::test]

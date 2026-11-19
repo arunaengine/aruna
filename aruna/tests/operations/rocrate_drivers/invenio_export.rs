@@ -19,6 +19,7 @@ async fn export_spec(
     ));
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     let mut destination = RepositoryDestination {
         group_id: fixture.group_id,
         connector_id: connector(fixture, server).await,

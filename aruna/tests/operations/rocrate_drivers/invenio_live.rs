@@ -34,6 +34,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
     require_import(run_rocrate_import(&ctx, &imported).await)?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     let title = format!("Aruna acceptance {}", Ulid::generate());
     let mut destination = RepositoryDestination {
         group_id: fixture.group_id,
@@ -679,6 +680,7 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
         assert!(count > 0, "{mode:?} imported nothing");
         replay_event_log(fixture.context.as_ref()).await?;
         process_materialization_batch(fixture.context.as_ref()).await?;
+        super::driven::queue_changes(&fixture.context).await?;
         let crate_json = aruna_drivers::driver::drive(
             aruna_operations::metadata::revision_read::RawViewOperation::revision(document),
             &fixture.context,
@@ -801,6 +803,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     require_import(outcome)?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     let (link, _) = list_links(&fixture.context, doc_id(2))
         .await?
         .pop()
@@ -849,6 +852,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     require_import(Box::pin(run_rocrate_import(&ctx, &update)).await)?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
 
     let (pulled, _) = list_links(&fixture.context, doc_id(2)).await?.remove(0);
     assert_eq!(pulled.active_job, None);

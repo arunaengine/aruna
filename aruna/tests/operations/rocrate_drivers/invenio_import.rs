@@ -535,6 +535,7 @@ async fn start_update(
     super::link::succeeded(Box::pin(run_rocrate_import(&ctx, &spec)).await);
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     let links = list_links(&fixture.context, doc_id(1)).await?;
     let [(link, true)] = links.as_slice() else {
         panic!("the import keeps one pull link with its next check queued: {links:?}");
@@ -580,6 +581,7 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
     super::link::succeeded(Box::pin(run_rocrate_import(&ctx, &update)).await);
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
 
     let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
         .await?
@@ -653,6 +655,7 @@ async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
     add_note(&fixture, "earlier-edit").await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     {
@@ -678,6 +681,7 @@ async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
     );
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
 
     let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
         .await?
