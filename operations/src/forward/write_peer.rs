@@ -9,7 +9,7 @@ use aruna_core::events::{Event, NetEvent, PeerAuthRefusal};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{event, value};
+use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
@@ -231,7 +231,7 @@ impl Operation for WritePeerOperation {
                 }
             }
             PeerStage::Config { auth, trust } => {
-                let config = value(result)?;
+                let config = result.value()?;
                 peer_configured(config.as_deref(), (self.peer, auth.realm_id), trust)
                     .map_err(unavailable)?;
                 self.accepted(auth)
