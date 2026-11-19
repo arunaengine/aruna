@@ -18,7 +18,9 @@ use aruna_core::compute::Secret;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::jobs::ProgressReporter;
-use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, USER_KEYSPACE};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, USER_KEYSPACE,
+};
 use aruna_core::plugin_installs::{PluginInstall, SecretBinding};
 use aruna_core::plugin_runs::{PluginRun, RunState, RunTrigger, SourceEvent, SourceKind};
 use aruna_core::plugins::PublishedPlugin;

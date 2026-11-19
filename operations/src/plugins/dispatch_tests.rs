@@ -59,7 +59,9 @@ async fn manual_runs() {
     let auth = fixture.auth();
     let elsewhere = start_run(ctx, &auth, realm, other, install.install_id, "{}", 5).await;
     assert!(matches!(elsewhere, Err(StartError::Elsewhere(node)) if node == local));
-    let plain = install_as(&fixture, &install_request(&fixture, None)).await.unwrap();
+    let plain = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let none = start_run(ctx, &auth, realm, local, plain.install_id, "{}", 5).await;
     assert!(matches!(none, Err(StartError::NoTrigger("manual"))));
 }

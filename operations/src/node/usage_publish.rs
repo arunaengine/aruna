@@ -468,7 +468,9 @@ impl Operation for PublishUsageOperation {
                 Ok(Next::Call(IoCall::Write(writes)))
             }
             PublishStep::Write => {
-                result.done().map_err(|error| failed(format!("snapshot write failed: {error}")))?;
+                result
+                    .done()
+                    .map_err(|error| failed(format!("snapshot write failed: {error}")))?;
                 self.replicate()
             }
             PublishStep::Replicate => match result.child::<(), ReplicateDocumentsError>()? {

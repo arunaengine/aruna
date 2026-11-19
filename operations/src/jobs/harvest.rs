@@ -811,7 +811,8 @@ fn stored_record(result: IoResult) -> Result<Option<MetadataRegistryRecord>, Har
 }
 
 fn confirm_absent(result: IoResult, document_id: Ulid) -> Result<(), HarvestFailure> {
-    let (rows, _) = result.page()
+    let (rows, _) = result
+        .page()
         .map_err(|error| retryable(format!("harvest pending projection scan: {error}")))?;
     if rows.is_empty() {
         return Ok(());

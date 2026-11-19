@@ -31,7 +31,9 @@ fn no_write() -> BTreeMap<String, Vec<String>> {
 async fn later_changes() {
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let installed = install_as(&fixture, &install_request(&fixture, None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let id = installed.install_id;
     let meta = format!("/{}/g/{}/meta", actor.realm_id, fixture.group_id);
     let choices = BTreeMap::from([("write".to_string(), vec![format!("{meta}/runs/**")])]);
@@ -186,7 +188,9 @@ async fn recovers_changes() {
     // role wider than its grants; the next change finishes it.
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let installed = install_as(&fixture, &install_request(&fixture, None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let id = installed.install_id;
     let group = format!("/{}/g/{}", actor.realm_id, fixture.group_id);
     let choices = no_write();
@@ -225,7 +229,9 @@ async fn stale_node_changes() {
     // Node A stalls in a grant change while node B finishes another one; A's late role write and
     // cleanup must not break B's newer active install, on either node.
     let fixture = Fixture::new().await;
-    let installed = install_as(&fixture, &install_request(&fixture, None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let id = installed.install_id;
     let (a, b) = fixture.split().await;
     let a_auth = a.auth();
@@ -288,7 +294,9 @@ async fn stale_node_changes() {
 async fn keeps_admin_deactivation() {
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let installed = install_as(&fixture, &install_request(&fixture, None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let (node, realm) = (actor.node_id, actor.realm_id);
     let change = AccountChange::of((actor, &auth), &installed, 1);
 
@@ -314,7 +322,9 @@ async fn keeps_admin_deactivation() {
 async fn repairs_after_failure() {
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let installed = install_as(&fixture, &install_request(&fixture, None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let (node, realm) = (actor.node_id, actor.realm_id);
     let change = AccountChange::of((actor, &auth), &installed, 1);
     drive(Teardown::new(change), ctx).await.unwrap();

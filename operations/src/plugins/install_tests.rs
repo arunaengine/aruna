@@ -95,7 +95,9 @@ async fn resumes_after_steps() {
             assert!(group_role(&fixture, &record).await.is_none());
         }
         assert_eq!(fixture.installs().await[0].state, InstallState::Preparing);
-        let installed = install_as(&fixture, &install_request(&fixture, Some(id))).await.unwrap();
+        let installed = install_as(&fixture, &install_request(&fixture, Some(id)))
+            .await
+            .unwrap();
         assert_eq!(
             installed.state,
             InstallState::Active,
@@ -163,8 +165,11 @@ async fn refuses_held_accounts() {
     let fixture = Fixture::new().await;
     let record = prepared_only(&fixture, Ulid::from_parts(9, 1)).await;
     fixture.realm_roles(&[record.account]).await;
-    let held = install_as(&fixture, &install_request(&fixture, Some(record.install_id)))
-        .await;
+    let held = install_as(
+        &fixture,
+        &install_request(&fixture, Some(record.install_id)),
+    )
+    .await;
     assert!(
         matches!(
             held,
@@ -199,8 +204,11 @@ async fn refuses_held_accounts() {
         },
     });
     drive(extra, &fixture.ctx).await.unwrap();
-    let held = install_as(&fixture, &install_request(&fixture, Some(record.install_id)))
-        .await;
+    let held = install_as(
+        &fixture,
+        &install_request(&fixture, Some(record.install_id)),
+    )
+    .await;
     assert!(
         matches!(
             held,
@@ -342,7 +350,9 @@ async fn failed_activation() {
     let id = Ulid::from_parts(9, 4);
     let (probe, seen, _) = counted().await;
     let start = seen.load(Ordering::SeqCst);
-    install_as(&probe, &install_request(&probe, Some(id))).await.unwrap();
+    install_as(&probe, &install_request(&probe, Some(id)))
+        .await
+        .unwrap();
     let commits = seen.load(Ordering::SeqCst) - start;
 
     let (fixture, seen, fail_at) = counted().await;
@@ -385,7 +395,9 @@ async fn keeps_receiver() {
     use crate::plugins::receiver::{eligible, pick_receiver};
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let installed = install_as(&fixture, &install_request(&fixture, None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     assert_eq!(installed.receiver, actor.node_id);
     let mut moved = installed.clone();
     moved.receiver = iroh::SecretKey::from_bytes(&[9u8; 32]).public();

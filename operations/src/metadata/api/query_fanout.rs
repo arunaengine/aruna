@@ -56,7 +56,10 @@ fn merge_call(job: MergeJob, budget: Duration) -> IoCall {
 
 /// The merged rows or tie count of a [`merge_call`].
 fn merged(result: IoResult) -> Result<MergeOutput, MergeError> {
-    match result.event().map_err(|error| MergeError::Failed(error.to_string()))? {
+    match result
+        .event()
+        .map_err(|error| MergeError::Failed(error.to_string()))?
+    {
         Event::Metadata(MetadataEvent::RowsMerged { result }) => result,
         Event::Metadata(MetadataEvent::Error { error, .. }) => {
             Err(MergeError::Failed(error.to_string()))

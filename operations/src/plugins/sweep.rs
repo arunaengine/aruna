@@ -258,7 +258,9 @@ mod tests {
     async fn unnamed_accounts() {
         let fixture = Fixture::new().await;
         let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-        let installed = install_as(&fixture, &install_request(&fixture, None)).await.unwrap();
+        let installed = install_as(&fixture, &install_request(&fixture, None))
+            .await
+            .unwrap();
         let config = read_config(ctx, actor.realm_id).await.unwrap();
         let now = 1_000;
         assert_eq!(
