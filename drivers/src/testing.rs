@@ -120,7 +120,9 @@ pub fn task_context(storage: StorageHandle) -> std::sync::Arc<DriverContext> {
 
 /// A storage-only driver context on a store opened at `root`.
 pub fn path_context(root: &str) -> DriverContext {
-    test_context(aruna_storage::storage::worker::FjallStorage::open(root).expect("open the test store"))
+    test_context(
+        aruna_storage::storage::worker::FjallStorage::open(root).expect("open the test store"),
+    )
 }
 
 /// A storage-only driver context on a fresh temporary store.

@@ -560,8 +560,10 @@ mod tests {
         // A real session listener that stopped on its shutdown token is
         // reported, never treated as a node failure.
         let temp = tempfile::tempdir().expect("temp dir");
-        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
-            .expect("storage opens");
+        let storage = aruna_storage::storage::worker::FjallStorage::open(
+            temp.path().to_str().expect("utf8 path"),
+        )
+        .expect("storage opens");
         let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -737,7 +739,10 @@ mod tests {
         https: std::net::SocketAddr,
         redirect: std::net::SocketAddr,
         files: &[String; 2],
-    ) -> (crate::config::Config, aruna_storage::storage::handle::StorageHandle) {
+    ) -> (
+        crate::config::Config,
+        aruna_storage::storage::handle::StorageHandle,
+    ) {
         let map: std::collections::BTreeMap<String, String> = [
             ("DATABASE_DIR", temp.join("store").to_str().expect("utf8")),
             ("SOCKET_ADDRESS", &rest.to_string()),
@@ -867,8 +872,10 @@ mod tests {
         use aruna_tasks::shutdown::Shutdown;
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
-            .expect("storage opens");
+        let storage = aruna_storage::storage::worker::FjallStorage::open(
+            temp.path().to_str().expect("utf8 path"),
+        )
+        .expect("storage opens");
         let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -917,8 +924,10 @@ mod tests {
         use aruna_tasks::shutdown::Shutdown;
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
-            .expect("storage opens");
+        let storage = aruna_storage::storage::worker::FjallStorage::open(
+            temp.path().to_str().expect("utf8 path"),
+        )
+        .expect("storage opens");
         let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,

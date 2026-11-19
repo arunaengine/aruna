@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::*;
 use super::bucket::MAX_REPLICATION_TARGETS;
 use super::listing::next_marker_of;
+use super::*;
 use crate::s3::checksum::UploadChecksumRequest;
 use crate::s3::scope::resolve_scope;
 use aruna_core::UserId;

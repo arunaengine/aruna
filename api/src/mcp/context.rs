@@ -237,10 +237,13 @@ impl McpServer {
         let auth = request_auth(&parts)?;
         authorize_read(self, &auth, tool_extras("list_group_members", &input)?).await?;
         group_argument(&input.group_id)?;
-        let response =
-            crate::routes::access::groups::run_group_members(&self.state, Some(auth), &input.group_id)
-                .await
-                .map_err(group_error)?;
+        let response = crate::routes::access::groups::run_group_members(
+            &self.state,
+            Some(auth),
+            &input.group_id,
+        )
+        .await
+        .map_err(group_error)?;
         json_output(response)
     }
 
@@ -260,10 +263,13 @@ impl McpServer {
         let auth = request_auth(&parts)?;
         authorize_read(self, &auth, tool_extras("get_group_usage", &input)?).await?;
         group_argument(&input.group_id)?;
-        let response =
-            crate::routes::access::groups::run_group_usage(&self.state, Some(auth), &input.group_id)
-                .await
-                .map_err(group_error)?;
+        let response = crate::routes::access::groups::run_group_usage(
+            &self.state,
+            Some(auth),
+            &input.group_id,
+        )
+        .await
+        .map_err(group_error)?;
         json_output(response)
     }
 

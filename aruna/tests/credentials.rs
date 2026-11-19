@@ -606,7 +606,8 @@ async fn token_reads_locked() -> TestResult<()> {
             .send()
             .await?;
         assert_eq!(created.status(), StatusCode::CREATED);
-        let created: aruna_api::routes::access::credentials::CreateS3Response = created.json().await?;
+        let created: aruna_api::routes::access::credentials::CreateS3Response =
+            created.json().await?;
         assert!(created.key_requests.is_empty(), "the node issues at once");
         let credentials = shared::S3Credentials {
             access_key_id: created.access_key_id,
@@ -737,7 +738,8 @@ async fn token_reads_old() -> TestResult<()> {
             .send()
             .await?;
         assert_eq!(created.status(), StatusCode::CREATED);
-        let created: aruna_api::routes::access::credentials::CreateS3Response = created.json().await?;
+        let created: aruna_api::routes::access::credentials::CreateS3Response =
+            created.json().await?;
         let grants = token_grants(&seed, &created.access_key_id).await?;
         assert_eq!(grants.len(), 2);
         let epochs = grants.iter().flat_map(|g| g.context.request.epochs.clone());
@@ -870,7 +872,8 @@ async fn token_opens_scope() -> TestResult<()> {
             .send()
             .await?;
         assert_eq!(created.status(), StatusCode::CREATED);
-        let created: aruna_api::routes::access::credentials::CreateS3Response = created.json().await?;
+        let created: aruna_api::routes::access::credentials::CreateS3Response =
+            created.json().await?;
         let access_key = created.access_key_id.clone();
         let grants = token_grants(&seed, &access_key).await?;
         let scopes: Vec<_> = grants.iter().map(|g| &g.context.request.scope).collect();
@@ -1116,7 +1119,8 @@ async fn token_needs_credential() -> TestResult<()> {
             .send()
             .await?;
         assert_eq!(created.status(), StatusCode::CREATED);
-        let created: aruna_api::routes::access::credentials::CreateS3Response = created.json().await?;
+        let created: aruna_api::routes::access::credentials::CreateS3Response =
+            created.json().await?;
         assert_eq!(created.key_requests.len(), 1);
         let access_key = created.access_key_id;
         let mut requests = token_requests(&seed, &access_key).await?;
@@ -1263,7 +1267,8 @@ async fn token_limit_revokes() -> TestResult<()> {
             .send()
             .await?;
         assert_eq!(created.status(), StatusCode::CREATED);
-        let created: aruna_api::routes::access::credentials::CreateS3Response = created.json().await?;
+        let created: aruna_api::routes::access::credentials::CreateS3Response =
+            created.json().await?;
 
         // Copies of the first grant fill the caller's 64 grants of the bucket.
         let grant = token_grants(&seed, &created.access_key_id).await?.remove(0);

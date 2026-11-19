@@ -1648,7 +1648,8 @@ pub async fn add_group_member(
     .map_err(map_member_error)?;
     let members = vec![user_id];
     let key_requests =
-        crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members).await;
+        crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members)
+            .await;
 
     Ok((
         StatusCode::CREATED,
@@ -1945,7 +1946,8 @@ pub async fn create_group_role(
     }
     let members = assigned_users.into_iter().collect();
     let key_requests =
-        crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members).await;
+        crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members)
+            .await;
     let role = CreatedRoleResponse { role, key_requests };
     Ok((StatusCode::CREATED, Json(role)))
 }

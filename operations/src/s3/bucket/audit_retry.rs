@@ -432,7 +432,11 @@ mod tests {
     }
 
     /// Whether `key` holds a row in `key_space`.
-    async fn stored(storage: &aruna_storage::storage::handle::StorageHandle, key_space: &str, key: Vec<u8>) -> bool {
+    async fn stored(
+        storage: &aruna_storage::storage::handle::StorageHandle,
+        key_space: &str,
+        key: Vec<u8>,
+    ) -> bool {
         let read = StorageEffect::Read {
             key_space: key_space.to_string(),
             key: key.into(),

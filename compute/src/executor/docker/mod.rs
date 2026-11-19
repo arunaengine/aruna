@@ -64,7 +64,6 @@ use archive::{
     list_archive, output_spec, stream_output,
 };
 use control::{ControlGuard, ControlRecord, DaemonLock};
-use session::session_gateway;
 
 /// Local Docker/OCI executor backend over bollard.
 pub struct DockerBackend {
@@ -1583,6 +1582,7 @@ fn parse_rfc3339_ms(s: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::session::session_gateway;
     use super::*;
 
     /// A byte bound tests pass explicitly, the size of the former fixed limit.

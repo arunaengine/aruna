@@ -419,7 +419,9 @@ mod tests {
     #[tokio::test]
     async fn boot_reuses_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let store = IdentityStore::from_storage(storage.clone());
 
         assert!(store.load().await.unwrap().is_none());
@@ -432,7 +434,9 @@ mod tests {
 
         drop(store);
         storage.close().await;
-        let reopened = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let reopened =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let store = IdentityStore::from_storage(reopened);
         let loaded = store
             .load()
@@ -453,7 +457,9 @@ mod tests {
         use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         storage
             .send_effect(Effect::Storage(aruna_core::effects::StorageEffect::Write {
                 key_space: NODE_STATE_KEYSPACE.to_string(),
@@ -533,7 +539,9 @@ mod tests {
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::Complete,

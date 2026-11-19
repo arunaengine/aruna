@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::*;
 use super::ensure::EnsureMirrorOperation;
 use super::settle::{RollbackClaim, SettleReconcileOperation};
+use super::*;
 use crate::replication::sync_relationship::{
     CreateRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
     SyncRelationshipDirection,

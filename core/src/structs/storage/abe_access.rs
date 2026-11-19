@@ -531,10 +531,9 @@ mod tests {
                 let (envelope, _) =
                     create_envelope(plan, &mut crate::key_seal::SeedRng::new(&[7; 32])).unwrap();
                 let context = envelope.context.bytes().unwrap();
-                Envelope::from_bytes(&public, &envelope.abe)
-                    .is_ok_and(|abe| {
-                        aruna_kpabe::envelope::open(&public, &key, &abe, &context).is_ok()
-                    })
+                Envelope::from_bytes(&public, &envelope.abe).is_ok_and(|abe| {
+                    aruna_kpabe::envelope::open(&public, &key, &abe, &context).is_ok()
+                })
             };
         let (sub, exact) = (
             |v: &str| KeyScope::Subtree(v.into()),
