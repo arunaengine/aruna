@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::jobs::{ArchiveEntryRead, ByteStream, JobEffect, JobEvent};
 use aruna_core::operation::Operation;
@@ -32,12 +32,10 @@ use crate::jobs::repository::connector::ConnectorViewOperation;
 use crate::jobs::repository::invenio::reference::WriteRepositoryReference;
 use crate::jobs::repository::{TransferError, is_reference, reference_source};
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
-use crate::replication::queue::{
-    BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult,
-};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 
 /// The connector kind of a repository import in reference mode, read through its connector.
 pub(super) fn reference_kind_call(run: &ImportRun) -> Option<IoCall> {
@@ -389,7 +387,7 @@ impl Operation for WriteEntryOperation {
                 Ok(Next::Call(self.queue()?))
             }
             Step::ReferenceQueue => {
-                (result.child::<QueueBlobResult, BlobQueueError>()?)
+                (result.child::<bool, IoError>()?)
                     .map_err(|error| ImportFailure::Retryable(error.to_string()))?;
                 self.checkpoint.imported = self.checkpoint.imported.saturating_add(1);
                 Ok(self.advanced())

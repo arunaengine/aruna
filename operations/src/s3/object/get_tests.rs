@@ -8,10 +8,10 @@ use crate::s3::object::get::{
     AdvanceEnd, AdvanceReference, AdvanceStep, GetObjectError, GetObjectInput, GetObjectOperation,
     GetObjectResult, GetObjectState, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, Turn,
 };
-use crate::s3::object::read::{
+use crate::s3::usage::{RowChange, UsageCounterUpdate};
+use crate::transfer::read::{
     GetRoutedOperation, HolderFailures, PromoteLeasedOperation, RoutedRead, routed_info,
 };
-use crate::s3::usage::{RowChange, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
@@ -2507,7 +2507,7 @@ mod sealed {
     #[test]
     fn remote_lock_typed() {
         use crate::replication::bao_read::BaoReadError;
-        use crate::s3::object::read::HolderFailures;
+        use crate::transfer::read::HolderFailures;
         use aruna_core::replication_protocol::BaoReadRefusal;
 
         let mut failures = HolderFailures::default();

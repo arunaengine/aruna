@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod audit_retry;
-pub mod bucket_jobs;
-pub mod bucket_storage;
 pub mod checked_rename;
 pub mod compression;
 pub mod cors;
@@ -14,7 +12,6 @@ pub mod delete;
 pub mod encryption;
 pub(crate) mod forward;
 pub mod holders;
-pub(crate) mod job_pages;
 pub(crate) mod job_progress;
 pub mod key;
 pub mod linked;
@@ -22,7 +19,6 @@ pub mod list;
 pub(crate) mod local_search;
 pub mod metadata;
 pub mod placement;
-pub mod release;
 pub mod remap;
 pub mod rename;
 pub mod rotate;

@@ -27,7 +27,7 @@ use crate::metadata::global_entries::{LocalVersionError, LocalVersionOperation};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput};
-use crate::s3::object::read::ObjectInfoOperation;
+use crate::transfer::read::ObjectInfoOperation;
 use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};

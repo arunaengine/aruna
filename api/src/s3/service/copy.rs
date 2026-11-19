@@ -14,8 +14,8 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
-use aruna_operations::s3::multipart::part_copy::PartCopyResult;
-use aruna_operations::s3::object::copy::{CopyResultData, CopySourceConditions};
+use aruna_operations::transfer::copy::{CopyResultData, CopySourceConditions};
+use aruna_operations::transfer::part_copy::PartCopyResult;
 use s3s::dto::{
     ChecksumType, CopyObjectOutput, CopyObjectResult, CopyPartResult, ETag, ETagCondition,
     Timestamp, TimestampFormat, UploadPartCopyOutput,

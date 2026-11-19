@@ -9,10 +9,8 @@ use aruna_core::structs::{SyncRelationship, sync_relationship_key};
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 
-use super::{
-    SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, decode_record, one_value, outgoing_read,
-    repair_key, repair_read,
-};
+use super::{SyncMirrorError, decode_record, one_value, outgoing_read, repair_read};
+use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord, repair_key};
 
 /// What a reconcile pass finds when it tries to claim a rollback.
 #[derive(Debug, PartialEq)]

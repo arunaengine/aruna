@@ -71,7 +71,6 @@ use aruna_operations::device::sync::{
     UPLOAD_DEFER_AFTER,
 };
 use aruna_operations::device_node::sync_note::{NoteSyncOperation, SyncNote};
-use aruna_operations::distribution::sharding::MaintainCursors;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::forward::realm::RelayAdminOperation;
 use aruna_operations::jobs::JOB_PRUNE_PAGE;
@@ -98,6 +97,7 @@ use aruna_operations::metadata::projection::{
 };
 use aruna_operations::plugins::work::PruneKeepingWork;
 use aruna_operations::replication::catch_up::CatchUpCursors;
+use aruna_operations::transfer::sharding::MaintainCursors;
 
 /// Replays the whole event log into the registry projection, one page at a time.
 async fn replay_event_log(
@@ -1017,6 +1017,7 @@ impl OperationsTaskHandler {
             }),
             key @ TaskKey::RecordAudit { .. } => Box::pin(async move {
                 use aruna_operations::s3::bucket::audit_retry::{AUDIT_RETRY, StoreAuditOperation};
+                use aruna_operations::transfer::sharding::{maintain_ranges, maintain_retry};
                 // The key change already applies; only its record waits for storage.
                 let store = StoreAuditOperation::new(key.clone());
                 if let Err(error) = drive(store, &self.context).await {
@@ -1065,7 +1066,6 @@ impl OperationsTaskHandler {
                 }
             }),
             TaskKey::MaintainRanges => Box::pin(async move {
-                use aruna_operations::distribution::sharding::{maintain_ranges, maintain_retry};
                 let context = &self.context;
                 let kept = (RANGE_CURSORS.lock().ok()).and_then(|cursors| cursors.clone());
                 let mut after = match aruna_drivers::driver::drive(

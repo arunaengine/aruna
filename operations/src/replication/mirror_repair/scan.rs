@@ -9,7 +9,8 @@ use aruna_core::rows::PrefixPages;
 use aruna_core::types::{Key, Value};
 use tracing::warn;
 
-use super::{SyncMirrorError, SyncMirrorRecord};
+use super::SyncMirrorError;
+use aruna_core::structs::storage::mirror_repair::SyncMirrorRecord;
 
 const REPAIR_PAGE_SIZE: usize = 128;
 const REPAIR_BATCH_SIZE: usize = 64;
@@ -113,9 +114,9 @@ impl Operation for ScanRepairsOperation {
 #[cfg(test)]
 mod tests {
     use super::super::tests::relationship;
-    use super::super::{SyncMirrorIntent, repair_key};
     use super::*;
     use aruna_core::calls::IoError;
+    use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, repair_key};
     use byteview::ByteView;
     use ulid::Ulid;
 

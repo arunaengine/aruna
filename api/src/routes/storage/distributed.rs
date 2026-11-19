@@ -14,12 +14,11 @@ use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionSettings, MemberState, MetadataCoverage, RangeBehaviour, SetPhase,
     TransferRole,
 };
-use aruna_operations::distribution::create::{
+use aruna_operations::transfer::create::{
     CreateError, CreateInput, CreationReport, LayoutKind, admit_pending, create_set,
 };
-use aruna_operations::distribution::status::{
-    DeletionStatus, DistributionStatus, Reach, add_progress, read_status,
-};
+use aruna_operations::transfer::status::{add_progress, read_status};
+use aruna_operations::transfer::status_view::{DeletionStatus, DistributionStatus, Reach};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

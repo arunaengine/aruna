@@ -18,13 +18,13 @@ use aruna_core::structs::storage::distribution::delegation::{COPY_CONTEXT_HEADER
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
-use aruna_operations::s3::object::copy::{CopySourceConditions, ReadCopyOperation, source_origin};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult};
 pub(in crate::s3::service) use aruna_operations::s3::object::member_write::CopyPath;
 use aruna_operations::s3::object::member_write::{
     CopyPathError, CopyPathOperation, answered_metadata, answered_policies, copy_headers,
     source_read,
 };
+use aruna_operations::transfer::copy::{CopySourceConditions, ReadCopyOperation, source_origin};
 use s3s::dto::{
     CopyObjectOutput, CopyObjectResult, CopyPartResult, ETag, Timestamp, TimestampFormat,
     UploadPartCopyOutput,
@@ -204,7 +204,7 @@ impl ArunaS3Service {
     async fn read_copy(
         &self,
         source: CopySource<'_>,
-        token: Option<&aruna_operations::s3::object::read::TokenRead>,
+        token: Option<&aruna_operations::transfer::read::TokenRead>,
     ) -> S3Result<GetObjectResult> {
         let input = GetObjectInput {
             bucket: source.name,
@@ -232,7 +232,7 @@ impl ArunaS3Service {
         (bucket, key): (String, String),
         source: CopySource<'_>,
         metadata: Option<HashMap<String, String>>,
-        token: Option<&aruna_operations::s3::object::read::TokenRead>,
+        token: Option<&aruna_operations::transfer::read::TokenRead>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let (name, key_of) = (source.name.clone(), source.key.clone());
         let distributed = source.bucket.distribution.is_some();
@@ -297,7 +297,7 @@ impl ArunaS3Service {
         forward: &Forward,
         (bucket, key, query): (String, String, String),
         source: CopySource<'_>,
-        token: Option<&aruna_operations::s3::object::read::TokenRead>,
+        token: Option<&aruna_operations::transfer::read::TokenRead>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let read = self.read_copy(source, token).await?;
         let version = read.resolved_version_id.or(read.version_id);

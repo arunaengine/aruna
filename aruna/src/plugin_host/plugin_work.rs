@@ -22,7 +22,7 @@ use aruna_operations::plugins::copy_steps::{CopyWork, LockedSource, PrepareCopy,
 use aruna_operations::plugins::work_calls::{AdmitWork, AdmittedWork, WorkRefusal};
 
 use super::transfers::{Download, Upload, download_work, upload_work};
-use aruna_operations::s3::object::copy::CopyObjectOperation;
+use aruna_operations::transfer::copy::CopyObjectOperation;
 
 /// How often the bytes moved so far reach the job's progress.
 pub(super) const PROGRESS_TICK: Duration = Duration::from_secs(1);

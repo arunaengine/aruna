@@ -7,6 +7,7 @@ mod batch;
 pub mod broken;
 pub mod check;
 pub mod drain;
+pub(crate) mod job_pages;
 pub mod misplaced;
 pub mod queue;
 pub mod rewrite;
@@ -49,13 +50,13 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
 use crate::groups::storage_routing::routing_key;
 use crate::s3::object::put::fenced::{Fenced, FencedWrite};
 use crate::s3::object::put::{PlainRecord, intent_rows, owner_call, path_owned, same_name_path};
 use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::managed_copy::{ManagedCopyError, check_old_copy};
+use aruna_core::structs::storage::cleanup::schedule_cleanup_effect;
 
 /// Steps of one version migration; errors name the step they stopped in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

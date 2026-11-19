@@ -15,9 +15,8 @@ use super::{
     SyncRelationshipDirection, SyncRelationshipError, pages, parse_values, same_create_identity,
     storage_key,
 };
-use crate::replication::mirror_repair::{
-    SyncMirrorIntent, SyncMirrorRecord, repair_key, same_relationship,
-};
+use crate::replication::mirror_repair::same_relationship;
+use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord, repair_key};
 
 #[derive(Debug, PartialEq)]
 enum Phase {

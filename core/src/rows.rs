@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::calls::{IoCall, IoError, IoResult, Next};
-use crate::operation::Operation;
+use crate::operation::{Operation, TransactionMode};
 use crate::types::{Key, KeySpace, Value};
 
 /// The call that reads one row.
@@ -142,6 +142,56 @@ impl PrefixPages {
     /// Whether the last page was taken.
     pub fn done(&self) -> bool {
         self.done
+    }
+}
+
+/// Deletes a set's marker row only while it still holds `seen`: a record installed since the
+/// pass read it wrote a newer revision, and its work is looked at again.
+#[derive(Debug, PartialEq)]
+pub struct SettleMarkerOperation {
+    key_space: String,
+    key: Vec<u8>,
+    seen: Vec<u8>,
+    deleting: bool,
+}
+
+impl SettleMarkerOperation {
+    pub fn new(key_space: &str, key: Vec<u8>, seen: Vec<u8>) -> Self {
+        Self {
+            key_space: key_space.to_string(),
+            key,
+            seen,
+            deleting: false,
+        }
+    }
+
+    fn row(&self) -> (String, Key) {
+        (self.key_space.clone(), self.key.clone().into())
+    }
+}
+
+impl Operation for SettleMarkerOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(IoCall::Read(vec![self.row()])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if self.deleting {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        if result.value()?.as_deref() != Some(self.seen.as_slice()) {
+            return Ok(Next::Done(()));
+        }
+        self.deleting = true;
+        Ok(Next::Call(IoCall::Delete(vec![self.row()])))
     }
 }
 

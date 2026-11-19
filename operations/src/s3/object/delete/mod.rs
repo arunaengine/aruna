@@ -53,7 +53,6 @@ use ulid::Ulid;
 
 mod abe;
 pub mod bulk;
-pub mod pinned;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeleteObjectState {

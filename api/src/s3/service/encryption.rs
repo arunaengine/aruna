@@ -18,7 +18,7 @@ use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::replication::plaintext::EncryptionCheckOperation;
 use aruna_operations::s3::bucket::encryption::EnableError;
-use aruna_operations::s3::key_status::KeyStatusOperation;
+use aruna_operations::transfer::key_status::KeyStatusOperation;
 use s3s::dto::{
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
     ServerSideEncryptionRule,

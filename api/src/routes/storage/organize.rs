@@ -25,7 +25,7 @@ use aruna_operations::s3::bucket::remap::{
     self, CountSelectedOperation, RemapPreviewOperation, RemapScope,
 };
 use aruna_operations::s3::imports::LastRunOperation;
-use aruna_operations::s3::imports::discovery::RuleAccessOperation;
+use aruna_operations::transfer::discovery::RuleAccessOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -802,7 +802,7 @@ pub async fn link_status(
         }));
     };
     let rules = drive(
-        aruna_operations::s3::imports::discovery::ReadDiscoveryOperation::new(
+        aruna_operations::transfer::discovery::ReadDiscoveryOperation::new(
             rule.group_id,
             rule.import_id,
         ),

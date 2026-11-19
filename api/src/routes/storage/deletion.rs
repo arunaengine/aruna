@@ -21,12 +21,12 @@ use aruna_operations::metadata::api::links::set_preview_distributed;
 use aruna_operations::replication::sync_relationship::{
     ListRelationshipsOperation, SyncRelationshipDirection,
 };
-use aruna_operations::s3::bucket::release::BucketScope;
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
-use aruna_operations::s3::object::delete::pinned::{PinnedError, RefuseScopeOperation};
 use aruna_operations::s3::object::versions::{
     ListVersionsError, ListVersionsInput, ListVersionsOperation,
 };
+use aruna_operations::transfer::pinned::{PinnedError, RefuseScopeOperation};
+use aruna_operations::transfer::release::BucketScope;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};

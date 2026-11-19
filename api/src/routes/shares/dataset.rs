@@ -16,7 +16,6 @@ use aruna_operations::distribution::resolve::{
     GlobalResolution, content_resolved, resolve_content, resolve_version, resolved,
 };
 use aruna_operations::distribution::routing::bound_view;
-use aruna_operations::distribution::status::read_view;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export::ExportOperation;
 use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
@@ -27,6 +26,7 @@ use aruna_operations::shares::dataset::{
 use aruna_operations::shares::rules::{
     NodeScope, bucket_pattern, exact_pattern, relative_path, visit_context,
 };
+use aruna_operations::transfer::status::read_view;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};

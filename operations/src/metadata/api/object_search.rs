@@ -37,7 +37,7 @@ use super::{DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::load_config::config_unavailable;
 use crate::s3::object::search::{SearchObjectsError, SearchObjectsInput};
-use crate::s3::object::search_scan::SearchObjectsOperation;
+use crate::transfer::search_scan::SearchObjectsOperation;
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::search::SearchNodePage;
 

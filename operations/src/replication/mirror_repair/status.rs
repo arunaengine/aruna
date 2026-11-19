@@ -13,8 +13,10 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use super::{
-    SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, decode_record, one_value, outgoing_read,
-    repair_entry, repair_key, repair_read, same_relationship,
+    SyncMirrorError, decode_record, one_value, outgoing_read, repair_read, same_relationship,
+};
+use aruna_core::structs::storage::mirror_repair::{
+    SyncMirrorIntent, SyncMirrorRecord, repair_entry, repair_key,
 };
 
 type Writes = Vec<(KeySpace, Key, Value)>;

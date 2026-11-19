@@ -17,7 +17,8 @@ use super::record::MirrorRecordOperation;
 use super::remove::{RemoveLocalOperation, RemoveMirrorOperation};
 use super::scan::{RepairScan, ScanRepairsOperation};
 use super::settle::{RollbackClaim, SettleReconcileOperation};
-use super::{SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, SyncMirrorResult};
+use super::{SyncMirrorError, SyncMirrorResult};
+use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 
 #[derive(Debug, PartialEq)]
 enum RepairPhase {

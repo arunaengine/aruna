@@ -21,7 +21,7 @@ use crate::plugins::submit::tests::{request, scope};
 use crate::plugins::test_support::{install_as, install_request};
 use crate::plugins::work::tests::edit_work;
 use crate::plugins::work::{FinalState, prune_work, read_work, summary_of};
-use crate::s3::object::copy::test::seed_bucket;
+use crate::transfer::copy::test::seed_bucket;
 use aruna_test_support::plugins::Fixture;
 use aruna_test_support::plugins::{path, ready};
 

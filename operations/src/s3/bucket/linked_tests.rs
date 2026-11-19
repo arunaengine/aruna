@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
-use crate::s3::bucket::job_pages::{
+use crate::blob::migration::job_pages::{
     JobAccessOperation, ProcessLinkedOperation, StillAdminOperation, StoreJobOperation,
 };
 use crate::s3::bucket::job_progress::JobStep;

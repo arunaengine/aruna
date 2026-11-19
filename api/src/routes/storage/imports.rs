@@ -23,11 +23,11 @@ use aruna_operations::s3::bucket::storage_move::StartMoveOperation;
 use aruna_operations::s3::imports::change::{ChangeImportOperation, ImportChange};
 use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
 use aruna_operations::s3::imports::cron::next_due;
-use aruna_operations::s3::imports::discovery::{AuthorizedRenamesOperation, RenameGuardsOperation};
 use aruna_operations::s3::imports::remove::RemoveImportOperation;
 use aruna_operations::s3::imports::{
     ImportRuleError, LastRunOperation, ListImportsOperation, ReadImportOperation,
 };
+use aruna_operations::transfer::discovery::{AuthorizedRenamesOperation, RenameGuardsOperation};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -850,7 +850,7 @@ pub async fn get_renames(
     }
     let context = state.get_ctx();
     let access = drive(
-        aruna_operations::s3::imports::discovery::RuleAccessOperation::new(
+        aruna_operations::transfer::discovery::RuleAccessOperation::new(
             &auth,
             state.get_node_id(),
             &rule,

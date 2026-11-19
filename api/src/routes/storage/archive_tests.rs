@@ -16,7 +16,7 @@ use crate::tests::distributed::{
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_operations::s3::object::archive::{EntryStatus, REPORT_PATH, Report};
+use aruna_operations::transfer::archive::{EntryStatus, REPORT_PATH, Report};
 use axum::http::StatusCode;
 use std::io::Read;
 

@@ -17,15 +17,15 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::routing::NodeRouting;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::s3::object::copy::{
-    CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopyResultData,
-    CopySourceConditions,
-};
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::put::PutObjectError;
+use crate::transfer::copy::{
+    CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopyResultData,
+    CopySourceConditions,
+};
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::jobs::JobRunOutcome;
 

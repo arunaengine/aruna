@@ -24,9 +24,9 @@ use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
-use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::groups::backends::backend_key;
 use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use aruna_core::structs::storage::cleanup::schedule_cleanup_effect;
 
 /// What one candidate resolved to. `Dropped` covers every reason the queue row
 /// is stale: retain, a vanished backend, or a location that is already gone.

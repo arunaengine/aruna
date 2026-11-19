@@ -10,7 +10,7 @@ use aruna_core::structs::storage::abe_access::{
 };
 use aruna_operations::abe::{MemberKeysOperation, ReissueOperation};
 use aruna_operations::auth::epoch_due::EpochDueOperation;
-use aruna_operations::s3::abe_rekey::RekeyOperation;
+use aruna_operations::transfer::abe_rekey::RekeyOperation;
 use axum::extract::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

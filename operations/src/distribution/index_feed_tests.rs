@@ -6,11 +6,11 @@
 use std::ops::Bound;
 use std::sync::Arc;
 
-use crate::distribution::feed_walks::{FeedLimits, state_key};
 use crate::distribution::test_record::{record, searched};
 use crate::distribution::test_store::{
     Feeder, apply, context, get, install, open, purge, range, send, write,
 };
+use crate::transfer::feed_walks::{FeedLimits, state_key};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::key_index::{KeyChange, KeyQuery, MetaTerms};

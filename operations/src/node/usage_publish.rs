@@ -24,7 +24,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::distribution::replica_shares::{GroupShare, ReplicaSharesOperation};
 use crate::s3::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation};
 use crate::s3::usage::{
     LoadCountersError, global_shard_rows, global_sum, schedule_snapshot_publish,
@@ -32,6 +31,7 @@ use crate::s3::usage::{
 use crate::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsError, ReplicateDocumentsOperation,
 };
+use crate::transfer::replica_shares::{GroupShare, ReplicaSharesOperation};
 
 /// Rows one marker or counter scan reads per page.
 const SCAN_PAGE: usize = 1_000;

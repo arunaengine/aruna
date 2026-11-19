@@ -5,7 +5,6 @@
 pub mod change;
 pub mod create;
 pub mod cron;
-pub mod discovery;
 pub mod folders;
 pub mod remove;
 pub mod shared;

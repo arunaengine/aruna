@@ -55,10 +55,10 @@ use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
-use aruna_operations::s3::imports::discovery::{
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::transfer::discovery::{
     AuthorizedPreviewOperation, FileOutcome, SetDiscoveryOperation,
 };
-use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_storage::scan::iter_prefix_page;
 use aruna_storage::storage;
 use std::collections::{BTreeMap, HashMap};

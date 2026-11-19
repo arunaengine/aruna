@@ -146,9 +146,9 @@ async fn record_pages_resume() {
     use aruna_core::key_index::KeyQuery;
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
-    use aruna_operations::distribution::feed_walks::FeedLimits;
     use aruna_operations::distribution::test_store::Feeder;
     use aruna_operations::staging::page::rows::MAX_PAGE_ENTRIES;
+    use aruna_operations::transfer::feed_walks::FeedLimits;
     use aruna_storage::key_index::RangeIndexes;
     use std::ops::Bound;
 
@@ -389,8 +389,8 @@ async fn import_records(
     let stopping = stop.clone();
     let mut woken = pages.subscribe();
     let feed = tokio::spawn(async move {
-        use aruna_operations::distribution::feed_walks::FeedLimits;
         use aruna_operations::distribution::test_store::Feeder;
+        use aruna_operations::transfer::feed_walks::FeedLimits;
         use aruna_storage::key_index::RangeIndexes;
         feed.storage_handle
             .install_range_indexes(RangeIndexes::new(indexes));

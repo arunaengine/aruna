@@ -59,12 +59,8 @@ use aruna_operations::s3::multipart::complete::{
 use aruna_operations::s3::multipart::create::{
     CreateMultipartError, CreateMultipartInput, CreateMultipartOperation,
 };
-use aruna_operations::s3::multipart::part_copy::{PartCopyError, PartCopyInput, PartCopyOperation};
 use aruna_operations::s3::multipart::part_upload::{
     UploadPartError, UploadPartInput, UploadPartOperation,
-};
-use aruna_operations::s3::object::copy::{
-    CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };
 use aruna_operations::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation,
@@ -76,6 +72,10 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::purge_fence::{PurgeFenceError, fence_key};
+use aruna_operations::transfer::copy::{
+    CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
+};
+use aruna_operations::transfer::part_copy::{PartCopyError, PartCopyInput, PartCopyOperation};
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;

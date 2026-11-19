@@ -41,12 +41,12 @@ use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError, check_error};
 use crate::metadata::forward::read::DatasetSummaryOperation;
 use crate::s3::bucket::dataset::{BucketMetadataError, BucketMetadataOperation};
-use crate::s3::bucket::release::access::MembersCheckOperation;
-use crate::s3::bucket::release::{BucketScope, MembersOutput, MembershipCaller, ReleaseError};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::read_access::{SourceObject, SourceReadError, SourceReadOperation};
+use crate::transfer::release::access::MembersCheckOperation;
+use crate::transfer::release::{BucketScope, MembersOutput, MembershipCaller, ReleaseError};
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::job_request::SubmitJobError;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};

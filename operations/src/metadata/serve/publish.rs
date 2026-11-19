@@ -16,12 +16,12 @@ use aruna_core::structs::storage::distribution::request::PublishRefusal;
 use aruna_core::structs::storage::distribution::{DistributionRequest, DistributionRevision};
 use ulid::Ulid;
 
-use crate::distribution::forward::PeerCallerOperation;
 use crate::distribution::submit::PublishLocalOperation;
 use crate::document_repository::{config_of, realm_config};
 use crate::forward::transport::reject;
 use crate::metadata::forward::read::DatasetSummaryOperation;
 use crate::realm::peer_trust::is_sync_eligible;
+use crate::transfer::forward::PeerCallerOperation;
 
 /// The dataset a metadata change links, if any.
 fn linked_dataset(request: &DistributionRequest) -> Option<Ulid> {

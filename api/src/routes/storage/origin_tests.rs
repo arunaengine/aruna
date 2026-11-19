@@ -303,7 +303,7 @@ fn view_keeps_fields() {
             relationship_id: Ulid::from_bytes([47; 16]),
             from: OriginVersion::Global(global.clone()),
         }),
-        source: Some(aruna_operations::s3::object::origin::SourceView {
+        source: Some(aruna_operations::transfer::origin::SourceView {
             url: Some("https://s3.example.org/a".to_string()),
             path: "a".to_string(),
             version: None,
@@ -314,13 +314,13 @@ fn view_keeps_fields() {
                 (ChecksumAlgorithm::Sha1, listing),
             ],
             sources: vec![
-                aruna_operations::s3::object::origin::SourcePlace {
+                aruna_operations::transfer::origin::SourcePlace {
                     url: Some("https://s3.example.org/a".to_string()),
                     path: "a".to_string(),
                     connector_id: None,
                     connector_name: None,
                 },
-                aruna_operations::s3::object::origin::SourcePlace {
+                aruna_operations::transfer::origin::SourcePlace {
                     url: Some("https://mirror.example.org/a".to_string()),
                     path: "a".to_string(),
                     connector_id: Some(Ulid::from_bytes([48; 16])),

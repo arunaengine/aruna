@@ -48,7 +48,7 @@ use super::{
 use crate::auth::bearer_token::GrantValidOperation;
 use crate::auth::error::{ArunaBearerError, AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::{BucketAccess, BucketAccessOperation};
-use crate::s3::bucket::job_pages::{ProcessLinkedOperation, StillAdminOperation};
+use crate::blob::migration::job_pages::{ProcessLinkedOperation, StillAdminOperation};
 
 /// Versions one task run handles per bucket before it yields to other timers.
 pub(super) const MIGRATION_PAGE: usize = 64;

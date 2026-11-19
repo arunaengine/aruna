@@ -47,9 +47,6 @@ use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultip
 use aruna_operations::s3::multipart::part_upload::{
     UploadPartInput, UploadPartOperation, UploadPartResult,
 };
-use aruna_operations::s3::object::copy::{
-    CopyObjectInput, CopyReferences, CopyResultData, CopySourceConditions,
-};
 use aruna_operations::s3::object::delete::{
     DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
@@ -60,6 +57,9 @@ use aruna_operations::s3::policy::successor::{
     MintSuccessorOperation, SuccessorOutcome, SuccessorPlan,
 };
 use aruna_operations::s3::realm_usage::{RealmUsageOperation, RealmUsageScope};
+use aruna_operations::transfer::copy::{
+    CopyObjectInput, CopyReferences, CopyResultData, CopySourceConditions,
+};
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -1023,7 +1023,7 @@ async fn copy_object(
     group_id: Ulid,
 ) -> CopyResultData {
     drive(
-        aruna_operations::s3::object::copy::CopyObjectOperation::new(
+        aruna_operations::transfer::copy::CopyObjectOperation::new(
             CopyObjectInput {
                 source_bucket: bucket.to_string(),
                 source_key: source_key.to_string(),

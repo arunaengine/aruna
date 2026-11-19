@@ -35,7 +35,6 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::blob::pause::{PauseError, PausePurgeOperation, PausedOperation};
 use crate::blob::purge::{PlanFilesOperation, PurgeFilesError, StorageFile, StorageFilesOperation};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
-use crate::s3::bucket::release::BucketScope;
 use crate::s3::fence_store::AcquireFenceOperation;
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{ListUploadsError, ListUploadsInput, ListUploadsOperation};
@@ -43,9 +42,10 @@ use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation, BulkDeleteOutcome,
 };
-use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
 use crate::s3::object::versions::{ListVersionsError, ListVersionsInput, ListVersionsOperation};
 use crate::s3::purge_fence::PurgeFenceError;
+use crate::transfer::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
+use crate::transfer::release::BucketScope;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::request_policy::PolicyRequestExtras;

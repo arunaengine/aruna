@@ -34,6 +34,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::encryption::public_key_of;
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
@@ -42,7 +43,6 @@ use aruna_drivers::driver::drive;
 use aruna_kpabe::{Envelope, UserKey};
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
-use aruna_operations::replication::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
