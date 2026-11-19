@@ -1651,6 +1651,7 @@ fn advance_writes_obligation() {
         permission: Permission::READ,
     }];
     let mut operation = drifted_operation().with_restrictions(Some(restrictions));
+    operation.stamp(millis(SystemTime::UNIX_EPOCH + MIN_ADVANCE_INTERVAL));
     let creator = operation.reference_creator.unwrap();
     let reader_auth = operation.auth_context();
     let headed = Ulid::generate();
@@ -1726,7 +1727,7 @@ fn advance_rejects_early() {
 // A backwards clock must not grant an unbounded advance budget.
 #[test]
 fn advance_rejects_rollback() {
-    let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
     let mut operation = drifted_operation();
     operation.stamp(millis(created_at - Duration::from_secs(3_600)));
     let mut advance = advance_to_reread(&mut operation, Ulid::generate());
@@ -1845,10 +1846,8 @@ fn successor_charges_size() {
         },
     )
     .in_bucket(&operation.input.bucket, RowChange::AddedVersion);
-    // The advance mints its successor id, then the generation of the usage markers.
-    let mut ids = aruna_core::id_mint::IdMint::default();
-    ids.mint(0);
-    let _ = expected.start_calls(ids.mint(0));
+    // The successor id is given here, so the advance's first mint is the markers' generation.
+    let _ = expected.start_calls(aruna_core::id_mint::IdMint::default().mint(0));
     assert_eq!(advance.usage, Some(expected));
 }
 

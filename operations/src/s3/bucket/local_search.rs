@@ -356,9 +356,14 @@ mod tests {
         let mut search = LocalBucketSearch::with_budget(input(), 1);
         search.first().unwrap();
         let next = Some(Key::from(b"bucket".to_vec()));
-        let Ok(Next::Done(page)) = search.next(scanned(Vec::new(), next)) else {
+        let seal = Ok(Next::Call(
+            Effect::Net(NetEffect::SealPosition(b"bucket".to_vec())).into(),
+        ));
+        assert_eq!(search.next(scanned(Vec::new(), next)), seal);
+        let sealed = Event::Net(NetEvent::PositionSealed(Some(vec![9, 9])));
+        let Ok(Next::Done(page)) = search.next(IoResult::Event(Box::new(sealed))) else {
             panic!("a used-up budget ends the page");
         };
-        assert!(page.scanned_to.is_some());
+        assert_eq!(page.scanned_to, Some(vec![9, 9]));
     }
 }
