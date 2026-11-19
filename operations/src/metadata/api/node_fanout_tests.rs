@@ -51,8 +51,7 @@ fn fanout(
 ) -> NodeFanoutOperation<Numbers> {
     let scope = MetadataFanoutScope::new(Some(mode), targets, partial);
     let label = MetadataFanoutOperation::Query;
-    let mut fanout =
-        NodeFanoutOperation::new((realm(), node(1)), scope, label, Numbers, map_read_error);
+    let mut fanout = NodeFanoutOperation::new((realm(), node(1)), scope, label, Numbers);
     fanout.stamp(1_000);
     fanout
 }
@@ -206,8 +205,7 @@ fn skipped_nodes_unasked() {
     )
     .with_skip(vec![node(2)]);
     let label = MetadataFanoutOperation::Query;
-    let mut fanout =
-        NodeFanoutOperation::new((realm(), node(1)), scope, label, Numbers, map_read_error);
+    let mut fanout = NodeFanoutOperation::new((realm(), node(1)), scope, label, Numbers);
     fanout.stamp(1_000);
     assert_eq!(group(fanout.first()).members.len(), 1);
 }
@@ -241,8 +239,7 @@ fn capped(skip: Vec<NodeId>, partial: bool) -> NodeFanoutOperation<Numbers> {
     )
     .with_skip(skip);
     let label = MetadataFanoutOperation::BucketSearch;
-    let mut fanout =
-        NodeFanoutOperation::new((realm(), nodes[0]), scope, label, Numbers, map_read_error);
+    let mut fanout = NodeFanoutOperation::new((realm(), nodes[0]), scope, label, Numbers);
     fanout.stamp(1_000);
     fanout
 }

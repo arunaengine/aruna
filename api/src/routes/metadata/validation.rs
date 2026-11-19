@@ -14,7 +14,7 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::export_types::GetVisibleRequest;
-use aruna_operations::metadata::forward::routed_status::RoutedStatusOperation;
+use aruna_operations::metadata::forward::routed::status::RoutedStatusOperation;
 use aruna_operations::metadata::profile::validation::{
     ProfileAssessOperation, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
 };

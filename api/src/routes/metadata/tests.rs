@@ -24,7 +24,7 @@ use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::node_fanout::DiscoveryOperation;
 use aruna_operations::metadata::api::read::query_metadata as run_query_metadata;
 use aruna_operations::metadata::api::read_types::{ApiQueryMode, MetadataQueryRequest};
-use aruna_operations::metadata::api::search_fanout::search_metadata as run_search_metadata;
+use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use aruna_operations::testing::sign_token;
 use aruna_operations::testing::test_context;
@@ -65,11 +65,11 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::inbound::initialize_incoming_fixture;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::repository::write_document_lifecycle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
+use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::{
     drain_projection_queue, replay_event_log, schedule_projection_drain,
 };

@@ -55,7 +55,7 @@ fn routed(holders: Vec<NodeId>) -> RoutedReadOperation {
 }
 
 #[test]
-fn offline_node_reads_here() {
+fn offline_reads_here() {
     let mut read = RoutedReadOperation::new(None, realm(), request(), None);
     assert!(matches!(read.first(), Ok(Next::Call(IoCall::Child(_)))));
     let missing = child(Err::<MetadataRegistryRecord, _>(MetadataApiError::NotFound));

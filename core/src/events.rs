@@ -529,6 +529,8 @@ pub enum NetEvent {
     CursorSigned(Option<iroh::Signature>),
     /// The caller a forwarded token stands for, or why it is not accepted from that peer.
     WritePeerAuth(Result<Box<crate::structs::identity::auth::AuthContext>, PeerAuthRefusal>),
+    /// The peer's last-contact time is refreshed.
+    PeerContact,
     /// The JSON-LD summary of a dataset, or why it could not be read.
     DatasetSummary(Result<String, crate::structs::storage::dataset_description::DescriptionError>),
     Shard(Box<ShardNetEvent>),
@@ -1041,6 +1043,7 @@ impl Event {
                     DelegatedRead,
                     DatasetSummary,
                     WritePeerAuth,
+                    PeerContact,
                     GrantSign,
                     DelegationSign,
                     HolderAvoided,

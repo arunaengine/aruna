@@ -11,6 +11,8 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_storage::StorageHandle;
 use tempfile::tempdir;
 
+use crate::tests::calls::{child, runs_child};
+
 const GRAPH: &str = "https://example.org/graph/1";
 const HAS_PART: &str = "http://schema.org/hasPart";
 
@@ -274,4 +276,170 @@ async fn retry_settles_unverified() {
         .await
         .unwrap();
     assert_eq!(rows, vec![posting_key(&verified_key, document)]);
+}
+
+fn version() -> Ulid {
+    Ulid::from_parts(9, 9)
+}
+
+fn posting() -> LinkPosting {
+    LinkPosting {
+        cursor: Ulid::from_parts(1, 1),
+        part: false,
+        subjects: vec!["#file".to_string()],
+    }
+}
+
+fn version_link() -> DataLink {
+    DataLink::Version {
+        realm_id: realm(),
+        version_id: version(),
+    }
+}
+
+// One local set whose hint matches the version, so the version index is read there.
+fn members(set_id: Ulid) -> BTreeMap<SetHint, Vec<Ulid>> {
+    BTreeMap::from([(SetHint::of_version(version()), vec![set_id])])
+}
+
+fn index_read(set_id: Ulid) -> IoCall {
+    let key = Key::from(index_key(set_id, version()));
+    IoCall::Read(vec![(VERSION_INDEX_KEYSPACE.to_string(), key)])
+}
+
+#[test]
+fn members_empty_page() {
+    let mut local = LocalMembersOperation::new();
+    let page = page_call(DISTRIBUTION_KEYSPACE, Vec::new(), None);
+    assert_eq!(local.first(), Ok(Next::Call(page)));
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    assert_eq!(local.next(empty), Ok(Next::Done(BTreeMap::new())));
+}
+
+#[test]
+fn members_skip_malformed() {
+    let mut local = LocalMembersOperation::new();
+    local.first().unwrap();
+    let after = Key::from(vec![2]);
+    let malformed = IoResult::Page {
+        rows: vec![(Key::from(vec![1]), ByteView::from(vec![0xff]))],
+        next: Some(after.clone()),
+    };
+    let page = page_call(DISTRIBUTION_KEYSPACE, Vec::new(), Some(after));
+    assert_eq!(local.next(malformed), Ok(Next::Call(page)));
+}
+
+#[test]
+fn no_versions_done() {
+    let link = DataLink::Set {
+        realm_id: realm(),
+        set_id: Ulid::from_parts(5, 5),
+    };
+    let links = BTreeMap::from([(link, posting())]);
+    let mut associate = AssociateVersionsOperation::new(links.clone());
+    assert_eq!(associate.first(), Ok(Next::Done(links)));
+}
+
+#[test]
+fn unknown_version_unverified() {
+    let mut associate =
+        AssociateVersionsOperation::new(BTreeMap::from([(version_link(), posting())]));
+    assert!(runs_child(associate.first()));
+    let none = child(Ok::<_, DataLinkError>(BTreeMap::<SetHint, Vec<Ulid>>::new()));
+    let unverified = DataLink::Unverified {
+        realm_id: realm(),
+        version_id: version(),
+    };
+    let expected = BTreeMap::from([(version_link(), posting()), (unverified, posting())]);
+    assert_eq!(associate.next(none), Ok(Next::Done(expected)));
+}
+
+#[test]
+fn indexed_version_verified() {
+    let set_id = Ulid::from_parts(5, 5);
+    let mut associate =
+        AssociateVersionsOperation::new(BTreeMap::from([(version_link(), posting())]));
+    associate.first().unwrap();
+    let local = child(Ok::<_, DataLinkError>(members(set_id)));
+    assert_eq!(associate.next(local), Ok(Next::Call(index_read(set_id))));
+    let found = IoResult::Values(vec![Some(ByteView::from(Vec::new()))]);
+    let verified = DataLink::SetVersion {
+        realm_id: realm(),
+        set_id,
+        version_id: version(),
+    };
+    let expected = BTreeMap::from([(version_link(), posting()), (verified, posting())]);
+    assert_eq!(associate.next(found), Ok(Next::Done(expected)));
+}
+
+fn unverified_row() -> (Key, ByteView) {
+    let link = DataLink::Unverified {
+        realm_id: realm(),
+        version_id: version(),
+    };
+    let key = posting_key(&link.key(), Ulid::from_parts(3, 3));
+    (
+        Key::from(key),
+        ByteView::from(posting().to_bytes().unwrap()),
+    )
+}
+
+#[test]
+fn retry_empty_page() {
+    let mut retry = RetryUnverifiedOperation::new(None, None);
+    let page = IoCall::Page {
+        space: DATA_LINK_KEYSPACE.to_string(),
+        prefix: Key::from(unverified_key()),
+        after: None,
+        limit: RETRY_PAGE,
+    };
+    assert_eq!(retry.first(), Ok(Next::Call(page)));
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    assert_eq!(retry.next(empty), Ok(Next::Done(None)));
+}
+
+#[test]
+fn retry_settles_local() {
+    let set_id = Ulid::from_parts(5, 5);
+    let mut retry = RetryUnverifiedOperation::new(None, None);
+    retry.first().unwrap();
+    let after = Key::from(vec![7]);
+    let page = IoResult::Page {
+        rows: vec![unverified_row()],
+        next: Some(after),
+    };
+    assert!(runs_child(retry.next(page)));
+    let local = child(Ok::<_, DataLinkError>(members(set_id)));
+    assert_eq!(retry.next(local), Ok(Next::Call(index_read(set_id))));
+    let found = IoResult::Values(vec![Some(ByteView::from(Vec::new()))]);
+    assert!(runs_child(retry.next(found)));
+    let settled = child(Ok::<(), DataLinkError>(()));
+    assert_eq!(retry.next(settled), Ok(Next::Done(Some(vec![7]))));
+}
+
+#[test]
+fn retry_skips_conflict() {
+    let mut retry = RetryUnverifiedOperation::new(None, None);
+    retry.first().unwrap();
+    let page = IoResult::Page {
+        rows: vec![unverified_row()],
+        next: None,
+    };
+    retry.next(page).unwrap();
+    let set_id = Ulid::from_parts(5, 5);
+    retry
+        .next(child(Ok::<_, DataLinkError>(members(set_id))))
+        .unwrap();
+    retry
+        .next(IoResult::Values(vec![Some(ByteView::from(Vec::new()))]))
+        .unwrap();
+    let conflict = DataLinkError::Storage(StorageError::TransactionConflict);
+    let lost = child(Err::<(), _>(conflict));
+    assert_eq!(retry.next(lost), Ok(Next::Done(None)));
 }

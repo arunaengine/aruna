@@ -31,7 +31,7 @@ use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::api::read_access::{child_results, children};
+use crate::metadata::api::access::{child_results, children};
 use crate::metadata::call_results::page_rows;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 use crate::metadata::record_reads::DocumentRecordOperation;
@@ -897,6 +897,7 @@ mod tests {
     use super::super::data_links::tests::apply_rows;
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::tests::calls::{child, runs_child};
     use aruna_core::effects::StorageEffect;
     use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
     use aruna_core::events::StorageEvent;
@@ -1432,5 +1433,201 @@ mod tests {
             panic!("expected an empty page");
         };
         assert_eq!(page, BacklinkPage::default());
+    }
+
+    fn materialized(record: &MetadataRegistryRecord) -> ByteView {
+        let status = MaterializationStatusRecord {
+            document_id: record.document_id,
+            event_id: record.last_event_id,
+            graph_iri: record.graph_iri.clone(),
+            context_digest: None,
+            dataset_digest: None,
+            state: MaterializationState::Materialized,
+            attempts: 1,
+            failures: 0,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        ByteView::from(postcard::to_allocvec(&status).unwrap())
+    }
+
+    #[test]
+    fn iri_rows_replace() {
+        let document_id = Ulid::from_parts(1, 1);
+        let fresh = record(document_id, Ulid::from_parts(2, 1), "p", OBJECT);
+        let mut rows = IriRowsOperation::new(document_id, vec![fresh.clone()]);
+        assert!(runs_child(rows.first()));
+        let stale = vec![9u8; 8];
+        let existing = child(Ok::<_, DataLinkError>(vec![stale.clone()]));
+        let Ok(Next::Done(planned)) = rows.next(existing) else {
+            panic!("expected the planned rows");
+        };
+        let (key_space, key, value) = iri_reference_entry(&fresh).unwrap();
+        assert!(planned.writes.contains(&(key_space, key, value)));
+        let stale_row = (
+            IRI_INDEX_KEYSPACE.to_string(),
+            ByteView::from(stale.clone()),
+        );
+        assert!(planned.deletes.contains(&stale_row));
+        let document_row = document_key(document_id, &stale).into();
+        assert!((planned.deletes).contains(&(DOCUMENT_IRI_KEYSPACE.to_string(), document_row)));
+    }
+
+    #[test]
+    fn projection_reads_references() {
+        let document_id = Ulid::from_parts(1, 1);
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+        let document = (document_id, Ulid::from_parts(2, 1), graph_iri.clone());
+        let mut project = ProjectRowsOperation::new(document);
+        let effect = Effect::Metadata(MetadataEffect::IriReferences { graph_iri });
+        assert_eq!(
+            project.first(),
+            Ok(Next::Call(IoCall::Effect(Box::new(effect))))
+        );
+        let references = MetadataEvent::IriReferences {
+            references: Vec::new(),
+        };
+        let answered = IoResult::Event(Box::new(Event::Metadata(references)));
+        assert!(runs_child(project.next(answered)));
+        let links = child(Ok::<_, DataLinkError>(
+            BTreeMap::<DataLink, LinkPosting>::new(),
+        ));
+        assert!(runs_child(project.next(links)));
+        assert!(runs_child(
+            project.next(child(Ok::<_, DataLinkError>(LinkRows::default())))
+        ));
+        let iris = child(Ok::<_, MetadataIriError>(LinkRows::default()));
+        assert_eq!(project.next(iris), Ok(Next::Done((LinkRows::default(), 0))));
+    }
+
+    #[test]
+    fn projection_error_unexpected() {
+        let document_id = Ulid::from_parts(1, 1);
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+        let mut project = ProjectRowsOperation::new((document_id, document_id, graph_iri));
+        project.first().unwrap();
+        let failed = MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::GraphNotFound,
+        };
+        let answered = IoResult::Event(Box::new(Event::Metadata(failed)));
+        assert!(matches!(
+            project.next(answered),
+            Err(MetadataIriError::UnexpectedEvent(_))
+        ));
+    }
+
+    #[test]
+    fn replace_needs_current() {
+        let record = registry_record(Ulid::from_parts(1, 1), Ulid::from_parts(2, 1));
+        let mut replace = ReplaceRowsOperation::new(record.clone(), LinkRows::default());
+        assert_eq!(replace.transaction(), TransactionMode::Write);
+        let read = IoCall::Read(status_rows(std::slice::from_ref(&record)));
+        assert_eq!(replace.first(), Ok(Next::Call(read)));
+        assert_eq!(
+            replace.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(false))
+        );
+    }
+
+    #[test]
+    fn replace_writes_first() {
+        let record = registry_record(Ulid::from_parts(1, 1), Ulid::from_parts(2, 1));
+        let write = (
+            IRI_INDEX_KEYSPACE.to_string(),
+            ByteView::from(vec![1]),
+            ByteView::from(vec![2]),
+        );
+        let delete = (IRI_INDEX_KEYSPACE.to_string(), ByteView::from(vec![3]));
+        let rows = LinkRows {
+            writes: vec![write.clone()],
+            deletes: vec![delete.clone()],
+        };
+        let mut replace = ReplaceRowsOperation::new(record.clone(), rows);
+        replace.first().unwrap();
+        let current = IoResult::Values(vec![Some(materialized(&record))]);
+        assert_eq!(
+            replace.next(current),
+            Ok(Next::Call(IoCall::Write(vec![write])))
+        );
+        assert_eq!(
+            replace.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Delete(vec![delete])))
+        );
+        assert_eq!(replace.next(IoResult::Done), Ok(Next::Done(true)));
+    }
+
+    #[test]
+    fn rebuild_empty_registry() {
+        let mut rebuild = RebuildIrisOperation::new();
+        let page = IoCall::Page {
+            space: METADATA_INDEX_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
+            limit: INDEX_PAGE_SIZE,
+        };
+        assert_eq!(rebuild.first(), Ok(Next::Call(page)));
+        let empty = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert!(runs_child(rebuild.next(empty)));
+        let live = child(Ok::<_, LiveRecordsError>(
+            Vec::<MetadataRegistryRecord>::new(),
+        ));
+        assert_eq!(rebuild.next(live), Ok(Next::Call(IoCall::Read(Vec::new()))));
+        assert_eq!(
+            rebuild.next(IoResult::Values(Vec::new())),
+            Ok(Next::Done(0))
+        );
+    }
+
+    #[test]
+    fn rebuild_counts_postings() {
+        let record = registry_record(Ulid::from_parts(1, 1), Ulid::from_parts(2, 1));
+        let mut rebuild = RebuildIrisOperation::new();
+        rebuild.first().unwrap();
+        let row = (
+            Key::from(vec![1]),
+            ByteView::from(postcard::to_allocvec(&record).unwrap()),
+        );
+        let page = IoResult::Page {
+            rows: vec![row],
+            next: None,
+        };
+        rebuild.next(page).unwrap();
+        let live = child(Ok::<_, LiveRecordsError>(vec![record.clone()]));
+        rebuild.next(live).unwrap();
+        let statuses = IoResult::Values(vec![Some(materialized(&record))]);
+        assert!(runs_child(rebuild.next(statuses)));
+        let projected = child(Ok::<_, MetadataIriError>((LinkRows::default(), 3usize)));
+        assert!(runs_child(rebuild.next(projected)));
+        let replaced = child(Ok::<_, MetadataIriError>(true));
+        assert_eq!(rebuild.next(replaced), Ok(Next::Done(3)));
+    }
+
+    #[test]
+    fn lookup_empty_page() {
+        let mut lookup = ReferenceLookupOperation::new(("p", OBJECT), 10);
+        assert!(runs_child(lookup.first()));
+        let page = (BacklinkPage::default(), open_budget());
+        let answered = child(Ok::<_, BacklinkError>(page));
+        assert_eq!(
+            lookup.next(answered),
+            Ok(Next::Done((Vec::new(), BTreeMap::new())))
+        );
+    }
+
+    #[test]
+    fn lookup_budget_ends() {
+        let mut lookup = ReferenceLookupOperation::new(("p", OBJECT), 10);
+        lookup.first().unwrap();
+        let spent = child(Err::<(BacklinkPage, LinkBudget), _>(
+            BacklinkError::BudgetExhausted,
+        ));
+        assert_eq!(
+            lookup.next(spent),
+            Ok(Next::Done((Vec::new(), BTreeMap::new())))
+        );
     }
 }

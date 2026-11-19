@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
-use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use aruna_core::events::Event;
 use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults, MetadataSearchHit,
@@ -20,8 +19,8 @@ use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use tracing::Span;
 
-use super::peer_auth::config_digest_matches;
-use super::search::clamp_remote_limit;
+use super::peer_auth::{authorize_peer, config_digest_matches};
+use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
     read_budget, write_body_at, write_message_at, write_stream_body, write_transport_message,
@@ -33,7 +32,6 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::ForwardedCallerOperation;
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
@@ -105,16 +103,20 @@ impl MetadataHandle {
             return MetadataTransportMessage::Reject("mirror_internal".to_string());
         };
         let vouched = matches!(auth_token, Some(AuthToken::Internal(_)));
-        // A mirror needs a caller; a device replay vouches for writes, not for mirrors.
-        let token = match auth_token {
-            Some(AuthToken::Replay { .. }) | None => {
+        let auth = match authorize_peer(
+            &self.inner.auth_validation,
+            &self.inner.storage_handle,
+            peer,
+            Some(*net_handle.realm_id()),
+            auth_token,
+            true,
+        )
+        .await
+        {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
                 return MetadataTransportMessage::Reject("access_denied".to_string());
             }
-            Some(token) => token,
-        };
-        let check = ForwardedCallerOperation::for_token(peer, *net_handle.realm_id(), Some(token));
-        let auth = match drive(check, context.as_ref()).await {
-            Ok(auth) => auth,
             Err(_) => return MetadataTransportMessage::Reject("access_denied".to_string()),
         };
 
@@ -334,7 +336,7 @@ impl MetadataHandle {
         peer: NodeId,
         message: MetadataTransportMessage,
     ) -> MetadataTransportMessage {
-        if context.graph_handle.is_none() {
+        let Some(graph) = context.graph_handle.as_ref() else {
             return match message {
                 MetadataTransportMessage::QueryGraphs { .. } => {
                     MetadataTransportMessage::QueryResults {
@@ -345,7 +347,7 @@ impl MetadataHandle {
                     result: Err(MetadataReadError::Unavailable),
                 },
             };
-        }
+        };
         match message {
             MetadataTransportMessage::QueryGraphs {
                 auth_token,
@@ -407,24 +409,26 @@ impl MetadataHandle {
             } => {
                 Box::pin(async {
                     match self.read_caller(context, peer, auth_token, false).await {
-                        // Peers filter by the profile an entity conforms to, and by nothing else.
-                        Ok(_) if predicate_iri != DCTERMS_CONFORMS_IRI => {
-                            MetadataTransportMessage::SearchResults {
-                                result: Err(MetadataReadError::Unavailable),
+                        Ok(auth_context) => match search_local_graphs(
+                            context,
+                            self.inner.clone(),
+                            graph,
+                            auth_context,
+                            graph_iris,
+                            query,
+                            clamp_remote_limit(limit),
+                            group_id,
+                            Some((predicate_iri, object_iri)),
+                        )
+                        .await
+                        {
+                            Ok(hits) => {
+                                MetadataTransportMessage::SearchResults { result: Ok(hits) }
                             }
-                        }
-                        Ok(auth_context) => {
-                            let search = MetadataEffect::SearchGraphs {
-                                auth_context,
-                                graph_iris,
-                                query,
-                                limit: clamp_remote_limit(limit),
-                                group_id,
-                                conforms_to: Some(object_iri),
-                            };
-                            let result = search_answer(self.run_effect(context, search).await);
-                            MetadataTransportMessage::SearchResults { result }
-                        }
+                            Err(error) => MetadataTransportMessage::SearchResults {
+                                result: Err(metadata_read_error(error)),
+                            },
+                        },
                         Err(error) => {
                             MetadataTransportMessage::SearchResults { result: Err(error) }
                         }
@@ -460,7 +464,7 @@ impl MetadataHandle {
                                     .and_then(|document| document.urls.s3);
                                 let local = (*net.realm_id(), net.node_id());
                                 let preflight =
-                                    super::super::api::preflight_local::references_preflight_local(
+                                    super::super::api::preflight::local::references_preflight_local(
                                         local, auth, *request, endpoint,
                                     );
                                 drive(preflight, context.as_ref())

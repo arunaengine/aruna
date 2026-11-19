@@ -1341,7 +1341,7 @@ fn skewed_event_deferred() {
 }
 
 #[test]
-fn deleted_graph_conflicts_commit() {
+fn deleted_graph_conflicts() {
     let event = create_event();
     let mut commit = ProjectionCommitOperation {
         writes: aruna_core::storage_entries::registry_write_entries(&event.record).unwrap(),
@@ -1392,7 +1392,7 @@ fn missing_event_fails() {
 }
 
 #[test]
-fn malformed_marker_deleted_call() {
+fn malformed_marker_call() {
     let mut drain = DrainProjectionOperation::new(None, max_clock_skew());
     drain.first().unwrap();
     let rows = vec![(Key::from(vec![1, 2, 3]), Value::from(Vec::new()))];

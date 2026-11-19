@@ -94,7 +94,7 @@ fn last_page_ends() {
 }
 
 #[test]
-fn open_page_signs_cursor() {
+fn open_page_signs() {
     let mut search = started(request(ObjectQueryMode::Local, None));
     search.first().unwrap();
     let Ok(Next::Call(IoCall::Effect(call))) = search.next(fanout(vec![page(&["a"], Some("a"))]))

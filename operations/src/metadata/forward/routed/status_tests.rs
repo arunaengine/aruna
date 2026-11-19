@@ -86,7 +86,7 @@ fn forwarded(
 }
 
 #[test]
-fn missing_document_not_found() {
+fn document_not_found() {
     let mut status = RoutedStatusOperation::new((Some(node(1)), realm()), request(), None, false);
     assert!(matches!(status.first(), Ok(Next::Call(IoCall::Child(_)))));
     let missing = child(Ok::<Option<MetadataRegistryRecord>, LiveRecordsError>(None));
@@ -94,7 +94,7 @@ fn missing_document_not_found() {
 }
 
 #[test]
-fn offline_node_answers_here() {
+fn offline_answers_here() {
     let mut routed = RoutedStatusOperation::new((None, realm()), request(), None, false);
     routed.first().unwrap();
     let found = child(Ok::<_, LiveRecordsError>(Some(record())));
@@ -138,7 +138,7 @@ fn split_answer_unavailable() {
 }
 
 #[test]
-fn local_status_checks_reader() {
+fn local_checks_reader() {
     let node = (realm(), Some(node(1)));
     let mut local = LocalStatusOperation::new(node, request(), Some(record()), true);
     assert!(matches!(local.first(), Ok(Next::Call(IoCall::Child(_)))));

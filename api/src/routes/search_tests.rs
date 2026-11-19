@@ -29,7 +29,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::materialization_queue::process_materialization_batch;
+use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::{drain_projection_queue, replay_event_log};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;

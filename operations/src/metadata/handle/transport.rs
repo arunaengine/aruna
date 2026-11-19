@@ -27,7 +27,6 @@ use crate::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, decode_message, encode_message, frame_class,
     response_cap,
 };
-use aruna_core::metadata::AuthToken;
 use aruna_core::telemetry::record_error;
 
 #[tracing::instrument(

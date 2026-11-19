@@ -13,8 +13,8 @@ use aruna_core::placement::read_holder_sets;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 
-use super::holder_reads::{AuthFailure, ReadDecision, reduce_holder_reads};
-use super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT, device_raw_revision};
+use super::super::holder_reads::{AuthFailure, ReadDecision, reduce_holder_reads};
+use super::super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT, device_raw_revision};
 use crate::device::replica::{ReplicaRecord, read_answer, replica_read};
 use crate::device::selection::keep_read;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -510,5 +510,5 @@ impl Operation for RoutedExportOperation {
 }
 
 #[cfg(test)]
-#[path = "routed_export_tests.rs"]
+#[path = "export_tests.rs"]
 mod call_tests;

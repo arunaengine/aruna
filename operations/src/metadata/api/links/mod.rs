@@ -33,7 +33,6 @@ use super::node_fanout::{FanoutParts, NodeCalls, NodeFanoutOperation, peer_answe
 use super::{
     ApiQueryMode, AuthContext, Event, MetadataApiError, MetadataFanoutOperation,
     MetadataFanoutScope, MetadataReadError, NodeId, RealmId, Span, Ulid, fanout_bearer,
-    map_read_error,
 };
 use crate::forward::transport::read_error;
 use crate::metadata::object_version::{ObjectVersion, ObjectVersionError, ObjectVersionOperation};
@@ -162,7 +161,6 @@ impl Operation for SetPreviewFanout {
             distributed_scope(),
             MetadataFanoutOperation::IdentifierLookup,
             calls,
-            map_read_error,
         );
         Ok(Next::Call(IoCall::child(fanout)))
     }
@@ -283,7 +281,6 @@ impl Operation for LinksFanout {
             distributed_scope(),
             MetadataFanoutOperation::IdentifierLookup,
             calls,
-            map_read_error,
         );
         Ok(Next::Call(IoCall::child(fanout)))
     }

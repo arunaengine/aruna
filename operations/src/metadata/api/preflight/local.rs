@@ -18,18 +18,18 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key};
 use ulid::Ulid;
 
-use super::list::PendingRecordsOperation;
-use super::preflight::{
-    MAX_TARGET_VERSIONS, PREFLIGHT_BUDGET, add_location_iris, index_state, visible_prefix,
-};
-use super::preflight_types::{
+use super::super::access::{child_results, children};
+use super::super::list::PendingRecordsOperation;
+use super::super::preflight_types::{
     MetadataNodeFreshness, MetadataPreflightLocation, MetadataVisibleReference,
     ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,
 };
-use super::read_access::{child_results, children};
-use super::readable::RecordReadableOperation;
-use super::title::DocumentTitleOperation;
-use super::{MAX_PAGINATION_DEPTH, MetadataApiError, REGISTRY_CANDIDATE_LIMIT};
+use super::super::readable::RecordReadableOperation;
+use super::super::title::DocumentTitleOperation;
+use super::super::{MAX_PAGINATION_DEPTH, MetadataApiError, REGISTRY_CANDIDATE_LIMIT};
+use super::{
+    MAX_TARGET_VERSIONS, PREFLIGHT_BUDGET, add_location_iris, index_state, visible_prefix,
+};
 use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::metadata::call_results::page_rows;
 use crate::metadata::data_links::LinkBudget;
@@ -453,5 +453,5 @@ impl Operation for LocalPreflightOperation {
 }
 
 #[cfg(test)]
-#[path = "preflight_local_tests.rs"]
+#[path = "local_tests.rs"]
 mod call_tests;

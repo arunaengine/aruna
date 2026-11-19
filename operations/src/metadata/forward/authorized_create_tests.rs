@@ -71,7 +71,7 @@ fn create(path: &str) -> AuthorizedCreateOperation {
     AuthorizedCreateOperation::new(node, (auth(realm()), extras(), None), document)
 }
 
-fn pinned(target: NodeId) -> CreateWithIdOperation {
+fn pinned(target: NodeId) -> PinnedCreateOperation {
     let actor = Actor {
         node_id: node(1),
         user_id: auth(realm()).user_id,
@@ -85,7 +85,7 @@ fn pinned(target: NodeId) -> CreateWithIdOperation {
         payload: payload(),
         message: None,
     };
-    CreateWithIdOperation::new((actor, Some(node(1))), (auth(realm()), extras()), create)
+    PinnedCreateOperation::new((actor, Some(node(1))), (auth(realm()), extras()), create)
 }
 
 #[test]
@@ -122,7 +122,7 @@ fn routed_create_emits() {
 }
 
 #[test]
-fn pinned_foreign_realm_refused() {
+fn foreign_pin_refused() {
     let mut create = pinned(node(1));
     create.auth = auth(RealmId::from_bytes([9; 32]));
     assert_eq!(create.first(), Err(CreateAuthorizedError::Forbidden));

@@ -4,9 +4,11 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::PeerAuthRefusal;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
+use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 
@@ -44,17 +46,20 @@ fn config_read(result: IoResult) -> Result<RealmConfigDocument, MetadataReadErro
 enum ReadStage {
     Caller,
     Config,
+    Contact,
 }
 
 /// The caller of a read a peer forwarded. A bearer or internal token is checked as a forwarded
 /// write's is; without one the read is anonymous from a configured member. A trusted read also
-/// needs a peer that may vouch for users.
+/// needs a peer that may vouch for users. An accepted read refreshes the peer's last contact.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ReadPeerOperation {
     peer: NodeId,
     realm_id: RealmId,
     auth_token: Option<AuthToken>,
     trusted: bool,
+    /// Whether the token check left the last contact to this read; a bearer check refreshes it.
+    contact: bool,
     auth: Option<AuthContext>,
     stage: ReadStage,
 }
@@ -70,9 +75,19 @@ impl ReadPeerOperation {
             realm_id,
             auth_token,
             trusted,
+            contact: true,
             auth: None,
             stage: ReadStage::Caller,
         }
+    }
+
+    fn accepted(&mut self) -> Turn<Option<AuthContext>> {
+        if !self.contact {
+            return Ok(Next::Done(self.auth.take()));
+        }
+        self.stage = ReadStage::Contact;
+        let contact = Effect::Net(NetEffect::PeerContact(self.peer));
+        Ok(Next::Call(IoCall::Effect(Box::new(contact))))
     }
 
     fn config(&mut self) -> Turn<Option<AuthContext>> {
@@ -90,8 +105,13 @@ impl Operation for ReadPeerOperation {
         match self.auth_token.take() {
             // A device replay vouches for a write, never for a read.
             Some(AuthToken::Replay { .. }) => Err(MetadataReadError::Unavailable),
-            Some(token) => {
+            Some(token @ AuthToken::Bearer(_)) => {
+                self.contact = false;
                 let check = WritePeerOperation::new(self.peer, token);
+                Ok(Next::Call(IoCall::child(check)))
+            }
+            Some(token) => {
+                let check = WritePeerOperation::quiet(self.peer, token);
                 Ok(Next::Call(IoCall::child(check)))
             }
             None => self.config(),
@@ -104,7 +124,7 @@ impl Operation for ReadPeerOperation {
                 self.auth = Some(caller_read(result, self.realm_id)?);
                 match self.trusted {
                     true => self.config(),
-                    false => Ok(Next::Done(self.auth.take())),
+                    false => self.accepted(),
                 }
             }
             ReadStage::Config => {
@@ -119,6 +139,11 @@ impl Operation for ReadPeerOperation {
                     ensure_peer_trust(&config, peer, realm_id, PeerTrust::Vouched(None))
                         .map_err(unavailable)?;
                 }
+                self.accepted()
+            }
+            ReadStage::Contact => {
+                // The read is accepted; a missed contact refresh only dates the peer's liveness.
+                let _ = event(result);
                 Ok(Next::Done(self.auth.take()))
             }
         }
@@ -137,6 +162,7 @@ pub(crate) enum PeerReader {
 }
 
 /// The caller of a search or release request a peer forwarded, as [`PeerReader`] admits it.
+/// These requests leave the peer's last-contact time as it was.
 #[derive(Debug, PartialEq)]
 pub(crate) struct SearchPeerOperation {
     peer: NodeId,
@@ -177,7 +203,7 @@ impl Operation for SearchPeerOperation {
     fn first(&mut self) -> Turn<AuthContext> {
         match (self.auth_token.take(), self.reader) {
             (Some(token @ AuthToken::Bearer(_)), _) => {
-                let check = WritePeerOperation::new(self.peer, token);
+                let check = WritePeerOperation::quiet(self.peer, token);
                 Ok(Next::Call(IoCall::child(check)))
             }
             (None, PeerReader::Buckets) => self.config(),
@@ -195,7 +221,7 @@ impl Operation for SearchPeerOperation {
                 self.auth = Some(auth);
                 self.config()
             }
-            ReadStage::Config => {
+            ReadStage::Config | ReadStage::Contact => {
                 let (peer, realm_id) = (self.peer, self.realm_id);
                 let Some(auth) = self.auth.take() else {
                     let config = config_read(result)?;

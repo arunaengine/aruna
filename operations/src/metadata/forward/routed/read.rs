@@ -14,9 +14,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
-use super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
-use super::read::METADATA_READ_DEADLINE;
-use super::routed_export::owner_reads;
+use super::super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
+use super::super::read::METADATA_READ_DEADLINE;
+use super::export::owner_reads;
 use crate::device::replica::{ReplicaRecord, read_answer as replica_answer, replica_read};
 use crate::device::selection::keep_read;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -46,10 +46,9 @@ enum ReadStage {
     Kept(MetadataRegistryRecord),
 }
 
-/// Reads one registry record on its holders, this node's own copy among them, all at once
-/// under one deadline. A device answers from its pinned replica, so a selected document stays
-/// readable while the realm is out of reach; an unselected replica answers only when the realm
-/// is unavailable, and the owner's own online read is kept for offline use.
+/// Reads one registry record on its holders, this node's copy among them, at once under one
+/// deadline. A device answers from its pinned replica; an unselected replica answers only while
+/// the realm is out of reach, and the owner's online read is kept for offline use.
 #[derive(Debug, PartialEq)]
 pub struct RoutedReadOperation {
     local_node: Option<NodeId>,
@@ -296,5 +295,5 @@ impl Operation for RoutedReadOperation {
 }
 
 #[cfg(test)]
-#[path = "routed_read_tests.rs"]
+#[path = "read_tests.rs"]
 mod call_tests;

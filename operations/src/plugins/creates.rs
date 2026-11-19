@@ -28,9 +28,9 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::forward::authorized_create::CreateAuthorizedError;
-use crate::metadata::forward::authorized_create::CreateWithIdOperation;
+use crate::metadata::forward::authorized_create::PinnedCreateOperation;
 use crate::metadata::forward::pinned::PinnedCreate;
-use crate::metadata::forward::routed_read::RoutedReadOperation;
+use crate::metadata::forward::routed::read::RoutedReadOperation;
 use crate::metadata::update_document::UpdateDocumentError;
 
 /// How the key row of a create was found.
@@ -346,7 +346,7 @@ impl FinishCreate {
                 let extras = PolicyRequestExtras::operation("plugin.metadata.create");
                 let who = (self.actor.clone(), self.network_node);
                 let auth = (self.granted.auth.clone(), extras);
-                let create = CreateWithIdOperation::new(who, auth, (**pinned).clone());
+                let create = PinnedCreateOperation::new(who, auth, (**pinned).clone());
                 self.phase = CreatePhase::Create;
                 Next::Call(IoCall::child(create))
             }

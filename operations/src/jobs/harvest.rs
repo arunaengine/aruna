@@ -55,8 +55,8 @@ use crate::metadata::create_document::{
     CreateDocumentResult, mint_document_for,
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
-use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
-use crate::metadata::forward::routed_write::RouteDeleteOperation;
+use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
+use crate::metadata::forward::routed::write::RouteDeleteOperation;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
 use crate::metadata::update_document::UpdateDocumentMutation;
 

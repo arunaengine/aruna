@@ -19,12 +19,12 @@ use aruna_operations::metadata::api::read::query_metadata;
 use aruna_operations::metadata::api::read_types::{
     DocumentQueryRequest, MetadataQueryRequest, MetadataReferencesRequest,
 };
+use aruna_operations::metadata::api::realm_search::search_metadata;
 use aruna_operations::metadata::api::references::ReferencesOperation;
-use aruna_operations::metadata::api::search_fanout::search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
-use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
-use aruna_operations::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
+use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
+use aruna_operations::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use aruna_operations::metadata::profile::validation::ProfileAssessOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use rmcp::Json;
@@ -1214,11 +1214,9 @@ mod authorization_tests {
                 .await
                 .unwrap();
         }
-        aruna_operations::metadata::materialization_queue::process_materialization_batch(
-            ctx.as_ref(),
-        )
-        .await
-        .unwrap();
+        aruna_operations::testing::process_materialization_batch(ctx.as_ref())
+            .await
+            .unwrap();
         // A text search sees only committed index updates.
         let graph = ctx.graph_handle.as_ref().unwrap();
         graph.flush_search_updates().await.unwrap();

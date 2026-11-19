@@ -42,7 +42,7 @@ fn check(document: u8) -> DocumentMatchOperation {
 }
 
 #[test]
-fn empty_index_matches_nothing() {
+fn empty_index_unmatched() {
     let mut lookup = IdentifierLookupOperation::new(realm(), None, query());
     assert!(matches!(
         lookup.first(),
@@ -56,7 +56,7 @@ fn empty_index_matches_nothing() {
 }
 
 #[test]
-fn indexed_documents_checked_once() {
+fn documents_checked_once() {
     let mut lookup = IdentifierLookupOperation::new(realm(), None, query());
     lookup.first().unwrap();
     let page = IoResult::Page {

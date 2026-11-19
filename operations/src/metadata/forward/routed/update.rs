@@ -14,7 +14,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
-use super::write::device_edit_error;
+use super::super::write::device_edit_error;
 use crate::device::edit::{DeviceEditError, accepts_edits, apply_local_edit};
 use crate::device::publish_queue::token_issued_at;
 use crate::device::replica::{ReplicaRecord, read_answer, replica_read};
@@ -59,10 +59,9 @@ enum UpdateStage {
     Forward,
 }
 
-/// Updates one document. On a device a selected or read document is edited locally and
-/// queued; a holder sees the change set when the intake drain forwards it. Otherwise this node
-/// updates its own copy when it holds the document, and hands the change to the other holders
-/// when it does not or its history is full. A known record pins the holders to its frozen set.
+/// Updates one document. A device edits a selected or read document locally and queues it for
+/// the intake drain; a holder updates its own copy, and hands the change to the other holders
+/// when it holds none or its history is full. A known record pins the holders to its frozen set.
 #[derive(Debug, PartialEq)]
 pub struct RouteUpdateOperation {
     actor: Actor,
@@ -296,5 +295,5 @@ impl Operation for RouteUpdateOperation {
 }
 
 #[cfg(test)]
-#[path = "routed_update_tests.rs"]
+#[path = "update_tests.rs"]
 mod call_tests;

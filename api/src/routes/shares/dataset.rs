@@ -21,7 +21,7 @@ use aruna_operations::metadata::api::export::ExportOperation;
 use aruna_operations::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use aruna_operations::metadata::forward::routed_export::ensure_export_limit;
+use aruna_operations::metadata::forward::routed::export::ensure_export_limit;
 use aruna_operations::shares::dataset::{
     DatasetFile, FilePlace, MemberSet, NamedSets, dataset_files, named_sets,
 };

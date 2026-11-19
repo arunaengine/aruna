@@ -14,8 +14,8 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
-use super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
-use super::read::{METADATA_READ_DEADLINE, keep_status};
+use super::super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
+use super::super::read::{METADATA_READ_DEADLINE, keep_status};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::read_answer;
 use crate::forward::transport::read_error;
@@ -316,5 +316,5 @@ impl Operation for RoutedStatusOperation {
 }
 
 #[cfg(test)]
-#[path = "routed_status_tests.rs"]
+#[path = "status_tests.rs"]
 mod call_tests;

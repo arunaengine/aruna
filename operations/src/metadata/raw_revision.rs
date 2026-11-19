@@ -466,6 +466,8 @@ pub(crate) mod tests {
         Ok(plan)
     }
     use crate::metadata::raw_events::{RAW_EVENT_LIMIT, RAW_PAGE_SIZE};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::storage_entries::create_event_entry;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
@@ -712,5 +714,94 @@ pub(crate) mod tests {
         let jsonld = plan.revision.unwrap().jsonld;
         assert!(jsonld.contains("\"name\":\"latest\""));
         assert!(!jsonld.contains("\"name\":\"late\""));
+    }
+
+    fn render() -> String {
+        let MetadataEventPayload::RoCrate { jsonld } = crate_payload("merged") else {
+            unreachable!("the crate payload carries JSON-LD");
+        };
+        jsonld
+    }
+
+    fn state_read(state: Option<RawRevisionState>) -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(Ok::<_, RawReadError>(
+            state,
+        )))
+    }
+
+    fn planned(turn: PlanTurn) -> RawEventPlan {
+        match turn {
+            Ok(Next::Done(plan)) => plan,
+            other => panic!("expected a plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scaffold_starts_state() {
+        let event = test_event(Ulid::from_parts(5, 1), 5);
+        let mut prepare = PrepareRawOperation::new(event.clone(), RawStateCache::default());
+        assert!(matches!(prepare.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let plan = planned(prepare.next(state_read(None)));
+        assert!(!plan.rebuild);
+        let key = raw_revision_key(event.record.document_id);
+        assert_eq!(plan.state_write.1, key);
+    }
+
+    #[test]
+    fn merged_cache_kept() {
+        let event = test_event(Ulid::from_parts(5, 1), 5);
+        let state = RawRevisionState {
+            base: None,
+            last_event_id: Ulid::from_parts(4, 1),
+            revision: None,
+            merged: true,
+        };
+        let cache = RawStateCache {
+            loaded: true,
+            state: Some(state.clone()),
+        };
+        let plan = planned(PrepareRawOperation::new(event, cache).first());
+        assert!(!plan.rebuild);
+        assert_eq!(plan.state, state);
+    }
+
+    #[test]
+    fn newer_event_advances() {
+        let event = test_event(Ulid::from_parts(5, 1), 5);
+        let state = RawRevisionState {
+            base: None,
+            last_event_id: Ulid::from_parts(4, 1),
+            revision: None,
+            merged: false,
+        };
+        let mut prepare = PrepareRawOperation::new(event, RawStateCache::default());
+        prepare.first().unwrap();
+        let read = prepare.next(state_read(Some(state.clone())));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(prepare.stage, PrepareStage::Advance(state));
+    }
+
+    #[test]
+    fn merge_renders_cached() {
+        let event = test_event(Ulid::from_parts(5, 1), 5);
+        let cache = RawStateCache {
+            loaded: true,
+            state: None,
+        };
+        let mut prepare = PrepareMergedOperation::new(event, (render(), 0), cache);
+        let plan = planned(prepare.first());
+        let revision = plan.revision.expect("a valid render becomes the revision");
+        assert_eq!(revision.jsonld, render());
+        assert!(plan.state.merged);
+    }
+
+    #[test]
+    fn merge_reads_state() {
+        let event = test_event(Ulid::from_parts(5, 1), 5);
+        let mut prepare =
+            PrepareMergedOperation::new(event, (render(), 0), RawStateCache::default());
+        assert!(matches!(prepare.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let plan = planned(prepare.next(state_read(None)));
+        assert!(plan.state.merged);
     }
 }

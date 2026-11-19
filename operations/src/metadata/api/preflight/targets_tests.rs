@@ -86,7 +86,7 @@ fn empty_bucket_refused() {
 }
 
 #[test]
-fn missing_bucket_not_found() {
+fn bucket_not_found() {
     let target = bucket_target(MetadataStorageOperation::LatestVersionTombstone);
     let mut resolve = ResolveTargetsOperation::new((realm(), node()), auth(), target, None);
     resolve.first().unwrap();

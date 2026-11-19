@@ -15,7 +15,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::read::query_metadata as run_query_metadata;
 use aruna_operations::metadata::api::read_types::{DocumentQueryRequest, MetadataQueryRequest};
-use aruna_operations::metadata::api::search_fanout::search_metadata as run_search_metadata;
+use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

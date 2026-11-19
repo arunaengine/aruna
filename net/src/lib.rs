@@ -1093,6 +1093,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::DelegatedRead(_)) => "delegated_read",
         Effect::Net(NetEffect::DatasetSummary(_)) => "dataset_summary",
         Effect::Net(NetEffect::WritePeerAuth(_)) => "write_peer_auth",
+        Effect::Net(NetEffect::PeerContact(_)) => "peer_contact",
         Effect::Net(NetEffect::GrantSign(_)) => "grant_sign",
         Effect::Net(NetEffect::DelegationSign(_)) => "delegation_sign",
         Effect::Net(NetEffect::AvoidHolder { .. }) => "avoid_holder",

@@ -1028,6 +1028,7 @@ mod tests {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_core::time::unix_timestamp_millis;
     use aruna_core::{NodeId, UserId};
     use aruna_storage::storage;
     use std::collections::{HashMap, HashSet};

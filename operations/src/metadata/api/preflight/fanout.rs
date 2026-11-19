@@ -18,28 +18,28 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use tracing::Span;
 
-use super::distributed_types::record_preflight_node;
-use super::fanout_types::{
+use super::super::distributed_types::record_preflight_node;
+use super::super::fanout_types::{
     MetadataFanoutOperation, MetadataFanoutScope, RealmNodeDiscovery, forwarded_bearer,
 };
-use super::node_fanout::{
+use super::super::node_fanout::{
     FanoutParts, NodeCalls, NodeFanoutOperation, discovery_answer, discovery_call, peer_answer,
     peer_request,
 };
-use super::preflight::{
-    PreflightCursorPlan, PreflightPlan, ResolvedPreflightTargets, assemble_preflight_execution,
-    plan_preflight_request,
-};
-use super::preflight_local::references_preflight_local;
-use super::preflight_targets::ResolveTargetsOperation;
-use super::preflight_types::{
+use super::super::preflight_types::{
     MetadataResolvedTarget, ReferenceExecution, ReferenceNodeExecution, ReferenceNodeRequest,
     ReferenceRequest, preflight_fingerprint,
 };
-use super::search_fanout::{cursor_signers, resume_cursor};
-use super::{
+use super::super::realm_search::{cursor_signers, resume_cursor};
+use super::super::{
     ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MAX_PAGINATION_DEPTH, MetadataApiError,
-    MetadataReadError, map_read_error,
+    MetadataReadError,
+};
+use super::local::references_preflight_local;
+use super::targets::ResolveTargetsOperation;
+use super::{
+    PreflightCursorPlan, PreflightPlan, ResolvedPreflightTargets, assemble_preflight_execution,
+    plan_preflight_request,
 };
 use crate::forward::transport::read_error;
 use crate::metadata::protocol::MetadataTransportMessage;
@@ -260,7 +260,6 @@ impl ReferencesPreflightOperation {
             scope,
             MetadataFanoutOperation::ReferencePreflight,
             calls,
-            map_read_error,
         )
         .until(self.deadline());
         self.stage = PreflightStage::Fanout(resolved, cursor);
@@ -348,5 +347,5 @@ impl Operation for ReferencesPreflightOperation {
 }
 
 #[cfg(test)]
-#[path = "preflight_fanout_tests.rs"]
+#[path = "fanout_tests.rs"]
 mod call_tests;

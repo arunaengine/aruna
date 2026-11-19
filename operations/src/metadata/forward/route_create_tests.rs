@@ -99,7 +99,7 @@ fn holder_creates_locally() {
 }
 
 #[test]
-fn non_holder_reads_config() {
+fn outsider_reads_config() {
     let mut route = route();
     route.first().unwrap();
     let refused = child(Err::<CreateDocumentResult, _>(
@@ -175,7 +175,7 @@ fn unavailable_holders_exhaust() {
 }
 
 #[test]
-fn denial_and_findings_map() {
+fn denials_findings_map() {
     let mut route = forwarding(&[node(2)]);
     let denied = reply(MetadataTransportMessage::ForwardedWriteDenied {
         error: WriteAuthError::Forbidden,

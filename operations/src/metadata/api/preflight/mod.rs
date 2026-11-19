@@ -20,6 +20,10 @@ use super::prefix_scan::PrefixScanError;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::search_cursor::{blank_signature, tie_order};
 
+pub mod fanout;
+pub(crate) mod local;
+pub(super) mod targets;
+
 /// The content hash of a location target, which has none: its bytes were never read.
 const LOCATION_HASH: [u8; 32] = [0; 32];
 

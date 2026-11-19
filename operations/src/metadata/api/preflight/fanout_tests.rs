@@ -2,8 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::MetadataFanoutStats;
-use super::super::preflight_types::{MetadataIndexState, MetadataNodeFreshness, ReferenceTarget};
+use super::super::super::MetadataFanoutStats;
+use super::super::super::preflight_types::{
+    MetadataIndexState, MetadataNodeFreshness, ReferenceTarget,
+};
 use super::*;
 use aruna_core::UserId;
 

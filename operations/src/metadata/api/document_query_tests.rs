@@ -83,7 +83,7 @@ fn readable(request: DocumentQueryRequest) -> (DocumentQueryOperation, QueryTurn
 }
 
 #[test]
-fn missing_document_not_found() {
+fn document_not_found() {
     let mut query = DocumentQueryOperation::new(realm(), node(1), request(None, false));
     query.first().unwrap();
     let missing = child(Ok::<Option<MetadataRegistryRecord>, LiveRecordsError>(None));
@@ -91,7 +91,7 @@ fn missing_document_not_found() {
 }
 
 #[test]
-fn local_mode_queries_here() {
+fn local_queries_here() {
     let (mut query, turn) = readable(request(Some(ApiQueryMode::Local), false));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     let turn = query.next(child(Ok::<_, StorageReadError>(true)));
@@ -135,7 +135,7 @@ fn unreadable_config_partial() {
 }
 
 #[test]
-fn replicas_tried_in_order() {
+fn replicas_tried_ordered() {
     let (mut query, _) = readable(request(None, false));
     query.holders = VecDeque::from([node(2), node(1)]);
     let Ok(Next::Call(IoCall::Effect(effect))) = query.next_holder() else {

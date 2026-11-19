@@ -9,8 +9,8 @@ use aruna_operations::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, ExportMetadataResult};
-use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
-use aruna_operations::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
+use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
+use aruna_operations::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
 use aruna_operations::plugins::calls::*;
@@ -29,13 +29,13 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
 use aruna_operations::metadata::create_entry::CreateEntryOperation;
-use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::plugins::dataset::merge_into;
 use aruna_operations::plugins::host_calls::VisibleObjects;
 use aruna_operations::plugins::store::Txn;
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::queued;
 use aruna_operations::testing::drain_projection_queue;
+use aruna_operations::testing::process_materialization_batch;
 
 /// Runs the projection and graph work a write queued.
 async fn project(ctx: &DriverContext) {

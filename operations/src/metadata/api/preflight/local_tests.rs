@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use super::super::preflight_types::{MetadataIndexState, MetadataResolvedTarget};
+use super::super::super::preflight_types::{MetadataIndexState, MetadataResolvedTarget};
 use super::*;
 use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;

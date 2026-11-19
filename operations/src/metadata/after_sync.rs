@@ -287,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_projection_wakes_retry() {
+    fn failed_projection_retries() {
         let mut result = empty();
         result.targets = vec![DocumentTarget::MetadataCreateEvent {
             document_id: ulid::Ulid::from_parts(1, 1),

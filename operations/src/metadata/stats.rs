@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_subsystem_counts_nothing() {
+    fn missing_subsystem_empty() {
         let mut count = GroupPurposeOperation::new(RealmId::from_bytes(REALM_SEED), Ulid::nil());
         assert!(matches!(count.first(), Ok(Next::Call(IoCall::Effect(_)))));
         let missing = IoResult::Event(Box::new(Event::Metadata(MetadataEvent::Error {
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_group_counts_zero() {
+    fn empty_group_zero() {
         let mut count = GroupPurposeOperation::new(RealmId::from_bytes(REALM_SEED), Ulid::nil());
         count.first().unwrap();
         let cached = IoResult::Event(Box::new(Event::Metadata(MetadataEvent::CachedGroup {

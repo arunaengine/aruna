@@ -278,6 +278,8 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::WritePeerAuth(_) => NetEvent::WritePeerAuth(Err(PeerAuthRefusal::Unavailable(
             "peer authorization must be dispatched by the operations runner".to_string(),
         ))),
+        // Peer contacts live in the metadata handle the runner holds.
+        NetEffect::PeerContact(_) => NetEvent::PeerContact,
         // The routed export reads through the handles the runner holds.
         NetEffect::DatasetSummary(_) => {
             NetEvent::DatasetSummary(Err(DescriptionError::Unavailable))
@@ -677,6 +679,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::DelegatedRead(_) => "delegated_read",
         NetEffect::DatasetSummary(_) => "dataset_summary",
         NetEffect::WritePeerAuth(_) => "write_peer_auth",
+        NetEffect::PeerContact(_) => "peer_contact",
         NetEffect::GrantSign(_) => "grant_sign",
         NetEffect::DelegationSign(_) => "delegation_sign",
         NetEffect::AvoidHolder { .. } => "avoid_holder",

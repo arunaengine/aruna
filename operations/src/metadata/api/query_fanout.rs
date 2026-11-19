@@ -29,9 +29,7 @@ use super::fanout_types::{
 };
 use super::node_fanout::{FanoutParts, NodeCalls, NodeFanoutOperation};
 use super::read_types::MetadataQueryExecution;
-use super::{
-    ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError, map_read_error,
-};
+use super::{ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
 use crate::forward::fetch::{peer_call, peer_reply};
 use crate::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
 use crate::metadata::query_cache::{RemoteKeyInput, credential_digest, remote_key};
@@ -366,7 +364,7 @@ pub struct DistributedQueryOperation {
 }
 
 impl DistributedQueryOperation {
-    pub(crate) fn new(
+    pub(super) fn new(
         (realm_id, local_node): (RealmId, NodeId),
         caller: QueryCaller,
         (graph_iris, query): (Option<Vec<String>>, String),
@@ -392,7 +390,7 @@ impl DistributedQueryOperation {
     }
 
     /// Runs a caller's query, which first passes the form check every request does.
-    pub(crate) fn request(
+    pub(super) fn request(
         node: (RealmId, NodeId),
         caller: QueryCaller,
         query: (Option<Vec<String>>, String),
@@ -499,7 +497,6 @@ impl DistributedQueryOperation {
             self.scope.clone(),
             MetadataFanoutOperation::Query,
             calls,
-            map_read_error,
         );
         let fanout = match self.deadline_ms {
             Some(deadline_ms) => fanout.until(deadline_ms),

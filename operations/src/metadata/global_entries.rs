@@ -543,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn local_object_reads_bucket() {
+    fn object_reads_bucket() {
         let realm = RealmId::from_bytes([1; 32]);
         let document = json!({"@id": "s3://shared/a.txt"});
         let mut normalize = super::NormalizeEntriesOperation::new(realm, node(3), document);

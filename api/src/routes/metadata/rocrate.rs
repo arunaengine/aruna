@@ -27,10 +27,10 @@ use aruna_operations::driver::drive;
 use aruna_operations::jobs::repository::{Action, TransferError, seal_token};
 use aruna_operations::metadata::api::export::ExportOperation;
 use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
-use aruna_operations::metadata::forward::routed_export::{
+use aruna_operations::metadata::forward::routed::export::{
     RoutedExportOperation, ensure_export_limit,
 };
-use aruna_operations::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
+use aruna_operations::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

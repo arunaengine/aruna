@@ -46,7 +46,6 @@ pub use self::lifecycle::{list_cached_group, list_cached_records, warm_caches};
 pub use self::pull_serve::{accept_pull, pull_status};
 pub use self::query::query_authorized_local;
 pub use self::search::search_authorized_local;
-pub(crate) use self::search::search_local_filtered;
 mod ingress;
 mod lifecycle;
 mod peer_auth;
@@ -419,10 +418,6 @@ impl MetadataHandle {
 
     pub(in crate::metadata) fn query_cache(&self) -> &MetadataQueryCache {
         &self.inner.query_cache
-    }
-
-    pub(crate) fn visibility_generation(&self) -> u64 {
-        self.inner.visibility_cache.current_generation()
     }
 
     /// Test hook: marks all visibility cache entries as expired so the next

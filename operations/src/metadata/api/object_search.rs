@@ -34,7 +34,7 @@ use super::search::{
 use super::search_types::{
     ObjectCursor, ObjectExecution, ObjectQueryMode, PendingBucket, SearchQueryRequest,
 };
-use super::{DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError, map_read_error};
+use super::{DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::load_config::config_unavailable;
@@ -220,7 +220,6 @@ impl ObjectSearchOperation {
             scope,
             MetadataFanoutOperation::ObjectSearch,
             calls,
-            map_read_error,
         )
         .until(self.deadline());
         self.stage = ObjectStage::Fanout(partitions);

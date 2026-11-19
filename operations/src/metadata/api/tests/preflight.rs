@@ -6,13 +6,13 @@ use super::*;
 use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
 use aruna_core::structs::storage::blob::CurrentVersionPointer;
 
+use super::super::preflight::targets::{ResolveTargetsOperation, ResolveVersionsOperation};
 use super::super::preflight::{
     PreflightCursorPlan, PreflightPlan, assemble_preflight_execution, index_state,
     plan_preflight_request, version_targets, visible_prefix,
 };
-use super::super::preflight_targets::{ResolveTargetsOperation, ResolveVersionsOperation};
 use super::super::preflight_types::preflight_fingerprint;
-use super::super::search_fanout::resume_cursor;
+use super::super::realm_search::resume_cursor;
 use crate::driver::drive;
 
 // Documents not materialized yet have no postings, so their absence is never reported current.
@@ -300,7 +300,7 @@ async fn write_versions(test: &MetadataTest, key: &str, count: u8, head: bool) {
 }
 
 /// The versions a bucket operation on `prefix` of the `genes` bucket would touch.
-async fn versions(
+async fn scan_versions(
     test: &MetadataTest,
     prefix: Option<&str>,
     operation: MetadataStorageOperation,
@@ -315,7 +315,7 @@ async fn large_scope_bounded() {
     for index in 0..130 {
         write_versions(&test, &format!("big/{index:03}"), 1, true).await;
     }
-    let (heads, complete) = versions(
+    let (heads, complete) = scan_versions(
         &test,
         None,
         MetadataStorageOperation::LatestVersionTombstone,
@@ -323,7 +323,7 @@ async fn large_scope_bounded() {
     .await
     .expect("large bucket resolves");
     assert_eq!((heads.len(), complete), (128, false));
-    let (versions, complete) = versions(
+    let (versions, complete) = scan_versions(
         &test,
         Some("big/"),
         MetadataStorageOperation::AllVersionsPurge,
@@ -331,7 +331,7 @@ async fn large_scope_bounded() {
     .await
     .expect("large prefix resolves");
     assert_eq!((versions.len(), complete), (128, false));
-    let (versions, complete) = versions(
+    let (versions, complete) = scan_versions(
         &test,
         Some("big/12"),
         MetadataStorageOperation::AllVersionsPurge,
@@ -347,7 +347,7 @@ async fn exact_key_purge() {
     write_versions(&test, "a", 3, true).await;
     write_versions(&test, "solo", 2, true).await;
     write_versions(&test, "zeta", 4, true).await;
-    let (versions, complete) = versions(
+    let (versions, complete) = scan_versions(
         &test,
         Some("solo"),
         MetadataStorageOperation::AllVersionsPurge,
@@ -357,7 +357,7 @@ async fn exact_key_purge() {
     assert!(complete);
     assert_eq!(versions.len(), 2);
     assert!(versions.iter().all(|(key, _)| key.key == "solo"));
-    let (heads, complete) = versions(
+    let (heads, complete) = scan_versions(
         &test,
         Some("solo"),
         MetadataStorageOperation::LatestVersionTombstone,
@@ -376,7 +376,7 @@ async fn headless_versions_purge() {
     let long = format!("dir/{}", "x".repeat(1100));
     write_versions(&test, &long, 1, false).await;
     write_versions(&test, &format!("other/{}", "x".repeat(1100)), 1, false).await;
-    let (versions, complete) = versions(
+    let (versions, complete) = scan_versions(
         &test,
         Some("dir/"),
         MetadataStorageOperation::AllVersionsPurge,
@@ -387,7 +387,7 @@ async fn headless_versions_purge() {
     keys.sort();
     assert!(complete);
     assert_eq!(keys, ["dir/a", "dir/a", "dir/bb", long.as_str()]);
-    let (versions, complete) = versions(
+    let (versions, complete) = scan_versions(
         &test,
         Some("dir/bb"),
         MetadataStorageOperation::AllVersionsPurge,
@@ -395,9 +395,10 @@ async fn headless_versions_purge() {
     .await
     .expect("headless key resolves");
     assert_eq!((versions.len(), complete), (1, true));
-    let (versions, complete) = versions(&test, None, MetadataStorageOperation::AllVersionsPurge)
-        .await
-        .expect("bucket resolves");
+    let (versions, complete) =
+        scan_versions(&test, None, MetadataStorageOperation::AllVersionsPurge)
+            .await
+            .expect("bucket resolves");
     assert_eq!((versions.len(), complete), (6, true));
 }
 

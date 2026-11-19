@@ -35,7 +35,7 @@ use crate::metadata::create_document::{
     CreateDocumentResult, mint_forward_document,
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
-use crate::metadata::forward::routed_write::ApplyBatchOperation;
+use crate::metadata::forward::routed::write::ApplyBatchOperation;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::realm::load_config::config_unavailable;
 

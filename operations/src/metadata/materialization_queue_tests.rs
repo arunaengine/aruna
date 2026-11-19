@@ -4,7 +4,6 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::metadata::repository::{StorageReadError, parse_status_read, read_status_effect};
 use crate::metadata::revision_read::RawViewOperation;
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{
@@ -185,15 +184,9 @@ async fn capture_pending(
 async fn read_materialization_status(
     storage: &StorageHandle,
     document_id: Ulid,
-    txn_id: Option<Ulid>,
 ) -> Result<Option<MaterializationStatusRecord>, MetadataMaterializationError> {
-    let event = storage
-        .send_effect(read_status_effect(document_id, txn_id))
-        .await;
-    parse_status_read(event).map_err(|error| match error {
-        StorageReadError::Storage(error) => error.into(),
-        StorageReadError::Conversion(error) => error.into(),
-    })
+    let key = materialization_status_key(document_id);
+    read_record(storage, MATERIALIZATION_STATUS_KEYSPACE, key).await
 }
 
 async fn read_document_job(
@@ -800,7 +793,7 @@ async fn failure_cap_parks() {
     assert!(!storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, index_key.to_vec()).await);
     assert!(!storage_key_exists(&storage, DOCUMENT_JOB_KEYSPACE, sidecar_key.to_vec()).await);
     assert!(!capture_pending(&storage, document_id).await.unwrap());
-    let status = read_materialization_status(&storage, document_id, None)
+    let status = read_materialization_status(&storage, document_id)
         .await
         .unwrap()
         .expect("failed status is written");
@@ -1003,7 +996,7 @@ async fn deadletters_requeue_due() {
         .expect("job is requeued");
     assert_eq!(requeued.failures, MATERIALIZATION_MAX_FAILURES - 1);
     assert_eq!(requeued.attempts, 0);
-    let status = read_materialization_status(&storage, document_id, None)
+    let status = read_materialization_status(&storage, document_id)
         .await
         .unwrap()
         .expect("status is reset");
@@ -1130,7 +1123,7 @@ async fn deadletter_drops_superseded() {
             .unwrap()
             .is_none()
     );
-    let status = read_materialization_status(&storage, document_id, None)
+    let status = read_materialization_status(&storage, document_id)
         .await
         .unwrap()
         .expect("status survives");
@@ -1732,7 +1725,7 @@ async fn finish_not_regress() {
     .unwrap();
 
     assert_eq!(
-        read_materialization_status(&storage, document_id, None)
+        read_materialization_status(&storage, document_id)
             .await
             .unwrap(),
         Some(newer_status)
@@ -1821,7 +1814,7 @@ async fn finish_stores_merge() {
     .unwrap();
 
     assert_eq!(
-        read_materialization_status(&storage, document_id, None)
+        read_materialization_status(&storage, document_id)
             .await
             .unwrap(),
         Some(newer_status),
@@ -1927,7 +1920,7 @@ async fn late_merges_chain() {
     );
     assert_eq!(raw.winning_event_id, newer.event_id);
     assert_eq!(
-        read_materialization_status(&storage, document_id, None)
+        read_materialization_status(&storage, document_id)
             .await
             .unwrap(),
         Some(newer_status)
@@ -1978,7 +1971,7 @@ async fn prune_keeps_retry() {
     finish_completed_jobs(&crate::testing::test_context(storage.clone()), vec![retry])
         .await
         .unwrap();
-    let status = read_materialization_status(&storage, document_id, None)
+    let status = read_materialization_status(&storage, document_id)
         .await
         .unwrap()
         .expect("the retry writes its status");
