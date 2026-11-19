@@ -199,11 +199,13 @@ impl Operation for ReadAccessOperation {
 pub(crate) mod tests {
     use super::*;
     use crate::auth::enforcement::{policy_reads, read_policies};
+    use crate::auth::permission_rules::CollectedRole;
     use aruna_core::UserId;
-    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::types::Value;
+    use std::collections::HashSet;
     use ulid::Ulid;
 
     pub(crate) fn realm() -> RealmId {
@@ -334,6 +336,90 @@ pub(crate) mod tests {
             Err::<PolicyEvaluators, _>(PolicyEnforcementError::Unavailable("down".to_string()));
         let turn = access.next(finished(vec![done(failed)]));
         assert_eq!(turn, Err(MetadataApiError::ServiceUnavailable));
+    }
+
+    fn grouped(seed: u64, path: &str) -> MetadataRegistryRecord {
+        let mut grouped = record(false);
+        grouped.document_id = Ulid::from_parts(seed, 3);
+        grouped.graph_iri = MetadataRegistryRecord::graph_iri_for(grouped.document_id);
+        grouped.document_path = path.to_string();
+        grouped.permission_path = MetadataRegistryRecord::permission_path_for(
+            &realm(),
+            grouped.group_id,
+            path,
+            grouped.document_id,
+        );
+        grouped
+    }
+
+    // The access of a caller holding one role of `patterns` in the records' group of `realm_id`.
+    fn ruled(
+        records: &[MetadataRegistryRecord],
+        realm_id: RealmId,
+        patterns: &[(&str, Permission)],
+    ) -> ReadAccess {
+        let role = Role {
+            role_id: Ulid::from_parts(5, 5),
+            name: "reader".to_string(),
+            permissions: (patterns.iter())
+                .map(|(pattern, permission)| ((*pattern).to_string(), permission.clone()))
+                .collect(),
+            assigned_users: HashSet::new(),
+        };
+        let collected = CollectedRole {
+            role,
+            direct: true,
+            public: false,
+        };
+        let rules = PermissionRules::from_roles(vec![collected], None).unwrap();
+        let groups = HashMap::from([(records[0].group_id, rules)]);
+        ReadAccess {
+            permissions: GroupPermissionRules::from_groups(Some(realm_id), groups),
+            evaluators: evaluators(records),
+            auth: Some(caller()),
+        }
+    }
+
+    #[test]
+    fn deny_hides_document() {
+        // A per-document DENY under a group-wide READ hides only that document.
+        let records = [grouped(1, "datasets/secret"), grouped(2, "datasets/open")];
+        let group = format!("/{}/g/{}/meta/**", realm(), records[0].group_id);
+        let patterns = [
+            (group.as_str(), Permission::READ),
+            (records[0].permission_path.as_str(), Permission::DENY),
+        ];
+        let access = ruled(&records, realm(), &patterns);
+        assert!(!access.shows(&records[0]));
+        assert!(access.shows(&records[1]));
+    }
+
+    #[test]
+    fn narrow_grant_shows() {
+        // A grant on one document shows it without opening the whole group.
+        let records = [grouped(1, "datasets/shared"), grouped(2, "datasets/hidden")];
+        let patterns = [(records[0].permission_path.as_str(), Permission::READ)];
+        let access = ruled(&records, realm(), &patterns);
+        assert!(access.shows(&records[0]));
+        assert!(!access.shows(&records[1]));
+    }
+
+    #[test]
+    fn foreign_rules_hide() {
+        // Rules collected for another realm open no private document here.
+        let records = [grouped(1, "datasets/shared"), record(true)];
+        let patterns = [(records[0].permission_path.as_str(), Permission::READ)];
+        let access = ruled(&records, RealmId::from_bytes([8; 32]), &patterns);
+        assert!(!access.shows(&records[0]));
+        assert!(access.shows(&records[1]));
+    }
+
+    #[test]
+    fn anonymous_sees_public() {
+        let records = [record(true), grouped(1, "datasets/private")];
+        let access = access_for(&records, None);
+        assert!(access.shows(&records[0]));
+        assert!(!access.shows(&records[1]));
     }
 
     #[test]

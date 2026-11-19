@@ -1359,21 +1359,6 @@ pub enum MetadataEffect {
         after: Option<String>,
         limit: usize,
     },
-    SearchGraphs {
-        auth_context: Option<AuthContext>,
-        graph_iris: Option<Vec<String>>,
-        query: String,
-        limit: usize,
-        /// Only documents of this group.
-        group_id: Option<GroupId>,
-        /// Only entities that conform to this profile IRI.
-        conforms_to: Option<String>,
-    },
-    QueryGraphs {
-        auth_context: Option<AuthContext>,
-        graph_iris: Option<Vec<String>>,
-        sparql: String,
-    },
     DeleteGraph {
         graph_iri: String,
     },
@@ -1486,6 +1471,43 @@ pub enum MetadataEffect {
     CachedGroup {
         group_id: GroupId,
     },
+    /// The registry cache's snapshot, an expired one included, with its generation.
+    RegistrySnapshot,
+    /// Stores a registry fill and the deletion state of its graphs, unless the registry cache
+    /// changed since `generation`.
+    StoreRegistry {
+        records: Vec<MetadataRegistryRecord>,
+        lifecycle: Vec<(String, bool)>,
+        generation: u64,
+    },
+    /// Re-stamps the deletion states a read resolved, unless the registry cache changed since
+    /// `generation`.
+    RefreshLifecycle {
+        lifecycle: Vec<(String, bool)>,
+        generation: u64,
+    },
+    /// The query cache's current stamp, taken before a read whose result it may keep.
+    QueryCacheStamp,
+    // Reads within a scope an operation decided.
+    /// One SPARQL query over exactly `graph_iris`, failing on a missing one, or, when not
+    /// `exact`, over those of them the store holds.
+    QueryScope {
+        graph_iris: Vec<String>,
+        exact: bool,
+        sparql: String,
+    },
+    /// A text search over the graphs of `records`, each hit named and described by its record;
+    /// `exact` as for a query.
+    SearchScope {
+        records: Vec<MetadataRegistryRecord>,
+        exact: bool,
+        query: String,
+        limit: usize,
+    },
+    /// Describes one subject of each record's graph, as search hits of equal score.
+    DescribeHits {
+        targets: Vec<(MetadataRegistryRecord, String)>,
+    },
 }
 
 impl MetadataEffect {
@@ -1505,8 +1527,6 @@ impl MetadataEffect {
             MetadataEffect::ExportRoCrate { .. } => "export_rocrate",
             MetadataEffect::ExportRoCrateSummary { .. } => "export_rocrate_summary",
             MetadataEffect::ExportRoCratePage { .. } => "export_rocrate_page",
-            MetadataEffect::SearchGraphs { .. } => "search_graphs",
-            MetadataEffect::QueryGraphs { .. } => "query_graphs",
             MetadataEffect::DeleteGraph { .. } => "delete_graph",
             MetadataEffect::ListGraphs => "list_graphs",
             MetadataEffect::CachedRecords => "cached_records",
@@ -1530,6 +1550,13 @@ impl MetadataEffect {
             MetadataEffect::CacheRecords { .. } => "cache_records",
             MetadataEffect::UncacheRecord { .. } => "uncache_record",
             MetadataEffect::CachedGroup { .. } => "cached_group",
+            MetadataEffect::RegistrySnapshot => "registry_snapshot",
+            MetadataEffect::StoreRegistry { .. } => "store_registry",
+            MetadataEffect::RefreshLifecycle { .. } => "refresh_lifecycle",
+            MetadataEffect::QueryCacheStamp => "query_cache_stamp",
+            MetadataEffect::QueryScope { .. } => "query_scope",
+            MetadataEffect::SearchScope { .. } => "search_scope",
+            MetadataEffect::DescribeHits { .. } => "describe_hits",
             MetadataEffect::QueryCacheGet { .. } => "query_cache_get",
             MetadataEffect::QueryCachePut { .. } => "query_cache_put",
         }
@@ -1562,12 +1589,6 @@ impl MetadataEffect {
             | MetadataEffect::PlanBatch { graph_iri, .. }
             | MetadataEffect::MergeBatch { graph_iri, .. } => Some(graph_iri.clone()),
             MetadataEffect::ExportRoCratePage { graph_iri, .. } => Some(graph_iri.clone()),
-            MetadataEffect::SearchGraphs { graph_iris, .. } => graph_iris
-                .as_ref()
-                .and_then(|graph_iris| graph_iris.first().cloned()),
-            MetadataEffect::QueryGraphs { graph_iris, .. } => graph_iris
-                .as_ref()
-                .and_then(|graph_iris| graph_iris.first().cloned()),
             MetadataEffect::ListGraphs
             | MetadataEffect::CachedRecords
             | MetadataEffect::CheckStructure { .. }
@@ -1581,7 +1602,14 @@ impl MetadataEffect {
             | MetadataEffect::UncacheRecord { .. }
             | MetadataEffect::CachedGroup { .. }
             | MetadataEffect::QueryCacheGet { .. }
-            | MetadataEffect::QueryCachePut { .. } => None,
+            | MetadataEffect::QueryCachePut { .. }
+            | MetadataEffect::RegistrySnapshot
+            | MetadataEffect::StoreRegistry { .. }
+            | MetadataEffect::RefreshLifecycle { .. }
+            | MetadataEffect::QueryCacheStamp
+            | MetadataEffect::QueryScope { .. }
+            | MetadataEffect::SearchScope { .. }
+            | MetadataEffect::DescribeHits { .. } => None,
         }
     }
 
@@ -1721,6 +1749,16 @@ pub enum MetadataEvent {
     CachedGroup {
         records: Option<Vec<MetadataRegistryRecord>>,
     },
+    /// The registry cache's snapshot, whether it is still fresh, and the cache generation.
+    RegistrySnapshot {
+        records: Option<std::sync::Arc<Vec<MetadataRegistryRecord>>>,
+        fresh: bool,
+        generation: u64,
+    },
+    /// Whether a registry fill or deletion refresh was kept.
+    RegistryStored {
+        accepted: bool,
+    },
     /// The kept shape sources of one Profile revision, if any; a store answers with `None`.
     ProfileShapes {
         shapes: Option<Vec<String>>,
@@ -1769,6 +1807,18 @@ pub enum MetadataError {
     /// A batch depends on events this replica has not merged yet; it applies once they arrive.
     #[error("metadata causal dependencies missing: {0}")]
     MissingDependencies(String),
+}
+
+/// A runner failure in a metadata operation: a lost conflict or a storage failure keeps its
+/// storage cause, anything else is a backend failure.
+impl From<crate::calls::IoError> for MetadataError {
+    fn from(error: crate::calls::IoError) -> Self {
+        match error {
+            crate::calls::IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            crate::calls::IoError::Storage(error) => Self::Storage(error),
+            error => Self::Backend(error.to_string()),
+        }
+    }
 }
 
 impl MetadataError {

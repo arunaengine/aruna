@@ -6,7 +6,7 @@ use super::list::{GroupRecordsOperation, ListVisibleOperation, PendingRecordsOpe
 use super::list_types::check_policy_limit;
 use super::*;
 use crate::driver::DriverContext;
-use crate::metadata::handle::QUERY_MAX_BYTES;
+use crate::metadata::local_query::QUERY_MAX_BYTES;
 
 use super::distributed_types::{
     MetadataQueryForm, aggregate_query_results, query_form, query_select_limit,

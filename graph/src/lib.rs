@@ -20,12 +20,14 @@ use tokio::sync::{OwnedMutexGuard, Semaphore};
 use crate::convert::{error_from_craqle, fjall_persist_mode, irokle_peer_id, policy_from_craqle};
 use crate::persist::flush_metadata_persistence;
 
+mod caches;
 mod convert;
 pub mod merge;
 mod persist;
 mod profiles;
 mod read;
 mod run;
+mod scope_reads;
 mod shacl;
 mod summaries;
 
@@ -114,6 +116,10 @@ struct GraphInner {
     profiles: crate::profiles::ProfileCache,
     /// Striped holds that serialize this node's writes to one document.
     document_holds: [Arc<tokio::sync::Mutex<()>>; DOCUMENT_HOLDS],
+    /// The registry snapshot and graph deletion states the read paths decide visibility from.
+    visibility: crate::caches::VisibilityCache,
+    /// SPARQL results by caller scope.
+    queries: crate::caches::QueryCache,
 }
 
 /// Stripes of the document write holds.
@@ -179,6 +185,8 @@ impl GraphHandle {
                     crate::summaries::SUMMARY_CACHE_TTL,
                 ),
                 document_holds: std::array::from_fn(|_| Arc::default()),
+                visibility: crate::caches::VisibilityCache::new(),
+                queries: crate::caches::QueryCache::new(),
             }),
         })
     }
@@ -262,6 +270,9 @@ impl GraphHandle {
             .collect();
         for graph in &applied {
             self.inner.summaries.remove(graph);
+        }
+        if !applied.is_empty() {
+            self.inner.queries.bump_apply();
         }
         Ok(applied)
     }

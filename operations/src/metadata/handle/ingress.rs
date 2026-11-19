@@ -6,10 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
-use aruna_core::events::Event;
-use aruna_core::metadata::{
-    MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults, MetadataSearchHit,
-};
+use aruna_core::metadata::MetadataError;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
@@ -20,7 +17,6 @@ use aruna_net::streams::BiStream;
 use tracing::Span;
 
 use super::peer_auth::{authorize_peer, config_digest_matches};
-use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
     read_budget, write_body_at, write_message_at, write_stream_body, write_transport_message,
@@ -35,10 +31,13 @@ use crate::driver::{DriverContext, drive};
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
+use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::message_kind::transport_message_kind;
 use crate::metadata::protocol::metadata_read_error;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::metadata::read_peer::{PeerReader, ReadPeerOperation, SearchPeerOperation};
+use crate::metadata::search_cursor::MAX_PAGINATION_DEPTH;
+use crate::metadata::text_search::LocalSearchOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::LocalBucketSearch;
 use crate::s3::bucket::release::publish::{HolderAnswerOperation, PublishError};
@@ -336,7 +335,8 @@ impl MetadataHandle {
         peer: NodeId,
         message: MetadataTransportMessage,
     ) -> MetadataTransportMessage {
-        let Some(graph) = context.graph_handle.as_ref() else {
+        let net = self.inner.net_handle.as_ref();
+        let (Some(_), Some(net)) = (context.graph_handle.as_ref(), net) else {
             return match message {
                 MetadataTransportMessage::QueryGraphs { .. } => {
                     MetadataTransportMessage::QueryResults {
@@ -348,27 +348,23 @@ impl MetadataHandle {
                 },
             };
         };
-        match message {
+        let realm_id = *net.realm_id();
+        let (auth_token, graph_iris, group_id, query, limit, reference) = match message {
             MetadataTransportMessage::QueryGraphs {
                 auth_token,
                 graph_iris,
                 sparql,
             } => {
-                Box::pin(async {
-                    match self.read_caller(context, peer, auth_token, false).await {
-                        Ok(auth_context) => {
-                            let query = MetadataEffect::QueryGraphs {
-                                auth_context,
-                                graph_iris,
-                                sparql,
-                            };
-                            let result = query_answer(self.run_effect(context, query).await);
-                            MetadataTransportMessage::QueryResults { result }
-                        }
-                        Err(error) => MetadataTransportMessage::QueryResults { result: Err(error) },
+                let result = match self.read_caller(context, peer, auth_token, false).await {
+                    Ok(auth) => {
+                        let query = LocalQueryOperation::new((realm_id, auth), graph_iris, sparql);
+                        Box::pin(drive(query, context))
+                            .await
+                            .map_err(metadata_read_error)
                     }
-                })
-                .await
+                    Err(error) => Err(error),
+                };
+                return MetadataTransportMessage::QueryResults { result };
             }
             MetadataTransportMessage::SearchGraphs {
                 auth_token,
@@ -376,28 +372,7 @@ impl MetadataHandle {
                 query,
                 limit,
                 group_id,
-            } => {
-                Box::pin(async {
-                    match self.read_caller(context, peer, auth_token, false).await {
-                        Ok(auth_context) => {
-                            let search = MetadataEffect::SearchGraphs {
-                                auth_context,
-                                graph_iris,
-                                query,
-                                limit: clamp_remote_limit(limit),
-                                group_id,
-                                conforms_to: None,
-                            };
-                            let result = search_answer(self.run_effect(context, search).await);
-                            MetadataTransportMessage::SearchResults { result }
-                        }
-                        Err(error) => {
-                            MetadataTransportMessage::SearchResults { result: Err(error) }
-                        }
-                    }
-                })
-                .await
-            }
+            } => (auth_token, graph_iris, group_id, query, limit, None),
             MetadataTransportMessage::FilteredSearchGraphs {
                 auth_token,
                 graph_iris,
@@ -407,37 +382,27 @@ impl MetadataHandle {
                 object_iri,
                 group_id,
             } => {
-                Box::pin(async {
-                    match self.read_caller(context, peer, auth_token, false).await {
-                        Ok(auth_context) => match search_local_graphs(
-                            context,
-                            self.inner.clone(),
-                            graph,
-                            auth_context,
-                            graph_iris,
-                            query,
-                            clamp_remote_limit(limit),
-                            group_id,
-                            Some((predicate_iri, object_iri)),
-                        )
-                        .await
-                        {
-                            Ok(hits) => {
-                                MetadataTransportMessage::SearchResults { result: Ok(hits) }
-                            }
-                            Err(error) => MetadataTransportMessage::SearchResults {
-                                result: Err(metadata_read_error(error)),
-                            },
-                        },
-                        Err(error) => {
-                            MetadataTransportMessage::SearchResults { result: Err(error) }
-                        }
-                    }
-                })
-                .await
+                let reference = Some((predicate_iri, object_iri));
+                (auth_token, graph_iris, group_id, query, limit, reference)
             }
             _ => unreachable!("request family routed incorrectly"),
-        }
+        };
+        let result = match self.read_caller(context, peer, auth_token, false).await {
+            Ok(auth) => {
+                let ask = (query, limit.clamp(1, MAX_PAGINATION_DEPTH));
+                let search = LocalSearchOperation::new(
+                    (realm_id, auth),
+                    (graph_iris, group_id),
+                    ask,
+                    reference,
+                );
+                Box::pin(drive(search, context))
+                    .await
+                    .map_err(metadata_read_error)
+            }
+            Err(error) => Err(error),
+        };
+        MetadataTransportMessage::SearchResults { result }
     }
 
     async fn preflight_request(
@@ -1485,23 +1450,5 @@ impl MetadataHandle {
             None => close_stream(&mut stream).await,
         }
         Ok(())
-    }
-}
-
-/// The answer of a local query effect, as the asking peer reads it.
-fn query_answer(event: Event) -> Result<MetadataQueryResults, MetadataReadError> {
-    match event {
-        Event::Metadata(MetadataEvent::QueryResult { results }) => Ok(results),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(metadata_read_error(error)),
-        _ => Err(MetadataReadError::Unavailable),
-    }
-}
-
-/// The answer of a local search effect, as the asking peer reads it.
-fn search_answer(event: Event) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
-    match event {
-        Event::Metadata(MetadataEvent::SearchResult { hits }) => Ok(hits),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(metadata_read_error(error)),
-        _ => Err(MetadataReadError::Unavailable),
     }
 }

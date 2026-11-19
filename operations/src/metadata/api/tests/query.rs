@@ -6,7 +6,9 @@ use super::*;
 
 use super::super::distributed::ordered_query;
 use super::super::query_fanout::{Partition, TieFetchOperation};
-use aruna_core::calls::{IoCall, IoResult, Next};
+use crate::metadata::api::access::tests::realm;
+use crate::metadata::local_query::LocalQueryOperation;
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::metadata::{MergeJob, MergeOutput, MetadataEffect, MetadataError, MetadataEvent};
@@ -382,6 +384,34 @@ fn partition_query_widest() {
     assert_eq!(partition.len() + widest, QUERY_MAX_BYTES);
 }
 
+// The query with its `LIMIT` set to `fetch`, as a tie fetch asks it.
+fn with_limit(query: &str, fetch: usize) -> Option<String> {
+    let mut parsed = spargebra::SparqlParser::new().parse_query(query).ok()?;
+    let spargebra::Query::Select {
+        pattern: spargebra::algebra::GraphPattern::Slice { length, .. },
+        ..
+    } = &mut parsed
+    else {
+        return None;
+    };
+    *length = Some(fetch);
+    Some(parsed.to_string())
+}
+
+/// The text of a local partition query, among the texts a tie fetch of `query` may run.
+fn local_text(call: &IoCall, query: &str, limit: Option<usize>) -> String {
+    let fetches = (limit.into_iter())
+        .flat_map(|limit| (0..32).map(move |shift| limit.saturating_add(1 << shift)))
+        .filter_map(|fetch| with_limit(query, fetch.min(QUERY_MAX_ROWS)));
+    let mut texts = std::iter::once(query.to_string()).chain(fetches);
+    texts
+        .find(|text| {
+            let local = LocalQueryOperation::new((realm(), None), None, text.clone());
+            *call == IoCall::child(local)
+        })
+        .expect("a text of the tie fetch")
+}
+
 /// Runs a tie fetch on one partition, answering each query with `answer` and each tie count with
 /// the graph merge, and returns its result with the query texts it ran.
 fn run_fetch(
@@ -389,37 +419,37 @@ fn run_fetch(
     limit: Option<usize>,
     answer: impl Fn(&str) -> Result<MetadataQueryResults, MetadataError>,
 ) -> (Result<MetadataQueryResults, MetadataReadError>, Vec<String>) {
-    let partition = Partition::Local(None);
+    let partition = Partition::Local(realm(), None);
     let mut fetch = TieFetchOperation::new(partition, (None, query.to_string()), limit, u64::MAX);
     let mut runs = Vec::new();
     fetch.stamp(0);
     let mut next = fetch.first();
     loop {
-        let effect = match next {
+        let call = match next {
             Ok(Next::Done(results)) => return (Ok(results), runs),
-            Ok(Next::Call(IoCall::Effect(effect))) => *effect,
+            Ok(Next::Call(call)) => call,
             Err(error) => return (Err(error), runs),
-            Ok(_) => panic!("expected one effect per step"),
+            Ok(_) => panic!("expected one call per step"),
         };
-        let event = match effect {
-            Effect::Metadata(MetadataEffect::QueryGraphs { sparql, .. }) => {
+        let result = match call {
+            IoCall::Effect(effect) => {
+                let Effect::Metadata(MetadataEffect::MergeRows { job, .. }) = *effect else {
+                    panic!("expected a merge");
+                };
+                let merged = MetadataEvent::RowsMerged {
+                    result: aruna_graph::merge::merge(job, &Default::default()),
+                };
+                IoResult::Event(Box::new(Event::Metadata(merged)))
+            }
+            call => {
+                let sparql = local_text(&call, query, limit);
                 let result = answer(&sparql);
                 runs.push(sparql);
-                match result {
-                    Ok(results) => MetadataEvent::QueryResult { results },
-                    Err(error) => MetadataEvent::Error {
-                        graph_iri: None,
-                        error,
-                    },
-                }
+                IoResult::Child(ChildOutcome::new(result))
             }
-            Effect::Metadata(MetadataEffect::MergeRows { job, .. }) => MetadataEvent::RowsMerged {
-                result: aruna_graph::merge::merge(job, &Default::default()),
-            },
-            _ => panic!("expected a query or a merge"),
         };
         fetch.stamp(0);
-        next = fetch.next(IoResult::Event(Box::new(Event::Metadata(event))));
+        next = fetch.next(result);
     }
 }
 

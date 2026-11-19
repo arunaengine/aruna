@@ -25,9 +25,31 @@ use crate::persist::{
 use crate::{CRAQLE_LATENCY, GraphHandle, GraphInner, SLOW_CALL};
 
 impl GraphHandle {
-    /// Runs one store effect on the blocking pool and answers with its event. Searches,
-    /// queries and best-effort sync need a read scope or the network and are refused here.
+    /// Runs one store or cache effect and answers with its event. A deleted graph leaves the
+    /// caches, and a write that applied makes every cached query result stale.
     pub async fn run(&self, effect: MetadataEffect) -> MetadataEvent {
+        if let MetadataEffect::DeleteGraph { graph_iri } = &effect {
+            self.inner.visibility.remove_graph(graph_iri);
+        }
+        let mutates_graph = effect.mutates_graph();
+        let event = self.run_store(effect).await;
+        if mutates_graph && !matches!(event, MetadataEvent::Error { .. }) {
+            self.inner.queries.bump_apply();
+        }
+        event
+    }
+
+    /// The cache and scoped read arms answer here; the store effects run on the blocking pool.
+    /// Unscoped searches and best-effort sync need a read scope or the network and are refused.
+    async fn run_store(&self, effect: MetadataEffect) -> MetadataEvent {
+        let effect = match self.run_cache(effect) {
+            Ok(event) => return event,
+            Err(effect) => effect,
+        };
+        let effect = match self.run_scoped(effect).await {
+            Ok(event) => return event,
+            Err(effect) => effect,
+        };
         let effect = match effect {
             MetadataEffect::CheckStructure { jsonld } => {
                 let report = self.run_profile_shacl(move |engine| {
@@ -64,17 +86,13 @@ impl GraphHandle {
                     .insert(profile_id, revision, Arc::new(shapes));
                 return MetadataEvent::ProfileShapes { shapes: None };
             }
-            // The registry cache stays with the metadata handle, which answers these first.
-            MetadataEffect::FlushGraph
-            | MetadataEffect::CacheGeneration
-            | MetadataEffect::CacheRecords { .. }
-            | MetadataEffect::UncacheRecord { .. }
-            | MetadataEffect::CachedGroup { .. }
-            | MetadataEffect::QueryCacheGet { .. }
-            | MetadataEffect::QueryCachePut { .. } => {
-                return MetadataEvent::Error {
-                    graph_iri: None,
-                    error: MetadataError::InvalidEffect,
+            MetadataEffect::FlushGraph => {
+                return match self.flush_persistence().await {
+                    Ok(()) => MetadataEvent::GraphFlushed,
+                    Err(error) => MetadataEvent::Error {
+                        graph_iri: None,
+                        error,
+                    },
                 };
             }
             MetadataEffect::MergeRows { job, budget } => {
@@ -123,10 +141,7 @@ impl GraphHandle {
         let graph_iri = effect.graph_iri();
         if matches!(
             effect,
-            MetadataEffect::SearchGraphs { .. }
-                | MetadataEffect::QueryGraphs { .. }
-                | MetadataEffect::SyncBestEffort { .. }
-                | MetadataEffect::CachedRecords
+            MetadataEffect::SyncBestEffort { .. } | MetadataEffect::CachedRecords
         ) {
             return MetadataEvent::Error {
                 graph_iri,
@@ -964,9 +979,7 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::ExportRoCrateSummary { .. }
         | MetadataEffect::ExportRoCratePage { .. }
         | MetadataEffect::ExportVersioned { .. }) => export_effect(node, &auth, effect),
-        MetadataEffect::SearchGraphs { .. }
-        | MetadataEffect::QueryGraphs { .. }
-        | MetadataEffect::SyncBestEffort { .. }
+        MetadataEffect::SyncBestEffort { .. }
         | MetadataEffect::CheckStructure { .. }
         | MetadataEffect::CheckProfile { .. }
         | MetadataEffect::CachedShapes { .. }
@@ -977,6 +990,13 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::CachedGroup { .. }
         | MetadataEffect::QueryCacheGet { .. }
         | MetadataEffect::QueryCachePut { .. }
+        | MetadataEffect::QueryCacheStamp
+        | MetadataEffect::RegistrySnapshot
+        | MetadataEffect::StoreRegistry { .. }
+        | MetadataEffect::RefreshLifecycle { .. }
+        | MetadataEffect::QueryScope { .. }
+        | MetadataEffect::SearchScope { .. }
+        | MetadataEffect::DescribeHits { .. }
         | MetadataEffect::ExportSummaryAt { .. }
         | MetadataEffect::DescribeTitle { .. }
         | MetadataEffect::IriReferences { .. }

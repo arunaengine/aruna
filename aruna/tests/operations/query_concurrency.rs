@@ -26,8 +26,10 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::local_query::LocalQueryOperation;
+use aruna_operations::metadata::text_search::LocalSearchOperation;
 use aruna_storage::FjallStorage;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -232,13 +234,9 @@ async fn query_names_as(
     harness: &TestHarness,
     auth: Option<AuthContext>,
 ) -> Result<Vec<String>, BoxError> {
-    let results = aruna_operations::metadata::query_authorized_local(
-        &harness.context,
-        auth,
-        None,
-        "SELECT ?s ?name WHERE { ?s a schema:Dataset . ?s schema:name ?name }".to_string(),
-    )
-    .await?;
+    let sparql = "SELECT ?s ?name WHERE { ?s a schema:Dataset . ?s schema:name ?name }";
+    let query = LocalQueryOperation::new((REALM, auth), None, sparql.to_string());
+    let results = drive(query, &harness.context).await?;
     let MetadataQueryResults::Solutions(rows) = results else {
         return Err("expected solutions".into());
     };
@@ -296,7 +294,12 @@ async fn stale_cache_refreshes() -> Result<(), BoxError> {
     let new_record = registry_record(harness.group_id, new_index, Some(new_graph_iri.clone()));
     write_registry_records(&harness, std::slice::from_ref(&new_record)).await?;
 
-    harness.handle.expire_visibility_caches();
+    harness
+        .context
+        .graph_handle
+        .as_ref()
+        .expect("graph")
+        .expire_caches();
 
     // Stale serve: the query right after expiry must not block on a refill,
     // so it still sees the old visible set.
@@ -337,7 +340,12 @@ async fn stale_cache_refreshes() -> Result<(), BoxError> {
         other => return Err(format!("lifecycle write failed: {other:?}").into()),
     }
 
-    harness.handle.expire_visibility_caches();
+    harness
+        .context
+        .graph_handle
+        .as_ref()
+        .expect("graph")
+        .expire_caches();
     // The stale read must not block on the sweep; lazy per-graph visibility reads the lifecycle
     // state at evaluation time.
     let _ = query_names(&harness).await?;
@@ -416,15 +424,10 @@ async fn search_graph_iris(
     query: &str,
     limit: usize,
 ) -> Result<Vec<String>, BoxError> {
-    let hits = aruna_operations::metadata::search_authorized_local(
-        &harness.context,
-        auth,
-        graph_iris,
-        query.to_string(),
-        limit,
-        None,
-    )
-    .await?;
+    let caller = (REALM, auth);
+    let search =
+        LocalSearchOperation::new(caller, (graph_iris, None), (query.to_string(), limit), None);
+    let hits = drive(search, &harness.context).await?;
     Ok(hits.into_iter().map(|hit| hit.graph_iri).collect())
 }
 
@@ -634,14 +637,10 @@ async fn local_order_by() -> Result<(), BoxError> {
     }
     write_registry_records(&harness, &records).await?;
 
-    let results = aruna_operations::metadata::query_authorized_local(
-        &harness.context,
-        None,
-        None,
-        "SELECT ?name WHERE { ?s a schema:Dataset ; schema:name ?name } ORDER BY DESC(?name)"
-            .to_string(),
-    )
-    .await?;
+    let sparql =
+        "SELECT ?name WHERE { ?s a schema:Dataset ; schema:name ?name } ORDER BY DESC(?name)";
+    let query = LocalQueryOperation::new((REALM, None), None, sparql.to_string());
+    let results = drive(query, &harness.context).await?;
     let MetadataQueryResults::Solutions(rows) = results else {
         return Err("expected solutions".into());
     };
@@ -852,7 +851,12 @@ async fn concurrent_mutation_profile() -> Result<(), BoxError> {
     };
 
     let stale_started = Instant::now();
-    harness.handle.expire_visibility_caches();
+    harness
+        .context
+        .graph_handle
+        .as_ref()
+        .expect("graph")
+        .expire_caches();
     let _ = query_names(&harness).await?;
     println!(
         "stale-serve query after TTL expiry: {:?}",

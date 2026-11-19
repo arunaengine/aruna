@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::auth::permission_rules::GroupPermissionRules;
-use aruna_core::structs::identity::auth::Permission;
 pub(super) fn registry_record(document_path: &str) -> MetadataRegistryRecord {
     let document_id = Ulid::generate();
     MetadataRegistryRecord {
@@ -35,28 +33,6 @@ pub(super) fn group_record(group_id: GroupId, document_path: &str) -> MetadataRe
         record.document_id,
     );
     record
-}
-
-pub(super) fn read_rules(
-    patterns: &[(&str, Permission)],
-) -> crate::auth::permission_rules::PermissionRules {
-    crate::auth::permission_rules::PermissionRules::from_roles(
-        vec![crate::auth::permission_rules::CollectedRole {
-            role: aruna_core::structs::identity::auth::Role {
-                role_id: Ulid::generate(),
-                name: "test".to_string(),
-                permissions: patterns
-                    .iter()
-                    .map(|(pattern, permission)| ((*pattern).to_string(), permission.clone()))
-                    .collect(),
-                assigned_users: HashSet::new(),
-            },
-            direct: true,
-            public: false,
-        }],
-        None,
-    )
-    .expect("patterns compile")
 }
 
 pub(super) fn filled_cache(records: Vec<MetadataRegistryRecord>) -> MetadataVisibilityCache {
@@ -233,15 +209,6 @@ fn eviction_keeps_tombstone() {
             .lifecycle_deleted_any(&deleted_record.graph_iri)
             .is_none()
     );
-
-    let scope = GraphVisibilityScope {
-        records: Arc::new(vec![deleted_record.clone()]),
-        permissions: GroupPermissionRules::default(),
-        lifecycle_visibility: LifecycleVisibility::Cache(HashSet::from([deleted_record
-            .graph_iri
-            .clone()])),
-    };
-    assert!(!scope.graph_visible(&cache, &deleted_record.graph_iri));
 }
 #[test]
 fn expired_entry_served() {
@@ -351,80 +318,4 @@ fn expired_lifecycle_entry() {
         cache.lifecycle_deleted_any("urn:graph:a"),
         Some((true, false))
     );
-}
-#[test]
-fn record_lookup_parses() {
-    let mut records: Vec<_> = (0..4)
-        .map(|index| registry_record(&format!("datasets/{index}")))
-        .collect();
-    let mut custom = registry_record("datasets/custom");
-    custom.graph_iri = "https://example.org/custom-graph".to_string();
-    records.push(custom.clone());
-    records.sort_unstable_by_key(|record| record.document_id);
-
-    for record in &records {
-        let found = record_for_graph(&records, &record.graph_iri).expect("record found");
-        assert_eq!(found.document_id, record.document_id);
-    }
-    assert!(
-        record_for_graph(
-            &records,
-            &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
-        )
-        .is_none()
-    );
-    assert!(record_for_graph(&records, "https://example.org/missing").is_none());
-}
-#[test]
-fn visibility_scope_enforces() {
-    let realm = RealmId([7u8; 32]);
-    let mut public_record = registry_record("datasets/public");
-    public_record.public = true;
-    let mut private_record = registry_record("datasets/private");
-    private_record.public = false;
-    let mut deleted_record = registry_record("datasets/deleted");
-    deleted_record.public = true;
-    let mut records = vec![
-        public_record.clone(),
-        private_record.clone(),
-        deleted_record.clone(),
-    ];
-    records.sort_unstable_by_key(|record| record.document_id);
-
-    let cache = MetadataVisibilityCache::new();
-    cache.store_lifecycle_deleted(deleted_record.graph_iri.clone(), true);
-
-    let anonymous = GraphVisibilityScope {
-        records: Arc::new(records.clone()),
-        permissions: GroupPermissionRules::default(),
-        lifecycle_visibility: LifecycleVisibility::Cache(HashSet::new()),
-    };
-    assert!(anonymous.graph_visible(&cache, &public_record.graph_iri));
-    assert!(!anonymous.graph_visible(&cache, &private_record.graph_iri));
-    assert!(!anonymous.graph_visible(&cache, &deleted_record.graph_iri));
-    assert!(!anonymous.graph_visible(
-        &cache,
-        &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
-    ));
-
-    let readable = HashMap::from([(
-        private_record.group_id,
-        read_rules(&[(private_record.permission_path.as_str(), Permission::READ)]),
-    )]);
-    let member = GraphVisibilityScope {
-        records: Arc::new(records.clone()),
-        permissions: GroupPermissionRules::from_groups(Some(realm), readable.clone()),
-        lifecycle_visibility: LifecycleVisibility::Cache(HashSet::new()),
-    };
-    assert!(member.graph_visible(&cache, &public_record.graph_iri));
-    assert!(member.graph_visible(&cache, &private_record.graph_iri));
-    assert!(!member.graph_visible(&cache, &deleted_record.graph_iri));
-
-    let wrong_realm = GraphVisibilityScope {
-        records: Arc::new(records),
-        permissions: GroupPermissionRules::from_groups(Some(RealmId([8u8; 32])), readable),
-        lifecycle_visibility: LifecycleVisibility::Cache(HashSet::new()),
-    };
-    assert!(wrong_realm.graph_visible(&cache, &public_record.graph_iri));
-    assert!(!wrong_realm.graph_visible(&cache, &private_record.graph_iri));
 }

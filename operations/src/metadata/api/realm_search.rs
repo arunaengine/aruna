@@ -12,7 +12,7 @@ use aruna_core::cursor::SEARCH_CURSOR_CONTEXT;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use aruna_core::events::{Event, NetEvent};
-use aruna_core::metadata::{AuthToken, MetadataEffect, MetadataEvent, MetadataSearchHit};
+use aruna_core::metadata::{AuthToken, MetadataError, MetadataSearchHit};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -39,12 +39,13 @@ use crate::metadata::search_cursor::{
     SearchCursorError, SearchWatermark, blank_signature, merge_search_hits, paginate,
     query_fingerprint, resume_fetch_limit,
 };
+use crate::metadata::text_search::LocalSearchOperation;
 
 /// Where one node's search runs.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum SearchTarget {
-    /// This node's graphs, under the caller's own authority.
-    Local(Option<AuthContext>),
+    /// This node's graphs of the realm, under the caller's own authority.
+    Local(RealmId, Option<AuthContext>),
     /// A peer, under the forwarded credential.
     Remote {
         node: NodeId,
@@ -98,16 +99,16 @@ impl NodeSearchOperation {
         let (graph_iris, query) = (self.ask.graph_iris.clone(), self.ask.query.clone());
         let (limit, group_id) = (self.limit, self.ask.group_id);
         let (node, auth_token) = match &self.target {
-            SearchTarget::Local(auth) => {
-                let effect = MetadataEffect::SearchGraphs {
-                    auth_context: auth.clone(),
-                    graph_iris,
-                    query,
-                    limit,
-                    group_id,
-                    conforms_to: profile,
-                };
-                return Ok(IoCall::Effect(Box::new(Effect::Metadata(effect))));
+            SearchTarget::Local(realm_id, auth) => {
+                let reference = profile.map(|object| (DCTERMS_CONFORMS_IRI.to_string(), object));
+                let caller = (*realm_id, auth.clone());
+                let search = LocalSearchOperation::new(
+                    caller,
+                    (graph_iris, group_id),
+                    (query, limit),
+                    reference,
+                );
+                return Ok(IoCall::child(search));
             }
             SearchTarget::Remote { node, auth_token } => (*node, auth_token.clone()),
         };
@@ -136,13 +137,8 @@ impl NodeSearchOperation {
 
     fn answer(&self, result: IoResult) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
         match &self.target {
-            SearchTarget::Local(_) => match event(result)? {
-                Event::Metadata(MetadataEvent::SearchResult { hits }) => Ok(hits),
-                Event::Metadata(MetadataEvent::Error { error, .. }) => {
-                    Err(metadata_read_error(error))
-                }
-                _ => Err(MetadataReadError::Unavailable),
-            },
+            SearchTarget::Local(..) => (result.child::<Vec<MetadataSearchHit>, MetadataError>()?)
+                .map_err(metadata_read_error),
             SearchTarget::Remote { node, .. } => match peer_reply(*node, result)? {
                 Ok(MetadataTransportMessage::SearchResults { result }) => result,
                 _ => Err(MetadataReadError::Unavailable),
@@ -186,6 +182,7 @@ impl Operation for NodeSearchOperation {
 /// How the search fanout asks each node: deeper for nodes a cursor resumes.
 #[derive(Debug, PartialEq)]
 struct SearchCalls {
+    realm_id: RealmId,
     auth: Option<AuthContext>,
     auth_token: Option<AuthToken>,
     ask: SearchAsk,
@@ -208,7 +205,7 @@ impl NodeCalls for SearchCalls {
     type Part = NodeHits;
 
     fn local(&self, node: NodeId) -> Effect {
-        self.search(node, SearchTarget::Local(self.auth.clone()))
+        self.search(node, SearchTarget::Local(self.realm_id, self.auth.clone()))
     }
 
     // Each node's searches ask within what is left of the search deadline.
@@ -352,6 +349,7 @@ impl MetadataSearchOperation {
         let profiles =
             (request.conforms_to.as_deref()).map_or_else(Vec::new, equivalent_profile_iris);
         let calls = SearchCalls {
+            realm_id: self.realm_id,
             auth: request.auth.clone(),
             auth_token: fanout_bearer(request.bearer_token.as_deref()),
             ask: SearchAsk {
@@ -741,19 +739,15 @@ mod call_tests {
     }
 
     fn search_answer(hits: Vec<MetadataSearchHit>) -> IoResult {
-        IoResult::Event(Box::new(Event::Metadata(MetadataEvent::SearchResult {
-            hits,
-        })))
+        IoResult::Child(ChildOutcome::new(Ok::<_, MetadataError>(hits)))
     }
 
-    fn profile(call: Result<Next<NodeHits>, MetadataReadError>) -> Option<String> {
-        let Ok(Next::Call(IoCall::Effect(effect))) = call else {
-            panic!("expected one search");
-        };
-        let Effect::Metadata(MetadataEffect::SearchGraphs { conforms_to, .. }) = *effect else {
-            panic!("expected a local search");
-        };
-        conforms_to
+    // The local search a filtered node search asks for one profile IRI.
+    fn profile_search(profile: &str) -> Result<Next<NodeHits>, MetadataReadError> {
+        let reference = Some((DCTERMS_CONFORMS_IRI.to_string(), profile.to_string()));
+        let query = ("reads".to_string(), 2);
+        let search = LocalSearchOperation::new((realm(), None), (None, None), query, reference);
+        Ok(Next::Call(IoCall::child(search)))
     }
 
     #[test]
@@ -764,10 +758,11 @@ mod call_tests {
             group_id: None,
             profiles: vec!["urn:a".to_string(), "urn:b".to_string()],
         };
-        let mut search = NodeSearchOperation::new(SearchTarget::Local(None), ask, 2, 5_000);
-        assert_eq!(profile(search.first()), Some("urn:a".to_string()));
+        let target = SearchTarget::Local(realm(), None);
+        let mut search = NodeSearchOperation::new(target, ask, 2, 5_000);
+        assert_eq!(search.first(), profile_search("urn:a"));
         let second = search.next(search_answer(vec![hit("./a", 0.2)]));
-        assert_eq!(profile(second), Some("urn:b".to_string()));
+        assert_eq!(second, profile_search("urn:b"));
         let answered = search.next(search_answer(vec![hit("./a", 0.7), hit("./b", 0.5)]));
         let Ok(Next::Done((hits, limit))) = answered else {
             panic!("expected the merged hits");

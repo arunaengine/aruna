@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::lifecycle::records_for_group;
-use super::search::{GraphVisibilityScope, LifecycleVisibility, record_for_graph};
-use super::search::{filter_candidate_records, select_visible_records};
 use super::*;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::events::Event;
@@ -53,7 +51,5 @@ fn graph_context(
 mod auth;
 mod effect;
 mod lifecycle;
-mod query;
-mod search;
 mod sync;
 mod visibility;

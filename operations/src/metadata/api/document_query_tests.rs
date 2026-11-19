@@ -4,8 +4,8 @@
 
 use super::*;
 use aruna_core::calls::ChildOutcome;
-use aruna_core::events::{MetadataAnswer, NetEvent, PeerRequestError};
-use aruna_core::metadata::MetadataError;
+use aruna_core::effects::Effect;
+use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use ulid::Ulid;
 
 fn realm() -> RealmId {
@@ -58,17 +58,6 @@ fn results() -> MetadataQueryResults {
     MetadataQueryResults::Boolean(true)
 }
 
-fn query_answer(result: Result<MetadataQueryResults, MetadataError>) -> IoResult {
-    let event = match result {
-        Ok(results) => MetadataEvent::QueryResult { results },
-        Err(error) => MetadataEvent::Error {
-            graph_iri: None,
-            error,
-        },
-    };
-    IoResult::Event(Box::new(Event::Metadata(event)))
-}
-
 /// A query answered up to its readable check.
 fn readable(request: DocumentQueryRequest) -> (DocumentQueryOperation, QueryTurn) {
     let mut query = DocumentQueryOperation::new(realm(), node(1), request);
@@ -95,14 +84,14 @@ fn local_queries_here() {
     let (mut query, turn) = readable(request(Some(ApiQueryMode::Local), false));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     let turn = query.next(child(Ok::<_, StorageReadError>(true)));
-    let effect = MetadataEffect::QueryGraphs {
-        auth_context: None,
-        graph_iris: Some(vec![record().graph_iri]),
-        sparql: request(None, false).query,
-    };
-    let call = IoCall::Effect(Box::new(Effect::Metadata(effect)));
+    let local = LocalQueryOperation::new(
+        (realm(), None),
+        Some(vec![record().graph_iri]),
+        request(None, false).query,
+    );
+    let call = IoCall::child(local);
     assert_eq!(turn, Ok(Next::Call(call)));
-    let Ok(Next::Done(done)) = query.next(query_answer(Ok(results()))) else {
+    let Ok(Next::Done(done)) = query.next(child(Ok::<_, MetadataError>(results()))) else {
         panic!("expected the results");
     };
     assert_eq!(done.results, results());
@@ -127,7 +116,7 @@ fn unreadable_config_partial() {
     partial
         .next(child(Ok::<_, StorageReadError>(true)))
         .unwrap();
-    let Ok(Next::Done(done)) = partial.next(query_answer(Ok(results()))) else {
+    let Ok(Next::Done(done)) = partial.next(child(Ok::<_, MetadataError>(results()))) else {
         panic!("expected the partial results");
     };
     assert!(done.fanout_stats.discovery_failed);
@@ -156,7 +145,7 @@ fn replicas_tried_ordered() {
         Ok(Next::Call(IoCall::Child(_)))
     ));
     query.next(child(Ok::<_, StorageReadError>(true))).unwrap();
-    let Ok(Next::Done(done)) = query.next(query_answer(Ok(results()))) else {
+    let Ok(Next::Done(done)) = query.next(child(Ok::<_, MetadataError>(results()))) else {
         panic!("expected the local results");
     };
     assert_eq!(done.fanout_stats.nodes_queried, 2);

@@ -18,8 +18,9 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use aruna_graph::{GraphHandle, GraphOptions, MetadataSearchStorage};
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::local_query::LocalQueryOperation;
 use aruna_storage::FjallStorage;
 use ulid::Ulid;
 
@@ -139,13 +140,9 @@ async fn create_crate_graph(handle: &DriverContext, index: usize) -> Result<(), 
 
 async fn timed_query(handle: &DriverContext, label: &str) -> Result<std::time::Duration, BoxError> {
     let started = Instant::now();
-    let results = aruna_operations::metadata::query_authorized_local(
-        handle,
-        None,
-        None,
-        "SELECT ?s ?name WHERE { ?s a schema:Dataset . ?s schema:name ?name } LIMIT 25".to_string(),
-    )
-    .await?;
+    let sparql = "SELECT ?s ?name WHERE { ?s a schema:Dataset . ?s schema:name ?name } LIMIT 25";
+    let query = LocalQueryOperation::new((REALM, None), None, sparql.to_string());
+    let results = drive(query, handle).await?;
     let elapsed = started.elapsed();
     let MetadataQueryResults::Solutions(rows) = results else {
         return Err("expected solutions".into());

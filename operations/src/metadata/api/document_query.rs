@@ -7,10 +7,8 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::Effect;
-use aruna_core::metadata::{AuthToken, MetadataEffect, MetadataEvent, MetadataQueryResults};
+use aruna_core::metadata::{AuthToken, MetadataError, MetadataQueryResults};
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use tracing::warn;
@@ -23,10 +21,10 @@ use super::{MetadataApiError, MetadataReadError, map_query_error, replica_query_
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{peer_call, peer_reply};
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
+use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::metadata::record_reads::RecordMaterializedOperation;
 use crate::metadata::repository::StorageReadError;
-use aruna_core::events::Event;
 
 /// One replica may open its stream and then answer, each within the transport's own bound.
 const HOLDER_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -102,15 +100,13 @@ impl DocumentQueryOperation {
     }
 
     fn local_query(&mut self) -> QueryTurn {
-        let effect = MetadataEffect::QueryGraphs {
-            auth_context: self.request.auth.clone(),
-            graph_iris: Some(vec![self.record()?.graph_iri.clone()]),
-            sparql: self.request.query.clone(),
-        };
+        let query = LocalQueryOperation::new(
+            (self.realm_id, self.request.auth.clone()),
+            Some(vec![self.record()?.graph_iri.clone()]),
+            self.request.query.clone(),
+        );
         self.stage = QueryStage::Local;
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            effect,
-        )))))
+        Ok(Next::Call(IoCall::child(query)))
     }
 
     fn configured(&mut self, config: RealmConfigDocument) -> QueryTurn {
@@ -220,16 +216,11 @@ fn materialized(result: IoResult) -> Result<(), MetadataApiError> {
     }
 }
 
-/// The results of a local query effect, or why there are none.
+/// The results of a local query, or why there are none.
 fn queried(result: IoResult) -> Result<MetadataQueryResults, MetadataApiError> {
-    match event(result)? {
-        Event::Metadata(MetadataEvent::QueryResult { results }) => Ok(results),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(map_query_error(error)),
-        other => Err(MetadataApiError::Internal(format!(
-            "unexpected metadata query event: {}",
-            other.label()
-        ))),
-    }
+    result
+        .child::<MetadataQueryResults, MetadataError>()?
+        .map_err(map_query_error)
 }
 
 impl Operation for DocumentQueryOperation {

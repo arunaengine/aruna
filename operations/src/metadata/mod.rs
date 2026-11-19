@@ -26,6 +26,7 @@ pub mod identifier_lookup;
 pub mod iri_index;
 pub mod list_documents;
 pub(crate) mod live_records;
+pub mod local_query;
 pub mod materialization_queue;
 pub(crate) mod message_kind;
 pub mod mirror_request;
@@ -46,16 +47,19 @@ pub mod raw_revision;
 pub(crate) mod read_peer;
 pub mod realm_counts;
 pub mod record_reads;
+pub mod registry_cache;
 pub mod repository;
 pub mod revision_read;
 mod search_cursor;
 pub mod secondary_ids;
 pub mod stats;
+pub mod text_search;
 pub mod timestamp_sweep;
 pub mod update_document;
 pub mod update_entry;
 pub(crate) mod updated_page;
 pub mod visibility_index;
+pub(crate) mod visible_scope;
 pub mod write_peer;
 
 /// The phase-time and identity samples a metadata operation stamps records
@@ -107,8 +111,7 @@ pub use builtin::builtin_shapes;
 pub use contact::{PEER_CONTACT_WINDOW, PeerContacts};
 pub use handle::{
     MetadataHandle, MetadataHandleOptions, accept_pull, export_rocrate_jsonld, list_cached_group,
-    list_cached_records, pull_status, query_authorized_local, search_authorized_local,
-    send_metadata_effect, warm_caches,
+    list_cached_records, pull_status, send_metadata_effect, warm_caches,
 };
 pub(crate) use message_kind::transport_message_kind;
 pub use protocol::{

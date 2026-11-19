@@ -932,6 +932,8 @@ impl MetadataEvent {
                 GraphFlushed,
                 ProfileShapes,
                 ProfileChecked,
+                RegistrySnapshot,
+                RegistryStored,
                 Error,
             }
         )

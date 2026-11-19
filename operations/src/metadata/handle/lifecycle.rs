@@ -257,44 +257,6 @@ impl MetadataVisibilityCache {
         }
     }
 
-    pub(super) fn refresh_if_current(
-        &self,
-        entries: impl IntoIterator<Item = (String, bool)>,
-        fill_generation: u64,
-    ) -> bool {
-        if self.current_generation() != fill_generation {
-            return false;
-        }
-        let entries = entries.into_iter().collect::<Vec<_>>();
-        if entries.len() > REGISTRY_CANDIDATE_LIMIT {
-            return false;
-        }
-        let now = Instant::now();
-        let expires_at = now + VISIBILITY_CACHE_TTL;
-        let mut lifecycle = self
-            .lifecycle_deleted
-            .lock()
-            .unwrap_or_else(|lock| lock.into_inner());
-        if self.current_generation() != fill_generation {
-            return false;
-        }
-        let protected = entries
-            .iter()
-            .map(|(graph_iri, _)| graph_iri.clone())
-            .collect::<HashSet<_>>();
-        Self::trim_lifecycle_deleted(&mut lifecycle, &protected, now);
-        for (graph_iri, deleted) in entries {
-            lifecycle.insert(
-                graph_iri,
-                LifecycleDeletedEntry {
-                    deleted,
-                    expires_at,
-                },
-            );
-        }
-        lifecycle.retain(|_, entry| entry.expires_at > now);
-        true
-    }
     // Incremental maintenance keeps the cached registry usable under writes;
     pub(super) fn upsert_registry_records(&self, updates: &[MetadataRegistryRecord]) {
         self.upsert_at(updates, None);
@@ -450,12 +412,7 @@ impl MetadataHandle {
             .graph_handle
             .as_ref()
             .ok_or(MetadataError::HandleMissing)?;
-        let applied = graph.reconcile().await?;
-        // Peer sync invalidates summaries because their cursor may precede newly applied content.
-        if !applied.is_empty() {
-            self.inner.query_cache.bump_apply();
-        }
-        Ok(applied.len())
+        Ok(graph.reconcile().await?.len())
     }
 
     /// Removes the local copy of every deleted graph; returns how many were removed.
@@ -862,18 +819,6 @@ pub(super) async fn list_deleted_iris(
         }
     }
     Ok((deleted, pages))
-}
-
-pub(super) async fn list_read_records(
-    inner: Arc<MetadataInner>,
-    graph: &GraphHandle,
-    span: &Span,
-) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
-    let registry_started = Instant::now();
-    let records = list_local_records(inner, graph).await?;
-    record_elapsed_ms(span, "registry_ms", registry_started);
-    span.record("registry_records", records.len() as u64);
-    Ok(records)
 }
 
 async fn warn_unprojected_graphs(graph: &GraphHandle, records: &[MetadataRegistryRecord]) {
