@@ -6,6 +6,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 
 use super::super::testing::{auth, child, dataset, node, realm};
 use super::*;
+use ulid::Ulid;
 
 fn config() -> RealmConfigDocument {
     RealmConfigDocument::new(realm(), Vec::new(), 3)
