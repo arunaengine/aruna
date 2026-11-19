@@ -5,8 +5,6 @@
 #[path = "identity_enrollment.rs"]
 pub mod enrollment;
 
-use enrollment::{EnrollmentPlan, plan_enrollment};
-
 use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -323,6 +321,7 @@ pub async fn mark_onboarding_phase(
 
 #[cfg(test)]
 mod tests {
+    use super::enrollment::{EnrollmentPlan, plan_enrollment};
     use super::*;
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
