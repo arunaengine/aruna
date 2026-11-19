@@ -656,6 +656,7 @@ impl<O: EffectOperation> Drive for ParentRun<'_, O> {
         let now = unix_timestamp_millis();
         self.1 = recorder::begin(type_name::<O>(), now, || format!("{:?}", self.0));
         self.0.stamp(now);
+        self.0.seed(rand::random());
         self.0.start()
     }
 
@@ -688,6 +689,7 @@ impl Drive for SubRun<'_> {
         let name = type_name_of_val(&*self.0);
         self.1 = recorder::begin(name, now, || format!("{:?}", self.0));
         self.0.stamp(now);
+        self.0.seed(rand::random());
         self.0.start()
     }
 
@@ -3847,10 +3849,11 @@ mod test {
         assert_eq!(started.elapsed(), Duration::from_secs(10));
     }
 
-    /// Waits one second and reports whether the runner stamped a time on it.
+    /// Waits one second and reports whether the runner stamped a time and seeded it.
     #[derive(Debug, Default, PartialEq)]
     struct Echo {
         stamped: Option<u64>,
+        seeded: bool,
         woke: bool,
     }
 
@@ -3872,7 +3875,7 @@ mod test {
         }
 
         fn finalize(self) -> Result<Self::Output, Self::Error> {
-            Ok(self.stamped.is_some())
+            Ok(self.stamped.is_some() && self.seeded)
         }
 
         fn abort(&mut self) -> aruna_core::types::Effects {
@@ -3881,6 +3884,10 @@ mod test {
 
         fn stamp(&mut self, now_ms: u64) {
             self.stamped = Some(now_ms);
+        }
+
+        fn seed(&mut self, _entropy: u128) {
+            self.seeded = true;
         }
     }
 
@@ -3897,7 +3904,7 @@ mod test {
         assert_eq!(
             result,
             Ok(true),
-            "the runner stamps the time on the operation"
+            "the runner stamps the time and the entropy on the operation"
         );
         // Other tests may record at the same time, so only this run's records count.
         let records = crate::recorder::take().records;
