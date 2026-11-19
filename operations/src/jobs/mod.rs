@@ -13,6 +13,7 @@ pub mod demand;
 pub mod device_admission;
 pub mod drain;
 pub mod export;
+pub mod fence;
 pub mod handed_imports;
 pub mod harvest;
 pub mod import;

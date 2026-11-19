@@ -20,7 +20,7 @@ use aruna_core::types::{Key, Value};
 use tracing::{debug, warn};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::node::fence::LiftFenceOperation;
+use crate::jobs::fence::LiftFenceOperation;
 
 /// The node-local row holding the wall time at which this node last caught up.
 pub const LAST_CONTACT_KEY: &[u8] = b"last_contact";

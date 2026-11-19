@@ -387,7 +387,7 @@ async fn fill(
     // After every start no job work is admitted until the node caught up; the fence is durable
     // before any peer can reach this node.
     let fence = DriverContext::storage_only(acquired.storage_handle.clone());
-    drive(aruna_operations::node::fence::RaiseFenceOperation, &fence)
+    drive(aruna_operations::jobs::fence::RaiseFenceOperation, &fence)
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     if matches!(
