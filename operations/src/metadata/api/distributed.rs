@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::handle::QUERY_MAX_BYTES;
+use crate::metadata::local_query::QUERY_MAX_BYTES;
 use super::distributed_types::query_select_limit;
 use super::{
     BucketPage, MetadataApiError, MetadataQueryResults, MetadataReadError, MetadataSearchHit,

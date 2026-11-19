@@ -26,6 +26,7 @@ pub mod identifier_lookup;
 pub(crate) mod iri_index;
 pub mod list_documents;
 pub(crate) mod live_records;
+pub mod local_query;
 pub mod materialization_queue;
 pub(crate) mod message_kind;
 pub mod mirror_request;
@@ -44,7 +45,6 @@ mod query_cache;
 pub(crate) mod raw_events;
 pub mod raw_revision;
 pub(crate) mod read_peer;
-pub(crate) mod read_scope;
 pub mod realm_counts;
 pub mod record_reads;
 pub mod registry_cache;
@@ -58,6 +58,7 @@ pub mod update_document;
 pub mod update_entry;
 pub(crate) mod updated_page;
 pub mod visibility_index;
+pub(crate) mod visible_scope;
 pub mod write_peer;
 
 /// The phase-time and identity samples a metadata operation stamps records

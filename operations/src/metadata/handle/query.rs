@@ -8,19 +8,17 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aruna_core::metadata::{MetadataError, MetadataQueryResults, QUERY_PREFIXES};
+use aruna_core::metadata::{MetadataError, MetadataQueryResults};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::telemetry::{record_duration_ms, record_elapsed_ms, record_error};
 use aruna_graph::{GraphHandle, ReadScope};
-use spargebra::{Query, SparqlParser};
 use tracing::{Span, debug_span, field};
 
 use super::effects::record_query_counts;
 use super::search::select_authorized_graphs;
-use super::{
-    METADATA_QUERY_DEADLINE, MetadataInner, QUERY_MAX_BYTES, REGISTRY_CANDIDATE_LIMIT, handles,
-};
+use super::{METADATA_QUERY_DEADLINE, MetadataInner, REGISTRY_CANDIDATE_LIMIT, handles};
 use crate::driver::DriverContext;
+use crate::metadata::local_query::parse_metadata_query;
 use crate::metadata::query_cache::{CachedQuery, LocalScopeKind, graphs_digest, local_key};
 #[tracing::instrument(
     name = "metadata.query.local",
@@ -175,31 +173,6 @@ pub(super) async fn query_local_graphs(
     }
     record_elapsed_ms(&span, "elapsed_ms", total_started);
     result
-}
-
-pub(super) fn parse_metadata_query(sparql: &str) -> Result<Query, MetadataError> {
-    if sparql.len() > QUERY_MAX_BYTES {
-        return Err(MetadataError::InvalidInput(format!(
-            "SPARQL query exceeds the {QUERY_MAX_BYTES}-byte limit"
-        )));
-    }
-    let query = SparqlParser::new()
-        .parse_query(&format!("{QUERY_PREFIXES}{sparql}"))
-        .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
-    let pattern = match &query {
-        Query::Select { pattern, .. } | Query::Ask { pattern, .. } => pattern,
-        Query::Construct { .. } | Query::Describe { .. } => {
-            return Err(MetadataError::InvalidInput(
-                "only SELECT and ASK metadata queries are supported".to_string(),
-            ));
-        }
-    };
-    if super::super::api::fanout_types::pattern_contains_service(pattern) {
-        return Err(MetadataError::InvalidInput(
-            "SERVICE is not supported in metadata queries".to_string(),
-        ));
-    }
-    Ok(query)
 }
 
 /// Runs one SPARQL query over the local graphs `auth_context` may read.

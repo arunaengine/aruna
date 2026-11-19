@@ -19,7 +19,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, Value};
 
 use crate::metadata::call_results::page_rows;
-use crate::metadata::read_scope::DeletedGraphsOperation;
+use crate::metadata::visible_scope::DeletedGraphsOperation;
 
 /// The live registry records of this node, ordered by document id.
 pub type Registry = Arc<Vec<MetadataRegistryRecord>>;

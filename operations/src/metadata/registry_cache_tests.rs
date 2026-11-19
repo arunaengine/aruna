@@ -116,7 +116,7 @@ fn fill_stores_registry() {
 }
 
 #[test]
-fn fill_over_limit_fails() {
+fn oversized_fill_fails() {
     let mut fill = RegistryFillOperation::new();
     fill.first().unwrap();
     fill.next(snapshot(None, false)).unwrap();

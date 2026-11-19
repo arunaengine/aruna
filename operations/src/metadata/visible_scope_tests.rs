@@ -10,7 +10,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::Value;
 use ulid::Ulid;
 
-fn record(seed: u64) -> MetadataRegistryRecord {
+pub(crate) fn record(seed: u64) -> MetadataRegistryRecord {
     let document_id = Ulid::from_parts(seed, 1);
     MetadataRegistryRecord {
         realm_id: realm(),
@@ -29,7 +29,7 @@ fn record(seed: u64) -> MetadataRegistryRecord {
     }
 }
 
-fn answer(event: MetadataEvent) -> IoResult {
+pub(crate) fn answer(event: MetadataEvent) -> IoResult {
     IoResult::Event(Box::new(Event::Metadata(event)))
 }
 

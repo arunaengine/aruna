@@ -62,7 +62,6 @@ const METADATA_CHUNK_SIZE: usize = 64 * 1024;
 const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
 const GRAPH_SYNC_ATTEMPTS: usize = 3;
 const GRAPH_SYNC_AFTER: Duration = Duration::from_millis(250);
-pub(crate) const QUERY_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const METADATA_QUERY_DEADLINE: Duration = Duration::from_secs(10);
 const VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
 

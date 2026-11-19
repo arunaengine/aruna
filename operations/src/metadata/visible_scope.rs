@@ -186,5 +186,5 @@ impl Operation for ReadScopeOperation {
 }
 
 #[cfg(test)]
-#[path = "read_scope_tests.rs"]
-mod call_tests;
+#[path = "visible_scope_tests.rs"]
+pub(crate) mod call_tests;
