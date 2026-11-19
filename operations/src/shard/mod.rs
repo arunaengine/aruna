@@ -123,7 +123,7 @@ mod tests {
     use aruna_core::storage_entries::shard_manifest_entry;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::sync::Arc;
     use tempfile::TempDir;
     use ulid::Ulid;
@@ -149,7 +149,7 @@ mod tests {
         }
     }
 
-    async fn write_manifest_row(storage: &aruna_storage::StorageHandle, shard: u32, doc: u8) {
+    async fn write_manifest_row(storage: &aruna_storage::storage::handle::StorageHandle, shard: u32, doc: u8) {
         let target = aruna_core::document::DocumentTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([doc; 16]),
         };

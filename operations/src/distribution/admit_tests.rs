@@ -17,7 +17,7 @@ use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::accounting::slot_key;
 use aruna_core::structs::storage::distribution::capacity::OBJECT_METADATA_BYTES;
 use aruna_core::structs::storage::format::Compression;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 
 use super::*;
 use crate::distribution::test_store::{get, open, range, send};

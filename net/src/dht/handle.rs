@@ -8,7 +8,7 @@ use aruna_core::effects::DhtGetOptions;
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use crossfire::{TrySendError, mpsc};
 use iroh::Endpoint;
 use tokio::sync::oneshot;

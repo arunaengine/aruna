@@ -83,7 +83,8 @@ pub(super) fn vault_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FjallStorage, StorageHandle};
+    use crate::storage::handle::StorageHandle;
+    use crate::storage::worker::FjallStorage;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::events::Event;
     use aruna_core::node_vault::VaultPurpose;

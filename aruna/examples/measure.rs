@@ -48,7 +48,8 @@ use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObje
 use aruna_operations::sync::notification_outbox::{
     EmitNotificationsInput, EmitNotificationsOperation,
 };
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_test_support::projection::project_logged_events;
 use convergence::{NO_PROGRESS_TIMEOUT, wait_empty_queues, wait_for_visibility};
 use futures_util::StreamExt;

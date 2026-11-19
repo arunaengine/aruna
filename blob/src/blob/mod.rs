@@ -6,7 +6,7 @@ use crate::egress::EgressGuard;
 use aruna_core::NodeId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use bao_tree::BlockSize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};

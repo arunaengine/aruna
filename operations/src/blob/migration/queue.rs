@@ -1379,7 +1379,7 @@ mod tests {
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use aruna_core::structs::storage::transition::{TransitionKind, TransitionTarget};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -1624,7 +1624,7 @@ mod tests {
 
     fn context(root: &std::path::Path) -> DriverContext {
         DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root.to_str().unwrap()).unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(root.to_str().unwrap()).unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,

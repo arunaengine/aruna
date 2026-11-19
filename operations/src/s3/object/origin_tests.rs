@@ -99,7 +99,7 @@ async fn seed(context: &DriverContext, actor: &Actor, listed: bool) -> Ulid {
 
 fn test_context(temp: &tempfile::TempDir) -> DriverContext {
     DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap(),
+        storage_handle: aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap(),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,

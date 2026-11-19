@@ -593,7 +593,7 @@ mod tests {
     };
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 

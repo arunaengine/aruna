@@ -25,7 +25,7 @@ use aruna_core::structs::storage::multipart::MultipartPartKey;
 use aruna_core::structs::{BackendState, BlobState, Status};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;

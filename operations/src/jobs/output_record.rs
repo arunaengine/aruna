@@ -340,7 +340,8 @@ mod tests {
         AttemptIntent, ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobState,
     };
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;
 

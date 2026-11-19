@@ -11,7 +11,7 @@ use aruna_core::id::NodeId;
 use aruna_core::metrics::NotificationWatchMetrics;
 use aruna_core::structs::NetworkDiagnosticsState;
 use aruna_core::structs::execution::notification_watch::WatchInterestTable;
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::endpoint::{QuicTransportConfig, VarInt, presets};

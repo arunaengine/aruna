@@ -27,7 +27,7 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::http::StatusCode;
 use axum::http::{HeaderValue, Request};

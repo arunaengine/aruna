@@ -2,8 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::handle::StorageHandle;
+use super::persistence::FjallPersistPolicy;
 use super::tests_rebuild::{first_dropped, seal_journal};
-use super::{FjallPersistPolicy, FjallStorage, StorageHandle};
+use super::worker::FjallStorage;
 use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -19,7 +21,7 @@ use std::time::{Duration, Instant};
 use tempfile::tempdir;
 use ulid::Ulid;
 
-fn small_handle(capacity: usize) -> (StorageHandle, super::StorageReceivers) {
+fn small_handle(capacity: usize) -> (StorageHandle, super::handle::StorageReceivers) {
     let (sender, foreground) = crossfire::mpsc::bounded_blocking(capacity);
     let (bulk_sender, bulk) = crossfire::mpsc::bounded_blocking(capacity);
     let handle = StorageHandle {
@@ -40,7 +42,7 @@ fn small_handle(capacity: usize) -> (StorageHandle, super::StorageReceivers) {
         range_indexes: std::sync::Arc::new(std::sync::OnceLock::new()),
         policies: std::sync::Arc::new(super::policies::PolicyPrograms::default()),
     };
-    (handle, super::StorageReceivers { foreground, bulk })
+    (handle, super::handle::StorageReceivers { foreground, bulk })
 }
 
 fn cleanup_write() -> StorageEffect {
@@ -67,7 +69,7 @@ fn foreground_precedes_bulk() {
         let effect = read(key_space);
         let (tx, rx) = super::response_channel(super::ResponseToken::empty());
         let span = super::storage_effect_span(&effect);
-        let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+        let in_flight = super::metrics::InFlightGuard::acquire(&handle.metrics);
         assert!(
             handle
                 .bulk_channel
@@ -80,7 +82,7 @@ fn foreground_precedes_bulk() {
     let effect = read("fg");
     let (tx, rx) = super::response_channel(super::ResponseToken::empty());
     let span = super::storage_effect_span(&effect);
-    let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+    let in_flight = super::metrics::InFlightGuard::acquire(&handle.metrics);
     assert!(
         handle
             .write_channel
@@ -111,11 +113,11 @@ fn bulk_keeps_share() {
         txn_id: None,
     };
     let mut keep = Vec::new();
-    let mut enqueue = |channel: &super::EffectSender, key_space: &str| {
+    let mut enqueue = |channel: &super::handle::EffectSender, key_space: &str| {
         let effect = read(key_space);
         let (tx, rx) = super::response_channel(super::ResponseToken::empty());
         let span = super::storage_effect_span(&effect);
-        let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+        let in_flight = super::metrics::InFlightGuard::acquire(&handle.metrics);
         assert!(
             channel
                 .try_send((effect, tx, span, Instant::now(), in_flight))
@@ -167,7 +169,7 @@ fn abort_routes_foreground() {
         };
         let (tx, rx) = super::response_channel(super::ResponseToken::empty());
         let span = super::storage_effect_span(&effect);
-        let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+        let in_flight = super::metrics::InFlightGuard::acquire(&handle.metrics);
         if handle
             .bulk_channel
             .try_send((effect, tx, span, Instant::now(), in_flight))
@@ -206,7 +208,7 @@ async fn cleanup_waits_space() {
     };
     let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
     let filler_span = super::storage_effect_span(&filler);
-    let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+    let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
         .write_channel
         .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
@@ -242,7 +244,7 @@ async fn ordinary_write_full() {
     };
     let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
     let filler_span = super::storage_effect_span(&filler);
-    let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+    let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
         .write_channel
         .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
@@ -322,7 +324,7 @@ fn bulk_full_rejects() {
         .open()
         .unwrap();
     let (bulk_sender, _bulk_receiver) = crossfire::mpmc::bounded_blocking(1);
-    let mut storage = super::FjallStorage {
+    let mut storage = super::worker::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
         txns: std::collections::HashMap::new(),
@@ -352,7 +354,7 @@ fn bulk_full_rejects() {
 
     let filler = read_effect();
     let span = super::storage_effect_span(&filler);
-    let guard = super::InFlightGuard::acquire(&metrics);
+    let guard = super::metrics::InFlightGuard::acquire(&metrics);
     let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
     assert!(
         storage
@@ -364,7 +366,7 @@ fn bulk_full_rejects() {
 
     let target = read_effect();
     let span = super::storage_effect_span(&target);
-    let guard = super::InFlightGuard::acquire(&metrics);
+    let guard = super::metrics::InFlightGuard::acquire(&metrics);
     let (target_tx, mut target_rx) = super::response_channel(super::ResponseToken::empty());
     let mut slow = super::SlowQueueAggregator::default();
     storage.forward_read(
@@ -723,7 +725,7 @@ fn keyed_read(key: &str) -> StorageEffect {
     }
 }
 
-fn serve_next(storage: &mut FjallStorage, receiver: &super::EffectReceiver) {
+fn serve_next(storage: &mut FjallStorage, receiver: &super::handle::EffectReceiver) {
     let item = receiver.recv().expect("effect stays queued");
     storage.process_single(item, &mut super::SlowQueueAggregator::default());
 }
@@ -879,7 +881,7 @@ async fn fence_aborts_txns() {
 
 async fn started_txn(
     handle: &StorageHandle,
-    receivers: &super::StorageReceivers,
+    receivers: &super::handle::StorageReceivers,
     storage: &mut FjallStorage,
 ) -> Ulid {
     let mut started =
@@ -966,7 +968,7 @@ async fn deferred_respects_fence() {
     let filler = keyed_read("filler");
     let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
     let filler_span = super::storage_effect_span(&filler);
-    let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+    let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
         .write_channel
         .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
@@ -1074,7 +1076,7 @@ fn unknown_open_keeps() {
             queued: false,
         },
     );
-    let mut owner = super::TransactionOwner::new(handle, txn_id);
+    let mut owner = super::owner::TransactionOwner::new(handle, txn_id);
 
     owner.unknown();
     assert_eq!(owner.id(), Some(txn_id));
@@ -1134,7 +1136,7 @@ fn delivery_aborts_start() {
     assert!(!response_tx.is_closed());
     drop(response_rx);
 
-    super::FjallStorage::deliver_response(
+    super::worker::FjallStorage::deliver_response(
         response_tx,
         StorageEvent::TransactionStarted { txn_id },
         "start_transaction",
@@ -1175,7 +1177,7 @@ fn delivery_finishes_commit() {
     let (response_tx, response_rx) = super::response_channel(token);
     drop(response_rx);
 
-    super::FjallStorage::deliver_response(
+    super::worker::FjallStorage::deliver_response(
         response_tx,
         StorageEvent::TransactionCommitted { txn_id },
         "commit_transaction",
@@ -1308,7 +1310,7 @@ fn unknown_commit_runs() {
             queued: false,
         },
     );
-    let mut storage = super::FjallStorage {
+    let mut storage = super::worker::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
         txns: std::collections::HashMap::from([(
@@ -1362,7 +1364,7 @@ fn unknown_commit_retires() {
             queued: false,
         },
     );
-    let mut storage = super::FjallStorage {
+    let mut storage = super::worker::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
         txns: std::collections::HashMap::new(),
@@ -1410,7 +1412,7 @@ fn retry_skips_queued() {
             queued: true,
         },
     );
-    let mut storage = super::FjallStorage {
+    let mut storage = super::worker::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
         txns: std::collections::HashMap::from([(
@@ -1508,7 +1510,7 @@ async fn commit_full_aborts() {
     };
     let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
     let filler_span = super::storage_effect_span(&filler);
-    let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+    let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
         .write_channel
         .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
@@ -2211,7 +2213,7 @@ async fn request_metrics_count() {
     assert!(matches!(event, Event::Storage(StorageEvent::Error { .. })));
     assert_eq!(
         handle.snapshot_metrics(),
-        super::StorageMetricsSnapshot {
+        super::metrics::StorageMetricsSnapshot {
             requests_total: 1,
             errors_total: 1,
             conflicts_total: 0,

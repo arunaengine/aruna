@@ -16,8 +16,8 @@ use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keyspaces::DHT_KEYSPACE;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::TxnId;
-use aruna_storage::StorageHandle;
-use aruna_storage::storage::TransactionOwner;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::owner::TransactionOwner;
 use byteview::ByteView;
 use crossfire::{AsyncRx, MAsyncTx, MTx, mpsc};
 use iroh::Endpoint;
@@ -2914,7 +2914,7 @@ mod tests {
     use super::*;
     use crate::test_support::make_node;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::{TempDir, tempdir};
 
     fn make_entry(seed: u8, key: DhtKeyId, expires_at: u64) -> StoredEntry {

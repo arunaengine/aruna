@@ -29,7 +29,10 @@ use aruna_core::structs::identity::node_state::{
     BootOrigin, PersistedNodeState, PersistedNodeStatus,
 };
 use aruna_graph::MetadataSearchStorage;
-use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
+use aruna_storage::errors::StorageLibError;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
+use aruna_storage::storage::worker::FjallStorage;
 use byteview::ByteView;
 use iroh::EndpointAddr;
 use iroh::KeyParsingError;
@@ -765,7 +768,7 @@ mod tests {
         StaticRealmEndpoint,
     };
     use aruna_net::{RelayMethod, format_endpoint_config};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::collections::BTreeMap;
     use tempfile::tempdir;
 

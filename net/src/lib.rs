@@ -53,7 +53,7 @@ use aruna_core::structs::execution::notification_watch::{WatchInterestEntry, Wat
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::{NetState, NetworkDiagnosticsState};
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use async_trait::async_trait;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr};

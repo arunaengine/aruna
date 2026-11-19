@@ -16,7 +16,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::device::publish_queue::{PublishEntry, PublishState};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::Json;
 use axum::extract::State;

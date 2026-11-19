@@ -1228,7 +1228,7 @@ mod tests {
             &Payload::Framed { checksum: None }
         ));
     }
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
 
     fn provider(path: &str) -> AuthProvider {
         let storage = FjallStorage::open(path).unwrap();

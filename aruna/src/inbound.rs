@@ -1084,7 +1084,7 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
@@ -1155,7 +1155,7 @@ mod tests {
             outbound_handle: None,
         };
         let documents = vec![evicted(1), evicted(2)];
-        let (failed, receivers) = aruna_storage::StorageHandle::new();
+        let (failed, receivers) = aruna_storage::storage::handle::StorageHandle::new();
         drop(receivers);
         let failed = context(failed);
         assert!(!reemit_evicted_documents(&failed, documents.clone()).await);

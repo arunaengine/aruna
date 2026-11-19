@@ -1100,7 +1100,8 @@ mod tests {
     };
     use aruna_drivers::driver::{DriverContext, drive, node_routing};
     use aruna_storage::scan::iter_prefix_page;
-    use aruna_storage::storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::{TempDir, tempdir};

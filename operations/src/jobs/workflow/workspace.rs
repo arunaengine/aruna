@@ -440,7 +440,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
 
     use std::collections::BTreeSet;
@@ -1198,7 +1198,7 @@ mod tests {
     async fn rejects_oversized_mounts() {
         // Fifty patterns are the issuance cap, so twenty-five mounted buckets
         // still pass and the twenty-sixth must fail permanently.
-        let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
+        let (storage_handle, _receivers) = aruna_storage::storage::handle::StorageHandle::new();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

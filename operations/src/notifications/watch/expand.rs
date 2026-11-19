@@ -32,7 +32,7 @@ mod tests {
     };
     use aruna_core::structs::storage::blob::object_permission_path;
     use aruna_drivers::driver::{DriverContext, drive, drive_retry};
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
     use ulid::Ulid;
 
     use crate::tests::notifications::{create_holder_watch, create_local_watch};

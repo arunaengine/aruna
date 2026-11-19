@@ -14,7 +14,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::tempdir;
 use ulid::Ulid;
@@ -106,7 +106,7 @@ fn mints_from_placement() {
 async fn caps_declared_outputs() {
     // The declaration bound is the immutable record's bound, so a valid
     // local success can never be impossible to publish.
-    let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
+    let (storage_handle, _receivers) = aruna_storage::storage::handle::StorageHandle::new();
     let context = DriverContext {
         storage_handle,
         net_handle: None,

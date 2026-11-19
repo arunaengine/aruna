@@ -442,7 +442,7 @@ mod tests {
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;

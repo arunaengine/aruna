@@ -17,7 +17,7 @@ use byteview::ByteView;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 
 const SCAN_SIZE: usize = 1_024;
 const SCAN_PAGE_LIMIT: usize = 8;
@@ -348,7 +348,7 @@ fn due_prefix_ms(key: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
 
     #[test]
     fn ulid_suffix_trips() {

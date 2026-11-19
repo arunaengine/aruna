@@ -429,7 +429,7 @@ async fn drain_reconcile_summary() {
     use aruna_net::{NetConfig, NetHandle};
 
     async fn write_stat(
-        storage: &aruna_storage::StorageHandle,
+        storage: &aruna_storage::storage::handle::StorageHandle,
         key_space: &str,
         key: Vec<u8>,
         value: Vec<u8>,
@@ -632,7 +632,7 @@ async fn drain_reconcile_config() {
     net.shutdown().await;
 }
 
-async fn restore_document_key(storage: &aruna_storage::StorageHandle) -> TaskKey {
+async fn restore_document_key(storage: &aruna_storage::storage::handle::StorageHandle) -> TaskKey {
     let task_handle = TaskHandle::new();
     let (seen_tx, mut seen_rx) = mpsc::channel(1);
     task_handle

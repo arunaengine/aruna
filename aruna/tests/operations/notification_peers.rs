@@ -45,7 +45,7 @@ use aruna_operations::realm::load_config::config_unavailable;
 use aruna_operations::tests::notifications::local_watch;
 use aruna_operations::tests::notifications::{data_group_id, data_node_id, data_path};
 use aruna_operations::tests::notifications::{seeded_record, upload_event};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_test_support::jobs::find_dedup_plan;
 use byteview::ByteView;
 use std::sync::Arc;
@@ -345,7 +345,7 @@ async fn webhook_queued(node: &Node, record: &NotificationRecord) -> bool {
 /// stored record of the same batch.
 /// The watches of `owner` stored on the node behind `storage`.
 async fn list_watch_subscriptions(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     owner: UserId,
 ) -> Result<
     Vec<aruna_core::structs::execution::notification_watch::WatchSubscription>,

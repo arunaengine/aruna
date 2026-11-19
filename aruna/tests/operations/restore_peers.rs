@@ -30,7 +30,7 @@ use aruna_operations::node::recovery_run::{
 use aruna_operations::placement::process_placements::ReconcilePlacementsOperation;
 use aruna_operations::shard::recovery::{RecoveryOutcome, RecoveryState, RecoveryStatus};
 use aruna_operations::shard::restore::*;
-use aruna_storage::storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;

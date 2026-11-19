@@ -33,7 +33,7 @@ use aruna_core::{NodeId, UserId};
 use aruna_drivers::driver::DriverContext;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::distribution::inventory::open_ranges;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use axum::Router;
 use axum::http::{StatusCode, Uri};
 use std::collections::HashMap;

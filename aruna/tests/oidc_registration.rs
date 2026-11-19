@@ -24,7 +24,7 @@ use aruna_operations::realm::announce_presence::{
 };
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_wire::users::RegisterUserResponse;
 use axum::http::StatusCode;

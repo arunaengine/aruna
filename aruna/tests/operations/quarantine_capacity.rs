@@ -25,7 +25,7 @@ use aruna_operations::sync::sync_quarantine::{
     AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
     QuarantinePage, QuarantinePageRequest, ReadQuarantineOperation,
 };
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use aruna_test_support::documents::reconcile_topics;
 use byteview::ByteView;
 use ulid::Ulid;
@@ -134,7 +134,7 @@ async fn list(ctx: &DriverContext, request: QuarantinePageRequest) -> Quarantine
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_blocks_releases() {
     let storage_dir = tempfile::tempdir().expect("storage dir");
-    let storage = aruna_storage::FjallStorage::open(storage_dir.path().to_str().expect("path"))
+    let storage = aruna_storage::storage::worker::FjallStorage::open(storage_dir.path().to_str().expect("path"))
         .expect("storage opens");
     let realm_id = RealmId::from_bytes([31; 32]);
     let net = NetHandle::new(

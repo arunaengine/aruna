@@ -6,7 +6,7 @@ use super::harness::*;
 use super::*;
 
 /// The outbox rows still waiting.
-async fn outbox_rows(storage: &aruna_storage::StorageHandle) -> Vec<(Key, ByteView)> {
+async fn outbox_rows(storage: &aruna_storage::storage::handle::StorageHandle) -> Vec<(Key, ByteView)> {
     let read = StorageEffect::Iter {
         key_space: aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
         prefix: None,
@@ -279,7 +279,7 @@ async fn drain_retries_queueing() {
 }
 
 async fn write_notification_outbox(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     record: &NotificationOutboxRecord,
 ) {
     let (key_space, key, value) = outbox_write_entry(record).expect("outbox entry");
@@ -297,7 +297,7 @@ async fn write_notification_outbox(
     }
 }
 
-async fn read_inbox_records(storage: &aruna_storage::StorageHandle) -> Vec<NotificationRecord> {
+async fn read_inbox_records(storage: &aruna_storage::storage::handle::StorageHandle) -> Vec<NotificationRecord> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),

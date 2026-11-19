@@ -1290,7 +1290,7 @@ mod tests {
 
     fn context(root: &str) -> Arc<DriverContext> {
         Arc::new(DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(root).unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -1304,7 +1304,7 @@ mod tests {
     /// context without one never exercises that gate.
     async fn net_context(root: &Path) -> (Arc<DriverContext>, NetHandle) {
         let storage_handle =
-            aruna_storage::FjallStorage::open(root.join("storage").to_str().unwrap()).unwrap();
+            aruna_storage::storage::worker::FjallStorage::open(root.join("storage").to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1930,7 +1930,7 @@ mod tests {
         // after the departing holder closed that generation.
         let directory = tempdir().unwrap();
         let storage =
-            aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId::from_bytes([9; 32]);
         let placement = fenced_bucket();
 
@@ -1989,7 +1989,7 @@ mod tests {
     async fn close_is_monotone() {
         let directory = tempdir().unwrap();
         let storage =
-            aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId::from_bytes([10; 32]);
         let placement = fenced_bucket();
         let stored = || async {
@@ -2062,7 +2062,7 @@ mod tests {
         // success without rewriting it would brick the bucket for good.
         let directory = tempdir().unwrap();
         let storage =
-            aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId::from_bytes([12; 32]);
         let placement = fenced_bucket();
         let (key_space, key) = fence_read(&realm_id, &placement);

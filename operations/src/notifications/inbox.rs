@@ -426,7 +426,7 @@ mod tests {
     use aruna_core::storage_entries::inbox_update_entry;
     use aruna_core::structs::execution::notification::NotificationClass;
     use aruna_drivers::driver::drive;
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
 
     async fn upsert_with_report(
         storage: &StorageHandle,

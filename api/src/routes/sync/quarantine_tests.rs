@@ -21,7 +21,7 @@ use aruna_core::structs::{
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_storage::storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::http::StatusCode;
 use ulid::Ulid;

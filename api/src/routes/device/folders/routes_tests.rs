@@ -21,7 +21,7 @@ use aruna_core::types::{Key, Value};
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::device::sync::repository::{action_entry, base_entry, folder_entry};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::http::StatusCode;
 use ed25519_dalek::SigningKey;

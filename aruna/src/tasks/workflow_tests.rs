@@ -43,7 +43,8 @@ use aruna_operations::jobs::workflow::recovery::RecoverSubmitOperation;
 use aruna_operations::jobs::workflow::settle::{ParkAttemptOperation, SettleScope};
 use aruna_operations::jobs::workflow::supervise::{SuperviseOperation, WalltimeAnchorOperation};
 use aruna_operations::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_test_support::jobs::{
     begin_external_running, claim_job, handoff_external_attempt, insert_job, mutate_job,

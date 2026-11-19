@@ -50,7 +50,7 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::data::identity::{ObjectLocation, normalized_id};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_test_support::staging::setup_driver_context;
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};

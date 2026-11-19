@@ -172,7 +172,7 @@ struct Started {
 async fn start(realm_id: RealmId, seed: u8) -> Started {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap().to_string();
-    let storage = aruna_storage::FjallStorage::open(&root).unwrap();
+    let storage = aruna_storage::storage::worker::FjallStorage::open(&root).unwrap();
     storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
     let config = NetConfig {

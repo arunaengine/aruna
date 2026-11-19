@@ -25,7 +25,7 @@ use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::shard::recovery::RecoveryStatus;
-use aruna_storage::FjallPersistPolicy;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
 use tokio::net::TcpListener;
@@ -70,7 +70,7 @@ pub struct NodeResources {
 /// The resources acquired so far. Infallible ownership is created up front;
 /// every fallible acquisition assigns its resource before the next step runs.
 struct Acquired {
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     shutdown: Shutdown,
@@ -89,7 +89,7 @@ struct Acquired {
 }
 
 impl Acquired {
-    fn new(storage_handle: aruna_storage::StorageHandle, task_handle: TaskHandle) -> Self {
+    fn new(storage_handle: aruna_storage::storage::handle::StorageHandle, task_handle: TaskHandle) -> Self {
         let jobs_runtime = JobsRuntime::new_paused();
         jobs_runtime.register_handler(Arc::new(PluginWorkHandler));
         Self {
@@ -275,7 +275,7 @@ pub(crate) async fn acquire(
 /// a partial one is a typed error; `on_drain` arms escalation before each drain.
 pub(crate) async fn acquire_with_storage(
     settings: Settings,
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     task_handle: TaskHandle,
     stop: &tokio_util::sync::CancellationToken,
     mut checkpoint: impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
@@ -333,7 +333,7 @@ pub(crate) async fn acquire_with_storage(
 #[cfg(test)]
 pub(crate) async fn acquire_resources(
     config: Config,
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     task_handle: TaskHandle,
     mut checkpoint: impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<NodeResources, Box<dyn std::error::Error>> {
@@ -713,11 +713,11 @@ mod tests {
     use aruna_core::structs::storage::usage::{UsageCounters, global_shard_keys};
     use aruna_drivers::testing::test_context;
     use aruna_operations::node::counter_check::CounterCheckError;
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
     use tempfile::tempdir;
 
     fn open_storage(dir: &tempfile::TempDir) -> StorageHandle {
-        aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
             .expect("storage opens")
     }
 
@@ -1038,7 +1038,7 @@ mod tests {
             );
 
             // Cleanup released every store handle: reopening the same root works.
-            let reopened = aruna_storage::FjallStorage::open(&path);
+            let reopened = aruna_storage::storage::worker::FjallStorage::open(&path);
             assert!(
                 reopened.is_ok(),
                 "{stage:?}: storage stayed locked after cleanup: {:?}",
@@ -1085,7 +1085,7 @@ mod tests {
         assert!(outcome.is_none());
 
         let reopened =
-            aruna_storage::FjallStorage::open(&path).expect("cleanup released the store");
+            aruna_storage::storage::worker::FjallStorage::open(&path).expect("cleanup released the store");
         let identity = crate::identity::IdentityStore::from_storage(reopened);
         assert!(
             identity.load().await.unwrap().is_none(),

@@ -35,7 +35,7 @@ use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadSt
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};

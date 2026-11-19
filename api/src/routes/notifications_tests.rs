@@ -28,7 +28,7 @@ use aruna_drivers::driver::drive;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::notifications::inbox::UpsertInboxOperation;
 use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
-use aruna_storage::storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

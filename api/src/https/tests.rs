@@ -775,7 +775,7 @@ async fn rest_stack(cors: crate::cors::CorsConfig) -> RestStack {
     let storage = tempfile::tempdir().expect("temp dir");
     let store_path = storage.path().to_str().expect("utf8 path");
     let driver_ctx = Arc::new(aruna_drivers::driver::DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(store_path).expect("storage"),
+        storage_handle: aruna_storage::storage::worker::FjallStorage::open(store_path).expect("storage"),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,
@@ -1012,7 +1012,7 @@ async fn s3_stack(
     let storage = tempfile::tempdir().expect("temp dir");
     let store_path = storage.path().to_str().expect("utf8 path");
     let driver_ctx = Arc::new(aruna_drivers::driver::DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(store_path).expect("storage"),
+        storage_handle: aruna_storage::storage::worker::FjallStorage::open(store_path).expect("storage"),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,

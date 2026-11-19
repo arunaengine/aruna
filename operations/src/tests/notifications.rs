@@ -19,7 +19,8 @@ use aruna_core::structs::identity::realm::RealmId;
 #[cfg(test)]
 use aruna_drivers::driver::{DriverContext, drive};
 #[cfg(test)]
-use aruna_storage::storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 #[cfg(test)]
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;

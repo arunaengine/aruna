@@ -183,7 +183,7 @@ fn changed_archive_aborts() {
 #[tokio::test]
 async fn retirement_fences_promotion() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let storage = aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
     let key = sealed().format.bucket_key().unwrap();
     let mut record = BucketKeyRecord::new(key, Ulid::nil(), [1; 32], 0);
     record.state = KeyState::Retiring;
@@ -843,7 +843,7 @@ pub(crate) mod received {
     }
 
     async fn read_value(
-        storage: &aruna_storage::StorageHandle,
+        storage: &aruna_storage::storage::handle::StorageHandle,
         key_space: &str,
         key: Vec<u8>,
     ) -> Result<Option<aruna_core::types::Value>, PromoteError> {

@@ -22,7 +22,8 @@ use aruna_core::structs::storage::node_info::{
 use aruna_drivers::driver::HangLimits;
 use aruna_graph::MetadataSearchStorage;
 use aruna_net::IrohRuntimeConfig;
-use aruna_storage::{CACHE_BYTES, FjallPersistPolicy};
+use aruna_storage::storage::lifecycle::CACHE_BYTES;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
 
 use crate::config::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};
 

@@ -54,7 +54,8 @@ use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperat
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::s3::access::get::GetAccessOperation;
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};

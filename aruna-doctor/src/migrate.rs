@@ -61,7 +61,7 @@ use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::plugins::decide::WaitingRow;
 use aruna_operations::replication::mirror_repair::SyncMirrorRecord;
-use aruna_storage::{SEALED_KEYSPACES, row_aad};
+use aruna_storage::storage::sealing::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use layouts::{CONNECTOR, HEAD, NODE_INFO, OBLIGATION, padded};
 use serde::de::DeserializeOwned;
@@ -1427,7 +1427,7 @@ mod tests {
         let sealed = &read(&path, CONNECTOR_SECRET_KEYSPACE)[b"row".as_slice()];
         assert!(!sealed.windows(11).any(|window| window == b"canary-61d0"));
         let key = CredentialEncryptionKey::derive(&[11u8; 32]);
-        let aad = aruna_storage::row_aad(CONNECTOR_SECRET_KEYSPACE, b"row");
+        let aad = aruna_storage::storage::sealing::row_aad(CONNECTOR_SECRET_KEYSPACE, b"row");
         assert_eq!(open_bytes(&key, sealed, &aad).unwrap(), plain);
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert_eq!((again.secrets_sealed, again.secrets_skipped.len()), (0, 1));
@@ -1455,7 +1455,7 @@ mod tests {
         };
         // The source row is still plain; the backend row is sealed with the S3 credential key.
         let backend_key = backend_id.to_bytes();
-        let aad = aruna_storage::row_aad(BACKEND_SECRET_KEYSPACE, &backend_key);
+        let aad = aruna_storage::storage::sealing::row_aad(BACKEND_SECRET_KEYSPACE, &backend_key);
         let credential = CredentialEncryptionKey::derive(&[11u8; 32]);
         let sealed = seal_bytes(
             &credential,

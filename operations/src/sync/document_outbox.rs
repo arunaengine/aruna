@@ -287,7 +287,8 @@ mod tests {
     use aruna_core::types::Value;
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_test_support::documents::{read_outbox_record, read_outbox_records};
     use tempfile::tempdir;
     use ulid::Ulid;

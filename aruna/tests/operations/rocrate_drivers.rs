@@ -59,7 +59,8 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use aruna_operations::testing::fresh_job_id;
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_test_support::metadata::process_materialization_batch;
 use aruna_test_support::projection::replay_event_log;

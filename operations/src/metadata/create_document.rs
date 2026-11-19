@@ -963,8 +963,8 @@ mod tests {
     use aruna_core::structs::placement::record::{
         FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, PlacementBinding,
     };
-    use aruna_storage::storage::EffectReceiver;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::{EffectReceiver, StorageHandle};
+    use aruna_storage::storage::worker::FjallStorage;
 
     use aruna_drivers::driver::{DriverContext, drive};
 

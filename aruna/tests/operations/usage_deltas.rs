@@ -60,7 +60,8 @@ use aruna_operations::s3::policy::successor::{
     MintSuccessorOperation, SuccessorOutcome, SuccessorPlan,
 };
 use aruna_operations::s3::realm_usage::{RealmUsageOperation, RealmUsageScope};
-use aruna_storage::{StorageHandle, storage};
+use aruna_storage::storage;
+use aruna_storage::storage::handle::StorageHandle;
 use tempfile::TempDir;
 use ulid::Ulid;
 

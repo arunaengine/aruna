@@ -255,7 +255,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::s3_session::SESSION_MAX_TTL;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::time::Duration;
     use tempfile::TempDir;
     use ulid::Ulid;

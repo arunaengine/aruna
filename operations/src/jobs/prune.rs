@@ -445,8 +445,8 @@ pub(crate) mod tests {
     use aruna_core::time::unix_timestamp_millis;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::test_context;
-    use aruna_storage::FjallStorage;
     use aruna_storage::scan::iter_prefix_page;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_test_support::jobs::insert_job;
     use aruna_test_support::jobs::read_job_record;
     use byteview::ByteView;

@@ -39,7 +39,8 @@ use aruna_operations::notifications::webhook::{
 use aruna_operations::sync::notification_outbox::{
     EmitNotificationsInput, EmitNotificationsOperation,
 };
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;

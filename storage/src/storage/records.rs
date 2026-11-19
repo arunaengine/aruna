@@ -11,9 +11,10 @@ use byteview::ByteView;
 use fjall::{OptimisticTxKeyspace, Readable};
 use ulid::Ulid;
 
+use super::worker::FjallStorage;
 use super::{
-    FjallStorage, Store, Txn, batch_read_with, iterate_page, range_page, read_last_with,
-    store_batch_read, store_iterate, store_last, store_read,
+    Store, Txn, batch_read_with, iterate_page, range_page, read_last_with, store_batch_read,
+    store_iterate, store_last, store_read,
 };
 
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);

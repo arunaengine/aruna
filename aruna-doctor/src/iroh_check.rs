@@ -410,7 +410,7 @@ mod tests {
     use super::*;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_wire::info::{
         InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeStatus, ServicesStatus,
     };

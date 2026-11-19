@@ -195,7 +195,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("blobs");
         std::fs::create_dir(&root).unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let net = aruna_net::NetHandle::new(
             aruna_net::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

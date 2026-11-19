@@ -30,7 +30,7 @@ use aruna_core::types::{GroupId, Key, Value};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::local_query::LocalQueryOperation;
 use aruna_operations::metadata::text_search::LocalSearchOperation;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -41,7 +41,7 @@ const REALM: RealmId = RealmId([9u8; 32]);
 struct TestHarness {
     _storage_dir: TempDir,
     _metadata_dir: TempDir,
-    storage: aruna_storage::StorageHandle,
+    storage: aruna_storage::storage::handle::StorageHandle,
     context: DriverContext,
     group_id: GroupId,
 }

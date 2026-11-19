@@ -19,7 +19,7 @@ use aruna_net::streams::BiStream;
 use aruna_net::{
     DiscoveryMethod, InboundEventHandler, NetConfig, NetError, NetHandle, RelayMethod,
 };
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use async_trait::async_trait;
 use byteview::ByteView;
 use iroh::endpoint::ReadToEndError;
@@ -722,7 +722,7 @@ struct RealmFixture {
     a: NetHandle,
     b: NetHandle,
     c: NetHandle,
-    b_storage: aruna_storage::StorageHandle,
+    b_storage: aruna_storage::storage::handle::StorageHandle,
     b_secret: iroh::SecretKey,
     node_b: NodeId,
     node_c: NodeId,

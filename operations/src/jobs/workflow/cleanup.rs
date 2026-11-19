@@ -294,7 +294,8 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, UserAccess, VersionKey,
     };
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
     use ulid::Ulid;

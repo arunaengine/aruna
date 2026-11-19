@@ -14,7 +14,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::structs::identity::auth::{Permission as Access, Role};
 use aruna_core::structs::identity::user::User;
 use aruna_drivers::driver::drive;
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 #[allow(unused_imports)]
 use aruna_test_support::plugins::Fixture;
 use serde_json::json;

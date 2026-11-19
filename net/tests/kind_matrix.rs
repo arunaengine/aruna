@@ -13,7 +13,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_net::streams::BiStream;
 use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use async_trait::async_trait;
 use irokle::Storage as _;
 use tempfile::tempdir;

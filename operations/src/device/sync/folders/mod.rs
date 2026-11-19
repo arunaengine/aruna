@@ -817,17 +817,17 @@ mod tests {
     /// for `release` on its own thread, so the effects behind it still run. `committed` gets the
     /// error the commit of that write's transaction answered with.
     fn hold_write(
-        storage: aruna_storage::StorageHandle,
-        receivers: aruna_storage::storage::StorageReceivers,
+        storage: aruna_storage::storage::handle::StorageHandle,
+        receivers: aruna_storage::storage::handle::StorageReceivers,
         held: FolderState,
         reached: tokio::sync::oneshot::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
         committed: tokio::sync::oneshot::Sender<Option<aruna_core::errors::StorageError>>,
     ) {
         fn forward(
-            storage: &aruna_storage::StorageHandle,
+            storage: &aruna_storage::storage::handle::StorageHandle,
             effect: aruna_core::effects::StorageEffect,
-            response: aruna_storage::storage::ResponseSender,
+            response: aruna_storage::storage::handle::ResponseSender,
         ) -> Option<aruna_core::errors::StorageError> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -900,7 +900,7 @@ mod tests {
             let folder = bound_folder(start);
             let folder_id = folder.folder_id;
             store_folder(&context, &folder).await.expect("row stored");
-            let (storage, receivers) = aruna_storage::StorageHandle::new();
+            let (storage, receivers) = aruna_storage::storage::handle::StorageHandle::new();
             let (reached, held) = tokio::sync::oneshot::channel();
             let (release, gate) = std::sync::mpsc::channel();
             let (committed, commit) = tokio::sync::oneshot::channel();

@@ -34,7 +34,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::federation::import::{
     BoundUploadOperation, ReadImportOperation, WriteImportOperation,
 };
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::Extension;
 use axum::body::Body;

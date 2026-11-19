@@ -16,7 +16,7 @@ use aruna_core::structs::NetworkDiagnosticsState;
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmEndpointAnnouncement, RealmId, endpoint_signing_bytes,
 };
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr, TransportAddr};
 use parking_lot::RwLock;

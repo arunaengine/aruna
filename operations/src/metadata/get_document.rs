@@ -164,7 +164,7 @@ mod tests {
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;
 

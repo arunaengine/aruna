@@ -9,7 +9,7 @@ use aruna_core::document::{
     DocumentSyncRevision, DocumentTarget, ShardManifest, ShardManifestEntry,
 };
 use aruna_core::{NodeId, alpn::Alpn};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use async_trait::async_trait;
 use std::{sync::Arc, time::Duration};
 use tempfile::tempdir;

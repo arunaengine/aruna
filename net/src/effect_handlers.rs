@@ -743,7 +743,7 @@ mod tests {
     use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect};
     use aruna_core::events::{DhtEvent, NetEvent};
     use aruna_core::keys::realm_presence_key;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 

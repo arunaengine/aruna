@@ -11,7 +11,7 @@ use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
 use aruna_core::{NodeId, UserId};
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
-use aruna_storage::storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use byteview::ByteView;
 use std::time::SystemTime;
 use tempfile::{TempDir, tempdir};

@@ -184,7 +184,7 @@ mod tests {
     use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::document_repository::GetConfigOperation;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;
     use ulid::Ulid;

@@ -11,7 +11,8 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_drivers::driver::DriverContext;
 use aruna_storage::scan::iter_prefix_page;
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_test_support::jobs::{insert_job, read_job_record, read_key_waits};
 
 fn temp_storage() -> (tempfile::TempDir, StorageHandle) {

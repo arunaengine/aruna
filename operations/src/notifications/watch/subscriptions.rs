@@ -20,7 +20,7 @@ mod tests {
     use aruna_core::structs::execution::notification_watch::{
         WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
     };
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
     use ulid::Ulid;
 
     async fn list_scope(

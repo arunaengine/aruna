@@ -931,7 +931,7 @@ mod tests {
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
     use byteview::ByteView;
     use serde::Serialize;
     use std::collections::HashMap;

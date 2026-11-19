@@ -10,7 +10,7 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_core::structs::storage::distribution::inventory::VersionEntry;
 use aruna_core::structs::storage::format::EncodingClass;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 
 use super::*;
 use crate::distribution::inventory::{AddedVersion, HeadChange, InventoryChange, InventoryUpdate};

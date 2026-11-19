@@ -20,7 +20,8 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_drivers::testing::test_context;
-use aruna_storage::{FjallPersistPolicy, FjallStorage};
+use aruna_storage::storage::persistence::FjallPersistPolicy;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ulid::Ulid;
 

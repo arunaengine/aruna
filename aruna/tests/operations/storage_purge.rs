@@ -76,7 +76,8 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::purge_fence::{PurgeFenceError, fence_key};
-use aruna_storage::{StorageHandle, storage};
+use aruna_storage::storage;
+use aruna_storage::storage::handle::StorageHandle;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;

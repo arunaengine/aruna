@@ -110,7 +110,7 @@ fn transient_errors_retry() {
 async fn manifest_read_authorized() {
     let tempdir = tempfile::tempdir().unwrap();
     let storage_handle =
-        aruna_storage::storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        aruna_storage::storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
     let context = aruna_drivers::testing::test_context(storage_handle.clone());
     let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
     let claim_token = Ulid::from_bytes([6; 16]);

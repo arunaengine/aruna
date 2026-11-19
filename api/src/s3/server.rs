@@ -1172,7 +1172,7 @@ mod tests {
             .with_writer(move || LogWriter(writer.clone()))
             .finish();
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -1537,7 +1537,7 @@ mod tests {
         // Behind a trusted proxy every client gets its own bucket; charging the
         // proxy would let one caller throttle every other caller of that proxy.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap())
+        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
             .expect("storage opens");
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
@@ -1602,7 +1602,7 @@ mod tests {
         // A request refused by the per-IP slot limit still reaches the request
         // metrics, so dashboards count every 503.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -1663,7 +1663,7 @@ mod tests {
         // A nondefault burst of one must reject the second request, proving S3
         // uses the configured quota rather than the default.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -1726,7 +1726,7 @@ mod tests {
         use tokio::net::TcpListener;
 
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap())
+        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
             .expect("test storage");
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
@@ -1788,7 +1788,7 @@ mod tests {
         use tokio::net::TcpListener;
 
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap())
+        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
             .expect("test storage");
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,

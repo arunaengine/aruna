@@ -409,7 +409,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory");
         let path = directory.path().to_str().expect("path");
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(path).expect("storage"),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(path).expect("storage"),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,

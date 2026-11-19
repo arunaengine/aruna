@@ -416,7 +416,7 @@ async fn connected_stream_pair() -> (NetHandle, tempfile::TempDir, NetHandle, te
 struct TestContext {
     _temp_dir: tempfile::TempDir,
     blob_handle: BlobHandle,
-    storage_handle: aruna_storage::storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
 }
 
 enum TestContextSetup<'a> {
