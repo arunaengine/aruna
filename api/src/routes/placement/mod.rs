@@ -1298,7 +1298,7 @@ pub async fn mint_object_placement(
                 created_at: SystemTime::now(),
                 now_ms: unix_timestamp_millis(),
             },
-            mint_version(hint),
+            mint_version(Ulid::generate(), hint),
         ),
         &state.get_ctx(),
     )

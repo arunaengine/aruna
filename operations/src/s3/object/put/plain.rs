@@ -47,7 +47,7 @@ impl PutObjectOperation {
         let request = &self.config.request;
         let id = self
             .version_id
-            .unwrap_or_else(|| mint_version(self.set_hint));
+            .unwrap_or_else(|| mint_version(Ulid::generate(), self.set_hint));
         let target = self
             .config
             .routing

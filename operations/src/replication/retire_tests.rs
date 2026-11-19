@@ -45,7 +45,13 @@ fn job() -> BlobJobRecord {
         replicate_delete_markers: true,
         mode: ReplicationMode::Live,
     };
-    let mut record = BlobJobRecord::new_relationship(input, Some(false), Ulid::from_parts(7, 7), 1);
+    let mut record = BlobJobRecord::new_relationship(
+        input,
+        Some(false),
+        Ulid::from_parts(7, 7),
+        1,
+        Ulid::generate(),
+    );
     record.job_id = Ulid::from_parts(6, 6);
     record
 }

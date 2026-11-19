@@ -94,12 +94,16 @@ pub(crate) fn member_jobs(
                 replicate_delete_markers: true,
                 mode: ReplicationMode::Live,
             };
-            BlobJobRecord::new(input, Some(obligation.delete_marker), now_ms).with_member(
-                MemberTarget {
-                    set_id: binding.set_id,
-                    member_id: delivery.member_id,
-                },
+            BlobJobRecord::new(
+                input,
+                Some(obligation.delete_marker),
+                now_ms,
+                Ulid::generate(),
             )
+            .with_member(MemberTarget {
+                set_id: binding.set_id,
+                member_id: delivery.member_id,
+            })
         })
         .collect()
 }

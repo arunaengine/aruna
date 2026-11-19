@@ -859,6 +859,8 @@ fn relationship_jobs(
             relationship.clone(),
             obligation.origin.as_ref(),
             upstream_sources,
+            aruna_core::time::unix_timestamp_millis(),
+            ulid::Ulid::generate(),
         );
         let job = job.map(|mut job| match obligation.reference_advance {
             Some(advance) => {

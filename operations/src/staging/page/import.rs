@@ -14,6 +14,7 @@ use crate::staging::page::rows::{
 };
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
@@ -58,6 +59,8 @@ pub struct PageImportOperation {
     /// Only builds the rows, in a read snapshot, and keeps them in `prepared`.
     prepare: bool,
     prepared: Option<PreparedRows>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 impl PageImportOperation {
@@ -70,6 +73,8 @@ impl PageImportOperation {
             result: None,
             prepare: false,
             prepared: None,
+            now_ms: 0,
+            mint: IdMint::default(),
         }
     }
 
@@ -150,7 +155,8 @@ impl PageImportOperation {
                 prepared.rows
             }
             _ if self.prepare => {
-                let rows = page_rows(&self.input, guards, versions.clone())?;
+                let mint = (&mut self.mint, self.now_ms);
+                let rows = page_rows(&self.input, guards, versions.clone(), mint)?;
                 let result = rows.result.clone();
                 let guards = guards.clone();
                 self.prepared = Some(PreparedRows {
@@ -161,7 +167,7 @@ impl PageImportOperation {
                 // The read snapshot ends without writes.
                 return Ok(Next::Done(result));
             }
-            _ => page_rows(&self.input, guards, versions)?,
+            _ => page_rows(&self.input, guards, versions, (&mut self.mint, self.now_ms))?,
         };
         if rows.result.registered > 0 {
             let usage = UsageCounterUpdate::for_group(self.input.group_id, rows.delta)
@@ -212,6 +218,14 @@ impl PageImportOperation {
 impl Operation for PageImportOperation {
     type Output = PageImportResult;
     type Error = PageImportError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> PageNext {
         let entries = self.input.entries.len();
@@ -316,6 +330,14 @@ impl PreparePageOperation {
 impl Operation for PreparePageOperation {
     type Output = PreparedRows;
     type Error = PageImportError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.0.stamp(now_ms);
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.0.seed(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<PreparedRows>, PageImportError> {
         let next = self.0.first()?;

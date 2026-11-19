@@ -221,7 +221,7 @@ impl CompleteUploadOperation {
         let set_hint = self.set_hint;
         let version_id = *self
             .version_id
-            .get_or_insert_with(|| mint_version(set_hint));
+            .get_or_insert_with(|| mint_version(Ulid::generate(), set_hint));
         // An import may register a listed object's version before the finalize commits it; an
         // upload opened at a provider path stays one after its rule was removed.
         if self.plain.as_ref().is_some_and(|target| target.listed) || self.plain_upload().is_some()

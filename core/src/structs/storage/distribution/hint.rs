@@ -51,10 +51,9 @@ pub fn hinted_id(time_ms: u64, random: u128, hint: SetHint) -> Ulid {
     )
 }
 
-/// Mints a new version id now: hinted inside a distributed bucket, a plain ULID otherwise.
-/// The mint time is always the timestamp. Collisions are checked by the version id index.
-pub fn mint_version(hint: Option<SetHint>) -> Ulid {
-    let fresh = Ulid::generate();
+/// A new version id from a freshly minted one: hinted inside a distributed bucket, unchanged
+/// otherwise. The mint time stays the timestamp. Collisions are checked by the version id index.
+pub fn mint_version(fresh: Ulid, hint: Option<SetHint>) -> Ulid {
     match hint {
         Some(hint) => with_hint(fresh, hint),
         None => fresh,
@@ -114,7 +113,6 @@ impl HintIndex {
 #[cfg(test)]
 mod tests {
     use super::{HintIndex, SetHint, hinted_id, mint_version};
-    use std::time::{Duration, SystemTime};
     use ulid::Ulid;
 
     fn set(seed: u8) -> Ulid {
@@ -148,11 +146,10 @@ mod tests {
 
     #[test]
     fn minted_ids_hinted() {
-        let before = SystemTime::now() - Duration::from_secs(1);
         let hint = SetHint::of_set(set(3));
-        let id = mint_version(Some(hint));
+        let id = mint_version(Ulid::from_parts(5_000, 9), Some(hint));
         assert_eq!(SetHint::of_version(id), hint);
-        assert!(id.datetime() >= before);
+        assert_eq!(id.timestamp_ms(), 5_000);
         // Distinct ids for one set still sort by mint time first.
         let later = hinted_id(id.timestamp_ms() + 1, 0, hint);
         assert!(later > id);
@@ -163,7 +160,7 @@ mod tests {
         let mut index = HintIndex::default();
         index.insert(set(4));
         index.insert(set(5));
-        let id = mint_version(Some(SetHint::of_set(set(4))));
+        let id = mint_version(Ulid::from_parts(5_000, 9), Some(SetHint::of_set(set(4))));
         assert!(index.candidates(id).any(|candidate| candidate == set(4)));
         index.remove(set(4));
         assert!(index.candidates(id).all(|candidate| candidate != set(4)));
