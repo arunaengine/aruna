@@ -400,7 +400,7 @@ impl SourceEvent {
     }
 }
 
-/// Key of a journal row of `kind`: journal time, then a random unique suffix, so rows of the
+/// Key of a journal row of `kind`: journal time, then a suffix unique to the event, so rows of the
 /// same millisecond have no set order.
 pub fn journal_key(kind: u8, journaled_ms: u64, unique: Ulid) -> Vec<u8> {
     let mut key = vec![kind];
@@ -414,7 +414,7 @@ pub fn journal_key(kind: u8, journaled_ms: u64, unique: Ulid) -> Vec<u8> {
 pub fn journal_entries(
     event: &SourceEvent,
 ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
-    let unique = Ulid::generate();
+    let unique = source_suffix(&event.source);
     let value = ByteView::from(event.to_bytes()?);
     let mut entries: Vec<_> = [JOURNAL_ROW, PENDING_ROW]
         .into_iter()
@@ -433,6 +433,15 @@ pub fn journal_entries(
         event.anchor_ms.to_be_bytes().to_vec().into(),
     ));
     Ok(entries)
+}
+
+/// The journal key suffix of `source`: the event's canonical identity hashed, so it needs no
+/// random read and stays unique per event.
+fn source_suffix(source: &str) -> Ulid {
+    let hash = blake3::hash(source.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    Ulid::from_bytes(bytes)
 }
 
 /// The version write `effect` with the event's journal rows in the same batch. A single write
