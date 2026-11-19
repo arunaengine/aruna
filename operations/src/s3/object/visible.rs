@@ -315,6 +315,12 @@ type VisibleTurn<S, R> = Result<
     VisibleError<<R as ShowRule>::Error, <S as ListSource>::Error>,
 >;
 
+/// How the page ends after an entry, `None` while it goes on.
+type VisibleStop<S, R> = Result<
+    Option<Next<VisiblePage<<S as ListSource>::Object>>>,
+    VisibleError<<R as ShowRule>::Error, <S as ListSource>::Error>,
+>;
+
 impl<S, R> VisiblePageOperation<S, R>
 where
     S: ListSource,
@@ -380,39 +386,54 @@ where
         }
     }
 
+    /// Takes entries in a loop, as one page may hold a long run decided without any call.
     fn next_entry(&mut self) -> VisibleTurn<S, R> {
-        let Some(entry) = self.entries.pop_front() else {
-            return match (self.more.take(), self.after_last()) {
-                (None, _) => self.done(),
-                (Some(_), Some(next)) => self.end_at(next),
-                (Some(token), None) => {
-                    self.input.continuation_token = Some(token);
-                    self.input.start_after = None;
-                    self.list_page()
-                }
+        loop {
+            let Some(entry) = self.entries.pop_front() else {
+                return match (self.more.take(), self.after_last()) {
+                    (None, _) => self.done(),
+                    (Some(_), Some(next)) => self.end_at(next),
+                    (Some(token), None) => {
+                        self.input.continuation_token = Some(token);
+                        self.input.start_after = None;
+                        self.list_page()
+                    }
+                };
             };
-        };
-        let name = Self::name(&entry).to_string();
-        let group = matches!(entry, Entry::Group(_));
-        let position = after_entry(&self.bucket, &name, group);
-        let place = EntryPlace {
-            name,
-            group,
-            position,
-        };
-        match entry {
-            Entry::Object(object) => match self.rule.shows(&object) {
-                Shown::Decided(shown) => self.object_decided(object, place, shown),
-                Shown::Ask(call) => {
-                    self.step = VisibleStep::Object(object, place);
-                    Ok(Next::Call(call))
+            let name = Self::name(&entry).to_string();
+            let group = matches!(entry, Entry::Group(_));
+            let position = after_entry(&self.bucket, &name, group);
+            let place = EntryPlace {
+                name,
+                group,
+                position,
+            };
+            let (shown, cost) = match entry {
+                Entry::Object(object) => match self.rule.shows(&object) {
+                    Shown::Decided(shown) => (shown, self.keep_object(object, shown)),
+                    Shown::Ask(call) => {
+                        self.step = VisibleStep::Object(object, place);
+                        return Ok(Next::Call(call));
+                    }
+                },
+                Entry::Group(prefix) if self.rule.groups(&prefix) => {
+                    return self.start_probe(prefix, None, ProbeFor::Entry(place));
                 }
-            },
-            Entry::Group(prefix) if self.rule.groups(&prefix) => {
-                self.start_probe(prefix, None, ProbeFor::Entry(place))
+                Entry::Group(_) => (false, 1),
+            };
+            if let Some(end) = self.settle_entry(place, shown, cost)? {
+                return Ok(end);
             }
-            Entry::Group(_) => self.entry_done(place, false, 1),
         }
+    }
+
+    /// Puts a shown object on the page and answers what the entry costs.
+    fn keep_object(&mut self, object: S::Object, shown: bool) -> usize {
+        if !shown {
+            return 1;
+        }
+        self.page.objects.push(object);
+        0
     }
 
     fn object_decided(
@@ -421,15 +442,19 @@ where
         place: EntryPlace,
         shown: bool,
     ) -> VisibleTurn<S, R> {
-        if !shown {
-            return self.entry_done(place, false, 1);
+        let cost = self.keep_object(object, shown);
+        self.entry_done(place, shown, cost)
+    }
+
+    fn entry_done(&mut self, place: EntryPlace, shown: bool, cost: usize) -> VisibleTurn<S, R> {
+        match self.settle_entry(place, shown, cost)? {
+            Some(end) => Ok(end),
+            None => self.next_entry(),
         }
-        self.page.objects.push(object);
-        self.entry_done(place, true, 0)
     }
 
     /// A hidden entry costs one; a prefix pays for the hidden entries its probe met.
-    fn entry_done(&mut self, place: EntryPlace, shown: bool, cost: usize) -> VisibleTurn<S, R> {
+    fn settle_entry(&mut self, place: EntryPlace, shown: bool, cost: usize) -> VisibleStop<S, R> {
         let EntryPlace {
             name,
             group,
@@ -449,12 +474,12 @@ where
                     pending: None,
                 })?,
             };
-            return self.end_at(next);
+            return self.end_at(next).map(Some);
         }
         if !shown {
             self.input.continuation_token = Some(position);
         }
-        self.next_entry()
+        Ok(None)
     }
 
     /// Seeks one shown entry below `group`; the first page holds one entry, as the first entry
@@ -490,37 +515,48 @@ where
     }
 
     fn probe_next(&mut self) -> VisibleTurn<S, R> {
-        let probe = self.probe.as_mut().ok_or(IoError::Unfinished)?;
-        let Some(object) = probe.objects.pop_front() else {
-            let Some(token) = probe.next.take() else {
-                return self.probe_end(ProbeEnd::Empty);
+        loop {
+            let probe = self.probe.as_mut().ok_or(IoError::Unfinished)?;
+            let Some(object) = probe.objects.pop_front() else {
+                let Some(token) = probe.next.take() else {
+                    return self.probe_end(ProbeEnd::Empty);
+                };
+                probe.input.continuation_token = Some(token);
+                probe.input.max_keys = None;
+                let call = self.source.call(&probe.input);
+                self.step = VisibleStep::ProbePage;
+                return Ok(Next::Call(call));
             };
-            probe.input.continuation_token = Some(token);
-            probe.input.max_keys = None;
-            let call = self.source.call(&probe.input);
-            self.step = VisibleStep::ProbePage;
-            return Ok(Next::Call(call));
-        };
-        match self.rule.shows(&object) {
-            Shown::Decided(shown) => self.probe_decided(object, shown),
-            Shown::Ask(call) => {
-                probe.current = Some(object);
-                self.step = VisibleStep::ProbeObject;
-                Ok(Next::Call(call))
+            match self.rule.shows(&object) {
+                Shown::Decided(shown) => {
+                    if let Some(end) = self.probe_stop(&object, shown) {
+                        return self.probe_end(end);
+                    }
+                }
+                Shown::Ask(call) => {
+                    probe.current = Some(object);
+                    self.step = VisibleStep::ProbeObject;
+                    return Ok(Next::Call(call));
+                }
             }
         }
     }
 
-    fn probe_decided(&mut self, object: S::Object, shown: bool) -> VisibleTurn<S, R> {
+    /// How a decided object ends the probe, `None` while it goes on.
+    fn probe_stop(&mut self, object: &S::Object, shown: bool) -> Option<ProbeEnd> {
         if shown {
-            return self.probe_end(ProbeEnd::Shown);
+            return Some(ProbeEnd::Shown);
         }
         self.budget = self.budget.saturating_sub(1);
-        if self.budget == 0 {
-            let at = after_entry(&self.bucket, S::key(&object), false).last_key;
-            return self.probe_end(ProbeEnd::Stopped(at));
+        (self.budget == 0)
+            .then(|| ProbeEnd::Stopped(after_entry(&self.bucket, S::key(object), false).last_key))
+    }
+
+    fn probe_decided(&mut self, object: S::Object, shown: bool) -> VisibleTurn<S, R> {
+        match self.probe_stop(&object, shown) {
+            Some(end) => self.probe_end(end),
+            None => self.probe_next(),
         }
-        self.probe_next()
     }
 
     fn probe_end(&mut self, end: ProbeEnd) -> VisibleTurn<S, R> {
@@ -688,6 +724,49 @@ mod tests {
             next: more.then(|| after_entry("b", "more", false)),
         });
         IoResult::Child(ChildOutcome::new(listed))
+    }
+
+    /// Runs `steps` on a stack far too small for one frame per hidden entry.
+    fn on_small_stack(steps: impl FnOnce() + Send + 'static) {
+        let thread = std::thread::Builder::new().stack_size(256 * 1024);
+        thread.spawn(steps).unwrap().join().unwrap();
+    }
+
+    fn hidden_run() -> Vec<String> {
+        (0..=SCAN_BUDGET)
+            .map(|index| format!("open/{index:06}"))
+            .collect()
+    }
+
+    #[test]
+    fn hidden_run_flat() {
+        on_small_stack(|| {
+            let keys = hidden_run();
+            let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let mut list = VisiblePageOperation::new(Pages, Keys, input(5), None);
+            list.first().unwrap();
+            let Ok(Next::Done(found)) = list.next(page(&keys, &[], false)) else {
+                panic!("the budget ends the page");
+            };
+            assert!(found.objects.is_empty());
+            assert!(matches!(found.next, Some(NextPage::Sealed(_))));
+        });
+    }
+
+    #[test]
+    fn hidden_probe_flat() {
+        on_small_stack(|| {
+            let keys = hidden_run();
+            let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let mut list = VisiblePageOperation::new(Pages, Keys, input(5), None);
+            list.first().unwrap();
+            list.next(page(&[], &["open/"], false)).unwrap();
+            let Ok(Next::Done(found)) = list.next(page(&keys, &[], false)) else {
+                panic!("the budget ends the probe");
+            };
+            assert!(found.prefixes.is_empty());
+            assert!(matches!(found.next, Some(NextPage::Sealed(_))));
+        });
     }
 
     #[test]
