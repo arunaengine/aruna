@@ -22,7 +22,7 @@ use crate::keyspaces::{
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
 use crate::operation::TransactionMode;
-use crate::reducer::reduced_admin_target;
+use crate::reducer::overlay::reduced_admin_target;
 use crate::register::{Admission, admit_write};
 use crate::row_plan::{PlanRows, PlanStop, Planned, RowPlan};
 use crate::storage_entries::sync_revision_key;

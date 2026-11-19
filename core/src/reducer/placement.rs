@@ -2,6 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::paths::{
+    CONFIG_STRATEGY_PATH, JOB_FAMILY_PATH, binding_scope_key, decode_node_kind,
+    normalized_strategy_binding, parse_config_node, placement_binding_value,
+};
 use super::*;
 
 /// Materializes reducer-owned placement state and repairs dangling references with the lowest live

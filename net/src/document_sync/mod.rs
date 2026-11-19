@@ -18,7 +18,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::{DhtKeyId, NodeId, short_display_id};
 use aruna_core::keyspaces::APPLIED_OPS_KEYSPACE;
-use aruna_core::reducer::reduced_admin_target;
+use aruna_core::reducer::overlay::reduced_admin_target;
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::sync_quarantine::{SyncQuarantineIdentity, SyncRejection};

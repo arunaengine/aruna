@@ -711,7 +711,8 @@ pub fn choose_origin_bucket(
 mod pure_tests {
     use super::*;
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-    use crate::reducer::{AdminDocumentState, overlay_placement};
+    use crate::reducer::AdminDocumentState;
+    use crate::reducer::placement::overlay_placement;
     use crate::structs::identity::auth::Actor;
     use crate::structs::identity::realm::{RealmId, RealmNodeKind};
     use crate::structs::placement::record::{

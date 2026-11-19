@@ -33,12 +33,15 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, GraphPruneRecord, MetadataDeleteRecord, MetadataEventPayload,
     MetadataEventRecord, MetadataLifecycleRecord,
 };
-use aruna_core::reducer::{
-    AdminDocumentState, CONFIG_DESCRIPTION_PATH, CONFIG_STRATEGY_PATH, METADATA_REPLICATION_PATH,
-    REVOCATIONS_PER_ORIGIN, USER_NAME_PATH, config_node_path, decode_reducer_state,
-    group_user_path, materialize_user_operation, needs_revocation_index, overlay_realm_config,
-    realm_user_path, user_attribute_path,
+use aruna_core::reducer::overlay::{
+    materialize_user_operation, needs_revocation_index, overlay_realm_config,
 };
+use aruna_core::reducer::paths::{
+    CONFIG_DESCRIPTION_PATH, CONFIG_STRATEGY_PATH, METADATA_REPLICATION_PATH, USER_NAME_PATH,
+    config_node_path, group_user_path, realm_user_path, user_attribute_path,
+};
+use aruna_core::reducer::revocation::REVOCATIONS_PER_ORIGIN;
+use aruna_core::reducer::{AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{
     create_acceptance_key, event_log_key, metadata_document_key, metadata_registry_key,
     reducer_conflict_key, reducer_state_entry, reducer_state_key, registry_write_entries,

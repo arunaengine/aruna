@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::paths::REVOKED_TOKENS_PATH;
 use super::*;
 
 pub(super) fn expiry_threshold(expires_at: u64) -> u64 {

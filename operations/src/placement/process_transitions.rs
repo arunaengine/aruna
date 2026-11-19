@@ -1258,7 +1258,8 @@ mod tests {
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     use aruna_core::placement::fence;
-    use aruna_core::reducer::{AdminDocumentState, overlay_placement};
+    use aruna_core::reducer::AdminDocumentState;
+    use aruna_core::reducer::placement::overlay_placement;
     use std::path::Path;
 
     use aruna_core::document::DocumentTarget;

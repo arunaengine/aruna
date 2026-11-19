@@ -10,7 +10,8 @@ use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, GROUP_POLICIES_PATH};
+use aruna_core::reducer::paths::GROUP_POLICIES_PATH;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,

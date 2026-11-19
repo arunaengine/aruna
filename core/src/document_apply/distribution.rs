@@ -22,7 +22,8 @@ use crate::keyspaces::{
     DISTRIBUTION_PARKED_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE, NODE_STATS_KEYSPACE,
     PARKED_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use crate::reducer::{AdminApplyStatus, AdminDocumentState, config_node_path};
+use crate::reducer::paths::config_node_path;
+use crate::reducer::{AdminApplyStatus, AdminDocumentState};
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
 use crate::storage_entries::reducer_state_entry;
 use crate::structs::identity::realm::{RealmConfigDocument, RealmId};

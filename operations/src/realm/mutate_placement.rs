@@ -13,7 +13,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, overlay_placement};
+use aruna_core::reducer::placement::overlay_placement;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::{PrefixPages, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, pending_projection_target, reducer_state_entry, stale_conflict_deletes,

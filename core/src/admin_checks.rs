@@ -6,7 +6,9 @@ use crate::admin_documents::{AdminDocumentEvent, AdminDocumentOperation, AdminDo
 use crate::auth::valid_revocation_expiry;
 use crate::document::DocumentTarget;
 use crate::id::NodeId;
-use crate::reducer::{AdminDocumentState, REVOCATIONS_PER_ORIGIN, config_node_path};
+use crate::reducer::AdminDocumentState;
+use crate::reducer::paths::config_node_path;
+use crate::reducer::revocation::REVOCATIONS_PER_ORIGIN;
 use crate::structs::identity::auth::Role;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};

@@ -12,9 +12,9 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::reducer::{
-    AdminDocumentError, AdminDocumentState, config_node_path, overlay_placement, parse_config_node,
-};
+use aruna_core::reducer::paths::{config_node_path, parse_config_node};
+use aruna_core::reducer::placement::overlay_placement;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -639,9 +639,8 @@ mod pure_tests {
         SYNC_OUTBOX_KEYSPACE,
     };
     use aruna_core::operation::{Operation, TransactionMode};
-    use aruna_core::reducer::{
-        AdminConflict, AdminConflictValue, AdminDocumentState, CONFIG_STRATEGY_PATH,
-    };
+    use aruna_core::reducer::paths::CONFIG_STRATEGY_PATH;
+    use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::reducer_conflict_key;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};

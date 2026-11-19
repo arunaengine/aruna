@@ -10,7 +10,8 @@ use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, DISPLAY_NAME_PATH};
+use aruna_core::reducer::paths::DISPLAY_NAME_PATH;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
