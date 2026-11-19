@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod exports;
+mod paths;
 mod reads;
 
 use aruna_core::NodeId;
@@ -11,14 +13,18 @@ use aruna_core::realm_vault::RealmSecretRef;
 use aruna_core::structs::identity::realm::RealmId;
 use thiserror::Error;
 
+use self::exports::{ExportAsk, ExportServeOperation};
+use self::paths::{PathAsk, PathReadOperation};
 use self::reads::{CallerReadOperation, ReadReply};
 use crate::distribution::imports::{HandedImport, StagingSpecOperation};
+use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::realm::promotion::{PromotionAnswer, PromotionRequest, ServePromotionOperation};
 use crate::realm_vault::{SecretAnswer, ServeRequest, ServeSecretOperation};
 use crate::replication::page::PageAnswer;
 use crate::replication::page::deliver::ServePageOperation;
 use crate::replication::queue::BlobQueueError;
+use aruna_core::metadata::AuthToken;
 
 /// What this node offers the requests it serves.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -29,6 +35,8 @@ pub struct ServeNode {
     pub graph: bool,
     /// Whether an object search may use the range indexes.
     pub indexed: bool,
+    /// The largest metadata document this node exports.
+    pub metadata_bytes: u64,
 }
 
 /// A reply and, for an export, the body sent after it.
@@ -47,6 +55,8 @@ pub enum ServeError {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Waiting {
     Read,
+    Path,
+    Export,
     Spec,
     Page,
     Realm(RealmAsk),
@@ -95,9 +105,10 @@ impl RealmAsk {
 }
 
 impl Waiting {
-    fn answer(self, result: IoResult) -> Result<MetadataTransportMessage, ServeError> {
-        Ok(match self {
-            Self::Read => result.child::<MetadataTransportMessage, IoError>()??,
+    fn answer(self, result: IoResult) -> Result<ServedReply, ServeError> {
+        let reply = match self {
+            Self::Export => return Ok(result.child::<ServedReply, IoError>()??),
+            Self::Read | Self::Path => result.child::<MetadataTransportMessage, IoError>()??,
             Self::Spec => MetadataTransportMessage::StagingSpecResult {
                 result: (result.child::<HandedImport, MetadataReadError>()?).map(Box::new),
             },
@@ -110,7 +121,8 @@ impl Waiting {
                 }),
             },
             Self::Realm(ask) => ask.answer(result)?,
-        })
+        };
+        Ok((reply, None))
     }
 }
 
@@ -140,6 +152,16 @@ impl ServeRequestOperation {
         Ok(Next::Call(call))
     }
 
+    fn path(&mut self, token: Option<AuthToken>, digest: [u8; 32], ask: PathAsk) -> ServeTurn {
+        let read = PathReadOperation::new((self.peer, self.node), token, digest, ask);
+        self.call(Waiting::Path, IoCall::child(read))
+    }
+
+    fn export(&mut self, digest: [u8; 32], ask: ExportAsk) -> ServeTurn {
+        let export = ExportServeOperation::new((self.peer, self.node), digest, ask);
+        self.call(Waiting::Export, IoCall::child(export))
+    }
+
     // A realm request needs this node's realm; without one it answers unavailable.
     fn realm(&mut self, ask: RealmAsk, serve: impl FnOnce(RealmId, NodeId) -> IoCall) -> ServeTurn {
         match self.node.local {
@@ -167,6 +189,78 @@ impl Operation for ServeRequestOperation {
             return self.call(Waiting::Read, IoCall::child(read));
         }
         match message {
+            MetadataTransportMessage::QueryDocument {
+                auth_token,
+                config_digest,
+                document_id,
+                sparql,
+            } => {
+                let ask = PathAsk::Query {
+                    document_id,
+                    sparql,
+                };
+                self.path(auth_token, config_digest, ask)
+            }
+            MetadataTransportMessage::ForwardPathLookup {
+                auth_token,
+                group_id,
+                document_path,
+                config_digest,
+            } => {
+                let ask = PathAsk::Lookup {
+                    group_id,
+                    path: document_path,
+                };
+                self.path(auth_token, config_digest, ask)
+            }
+            MetadataTransportMessage::ForwardPathResolution {
+                auth_token,
+                group_id,
+                document_path,
+                config_digest,
+            } => {
+                let ask = PathAsk::Resolve {
+                    group_id,
+                    path: document_path,
+                };
+                self.path(auth_token, config_digest, ask)
+            }
+            MetadataTransportMessage::ForwardExportDocument {
+                auth_token,
+                config_digest,
+                document_id,
+                view,
+                metadata_bytes,
+                limit,
+                offset,
+                after,
+            } => {
+                let request = ExportMetadataRequest {
+                    document_id,
+                    auth: None,
+                    view,
+                    limit,
+                    offset,
+                    after,
+                };
+                let ask = ExportAsk::Document {
+                    token: auth_token,
+                    request: Some(request),
+                    metadata_bytes,
+                };
+                self.export(config_digest, ask)
+            }
+            MetadataTransportMessage::ForwardExportProfile {
+                config_digest,
+                profile_id,
+                expected_revision,
+            } => {
+                let ask = ExportAsk::Profile {
+                    profile_id,
+                    expected_revision,
+                };
+                self.export(config_digest, ask)
+            }
             MetadataTransportMessage::StagingSpec {
                 transfer_id,
                 job_id,
@@ -212,7 +306,7 @@ impl Operation for ServeRequestOperation {
             expected: "no answer",
             got: result.label(),
         })?;
-        Ok(Next::Done((waiting.answer(result)?, None)))
+        Ok(Next::Done(waiting.answer(result)?))
     }
 }
 

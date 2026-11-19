@@ -3,15 +3,20 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::document_repository::GetConfigError;
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::protocol::MetadataPathCandidate;
 use crate::s3::bucket::get::GetBucketError;
 use crate::tests::calls::{caller_of, child, node, runs_child};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 
 fn local() -> ServeNode {
     ServeNode {
         local: Some((node(1), RealmId([1u8; 32]))),
         graph: true,
         indexed: false,
+        metadata_bytes: 1024,
     }
 }
 
@@ -158,6 +163,73 @@ fn owner_missing_bucket() {
         read.next(child(missing)),
         Ok(Next::Done(MetadataTransportMessage::BucketOwnerResult {
             result: Err(MetadataReadError::NotFound)
+        }))
+    );
+}
+
+fn config(seed: u8) -> Result<RealmConfigDocument, GetConfigError> {
+    Ok(RealmConfigDocument::new(RealmId([seed; 32]), Vec::new(), 2))
+}
+
+fn digest(seed: u8) -> [u8; 32] {
+    config(seed).unwrap().digest().unwrap()
+}
+
+#[test]
+fn export_needs_digest() {
+    // A Profile export under another realm config than the sender's answers unavailable.
+    let ask = ExportAsk::Profile {
+        profile_id: ulid::Ulid::from_bytes([5u8; 16]),
+        expected_revision: ulid::Ulid::from_bytes([6u8; 16]),
+    };
+    let mut export = ExportServeOperation::new((node(2), local()), digest(1), ask);
+    assert!(runs_child(export.first()));
+    assert_eq!(
+        export.next(child(config(2))),
+        Ok(Next::Done((
+            MetadataTransportMessage::ForwardedExport {
+                result: Err(MetadataReadError::Unavailable)
+            },
+            None
+        )))
+    );
+}
+
+#[test]
+fn query_needs_holder() {
+    // A document query for a document this node does not hold is never checked further.
+    let ask = PathAsk::Query {
+        document_id: ulid::Ulid::from_bytes([5u8; 16]),
+        sparql: "ASK {}".to_string(),
+    };
+    let mut query = PathReadOperation::new((node(2), local()), None, digest(1), ask);
+    assert!(runs_child(query.first()));
+    assert_eq!(
+        query.next(child(config(1))),
+        Ok(Next::Done(MetadataTransportMessage::DocumentQueryResults {
+            result: Err(MetadataReadError::Unavailable)
+        }))
+    );
+}
+
+#[test]
+fn lookup_rechecks_config() {
+    // A path lookup only stands while the config still matches after the read.
+    let ask = PathAsk::Lookup {
+        group_id: ulid::Ulid::from_bytes([5u8; 16]),
+        path: "a/b".to_string(),
+    };
+    let mut lookup = PathReadOperation::new((node(2), local()), None, digest(1), ask);
+    assert!(runs_child(lookup.first()));
+    let caller: Result<Option<AuthContext>, MetadataReadError> = Ok(None);
+    assert!(runs_child(lookup.next(child(caller))));
+    assert!(runs_child(lookup.next(child(config(1)))));
+    let found: Result<Vec<MetadataPathCandidate>, MetadataApiError> = Ok(Vec::new());
+    assert!(runs_child(lookup.next(child(found))));
+    assert_eq!(
+        lookup.next(child(config(2))),
+        Ok(Next::Done(MetadataTransportMessage::ForwardedPathLookup {
+            result: Err(MetadataReadError::Unavailable)
         }))
     );
 }
