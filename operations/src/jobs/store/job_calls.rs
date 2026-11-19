@@ -73,11 +73,7 @@ where
     StoreCall::of(build, Ok, ATTEMPT_EXHAUSTED)
 }
 
-fn control_of(job_id: JobId, change: impl ControlEdit) -> StoreCall<AttemptControl> {
-    control_with(job_id, Vec::new(), change)
-}
-
-/// [`control_of`], with `extra` rows that must land with the change.
+/// A change to a job's attempt control, with `extra` rows that must land with the change.
 fn control_with(
     job_id: JobId,
     extra: JobWrites,

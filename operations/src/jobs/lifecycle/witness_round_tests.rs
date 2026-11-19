@@ -127,7 +127,9 @@ fn family_read_required() {
     // An unreadable membership view is no verdict either.
     let mut operation = configured(&fixture);
     operation
-        .next(child(Ok::<_, FamilyReadError>(Vec::new())))
+        .next(child(Ok::<_, FamilyReadError>(
+            Vec::<JobRecordEnvelope>::new(),
+        )))
         .unwrap();
     let unknown = operation.next(child(Ok::<Option<WriterView>, IoError>(None)));
     assert_eq!(outcome(unknown), RoundOutcome::Retry { after_ms: base });
