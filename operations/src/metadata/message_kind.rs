@@ -152,5 +152,7 @@ pub fn transport_message_kind(message: &MetadataTransportMessage) -> &'static st
         MetadataTransportMessage::NodeSecretChecked { .. } => "node_secret_checked",
         MetadataTransportMessage::ForwardedGraphPending { .. } => "forwarded_graph_pending",
         MetadataTransportMessage::ExportAnswer { .. } => "export_answer",
+        MetadataTransportMessage::QuerySubmissionClaim { .. } => "query_submission_claim",
+        MetadataTransportMessage::SubmissionClaimAnswered { .. } => "submission_claim_answered",
     }
 }

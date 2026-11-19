@@ -299,6 +299,22 @@ async fn peer_request(
             let result = Box::pin(aruna_drivers::driver::drive(admit, context.as_ref())).await;
             Ok(MetadataTransportMessage::ForwardedJobSubmission { result })
         }
+        MetadataTransportMessage::QuerySubmissionClaim {
+            submission_id,
+            admit_by,
+        } => {
+            use aruna_operations::jobs::lifecycle::closure::ServeClosureOperation;
+            let answer = match context.node_and_realm() {
+                Some((_, realm_id)) => {
+                    let question = (submission_id, admit_by);
+                    let serve = ServeClosureOperation::new(realm_id, peer, question);
+                    let answered = Box::pin(drive(serve, context.as_ref())).await;
+                    answered.unwrap_or(aruna_core::jobs::ClosureAnswer::Undecided)
+                }
+                None => aruna_core::jobs::ClosureAnswer::Undecided,
+            };
+            Ok(MetadataTransportMessage::SubmissionClaimAnswered { answer })
+        }
         MetadataTransportMessage::ResolveJobInputs {
             auth_token,
             request,

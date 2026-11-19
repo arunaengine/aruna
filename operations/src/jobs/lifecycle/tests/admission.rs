@@ -58,6 +58,7 @@ async fn admit(
             now_ms: 3_000,
             quota_refusal: None,
             quota_revision: None,
+            admit_by: None,
         }),
         context,
     )
@@ -98,6 +99,7 @@ async fn rejects_stale_quota() {
             now_ms: 3_000,
             quota_refusal: None,
             quota_revision: Some(0),
+            admit_by: None,
         }),
         &ctx,
     )

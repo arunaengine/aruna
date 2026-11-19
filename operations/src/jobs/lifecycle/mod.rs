@@ -21,6 +21,7 @@ mod advertised;
 pub mod alias;
 pub mod cancel;
 pub mod chain;
+pub mod closure;
 pub mod family_reads;
 mod fetch;
 mod forward;
@@ -82,6 +83,12 @@ pub enum LifecycleError {
     /// Standing quota refused this NEW admission; replays are never refused.
     #[error("standing compute quota refused the admission: {0}")]
     QuotaDenied(#[from] QuotaDenied),
+    /// A plugin task's request reached a holder after its admission deadline, or without one.
+    #[error("the request is past its admission deadline")]
+    AdmissionClosed,
+    /// A plugin task's work row on the receiver is no longer dispatched.
+    #[error("the plugin task's work has ended")]
+    TaskEnded,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: expected {expected}, got {got}")]

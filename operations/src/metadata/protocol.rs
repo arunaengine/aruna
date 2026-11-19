@@ -735,6 +735,15 @@ pub enum MetadataTransportMessage {
             MetadataReadError,
         >,
     },
+    /// Asks a node a plugin task's submission was sent to whether it admitted it; past
+    /// `admit_by` it closes the submission when it holds no claim. Appended to keep indices.
+    QuerySubmissionClaim {
+        submission_id: SubmissionId,
+        admit_by: u64,
+    },
+    SubmissionClaimAnswered {
+        answer: aruna_core::jobs::ClosureAnswer,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.

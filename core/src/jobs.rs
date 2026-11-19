@@ -445,6 +445,20 @@ pub enum SubmissionRefusal {
     Unavailable,
 }
 
+/// What a node a plugin task's submission was sent to answers after its admission deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClosureAnswer {
+    /// The node stores a claim of the submission: its request family and alias.
+    Claimed {
+        family: crate::structs::execution::job::JobFamilyId,
+        job_id: JobId,
+    },
+    /// No claim, and a committed closure row refuses every later admission there.
+    Absent,
+    /// Nothing decided; ask again.
+    Undecided,
+}
+
 /// A failed call leaves the request unanswered, which another holder may still answer.
 impl From<crate::calls::IoError> for SubmissionRefusal {
     fn from(_: crate::calls::IoError) -> Self {
