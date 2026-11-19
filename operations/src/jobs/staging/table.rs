@@ -558,7 +558,7 @@ impl Operation for ChunkReadOperation {
                     Ok(()) => {
                         let (bytes, complete) = work.cursor.chunk();
                         if let Some(kept) = self.kept.as_mut() {
-                            kept.work = work;
+                            kept.work = *work;
                         }
                         self.read.version_id = self.read.version_id.or(self.opened.take());
                         self.read.gzip = Some(true);

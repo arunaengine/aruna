@@ -264,9 +264,18 @@ fn chunk_needs_newline() {
     let mut chunk = allowed_reader(0);
     chunk.observation = Some(observation);
     chunk.end = MANIFEST_CHUNK;
-    let line = format!("{}  a.txt\nrest", "0".repeat(32));
-    assert!(chunk.collected(line.into_bytes()).is_ok());
-    assert_eq!(chunk.writes.len(), 1);
+    let complete = format!("{}  a.txt", "0".repeat(32));
+    let (algorithm, digest, _) = parse_manifest_line(&complete).unwrap();
+    let turn = chunk.collected(format!("{complete}\nrest").into_bytes());
+    let row = (
+        STAGING_MANIFEST_KEYSPACE.to_string(),
+        manifest_key(chunk.run.job_id, "data/a.txt"),
+        ByteView::from(postcard::to_allocvec(&(algorithm, digest)).unwrap()),
+    );
+    let commit = chunk
+        .run
+        .commit_call(None, &chunk.next, vec![row], Vec::new());
+    assert_eq!(turn, Ok(Next::Call(commit.unwrap())));
     let next = chunk.next.manifest.as_ref().expect("the manifest goes on");
     assert_eq!(next.offset, 39);
 }

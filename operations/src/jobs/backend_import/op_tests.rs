@@ -221,8 +221,12 @@ fn stored_intents_match() {
         (own.clone(), Value::from(Vec::new())),
         (other.clone(), Value::from(Vec::new())),
     ];
-    let Ok(Next::Done(keys)) = intents.next(answer(Ok::<_, ItemError>(rows))) else {
-        panic!("a path without a tag has one base");
+    // The file's path and its free path are both read, also when they are the same.
+    let turn = intents.next(answer(Ok::<_, ItemError>(rows)));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let free = answer(Ok::<_, ItemError>(Vec::<(Key, Value)>::new()));
+    let Ok(Next::Done(keys)) = intents.next(free) else {
+        panic!("expected the stored intents");
     };
     assert!(keys.contains(&own));
     assert!(!keys.contains(&other));
