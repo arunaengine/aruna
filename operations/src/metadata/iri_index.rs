@@ -1395,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_page_reads_once() {
+    fn predicate_reads_once() {
         let budget = LinkBudget { seeks: 2, rows: 8 };
         let mut read = BacklinksOperation::new((OBJECT, Some("p")), (None, 10), budget);
         assert!(matches!(read.first(), Ok(Next::Call(IoCall::Effect(_)))));

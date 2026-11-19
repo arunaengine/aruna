@@ -112,7 +112,7 @@ fn replay_admits_nothing() {
 }
 
 #[test]
-fn missing_bucket_not_found() {
+fn missing_bucket_refused() {
     let mut admit = AdmitPullOperation::new(node(1), auth(), request(false));
     admit.first().unwrap();
     admit
@@ -123,7 +123,7 @@ fn missing_bucket_not_found() {
 }
 
 #[test]
-fn ordinary_bucket_checks_write() {
+fn bucket_checks_write() {
     let mut admit = AdmitPullOperation::new(node(1), auth(), request(false));
     admit.first().unwrap();
     admit

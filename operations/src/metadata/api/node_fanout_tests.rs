@@ -107,7 +107,7 @@ fn strict_discovery_fails() {
 }
 
 #[test]
-fn local_mode_asks_self() {
+fn local_asks_self() {
     let mut fanout = fanout(ApiQueryMode::Local, None, false);
     let asked = group(fanout.first());
     assert!(matches!(

@@ -305,7 +305,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nothing_listed_reads_nothing() {
+    fn empty_reads_nothing() {
         let mut access = ReadAccessOperation::new(realm(), None, &[]);
         assert_eq!(access.first(), Ok(Next::Done(ReadAccess::default())));
     }
@@ -337,7 +337,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn failed_rules_hide_private() {
+    fn failed_rules_hide() {
         let records = [record(true), record(false)];
         let access = access_for(&records, Some(caller()));
         assert!(access.shows(&records[0]));
