@@ -947,7 +947,7 @@ impl DeleteObjectOperation {
     }
 
     fn write_tombstone(&mut self) -> Turn {
-        let version_id = mint_version(self.set_hint);
+        let version_id = mint_version(Ulid::generate(), self.set_hint);
         self.version_id = Some(version_id);
         self.deleted_version_created =
             Some(SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms));

@@ -142,6 +142,7 @@ mod pure_tests {
             },
             None,
             0,
+            Ulid::generate(),
         )
     }
 

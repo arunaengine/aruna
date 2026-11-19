@@ -790,7 +790,10 @@ pub fn reserve_output_commits(
         job_id,
         move |_: &mut JobRecord, control: &mut AttemptControl| {
             let mint = |(node_id, bucket, _): &(NodeId, String, String)| {
-                mint_version(hints.get(&(*node_id, bucket.clone())).copied())
+                mint_version(
+                    Ulid::generate(),
+                    hints.get(&(*node_id, bucket.clone())).copied(),
+                )
             };
             match control.reserve_outputs(&destinations, mint) {
                 true => Ok(JobMutation::Persist),
