@@ -266,14 +266,7 @@ async fn s3_decoded_compose() {
 
 /// Seeded xorshift bytes, which do not compress.
 fn noise(len: usize, mut seed: u64) -> Vec<u8> {
-    (0..len)
-        .map(|_| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed as u8
-        })
-        .collect()
+    crate::codec::tests::random(len, seed)
 }
 
 /// Streams parts 1 to 3, then replaces parts 1 and 3 with staged blobs of `sizes`.

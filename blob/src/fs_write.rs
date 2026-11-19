@@ -688,21 +688,10 @@ fn sibling_path(relative: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use crate::fs_source::list_local;
-    use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_ROOT;
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-    use std::collections::HashMap;
 
     fn access(root: &Path, path: &str) -> ResolvedSourceAccess {
-        ResolvedSourceAccess::OpenDal {
-            kind: SourceConnectorKind::LocalDirectory,
-            config: HashMap::from([(
-                OFFERED_DIRECTORY_ROOT.to_string(),
-                root.to_string_lossy().to_string(),
-            )]),
-            path: path.to_string(),
-            version: None,
-        }
+        crate::fs_source::tests::access(root, path)
     }
 
     fn body(bytes: &'static [u8]) -> BackendStream<Result<Bytes, StreamError>> {
