@@ -2136,7 +2136,8 @@ mod tests {
             version_id: Ulid::from(8u128),
             delete_marker: false,
         };
-        let job = relationship_job(node(1), target, link, None, &[]).unwrap();
+        let job =
+            relationship_job(node(1), target, link, None, &[], unix_timestamp_millis()).unwrap();
         assert_eq!(job.input.auth_context.realm_id, realm());
         assert_eq!(job.input.auth_context.user_id.realm_id, foreign);
     }
@@ -2157,6 +2158,7 @@ mod tests {
                 hop_count: 4,
             }),
             &[],
+            unix_timestamp_millis(),
         );
 
         assert!(job.is_none());
@@ -2179,6 +2181,7 @@ mod tests {
             paused,
             None,
             &[],
+            unix_timestamp_millis(),
         );
 
         assert!(job.is_none());
@@ -2201,6 +2204,7 @@ mod tests {
             reference,
             None,
             &[],
+            unix_timestamp_millis(),
         )
         .unwrap();
 
@@ -2222,6 +2226,7 @@ mod tests {
             sync_link(21, 1, "a", 2, "b"),
             None,
             &[],
+            unix_timestamp_millis(),
         )
         .unwrap();
         let second = relationship_job(
@@ -2235,6 +2240,7 @@ mod tests {
             sync_link(22, 2, "b", 3, "c"),
             first.origin.as_ref(),
             &first.upstream_sources,
+            unix_timestamp_millis(),
         )
         .unwrap();
 
@@ -2249,6 +2255,7 @@ mod tests {
             sync_link(23, 3, "c", 1, "a"),
             second.origin.as_ref(),
             &second.upstream_sources,
+            unix_timestamp_millis(),
         );
 
         assert_eq!(first.upstream_sources.len(), 1);
@@ -2277,6 +2284,7 @@ mod tests {
                 hop_count: 1,
             }),
             &[upstream],
+            unix_timestamp_millis(),
         );
 
         assert!(job.is_some());
@@ -2526,6 +2534,7 @@ mod tests {
             link,
             None,
             &[],
+            unix_timestamp_millis(),
         )
         .expect("future job builds")
         .with_writer_auth(auth_context());

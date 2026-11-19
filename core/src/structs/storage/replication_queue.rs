@@ -13,7 +13,6 @@ use crate::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::storage::replication::ArunaArn;
 use crate::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_key};
-use crate::time::unix_timestamp_millis;
 use crate::types::Key;
 use byteview::ByteView;
 
@@ -378,6 +377,7 @@ pub fn relationship_job(
     relationship: SyncRelationship,
     inbound_origin: Option<&SyncOrigin>,
     upstream_sources: &[ArunaArn],
+    now_ms: u64,
 ) -> Option<BlobJobRecord> {
     let RelationshipJobTarget {
         bucket,
@@ -404,7 +404,6 @@ pub fn relationship_job(
         return None;
     }
 
-    let now_ms = unix_timestamp_millis();
     let origin = Some(match inbound_origin {
         Some(origin) => SyncOrigin {
             relationship_id: relationship.id,
