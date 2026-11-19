@@ -74,11 +74,13 @@ where
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, P::Error> {
-        let Some(plan) = self.plan.take() else {
+        if self.plan.is_none() {
             let answer = result.child::<Self::Output, <P::Call as Operation>::Error>()?;
             return Ok(Next::Done(answer?));
-        };
+        }
+        // A refused admission keeps the plan, so its call is never built.
         let install = result.child::<PluginInstall, CallError>()??;
+        let plan = self.plan.take().ok_or(IoError::Unfinished)?;
         Ok(Next::Call(IoCall::child(plan.call(&install, self.now_ms)?)))
     }
 }
