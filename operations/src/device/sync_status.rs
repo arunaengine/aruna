@@ -12,7 +12,7 @@ use aruna_core::events::Event;
 use aruna_core::keyspaces::{DEVICE_INTAKE_KEYSPACE, SYNC_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
-use aruna_core::structs::{EntryState, FolderState, SyncBase, SyncedFolder};
+use aruna_core::structs::synced_folder::{EntryState, FolderState, SyncBase, SyncedFolder};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{GroupId, Value};
 use byteview::ByteView;
@@ -551,7 +551,7 @@ mod tests {
     use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::{FolderMode, RemoteBinding};
+    use aruna_core::structs::synced_folder::{FolderMode, RemoteBinding};
     use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use std::sync::Arc;
@@ -607,7 +607,7 @@ mod tests {
 
     fn base(synced: bool, entry: EntryState) -> SyncBase {
         SyncBase {
-            synced: synced.then(|| aruna_core::structs::SyncedBytes {
+            synced: synced.then(|| aruna_core::structs::synced_folder::SyncedBytes {
                 fingerprint: "f".to_string(),
                 blake3: [6u8; 32],
                 size: 1,

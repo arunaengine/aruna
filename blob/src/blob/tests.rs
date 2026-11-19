@@ -24,12 +24,12 @@ use aruna_core::keyspaces::{
     PATHS_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::Status;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::info::Status;
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobTimeoutConfig,
     HiddenBlobKey, ResolvedBackend, WriteOwner,

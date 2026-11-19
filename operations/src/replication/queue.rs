@@ -269,7 +269,7 @@ mod tests {
         REPLICATION_OBLIGATION_KEYSPACE,
     };
     use aruna_core::plugin_runs::{SourceEvent, SourceKind};
-    use aruna_core::structs::{SyncMode, SyncRelationship, SyncState};
+    use aruna_core::structs::sync_relationship::{SyncMode, SyncRelationship, SyncState};
     use aruna_core::time::unix_timestamp_millis;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::handle::StorageHandle;
@@ -533,7 +533,9 @@ mod tests {
     use aruna_core::structs::storage::replication_queue::{
         ReferenceAdvance, ReplicationMode, SyncOrigin,
     };
-    use aruna_core::structs::{ReferenceHandling, SyncStatusSnapshot, sync_relationship_key};
+    use aruna_core::structs::sync_relationship::{
+        ReferenceHandling, SyncStatusSnapshot, sync_relationship_key,
+    };
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::user::id::UserId;
     use aruna_net::NetHandle;

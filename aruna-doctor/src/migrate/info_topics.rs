@@ -9,7 +9,7 @@ use aruna_core::id::TopicId as DocumentTopic;
 use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
 use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineUsage};
+use aruna_core::structs::sync_quarantine::{QUARANTINE_USAGE_KEY, SyncQuarantineUsage};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use irokle::{FjallStorage, Storage, TopicId};
 use std::path::Path;

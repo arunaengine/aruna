@@ -14,7 +14,9 @@ use crate::id::NodeId;
 use crate::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE};
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::storage::replication::ArunaArn;
-use crate::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_key};
+use crate::structs::sync_relationship::{
+    SyncMode, SyncRelationship, SyncState, sync_relationship_key,
+};
 use crate::task::{TaskEffect, TaskKey};
 use crate::types::Key;
 use byteview::ByteView;

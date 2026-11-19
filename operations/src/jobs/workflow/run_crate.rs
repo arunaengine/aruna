@@ -8,7 +8,6 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
 use aruna_core::rows::{outside_answer, outside_call};
-use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionSpec, InputContent, InputSource, JobError, JobId, JobPayload,
     JobRecord, JobResultPayload, JobState, LaunchRecord, LocalCrate, RunCrateStatus, RunLink,
@@ -24,6 +23,7 @@ use aruna_core::structs::storage::data::identity::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::structs::synced_folder::ORIGIN_DEVICE_TAG;
 use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 

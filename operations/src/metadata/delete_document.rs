@@ -19,11 +19,13 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::persistent_id::{
+    PersistentIdMapping, persistent_id_key, secondary_index_deletes,
+};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
-use aruna_core::structs::{PersistentIdMapping, persistent_id_key, secondary_index_deletes};
 use aruna_core::types::{Key, KeySpace};
 use byteview::ByteView;
 use thiserror::Error;
@@ -475,9 +477,9 @@ mod call_tests {
         DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, METADATA_AUDIT_KEYSPACE,
         PRUNE_JOB_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
     };
-    use aruna_core::structs::PersistentIdStatus;
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+    use aruna_core::structs::persistent_id::PersistentIdStatus;
     use aruna_core::structs::placement::record::PlacementStrategy;
 
     use aruna_core::types::Value;
@@ -801,7 +803,7 @@ mod call_tests {
         ));
         assert!(rows_in(&unminted, ID_MAPPING_KEYSPACE).is_empty());
 
-        let revision = aruna_core::structs::PersistentIdRevision {
+        let revision = aruna_core::structs::persistent_id::PersistentIdRevision {
             event_id: Ulid::from_parts(17, 17),
             actor: actor.node_id,
             occurred_at_ms: 1,

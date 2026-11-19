@@ -2337,7 +2337,7 @@ async fn interface_services_status(state: &ServerState) -> InterfaceServicesStat
 /// request from the maintained counters, not from the store itself.
 async fn backend_statuses(
     state: &ServerState,
-    backends: Vec<aruna_core::structs::BackendState>,
+    backends: Vec<aruna_core::structs::info::BackendState>,
 ) -> Vec<BackendStatus> {
     let context = state.get_ctx();
     let mut statuses = Vec::with_capacity(backends.len());
@@ -2593,7 +2593,7 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
 /// Maps a live peer connection to its wire form. `last_error` leaks internal
 /// diagnostics, so it is populated for realm config admins only.
 fn map_peer_connection(
-    peer: &aruna_core::structs::PeerConnectionState,
+    peer: &aruna_core::structs::info::PeerConnectionState,
     admin: bool,
 ) -> PeerConnectionInfo {
     PeerConnectionInfo {

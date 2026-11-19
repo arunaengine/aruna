@@ -5,8 +5,8 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::synced_folder::SyncRefusal;
 use aruna_core::types::GroupId;
 use ulid::Ulid;
 

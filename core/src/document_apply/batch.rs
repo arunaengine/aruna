@@ -29,7 +29,7 @@ use crate::metadata::GraphLifecycleRecord;
 use crate::operation::Operation;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
-use crate::structs::{SyncQuarantineIdentity, SyncRejection};
+use crate::structs::sync_quarantine::{SyncQuarantineIdentity, SyncRejection};
 use crate::sync_checks::{EventScreen, screen_event};
 
 /// What applying one batch left for the reconcile pass.

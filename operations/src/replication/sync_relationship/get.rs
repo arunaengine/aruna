@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::rows::PrefixPages;
-use aruna_core::structs::SyncRelationship;
+use aruna_core::structs::sync_relationship::SyncRelationship;
 use ulid::Ulid;
 
 use super::{SyncRelationshipDirection, SyncRelationshipError, pages, parse_values};

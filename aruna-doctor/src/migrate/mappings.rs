@@ -7,7 +7,7 @@ use super::removals::outbox_record;
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::structs::{PersistentIdMapping, secondary_index_entries};
+use aruna_core::structs::persistent_id::{PersistentIdMapping, secondary_index_entries};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use std::collections::BTreeMap;
 
@@ -96,14 +96,15 @@ mod tests {
     use crate::migrate::tests::{read, write};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, SECONDARY_ID_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
-    use aruna_core::structs::LegacyMapping;
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::persistent_id::{
+        LegacyMapping, PersistentIdMapping, PersistentIdRevision, persistent_id_change,
+    };
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::secondary_id::{
         IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier,
     };
-    use aruna_core::structs::{PersistentIdMapping, PersistentIdRevision, persistent_id_change};
     use aruna_core::user::id::UserId;
     use aruna_operations::sync::outbox_record::new_identified_record;
     use tempfile::tempdir;

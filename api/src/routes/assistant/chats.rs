@@ -8,7 +8,7 @@ use crate::routes::access::sessions::unix_rfc3339;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::{AssistantChatHead, AssistantChatTurn};
+use aruna_core::structs::assistant_chat::{AssistantChatHead, AssistantChatTurn};
 use aruna_drivers::driver::drive;
 use aruna_operations::assistant::ChatStoreError;
 use aruna_operations::assistant::heads::{

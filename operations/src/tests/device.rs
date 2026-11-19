@@ -14,7 +14,7 @@ use crate::device::sync::folders::FolderError;
 use crate::device::sync::repository::folder_entry;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::structs::SyncedFolder;
+use aruna_core::structs::synced_folder::SyncedFolder;
 use aruna_core::types::{Key, TxnId, Value};
 
 pub(crate) async fn context() -> (TempDir, DriverContext) {

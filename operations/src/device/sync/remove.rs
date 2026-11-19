@@ -9,7 +9,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::{ActionOutcome, SyncActionRecord, SyncedFolder, WriteGuard};
+use aruna_core::structs::synced_folder::{ActionOutcome, SyncActionRecord, SyncedFolder, WriteGuard};
 
 use super::actions::ActionError;
 use super::repository::{action_entry, base_key};
@@ -129,7 +129,7 @@ mod tests {
     use super::*;
     use crate::device::sync::reconcile::pure_tests::folder;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::{ActionKind, ActionScope};
+    use aruna_core::structs::synced_folder::{ActionKind, ActionScope};
     use aruna_core::user::id::UserId;
     use ulid::Ulid;
 

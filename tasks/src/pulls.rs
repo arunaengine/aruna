@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use aruna_core::structs::{SyncPullAck, SyncPullStatus, SyncRefusal};
+use aruna_core::structs::synced_folder::{SyncPullAck, SyncPullStatus, SyncRefusal};
 use aruna_core::task::{PullEffect, PullEvent, PullProgress};
 
 #[derive(Debug)]

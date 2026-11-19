@@ -26,7 +26,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::replication::ReplicationFailure;
 use aruna_core::structs::storage::routing::NodeRouting;
-use aruna_core::structs::{
+use aruna_core::structs::sync_relationship::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, sync_relationship_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};

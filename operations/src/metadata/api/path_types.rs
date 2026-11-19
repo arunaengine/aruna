@@ -8,6 +8,7 @@ use super::{
     RealmConfigDocument, RealmId, Ulid, meta_bucket_subject, neg_log2_q48, peer_rank,
     resolve_holders_limit, resolve_shard_holders, select_top_peers, selector_hash,
 };
+use aruna_core::structs::path_claim::resolve_path_claim;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetadataLookupRequest {
@@ -262,8 +263,7 @@ pub(super) fn reduce_path_candidates(
         .iter()
         .map(|candidate| candidate.claim.clone())
         .collect::<Vec<_>>();
-    let resolution =
-        aruna_core::structs::resolve_path_claim(&claims).ok_or(MetadataApiError::NotFound)?;
+    let resolution = resolve_path_claim(&claims).ok_or(MetadataApiError::NotFound)?;
     let winner = candidates
         .iter()
         .filter(|candidate| candidate.claim == resolution.winner)

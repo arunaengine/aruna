@@ -6,7 +6,7 @@ use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::errors::BlobError;
-use aruna_core::structs::Status;
+use aruna_core::structs::info::Status;
 use aruna_core::structs::storage::backends::{ImportRoot, NodeBackendEntry, NodeBackendsConfig};
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendRef, BlobTimeoutConfig, ResolvedBackend,

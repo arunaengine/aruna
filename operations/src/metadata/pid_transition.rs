@@ -8,10 +8,12 @@ use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{decode, encoded_row, read_row};
 use aruna_core::storage_entries::metadata_document_key;
+use aruna_core::structs::persistent_id::{
+    PersistentIdFailure, PersistentIdMapping, secondary_index_deletes,
+};
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
-use aruna_core::structs::{PersistentIdFailure, PersistentIdMapping, secondary_index_deletes};
 use aruna_core::types::{Key, KeySpace};
 use aruna_core::user::id::UserId;
 use ulid::Ulid;

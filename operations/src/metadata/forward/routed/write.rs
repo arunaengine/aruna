@@ -11,10 +11,10 @@ use aruna_core::id::NodeId;
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource, MetadataEffect};
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::synced_folder::SyncRefusal;
 use tracing::warn;
 use ulid::Ulid;
 

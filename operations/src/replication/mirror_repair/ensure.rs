@@ -8,10 +8,10 @@ use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
-use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
+use aruna_core::structs::sync_relationship::SyncRelationship;
 use aruna_core::types::GroupId;
 
 use super::{MirrorPeer, SyncMirrorError, create_peer};

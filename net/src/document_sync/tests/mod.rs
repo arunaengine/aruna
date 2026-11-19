@@ -54,6 +54,9 @@ use aruna_core::structs::identity::realm::{
     UserCapOverride,
 };
 use aruna_core::structs::identity::user::User;
+use aruna_core::structs::persistent_id::{
+    PersistentIdMapping, persistent_id_change, persistent_id_key, persistent_id_target,
+};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_target,
 };
@@ -64,9 +67,8 @@ use aruna_core::structs::placement::record::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::usage::NodeUsageSnapshot;
-use aruna_core::structs::{
-    PersistentIdMapping, QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord,
-    SyncQuarantineUsage, persistent_id_change, persistent_id_key, persistent_id_target,
+use aruna_core::structs::sync_quarantine::{
+    QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord, SyncQuarantineUsage,
 };
 use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 use aruna_core::sync_checks::{

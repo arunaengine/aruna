@@ -10,7 +10,7 @@ use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
-use aruna_core::structs::SyncRelationship;
+use aruna_core::structs::sync_relationship::SyncRelationship;
 use aruna_core::types::GroupId;
 
 use aruna_core::metadata::protocol::{
@@ -129,7 +129,7 @@ mod tests {
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::replication::ArunaArn;
-    use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
+    use aruna_core::structs::sync_relationship::{SyncMode, SyncState, SyncStatusSnapshot};
     use aruna_core::user::id::UserId;
     use std::time::SystemTime;
     use ulid::Ulid;

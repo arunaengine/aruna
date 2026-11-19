@@ -10,7 +10,7 @@ use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{
+use aruna_core::structs::sync_relationship::{
     SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot, sync_relationship_key,
 };
 use aruna_drivers::driver::DriverContext;

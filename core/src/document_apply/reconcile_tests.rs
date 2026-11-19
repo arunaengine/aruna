@@ -5,7 +5,7 @@
 use super::super::fixtures::{actor, child, config_target, config_topic, realm};
 use super::*;
 use crate::document::DocumentEvent;
-use crate::structs::SyncQuarantineIdentity;
+use crate::structs::sync_quarantine::SyncQuarantineIdentity;
 
 type Answer = Result<Next<DocumentReconcileResult>, ApplyError>;
 

@@ -20,7 +20,7 @@ use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
 use crate::storage_entries::{
     commit_message_entry, create_acceptance_entry, create_projection_entries,
 };
-use crate::structs::{SyncQuarantineIdentity, SyncRejection};
+use crate::structs::sync_quarantine::{SyncQuarantineIdentity, SyncRejection};
 
 /// One replicated create or update waiting for the batch's single transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]

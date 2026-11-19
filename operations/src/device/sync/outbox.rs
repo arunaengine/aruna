@@ -20,7 +20,7 @@ use aruna_core::structs::execution::offered_directory::modified_ms;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     EntrySide, EntryState, FolderState, LocalOrigin, SyncBase, SyncPull, SyncPullAck, SyncRefusal,
     SyncedBytes, SyncedFolder,
 };
@@ -681,7 +681,7 @@ impl Operation for RequeueUploadsOperation {
 mod tests {
     use std::sync::Arc;
 
-    use aruna_core::structs::{FolderMode, RemoteBinding};
+    use aruna_core::structs::synced_folder::{FolderMode, RemoteBinding};
     use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
@@ -695,7 +695,7 @@ mod tests {
     use crate::tests::device::{context, read_value, store_folder, write_rows};
     use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::{FolderState, SyncBase, SyncedFolder};
+    use aruna_core::structs::synced_folder::{FolderState, SyncBase, SyncedFolder};
     use aruna_drivers::driver::{DriverContext, drive};
 
     fn node_id() -> aruna_core::id::NodeId {

@@ -28,7 +28,7 @@ use crate::structs::execution::notification_watch::{interest_node_key, watch_sub
 use crate::structs::execution::setting::setting_key;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::vault::user_record_key;
-use crate::structs::persistent_id_key;
+use crate::structs::persistent_id::persistent_id_key;
 use crate::structs::placement::policy::document::placement_policy_key;
 use crate::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
 use crate::structs::storage::node_info::node_info_key;
@@ -368,7 +368,7 @@ pub struct ReconcileBatch {
     pub cursor_key: ByteView,
     pub cursor_value: ByteView,
     /// Ops whose payload never decoded into an event.
-    pub rejections: Vec<crate::structs::SyncRejection>,
+    pub rejections: Vec<crate::structs::sync_quarantine::SyncRejection>,
     pub events: Vec<BatchEvent>,
 }
 

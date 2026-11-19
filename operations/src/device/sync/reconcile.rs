@@ -11,7 +11,7 @@ use aruna_core::events::{Event, LocalFileEvent};
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::offered_directory::fingerprint_complete;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
     SyncedFolder, WriteGuard, decide,
 };
@@ -704,7 +704,7 @@ pub(super) mod pure_tests {
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::offered_directory::FileStat;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::{FolderMode, FolderState, RemoteBinding};
+    use aruna_core::structs::synced_folder::{FolderMode, FolderState, RemoteBinding};
     use aruna_core::user::id::UserId;
     use byteview::ByteView;
 

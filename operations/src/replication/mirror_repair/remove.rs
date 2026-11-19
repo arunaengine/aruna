@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation::Operation;
-use aruna_core::structs::SyncRelationship;
+use aruna_core::structs::sync_relationship::SyncRelationship;
 
 use super::ensure::{creator_token, peer_failure};
 use super::{MirrorPeer, SyncMirrorError, delete_peer};

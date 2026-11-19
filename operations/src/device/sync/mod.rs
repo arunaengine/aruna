@@ -23,7 +23,7 @@ use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     FolderMode, FolderState, Observed, RemoteBinding, RemoteHead, SyncListCursor, SyncPageLimit,
     SyncRefusal, SyncVersionPage, SyncedFolder,
 };

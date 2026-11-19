@@ -12,9 +12,8 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::rows::read_row;
-use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::persistent_id_key;
+use aruna_core::structs::persistent_id::{PersistentIdMapping, persistent_id_key};
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use ulid::Ulid;
 
@@ -282,10 +281,10 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
     use aruna_core::storage_entries::registry_write_entries;
-    use aruna_core::structs::PersistentIdStatus;
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::persistent_id::PersistentIdStatus;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,

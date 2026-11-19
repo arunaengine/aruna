@@ -28,8 +28,8 @@ use crate::keyspaces::APPLIED_OPS_KEYSPACE;
 use crate::operation::{HoldScope, Operation, TransactionMode};
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
 use crate::rows::read_row;
-use crate::structs::SyncRejection;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::sync_quarantine::SyncRejection;
 use crate::types::{Key, Value};
 
 type DeferredTopics = BTreeMap<DocumentSyncDependency, BTreeSet<irokle::TopicId>>;

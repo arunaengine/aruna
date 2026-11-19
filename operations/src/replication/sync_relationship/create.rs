@@ -7,7 +7,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, read_row, values};
-use aruna_core::structs::{SyncRelationship, SyncState};
+use aruna_core::structs::sync_relationship::{SyncRelationship, SyncState};
 use aruna_core::types::Value;
 use byteview::ByteView;
 

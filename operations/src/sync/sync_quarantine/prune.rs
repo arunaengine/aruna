@@ -6,7 +6,9 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::SYNC_QUARANTINE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
-use aruna_core::structs::{SyncQuarantineRecord, SyncQuarantineUsage, quarantine_usage_entry};
+use aruna_core::structs::sync_quarantine::{
+    SyncQuarantineRecord, SyncQuarantineUsage, quarantine_usage_entry,
+};
 use aruna_core::types::{Key, KeySpace, Value};
 
 use super::{

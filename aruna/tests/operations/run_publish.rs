@@ -21,7 +21,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::structs::{RemoteBinding, SyncRefusal};
+use aruna_core::structs::synced_folder::{RemoteBinding, SyncRefusal};
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;

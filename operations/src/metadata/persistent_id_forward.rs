@@ -7,10 +7,10 @@ use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id::PersistentIdMapping;
 use aruna_core::structs::placement::binding_directory::BindingError;
 use aruna_core::structs::placement::record::{
     DocumentClass, FIRST_GRANTABLE_HANDLE, PlacementScope,

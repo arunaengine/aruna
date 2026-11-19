@@ -9,8 +9,10 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{JobError, JobResultPayload};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id::{
+    MintPersistentSpec, PersistentIdFailure, PersistentIdMapping,
+};
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
-use aruna_core::structs::{MintPersistentSpec, PersistentIdFailure, PersistentIdMapping};
 use ulid::Ulid;
 
 use crate::metadata::api::MetadataApiError;
@@ -217,7 +219,7 @@ impl Operation for RegisterIdentifiersOperation {
 mod tests {
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::job::JobId;
-    use aruna_core::structs::{PersistentIdRevision, PersistentIdStatus};
+    use aruna_core::structs::persistent_id::{PersistentIdRevision, PersistentIdStatus};
     use aruna_core::user::id::UserId;
 
     use super::*;

@@ -30,7 +30,7 @@ use aruna_core::structs::storage::format::{CompressionMigration, EncodingClass};
 use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::replication_queue::queued_prefixes;
-use aruna_core::structs::sync_relationship_prefix;
+use aruna_core::structs::sync_relationship::sync_relationship_prefix;
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;

@@ -7,10 +7,10 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::extract;
 use crate::tests::realms::member_state;
 use aruna_core::calls::IoError;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::{
+use aruna_core::structs::assistant_chat::{
     MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS, MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
 };
+use aruna_core::structs::identity::auth::AuthContext;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 

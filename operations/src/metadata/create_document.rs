@@ -27,12 +27,12 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::persistent_id::{MintPersistentSpec, PersistentIdMapping};
 use aruna_core::structs::placement::binding_directory::BindingError;
 use aruna_core::structs::placement::record::{
     DocumentClass, PlacementRef, PlacementScope, PlacementStrategy, shard_for_subject,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
 use aruna_core::structured_id::clock_health::ClockHealthError;
 use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 use aruna_core::types::{GroupId, Key, Value};
@@ -957,8 +957,8 @@ mod tests {
     use aruna_core::metadata::RawOriginBudget;
     use aruna_core::placement::resolve_shard_holders;
     use aruna_core::storage_entries::{event_log_prefix, pending_projection_key};
-    use aruna_core::structs::PersistentIdStatus;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::structs::persistent_id::PersistentIdStatus;
     use aruna_core::structs::placement::record::{
         FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, PlacementBinding,
     };

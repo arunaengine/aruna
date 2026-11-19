@@ -34,8 +34,9 @@ use aruna_core::structs::storage::mirror_repair::{
     SyncMirrorIntent, SyncMirrorRecord, repair_entry, repair_key,
 };
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::sync_relationship_key;
-use aruna_core::structs::{ReferenceHandling, SyncMode, SyncState, SyncStatusSnapshot};
+use aruna_core::structs::sync_relationship::{
+    ReferenceHandling, SyncMode, SyncState, SyncStatusSnapshot, sync_relationship_key,
+};
 use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::storage::worker::FjallStorage;

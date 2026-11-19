@@ -10,7 +10,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicationMode};
-use aruna_core::structs::{SyncMode, SyncStatusSnapshot};
+use aruna_core::structs::sync_relationship::{SyncMode, SyncStatusSnapshot};
 use aruna_core::user::id::UserId;
 use ulid::Ulid;
 

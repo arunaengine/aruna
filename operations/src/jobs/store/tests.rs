@@ -14,7 +14,6 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportRow, ImportRoCrateResult,
     ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, LEASE_INDEX_PREFIX,
@@ -22,6 +21,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id::MintPersistentSpec;
 use aruna_core::types::TxnId;
 use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};

@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::structs::SyncRelationship;
+use aruna_core::structs::sync_relationship::SyncRelationship;
 
 use super::{SyncRelationshipDirection, SyncRelationshipError, write_call};
 

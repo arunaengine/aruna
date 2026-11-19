@@ -354,7 +354,7 @@ async fn cross_shard_unknown() {
             requested_path: record.document_path.clone(),
         })
         .collect::<Vec<_>>();
-    let resolution = aruna_core::structs::resolve_path_claim(&claims).unwrap();
+    let resolution = aruna_core::structs::path_claim::resolve_path_claim(&claims).unwrap();
     let winner_id = resolution.winner.document_id.as_ulid();
     let loser_id = resolution.conflicts[0].document_id.as_ulid();
     first.public = first.document_id == loser_id;

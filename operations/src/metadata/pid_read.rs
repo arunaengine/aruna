@@ -5,8 +5,8 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::persistent_id::PersistentIdMapping;
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};

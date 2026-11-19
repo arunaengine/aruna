@@ -19,7 +19,6 @@ use aruna_core::operation::Operation;
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::rows::{outside_answer, outside_call, read_row, values};
 use aruna_core::storage_entries::reducer_state_key;
-use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
@@ -27,6 +26,7 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
+use aruna_core::structs::synced_folder::SyncRefusal;
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
 use craqle::GraphReplicaSnapshot;

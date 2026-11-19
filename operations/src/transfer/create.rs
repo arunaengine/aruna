@@ -12,7 +12,6 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
-use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::distribution::capacity::{RangeSize, with_unopened};
@@ -29,6 +28,7 @@ use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionConfig, DistributionMember, DistributionRevision,
     DistributionSettings, SetPhase,
 };
+use aruna_core::structs::synced_folder::SyncRefusal;
 use aruna_core::types::GroupId;
 use thiserror::Error;
 use tracing::warn;

@@ -16,9 +16,9 @@ use aruna_core::metadata::{
     MetadataError, MetadataEventRecord, MetadataQueryResults, MetadataSearchHit,
 };
 use aruna_core::storage_entries::{event_log_key, pending_projection_target};
-use aruna_core::structs::PathClaimRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::path_claim::PathClaimRecord;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, VersionKey, bucket_permission_path,

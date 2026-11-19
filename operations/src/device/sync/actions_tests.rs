@@ -161,7 +161,7 @@ fn bulk_counts_stale() {
     run.next(child(Ok::<_, FolderError>(folder()))).unwrap();
     assert_eq!(run.step, ActionStep::Listing);
     let pending = EntryState::PendingReplace {
-        reason: aruna_core::structs::ReplaceReason::BaseUnknown,
+        reason: aruna_core::structs::synced_folder::ReplaceReason::BaseUnknown,
         remote_version: Ulid::from_bytes([3; 16]),
         conflicted_copy: None,
     };

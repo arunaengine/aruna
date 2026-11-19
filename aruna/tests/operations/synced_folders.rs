@@ -23,7 +23,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, FolderState, ORIGIN_DEVICE_TAG,
     RemoteBinding, SyncBase, SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal,
 };
@@ -72,7 +72,7 @@ const REMOTE_BUCKET: &str = "lab-data";
 async fn bind_folder(
     context: &std::sync::Arc<DriverContext>,
     input: BindFolderInput,
-) -> Result<aruna_core::structs::SyncedFolder, FolderError> {
+) -> Result<aruna_core::structs::synced_folder::SyncedFolder, FolderError> {
     let folder_id = drive(reserve_folder(input), context).await?.folder_id;
     drive(finish_binding(folder_id), context).await
 }
@@ -289,7 +289,7 @@ async fn bind(
     realm: &Topology,
     root: &std::path::Path,
     group_id: GroupId,
-) -> TestResult<aruna_core::structs::SyncedFolder> {
+) -> TestResult<aruna_core::structs::synced_folder::SyncedFolder> {
     let device = realm.user_node();
     let server = realm.node(0);
     let folder = bind_folder(

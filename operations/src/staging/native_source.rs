@@ -19,7 +19,7 @@ use aruna_core::structs::storage::read_grant::{
     self, GrantScope, HEAD_OPERATION, MAX_REQUEST_SECS, READ_OPERATION, SignedRequest,
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::{SyncRelationship, SyncState};
+use aruna_core::structs::sync_relationship::{SyncRelationship, SyncState};
 use aruna_core::types::GroupId;
 use bytes::Bytes;
 use tracing::warn;
@@ -642,7 +642,7 @@ mod tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::replication::ArunaArn;
-    use aruna_core::structs::{ReferenceHandling, SyncMode, SyncStatusSnapshot};
+    use aruna_core::structs::sync_relationship::{ReferenceHandling, SyncMode, SyncStatusSnapshot};
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::worker::FjallStorage;
 

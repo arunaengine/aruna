@@ -15,7 +15,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::{
+use aruna_core::structs::sync_quarantine::{
     SyncQuarantineCapacity, SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineInput,
     build_quarantine_entries, quarantine_row_entry, quarantine_usage_entry,
 };
@@ -266,7 +266,7 @@ async fn prune_reclaims_capacity() {
     .unwrap_err();
     assert!(matches!(
         error,
-        aruna_core::structs::SyncQuarantineError::AtCapacity { .. }
+        aruna_core::structs::sync_quarantine::SyncQuarantineError::AtCapacity { .. }
     ));
 
     acknowledge(&ctx, 0).await;

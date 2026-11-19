@@ -70,7 +70,9 @@ use aruna_core::structs::storage::replication_queue::{
 use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::structs::storage::routing::{GroupRoutingInputs, RoutingError};
 use aruna_core::structs::storage::routing::{NodeRouting, StorageRoutingRule, resolve_backend};
-use aruna_core::structs::{ReferenceHandling, SyncMode, SyncRelationship, sync_state_key};
+use aruna_core::structs::sync_relationship::{
+    ReferenceHandling, SyncMode, SyncRelationship, sync_state_key,
+};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::user::id::UserId;
@@ -2940,7 +2942,6 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::replication_protocol::{VersionReplicationMessage, VersionReplicationRequest};
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::ReferenceHandling;
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
@@ -2968,6 +2969,7 @@ mod tests {
         ReferenceAdvance, ReplicationMode, SyncOrigin,
     };
     use aruna_core::structs::storage::routing::GroupRoutingInputs;
+    use aruna_core::structs::sync_relationship::ReferenceHandling;
     use aruna_core::types::{Key, Value};
     use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};

@@ -8,7 +8,7 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, transport_message_kind,
 };
-use aruna_core::structs::SyncRefusal;
+use aruna_core::structs::synced_folder::SyncRefusal;
 use thiserror::Error;
 
 use crate::forward::routing::HolderWriteError;

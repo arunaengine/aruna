@@ -26,7 +26,7 @@ use aruna_core::structs::storage::distribution::source_root::{RootEntry, SourceR
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::structs::tagged_receipt;
+use aruna_core::structs::synced_folder::tagged_receipt;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use thiserror::Error;
 use ulid::Ulid;

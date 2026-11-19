@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::structs::RemoteBinding;
+use aruna_core::structs::synced_folder::RemoteBinding;
 use ulid::Ulid;
 
 fn base_with(entry: EntryState) -> SyncBase {

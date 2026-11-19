@@ -36,7 +36,7 @@ use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_core::structs::storage::usage::UsageCounters;
-use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
+use aruna_core::structs::sync_relationship::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_kpabe::envelope::Envelope;

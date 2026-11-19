@@ -22,8 +22,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::rows::{read_row, values};
-use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::storage::mirror_repair::SyncMirrorRecord;
+use aruna_core::structs::sync_relationship::SyncRelationship;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 

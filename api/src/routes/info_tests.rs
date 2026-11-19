@@ -251,9 +251,9 @@ async fn admin_sees_operations() {
 /// member sees it redacted while a realm config admin sees it in full.
 #[test]
 fn peer_error_visibility() {
-    let peer = aruna_core::structs::PeerConnectionState {
+    let peer = aruna_core::structs::info::PeerConnectionState {
         node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-        status: aruna_core::structs::PeerConnectionStatus::Unreachable,
+        status: aruna_core::structs::info::PeerConnectionStatus::Unreachable,
         active_addresses: Vec::new(),
         last_error: Some("dial refused: 10.0.0.9:4433".to_string()),
         retry_in_secs: Some(5),

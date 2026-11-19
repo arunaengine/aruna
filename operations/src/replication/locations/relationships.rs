@@ -9,7 +9,9 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::PrefixPages;
-use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_prefix};
+use aruna_core::structs::sync_relationship::{
+    SyncMode, SyncRelationship, SyncState, sync_relationship_prefix,
+};
 use std::collections::BTreeSet;
 
 const RELATIONSHIP_PAGE_SIZE: usize = 256;
@@ -109,7 +111,7 @@ mod pure_tests {
     use aruna_core::calls::{IoResult, Next};
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::replication::ArunaArn;
-    use aruna_core::structs::{
+    use aruna_core::structs::sync_relationship::{
         ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
     };
     use ulid::Ulid;

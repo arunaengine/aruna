@@ -14,7 +14,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
+use aruna_core::structs::synced_folder::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, Value};
 use aruna_core::user::id::UserId;

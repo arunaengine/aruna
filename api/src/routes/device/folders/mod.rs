@@ -21,7 +21,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::id::NodeId;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ActionKind, ActionOutcome, ActionScope, FolderMode, FolderState, RemoteBinding,
 };
 use aruna_core::types::Key;
@@ -250,7 +250,7 @@ fn map_action_error(error: ActionError) -> ServerError {
 /// One folder with the counters its entries currently add up to.
 async fn folder_detail(
     state: &ServerState,
-    folder: aruna_core::structs::SyncedFolder,
+    folder: aruna_core::structs::synced_folder::SyncedFolder,
 ) -> ServerResult<SyncedFolderView> {
     let counters = drive(folder_counters(folder.folder_id), &state.get_ctx())
         .await

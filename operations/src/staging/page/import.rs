@@ -19,7 +19,7 @@ use aruna_core::rows::values;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::structs::storage::blob::CurrentVersionPointer;
 use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
-use aruna_core::structs::sync_relationship_prefix;
+use aruna_core::structs::sync_relationship::sync_relationship_prefix;
 use std::collections::BTreeSet;
 use ulid::Ulid;
 

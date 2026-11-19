@@ -26,15 +26,15 @@ use aruna_core::metadata::protocol::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id::{
+    PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
+    PersistentIdStatus,
+};
 use aruna_core::structs::secondary_id::{
     IdentifierOrigin, SecondaryIdKind, normalize_endpoint, normalize_value,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifier};
-use aruna_core::structs::{
-    PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
-    PersistentIdStatus,
-};
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -1002,7 +1002,7 @@ mod tests {
             aruna_core::structs::execution::job::JobId::from_bytes([6; 16]),
             false,
             "/private/document".to_string(),
-            aruna_core::structs::PersistentIdRevision {
+            aruna_core::structs::persistent_id::PersistentIdRevision {
                 event_id: Ulid::from_bytes([7; 16]),
                 actor: iroh::SecretKey::from_bytes(&[8; 32]).public(),
                 occurred_at_ms: 9,
@@ -1068,7 +1068,7 @@ mod tests {
         use aruna_core::storage_entries::metadata_document_key;
         use aruna_core::structs::identity::auth::NodeCapabilities;
         use aruna_core::structs::identity::realm::RealmId;
-        use aruna_core::structs::persistent_id_key;
+        use aruna_core::structs::persistent_id::persistent_id_key;
         use aruna_core::structs::placement::record::PlacementRef;
         use aruna_drivers::testing::test_context;
 
@@ -1091,7 +1091,7 @@ mod tests {
         let document_id = Ulid::from_bytes([10; 16]);
         let group_id = Ulid::from_bytes([11; 16]);
         seed_group_docs(&context, realm_id, &actor, group_id, "public", user_id).await;
-        let revision = aruna_core::structs::PersistentIdRevision {
+        let revision = aruna_core::structs::persistent_id::PersistentIdRevision {
             event_id: Ulid::from_bytes([7; 16]),
             actor: node_id,
             occurred_at_ms: 9,

@@ -12,11 +12,11 @@ use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
 use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::{
+use aruna_core::structs::persistent_id::{
     PersistentIdMapping, PersistentIdRevision, persistent_id_change, persistent_id_key,
     persistent_id_target, secondary_index_entries,
 };
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::TxnId;
 use byteview::ByteView;
 use thiserror::Error;

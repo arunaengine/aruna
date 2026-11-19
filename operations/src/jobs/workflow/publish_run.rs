@@ -19,7 +19,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{NodeRealm, RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::data::identity::parse_hash;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::{RemoteBinding, SyncPull, SyncPullAck, SyncRefusal};
+use aruna_core::structs::synced_folder::{RemoteBinding, SyncPull, SyncPullAck, SyncRefusal};
 use aruna_core::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

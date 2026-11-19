@@ -20,6 +20,8 @@ use crate::metadata::{
 };
 use crate::structs::execution::job::SubmissionId;
 use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
+use crate::structs::path_claim::PathClaimRecord;
+use crate::structs::persistent_id::{PersistentIdFailure, PersistentIdMapping};
 use crate::structs::placement::policy::document::PlacementPolicyDocument;
 use crate::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef};
 use crate::structs::placement::record::PlacementRef;
@@ -31,9 +33,9 @@ use crate::structs::storage::distribution::source_root::HandedImport;
 use crate::structs::storage::distribution::statement::SignedStatement;
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::NodeInfoDocument;
-use crate::structs::{
-    PathClaimRecord, PersistentIdFailure, PersistentIdMapping, SyncListCursor, SyncPageLimit,
-    SyncPull, SyncPullStatus, SyncRefusal, SyncRelationship, SyncVersionPage,
+use crate::structs::sync_relationship::SyncRelationship;
+use crate::structs::synced_folder::{
+    SyncListCursor, SyncPageLimit, SyncPull, SyncPullStatus, SyncRefusal, SyncVersionPage,
 };
 use crate::types::GroupId;
 use crate::user::id::UserId;

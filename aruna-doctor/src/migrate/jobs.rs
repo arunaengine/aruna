@@ -9,7 +9,6 @@ use crate::explorer::ExplorerError;
 use aruna_core::id::NodeId;
 use aruna_core::repository::link::LinkFailure;
 use aruna_core::repository::{ExportIdentity, RepositoryRecord};
-use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
 use aruna_core::structs::execution::job::{
     ArtifactRef, AttemptIntent, CapturedInput, CopyJobSpec, ExecutionSpec, ExportOmissionCounts,
@@ -19,6 +18,7 @@ use aruna_core::structs::execution::job::{
     parse_dedup_value,
 };
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::persistent_id::MintPersistentSpec;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::secondary_id::{RegisterIdentifiersSpec, SecondaryIdentifier};
 use aruna_core::structs::storage::backend_import::BackendImportSpec;

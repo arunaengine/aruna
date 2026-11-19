@@ -4101,7 +4101,7 @@ fn mapped_refuses_replicas() {
 fn keeps_pull_receipt() {
     use aruna_core::keyspaces::SYNC_RECEIPT_KEYSPACE;
     use aruna_core::structs::storage::distribution::DistributionBinding;
-    use aruna_core::structs::{ORIGIN_DEVICE_TAG, SYNC_VERSION_TAG, tagged_receipt};
+    use aruna_core::structs::synced_folder::{ORIGIN_DEVICE_TAG, SYNC_VERSION_TAG, tagged_receipt};
     let device = iroh::SecretKey::from_bytes(&[9; 32]).public();
     let pulled = Ulid::from_bytes([2; 16]);
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);

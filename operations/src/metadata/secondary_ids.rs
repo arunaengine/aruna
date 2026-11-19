@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::api::IdentifierMatch;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::PersistentIdMapping;
+use aruna_core::structs::persistent_id::PersistentIdMapping;
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use ulid::Ulid;
 
@@ -157,9 +157,9 @@ pub(crate) mod tests {
     use aruna_core::calls::IoError;
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, SECONDARY_ID_KEYSPACE};
-    use aruna_core::structs::PersistentIdRevision;
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::persistent_id::PersistentIdRevision;
     use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 
     pub(crate) fn mapping(document_id: Ulid) -> PersistentIdMapping {

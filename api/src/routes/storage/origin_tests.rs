@@ -19,7 +19,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{SyncRelationship, SyncState, SyncStatusSnapshot, sync_relationship_key};
+use aruna_core::structs::sync_relationship::{
+    SyncRelationship, SyncState, SyncStatusSnapshot, sync_relationship_key,
+};
 use aruna_core::user::id::UserId;
 use axum::http::StatusCode;
 use std::time::SystemTime;
