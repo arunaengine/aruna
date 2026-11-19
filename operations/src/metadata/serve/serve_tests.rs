@@ -233,3 +233,130 @@ fn lookup_rechecks_config() {
         }))
     );
 }
+
+fn relationship(source_bucket: &str) -> aruna_core::structs::SyncRelationship {
+    use aruna_core::structs::storage::replication::ArunaArn;
+    use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
+    let realm_id = RealmId([1u8; 32]);
+    aruna_core::structs::SyncRelationship {
+        id: ulid::Ulid::from_bytes([7u8; 16]),
+        source: ArunaArn::s3_bucket(realm_id, node(1), source_bucket).unwrap(),
+        target: ArunaArn::s3_bucket(realm_id, node(2), "target").unwrap(),
+        mode: SyncMode::Continuous,
+        reference_handling: Default::default(),
+        reference_serving: false,
+        replicate_deletes: true,
+        created_by: aruna_core::UserId::local(ulid::Ulid::from_bytes([8u8; 16]), realm_id),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        state: SyncState::Enabled,
+        status: SyncStatusSnapshot::default(),
+    }
+}
+
+#[test]
+fn workspace_delete_allowed() {
+    // Only a delete may name a workspace bucket, and only its creator may ask.
+    use super::mirror::valid_sync_request;
+    let stored = relationship("ws-temporary");
+    let buckets = ("ws-temporary", "target");
+    let realm_id = RealmId([1u8; 32]);
+    assert!(valid_sync_request(
+        &stored,
+        buckets,
+        realm_id,
+        stored.created_by,
+        true
+    ));
+    assert!(!valid_sync_request(
+        &stored,
+        buckets,
+        realm_id,
+        stored.created_by,
+        false
+    ));
+    let other = aruna_core::UserId::local(ulid::Ulid::from_bytes([9u8; 16]), realm_id);
+    assert!(!valid_sync_request(&stored, buckets, realm_id, other, true));
+}
+
+#[test]
+fn rollback_check_scope() {
+    use super::mirror::RollbackRequest;
+    let stored = relationship("source");
+    let request = RollbackRequest {
+        peer: node(1),
+        local_node: node(2),
+        vouched: true,
+    };
+    assert!(request.allows(&stored, &stored));
+    let other_peer = RollbackRequest {
+        peer: node(3),
+        ..request
+    };
+    assert!(!other_peer.allows(&stored, &stored));
+    let outgoing = RollbackRequest {
+        peer: node(2),
+        local_node: node(1),
+        ..request
+    };
+    assert!(!outgoing.allows(&stored, &stored));
+    let bearer = RollbackRequest {
+        vouched: false,
+        ..request
+    };
+    assert!(!bearer.allows(&stored, &stored));
+    let mut changed = stored.clone();
+    changed.created_at += std::time::Duration::from_millis(1);
+    assert!(!request.allows(&stored, &changed));
+}
+
+#[test]
+fn sync_bucket_owned() {
+    // A mirror's new bucket belongs to the source group and the mirror's creator.
+    let stored = relationship("source");
+    let group = ulid::Ulid::from_bytes([4u8; 16]);
+    let bucket = super::mirror::sync_bucket(group, &stored);
+    assert_eq!(bucket.group_id, group);
+    assert_eq!(bucket.created_by, stored.created_by);
+}
+
+#[test]
+fn mirror_needs_token() {
+    use super::mirror::{MirrorRequest, MirrorServeOperation};
+    let request = MirrorRequest {
+        token: None,
+        relationship: relationship("source"),
+        source_group: None,
+        extras: None,
+        delete: true,
+        rollback: false,
+    };
+    let mut mirror = MirrorServeOperation::new(node(1), local().local, request);
+    let denied = MetadataTransportMessage::Reject("access_denied".to_string());
+    assert_eq!(mirror.first(), Ok(Next::Done(denied)));
+}
+
+#[test]
+fn read_only_refuses_mirror() {
+    // A read-only bucket refuses a mirror like a denied write, before any bucket is made.
+    use super::mirror::{MirrorRequest, MirrorServeOperation};
+    use crate::staging::bucket_guard::BucketGuardError;
+    let realm_id = RealmId([1u8; 32]);
+    let caller = caller_of(realm_id);
+    let mut stored = relationship("source");
+    stored.created_by = caller.user_id;
+    let request = MirrorRequest {
+        token: Some(aruna_core::metadata::AuthToken::Internal(caller.clone())),
+        relationship: stored,
+        source_group: Some(ulid::Ulid::from_bytes([4u8; 16])),
+        extras: None,
+        delete: false,
+        rollback: false,
+    };
+    let mut mirror = MirrorServeOperation::new(node(1), Some((node(2), realm_id)), request);
+    assert!(runs_child(mirror.first()));
+    let accepted: Result<AuthContext, aruna_core::events::PeerAuthRefusal> = Ok(caller);
+    assert!(runs_child(mirror.next(child(accepted))));
+    let guarded: Result<(), BucketGuardError> = Err(BucketGuardError::ReadOnly("target".into()));
+    let denied = MetadataTransportMessage::Reject("access_denied".to_string());
+    assert_eq!(mirror.next(child(guarded)), Ok(Next::Done(denied)));
+}
