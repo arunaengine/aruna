@@ -42,8 +42,9 @@ enum EmitState {
     Forward(NodeId),
 }
 
-/// Delivers one event to known holders. Best effort: every failure only warns. System writes
-/// with a nil actor are not emitted, since watches are a user-plane feature.
+/// Delivers one event to known holders and answers whether it settled: every holder took it or
+/// refused it for good; an unreached holder or a local expansion that may pass later keeps it
+/// open. System writes with a nil actor are not emitted; watches are a user-plane feature.
 #[derive(Debug, PartialEq)]
 pub(crate) struct EmitWatchOperation {
     event: WatchEvent,
@@ -52,10 +53,11 @@ pub(crate) struct EmitWatchOperation {
     holders: Vec<NodeId>,
     config: Option<RealmConfigDocument>,
     pending: VecDeque<NodeId>,
+    unsettled: bool,
     state: EmitState,
 }
 
-type Turn = Result<Next<()>, IoError>;
+type Turn = Result<Next<bool>, IoError>;
 
 impl EmitWatchOperation {
     /// `holders` are the nodes this node's interest table matches for the event.
@@ -66,6 +68,7 @@ impl EmitWatchOperation {
             holders,
             config: None,
             pending: VecDeque::new(),
+            unsettled: false,
             state: EmitState::Config,
         }
     }
@@ -146,7 +149,7 @@ impl EmitWatchOperation {
 
     fn next_holder(&mut self) -> Turn {
         let Some(holder) = self.pending.pop_front() else {
-            return Ok(Next::Done(()));
+            return Ok(Next::Done(!self.unsettled));
         };
         if holder != self.local {
             self.state = EmitState::Forward(holder);
@@ -178,6 +181,7 @@ impl EmitWatchOperation {
             Ok(outcome) => outcome,
             Err(error) => {
                 warn!(%error, "Failed to expand watch event for local holder");
+                self.unsettled |= !matches!(error, ExpandError::Fatal(_));
                 return self.next_holder();
             }
         };
@@ -201,12 +205,12 @@ impl EmitWatchOperation {
 }
 
 impl Operation for EmitWatchOperation {
-    type Output = ();
+    type Output = bool;
     type Error = IoError;
 
     fn first(&mut self) -> Turn {
         if self.event.actor == UserId::nil(self.event.realm_id) {
-            return Ok(Next::Done(()));
+            return Ok(Next::Done(true));
         }
         let config = GetConfigOperation::new(self.event.realm_id);
         Ok(Next::Call(IoCall::child(config)))
@@ -237,8 +241,11 @@ impl Operation for EmitWatchOperation {
             }
             EmitState::Forward(holder) => {
                 let answer = result.child::<NotificationTransportMessage, RemoteError>()?;
+                // A holder that answered, even with a refusal, settles; one not reached does not.
+                let unreached = answer.is_err();
                 if let Err(error) = events_delivered(answer) {
                     warn!(holder = %holder, %error, "Failed to forward watch event to remote holder");
+                    self.unsettled |= unreached;
                 }
                 self.next_holder()
             }
@@ -247,7 +254,8 @@ impl Operation for EmitWatchOperation {
 }
 
 /// Post-commit emission of an origin watch event to the holders this node's interest matches
-/// and to this node when it holds a matching watch. A node without a net handle emits nothing.
+/// and to this node when it holds a matching watch; answers whether the event is settled. A node
+/// without a net handle emits nothing.
 #[derive(Debug, PartialEq)]
 pub struct EmitEventOperation {
     event: WatchEvent,
@@ -284,7 +292,7 @@ impl EmitEventOperation {
 }
 
 impl Operation for EmitEventOperation {
-    type Output = ();
+    type Output = bool;
     type Error = IoError;
 
     fn first(&mut self) -> Turn {
@@ -298,10 +306,10 @@ impl Operation for EmitEventOperation {
 
     fn next(&mut self, result: IoResult) -> Turn {
         if self.emitting {
-            return result.child::<(), IoError>()?.map(Next::Done);
+            return result.child::<bool, IoError>()?.map(Next::Done);
         }
         match result.event()? {
-            Event::Net(NetEvent::WatchHolders(None)) => Ok(Next::Done(())),
+            Event::Net(NetEvent::WatchHolders(None)) => Ok(Next::Done(true)),
             Event::Net(NetEvent::WatchHolders(Some((local, holders)))) => {
                 self.emitting = true;
                 let emit = EmitWatchOperation::new(self.event.clone(), local, holders);

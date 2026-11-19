@@ -284,12 +284,14 @@ enum DrainStep {
 }
 
 /// Queues the checks of changed documents, runs every due check and returns the wait until the
-/// next one.
+/// next one. Changes it could not queue end the run with their error after the due checks, so
+/// the shell runs it again instead of leaving the change rows unseen.
 #[derive(Debug, PartialEq)]
 pub struct DrainLinksOperation {
     scope: NodeScope,
     pages: PrefixPages,
     rows: VecDeque<(Key, Value)>,
+    unqueued: Option<LinkError>,
     next_due: Option<u64>,
     started_ms: Option<u64>,
     now_ms: u64,
@@ -302,6 +304,7 @@ impl DrainLinksOperation {
             scope,
             pages: queue_pages(),
             rows: VecDeque::new(),
+            unqueued: None,
             next_due: None,
             started_ms: None,
             now_ms: 0,
@@ -340,6 +343,9 @@ impl DrainLinksOperation {
             return child(IoCall::child(check));
         }
         if self.pages.done() {
+            if let Some(error) = self.unqueued.take() {
+                return Err(error);
+            }
             let wait = self.next_due.map(|due| due_after(self.now_ms, due));
             return Ok(Next::Done(wait));
         }
@@ -365,6 +371,7 @@ impl Operation for DrainLinksOperation {
             DrainStep::Changes => {
                 if let Err(error) = result.child::<(), LinkError>()? {
                     warn!(%error, "Failed to queue the link checks of changed documents");
+                    self.unqueued = Some(error);
                 }
                 self.queue_page()
             }
@@ -1062,10 +1069,12 @@ impl Operation for PushRevisionOperation {
 #[derive(Debug, PartialEq)]
 enum TimerStep {
     Page,
+    Changes,
     Arm,
 }
 
-/// Arms the drain for the earliest queued check; the queue itself is the durable state.
+/// Arms the drain for the earliest queued check, or now while changed documents wait for their
+/// checks; the queue and the change rows are the durable state.
 #[derive(Debug, PartialEq)]
 pub struct LinkTimerOperation {
     pages: PrefixPages,
@@ -1113,6 +1122,19 @@ impl Operation for LinkTimerOperation {
                 }
                 if !self.pages.done() {
                     return Ok(Next::Call(self.pages.call()));
+                }
+                self.step = TimerStep::Changes;
+                Ok(Next::Call(IoCall::Page {
+                    space: LINK_CHANGE_KEYSPACE.to_string(),
+                    prefix: ByteView::from(Vec::new()),
+                    after: None,
+                    limit: 1,
+                }))
+            }
+            TimerStep::Changes => {
+                let (changes, _) = result.page()?;
+                if !changes.is_empty() {
+                    self.next_due = min_due_at(self.next_due, self.now_ms);
                 }
                 let Some(due) = self.next_due else {
                     return Ok(Next::Done(()));

@@ -26,7 +26,8 @@ use crate::calls::{IoCall, IoResult, Next};
 use crate::config_authority::AdminEventValidation;
 use crate::deferred_topics::DocumentSyncDependency;
 use crate::document::{
-    DocumentChange, DocumentChangeKind, DocumentEvent, DocumentSyncRevision, DocumentTarget,
+    AppliedStep, AppliedSync, DocumentChange, DocumentChangeKind, DocumentEvent,
+    DocumentReconcileResult, DocumentSyncRevision, DocumentTarget,
 };
 use crate::effects::{Effect, StorageEffect};
 use crate::events::{Event, StorageEvent};
@@ -566,6 +567,22 @@ fn batch_moves_cursors() {
     let cursor = vec![(config_topic(), cursor_row())];
     let plan = CreateBatchPlan::new(Vec::new(), cursor, Vec::new()).unwrap();
     assert!(run(plan, &nothing()).writes.contains(&cursor_row()));
+}
+
+// The follow-up row goes only with accepted creates; moving cursors alone queues none.
+#[test]
+fn batch_queues_accepted() {
+    let followups = AppliedSync {
+        id: Ulid::from_parts(1, 1),
+        node_id: node(),
+        realm_id: Some(realm()),
+        result: DocumentReconcileResult::default(),
+        next: AppliedStep::Usage,
+    };
+    let cursor = vec![(config_topic(), cursor_row())];
+    let plan = CreateBatchPlan::new(Vec::new(), cursor, Vec::new()).unwrap();
+    let ran = run(plan.queuing(Some(followups)), &nothing());
+    assert_eq!(ran.writes, vec![cursor_row()]);
 }
 
 #[test]

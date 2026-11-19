@@ -20,7 +20,7 @@ use crate::server::state::ServerState;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::id::NodeId;
 use aruna_core::job_request::SubmitJobError;
-use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
+use aruna_core::live_version::LiveVersionInput;
 use aruna_core::staging_checkpoint::ReadCheckpointOperation;
 use aruna_core::structs::execution::job::identity::JobState;
 use aruna_core::structs::execution::job::input::{
@@ -41,6 +41,7 @@ use aruna_operations::auth::request_authorization::rules_operation;
 use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};
 use aruna_operations::distribution::routing::{bound_view, route_read};
 use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::replication::live_queue::QueueLiveOperation;
 use aruna_operations::s3::object::head_source::HeadSourceError;
 use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
@@ -1961,7 +1962,7 @@ pub(crate) async fn queue_live_replication(
     delete_marker: bool,
 ) {
     if let Err(error) = drive(
-        LiveVersionOperation::new(LiveVersionInput {
+        QueueLiveOperation::new(LiveVersionInput {
             local_node_id: state.get_node_id(),
             auth_context,
             bucket: bucket.clone(),

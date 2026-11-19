@@ -1,9 +1,10 @@
 //! Runs the usage, watch, mail and metadata follow-ups of the reconciles shard pulls applied,
-//! oldest first, and deletes each row after them; a failed follow-up only warns.
+//! oldest first, and deletes each row after them; a failed follow-up keeps its row for a rerun.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{AppliedStep, AppliedSync, applied_sync_entry};
@@ -19,8 +20,10 @@ use crate::notifications::watch::interest::RefreshInterestOperation;
 
 /// Rows one page of the drain reads at most.
 pub(crate) const APPLIED_DRAIN_PAGE: usize = 16;
+/// When the drain runs again after a follow-up failed; its row waits at that follow-up.
+pub const APPLIED_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-type Turn = Result<Next<()>, IoError>;
+type Turn = Result<Next<Option<Duration>>, IoError>;
 
 #[derive(Clone, Debug, PartialEq)]
 enum DrainStep {
@@ -30,16 +33,17 @@ enum DrainStep {
     Delete,
 }
 
-/// One drain run: the follow-ups of every queued reconcile run and its row is deleted, page by
-/// page, until the keyspace is empty. Each finished follow-up is stored in the row, so a rerun
-/// after a restart starts at the next one. A row that does not decode is deleted.
+/// One drain run over every queued reconcile, page by page. Each follow-up that succeeded is
+/// stored in its row and the last one deletes it; a failed one keeps the row for a rerun, and
+/// an unreadable row is deleted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedDrainOperation {
     step: DrainStep,
     pending: VecDeque<(Key, Option<AppliedSync>)>,
     current: Option<Key>,
     applied: Option<AppliedSync>,
-    more: bool,
+    after: Option<Key>,
+    failed: bool,
 }
 
 impl Default for AppliedDrainOperation {
@@ -55,7 +59,8 @@ impl AppliedDrainOperation {
             pending: VecDeque::new(),
             current: None,
             applied: None,
-            more: false,
+            after: None,
+            failed: false,
         }
     }
 
@@ -64,16 +69,16 @@ impl AppliedDrainOperation {
         Ok(Next::Call(IoCall::Page {
             space: APPLIED_SYNC_KEYSPACE.to_string(),
             prefix: Key::from(Vec::new()),
-            after: None,
+            after: self.after.clone(),
             limit: APPLIED_DRAIN_PAGE,
         }))
     }
 
     fn next_row(&mut self) -> Turn {
         let Some((key, applied)) = self.pending.pop_front() else {
-            return match self.more {
-                true => self.read_page(),
-                false => Ok(Next::Done(())),
+            return match self.after {
+                Some(_) => self.read_page(),
+                None => Ok(Next::Done(self.failed.then_some(APPLIED_RETRY_AFTER))),
             };
         };
         self.current = Some(key);
@@ -155,7 +160,8 @@ impl Operation for AppliedDrainOperation {
         match std::mem::replace(&mut self.step, DrainStep::Page) {
             DrainStep::Page => {
                 let (rows, next) = result.page()?;
-                self.more = next.is_some();
+                // Rows kept after a failed follow-up are passed: the next page starts after them.
+                self.after = next;
                 for (key, value) in rows {
                     let applied = AppliedSync::from_bytes(value.as_ref())
                         .inspect_err(|error| warn!(%error, "Deleting an unreadable applied sync"))
@@ -174,7 +180,11 @@ impl Operation for AppliedDrainOperation {
                     }
                 };
                 if let Some(error) = failure {
-                    warn!(%error, ?step, "A follow-up stopped after the shard restore");
+                    warn!(%error, ?step, "A follow-up stopped after the shard restore; it reruns");
+                    self.failed = true;
+                    self.applied = None;
+                    self.current = None;
+                    return self.next_row();
                 }
                 self.finished(step)
             }
@@ -256,8 +266,7 @@ mod tests {
         IoCall::child(AfterSyncOperation::new(Some(node()), result, false))
     }
 
-    // The follow-ups run in order and each is stored once it ran; a failed one does not stop
-    // the next, and the row goes last.
+    // The follow-ups run in order and each is stored once it succeeded; the row goes last.
     #[test]
     fn followups_run_ordered() {
         let realm_id = Some(realm());
@@ -270,8 +279,7 @@ mod tests {
             drain.next(queued(&row)),
             Ok(Next::Call(IoCall::child(usage)))
         );
-        let failed = RefreshUsageError::Io(IoError::Aborted);
-        let turn = drain.next(child::<(), _>(Err(failed)));
+        let turn = drain.next(child::<(), RefreshUsageError>(Ok(())));
         assert_eq!(turn, progress(realm_id, AppliedStep::Interest));
         let interest = RefreshInterestOperation::new(&targets(), realm());
         assert_eq!(
@@ -291,7 +299,32 @@ mod tests {
         let timings = MetadataTimings::default();
         let turn = drain.next(child::<_, IoError>(Ok(timings)));
         assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
-        assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(())));
+        assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(None)));
+    }
+
+    // A failed follow-up stores no progress and keeps its row, the last one too; the drain
+    // goes on with the next row and asks to run again.
+    #[test]
+    fn failed_followup_kept() {
+        let mut drain = AppliedDrainOperation::new();
+        drain.first().unwrap();
+        let usage = applied(Some(realm()), AppliedStep::Usage);
+        let mut last = applied(Some(realm()), AppliedStep::Metadata);
+        last.id = Ulid::from_parts(2_000, 7);
+        let rows = [&usage, &last].map(|row| {
+            let (_, key, value) = applied_sync_entry(row).unwrap();
+            (key, value)
+        });
+        let page = IoResult::Page {
+            rows: rows.to_vec(),
+            next: None,
+        };
+        assert!(matches!(drain.next(page), Ok(Next::Call(IoCall::Child(_)))));
+        let failed = RefreshUsageError::Io(IoError::Aborted);
+        let turn = drain.next(child::<(), _>(Err(failed)));
+        assert_eq!(turn, Ok(Next::Call(after_sync())));
+        let turn = drain.next(child::<MetadataTimings, _>(Err(IoError::Aborted)));
+        assert_eq!(turn, Ok(Next::Done(Some(APPLIED_RETRY_AFTER))));
     }
 
     // A rerun after a restart starts at the stored follow-up: the refreshes that ran already

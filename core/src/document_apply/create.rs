@@ -14,7 +14,9 @@ use super::registry::{
 };
 use super::{ApplyError, PlacementOutcome, Step, invalid};
 use crate::deferred_topics::DocumentSyncDependency;
-use crate::document::{DocumentChange, DocumentEvent, DocumentTarget};
+use crate::document::{
+    AppliedSync, DocumentChange, DocumentEvent, DocumentTarget, applied_sync_entry,
+};
 use crate::metadata::MetadataEventRecord;
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
 use crate::storage_entries::{
@@ -93,6 +95,7 @@ pub struct CreateBatchPlan {
     cursor_writes: Vec<(irokle::TopicId, Row)>,
     rejections: Vec<SyncRejection>,
     notes: Vec<CreateNote>,
+    followups: Option<AppliedSync>,
 }
 
 impl CreateBatchPlan {
@@ -124,7 +127,15 @@ impl CreateBatchPlan {
             cursor_writes,
             rejections,
             notes,
+            followups: None,
         })
+    }
+
+    /// Also writes `followups`, filled with the accepted creates, in the same transaction, so
+    /// the drain runs their follow-ups once they and their cursors are stored.
+    pub fn queuing(mut self, followups: Option<AppliedSync>) -> Self {
+        self.followups = followups;
+        self
     }
 
     fn is_empty(&self) -> bool {
@@ -337,6 +348,14 @@ impl RowPlan for CreateBatchPlan {
                 .filter(|(topic, _)| !held.contains(topic))
                 .map(|(_, write)| write.clone()),
         );
+        let followups = self.followups.clone().filter(|_| !outcome.accepted.is_empty());
+        if let Some(mut followups) = followups {
+            for (target, record) in &outcome.accepted {
+                followups.result.targets.push(target.clone());
+                followups.result.metadata_create_events.push(record.clone());
+            }
+            writes.push(applied_sync_entry(&followups).map_err(invalid)?);
+        }
         Ok(Planned::changes(outcome, Vec::new(), writes))
     }
 }
