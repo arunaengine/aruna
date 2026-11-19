@@ -42,6 +42,8 @@ const AUDIT_OUTBOUND_LIMIT: usize = 16;
 pub const AUDIT_DEADLINE_SECS: u64 = 30;
 const AUDIT_FANOUT_CONCURRENCY: usize = 8;
 const AUDIT_PEER_DEADLINE: Duration = Duration::from_secs(3);
+/// The longest the peers of a fan-out are waited for when the caller gives no wait.
+const AUDIT_FANOUT_DEADLINE: Duration = Duration::from_secs(30);
 pub(super) static AUDIT_INBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_INBOUND_LIMIT)));
 pub(super) static AUDIT_OUTBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
@@ -551,8 +553,9 @@ impl Operation for ListAuditOperation {
             return Ok(Next::Done(self.aggregate()));
         }
         let limit = usize::from(self.include_local) + AUDIT_FANOUT_CONCURRENCY;
+        let fallback = (!self.peers.is_empty()).then_some(AUDIT_FANOUT_DEADLINE);
         let form = GroupForm::All {
-            deadline: self.wait,
+            deadline: self.wait.or(fallback),
         };
         Ok(Next::Call(IoCall::Group(EffectGroup {
             members,
@@ -933,6 +936,34 @@ mod tests {
             panic!("local page must use storage iteration");
         };
         assert_eq!(*limit, AUDIT_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn peers_fallback_deadline() {
+        // Without a caller's wait the peers still get the fan-out deadline, a lone local page none.
+        let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let peer = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        for (peers, deadline) in [
+            (vec![peer], Some(Duration::from_secs(30))),
+            (Vec::new(), None),
+        ] {
+            let mut operation = ListAuditOperation::new(
+                RealmId([1u8; 32]),
+                node,
+                true,
+                Ulid::from_bytes([2u8; 16]),
+                None,
+                peers,
+                None,
+                10,
+                None,
+                [0u8; 32],
+            );
+            let Ok(Next::Call(IoCall::Group(group))) = operation.first() else {
+                panic!("expected one audit group");
+            };
+            assert_eq!(group.form, GroupForm::All { deadline });
+        }
     }
 
     #[test]
