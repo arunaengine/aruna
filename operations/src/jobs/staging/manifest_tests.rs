@@ -276,6 +276,7 @@ fn chunk_needs_newline() {
         .run
         .commit_call(None, &chunk.next, vec![row], Vec::new());
     assert_eq!(turn, Ok(Next::Call(commit.unwrap())));
+    // The next chunk starts after the stored line and its newline: 32 + 2 + 5 + 1 bytes.
     let next = chunk.next.manifest.as_ref().expect("the manifest goes on");
-    assert_eq!(next.offset, 39);
+    assert_eq!(next.offset, 40);
 }
