@@ -18,7 +18,7 @@ use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::persistent_id::RegisterIdentifiersOperation;
 use aruna_operations::jobs::repository::connector::ConnectorViewOperation;
 use aruna_operations::jobs::repository::invenio::query::{
-    ResolveRecordOperation, SearchRecordsOperation,
+    RecordReference, ResolveRecordOperation, SearchRecordsOperation,
 };
 use aruna_operations::jobs::repository::invenio::remote::RemoteStateOperation;
 use aruna_operations::jobs::repository::link_queue::{
@@ -28,7 +28,7 @@ use aruna_operations::jobs::repository::link_queue::{
 use aruna_operations::jobs::repository::link_store::{ApplyChangeOperation, ListLinksOperation};
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::pull::StartPullOperation;
-use aruna_operations::jobs::repository::{RecordReference, TransferError, seal_token};
+use aruna_operations::jobs::repository::{TransferError, seal_token};
 use serde_json::Value;
 use ulid::Ulid;
 

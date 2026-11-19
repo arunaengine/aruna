@@ -15,7 +15,7 @@ use ulid::Ulid;
 
 use crate::jobs::lifecycle::launch_admit::LaunchNode;
 use crate::jobs::lifecycle::submit_external::IngressNode;
-use crate::jobs::lifecycle::witness::WitnessNode;
+use crate::jobs::lifecycle::witness_round::WitnessNode;
 use crate::jobs::local_run::{LocalExecutionConfig, LocalRunOperation};
 
 /// This node as the submission operations see it at `now_ms`; `None` without a network.

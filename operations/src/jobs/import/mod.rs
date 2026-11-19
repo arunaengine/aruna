@@ -6,15 +6,13 @@ mod acquire;
 #[cfg(test)]
 mod consortium_tests;
 mod finish;
-mod job;
+pub mod job;
 mod plan;
 mod reports;
 pub(crate) mod rewrite;
 pub mod upload;
 pub mod upload_store;
 mod write;
-
-pub use job::ImportJobOperation;
 
 use std::collections::HashMap;
 use std::sync::Arc;

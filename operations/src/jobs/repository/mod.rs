@@ -30,7 +30,6 @@ pub(crate) mod push;
 mod submit;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub use invenio::query::RecordReference;
 
 /// The running job an operation works for: its identity, stop signals and progress.
 #[derive(Clone)]

@@ -15,7 +15,7 @@ use aruna_drivers::driver::drive;
 use aruna_operations::harvest::read_connector::{
     ConnectorView, GetRepositoryOperation, ReadConnectorError,
 };
-use aruna_operations::jobs::export::CrateJsonOperation;
+use aruna_operations::jobs::export::snapshot::CrateJsonOperation;
 use aruna_operations::jobs::repository::check::{CrateCheck, RequirementCheck, profile_failure};
 use aruna_operations::jobs::repository::link_queue::OwnerHoldsOperation;
 use aruna_operations::jobs::repository::link_store::{

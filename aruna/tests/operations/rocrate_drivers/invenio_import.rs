@@ -362,7 +362,7 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn doi_keeps_case() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::resolve;
-    use aruna_operations::jobs::repository::RecordReference;
+    use aruna_operations::jobs::repository::invenio::query::RecordReference;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let connector_id = connector(&fixture, &server).await;

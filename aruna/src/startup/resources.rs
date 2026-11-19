@@ -20,6 +20,7 @@ use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_graph::{GraphHandle, GraphOptions};
 use aruna_net::NetHandle;
 use aruna_net::config::NetConfig;
+use aruna_operations::groups::deletion::coordinator::InstallOnboardingOperation;
 use aruna_operations::metadata::projection::{DEFAULT_SKEW_MS, store_clock_skew};
 use aruna_operations::metadata::provenance::export::ForgetSpoolOperation;
 use aruna_operations::node::counter_check::CounterCheckOperation;
@@ -411,7 +412,7 @@ async fn fill(
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        let install = aruna_operations::groups::deletion::InstallOnboardingOperation::new(
+        let install = InstallOnboardingOperation::new(
             &ticket,
             config.realm_id,
             config.node_id,

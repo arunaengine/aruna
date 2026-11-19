@@ -22,7 +22,7 @@ use tracing::warn;
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
-use crate::groups::deletion::ApplyRequestOperation;
+use crate::groups::deletion::peer::ApplyRequestOperation;
 use crate::groups::forward::ApplyGroupOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::audit::AUDIT_DEADLINE_SECS;

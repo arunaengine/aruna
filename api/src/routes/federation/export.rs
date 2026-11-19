@@ -23,11 +23,12 @@ use aruna_core::transfer::{
 };
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::federation::import::header_value;
+use aruna_operations::jobs::export::consent::UnheldBucketOperation;
 use aruna_operations::jobs::export::grant::{
     AdmitGrantOperation, IssueExportOperation, IssueGrantConfig, ReadGrantOperation,
     RevokeGrantOperation, export_access,
 };
-use aruna_operations::jobs::export::{CrateJsonOperation, UnheldBucketOperation};
+use aruna_operations::jobs::export::snapshot::CrateJsonOperation;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};

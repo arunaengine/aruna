@@ -2,15 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod job;
+pub mod job;
 mod object;
 mod prepare;
 mod reads;
 mod recover;
 pub mod schedule;
 mod twin;
-
-pub use job::BackendImportOperation;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;

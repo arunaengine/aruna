@@ -1048,7 +1048,7 @@ pub async fn delete_group(
     let token =
         forwarded_bearer(bearer.as_ref().map(|bearer| bearer.as_str())).map_err(map_api_error)?;
     let ctx = state.get_ctx();
-    let delete = aruna_operations::groups::deletion::DeleteGroupOperation::new(
+    let delete = aruna_operations::groups::deletion::coordinator::DeleteGroupOperation::new(
         ctx.node_and_realm(),
         auth,
         token,
@@ -1164,7 +1164,7 @@ pub async fn get_deletion_blockers(
     }
     let group_id = parse_group_id(&group_id)?;
     let ctx = state.get_ctx();
-    let check = aruna_operations::groups::deletion::CheckGroupOperation::new(
+    let check = aruna_operations::groups::deletion::check::CheckGroupOperation::new(
         ctx.node_and_realm(),
         auth,
         group_id,
