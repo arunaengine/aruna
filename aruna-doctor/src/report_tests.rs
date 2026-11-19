@@ -286,3 +286,60 @@ fn refuses_missing_database() {
     assert!(build_report(empty.to_str().unwrap(), NOW_MS).is_err());
     assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
 }
+
+// A marker, the last contact, a reservation without a job and an overdue job held by its
+// reservation show up, so a stuck discard is visible.
+#[test]
+fn reports_discard_state() {
+    use aruna_core::compute::quota::JobReservationRecord;
+    use aruna_core::keyspaces::{COMPUTE_DEPARTURE_KEYSPACE, JOB_RESERVATION_KEYSPACE};
+    use aruna_core::structs::execution::job::EffectiveResources;
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("db");
+    {
+        let db = OptimisticTxDatabase::builder(&path).open().unwrap();
+        let open = |name| db.keyspace(name, KeyspaceCreateOptions::default).unwrap();
+        let (jobs, schedule) = (open(JOB_KEYSPACE), open(SCHEDULE_INDEX_KEYSPACE));
+        let (local, reservations) = (
+            open(COMPUTE_DEPARTURE_KEYSPACE),
+            open(JOB_RESERVATION_KEYSPACE),
+        );
+        let mut txn = db.write_tx().unwrap();
+        let held = job(job_id(1), execution(), JobState::Failed);
+        let record = held.to_bytes().unwrap();
+        txn.insert(&jobs, job_record_key(held.job_id).to_vec(), record);
+        txn.insert(&schedule, job_prune_key(2_000, job_id(1)).to_vec(), []);
+        for (seed, owner) in [(1u8, job_id(1)), (2u8, job_id(2))] {
+            let row = JobReservationRecord {
+                execution_id: Ulid::from_bytes([seed; 16]),
+                job_id: owner,
+                logical_job_id: owner,
+                resources: EffectiveResources {
+                    cpu_cores: 1,
+                    ram_bytes: 512,
+                    disk_bytes: 0,
+                    max_walltime_ms: 1_000,
+                    preemptible: false,
+                },
+                created_at_ms: 5,
+                subject_generation: 1,
+                subject_digest: [0u8; 32],
+                config_clock: Default::default(),
+                backend: "default".to_string(),
+                config_generation: 0,
+                config_digest: [0; 32],
+            };
+            txn.insert(&reservations, [seed], postcard::to_allocvec(&row).unwrap());
+        }
+        txn.insert(&local, b"discard".to_vec(), []);
+        txn.insert(&local, b"last_contact".to_vec(), 1_234u64.to_be_bytes());
+        txn.commit().unwrap().unwrap();
+    }
+
+    let report = job_records(&path);
+
+    assert!(report.discard.marker);
+    assert_eq!(report.discard.last_contact_ms, Some(1_234));
+    assert_eq!(report.discard.orphan_reservations, 1);
+    assert_eq!(report.held.get("reserved"), Some(&1));
+}

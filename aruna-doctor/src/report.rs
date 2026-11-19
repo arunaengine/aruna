@@ -4,29 +4,31 @@
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE,
-    DEADLINE_INDEX_KEYSPACE, DEDUP_INDEX_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
-    FAMILY_OUTBOX_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
-    FAMILY_RECORD_KEYSPACE, INPUT_PAGE_KEYSPACE, JOB_CLAIM_KEYSPACE, JOB_ENTRY_KEYSPACE,
-    JOB_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE, JOB_STATE_KEYSPACE,
-    LAUNCH_RECORD_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, PLUGIN_RUNS_KEYSPACE,
-    PLUGIN_WORK_KEYSPACE, RUN_CRATE_KEYSPACE, RUN_LINK_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
-    STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE, STAGING_STATE_KEYSPACE,
-    WITNESS_DEADLINE_KEYSPACE,
+    COMPUTE_DEPARTURE_KEYSPACE, DEADLINE_INDEX_KEYSPACE, DEDUP_INDEX_KEYSPACE,
+    FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
+    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+    INPUT_PAGE_KEYSPACE, JOB_CLAIM_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
+    JOB_RESERVATION_KEYSPACE, JOB_STATE_KEYSPACE, LAUNCH_RECORD_KEYSPACE, OUTPUT_RECORD_KEYSPACE,
+    PLAN_EXPLAIN_KEYSPACE, PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE, RUN_CRATE_KEYSPACE,
+    RUN_LINK_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE,
+    STAGING_STATE_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
+use aruna_core::node_state::{DISCARD_KEY, LAST_CONTACT_KEY};
 use aruna_core::plugin_runs::{PluginRun, RUN_ROW};
 use aruna_core::structs::execution::job::record_rows::{
     OutboxEntry, PendingRecord, ProjectionCache,
 };
 use aruna_core::structs::execution::job::{
-    DUE_INDEX_PREFIX, JobPayload, JobRecord, JobRecordKey, LEASE_INDEX_PREFIX, PRUNE_INDEX_PREFIX,
-    cleanup_job_id, job_record_key, parse_schedule_key,
+    DUE_INDEX_PREFIX, JobId, JobPayload, JobRecord, JobRecordKey, LEASE_INDEX_PREFIX,
+    PRUNE_INDEX_PREFIX, cleanup_job_id, job_record_key, parse_schedule_key,
 };
 use aruna_operations::plugins::work::{WORK_ROW, WorkRow, WorkState, index_key};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 /// Every keyspace whose rows the report counts.
@@ -104,6 +106,17 @@ pub struct JobRecords {
     pub plugins: PluginRows,
     /// Overdue prune rows that the prune pass keeps, by hold reason.
     pub held: BTreeMap<String, u64>,
+    pub discard: DiscardRows,
+}
+
+/// The discard state of this node and the reservations no job record holds.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DiscardRows {
+    /// An unfinished discard left its marker.
+    pub marker: bool,
+    /// When this node last caught up; absent when the row is missing or unreadable.
+    pub last_contact_ms: Option<u64>,
+    pub orphan_reservations: u64,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -218,10 +231,34 @@ fn job_records(database: &Database, report: &mut Report) -> Result<(), CliError>
     if let Some(keyspace) = &jobs {
         count_jobs(&snapshot, keyspace, &mut records)?;
     }
+    if let Some(keyspace) = database.keyspace(COMPUTE_DEPARTURE_KEYSPACE)? {
+        records.discard.marker = snapshot.get(&keyspace, DISCARD_KEY)?.is_some();
+        let contact = snapshot.get(&keyspace, LAST_CONTACT_KEY)?;
+        records.discard.last_contact_ms = contact
+            .and_then(|value| <[u8; 8]>::try_from(value.as_ref()).ok())
+            .map(u64::from_be_bytes);
+    }
+    let mut reserved = BTreeSet::new();
+    if let Some(keyspace) = database.keyspace(JOB_RESERVATION_KEYSPACE)? {
+        for entry in snapshot.iter(&keyspace) {
+            let value = entry.value()?;
+            let Ok(row) = postcard::from_bytes::<JobReservationRecord>(value.as_ref()) else {
+                continue;
+            };
+            let key = job_record_key(row.job_id);
+            let held = match &jobs {
+                Some(jobs) => snapshot.get(jobs, key.as_ref())?.is_some(),
+                None => false,
+            };
+            records.discard.orphan_reservations += u64::from(!held);
+            reserved.insert(row.job_id);
+        }
+    }
     if let Some(keyspace) = database.keyspace(SCHEDULE_INDEX_KEYSPACE)? {
         let holds = Holds {
             jobs: jobs.as_ref(),
             work: work.as_ref(),
+            reserved: &reserved,
         };
         count_schedule(&snapshot, &keyspace, &holds, now_ms, &mut records)?;
     }
@@ -293,6 +330,8 @@ fn job_records(database: &Database, report: &mut Report) -> Result<(), CliError>
 struct Holds<'a> {
     jobs: Option<&'a OptimisticTxKeyspace>,
     work: Option<&'a OptimisticTxKeyspace>,
+    /// Jobs whose reservation is not released yet.
+    reserved: &'a BTreeSet<JobId>,
 }
 
 fn count_jobs(
@@ -358,9 +397,13 @@ fn hold_reason(
             };
             let key = job_record_key(cleanup_job_id(record.job_id));
             let cleanup = read_job(snapshot, jobs, key.as_ref())?;
-            Ok(cleanup
-                .is_some_and(|cleanup| !cleanup.state.is_terminal())
-                .then_some("cleanup_pending"))
+            if cleanup.is_some_and(|cleanup| !cleanup.state.is_terminal()) {
+                return Ok(Some("cleanup_pending"));
+            }
+            Ok(holds
+                .reserved
+                .contains(&record.job_id)
+                .then_some("reserved"))
         }
         JobPayload::PluginWork(spec) => {
             let Some(work) = holds.work else {
