@@ -521,7 +521,8 @@ mod tests {
         DoctorValidationState, Valid, build_token_view, create_bootstrap_token, create_oidc_token,
         load_oidc_providers, password_grant_body, request_oidc_token,
     };
-    use crate::tests::fixtures::{TestEnvGuard, env_lock};
+    use crate::tests::fixtures::env_lock;
+    use aruna_core::testing::EnvGuard;
     use aruna::bootstrap::ensure_onboarding_secret;
     use aruna::inbound::initialize_net_holder;
     use aruna::tasks::incoming::start_task_queues;
@@ -915,8 +916,8 @@ mod tests {
         }
     }
 
-    fn set_oidc_env(base_url: &str, provider: &OidcProviderConfig) -> TestEnvGuard {
-        TestEnvGuard::set(&[
+    fn set_oidc_env(base_url: &str, provider: &OidcProviderConfig) -> EnvGuard {
+        EnvGuard::set(&[
             (
                 "SOCKET_ADDRESS",
                 base_url.trim_start_matches("http://").to_string(),
@@ -1140,7 +1141,7 @@ mod tests {
     #[tokio::test]
     async fn loads_oidc_providers() {
         let _guard = env_lock().lock().await;
-        let _env = TestEnvGuard::set(&[
+        let _env = EnvGuard::set(&[
             ("OIDC_PROVIDER_IDS", "main".to_string()),
             ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
             ("OIDC_MAIN_AUDIENCE", "aruna-api".to_string()),

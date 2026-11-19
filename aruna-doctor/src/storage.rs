@@ -202,7 +202,8 @@ mod tests {
         KeyspaceCreateOptions, OptimisticTxDatabase, SnapshotError, import_new_database,
         snapshot_database,
     };
-    use crate::tests::fixtures::{TestEnvGuard, env_lock};
+    use crate::tests::fixtures::env_lock;
+    use aruna_core::testing::EnvGuard;
     use aruna::config::load;
     use aruna_api::server::state::ServerState;
     use aruna_blob::blob::BlobHandler;
@@ -244,7 +245,7 @@ mod tests {
         let restored_db_path = temp.path().join("restored-db");
         let blob_root = temp.path().join("blob-root");
 
-        let _env = TestEnvGuard::set(&[
+        let _env = EnvGuard::set(&[
             (
                 "DATABASE_DIR",
                 source_db_path
