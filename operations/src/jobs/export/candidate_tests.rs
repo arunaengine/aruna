@@ -10,6 +10,7 @@ use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::jobs::context::JobContext;
 use crate::jobs::executor::JobRunOutcome;
+use crate::jobs::export::archive::failure_outcome;
 use crate::jobs::export::consent::UnheldBucketOperation;
 use crate::jobs::export::resolve::CandidateSource;
 use crate::jobs::export::resolve::ExportCandidate;
