@@ -218,7 +218,9 @@ fn discard_marker_waits() {
     ])));
     assert_eq!(marked().next(holding), outcome(false, Vec::new()));
     let mut released = marked();
-    let none = IoResult::Child(ChildOutcome::new(Ok::<_, LifecycleError>(Vec::new())));
+    let none = IoResult::Child(ChildOutcome::new(Ok::<_, LifecycleError>(Vec::<
+        JobReservationRecord,
+    >::new())));
     assert_eq!(released.next(none), config_read());
     let refresh = IoCall::child(RefreshContactOperation::new(7_000, true));
     let alone = config(RealmNodeKind::Management, &[]);
