@@ -43,7 +43,7 @@ use super::lifecycle::{match_targets, targets};
 use super::marks::SweepMarks;
 use super::matcher::MatchJournal;
 use super::prune::PruneAudit;
-use super::publish::{CheckPublish, FinishPublish, PublishError, PublishStep};
+use super::publish::{PublishError, PublishPlugin};
 use super::receiver::lost_reason;
 use super::reconcile::{RepairSettled, repair_account};
 use super::records::{InstallEntryConfig, InstallEntryOperation};
@@ -341,6 +341,7 @@ pub async fn store_local(
     bytes: &[u8],
     now_ms: u64,
 ) -> Result<(), ArtifactError> {
+    let bytes = bytes::Bytes::copy_from_slice(bytes);
     drive(StoreCopy::new(config, digest, bytes, now_ms), ctx).await
 }
 
@@ -367,11 +368,6 @@ pub async fn fetch_artifact(
     digest: &str,
 ) -> Result<Assembled, ArtifactError> {
     let fetched = drive(FetchArtifact::new(config, digest, local_of(ctx))?, ctx).await?;
-    if fetched.fresh {
-        let bytes = &fetched.copy.bytes;
-        let store = StoreCopy::new(config, digest, bytes, unix_timestamp_millis());
-        drive(store, ctx).await?;
-    }
     Ok(fetched.copy)
 }
 
@@ -381,13 +377,7 @@ pub async fn publish_plugin(
     auth: AuthContext,
     artifact: Vec<u8>,
 ) -> Result<PublishedPlugin, PublishError> {
-    let check = CheckPublish::new(&actor, &auth, &artifact, unix_timestamp_millis())?;
-    let plan = match drive(check, ctx).await? {
-        PublishStep::Known(published) => return Ok(published),
-        PublishStep::Store(plan) => plan,
-    };
-    drive(plan.store_copy(&artifact), ctx).await?;
-    drive(FinishPublish::new(actor, auth, *plan, artifact), ctx).await
+    drive(PublishPlugin::new(actor, auth, artifact.into()), ctx).await
 }
 
 pub async fn job_row(

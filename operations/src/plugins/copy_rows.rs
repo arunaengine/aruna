@@ -12,6 +12,7 @@ use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugins::{ArtifactBytes, Chunk, MAX_ARTIFACT, MemoryPermit};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
+use bytes::Bytes;
 
 use super::artifacts::ArtifactError;
 use super::copies::{Assembled, reserve_call, reserved};
@@ -64,7 +65,7 @@ pub(crate) fn chunk_fits(chunk: &Chunk) -> bool {
 }
 
 /// Digests whose copies stay: published versions and versions an install pins.
-fn kept_digests(config: &RealmConfigDocument) -> BTreeSet<String> {
+pub(crate) fn kept_digests(config: &RealmConfigDocument) -> BTreeSet<String> {
     let pinned = config.installs.iter().map(|install| &install.digest);
     (config.plugins.iter().map(|plugin| &plugin.digest))
         .chain(pinned)
@@ -442,24 +443,34 @@ enum StorePhase {
 /// Writes this node's whole copy and syncs before anyone is told. Progress is kept with every
 /// chunk, so an interrupted write is counted and swept like an unfinished copy from a peer.
 #[derive(Debug, PartialEq)]
-pub struct StoreCopy<'a> {
+pub struct StoreCopy {
     kept: BTreeSet<String>,
     digest: String,
-    bytes: &'a [u8],
+    bytes: Bytes,
     now_ms: u64,
     progress: Progress,
     index: u32,
     phase: StorePhase,
 }
 
-impl<'a> StoreCopy<'a> {
-    pub fn new(config: &RealmConfigDocument, digest: &str, bytes: &'a [u8], now_ms: u64) -> Self {
+impl StoreCopy {
+    pub fn new(config: &RealmConfigDocument, digest: &str, bytes: Bytes, now_ms: u64) -> Self {
+        Self::keeping(kept_digests(config), digest, bytes, now_ms)
+    }
+
+    /// A store bounded by the digests the realm keeps, as [`kept_digests`] reads them.
+    pub(crate) fn keeping(
+        kept: BTreeSet<String>,
+        digest: &str,
+        bytes: Bytes,
+        now_ms: u64,
+    ) -> Self {
         Self {
-            kept: kept_digests(config),
+            kept,
             digest: digest.to_string(),
+            progress: Progress::new(bytes.len() as u64, now_ms),
             bytes,
             now_ms,
-            progress: Progress::new(bytes.len() as u64, now_ms),
             index: 0,
             phase: StorePhase::Reading,
         }
@@ -478,7 +489,7 @@ impl<'a> StoreCopy<'a> {
         let rows = vec![
             (
                 chunk_key(&self.digest, index),
-                chunk_bytes(self.bytes, index).to_vec(),
+                chunk_bytes(&self.bytes, index).to_vec(),
             ),
             (progress_key(&self.digest), self.progress.encode()),
         ];
@@ -492,7 +503,7 @@ impl<'a> StoreCopy<'a> {
     }
 }
 
-impl Operation for StoreCopy<'_> {
+impl Operation for StoreCopy {
     type Output = ();
     type Error = ArtifactError;
 

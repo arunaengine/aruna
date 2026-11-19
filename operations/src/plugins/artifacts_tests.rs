@@ -187,8 +187,10 @@ mod operations {
             assert!(is_effect(&answer));
             answer = read.next(chunk_from(node(2), index));
         }
-        let Ok(Next::Done(fetched)) = answer else {
-            panic!("the last chunk completes the copy");
+        assert!(is_child(&answer), "the checked copy is kept here first");
+        let kept = child_result(Ok::<(), ArtifactError>(()));
+        let Ok(Next::Done(fetched)) = read.next(kept) else {
+            panic!("keeping the copy completes the fetch");
         };
         assert!(fetched.fresh);
         assert_eq!(fetched.copy.bytes, FIXTURE);
