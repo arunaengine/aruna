@@ -98,18 +98,6 @@ impl ListUploadsOperation {
         self
     }
 
-    #[cfg(test)]
-    fn with_scan_limit(mut self, scan_round_limit: usize) -> Self {
-        self.scan_round_limit = scan_round_limit;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_scan_budget(mut self, max_scan_rows: usize) -> Self {
-        self.max_scan_rows = max_scan_rows;
-        self
-    }
-
     fn upload_round(&mut self) -> Step {
         let remaining = self.max_scan_rows.saturating_sub(self.scan_rows);
         if remaining == 0 {
@@ -259,6 +247,18 @@ mod test {
     use aruna_storage::storage;
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
+
+    impl ListUploadsOperation {
+        fn with_scan_limit(mut self, scan_round_limit: usize) -> Self {
+            self.scan_round_limit = scan_round_limit;
+            self
+        }
+
+        fn with_scan_budget(mut self, max_scan_rows: usize) -> Self {
+            self.max_scan_rows = max_scan_rows;
+            self
+        }
+    }
 
     fn driver_context(storage_handle: storage::StorageHandle) -> DriverContext {
         DriverContext {

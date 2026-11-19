@@ -7,7 +7,7 @@ use super::*;
 use crate::distribution::inventory::{InventoryChange, InventoryUpdate};
 use crate::distribution::test_store::{
     account, apply, begin, commit, context, counters, exact, get, install, open, purge, range,
-    stage, write,
+    stage, write, write_change,
 };
 use crate::driver::drive;
 use aruna_core::calls::ChildOutcome;
@@ -169,7 +169,7 @@ async fn walks_empty_uploads() {
 async fn keeps_epoch_maximum() {
     let (_dir, handle) = open();
     install(&handle, set(), &[range(1, "", None)]).await;
-    let mut change = write(set(), "a", 1, 1).change().clone();
+    let mut change = write_change(set(), "a", 1, 1);
     change.added[0].epoch = OriginalEpoch(7);
     assert!(apply(&handle, InventoryUpdate::new(change)).await.unwrap());
     assert!(apply(&handle, purge(set(), "a", &[1])).await.unwrap());

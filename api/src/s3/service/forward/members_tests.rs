@@ -14,6 +14,16 @@ use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use super::reads::STALE_HEADER;
 use crate::tests::members::{BUCKET, Members, members};
 
+/// The distribution record a member holds for `binding`.
+async fn snapshot_of(
+    service: &crate::s3::service::ArunaS3Service,
+    binding: &aruna_core::structs::storage::distribution::DistributionBinding,
+) -> aruna_core::structs::storage::distribution::DistributionSnapshot {
+    let view = aruna_operations::distribution::routing::bound_view(binding);
+    let view = aruna_operations::driver::drive(view, service.state.as_ref());
+    view.await.unwrap().head.snapshot
+}
+
 /// A request the access hook admitted for `user` on `bucket`.
 fn request<T>(input: T, method: Method, user: UserAccess, bucket: BucketInfo) -> S3Request<T> {
     let mut extensions = Extensions::new();
@@ -1452,7 +1462,7 @@ async fn copies_answer_stale() {
     copy_rows(&members, 1, 2).await;
     members.nodes[1].stop().await;
     let binding = members.nodes[2].bucket().await.distribution.unwrap();
-    let snapshot = members.nodes[2].service.snapshot(&binding).await.unwrap();
+    let snapshot = snapshot_of(&members.nodes[2].service, &binding).await;
     let range_id = snapshot.config.ranges[1].range_id;
     let stale = format!("range={range_id}");
     for on in [0, 2] {
@@ -1518,21 +1528,20 @@ async fn copy_read_marked() {
     put(&members, 0, "k/1", b"k/1").await;
     copy_rows(&members, 1, 2).await;
     let binding = members.nodes[0].bucket().await.distribution.unwrap();
-    let snapshot = members.nodes[0].service.snapshot(&binding).await.unwrap();
+    let snapshot = snapshot_of(&members.nodes[0].service, &binding).await;
     let copy = super::Forward {
         set_id: binding.set_id,
         range_id: snapshot.config.ranges[1].range_id,
         node_id: members.nodes[2].node_id(),
     };
-    let read = || {
-        super::reads::read_request(
-            Method::GET,
-            "GetObject",
-            BUCKET,
-            "k/1",
-            None,
-            &HeaderMap::new(),
-        )
+    let read = || super::ForwardRequest {
+        method: aruna_core::member_read::MemberMethod::Get,
+        operation: "GetObject",
+        bucket: BUCKET.to_string(),
+        key: "k/1".to_string(),
+        query: None,
+        headers: Vec::new(),
+        body: super::ForwardBody::Empty,
     };
     let service = &members.nodes[0].service;
     let error = service
@@ -1545,5 +1554,6 @@ async fn copy_read_marked() {
     let answer = service
         .forward_read(&members.user_on(0), &copy, marked)
         .await;
-    assert_eq!(answer.unwrap().bytes().await.unwrap().as_ref(), b"k/1");
+    let text = service.answer_text(answer.unwrap()).await.unwrap();
+    assert_eq!(text, "k/1");
 }

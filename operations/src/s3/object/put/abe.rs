@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE,
     ABE_VERSION_KEYSPACE,
@@ -12,7 +11,7 @@ use aruna_core::structs::storage::abe::{
     AbeError, AbeParameters, EnvelopeArchive, EnvelopePlan, ObjectEnvelope, envelope_charge,
 };
 use aruna_core::structs::storage::encryption::BucketKeyRef;
-use aruna_core::types::{Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 
 impl PutObjectOperation {
     pub(super) fn read_abe(&mut self, fence: bool) -> Turn {
@@ -99,19 +98,6 @@ pub(crate) fn parse_abe(
         return Err(AbeError::Context);
     }
     Ok((parameters, epoch))
-}
-
-/// The write publishing `envelope` for `version` stored at `location`, with its usage charge.
-pub(crate) fn envelope_write(
-    envelope: &ObjectEnvelope,
-    version: &VersionKey,
-    location: &BackendLocation,
-    rows: (&HashMap<String, String>, u64, Option<TxnId>),
-) -> Result<(Effect, u64), AbeError> {
-    let (metadata, limit, txn_id) = rows;
-    let (writes, charge) = located_rows(envelope, version, location, (metadata, limit))?;
-    let write = StorageEffect::BatchWrite { writes, txn_id };
-    Ok((Effect::Storage(write), charge))
 }
 
 /// The rows publishing `envelope` for `version` stored at `location`, with its usage charge.

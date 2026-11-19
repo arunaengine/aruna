@@ -6,10 +6,9 @@
 use super::*;
 use crate::s3::abe_copies::copy_row;
 use crate::s3::bucket::key::rows::Row;
-use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
+use crate::s3::object::put::abe::{abe_reads, located_rows, parse_abe};
 use crate::s3::usage::RowChange;
 use crate::s3::usage::StoredDelta;
-use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
@@ -270,16 +269,9 @@ impl RewriteVersionOperation {
             return Err(RewriteError::ContentMismatch);
         }
         let limit = RoCrateLimits::default().metadata_bytes;
-        let (effect, charge) = envelope_write(
-            envelope,
-            &self.version_key,
-            published,
-            (metadata, limit, None),
-        )
-        .map_err(abe_error)?;
-        let Effect::Storage(StorageEffect::BatchWrite { writes, .. }) = effect else {
-            return Err(RewriteError::NotFinished);
-        };
+        let (writes, charge) =
+            located_rows(envelope, &self.version_key, published, (metadata, limit))
+                .map_err(abe_error)?;
         Ok((writes, i128::from(charge) - i128::from(old_charge)))
     }
 

@@ -8,7 +8,7 @@ use crate::distribution::inventory::InventoryUpdate;
 use crate::distribution::rebuild::{RebuildConfig, RebuildOperation, RebuildOutcome};
 use crate::distribution::test_store::{
     account, apply, begin, commit, context, counters, exact, get, install, open, purge, range,
-    stage, write,
+    stage, write, write_change,
 };
 use crate::driver::drive;
 use aruna_core::structs::storage::distribution::OriginalEpoch;
@@ -185,7 +185,7 @@ async fn refuses_bad_splits() {
 async fn children_keep_epoch() {
     let (_dir, handle) = open();
     install(&handle, set(), &[range(1, "", None)]).await;
-    let mut change = write(set(), "a", 1, 1).change().clone();
+    let mut change = write_change(set(), "a", 1, 1);
     change.added[0].epoch = OriginalEpoch(7);
     assert!(apply(&handle, InventoryUpdate::new(change)).await.unwrap());
     assert!(apply(&handle, purge(set(), "a", &[1])).await.unwrap());

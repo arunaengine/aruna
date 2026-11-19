@@ -47,6 +47,8 @@ enum PartStep {
     ReadSaved,
     WritePart,
     Publish,
+    /// The record transaction answered with a failure, so no commit is in flight.
+    Refused,
     Release,
 }
 
@@ -360,6 +362,7 @@ impl UploadPartOperation {
             Ok(()) => return self.committed(),
             Err(error) => error,
         };
+        self.step = PartStep::Refused;
         let UploadPartError::StorageError(storage) = &error else {
             return Err(error);
         };
@@ -459,6 +462,7 @@ impl Operation for UploadPartOperation {
             PartStep::ReadSaved => self.write_piece(result.page()?.0),
             PartStep::WritePart => self.write_finished(result.event()?),
             PartStep::Publish => self.published(result.child::<(), UploadPartError>()?),
+            PartStep::Refused => Err(IoError::Unfinished.into()),
             PartStep::Release => self.released(result.child::<(), StorageError>()?),
         }
     }
@@ -633,7 +637,7 @@ mod test {
     use tempfile::tempdir;
 
     fn test_user_id() -> UserId {
-        UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
+        UserId::local(Ulid::from_bytes([8u8; 16]), RealmId::from_bytes([1u8; 32]))
     }
 
     fn body() -> Option<BackendStream<Result<Bytes, StreamError>>> {

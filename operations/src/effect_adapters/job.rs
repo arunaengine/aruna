@@ -140,6 +140,15 @@ pub(super) async fn dispatch_job(
             let (zip, result) = archive::zip_stream(zip, &path, modified_ms, stream, stop).await;
             JobEvent::ZipStreamed { zip, result }
         }
+        JobEffect::ZipCounted {
+            zip,
+            path,
+            modified_ms,
+            stream,
+        } => {
+            let (zip, result) = archive::zip_counted(zip, &path, modified_ms, stream).await;
+            JobEvent::ZipCounted { zip, result }
+        }
         JobEffect::ZipClose(zip) => JobEvent::ZipClosed(archive::zip_close(zip).await),
     })
 }

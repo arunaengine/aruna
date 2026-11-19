@@ -5,10 +5,18 @@
 
 use super::*;
 use crate::distribution::test_store::{
-    apply, begin, commit, counters, get, has_row, install, open, range, stage,
+    apply, begin, commit, counters, get, has_row, install, open, range, stage, stage_usage,
 };
 use aruna_core::structs::storage::distribution::accounting::{Cursor, Rebuild};
 use aruna_storage::storage::StorageHandle;
+
+fn change_of(update: &InventoryUpdate) -> &InventoryChange {
+    update.queued.front().expect("a queued change")
+}
+
+fn change_mut(update: &mut InventoryUpdate) -> &mut InventoryChange {
+    update.queued.front_mut().expect("a queued change")
+}
 
 fn set() -> Ulid {
     Ulid::from_bytes([9; 16])
@@ -115,7 +123,7 @@ async fn reference_records_root() {
         probe_config: BTreeMap::new(),
     };
     let mut update = put("a", 1, 1, 10);
-    update.change_mut().root = Some(entry.clone());
+    change_mut(&mut update).root = Some(entry.clone());
     assert!(apply(&handle, update).await.unwrap());
     let key = root_key(set(), &entry.root.digest().unwrap());
     let stored = get(&handle, SOURCE_ROOT_KEYSPACE, key).await.unwrap();
@@ -154,8 +162,8 @@ async fn update_keeps_content() {
     single_range(&handle).await;
     assert!(apply(&handle, put("a", 1, 1, 10)).await.unwrap());
     let mut update = put("a", 1, 1, 10);
-    update.change_mut().added[0].entry.referenced = true;
-    update.change_mut().head = HeadChange::Keep;
+    change_mut(&mut update).added[0].entry.referenced = true;
+    change_mut(&mut update).head = HeadChange::Keep;
     assert!(apply(&handle, update).await.unwrap());
     let content = content_key(set(), &stored(10).identity.unwrap(), id(1));
     let kept = get(&handle, CONTENT_INDEX_KEYSPACE, content).await;
@@ -170,7 +178,7 @@ async fn replay_changes_nothing() {
     let before = counters(&handle, active(1)).await;
     assert!(apply(&handle, put("a", 1, 1, 10)).await.unwrap());
     let mut late = put("a", 1, 7, 10);
-    late.change_mut().head = HeadChange::Keep;
+    change_mut(&mut late).head = HeadChange::Keep;
     assert!(
         apply(&handle, late).await.unwrap(),
         "another generation is still a replay"
@@ -197,10 +205,10 @@ async fn refuses_other_content() {
     let result = apply(&handle, put("a", 1, 1, 11)).await;
     assert_eq!(result, Err(InventoryError::Collision(id(1))));
     let mut pending = put("a", 2, 2, 0);
-    if let HeadChange::Set(head) = &mut pending.change_mut().head {
+    if let HeadChange::Set(head) = &mut change_mut(&mut pending).head {
         (head.version.identity, head.version.pending) = (None, true);
     }
-    let entry = &mut pending.change_mut().added[0].entry;
+    let entry = &mut change_mut(&mut pending).added[0].entry;
     (entry.identity, entry.pending) = (None, true);
     assert!(apply(&handle, pending.clone()).await.unwrap());
     assert!(
@@ -219,16 +227,16 @@ async fn refuses_other_content() {
 
     // A marker and a version never share an id, and stored content never loses its identity.
     let mut marker = put("a", 2, 2, 0);
-    let entry = &mut marker.change_mut().added[0].entry;
+    let entry = &mut change_mut(&mut marker).added[0].entry;
     (entry.marker, entry.identity) = (true, None);
-    marker.change_mut().head = HeadChange::Keep;
+    change_mut(&mut marker).head = HeadChange::Keep;
     assert_eq!(
         apply(&handle, marker).await,
         Err(InventoryError::Collision(id(2)))
     );
     let mut unknown = put("a", 2, 2, 0);
-    unknown.change_mut().added[0].entry.identity = None;
-    unknown.change_mut().head = HeadChange::Keep;
+    change_mut(&mut unknown).added[0].entry.identity = None;
+    change_mut(&mut unknown).head = HeadChange::Keep;
     assert_eq!(
         apply(&handle, unknown).await,
         Err(InventoryError::Collision(id(2)))
@@ -321,7 +329,7 @@ async fn seeks_range_bounds() {
 
     let other = Ulid::from_bytes([10; 16]);
     let mut stray = put("a", 3, 1, 1);
-    stray.change_mut().set_id = other;
+    change_mut(&mut stray).set_id = other;
     let missing = apply(&handle, stray).await;
     assert!(matches!(missing, Err(InventoryError::RangeMissing { .. })));
 }
@@ -552,18 +560,11 @@ async fn counts_own_admissions() {
         .await;
     assert!(commit(&handle, txn_id).await);
 
-    let changes = [put("a", 1, 1, 1), put("b", 2, 1, 1)].map(|update| update.change().clone());
+    let changes = [put("a", 1, 1, 1), put("b", 2, 1, 1)].map(|update| change_of(&update).clone());
     let mut update =
         UsageCounterUpdate::for_group(Ulid::nil(), UsageDelta::default()).with_inventories(changes);
     let txn_id = begin(&handle).await;
-    let mut effects = update.start(txn_id);
-    while let Some(effect) = effects.pop() {
-        let event = crate::distribution::test_store::send(&handle, effect).await;
-        match update.step(event, txn_id).unwrap() {
-            Some(next) => effects = next,
-            None => break,
-        }
-    }
+    stage_usage(&handle, txn_id, &mut update).await.unwrap();
     assert!(commit(&handle, txn_id).await);
     assert_eq!(
         counters(&handle, count).await.sampled,
@@ -603,18 +604,11 @@ async fn sees_staged_entry() {
         .await;
     assert!(commit(&handle, txn_id).await);
 
-    let changes = [put(high, 1, 1, 1), put(low, 2, 1, 1)].map(|update| update.change().clone());
+    let changes = [put(high, 1, 1, 1), put(low, 2, 1, 1)].map(|update| change_of(&update).clone());
     let mut update =
         UsageCounterUpdate::for_group(Ulid::nil(), UsageDelta::default()).with_inventories(changes);
     let txn_id = begin(&handle).await;
-    let mut effects = update.start(txn_id);
-    while let Some(effect) = effects.pop() {
-        let event = crate::distribution::test_store::send(&handle, effect).await;
-        match update.step(event, txn_id).unwrap() {
-            Some(next) => effects = next,
-            None => break,
-        }
-    }
+    stage_usage(&handle, txn_id, &mut update).await.unwrap();
     assert!(commit(&handle, txn_id).await);
     let row = |key: &str| SampleEntry::of_key(key).row_key(set(), id(1));
     assert!(get(&handle, KEY_SAMPLE_KEYSPACE, row(low)).await.is_some());

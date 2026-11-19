@@ -43,6 +43,12 @@ pub struct DelegatedCaller {
     pub credential_expiry: u64,
 }
 
+impl std::fmt::Debug for DelegatedCaller {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DelegatedCaller")
+    }
+}
+
 /// How a listing proves its caller to the member. Never shown in a `Debug` print.
 #[derive(Clone, PartialEq)]
 pub enum MemberAccess {

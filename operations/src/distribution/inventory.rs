@@ -29,9 +29,8 @@ use aruna_core::structs::storage::distribution::inventory::{
 use aruna_core::structs::storage::distribution::search::feed_value;
 use aruna_core::structs::storage::distribution::source_root::{RootEntry, root_key};
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange, OriginalEpoch};
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -80,68 +79,6 @@ impl StagedCall {
             Self::InTransaction(call) => call,
             Self::Outside(call) => outside_call(call),
         }
-    }
-
-    /// The effect of this call for a host that holds the transaction `txn_id` itself.
-    pub(crate) fn into_effect(self, txn_id: TxnId) -> Result<Effect, InventoryError> {
-        let (call, txn) = match self {
-            Self::InTransaction(call) => (call, Some(txn_id)),
-            Self::Outside(call) => (call, None),
-        };
-        let storage = match call {
-            IoCall::Read(reads) => StorageEffect::BatchRead { reads, txn_id: txn },
-            IoCall::Page {
-                space,
-                prefix,
-                after,
-                limit,
-            } => StorageEffect::Iter {
-                key_space: space,
-                prefix: Some(prefix),
-                start: after.map(IterStart::After),
-                limit,
-                txn_id: txn,
-            },
-            IoCall::Write(writes) => StorageEffect::BatchWrite {
-                writes,
-                txn_id: txn,
-            },
-            IoCall::Delete(deletes) => StorageEffect::BatchDelete {
-                deletes,
-                txn_id: txn,
-            },
-            IoCall::AddCounters { space, deltas } => StorageEffect::AddCounters {
-                key_space: space,
-                deltas,
-                txn_id,
-            },
-            IoCall::AddUsage {
-                space,
-                deltas,
-                buckets,
-            } => StorageEffect::AddUsage {
-                key_space: space,
-                deltas,
-                buckets,
-                txn_id,
-            },
-            IoCall::Effect(effect) => match *effect {
-                Effect::Storage(mut storage) => {
-                    if let Some(slot) = storage.txn_slot() {
-                        *slot = txn;
-                    }
-                    storage
-                }
-                other => return Ok(other),
-            },
-            // The update makes no other call.
-            _ => {
-                let expected = "a storage call";
-                let got = "another call";
-                return Err(IoError::Unexpected { expected, got }.into());
-            }
-        };
-        Ok(Effect::Storage(storage))
     }
 }
 
@@ -314,16 +251,6 @@ impl InventoryUpdate {
         self.phase == Phase::Done
     }
 
-    #[cfg(test)]
-    pub fn change(&self) -> &InventoryChange {
-        self.queued.front().expect("a queued change")
-    }
-
-    #[cfg(test)]
-    pub fn change_mut(&mut self) -> &mut InventoryChange {
-        self.queued.front_mut().expect("a queued change")
-    }
-
     /// The first call of the update, or `None` when it has nothing to do.
     pub fn start_calls(&mut self) -> Option<StagedCall> {
         self.next_round()
@@ -389,57 +316,6 @@ impl InventoryUpdate {
                 }
                 .into())
             }
-        }
-    }
-
-    pub fn start(&mut self, txn_id: TxnId) -> Effects {
-        match self.start_calls().map(|call| call.into_effect(txn_id)) {
-            Some(Ok(effect)) => smallvec![effect],
-            // The first call is always a storage call.
-            Some(Err(_)) | None => smallvec![],
-        }
-    }
-
-    /// Returns `Ok(Some(effects))` while storage work remains and `Ok(None)` once every row
-    /// and counter delta is staged in the transaction.
-    pub fn step(&mut self, event: Event, txn_id: TxnId) -> Result<Option<Effects>, InventoryError> {
-        let result = self.answer_of(event)?;
-        match self.step_calls(result)? {
-            Some(call) => Ok(Some(smallvec![call.into_effect(txn_id)?])),
-            None => Ok(None),
-        }
-    }
-
-    /// The answer an event of the old interface gives the call of the current phase.
-    fn answer_of(&self, event: Event) -> Result<IoResult, InventoryError> {
-        match (&self.phase, event) {
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (
-                Phase::Locate,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => Ok(IoResult::Page {
-                rows: values,
-                next: next_start_after,
-            }),
-            (
-                Phase::Read | Phase::SampleCount,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => Ok(IoResult::Values(
-                values.into_iter().map(|(_, value)| value).collect(),
-            )),
-            (
-                Phase::SampleProbe | Phase::SampleRead,
-                event @ Event::Storage(StorageEvent::IterResult { .. }),
-            ) => Ok(IoResult::Event(Box::new(event))),
-            (Phase::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
-            | (Phase::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. }))
-            | (Phase::Count, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                Ok(IoResult::Done)
-            }
-            (_, event) => Err(InventoryError::UnexpectedEvent(Box::new(event))),
         }
     }
 

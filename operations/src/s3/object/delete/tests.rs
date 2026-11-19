@@ -1123,7 +1123,7 @@ async fn seed_pending(storage: &storage::StorageHandle, versions: &[Ulid]) -> Ba
             txn_id: None,
         });
         let owner = CopyOwner::new(archive.clone(), version_key);
-        let Effect::Storage(effect) = owner_write_effect(&owner, None).unwrap() else {
+        let Effect::Storage(effect) = owner_write_effect(&owner).unwrap() else {
             panic!("owner rows are storage writes");
         };
         effects.push(effect);
@@ -1146,12 +1146,38 @@ fn delete_pending(group_id: Ulid, version_id: Ulid) -> DeleteObjectOperation {
     })
 }
 
+/// Commits one counter update in its own transaction, as a writer's commit would.
+#[derive(Debug, PartialEq)]
+struct ApplyUsage(UsageCounterUpdate);
+
+impl aruna_core::operation::Operation for ApplyUsage {
+    type Output = ();
+    type Error = crate::s3::usage::UsageUpdateError;
+
+    fn first(&mut self) -> Result<aruna_core::calls::Next<()>, Self::Error> {
+        let call = self.0.start_calls().into_call();
+        Ok(aruna_core::calls::Next::Call(call))
+    }
+
+    fn next(
+        &mut self,
+        result: aruna_core::calls::IoResult,
+    ) -> Result<aruna_core::calls::Next<()>, Self::Error> {
+        Ok(match self.0.step_calls(result)? {
+            Some(call) => aruna_core::calls::Next::Call(call.into_call()),
+            None => aruna_core::calls::Next::Done(()),
+        })
+    }
+
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
+    }
+}
+
 /// Commits one counter update, as the publication of the seeded versions would.
 async fn apply_usage(storage: &storage::StorageHandle, update: UsageCounterUpdate) {
     let context = crate::testing::test_context(storage.clone());
-    drive(crate::s3::usage::ApplyUsage(update), &context)
-        .await
-        .unwrap();
+    drive(ApplyUsage(update), &context).await.unwrap();
 }
 
 async fn read_counters(

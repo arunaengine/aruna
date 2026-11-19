@@ -19,6 +19,7 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::structs::execution::job::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::dataset_description::DescriptionError;
+use aruna_core::structs::storage::distribution::delegation::{Delegation, SignedDelegation};
 use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
 use aruna_core::structs::storage::distribution::{SignedSnapshot, SignedStatement, StatementClaim};
 use aruna_core::structs::storage::read_grant::{ReadGrant, SignedGrant};
@@ -260,6 +261,11 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             NetEvent::ExecutionSign(sign_execution(&ctx.secret_key, *claim))
         }
         NetEffect::GrantSign(grant) => NetEvent::GrantSign(sign_grant(&ctx.secret_key, *grant)),
+        NetEffect::DelegationSign(delegation) => {
+            NetEvent::DelegationSign(sign_delegation(&ctx.secret_key, *delegation))
+        }
+        // The avoided holders are read through the handle the runner holds.
+        NetEffect::AvoidHolder { .. } => NetEvent::HolderAvoided,
         NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
             "artifact copies must be dispatched by the operations runner".to_string(),
         )),
@@ -359,6 +365,21 @@ pub(crate) fn sign_grant(key: &iroh::SecretKey, grant: ReadGrant) -> Option<Box<
     }
     let signature = key.sign(&grant.signing_bytes().ok()?);
     Some(Box::new(SignedGrant { signature, grant }))
+}
+
+/// Signs a delegation with this node's key, only when it names this node as issuer.
+pub(crate) fn sign_delegation(
+    key: &iroh::SecretKey,
+    delegation: Delegation,
+) -> Option<Box<SignedDelegation>> {
+    if delegation.issuer != key.public() {
+        return None;
+    }
+    let signature = key.sign(&delegation.signing_bytes().ok()?);
+    Some(Box::new(SignedDelegation {
+        delegation,
+        signature,
+    }))
 }
 
 /// Signs a job record with this node's key, only when the claim names this node as publisher.
@@ -652,6 +673,8 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::DatasetSummary(_) => "dataset_summary",
         NetEffect::WritePeerAuth(_) => "write_peer_auth",
         NetEffect::GrantSign(_) => "grant_sign",
+        NetEffect::DelegationSign(_) => "delegation_sign",
+        NetEffect::AvoidHolder { .. } => "avoid_holder",
         NetEffect::Shard(_) => "shard",
         NetEffect::EnsureTopics { .. } => "ensure_topics",
         NetEffect::AllowTopicPeers { .. } => "allow_topic_peers",

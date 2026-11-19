@@ -16,9 +16,8 @@ use reqwest::{Response, Url};
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::OutboundHandle;
+use crate::member_read::MEMBERS;
 
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a member may take to start its answer.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bytes of a member's answer read at most; a longer answer fails instead of filling memory.
@@ -141,15 +140,10 @@ fn signed_header(
     signer.sign(bound)?.encode().ok()
 }
 
-impl OutboundHandle {
-    /// Lists one range at its member. Member addresses come from the realm's own records, so
-    /// this client passes no egress screen.
-    pub async fn list_range(
-        &self,
-        listing: RangeListing,
-        signer: &dyn ListingSigner,
-    ) -> RangeAnswer {
-        let client = &self.inner.members;
+/// Lists one range at its member.
+pub async fn list_range(listing: RangeListing, signer: &dyn ListingSigner) -> RangeAnswer {
+    {
+        let client = &*MEMBERS;
         let request = match &listing.access {
             RangeAccess::Bearer(token) => {
                 let Some(url) = rest_url(&listing) else {

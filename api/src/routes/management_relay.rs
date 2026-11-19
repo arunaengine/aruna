@@ -4,132 +4,42 @@
 
 use crate::error::ServerError;
 use crate::routes::assistant::PROXY_BODY_LIMIT;
-use crate::routes::info::{load_node_documents, management_node_urls};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
-use aruna_core::admin_documents::AdminDocumentTarget;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::reducer::decode_reducer_state;
-use aruna_core::storage_entries::reducer_state_key;
+use aruna_core::member_read::MemberMethod;
+use aruna_core::structs::SESSION_HEADER;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::{CENTRAL_PROVIDER_ID, SESSION_HEADER};
-use aruna_operations::device::realm_documents::installed_management_urls;
-use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::users::merge::{Coordinator, coordinator as merge_coordinator};
+use aruna_operations::relay::call::{
+    NodeCall, RawHeader, RelayFailure, RelayReply, StartCallOperation,
+};
+use aruna_operations::relay::management::{
+    ManagementCall, ManagementRelayOperation, NodeRelay, NodeRelayEnd, NodeRelayOperation,
+    RelayEnd, TargetMark, coordinated_route, holder_route, next_hops, relay_route, stream_headers,
+    target_url,
+};
+use aruna_operations::relay::targets::{
+    CoordinatorTarget, CoordinatorTargetOperation, HolderTargetOperation, PeerTargetsOperation,
+};
+use aruna_operations::s3::object::member_rest;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, MatchedPath, OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use futures_util::StreamExt;
 use std::collections::BTreeMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 /// The nodes a relayed call passed, comma-separated. Anyone can send it, so it never makes a
 /// node answer a call it would relay; it only stops a call that would circle.
-pub(crate) const RELAY_HOP_HEADER: HeaderName = HeaderName::from_static("x-aruna-relay-hop");
-
-/// The nest every REST route is served under, stripped before the path is
-/// appended to a peer's published api base url.
-const API_PREFIX: &str = "/api/v1";
+pub(crate) const RELAY_HOP_HEADER: HeaderName =
+    HeaderName::from_static(member_rest::RELAY_HOP_HEADER);
 
 /// Realm membership changes rarely, so the resolved targets are reused inside
 /// this window instead of re-reading realm state per request.
 const MANAGEMENT_URL_TTL: Duration = Duration::from_secs(60);
-const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
-const RELAY_TARGET_LIMIT: usize = 3;
-
-/// Management-only routes, by method and route template. Explicit by design:
-/// node-local routes such as compute drain, placement diagnostics and sync
-/// quarantine must keep answering on the node they were called on.
-const RELAYED_ROUTES: &[(&str, &str)] = &[
-    ("DELETE", "/access/devices/{node_id}"),
-    ("DELETE", "/access/onboarding/secrets/{id}"),
-    ("DELETE", "/access/users/me/devices/{id}"),
-    ("DELETE", "/plugin-installs/{id}"),
-    ("DELETE", "/system/realm/admins/{user_id}"),
-    ("DELETE", "/system/realm/email"),
-    ("DELETE", "/system/realm/oidc-providers/{id}"),
-    ("DELETE", "/system/realm/secrets/{name}"),
-    ("GET", "/access/groups/{id}/service-accounts"),
-    ("GET", "/access/onboarding/secrets"),
-    ("GET", "/access/onboarding/secrets/{id}/status"),
-    ("GET", "/access/token"),
-    ("GET", "/access/users/me/secrets/{name}/value"),
-    ("GET", "/system/realm/placement"),
-    ("PATCH", "/access/users/me/devices/{id}"),
-    ("PATCH", "/system/realm/nodes/{node_id}"),
-    ("PATCH", "/system/realm/placement"),
-    ("POST", "/access/groups/{id}/service-accounts"),
-    (
-        "POST",
-        "/access/groups/{id}/service-accounts/{account_id}/tokens",
-    ),
-    ("POST", "/access/onboarding/bootstrap"),
-    ("POST", "/access/onboarding/secrets"),
-    ("POST", "/access/sessions"),
-    ("POST", "/access/users/register"),
-    ("POST", "/plugin-installs/{id}/pause"),
-    ("POST", "/plugin-installs/{id}/resume"),
-    ("POST", "/plugins"),
-    ("POST", "/plugins/{name}/installs"),
-    ("POST", "/system/realm/nodes/{node_id}/promote"),
-    ("POST", "/system/realm/secrets"),
-    ("POST", "/system/realm/secrets/{name}/rotate"),
-    ("PUT", "/access/policies/realm"),
-    ("PUT", "/access/users/{id}/status"),
-    ("PUT", "/compute/config"),
-    ("PUT", "/plugin-installs/{id}/grants"),
-    ("PUT", "/plugin-installs/{id}/version"),
-    ("PUT", "/system/realm/admins/{user_id}"),
-    ("PUT", "/system/realm/email"),
-    ("PUT", "/system/realm/federation"),
-    ("PUT", "/system/realm/oidc-providers/{id}"),
-    ("PUT", "/system/realm/portal-features"),
-    ("PUT", "/system/realm/quota"),
-    ("PUT", "/system/realm/secrets/{name}"),
-];
-
-/// Routes every node passes to the realm's merge coordinator, a management node itself included.
-const COORDINATED_ROUTES: &[(&str, &str)] = &[
-    ("POST", "/access/users/me/merge"),
-    ("POST", "/access/users/me/subjects"),
-    ("PUT", "/system/realm/merge-coordinator"),
-];
-
-/// Routes only the central assistant's holder answers, with no failover: its key and counters
-/// exist on that node alone. Provider routes count only for the id `central`.
-const HOLDER_ROUTES: &[(&str, &str)] = &[
-    ("DELETE", "/system/assistant/central"),
-    ("GET", "/system/assistant/central"),
-    ("GET", "/system/assistant/providers/{id}/models"),
-    ("GET", "/system/assistant/providers/{id}/proxy/{*path}"),
-    ("POST", "/system/assistant/central/test"),
-    ("POST", "/system/assistant/providers/{id}/proxy/{*path}"),
-    ("PUT", "/system/assistant/central"),
-];
-
-/// A chat answer streams for as long as the model writes, so only connecting is bounded.
-static STREAM_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .connect_timeout(RELAY_CONNECT_TIMEOUT)
-        .build()
-        .unwrap_or_default()
-});
-
-static RELAY_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .connect_timeout(RELAY_CONNECT_TIMEOUT)
-        .timeout(RELAY_TIMEOUT)
-        .build()
-        .unwrap_or_default()
-});
 
 /// Management api urls this node last resolved, and when.
 #[derive(Debug, Default)]
@@ -149,33 +59,37 @@ pub(crate) async fn relay_middleware(
         .extensions()
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_string());
+    let matched = matched.as_deref();
+    let method = request.method().as_str();
+    let (realm_id, here, context) = (state.get_realm_id(), state.get_node_id(), state.get_ctx());
     // The holder is checked on every central call, relayed or not: a hop header proves nothing.
-    if holder_route(request.method(), matched.as_deref(), request.uri()) {
-        return match holder_target(&state).await {
+    if holder_route(method, matched, request.uri().path()) {
+        let holder = HolderTargetOperation::new(realm_id, here);
+        return match drive(holder, &context).await {
             Ok(None) => next.run(request).await,
             Ok(Some((node, target))) => match passed_hops(&state, request.headers(), node) {
-                Some(hops) => stream_relay(&target, hops, request).await,
+                Some(hops) => stream_relay(&state, &target, hops, request).await,
                 None => {
                     warn!(relay_target = %target, "Central assistant call would circle between nodes");
                     ServerError::NoManagementNode.into_response()
                 }
             },
-            Err(error) => error.into_response(),
+            Err(_) => ServerError::NoManagementNode.into_response(),
         };
     }
-    if let Some(route) = coordinated_route(request.method(), matched.as_deref()) {
-        return match coordinator_targets(&state).await {
-            Ok(None) => next.run(request).await,
-            Ok(Some(targets)) => relay(&state, route, targets, request).await,
-            Err(error) => error.into_response(),
+    if let Some(route) = coordinated_route(method, matched) {
+        let target = CoordinatorTargetOperation::new(realm_id, here, state.is_management_node());
+        return match drive(target, &context).await {
+            Ok(CoordinatorTarget::Here) => next.run(request).await,
+            Ok(CoordinatorTarget::Node(url)) => relay(&state, route, vec![url], request).await,
+            Ok(CoordinatorTarget::Managers) => {
+                let targets = management_targets(&state).await;
+                relay(&state, route, targets, request).await
+            }
+            Err(_) => ServerError::NoManagementNode.into_response(),
         };
     }
-    let route = relay_route(
-        request.method(),
-        matched.as_deref(),
-        state.is_management_node(),
-    );
-    let Some(route) = route else {
+    let Some(route) = relay_route(method, matched, state.is_management_node()) else {
         return next.run(request).await;
     };
     let urls = management_targets(&state).await;
@@ -183,160 +97,73 @@ pub(crate) async fn relay_middleware(
     relay(&state, route, targets, request).await
 }
 
-/// The allowlisted route this request must be relayed for, if any. A management node relays
-/// none.
-fn relay_route(
-    method: &Method,
-    matched: Option<&str>,
-    is_management: bool,
-) -> Option<&'static str> {
-    let matched = matched?;
-    let path = matched.strip_prefix(API_PREFIX).unwrap_or(matched);
-    RELAYED_ROUTES
-        .iter()
-        .find(|(route_method, route)| method.as_str() == *route_method && path == *route)
-        .map(|(_, route)| *route)
-        .filter(|_| !is_management)
-}
-
-/// The coordinated route this request names.
-fn coordinated_route(method: &Method, matched: Option<&str>) -> Option<&'static str> {
-    let path = matched?.strip_prefix(API_PREFIX).unwrap_or(matched?);
-    COORDINATED_ROUTES
-        .iter()
-        .find(|(route_method, route)| method.as_str() == *route_method && path == *route)
-        .map(|(_, route)| *route)
-}
-
-/// Where a coordinated route goes: `None` when this node answers it, being the pinned merge
-/// coordinator or, while none is pinned or it left, a management node; else the coordinator's
-/// url, or the management nodes. An unknown pinned node has no url, so the call is refused.
-async fn coordinator_targets(state: &Arc<ServerState>) -> Result<Option<Vec<String>>, ServerError> {
-    let config = drive(
-        GetConfigOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|_| ServerError::NoManagementNode)?;
-    let target = AdminDocumentTarget::RealmConfig {
-        realm_id: state.get_realm_id(),
-    };
-    let reducer = match state
-        .get_ctx()
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: DOCUMENT_STATE_KEYSPACE.to_string(),
-            key: reducer_state_key(&target),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            value.and_then(|bytes| decode_reducer_state(&bytes).ok())
-        }
-        _ => return Err(ServerError::NoManagementNode),
-    };
-    match merge_coordinator(&config, reducer.as_ref()) {
-        Coordinator::Pinned(node) if node == state.get_node_id() => Ok(None),
-        Coordinator::Pinned(node) => {
-            let documents = load_node_documents(state, &config).await;
-            management_node_urls(&config, &documents)
-                .into_iter()
-                .find(|(node_id, _)| *node_id == node)
-                .and_then(|(_, url)| url)
-                .map(|url| Some(vec![url]))
-                .ok_or(ServerError::NoManagementNode)
-        }
-        Coordinator::Unpinned | Coordinator::Left if state.is_management_node() => Ok(None),
-        Coordinator::Unpinned | Coordinator::Left => Ok(Some(management_targets(state).await)),
-    }
-}
-
-/// The nodes a call passed, this one appended; `None` when the call came through this node or
-/// the target already, which would make it circle.
-pub(crate) fn passed_hops(
-    state: &ServerState,
-    headers: &HeaderMap,
-    target: Option<NodeId>,
-) -> Option<HeaderValue> {
-    let own = state.get_node_id().to_string();
-    let passed = headers
+/// The hop header a call came with, empty when it has none or it is no text.
+pub(crate) fn passed_text(headers: &HeaderMap) -> &str {
+    headers
         .get(RELAY_HOP_HEADER)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    let seen = |node: &str| passed.split(',').any(|hop| hop.trim() == node);
-    if seen(&own) || target.is_some_and(|node| seen(&node.to_string())) {
-        return None;
-    }
-    let hops = match passed.is_empty() {
-        true => own,
-        false => format!("{passed},{own}"),
-    };
-    HeaderValue::from_str(&hops).ok()
-}
-
-/// Whether the central assistant's holder must answer this request.
-fn holder_route(method: &Method, matched: Option<&str>, uri: &Uri) -> bool {
-    let Some(matched) = matched else {
-        return false;
-    };
-    let path = matched.strip_prefix(API_PREFIX).unwrap_or(matched);
-    let listed = HOLDER_ROUTES
-        .iter()
-        .any(|(route_method, route)| method.as_str() == *route_method && path == *route);
-    let central = format!("/system/assistant/providers/{CENTRAL_PROVIDER_ID}/");
-    listed && (!path.contains("{id}") || uri.path().contains(&central))
-}
-
-/// `None` when this node holds the central assistant: the first management node in realm order.
-/// A device knows no node addresses and asks the management node it was installed from.
-async fn holder_target(
-    state: &Arc<ServerState>,
-) -> Result<Option<(Option<NodeId>, String)>, ServerError> {
-    let config = drive(
-        GetConfigOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|_| ServerError::NoManagementNode)?;
-    let documents = load_node_documents(state, &config).await;
-    match management_node_urls(&config, &documents).into_iter().next() {
-        Some((node, _)) if node == state.get_node_id() => Ok(None),
-        Some((node, Some(url))) => Ok(Some((Some(node), url))),
-        _ => drive(
-            installed_management_urls(state.get_realm_id()),
-            &state.get_ctx(),
-        )
-        .await
         .unwrap_or_default()
-        .into_iter()
-        .next()
-        .map(|url| Some((None, url)))
-        .ok_or(ServerError::NoManagementNode),
+}
+
+fn passed_hops(state: &ServerState, headers: &HeaderMap, target: Option<NodeId>) -> Option<String> {
+    next_hops(state.get_node_id(), passed_text(headers), target)
+}
+
+/// The first value of each of `names` that `headers` holds, byte for byte.
+fn picked(headers: &HeaderMap, names: &[HeaderName]) -> Vec<RawHeader> {
+    (names.iter())
+        .filter_map(|name| {
+            let value = headers.get(name)?.as_bytes().to_vec();
+            Some((name.as_str().to_string(), value))
+        })
+        .collect()
+}
+
+fn hop_header(hops: String) -> RawHeader {
+    (RELAY_HOP_HEADER.as_str().to_string(), hops.into_bytes())
+}
+
+/// Inside the `/api/v1` nest the URI lacks that prefix; the original URI keeps it.
+fn original_uri(request: &Request) -> Uri {
+    request
+        .extensions()
+        .get::<OriginalUri>()
+        .map_or_else(|| request.uri().clone(), |original| original.0.clone())
+}
+
+/// Sets `headers` on `response`, replacing what it holds under the same names.
+pub(crate) fn add_headers(response: &mut Response, headers: &[(String, String)]) {
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name.as_bytes());
+        if let (Ok(name), Ok(value)) = (name, HeaderValue::from_str(value)) {
+            response.headers_mut().insert(name, value);
+        }
     }
+}
+
+pub(crate) fn reply_status(reply: &RelayReply) -> StatusCode {
+    StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 
 /// Passes a central assistant call to its holder and streams the answer back as it arrives.
-async fn stream_relay(target: &str, hops: HeaderValue, request: Request) -> Response {
-    let uri = request
-        .extensions()
-        .get::<OriginalUri>()
-        .map_or_else(|| request.uri().clone(), |original| original.0.clone());
-    let url = relay_url(target, &uri);
-    let mut outgoing = STREAM_CLIENT
-        .request(request.method().clone(), &url)
-        .header(RELAY_HOP_HEADER, hops);
+async fn stream_relay(
+    state: &ServerState,
+    target: &str,
+    hops: String,
+    request: Request,
+) -> Response {
+    let uri = original_uri(&request);
+    let Some(method) = MemberMethod::parse(request.method().as_str()) else {
+        return ServerError::RelayFailed.into_response();
+    };
     let forwarded = [
         header::AUTHORIZATION,
         header::CONTENT_TYPE,
         header::ACCEPT,
         HeaderName::from_static(SESSION_HEADER),
     ];
-    for name in forwarded {
-        if let Some(value) = request.headers().get(&name) {
-            outgoing = outgoing.header(name, value.clone());
-        }
-    }
+    let mut headers = picked(request.headers(), &forwarded);
+    headers.push(hop_header(hops));
     let body = match axum::body::to_bytes(request.into_body(), PROXY_BODY_LIMIT).await {
         Ok(body) => body,
         Err(_) => {
@@ -344,33 +171,28 @@ async fn stream_relay(target: &str, hops: HeaderValue, request: Request) -> Resp
                 .into_response();
         }
     };
-    let response = match outgoing.body(body).send().await {
-        Ok(response) => response,
+    let call = NodeCall {
+        method,
+        url: target_url(target, uri.path(), uri.query()),
+        headers,
+        body,
+        limit: None,
+        no_redirect: false,
+    };
+    let answer = match drive(StartCallOperation::new(call), &state.get_ctx()).await {
+        Ok(answer) => answer,
         Err(error) => {
-            warn!(relay_target = %url, error = %error, "Central assistant relay failed");
-            return match error.is_connect() {
-                true => ServerError::NoManagementNode.into_response(),
-                false => ServerError::RelayFailed.into_response(),
+            warn!(relay_target = %target, error = %error, "Central assistant relay failed");
+            return match error {
+                RelayFailure::Silent => ServerError::NoManagementNode.into_response(),
+                _ => ServerError::RelayFailed.into_response(),
             };
         }
     };
-    let status = response.status();
-    let mut headers = HeaderMap::new();
-    for name in [
-        header::CONTENT_TYPE,
-        header::RETRY_AFTER,
-        header::CACHE_CONTROL,
-    ] {
-        if let Some(value) = response.headers().get(&name) {
-            headers.insert(name, value.clone());
-        }
-    }
-    let stream = response
-        .bytes_stream()
-        .map(|chunk| chunk.map_err(std::io::Error::other));
-    let mut relayed = Response::new(Body::from_stream(stream));
-    *relayed.status_mut() = status;
-    *relayed.headers_mut() = headers;
+    let kept = stream_headers(&answer);
+    let mut relayed = Response::new(Body::from_stream(answer.stream.0));
+    *relayed.status_mut() = StatusCode::from_u16(answer.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    add_headers(&mut relayed, &kept);
     relayed
 }
 
@@ -389,21 +211,18 @@ async fn relay(
         warn!(route, "A relayed route would circle between nodes");
         return ServerError::NoManagementNode.into_response();
     };
-    let method = request.method().clone();
-    // Inside the `/api/v1` nest the URI lacks that prefix; the original URI keeps it.
-    let uri = request
-        .extensions()
-        .get::<OriginalUri>()
-        .map_or_else(|| request.uri().clone(), |original| original.0.clone());
-    let authorization = request.headers().get(header::AUTHORIZATION).cloned();
-    let content_type = request.headers().get(header::CONTENT_TYPE).cloned();
-    let preconditions: Vec<_> = [header::IF_MATCH, header::IF_NONE_MATCH]
-        .into_iter()
-        .filter_map(|name| {
-            let value = request.headers().get(&name)?.clone();
-            Some((name, value))
-        })
-        .collect();
+    let Some(method) = MemberMethod::parse(request.method().as_str()) else {
+        return ServerError::RelayFailed.into_response();
+    };
+    let uri = original_uri(&request);
+    let forwarded = [
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::IF_MATCH,
+        header::IF_NONE_MATCH,
+    ];
+    let mut headers = picked(request.headers(), &forwarded);
+    headers.push(hop_header(hop));
     // An artifact upload is read only for a caller who may publish, within this node's memory.
     let mut _memory = None;
     let body = if route == "/plugins" {
@@ -425,51 +244,24 @@ async fn relay(
             Err(rejection) => return rejection.into_response(),
         }
     };
-
-    // Targets are tried in order, but only a failure that provably predates
-    // processing may move a non-idempotent request on to the next target.
-    let mut unknown = None;
-    for target in targets.iter().take(RELAY_TARGET_LIMIT) {
-        let url = relay_url(target, &uri);
-        let mut outgoing = RELAY_CLIENT
-            .request(method.clone(), &url)
-            .header(RELAY_HOP_HEADER, hop.clone())
-            .body(body.clone());
-        if let Some(authorization) = &authorization {
-            outgoing = outgoing.header(header::AUTHORIZATION, authorization.clone());
-        }
-        if let Some(content_type) = &content_type {
-            outgoing = outgoing.header(header::CONTENT_TYPE, content_type.clone());
-        }
-        for (name, value) in &preconditions {
-            outgoing = outgoing.header(name, value.clone());
-        }
-        let sent = outgoing.send().await;
-        record_outcome(state, target, &sent).await;
-        match sent {
-            Ok(response)
-                if may_try_response(route, response.status())
-                    || gateway_failed(&method, response.status()) =>
-            {
-                unknown = Some((url, response));
-            }
-            Ok(response) => return relayed_response(route, &url, response).await,
-            Err(error) => {
-                let is_connect = error.is_connect();
-                warn!(route, relay_target = %url, is_connect, error = %error, "Management relay target failed");
-                if !may_try_next(&method, is_connect) {
-                    return ServerError::RelayFailed.into_response();
-                }
-            }
-        }
+    let call = ManagementCall {
+        route,
+        method,
+        path: uri.path().to_string(),
+        query: uri.query().map(str::to_string),
+        headers,
+        body,
+        targets,
+    };
+    let Ok(outcome) = drive(ManagementRelayOperation::new(call), &state.get_ctx()).await else {
+        return ServerError::RelayFailed.into_response();
+    };
+    record_marks(state, outcome.marks).await;
+    match outcome.end {
+        RelayEnd::Reply(reply) => relayed_response(reply),
+        RelayEnd::NoNode => ServerError::NoManagementNode.into_response(),
+        RelayEnd::Failed => ServerError::RelayFailed.into_response(),
     }
-
-    if let Some((url, response)) = unknown {
-        return relayed_response(route, &url, response).await;
-    }
-
-    warn!(route, "No management node answered a relayed route");
-    ServerError::NoManagementNode.into_response()
 }
 
 /// Passes a call once to one named node, such as the receiver of a plugin install, and its
@@ -484,43 +276,33 @@ pub(crate) async fn relay_to_node(
 ) -> Response {
     let unavailable =
         |reason: String| ServerError::ServiceUnavailableReason(reason).into_response();
-    let config = drive(
-        GetConfigOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await;
-    let Ok(config) = config else {
-        return unavailable("the realm configuration is not readable".into());
+    let Some(method) = MemberMethod::parse(method.as_str()) else {
+        return ServerError::RelayFailed.into_response();
     };
-    let documents = load_node_documents(state, &config).await;
-    let Some(target) = documents.get(&node).and_then(|doc| doc.urls.api.clone()) else {
-        return unavailable(format!("node {node} has no published address"));
-    };
-    let Some(hops) = passed_hops(state, headers, Some(node)) else {
-        return unavailable(format!(
-            "the call to node {node} would circle between nodes"
-        ));
-    };
-    let url = relay_url(&target, uri);
-    let mut outgoing = (RELAY_CLIENT.request(method, &url))
-        .header(RELAY_HOP_HEADER, hops)
-        .body(body);
     let forwarded = [
         header::AUTHORIZATION,
         header::CONTENT_TYPE,
         HeaderName::from_static(SESSION_HEADER),
     ];
-    for name in forwarded {
-        if let Some(value) = headers.get(&name) {
-            outgoing = outgoing.header(name, value.clone());
-        }
-    }
-    match outgoing.send().await {
-        Ok(response) => relayed_response("node", &url, response).await,
-        Err(error) => {
-            warn!(relay_target = %url, error = %error, "Relay to a node failed");
-            ServerError::RelayFailed.into_response()
-        }
+    let relay = NodeRelay {
+        realm_id: state.get_realm_id(),
+        local: state.get_node_id(),
+        node,
+        method,
+        path: uri.path().to_string(),
+        query: uri.query().map(str::to_string),
+        passed: passed_text(headers).to_string(),
+        headers: picked(headers, &forwarded),
+        body,
+    };
+    match drive(NodeRelayOperation::new(relay), &state.get_ctx()).await {
+        Ok(NodeRelayEnd::Reply(reply)) => relayed_response(reply),
+        Ok(NodeRelayEnd::NoConfig) => unavailable("the realm configuration is not readable".into()),
+        Ok(NodeRelayEnd::NoAddress) => unavailable(format!("node {node} has no published address")),
+        Ok(NodeRelayEnd::Circling) => unavailable(format!(
+            "the call to node {node} would circle between nodes"
+        )),
+        Ok(NodeRelayEnd::Failed) | Err(_) => ServerError::RelayFailed.into_response(),
     }
 }
 
@@ -531,107 +313,31 @@ fn healthy_first(mut targets: Vec<String>, failed: &BTreeMap<String, Instant>) -
 }
 
 /// Remembers a connect failure or gateway answer of a target; any other answer clears the mark.
-async fn record_outcome(
-    state: &Arc<ServerState>,
-    target: &str,
-    sent: &Result<reqwest::Response, reqwest::Error>,
-) {
-    let failed = match sent {
-        Ok(response) => gateway_failed(&Method::GET, response.status()),
-        Err(error) => error.is_connect(),
-    };
+async fn record_marks(state: &ServerState, marks: Vec<TargetMark>) {
     let cache = state.management_url_cache();
-    if !failed && !cache.read().await.failed.contains_key(target) {
-        return;
-    }
-    let mut cached = cache.write().await;
-    match failed {
-        true => {
-            cached.failed.retain(|_, at| is_fresh(Some(*at)));
-            cached.failed.insert(target.to_string(), Instant::now());
+    for TargetMark { target, failed } in marks {
+        if !failed && !cache.read().await.failed.contains_key(&target) {
+            continue;
         }
-        false => {
-            cached.failed.remove(target);
-        }
-    }
-}
-
-/// Whether a send failure may be retried against the next target. A connect
-/// failure, which reqwest also reports for a connect timeout, provably predates
-/// any processing; later failures are only safe to repeat for an idempotent method.
-fn may_try_next(method: &Method, is_connect: bool) -> bool {
-    is_connect || method == Method::GET
-}
-
-/// Whether a gateway answer may move a GET on: an ingress in front of a stopped management node
-/// answers 502, 503 or 504 instead of refusing the connection.
-fn gateway_failed(method: &Method, status: StatusCode) -> bool {
-    method == Method::GET
-        && matches!(
-            status,
-            StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
-        )
-}
-
-/// Whether a node-local enrollment miss may be tried on the next target.
-fn may_try_response(route: &str, status: StatusCode) -> bool {
-    matches!(
-        (route, status),
-        (
-            "/access/onboarding/secrets/{id}"
-                | "/access/onboarding/secrets/{id}/status"
-                | "/access/users/me/devices/{id}",
-            StatusCode::NOT_FOUND
-        ) | ("/access/onboarding/bootstrap", StatusCode::UNAUTHORIZED)
-    )
-}
-
-/// Published api urls are bare origins (`API_PUBLIC_URL`), so the nest comes
-/// from the incoming path; a target that already carries it contributes it.
-fn relay_url(target: &str, uri: &Uri) -> String {
-    let base = target.trim_end_matches('/');
-    let path = uri.path();
-    let suffix = match base.ends_with(API_PREFIX) {
-        true => path.strip_prefix(API_PREFIX).unwrap_or(path),
-        false => path,
-    };
-    match uri.query() {
-        Some(query) => format!("{base}{suffix}?{query}"),
-        None => format!("{base}{suffix}"),
-    }
-}
-
-async fn relayed_response(route: &'static str, url: &str, response: reqwest::Response) -> Response {
-    let status = response.status();
-    let headers = relayed_headers(response.headers());
-    match response.bytes().await {
-        Ok(body) => {
-            debug!(route, relay_target = %url, status = status.as_u16(), "Relayed a management route");
-            let mut relayed = (status, body).into_response();
-            relayed.headers_mut().remove(header::CONTENT_TYPE);
-            for (name, value) in headers {
-                relayed.headers_mut().insert(name, value);
+        let mut cached = cache.write().await;
+        match failed {
+            true => {
+                cached.failed.retain(|_, at| is_fresh(Some(*at)));
+                cached.failed.insert(target, Instant::now());
             }
-            relayed
-        }
-        Err(error) => {
-            warn!(route, relay_target = %url, error = %error, "Management relay response failed");
-            // The management node already answered, so it may have applied the call.
-            ServerError::RelayFailed.into_response()
+            false => {
+                cached.failed.remove(&target);
+            }
         }
     }
 }
 
-fn relayed_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
-    [&header::CONTENT_TYPE, &header::RETRY_AFTER, &header::ETAG]
-        .into_iter()
-        .filter_map(|name| {
-            headers
-                .get(name)
-                .cloned()
-                .map(|value| (name.clone(), value))
-        })
-        .collect()
+fn relayed_response(reply: RelayReply) -> Response {
+    let status = reply_status(&reply);
+    let mut relayed = (status, reply.body).into_response();
+    relayed.headers_mut().remove(header::CONTENT_TYPE);
+    add_headers(&mut relayed, &reply.headers);
+    relayed
 }
 
 /// Cached management targets; a stale window triggers a realm-config read,
@@ -649,23 +355,9 @@ async fn management_targets(state: &Arc<ServerState>) -> Vec<String> {
     if is_fresh(cached.refreshed_at) {
         return cached.urls.clone();
     }
-    match drive(
-        GetConfigOperation::new(state.get_realm_id()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(config) => {
-            let documents = load_node_documents(state, &config).await;
-            let peers = peer_management_urls(state.get_node_id(), &config, &documents);
-            let installed = drive(
-                installed_management_urls(state.get_realm_id()),
-                &state.get_ctx(),
-            )
-            .await
-            .unwrap_or_default();
-            cached.urls = relay_targets(peers, installed);
-        }
+    let peers = PeerTargetsOperation::new(state.get_realm_id(), state.get_node_id());
+    match drive(peers, &state.get_ctx()).await {
+        Ok(urls) => cached.urls = urls,
         Err(error) => debug!(error = %error, "Management relay reuses cached management urls"),
     }
     cached.refreshed_at = Some(Instant::now());
@@ -674,38 +366,6 @@ async fn management_targets(state: &Arc<ServerState>) -> Vec<String> {
 
 fn is_fresh(refreshed_at: Option<Instant>) -> bool {
     refreshed_at.is_some_and(|refreshed_at| refreshed_at.elapsed() < MANAGEMENT_URL_TTL)
-}
-
-/// The targets a relayed route is tried against. A device holds no peer
-/// node-info document, so the list a realm node installed on it is the only
-/// address it has for a management node.
-fn relay_targets(peers: Vec<String>, installed: Vec<String>) -> Vec<String> {
-    match peers.is_empty() {
-        true => installed,
-        false => peers,
-    }
-}
-
-/// Management peers in node-id order, this node excluded. The order is stable
-/// so repeated calls pin the same peer: an onboarding secret is minted into one
-/// management node's local store and its status and revoke must return there.
-fn peer_management_urls(
-    current: NodeId,
-    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-    documents: &BTreeMap<NodeId, aruna_core::structs::storage::node_info::NodeInfoDocument>,
-) -> Vec<String> {
-    let ordered: BTreeMap<NodeId, String> = management_node_urls(config, documents)
-        .into_iter()
-        .filter(|(node_id, _)| *node_id != current)
-        .filter_map(|(node_id, url)| url.map(|url| (node_id, url)))
-        .collect();
-    let mut urls: Vec<String> = Vec::new();
-    for url in ordered.into_values() {
-        if !urls.contains(&url) {
-            urls.push(url);
-        }
-    }
-    urls
 }
 
 #[cfg(test)]

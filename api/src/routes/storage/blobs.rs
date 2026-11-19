@@ -6,7 +6,7 @@ use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
+use crate::routes::storage::relay::{RestRead, holder_json, missed_json, query_path};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::Permission;
@@ -574,10 +574,15 @@ pub async fn blob_locations(
             .map(|version| ("version_id", version)),
     );
     let path = query_path("/data/blobs/locations", &pairs);
-    if let Some(holders) = read_holders(&state, &info, &query.path, &headers).await? {
-        return relay_read(&state, &holders, &path, bearer.as_ref())
-            .await
-            .map(Json);
+    let relayed = RestRead {
+        info: &info,
+        key: &query.path,
+        headers: &headers,
+        path: &path,
+        bearer: bearer.as_ref(),
+    };
+    if let Some(answer) = holder_json(&state, &relayed).await? {
+        return Ok(Json(answer));
     }
     let request = LocationSummaryRequest {
         realm_id: state.get_realm_id(),
@@ -597,12 +602,10 @@ pub async fn blob_locations(
         other => ServerError::InternalError(other.into()),
     })?;
     let Some(resolved) = local.summary.version_id else {
-        let Some(coordinator) = copy_miss(&state, &info, &query.path, &headers).await? else {
-            return Err(ServerError::NotFound);
+        return match missed_json(&state, &relayed).await? {
+            Some(answer) => Ok(Json(answer)),
+            None => Err(ServerError::NotFound),
         };
-        return relay_read(&state, &coordinator, &path, bearer.as_ref())
-            .await
-            .map(Json);
     };
     let blake3 = local.blake3;
     let delete_marker = local.delete_marker;

@@ -30,7 +30,7 @@ use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::routes::storage::relay::{
-    copy_miss, query_path, read_holders, relay_json, relay_read, rest_target,
+    RestRead, holder_json, missed_json, query_path, relay_json, rest_target,
 };
 use crate::server::state::ServerState;
 
@@ -409,8 +409,15 @@ pub async fn list_release_files(
         query_path(route, &[pairs, vec![("limit", limit.as_str())]].concat())
     };
     let route = format!("/data/buckets/{bucket}/releases/{version}/files");
-    if let Some(holders) = read_holders(&state, &info, &params.key, &headers).await? {
-        let answer = relay_read(&state, &holders, &relayed(&route), bearer.as_ref()).await?;
+    let path = relayed(&route);
+    let read = RestRead {
+        info: &info,
+        key: &params.key,
+        headers: &headers,
+        path: &path,
+        bearer: bearer.as_ref(),
+    };
+    if let Some(answer) = holder_json(&state, &read).await? {
         return Ok(Json(answer));
     }
     let scope = BucketScope {
@@ -434,13 +441,8 @@ pub async fn list_release_files(
     let view = match found {
         Ok(view) => view,
         // A copy may not have received the release yet; its coordinator decides.
-        Err(ViewError::Missing) => match copy_miss(&state, &info, &params.key, &headers).await? {
-            Some(holders) => {
-                let path = relayed(&route);
-                return Ok(Json(
-                    relay_read(&state, &holders, &path, bearer.as_ref()).await?,
-                ));
-            }
+        Err(ViewError::Missing) => match missed_json(&state, &read).await? {
+            Some(answer) => return Ok(Json(answer)),
             None => return Err(ServerError::NotFound),
         },
         Err(ViewError::NoRelease) => return Err(ServerError::NotFound),

@@ -8,50 +8,32 @@ use super::data::map_bucket_error;
 use super::{McpServer, explained, internal_error, server_error};
 use crate::error::ServerError;
 use crate::lookup::map_guard_error;
-use crate::routes::storage::relay::{RELAY_NODE_HEADER, capped_body, node_directed};
+use crate::routes::storage::relay::node_directed;
 use aruna_core::NodeId;
-use aruna_core::node_state::NodeUrlsOperation;
+use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::routing::route_read;
-use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::fanout::search_buckets_distributed;
 use aruna_operations::metadata::api::search_types::BucketSearchRequest;
+use aruna_operations::relay::tool::{
+    Holder, RouteError, ToolCall, ToolCallOperation, ToolRefusal, add_holder, pick_node,
+    search_done,
+};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::str::FromStr;
-use std::sync::LazyLock;
 use std::time::Duration;
-use ulid::Ulid;
 
-const API_PREFIX: &str = "/api/v1";
 const SEARCH_PAGE: usize = 50;
 /// How long finding the node that holds a bucket may take, every search page included.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a forwarded call may take, its answer included; a scan may run for a while.
-const CALL_TIMEOUT: Duration = Duration::from_secs(120);
-
-static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default()
-});
-
-/// A realm node that holds a readable bucket of the asked name, as the bucket search finds it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Holder {
-    pub node_id: NodeId,
-    /// The distributed bucket this node's bucket is a member of.
-    pub set_id: Option<Ulid>,
-}
 
 /// What a holder search could not cover: the nodes that did not answer, and whether nodes
 /// failed, node discovery failed or the search ran out of time.
@@ -59,64 +41,6 @@ pub(crate) struct Holder {
 pub(crate) struct Missed {
     pub nodes: Vec<NodeId>,
     pub incomplete: bool,
-}
-
-/// Whether a holder search stops after a page: at the end, once a holder is known and nodes
-/// failed, or when nodes failed and nothing came back. A node still scanning may hold a bucket
-/// of the same name, so a page past the name does not end the search.
-pub(crate) fn search_done(found: bool, (hits, failed): (bool, bool), end: bool) -> bool {
-    end || (found && failed) || (failed && !hits)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum RouteError {
-    /// No node holds a bucket of the name that the caller may read.
-    Missing,
-    /// Several nodes hold different buckets of the name.
-    Ambiguous(Vec<NodeId>),
-}
-
-/// The node a call on a bucket runs on, `None` for this node: the `named` node; else this node
-/// when it holds the bucket, unless `routed` names the member keeping the key's records; else
-/// the one holder, for a distributed bucket the first of `members` that keep the call's key.
-pub(crate) fn pick_node(
-    here: NodeId,
-    (named, local, routed): (Option<NodeId>, bool, Option<NodeId>),
-    holders: &[Holder],
-    members: &[NodeId],
-) -> Result<Option<NodeId>, RouteError> {
-    if let Some(named) = named.filter(|named| *named != here) {
-        return Ok(Some(named));
-    }
-    if named.is_some() || local {
-        return Ok(routed.filter(|routed| *routed != here));
-    }
-    let Some(first) = holders.first() else {
-        return Err(RouteError::Missing);
-    };
-    if first.set_id.is_some() && holders.iter().all(|holder| holder.set_id == first.set_id) {
-        let member = members.iter().find(|member| **member != here);
-        return Ok(Some(member.copied().unwrap_or(first.node_id)));
-    }
-    match holders {
-        [one] => Ok(Some(one.node_id)),
-        _ => Err(RouteError::Ambiguous(
-            holders.iter().map(|holder| holder.node_id).collect(),
-        )),
-    }
-}
-
-/// Whether `node_id` is a server or management node in the realm's current configuration;
-/// devices and nodes no longer configured never receive a forwarded call and its token.
-pub(crate) fn realm_server(config: &RealmConfigDocument, node_id: NodeId) -> bool {
-    let node_id = node_id.to_string();
-    (config.nodes.iter()).any(|node| node.node_id == node_id && node.kind.is_sync_eligible())
-}
-
-/// The `/mcp` url on a node's published api base, which may carry the REST nest.
-pub(crate) fn mcp_url(base: &str) -> String {
-    let base = base.trim_end_matches('/');
-    format!("{}/mcp", base.strip_suffix(API_PREFIX).unwrap_or(base))
 }
 
 impl McpServer {
@@ -213,13 +137,7 @@ impl McpServer {
                     node_id: hit.node_id,
                     set_id: hit.set_id,
                 };
-                let known = |other: &Holder| match holder.set_id {
-                    Some(set_id) => other.set_id == Some(set_id),
-                    None => *other == holder,
-                };
-                if !holders.iter().any(known) {
-                    holders.push(holder);
-                }
+                add_holder(&mut holders, holder);
             }
             cursor = page.next_cursor;
             if search_done(!holders.is_empty(), page_state, cursor.is_none()) {
@@ -243,69 +161,47 @@ impl McpServer {
     ) -> Result<T, CallToolResult> {
         let bearer =
             request_bearer(parts).ok_or_else(|| server_error(ServerError::Unauthorized))?;
-        let silent = |why: String| {
-            server_error(ServerError::ServiceUnavailableReason(format!(
-                "node {node_id} holds the bucket but {why}; retry later"
-            )))
+        let call = ToolCall {
+            realm_id: self.state.get_realm_id(),
+            node_id,
+            bearer: SharedSecret::new(SecretBytes::new(bearer.as_str().as_bytes().to_vec())),
+            tool: tool.to_string(),
+            arguments: serde_json::to_value(input).map_err(internal_error)?,
         };
-        let context = self.state.get_ctx();
-        let realm = GetConfigOperation::new(self.state.get_realm_id());
-        let realm = drive(realm, &context).await.map_err(internal_error)?;
-        if !realm_server(&realm, node_id) {
-            return Err(explained(
-                ServerError::BadRequest,
-                format!(
-                    "node {node_id} is not a server node of this realm; pass a node_id from \
-                     list_buckets or omit it"
-                ),
-            ));
-        }
-        let urls = drive(NodeUrlsOperation::new(node_id), context.as_ref())
-            .await
-            .ok()
-            .flatten();
-        let Some(base) = urls.and_then(|urls| urls.api) else {
-            return Err(silent("publishes no api address".to_string()));
-        };
-        let mut arguments = serde_json::to_value(input).map_err(internal_error)?;
-        arguments["node_id"] = Value::String(node_id.to_string());
-        let call = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": tool, "arguments": arguments },
-        });
-        let sent = async {
-            let response = (CLIENT.post(mcp_url(&base)))
-                .bearer_auth(bearer.as_str())
-                .header(RELAY_NODE_HEADER, node_id.to_string())
-                .header(http::header::ACCEPT, "application/json, text/event-stream")
-                .json(&call)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?;
-            let status = response.status();
-            Ok::<_, String>((status, capped_body(response).await?))
-        };
-        let (status, body) = match tokio::time::timeout(CALL_TIMEOUT, sent).await {
-            Ok(Ok(answer)) => answer,
-            Ok(Err(error)) => return Err(silent(format!("did not answer: {error}"))),
-            Err(_) => return Err(silent("did not answer in time".to_string())),
-        };
-        let refused = |error: ServerError| {
-            explained(error, format!("node {node_id} refused the forwarded call"))
-        };
-        match status.as_u16() {
-            200..=299 => {}
-            401 => return Err(refused(ServerError::Unauthorized)),
-            403 => return Err(refused(ServerError::Forbidden)),
-            status => {
-                return Err(server_error(ServerError::BadGatewayReason(format!(
-                    "node {node_id} answered the forwarded call with HTTP {status}"
-                ))));
-            }
-        }
+        let call = ToolCallOperation::new(call);
+        let body = (drive(call, &self.state.get_ctx()).await)
+            .map_err(|error| tool_refusal(error, node_id))?;
         answer(node_id, &body)
+    }
+}
+
+/// A forwarded call that brought no reply, as this node's answer naming that node.
+fn tool_refusal(error: ToolRefusal, node_id: NodeId) -> CallToolResult {
+    let silent = |why: String| {
+        server_error(ServerError::ServiceUnavailableReason(format!(
+            "node {node_id} holds the bucket but {why}; retry later"
+        )))
+    };
+    let refused =
+        |error: ServerError| explained(error, format!("node {node_id} refused the forwarded call"));
+    match error {
+        ToolRefusal::NotServer => explained(
+            ServerError::BadRequest,
+            format!(
+                "node {node_id} is not a server node of this realm; pass a node_id from \
+                 list_buckets or omit it"
+            ),
+        ),
+        ToolRefusal::NoAddress => silent("publishes no api address".to_string()),
+        ToolRefusal::Silent(why) => silent(format!("did not answer: {why}")),
+        ToolRefusal::Late => silent("did not answer in time".to_string()),
+        ToolRefusal::Unauthorized => refused(ServerError::Unauthorized),
+        ToolRefusal::Forbidden => refused(ServerError::Forbidden),
+        ToolRefusal::Status(status) => server_error(ServerError::BadGatewayReason(format!(
+            "node {node_id} answered the forwarded call with HTTP {status}"
+        ))),
+        ToolRefusal::Failed(reason) => internal_error(reason),
+        ToolRefusal::Io(error) => internal_error(error),
     }
 }
 

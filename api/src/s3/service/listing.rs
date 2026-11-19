@@ -17,6 +17,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::multipart::parts::ListPartsResult;
 use aruna_operations::s3::multipart::uploads::ListUploadsResult;
+use aruna_operations::s3::object::list::ListedObject;
 use aruna_operations::s3::object::list::{
     ListBucketInput as LOV2I, ListContinuationToken, decode_list_token, encode_list_token,
 };
@@ -59,6 +60,20 @@ impl ListingKeys for ListedKeys {
 
     fn groups(&self, prefix: &str) -> bool {
         (self.scope.as_ref()).is_none_or(|scope| scope.allows_prefix(prefix)) && self.reads(prefix)
+    }
+}
+
+/// The keys a merged listing shows: those inside the caller's scope, here and from any member.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ScopedKeys(pub(super) Option<SubpathScope>);
+
+impl ListingKeys for ScopedKeys {
+    fn allows(&self, key: &str) -> bool {
+        self.0.as_ref().is_none_or(|scope| scope.allows_key(key))
+    }
+
+    fn groups(&self, prefix: &str) -> bool {
+        (self.0.as_ref()).is_none_or(|scope| scope.allows_prefix(prefix))
     }
 }
 
@@ -143,6 +158,31 @@ impl ArunaS3Service {
             .transpose()
     }
 
+    /// A listed object as an S3 listing shows it.
+    pub(super) fn listed_object(
+        &self,
+        object: ListedObject,
+        owner: &Option<Owner>,
+        url_encoded: bool,
+    ) -> Object {
+        let response_fields = self.build_response_fields(
+            object.location.as_ref(),
+            None,
+            None,
+            object.source_metadata.as_ref(),
+            object.last_refresh,
+            object.version_created_at,
+        );
+        Object {
+            e_tag: response_fields.e_tag,
+            key: Some(self.encoded(object.head.key, url_encoded)),
+            last_modified: response_fields.last_modified,
+            owner: owner.clone(),
+            size: response_fields.content_length,
+            ..Default::default()
+        }
+    }
+
     /// Runs one listing page shared by ListObjects and ListObjectsV2. Only entries the reader
     /// may see show, a common prefix once one below it does, and with `access` only what that
     /// share session may read; a page that stopped among hidden entries continues sealed.
@@ -180,39 +220,12 @@ impl ArunaS3Service {
             Some(NextPage::Sealed(sealed)) => (None, Some(sealed)),
             None => (None, None),
         };
-        let result = (page.objects, page.prefixes);
-
-        let encode_field = |value: String| -> String {
-            if url_encoded {
-                utf8_percent_encode(&value, URL_ENCODE_SET).to_string()
-            } else {
-                value
-            }
-        };
-
-        let contents: Vec<Object> = (result.0.into_iter())
-            .map(|object| {
-                let response_fields = self.build_response_fields(
-                    object.location.as_ref(),
-                    None,
-                    None,
-                    object.source_metadata.as_ref(),
-                    object.last_refresh,
-                    object.version_created_at,
-                );
-                Object {
-                    e_tag: response_fields.e_tag,
-                    key: Some(encode_field(object.head.key)),
-                    last_modified: response_fields.last_modified,
-                    owner: owner.clone(),
-                    size: response_fields.content_length,
-                    ..Default::default()
-                }
-            })
+        let contents: Vec<Object> = (page.objects.into_iter())
+            .map(|object| self.listed_object(object, &owner, url_encoded))
             .collect();
-        let common_prefixes: Vec<CommonPrefix> = (result.1.into_iter())
+        let common_prefixes: Vec<CommonPrefix> = (page.prefixes.into_iter())
             .map(|prefix| CommonPrefix {
-                prefix: Some(encode_field(prefix)),
+                prefix: Some(self.encoded(prefix, url_encoded)),
             })
             .collect();
 
@@ -223,23 +236,6 @@ impl ArunaS3Service {
             sealed,
         })
     }
-}
-
-pub(super) fn scoped_marker(
-    bucket: &str,
-    last_key: Option<&str>,
-    last_prefix: Option<&str>,
-) -> S3Result<Option<ListContinuationToken>> {
-    let group = last_prefix.filter(|prefix| last_key.is_none_or(|key| *prefix > key));
-    let Some(entry) = group.or(last_key) else {
-        return Ok(None);
-    };
-    let last_key = BlobHeadKey::object_prefix(bucket, entry)
-        .map_err(|_| s3_error!(InternalError, "Invalid listing marker"))?;
-    Ok(Some(ListContinuationToken {
-        last_key,
-        last_common_prefix: group.map(str::to_string),
-    }))
 }
 
 pub(super) fn list_parts_output(
@@ -495,8 +491,8 @@ impl ArunaS3Service {
 
 #[cfg(test)]
 mod tests {
-    use super::scoped_marker;
     use aruna_core::structs::storage::blob::BlobHeadKey;
+    use aruna_operations::s3::object::member_merge::merged_marker as scoped_marker;
 
     #[test]
     fn prefix_token_precedence() {

@@ -50,31 +50,6 @@ fn bounds_before_reading() {
     );
 }
 
-#[test]
-fn relay_drops_credentials() {
-    let received = headers(&[
-        ("cookie", "canary-cookie"),
-        ("proxy-authorization", "Basic canary-proxy"),
-        ("authorization", "Bearer canary-auth"),
-        ("connection", "close"),
-        ("x-aruna-relay-hop", "spoofed"),
-        ("x-hub-signature-256", "sha256=ab"),
-        ("x-delivery", "d-1"),
-        ("content-type", "application/json"),
-    ]);
-    let sent = relayed(&received, false);
-    let mut names: Vec<&str> = sent.keys().map(HeaderName::as_str).collect();
-    names.sort_unstable();
-    assert_eq!(names, ["content-type", "x-delivery", "x-hub-signature-256"]);
-    let checked = relayed(&received, true);
-    let kept = checked.get(header::AUTHORIZATION);
-    assert_eq!(
-        kept.and_then(|value| value.to_str().ok()),
-        Some("Bearer canary-auth")
-    );
-    assert!(!checked.contains_key(header::COOKIE));
-}
-
 #[tokio::test]
 async fn refuses_unknown_installs() {
     let (_dir, storage) = test_storage();
