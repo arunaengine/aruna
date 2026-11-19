@@ -213,7 +213,9 @@ impl QueueChangesOperation {
 
     fn clear(&mut self, keys: Vec<Key>) -> Turn<()> {
         self.step = ChangeStep::Cleared;
-        let rows = keys.into_iter().map(|key| (LINK_CHANGE_KEYSPACE.to_string(), key));
+        let rows = keys
+            .into_iter()
+            .map(|key| (LINK_CHANGE_KEYSPACE.to_string(), key));
         Ok(Next::Call(IoCall::Delete(rows.collect())))
     }
 }
@@ -240,8 +242,10 @@ impl Operation for QueueChangesOperation {
                 if keys.is_empty() {
                     return Ok(Next::Done(()));
                 }
-                let documents: BTreeSet<Ulid> =
-                    keys.iter().filter_map(|key| link_change_document(key)).collect();
+                let documents: BTreeSet<Ulid> = keys
+                    .iter()
+                    .filter_map(|key| link_change_document(key))
+                    .collect();
                 self.step = ChangeStep::Queued(keys);
                 child(IoCall::child(QueueRowsOperation::new(documents)))
             }

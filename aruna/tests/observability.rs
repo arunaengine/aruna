@@ -676,7 +676,11 @@ mod process {
                 None
             })
             .await;
-            assert!(met.is_some(), "test barrier never reached {expected}\n{}", self.logs());
+            assert!(
+                met.is_some(),
+                "test barrier never reached {expected}\n{}",
+                self.logs()
+            );
         }
 
         /// Waits for a complete drain invocation before sampling the store.
@@ -703,7 +707,11 @@ mod process {
                 None
             })
             .await;
-            assert!(quiet.is_some(), "never reached a quiescent drain\n{}", self.logs());
+            assert!(
+                quiet.is_some(),
+                "never reached a quiescent drain\n{}",
+                self.logs()
+            );
         }
 
         pub fn signal(&self, name: &str) {

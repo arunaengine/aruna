@@ -79,7 +79,10 @@ fn consumed(consumed_now: bool) -> IoResult {
 fn armed() -> IoResult {
     let key = TaskKey::PublishWatchInterest;
     let after = WATCH_PUBLISH_DEBOUNCE;
-    IoResult::Event(Box::new(Event::Task(TaskEvent::TimerScheduled { key, after })))
+    IoResult::Event(Box::new(Event::Task(TaskEvent::TimerScheduled {
+        key,
+        after,
+    })))
 }
 
 /// Runs up to the listing of the joiner in the realm config.

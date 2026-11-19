@@ -1031,7 +1031,12 @@ async fn wait_outbox(
     drainer: &aruna::tasks::incoming::OutboxDrainer,
     nodes: &[TestNode],
 ) -> Result<(), BoxError> {
-    wait_drained(&nodes[0], Some(drainer), "outbox did not drain without progress").await
+    wait_drained(
+        &nodes[0],
+        Some(drainer),
+        "outbox did not drain without progress",
+    )
+    .await
 }
 
 async fn wait_auto_outbox(node: &TestNode) -> Result<(), BoxError> {

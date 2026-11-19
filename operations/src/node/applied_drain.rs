@@ -229,7 +229,10 @@ mod tests {
         assert!(matches!(drain.first(), Ok(Next::Call(IoCall::Page { .. }))));
         let generation = Ulid::from_parts(1_000, 7);
         let usage = RefreshUsageOperation::new(node(), Some(realm()), &targets(), generation);
-        assert_eq!(drain.next(queued(Some(realm()))), Ok(Next::Call(IoCall::child(usage))));
+        assert_eq!(
+            drain.next(queued(Some(realm()))),
+            Ok(Next::Call(IoCall::child(usage)))
+        );
         let failed = RefreshUsageError::Io(IoError::Aborted);
         let interest = RefreshInterestOperation::new(&targets(), realm());
         let turn = drain.next(child::<(), _>(Err(failed)));

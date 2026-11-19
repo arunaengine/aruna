@@ -97,7 +97,9 @@ async fn user_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
     // topic, so it reaches every holder of that bucket.
     let (listed, holders, created) = (&nodes, &holders, &created);
     let reached = poll_until(CONVERGENCE_TIMEOUT, move || async move {
-        let holding = listed.iter().filter(|node| holders.contains(&node.net.node_id()));
+        let holding = listed
+            .iter()
+            .filter(|node| holders.contains(&node.net.node_id()));
         for node in holding {
             match registry_record(node, document_id).await {
                 Err(error) => return Some(Err(error)),
@@ -722,7 +724,9 @@ async fn wait_holder_records(
     document_id: Ulid,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let reached = poll_until(CONVERGENCE_TIMEOUT, move || async move {
-        let holding = nodes.iter().filter(|node| holders.contains(&node.net.node_id()));
+        let holding = nodes
+            .iter()
+            .filter(|node| holders.contains(&node.net.node_id()));
         for node in holding {
             match registry_record(node, document_id).await {
                 Err(error) => return Some(Err(error)),

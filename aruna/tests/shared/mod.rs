@@ -258,7 +258,12 @@ where
     let cap = timeout.min(CONDITION_CAP);
     let held = poll_until(timeout, || {
         let ask = condition();
-        async move { time_limit(cap, ask).await.is_ok_and(|ready| ready).then_some(()) }
+        async move {
+            time_limit(cap, ask)
+                .await
+                .is_ok_and(|ready| ready)
+                .then_some(())
+        }
     })
     .await;
     match held {
@@ -272,19 +277,15 @@ pub(crate) async fn wait_realm_nodes(
     realm_id: &RealmId,
     expected: usize,
 ) -> TestResult<()> {
-    wait_until(
-        "realm node convergence",
-        WAIT_CAP,
-        || async {
-            for context in contexts {
-                match drive(GetNodesOperation::new(*realm_id), context).await {
-                    Ok(nodes) if nodes.len() == expected => {}
-                    _ => return false,
-                }
+    wait_until("realm node convergence", WAIT_CAP, || async {
+        for context in contexts {
+            match drive(GetNodesOperation::new(*realm_id), context).await {
+                Ok(nodes) if nodes.len() == expected => {}
+                _ => return false,
             }
-            true
-        },
-    )
+        }
+        true
+    })
     .await
 }
 
@@ -446,15 +447,11 @@ pub(crate) async fn wait_group_http(
     bearer_token: &str,
     group_id: &str,
 ) -> TestResult<GroupInfoResponse> {
-    wait_until(
-        "group visibility over REST",
-        WAIT_CAP,
-        || async {
-            get_group_http(base_url, bearer_token, group_id)
-                .await
-                .is_ok()
-        },
-    )
+    wait_until("group visibility over REST", WAIT_CAP, || async {
+        get_group_http(base_url, bearer_token, group_id)
+            .await
+            .is_ok()
+    })
     .await?;
 
     get_group_http(base_url, bearer_token, group_id).await
@@ -466,15 +463,11 @@ pub(crate) async fn wait_group_member(
     bearer_token: &str,
     group_id: &str,
 ) -> TestResult<()> {
-    wait_until(
-        "group membership over REST",
-        WAIT_CAP,
-        || async {
-            get_group_http(base_url, bearer_token, group_id)
-                .await
-                .is_ok_and(|group| group.dataset_location.is_some())
-        },
-    )
+    wait_until("group membership over REST", WAIT_CAP, || async {
+        get_group_http(base_url, bearer_token, group_id)
+            .await
+            .is_ok_and(|group| group.dataset_location.is_some())
+    })
     .await
 }
 

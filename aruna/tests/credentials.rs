@@ -405,18 +405,14 @@ async fn credential_outlives_session() -> TestResult<()> {
     assert_eq!(stored.expiry, never_expiry(), "no lifetime means no expiry");
     let group_path = &format!("{}/api/v1/access/groups/{group_id}", seed.base_url);
     let short = &short;
-    wait_until(
-        "the issuing token to expire",
-        WAIT_CAP,
-        || async move {
-            let response = reqwest::Client::new()
-                .get(group_path)
-                .bearer_auth(short)
-                .send()
-                .await;
-            response.is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
-        },
-    )
+    wait_until("the issuing token to expire", WAIT_CAP, || async move {
+        let response = reqwest::Client::new()
+            .get(group_path)
+            .bearer_auth(short)
+            .send()
+            .await;
+        response.is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
+    })
     .await?;
     let client = s3_client_once(&s3, &keys);
     assert_eq!(put_code(&client, "after-session.txt").await?, None);

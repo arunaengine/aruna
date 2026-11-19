@@ -152,7 +152,10 @@ async fn cancel_running_cleanup() {
     let claimed = claim(&ctx, probe_record(job_id, 10_000, 5, Some(marker_str))).await;
 
     spawn_job(&runtime, ctx.clone(), claimed);
-    poll_until(WAIT_CAP, || std::future::ready(marker.exists().then_some(()))).await;
+    poll_until(WAIT_CAP, || {
+        std::future::ready(marker.exists().then_some(()))
+    })
+    .await;
     assert!(
         marker.exists(),
         "probe should create its marker while running"
@@ -164,7 +167,10 @@ async fn cancel_running_cleanup() {
         .unwrap();
     assert_eq!(state, JobState::Cancelled);
     // Cleanup follows the stored terminal state, so it may still be running here.
-    poll_until(WAIT_CAP, || std::future::ready((!marker.exists()).then_some(()))).await;
+    poll_until(WAIT_CAP, || {
+        std::future::ready((!marker.exists()).then_some(()))
+    })
+    .await;
     assert!(!marker.exists(), "cleanup hook must remove the marker");
 }
 
@@ -275,7 +281,10 @@ async fn zombie_skips_cleanup() {
         (cancel.clone(), None),
         (CancellationToken::new(), RangeTurns::default(), Vec::new()),
     ));
-    poll_until(WAIT_CAP, || std::future::ready(marker.exists().then_some(()))).await;
+    poll_until(WAIT_CAP, || {
+        std::future::ready(marker.exists().then_some(()))
+    })
+    .await;
     assert!(marker.exists(), "probe must reach its cleanup side effect");
 
     requeue_job(
@@ -601,7 +610,10 @@ async fn shutdown_skips_cleanup() {
     let runtime = JobsRuntime::new();
     spawn_job(&runtime, ctx.clone(), claimed);
     wait_running(&ctx, job_id).await;
-    poll_until(WAIT_CAP, || std::future::ready(marker.exists().then_some(()))).await;
+    poll_until(WAIT_CAP, || {
+        std::future::ready(marker.exists().then_some(()))
+    })
+    .await;
     assert!(marker.exists(), "probe should create its marker");
 
     let report = shutdown_jobs(&runtime, &ctx, Duration::from_secs(10)).await;

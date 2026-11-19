@@ -436,21 +436,17 @@ async fn remote_version_downloads() -> TestResult<()> {
         .to_string();
         let object_url = format!("{}/api/v1/ga4gh/drs/v1/objects/{object_id}", seed.base_url);
         // The seed answers 503 until the published document reaches it.
-        wait_until(
-            "routed DRS lookup",
-            shared::WAIT_CAP,
-            || {
-                let request = reqwest::Client::new()
-                    .get(&object_url)
-                    .bearer_auth(&bearer_token);
-                async move {
-                    request
-                        .send()
-                        .await
-                        .is_ok_and(|response| response.status() == StatusCode::OK)
-                }
-            },
-        )
+        wait_until("routed DRS lookup", shared::WAIT_CAP, || {
+            let request = reqwest::Client::new()
+                .get(&object_url)
+                .bearer_auth(&bearer_token);
+            async move {
+                request
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status() == StatusCode::OK)
+            }
+        })
         .await?;
         let object_body: Value = reqwest::Client::new()
             .get(&object_url)

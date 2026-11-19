@@ -246,19 +246,15 @@ async fn check_recovery(
     let before = metadata_counts(seed, joiner.config.node_id);
     let result = async {
         announce_peer(&peer.net, seed.realm_id).await?;
-        wait_until(
-            "metadata fan-out recovery",
-            shared::WAIT_CAP,
-            || {
-                let seed_url = seed.base_url.clone();
-                let token = token.to_string();
-                async move {
-                    metadata_query(&seed_url, &token).await.is_ok_and(|result| {
-                        result["complete"] == true && result["nodes_failed"] == 0
-                    })
-                }
-            },
-        )
+        wait_until("metadata fan-out recovery", shared::WAIT_CAP, || {
+            let seed_url = seed.base_url.clone();
+            let token = token.to_string();
+            async move {
+                metadata_query(&seed_url, &token)
+                    .await
+                    .is_ok_and(|result| result["complete"] == true && result["nodes_failed"] == 0)
+            }
+        })
         .await?;
         let info = realm_info(&seed.base_url, token).await?;
         assert!(

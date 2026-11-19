@@ -186,18 +186,14 @@ async fn joiner_issues_credential() -> TestResult<()> {
 
     let group_path = &format!("{}/api/v1/access/groups/{group_id}", joiner.base_url);
     let short = &short;
-    wait_until(
-        "the issuing token to expire",
-        WAIT_CAP,
-        || async move {
-            let response = reqwest::Client::new()
-                .get(group_path)
-                .bearer_auth(short)
-                .send()
-                .await;
-            response.is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
-        },
-    )
+    wait_until("the issuing token to expire", WAIT_CAP, || async move {
+        let response = reqwest::Client::new()
+            .get(group_path)
+            .bearer_auth(short)
+            .send()
+            .await;
+        response.is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
+    })
     .await?;
 
     let keys = as_credentials(created);
@@ -301,11 +297,9 @@ async fn account_changes_apply() -> TestResult<()> {
         .bearer_auth(&admin)
         .json(&json!({ "active": false }));
     assert_eq!(deactivated.send().await?.status(), StatusCode::NO_CONTENT);
-    wait_until(
-        "deactivation to end the key",
-        WAIT_CAP,
-        || async move { get(service, "shared-bucket", "entry.txt").await.is_err() },
-    )
+    wait_until("deactivation to end the key", WAIT_CAP, || async move {
+        get(service, "shared-bucket", "entry.txt").await.is_err()
+    })
     .await?;
     // The refused request deleted the key, so it is now unknown.
     let ended = get(service, "shared-bucket", "entry.txt").await;

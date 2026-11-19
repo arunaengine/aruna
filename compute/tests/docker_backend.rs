@@ -212,7 +212,10 @@ async fn wait_running(backend: &DockerBackend, attempt: &AttemptRef) {
         (matches!(status.phase, AttemptPhase::Running) || status.is_terminal()).then_some(())
     })
     .await;
-    assert!(reached.is_some(), "container never reached running/terminal");
+    assert!(
+        reached.is_some(),
+        "container never reached running/terminal"
+    );
 }
 
 #[tokio::test]

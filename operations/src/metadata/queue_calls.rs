@@ -452,7 +452,10 @@ fn armed(turn: MaterializationTurn<MetadataDrainResult>) -> IoResult {
     same_call(turn, Ok(Next::Call(drain)));
     let key = TaskKey::DrainLinkQueue;
     let after = Duration::ZERO;
-    IoResult::Event(Box::new(Event::Task(TaskEvent::TimerScheduled { key, after })))
+    IoResult::Event(Box::new(Event::Task(TaskEvent::TimerScheduled {
+        key,
+        after,
+    })))
 }
 
 #[test]

@@ -453,7 +453,9 @@ async fn pull_done(
         match status {
             SyncPullStatus::Done(ack) => Some(Ok(ack)),
             SyncPullStatus::Pending { .. } => None,
-            other => Some(Err(format!("the pull ended without a version: {other:?}").into())),
+            other => Some(Err(
+                format!("the pull ended without a version: {other:?}").into()
+            )),
         }
     })
     .await;

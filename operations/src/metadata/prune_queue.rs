@@ -856,7 +856,9 @@ mod tests {
     }
 
     fn pruned() -> IoResult {
-        IoResult::Child(aruna_core::calls::ChildOutcome::new(Ok::<_, MetadataError>(true)))
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(
+            Ok::<_, MetadataError>(true),
+        ))
     }
 
     // A pruned dataset queues a change for its links, then arms the link drain.
@@ -878,7 +880,10 @@ mod tests {
     fn foreign_graph_ignored() {
         let mut batch = pruned_batch("urn:other".to_string());
         let job = (PRUNE_JOB_KEYSPACE.to_string(), ByteView::from(vec![1]));
-        assert_eq!(batch.next(pruned()), Ok(Next::Call(IoCall::Delete(vec![job]))));
+        assert_eq!(
+            batch.next(pruned()),
+            Ok(Next::Call(IoCall::Delete(vec![job])))
+        );
     }
 
     #[tokio::test]
