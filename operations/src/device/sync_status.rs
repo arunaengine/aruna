@@ -14,7 +14,6 @@ use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::structs::{EntryState, FolderState, SyncBase, SyncedFolder};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Value};
 use byteview::ByteView;
 use tracing::warn;
@@ -316,7 +315,7 @@ pub struct SyncStatusOperation {
 /// The read of the Sync view; see [`SyncStatusOperation`].
 pub fn sync_status() -> SyncStatusOperation {
     SyncStatusOperation {
-        now_ms: unix_timestamp_millis(),
+        now_ms: 0,
         step: ViewStep::State,
         state: DeviceSyncState::default(),
         replicas: Vec::new(),
@@ -356,6 +355,10 @@ impl SyncStatusOperation {
 impl Operation for SyncStatusOperation {
     type Output = SyncStatus;
     type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<SyncStatus>, IoError> {
         Ok(Next::Call(state_read()))
@@ -432,7 +435,7 @@ pub struct SyncRunOperation {
 /// The start of one sync pass; see [`SyncRunOperation`].
 pub fn start_sync_run() -> SyncRunOperation {
     SyncRunOperation {
-        now_ms: unix_timestamp_millis(),
+        now_ms: 0,
         step: RunStep::State,
         state: DeviceSyncState::default(),
         failed: VecDeque::new(),
@@ -483,6 +486,10 @@ impl SyncRunOperation {
 impl Operation for SyncRunOperation {
     type Output = bool;
     type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<bool>, IoError> {
         Ok(Next::Call(state_read()))
@@ -568,6 +575,7 @@ mod tests {
             "notes".to_string(),
             false,
             "{}".to_string(),
+            aruna_core::time::unix_timestamp_millis(),
         );
         entry.state = state;
         entry
@@ -732,7 +740,7 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         });
-        let now = unix_timestamp_millis();
+        let now = aruna_core::time::unix_timestamp_millis();
         let note = |note| aruna_drivers::driver::drive(NoteSyncOperation::new(note, now), &context);
         note(SyncNote::Contact).await.unwrap();
         assert!(

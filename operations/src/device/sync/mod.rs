@@ -28,7 +28,6 @@ use aruna_core::structs::{
     SyncRefusal, SyncVersionPage, SyncedFolder,
 };
 use aruna_core::task::TaskKey;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use thiserror::Error;
 use tracing::warn;
@@ -118,6 +117,7 @@ fn subset<T: Clone>(source: &BTreeMap<String, T>, keys: &[String]) -> BTreeMap<S
 pub fn folder_pass(ids: Option<(NodeId, RealmId)>, folder: SyncedFolder) -> FolderPassOperation {
     let ids = ids.map(|(node_id, realm_id)| (realm_id, node_id));
     FolderPassOperation {
+        now_ms: 0,
         ids,
         stored: folder.clone(),
         folder,
@@ -154,6 +154,7 @@ pub struct FolderPassOperation {
     pages: VecDeque<Vec<String>>,
     plan: ReconcilePlan,
     failure: Option<ReconcileFolderError>,
+    now_ms: u64,
 }
 
 type PassTurn = Result<Next<ReconcilePlan>, ReconcileFolderError>;
@@ -166,7 +167,7 @@ impl FolderPassOperation {
     /// Stops the pass and stores why on the folder row.
     fn fail(&mut self, error: ReconcileFolderError) -> PassTurn {
         self.stored.last_error = Some(error.describe(&self.folder.remote));
-        self.stored.last_error_ms = Some(unix_timestamp_millis());
+        self.stored.last_error_ms = Some(self.now_ms);
         self.failure = Some(error);
         self.step = PassStep::StoreFailure;
         Ok(Next::Call(IoCall::child(store_progress(&self.stored))))
@@ -244,7 +245,7 @@ impl FolderPassOperation {
             folder: self.folder.clone(),
             local: subset(&self.local, &page),
             remote: subset(&self.view.heads, &page),
-            now_ms: unix_timestamp_millis(),
+            now_ms: self.now_ms,
         };
         self.step = PassStep::Decide;
         let decide = ReconcileFolderOperation::new(input);
@@ -259,7 +260,7 @@ impl FolderPassOperation {
     }
 
     fn store(&mut self) -> PassTurn {
-        self.stored.last_reconcile_ms = Some(unix_timestamp_millis());
+        self.stored.last_reconcile_ms = Some(self.now_ms);
         self.stored.last_error = None;
         self.stored.last_error_ms = None;
         self.stored.list_cursor = self.view.next_cursor.take();
@@ -275,6 +276,10 @@ impl FolderPassOperation {
 impl Operation for FolderPassOperation {
     type Output = ReconcilePlan;
     type Error = ReconcileFolderError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn hold_scope(&self) -> Option<HoldScope> {
         Some(folder_scope(self.folder.folder_id))
