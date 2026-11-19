@@ -209,9 +209,11 @@ impl PruneJobsOperation {
         }
     }
 
-    /// Limits the pass to the jobs a due window checked; the first other job ends the pass.
-    pub fn within(mut self, checked: BTreeSet<JobId>) -> Self {
+    /// Limits the pass to the jobs a due window checked, read after the index row `after`; the
+    /// first other job ends the pass.
+    pub fn within(mut self, checked: BTreeSet<JobId>, after: Option<Key>) -> Self {
         self.checked = Some(checked);
+        self.next_page = after;
         self
     }
 
@@ -363,7 +365,8 @@ impl Operation for PruneJobsOperation {
     type Error = PruneError;
 
     fn first(&mut self) -> PruneNext {
-        self.page(None)
+        let after = self.next_page.take();
+        self.page(after)
     }
 
     fn next(&mut self, result: IoResult) -> PruneNext {
@@ -620,7 +623,7 @@ pub(crate) mod tests {
     fn unchecked_job_waits() {
         let (checked, later) = (JobId::from_bytes([8u8; 16]), JobId::from_bytes([9u8; 16]));
         let only = BTreeSet::from([checked]);
-        let mut prune = PruneJobsOperation::new(10, 4, BTreeSet::new()).within(only);
+        let mut prune = PruneJobsOperation::new(10, 4, BTreeSet::new()).within(only, None);
         let read = prune.record_read(prune_key(5, later), Some(terminal_record(later, 1)));
         assert!(is_child(&read));
         assert_eq!(prune.step, PruneStep::Deletes);
@@ -978,6 +981,35 @@ pub(crate) mod tests {
                 .is_some(),
             "the cleanup still needs its parent"
         );
+    }
+
+    #[tokio::test]
+    async fn held_window_moves() {
+        // A full window of jobs held by their cleanups does not stop a later due job.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
+        let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 10);
+        for seed in 1..=4u8 {
+            let job_id = JobId::from_bytes([seed; 16]);
+            insert_job(&context, &execution_record(job_id, finished))
+                .await
+                .unwrap();
+            insert_job(&context, &cleanup_record(job_id)).await.unwrap();
+        }
+        let eligible = JobId::from_bytes([9u8; 16]);
+        insert_job(&context, &terminal_record(eligible, finished + 5))
+            .await
+            .unwrap();
+
+        let prune = crate::plugins::work::PruneKeepingWork::new(1);
+        let outcome = drive(prune, &context).await.unwrap();
+
+        assert_eq!(outcome.pruned, 1, "the job after the held window is pruned");
+        let gone = read_job_record(&context, eligible, None).await.unwrap();
+        assert!(gone.is_none());
+        let held = read_job_record(&context, JobId::from_bytes([1u8; 16]), None);
+        assert!(held.await.unwrap().is_some(), "held jobs stay");
     }
 
     #[tokio::test]

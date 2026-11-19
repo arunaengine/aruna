@@ -108,7 +108,9 @@ impl CaptureDrainOperation {
             self.taking = gathered.into();
             let document_id = self.document.ok_or(IoError::Unfinished)?;
             self.step = CaptureStep::Record;
-            return Ok(Next::Call(IoCall::child(DocumentRecordOperation::new(document_id))));
+            return Ok(Next::Call(IoCall::child(DocumentRecordOperation::new(
+                document_id,
+            ))));
         }
     }
 
@@ -278,7 +280,10 @@ mod tests {
         let mut drain = CaptureDrainOperation::new(GitNode::default());
         drain.first().unwrap();
         let record_read = IoCall::child(DocumentRecordOperation::new(DOCUMENT));
-        assert_eq!(drain.next(marks(&mark("first", true))), Ok(Next::Call(record_read)));
+        assert_eq!(
+            drain.next(marks(&mark("first", true))),
+            Ok(Next::Call(record_read))
+        );
         let found = child(Ok::<_, StorageReadError>(Some(record())));
         let graph = Some((EVENT, "first".to_string()));
         let snapshot = IoCall::child(capture(&GitNode::default(), &record(), graph));
@@ -312,7 +317,10 @@ mod tests {
     fn unready_mark_kept() {
         let mut drain = CaptureDrainOperation::new(GitNode::default());
         drain.first().unwrap();
-        assert_eq!(drain.next(marks(&mark("first", false))), Ok(Next::Done(None)));
+        assert_eq!(
+            drain.next(marks(&mark("first", false))),
+            Ok(Next::Done(None))
+        );
     }
 
     fn ordered(event: Ulid, materialized_at_ms: u64, ready: bool) -> (Key, Value) {
@@ -380,7 +388,10 @@ mod tests {
         drain.next(IoResult::Page { rows, next: None }).unwrap();
         assert_eq!(drain.next(found()), snapshot_of(EVENT));
         let failed = child(Err::<(), _>(GitError::Unavailable));
-        assert_eq!(drain.next(failed), Ok(Next::Done(Some(CAPTURE_RETRY_AFTER))));
+        assert_eq!(
+            drain.next(failed),
+            Ok(Next::Done(Some(CAPTURE_RETRY_AFTER)))
+        );
     }
 
     // Marks of one document that a page boundary splits are gathered before any is taken.
@@ -390,10 +401,18 @@ mod tests {
         drain.first().unwrap();
         let first = vec![ordered(EVENT, 20, true)];
         let after = Some(document_job_key(DOCUMENT, EVENT));
-        let page = drain.next(IoResult::Page { rows: first, next: after });
+        let page = drain.next(IoResult::Page {
+            rows: first,
+            next: after,
+        });
         assert!(matches!(page, Ok(Next::Call(IoCall::Page { .. }))));
         let rest = vec![ordered(LATER, 10, true)];
-        drain.next(IoResult::Page { rows: rest, next: None }).unwrap();
+        drain
+            .next(IoResult::Page {
+                rows: rest,
+                next: None,
+            })
+            .unwrap();
         assert_eq!(drain.next(found()), snapshot_of(LATER));
     }
 
@@ -403,6 +422,9 @@ mod tests {
         let mut drain = CaptureDrainOperation::new(GitNode::default());
         drain.first().unwrap();
         let rows = vec![(document_job_key(DOCUMENT, EVENT), Value::from(vec![0xff]))];
-        assert_eq!(drain.next(IoResult::Page { rows, next: None }), delete_mark());
+        assert_eq!(
+            drain.next(IoResult::Page { rows, next: None }),
+            delete_mark()
+        );
     }
 }

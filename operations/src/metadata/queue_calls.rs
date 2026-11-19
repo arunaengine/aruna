@@ -508,7 +508,10 @@ fn finish_readies_mark() {
     let Ok(Next::Call(IoCall::Delete(deletes))) = deleted else {
         panic!("expected the finish deletes, got {deleted:?}");
     };
-    let mark = (MATERIALIZATION_CAPTURE_KEYSPACE.to_string(), Key::from(sidecar_key()));
+    let mark = (
+        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+        Key::from(sidecar_key()),
+    );
     assert!(deletes.contains(&mark));
 }
 

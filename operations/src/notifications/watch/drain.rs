@@ -85,7 +85,9 @@ impl WatchDrainOperation {
             let Some((key, queued)) = self.pending.pop_front() else {
                 return match self.after {
                     Some(_) => self.read_page(),
-                    None => Ok(Next::Done(self.next_due.map(|due| due_after(self.now_ms, due)))),
+                    None => Ok(Next::Done(
+                        self.next_due.map(|due| due_after(self.now_ms, due)),
+                    )),
                 };
             };
             let Some(queued) = queued else {
@@ -96,7 +98,10 @@ impl WatchDrainOperation {
                 self.waits_until(due_at_ms);
                 continue;
             }
-            let holders = queued.retry.as_ref().and_then(|retry| retry.holders.clone());
+            let holders = queued
+                .retry
+                .as_ref()
+                .and_then(|retry| retry.holders.clone());
             let emit = EmitEventOperation::retrying(queued.event.clone(), holders);
             self.current = Some((key, queued));
             self.step = DrainStep::Emit;
@@ -120,7 +125,9 @@ impl WatchDrainOperation {
             holders,
         });
         self.waits_until(due_at_ms);
-        let row = queued.entry().map_err(|error| IoError::Codec(error.to_string()))?;
+        let row = queued
+            .entry()
+            .map_err(|error| IoError::Codec(error.to_string()))?;
         self.step = DrainStep::Retry;
         Ok(Next::Call(IoCall::Write(vec![row])))
     }
@@ -260,7 +267,10 @@ mod tests {
             value,
         )])));
         assert_eq!(drain.next(emitted(Ok(vec![node(2)]))), stored);
-        assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(Some(WATCH_RETRY_AFTER))));
+        assert_eq!(
+            drain.next(IoResult::Done),
+            Ok(Next::Done(Some(WATCH_RETRY_AFTER)))
+        );
     }
 
     // A failed row waits for its attempt time even when a new event arms the drain at once;
@@ -284,11 +294,23 @@ mod tests {
         ];
         let mut drain = drain();
         let only = EmitEventOperation::retrying(event(2), Some(vec![node(3)]));
-        assert_eq!(drain.next(page(rows, None)), Ok(Next::Call(IoCall::child(only))));
-        assert!(matches!(drain.next(emitted(Ok(Vec::new()))), Ok(Next::Call(IoCall::Delete(_)))));
+        assert_eq!(
+            drain.next(page(rows, None)),
+            Ok(Next::Call(IoCall::child(only)))
+        );
+        assert!(matches!(
+            drain.next(emitted(Ok(Vec::new()))),
+            Ok(Next::Call(IoCall::Delete(_)))
+        ));
         let fresh = EmitEventOperation::retrying(event(3), None);
-        assert_eq!(drain.next(IoResult::Done), Ok(Next::Call(IoCall::child(fresh))));
-        assert!(matches!(drain.next(emitted(Ok(Vec::new()))), Ok(Next::Call(IoCall::Delete(_)))));
+        assert_eq!(
+            drain.next(IoResult::Done),
+            Ok(Next::Call(IoCall::child(fresh)))
+        );
+        assert!(matches!(
+            drain.next(emitted(Ok(Vec::new()))),
+            Ok(Next::Call(IoCall::Delete(_)))
+        ));
         let wait = Some(Duration::from_millis(10_000));
         assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(wait)));
     }
@@ -302,7 +324,9 @@ mod tests {
             holders: Some(vec![node(3)]),
         };
         let mut drain = drain();
-        drain.next(page(vec![row(&queued(2, Some(due)))], None)).unwrap();
+        drain
+            .next(page(vec![row(&queued(2, Some(due)))], None))
+            .unwrap();
         let retry = WatchRetry {
             due_at_ms: NOW_MS + 60_000,
             attempts: 2,

@@ -541,7 +541,7 @@ fn held_capture_outcomes() {
         let mut run = HeldCaptureOperation {
             node: git_node(),
             record: document.clone(),
-            revision: None,
+            graph: None,
             forgotten: false,
         };
         let scope = HoldScope::GitRepository(document.document_id);
