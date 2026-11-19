@@ -5,7 +5,7 @@
 
 mod item;
 mod job;
-mod lanes;
+pub mod lanes;
 mod limiter;
 mod manifest;
 mod mirrors;

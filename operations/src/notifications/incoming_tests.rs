@@ -9,7 +9,7 @@ use crate::notifications::checks::{
 use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;
 use crate::tests::notifications::{data_group_id, data_node_id};
-use crate::tests::notifications::{record, upload_event};
+use crate::tests::notifications::{seeded_record, upload_event};
 use aruna_core::UserId;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -63,7 +63,7 @@ fn transient_batch_cap() {
     let recipient = UserId::new(Ulid::generate(), realm_id);
     let mut records: Vec<_> = (0..=OUTBOX_BATCH_SIZE)
         .map(|index| {
-            let mut record = record(recipient, (index % 255 + 1) as u8);
+            let mut record = seeded_record(recipient, (index % 255 + 1) as u8);
             record.class = NotificationClass::Transient;
             record
         })

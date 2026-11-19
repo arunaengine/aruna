@@ -2,23 +2,36 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::SystemTime;
 
 use aruna_core::UserId;
+#[cfg(test)]
 use aruna_core::calls::{IoCall, IoResult, Next};
+#[cfg(test)]
 use aruna_core::effects::StorageEffect;
+#[cfg(test)]
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
+use aruna_core::keyspaces::AUTH_KEYSPACE;
+#[cfg(test)]
+use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
+#[cfg(test)]
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-use aruna_core::structs::identity::group_delete::{GroupDeletionError, MembershipFence};
+use aruna_core::structs::identity::group_delete::GroupDeletionError;
+#[cfg(test)]
+use aruna_core::structs::identity::group_delete::MembershipFence;
+#[cfg(test)]
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use ulid::Ulid;
 
+#[cfg(test)]
 use super::check::CheckOperation;
+#[cfg(test)]
 use super::check::{CheckNodeOperation, ScanOperation};
 use super::tests::{Fixture, node, read, write};
 use crate::driver::drive;

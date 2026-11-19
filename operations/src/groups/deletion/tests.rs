@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::storage::format::Compression;
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::time::SystemTime;
 
@@ -10,10 +11,14 @@ use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
-use aruna_core::effects::{Effect, StorageEffect};
+#[cfg(test)]
+use aruna_core::effects::Effect;
+use aruna_core::effects::StorageEffect;
+#[cfg(test)]
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::*;
+#[cfg(test)]
 use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::storage_entries::reducer_state_entry;
@@ -31,7 +36,9 @@ use ulid::Ulid;
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
 use crate::driver::{DriverContext, drive};
+#[cfg(test)]
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
+#[cfg(test)]
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 
 pub struct Fixture {

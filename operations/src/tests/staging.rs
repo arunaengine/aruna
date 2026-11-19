@@ -3,37 +3,51 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
-use crate::driver::{DriverContext, drive};
-use crate::driver::{drive, node_routing};
+use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive, node_routing};
+use crate::groups::routing::BucketRules;
+use crate::groups::routing::SnapshotOperation;
 use crate::jobs::context::JobContext;
-use crate::jobs::executor::{JobRunOutcome, ProgressReporter};
-use crate::jobs::staging::lanes::*;
-use crate::jobs::staging::table::*;
+use crate::jobs::executor::ProgressReporter;
+use crate::placement::policy::GateOperation;
+use crate::replication::queue::LiveVersionInput;
+use crate::replication::queue::LiveVersionOperation;
 use crate::s3::bucket::create::CreateBucketOperation;
+use crate::s3::object::get::GetObjectInput;
+use crate::s3::object::head::HeadObjectInput;
+use crate::s3::object::head::HeadObjectOperation;
+use crate::s3::object::put::PutObjectConfig;
+use crate::s3::object::put::PutObjectInput;
+use crate::s3::object::put::PutObjectOperation;
 use crate::s3::object::search::{ObjectKeyMatch, SearchObjectsInput};
 use crate::s3::object::search_scan::SearchObjectsOperation;
 use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
-use aruna_core::structs::execution::job::StagingJobPrefix;
+use aruna_core::events::Event;
+use aruna_core::stream::BackendStream;
+use aruna_core::stream::StreamError;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_core::structs::execution::job::{
-    JobClaim, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, StagingJobPrefix,
+    JobClaim, JobId, JobPayload, JobProgress, JobRecord, StagingJobPrefix,
 };
 use aruna_core::structs::execution::source_access::{
     ResolvedSourceAccess, ResolvedSourceConnector, SourceMetadata,
 };
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
+use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::execution::table::TableImport;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::Value;
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
+use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -353,7 +367,6 @@ pub struct Fixture {
 impl Fixture {
     pub async fn new(endpoint: &str, table: serde_json::Value) -> Self {
         use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
-        use crate::tests::staging::{create_test_bucket, setup_driver_context};
         use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 
         let test = setup_driver_context().await;
@@ -564,8 +577,8 @@ pub async fn write_object(
     (name, bucket): (&str, &BucketInfo),
     key: &str,
     (body, metadata): (Bytes, &BTreeMap<String, String>),
-) -> Result<(), ItemFailure> {
-    let system = |error: String| ItemFailure::System(error);
+) -> Result<(), String> {
+    let system = |error: String| error;
     let routing = drive(
         SnapshotOperation::new(
             &node_routing(&ctx.driver),
@@ -618,7 +631,7 @@ pub async fn write_object(
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
-    let result = drive(operation, &ctx.driver).await.map_err(put_failure)?;
+    let result = (drive(operation, &ctx.driver).await).map_err(|error| error.to_string())?;
     drive(
         LiveVersionOperation::new(LiveVersionInput {
             local_node_id: spec.node_id,
@@ -632,7 +645,7 @@ pub async fn write_object(
     )
     .await
     .map(|_| ())
-    .map_err(|error| ItemFailure::Stage(format!("replication queue failed: {error}")))
+    .map_err(|error| format!("replication queue failed: {error}"))
 }
 
 /// A staging spec with one reference prefix that the staging tests vary.

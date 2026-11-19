@@ -360,7 +360,7 @@ impl OperationsTaskHandler {
             DocumentOutboxEvent::AdminOperation { event, .. }
                 if matches!(event.op, aruna_core::admin_documents::AdminDocumentOperation::GroupDeleted { .. })))
             && let Err(error) = aruna_operations::driver::drive(
-                aruna_operations::groups::deletion::SyncDecisionOperation,
+                aruna_operations::groups::deletion::coordinator::SyncDecisionOperation,
                 self.context.as_ref(),
             )
             .await

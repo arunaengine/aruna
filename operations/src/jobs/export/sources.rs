@@ -38,7 +38,7 @@ use crate::s3::object::head::{
 
 /// What the source lookups of one export run have learned, so each is asked only once.
 #[derive(Debug, Default, PartialEq)]
-pub(super) struct AliasState {
+pub struct AliasState {
     policies: BTreeMap<GroupId, PolicyEvaluator>,
     rules: BTreeMap<GroupId, PermissionRules>,
     paths: BTreeSet<(GroupId, String)>,

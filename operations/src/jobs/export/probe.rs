@@ -19,14 +19,14 @@ use crate::jobs::import::{job_call, stops_of};
 use crate::replication::bao_read::BaoReadOutput;
 
 /// Candidates that failed while the archive was written, by entity and candidate.
-pub(super) type CandidateFailures = BTreeMap<usize, BTreeMap<usize, OpenStatus>>;
+pub type CandidateFailures = BTreeMap<usize, BTreeMap<usize, OpenStatus>>;
 
 /// The entities after a probe and the copy chosen for each included one.
 #[derive(Debug, PartialEq)]
-pub(super) struct Probed {
-    pub(super) entities: Vec<ExportEntity>,
-    pub(super) entries: Vec<ProbedEntry>,
-    pub(super) aliases: AliasState,
+pub struct Probed {
+    pub entities: Vec<ExportEntity>,
+    pub entries: Vec<ProbedEntry>,
+    pub aliases: AliasState,
 }
 
 /// What the candidates of the running entity showed so far.
@@ -61,7 +61,7 @@ enum ProbeStep {
 /// Finds the first candidate of each open entity that can be read. An entity without one is left
 /// out, unless a corrupt copy or a missing bucket key must fail the export.
 #[derive(Debug, PartialEq)]
-pub(super) struct ProbeSourcesOperation {
+pub struct ProbeSourcesOperation {
     scope: SourceScope,
     entities: Vec<ExportEntity>,
     failures: CandidateFailures,
@@ -77,7 +77,7 @@ pub(super) struct ProbeSourcesOperation {
 type ProbeTurn = Result<Next<Probed>, ExportFailure>;
 
 impl ProbeSourcesOperation {
-    pub(super) fn new(
+    pub fn new(
         scope: SourceScope,
         entities: Vec<ExportEntity>,
         failures: CandidateFailures,

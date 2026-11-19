@@ -90,7 +90,7 @@ pub struct ExportCheckpoint {
     context_digest: Option<[u8; 32]>,
     dataset_digest: Option<[u8; 32]>,
     pub(crate) raw_jsonld: Option<String>,
-    entities: Vec<ExportEntity>,
+    pub entities: Vec<ExportEntity>,
     rewritten_jsonld: Option<Vec<u8>>,
     report_json: Option<Vec<u8>>,
     report: Vec<ExportReportRow>,
