@@ -17,7 +17,7 @@ use aruna_core::id::NodeId;
 use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::scheduling::PlannedInput;
+use aruna_core::scheduling::{PlannedInput, hosts_session};
 use aruna_core::structs::execution::job::{
     ExecutionClaim, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobId, JobPayload,
     JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
@@ -33,9 +33,10 @@ use ulid::Ulid;
 use super::LifecycleError;
 use super::cancel::FlagLocalRunOperation;
 use super::fetch::{FetchFamilyOperation, FetchedFamily};
-use super::ids::workspace_of;
+use super::ids::{session_of, workspace_of};
 use super::launch_checks::{CheckError, LaunchCheck, LaunchChecksOperation, Verdict};
 use super::outbox::schedule_outbox_drain;
+use super::plan::network_access;
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::RecordStoreError;
@@ -660,6 +661,14 @@ impl AdmitLaunchOperation {
         // An advertisement that lags the config, as after a restart, is undecided: the holder
         // retries once it is refreshed, where a refusal would exclude this target for good.
         if self.node.config_digest != Some(capability.config_digest) {
+            return Err(LaunchUndecided);
+        }
+        // Session support is runtime state, such as a Docker daemon that moved, so a backend
+        // without it leaves the offer undecided instead of refused.
+        let network = network_access(spec);
+        if session_of(&spec.payload).is_some()
+            && !hosts_session(&capability.kind, capability.session, network)
+        {
             return Err(LaunchUndecided);
         }
         let read = ReadInfoOperation::new(vec![self.node.local]);

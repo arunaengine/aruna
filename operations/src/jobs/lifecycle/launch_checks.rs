@@ -150,9 +150,6 @@ impl LocalCapabilityOperation {
             || (spec.payload.backend.as_deref())
                 .is_some_and(|name| name.trim() != capability.backend)
             || !capability.supports(REALM_STAGING)
-            || (ids::session_of(&spec.payload).is_some()
-                && network_access(spec) != NetworkAccess::Open
-                && !capability.session)
             || !capability.limits.fits(&spec.resources)
         {
             return Err(LaunchDecline::Unauthorized);
