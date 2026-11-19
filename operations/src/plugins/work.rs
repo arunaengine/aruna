@@ -439,9 +439,9 @@ impl Operation for HoldsJob {
     }
 }
 
-/// One job prune pass that keeps a due plugin work job while [`holds_job`] says so. Both prune
-/// steps use the time of the run's start, so no job falls due between the check and the prune.
-/// The prune deletes only checked jobs; held jobs do not fill a window, so later jobs progress.
+/// One job prune pass that keeps a due plugin work job while [`holds_job`] says so, at the run's
+/// start time. It deletes only checked jobs; held jobs do not fill a window, and a round that
+/// deleted nothing while more jobs were due goes on after its checked window.
 #[derive(Debug, PartialEq)]
 pub struct PruneKeepingWork {
     page_size: usize,
@@ -450,6 +450,7 @@ pub struct PruneKeepingWork {
     checked: BTreeSet<JobId>,
     kept: BTreeSet<JobId>,
     after: Option<Key>,
+    start: Option<Key>,
     phase: KeepPhase,
 }
 
@@ -471,6 +472,7 @@ impl PruneKeepingWork {
             checked: BTreeSet::new(),
             kept: BTreeSet::new(),
             after: None,
+            start: None,
             phase: KeepPhase::Due,
         }
     }
@@ -499,7 +501,8 @@ impl PruneKeepingWork {
             std::mem::take(&mut self.kept),
             std::mem::take(&mut self.checked),
         );
-        let prune = PruneJobsOperation::new(self.now(), self.page_size, kept).within(checked);
+        let prune = PruneJobsOperation::new(self.now(), self.page_size, kept);
+        let prune = prune.within(checked, self.start.clone());
         Ok(Next::Call(IoCall::child(prune)))
     }
 }
@@ -538,6 +541,11 @@ impl Operation for PruneKeepingWork {
             }
             KeepPhase::Prune => {
                 let outcome = result.child::<JobPruneOutcome, PruneError>()??;
+                // Cleanups held every checked job; only deleted jobs count against the pass.
+                if outcome.pruned == 0 && outcome.has_more && self.after.is_some() {
+                    self.start = self.after.clone();
+                    return self.due();
+                }
                 Ok(Next::Done(outcome))
             }
         }
