@@ -24,7 +24,7 @@ use super::bound::{CheckNodeBinding, NodeCheckFailure, delivery_clash, vault_kin
 use super::held::{AskRelease, HeldSecrets};
 use super::hooks::{DROPPED, HookError};
 use super::install::{InstallError, admin_answer, admin_call, pick_version, read_manifest};
-use super::rate::take_hook;
+use super::rate::{take_hook, taken};
 use super::receiver::lost_reason;
 use super::rows::StoreError;
 use super::runs::{RunError, admit, declared_trigger, enqueue_timer, new_run};
@@ -272,6 +272,8 @@ pub struct VerifyHook {
     now_ms: u64,
     ids: IdMint,
     check: Option<HookCheck>,
+    /// The secret release asked once the request is counted within the install's rate.
+    rating: Option<ReleaseRequest>,
 }
 
 impl VerifyHook {
@@ -289,6 +291,7 @@ impl VerifyHook {
             now_ms,
             ids: IdMint::default(),
             check: None,
+            rating: None,
         }
     }
 
@@ -312,9 +315,6 @@ impl VerifyHook {
         if install.state != InstallState::Active {
             return Err(HookError::Paused(install.state.as_str()));
         }
-        if !take_hook(id, self.now_ms) {
-            return Err(HookError::Rate);
-        }
         let release = ReleaseRequest {
             install_id: id,
             slot: slot.clone(),
@@ -323,14 +323,13 @@ impl VerifyHook {
             held: None,
             run_id: None,
         };
-        let config = Arc::new(config);
-        let ask = AskRelease::new(config.clone(), self.local, release);
         self.check = Some(HookCheck {
-            config,
+            config: Arc::new(config),
             manifest: Box::new(manifest),
             slot,
         });
-        Ok(Next::Call(IoCall::child(ask)))
+        self.rating = Some(release);
+        Ok(Next::Call(take_hook(id, self.now_ms)))
     }
 
     fn released(
@@ -395,6 +394,17 @@ impl Operation for VerifyHook {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<VerifiedHook>, HookError> {
+        if let Some(release) = self.rating.take() {
+            if !taken(result)? {
+                return Err(HookError::Rate);
+            }
+            let config = (self.check.as_ref())
+                .ok_or(IoError::Unfinished)?
+                .config
+                .clone();
+            let ask = AskRelease::new(config, self.local, release);
+            return Ok(Next::Call(IoCall::child(ask)));
+        }
         let Some(check) = self.check.take() else {
             let config = result.child::<RealmConfigDocument, GetConfigError>()?;
             let config = config

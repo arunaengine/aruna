@@ -133,8 +133,8 @@ impl ApplyEditOperation {
 
     /// Picks the next dot of this device's actor and plans the edit without changing the graph.
     fn plan(&mut self, current: Option<MetadataActor>) -> EditTurn {
-        let record = self.record()?;
         let mut draft_id = self.ids.mint(self.now_ms);
+        let record = self.record()?;
         if let Some(current) = &current
             && draft_id <= current.last_event_id
         {

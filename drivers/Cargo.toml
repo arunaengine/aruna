@@ -21,6 +21,7 @@ aruna-core = { workspace = true }
 aruna-graph = { workspace = true }
 aruna-net = { workspace = true }
 aruna-outbound = { workspace = true }
+aruna-plugins = { workspace = true }
 aruna-storage = { workspace = true }
 aruna-tasks = { workspace = true }
 bytes = { workspace = true }

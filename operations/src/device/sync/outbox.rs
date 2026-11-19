@@ -32,7 +32,7 @@ use crate::device::backlog::{
     DrainOperation, DrainQueue, ForwardOutcome, forward_member, outcome_rechecks,
 };
 use crate::device::drain::DrainOutcome;
-use crate::device::retry::{exhausted, retry_due_ms};
+use crate::device::retry::{exhausted, retry_due_at};
 use crate::device::scan_rows::{ScanRowsError, ScanRowsOperation};
 use crate::document_repository::{config_of, realm_config};
 use aruna_core::structs::identity::realm::NodeRealm;
@@ -211,6 +211,7 @@ struct ForwardUploadOperation {
     step: UploadStep,
     walk: Option<PullWalk>,
     moved: Option<UploadState>,
+    now_ms: u64,
 }
 
 type Forwarding = Result<Next<ForwardOutcome>, IoError>;
@@ -224,6 +225,7 @@ impl ForwardUploadOperation {
             step: UploadStep::Folder,
             walk: None,
             moved: None,
+            now_ms: 0,
         }
     }
 
@@ -252,7 +254,7 @@ impl ForwardUploadOperation {
                 retryable: true,
             },
             false => UploadState::Pending {
-                due_at_ms: retry_due_ms(attempts),
+                due_at_ms: retry_due_at(self.now_ms, attempts),
                 attempts,
                 last_error: Some(reason),
             },
@@ -339,6 +341,10 @@ impl ForwardUploadOperation {
 impl Operation for ForwardUploadOperation {
     type Output = ForwardOutcome;
     type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Forwarding {
         let key = folder_key(self.upload.folder_id).to_vec();

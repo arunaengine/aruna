@@ -310,7 +310,7 @@ mod tests {
 
         let rows = read_outbox_rows(&context).await;
         assert_eq!(rows.len(), 2);
-        let ids: std::collections::HashSet<Ulid> =
+        let ids: std::collections::HashSet<ulid::Ulid> =
             rows.iter().map(|(_, row)| row.outbox_id).collect();
         assert_eq!(ids.len(), 2);
         for (_, row) in &rows {

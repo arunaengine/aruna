@@ -40,7 +40,7 @@ use super::intents::{Begun, begin, written};
 use super::job_work::StartWork;
 use super::objects::LocalObject;
 use super::outgoing::{outgoing, request_context};
-use super::rate::take_call;
+use super::rate::{take_call, taken};
 use super::rows::StoreError;
 use super::submit::WorkRequest;
 use super::unavailable;
@@ -99,6 +99,8 @@ pub struct AdmitCall {
     scope: RunScope,
     target: Option<(Permission, String)>,
     now_ms: u64,
+    /// The checked install, while its call is counted against the rate.
+    install: Option<PluginInstall>,
 }
 
 impl AdmitCall {
@@ -107,14 +109,26 @@ impl AdmitCall {
             scope: scope.clone(),
             target: target.map(|(permission, path)| (permission, path.to_string())),
             now_ms: 0,
+            install: None,
         }
     }
 }
 
-fn admitted_install(result: IoResult, now_ms: u64) -> Result<PluginInstall, CallError> {
-    let install = result.child::<PluginInstall, CallError>()??;
-    match take_call(install.install_id, now_ms) {
-        true => Ok(install),
+/// Step 5 after the checks: the checked install's call counted against its rate. Answers the
+/// call to make, or the install once its call was within the rate.
+fn admitted_install(
+    install: &mut Option<PluginInstall>,
+    result: IoResult,
+    now_ms: u64,
+) -> Result<Result<PluginInstall, IoCall>, CallError> {
+    let Some(checked) = install.take() else {
+        let checked = result.child::<PluginInstall, CallError>()??;
+        let take = take_call(checked.install_id, now_ms);
+        *install = Some(checked);
+        return Ok(Err(take));
+    };
+    match taken(result)? {
+        true => Ok(Ok(checked)),
         false => Err(CallError(HostError::new(
             ErrorKind::Limit,
             "the install makes calls too fast",
@@ -137,7 +151,12 @@ impl Operation for AdmitCall {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<PluginInstall>, CallError> {
-        Ok(Next::Done(admitted_install(result, self.now_ms)?))
+        Ok(
+            match admitted_install(&mut self.install, result, self.now_ms)? {
+                Ok(install) => Next::Done(install),
+                Err(take) => Next::Call(take),
+            },
+        )
     }
 }
 
@@ -155,6 +174,7 @@ pub struct GrantedCall {
     permission: Permission,
     target: Option<String>,
     now_ms: u64,
+    install: Option<PluginInstall>,
 }
 
 impl GrantedCall {
@@ -165,6 +185,7 @@ impl GrantedCall {
             permission,
             target: Some(target.to_string()),
             now_ms: 0,
+            install: None,
         }
     }
 
@@ -175,6 +196,7 @@ impl GrantedCall {
             permission,
             target: None,
             now_ms: 0,
+            install: None,
         }
     }
 }
@@ -194,7 +216,10 @@ impl Operation for GrantedCall {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Granted>, CallError> {
-        let install = admitted_install(result, self.now_ms)?;
+        let install = match admitted_install(&mut self.install, result, self.now_ms)? {
+            Ok(install) => install,
+            Err(take) => return Ok(Next::Call(take)),
+        };
         let patterns = match &self.target {
             Some(target) => matching(&install, self.permission, target)?,
             None => patterns_for(&parse_grants(&install.grants), self.permission),

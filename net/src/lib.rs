@@ -1165,6 +1165,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Compute(_) => "compute",
         Effect::Git(_) => "git",
         Effect::Outbound(_) => "outbound",
+        Effect::Plugin(_) => "plugin",
         Effect::Delay(_) => "delay",
         Effect::Job(_) => "job",
     }

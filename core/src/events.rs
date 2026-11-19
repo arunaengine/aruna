@@ -57,6 +57,7 @@ pub enum Event {
     Group(GroupEvent),
     Session(Box<crate::compute::session::SessionAnswer>),
     Outbound(OutboundEvent),
+    Plugin(crate::plugins::PluginEvent),
     /// Answers `Effect::Delay` once its time passed.
     Delayed,
     /// The adapter of this effect kind did not answer within the runner's hang limit.
@@ -1150,6 +1151,7 @@ impl Event {
             Event::Child(_) => "Event::Child",
             Event::Job(_) => "Event::Job",
             Event::Git(_) => "Event::Git",
+            Event::Plugin(_) => "Event::Plugin",
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(
