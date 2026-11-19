@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
+use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionSpec, InputContent, InputSource, JobError, JobId, JobPayload,
@@ -517,7 +518,7 @@ impl RecordCrateOperation {
                     status,
                     document_id,
                 };
-                self.call(step, IoCall::Write(vec![entry]))
+                self.call(step, outside_call(IoCall::Write(vec![entry])))
             }
             Err(error) => {
                 warn!(job_id = %self.for_job, %error, "Run crate watch event failed");
@@ -653,7 +654,7 @@ impl Operation for RecordCrateOperation {
                 status,
                 document_id,
             } => {
-                if let Err(error) = result.done() {
+                if let Err(error) = outside_answer(result).and_then(IoResult::done) {
                     warn!(job_id = %self.for_job, %error, "Run crate watch event failed");
                     return self.finish(status, Some(document_id));
                 }

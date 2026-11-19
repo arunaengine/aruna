@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{
     REPLICATION_OBLIGATION_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::read_row;
+use aruna_core::rows::{outside_answer, outside_call, read_row};
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, schedule_watch_drain, watch_event_entry,
     watch_resource_path,
@@ -1093,7 +1093,10 @@ impl ProcessJobOperation {
         );
         match event {
             Some(event) => match watch_event_entry(&event) {
-                Ok(entry) => self.call(JobStep::Emit(Box::new(after)), IoCall::Write(vec![entry])),
+                Ok(entry) => {
+                    let write = outside_call(IoCall::Write(vec![entry]));
+                    self.call(JobStep::Emit(Box::new(after)), write)
+                }
                 Err(error) => {
                     warn!(%error, "A sync watch event could not be queued");
                     self.after_store(after)
@@ -1275,7 +1278,7 @@ impl Operation for ProcessJobOperation {
                 self.stored(watch, *after, stored)
             }
             // A queued event leaves with the drain; a failed queue write only warns.
-            JobStep::Emit(after) => match result.done() {
+            JobStep::Emit(after) => match outside_answer(result).and_then(IoResult::done) {
                 Ok(()) => self.call(JobStep::Armed(after), IoCall::from(schedule_watch_drain())),
                 Err(error) => {
                     warn!(%error, "A sync watch event could not be queued");

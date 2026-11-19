@@ -9,6 +9,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::repository::RepositoryPull;
+use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{
     ImportReportDetail, ImportReportRow, ImportRoCrateSource, ReasonCode,
@@ -298,7 +299,7 @@ impl Operation for CreateDatasetOperation {
                     created.event_id,
                 );
                 match watch_event_entry(&event) {
-                    Ok(entry) => Ok(Next::Call(IoCall::Write(vec![entry]))),
+                    Ok(entry) => Ok(Next::Call(outside_call(IoCall::Write(vec![entry])))),
                     Err(error) => {
                         warn!(%error, "The import's watch event could not be queued");
                         Ok(Next::Done(self.checkpoint.clone()))
@@ -307,7 +308,7 @@ impl Operation for CreateDatasetOperation {
             }
             // A failed queue write only warns, as a failed emission did.
             CreateStep::Emit => {
-                if let Err(error) = result.done() {
+                if let Err(error) = outside_answer(result).and_then(IoResult::done) {
                     warn!(%error, "The import's watch event could not be queued");
                 }
                 Ok(Next::Then {

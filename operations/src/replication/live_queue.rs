@@ -8,6 +8,7 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
+use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, schedule_watch_drain, watch_event_entry,
     watch_resource_path,
@@ -107,7 +108,7 @@ impl CompletePutOperation {
         };
         self.step = PutStep::Emit;
         match watch_event_entry(&event) {
-            Ok(entry) => Ok(Next::Call(IoCall::Write(vec![entry]))),
+            Ok(entry) => Ok(Next::Call(outside_call(IoCall::Write(vec![entry])))),
             Err(error) => {
                 warn!(%error, "The upload watch event could not be queued");
                 Ok(Next::Done(()))
@@ -142,7 +143,7 @@ impl Operation for CompletePutOperation {
             }
             PutStep::Holders => self.emit(result.event()?),
             PutStep::Emit => {
-                if let Err(error) = result.done() {
+                if let Err(error) = outside_answer(result).and_then(IoResult::done) {
                     warn!(%error, "The upload watch event could not be queued");
                 }
                 Ok(Next::Then {
@@ -267,12 +268,13 @@ mod tests {
     fn put_queues_watch() {
         let mut operation = asking();
         let turn = operation.next(holders(Some((node(1), vec![node(2)]))));
-        assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         let armed = Ok(Next::Then {
             output: (),
             calls: vec![IoCall::from(schedule_watch_drain())],
         });
-        assert_eq!(operation.next(IoResult::Done), armed);
+        let written = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(IoResult::Done)));
+        assert_eq!(operation.next(written), armed);
     }
 
     #[test]

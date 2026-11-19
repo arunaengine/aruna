@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::id_mint::IdMint;
+use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, HashSet};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -417,7 +418,7 @@ impl Operation for AcceptVersionOperation {
                         match entry {
                             Some(Ok(entry)) => {
                                 self.step = AcceptStep::Emit;
-                                Ok(Next::Call(IoCall::Write(vec![entry])))
+                                Ok(Next::Call(outside_call(IoCall::Write(vec![entry]))))
                             }
                             Some(Err(error)) => {
                                 warn!(%error, "A replicated watch event was not queued");
@@ -435,7 +436,7 @@ impl Operation for AcceptVersionOperation {
             // Failures only warn inside the operation.
             // A failed queue write only warns, as a failed emission did.
             AcceptStep::Emit => {
-                if let Err(error) = result.done() {
+                if let Err(error) = outside_answer(result).and_then(IoResult::done) {
                     warn!(%error, "A replicated watch event was not queued");
                 }
                 Ok(Next::Then {
