@@ -900,12 +900,10 @@ mod tests {
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::FjallStorage;
     use aruna_storage::StorageHandle;
     use byteview::ByteView;
     use serde::Serialize;
     use std::collections::HashMap;
-    use tempfile::tempdir;
 
     fn upload_record(
         upload_id: Ulid,
@@ -1021,21 +1019,7 @@ mod tests {
     }
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        (
-            dir,
-            DriverContext {
-                storage_handle: storage,
-                net_handle: None,
-                blob_handle: None,
-                graph_handle: None,
-                task_handle: None,
-                compute_handle: None,
-                outbound_handle: None,
-            },
-        )
+        crate::testing::temp_context()
     }
 
     async fn is_protected(

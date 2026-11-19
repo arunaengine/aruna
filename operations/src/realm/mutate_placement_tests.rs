@@ -152,17 +152,7 @@ fn create_event(actor: &Actor, strategy_id: Ulid, document_seed: u8) -> Metadata
 }
 
 async fn write_entries(context: &DriverContext, writes: Vec<(String, Key, Value)>) {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::BatchWriteResult { .. })
-    ));
+    crate::testing::write_entries(&context.storage_handle, writes).await;
 }
 
 #[tokio::test]

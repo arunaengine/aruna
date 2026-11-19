@@ -32,8 +32,7 @@ mod tests {
     };
     use aruna_core::structs::storage::blob::object_permission_path;
     use aruna_drivers::driver::{DriverContext, drive, drive_retry};
-    use aruna_storage::{FjallStorage, StorageHandle};
-    use tempfile::tempdir;
+    use aruna_storage::StorageHandle;
     use ulid::Ulid;
 
     use crate::tests::notifications::{create_holder_watch, create_local_watch};
@@ -71,21 +70,7 @@ mod tests {
     }
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        (
-            dir,
-            DriverContext {
-                storage_handle: storage,
-                net_handle: None,
-                blob_handle: None,
-                graph_handle: None,
-                task_handle: None,
-                compute_handle: None,
-                outbound_handle: None,
-            },
-        )
+        crate::testing::temp_context()
     }
 
     fn user(realm: RealmId, seed: u8) -> UserId {

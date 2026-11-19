@@ -204,13 +204,7 @@ mod tests {
     use std::collections::HashMap;
 
     async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        let effect = StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        };
-        context.storage_handle.send_storage_effect(effect).await;
+        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     async fn present(context: &DriverContext, key_space: &str, key: Vec<u8>) -> bool {

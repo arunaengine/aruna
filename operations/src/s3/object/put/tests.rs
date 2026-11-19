@@ -31,18 +31,7 @@ fn count_files(path: &Path) -> usize {
 }
 
 async fn read_value(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        panic!("unexpected storage read result");
-    };
-    value
+    crate::testing::read_value(&context.storage_handle, key_space, key).await
 }
 
 fn test_location(created_by: UserId) -> BackendLocation {

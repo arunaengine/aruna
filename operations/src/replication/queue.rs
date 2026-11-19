@@ -1200,15 +1200,7 @@ mod tests {
     }
 
     fn plain_context(storage: &StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
+        aruna_drivers::testing::test_context(storage.clone())
     }
 
     /// The plugin journal rows this node has not matched yet.

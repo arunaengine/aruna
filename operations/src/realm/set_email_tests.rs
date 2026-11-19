@@ -6,8 +6,6 @@ use super::*;
 use crate::document_repository::GetConfigOperation;
 use crate::testing::path_context;
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
 use aruna_drivers::driver::{DriverContext, drive};
@@ -53,19 +51,7 @@ fn email_config(actor: &Actor, profile: Option<EmailInput>) -> SetEmailConfig {
 }
 
 async fn write(ctx: &DriverContext, key_space: &str, key: Key, value: Vec<u8>) {
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key,
-            value: value.into(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => panic!("unexpected event: {other:?}"),
-    }
+    crate::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
 }
 
 /// Seeds a config where `kind` describes the actor's node and makes the actor a realm admin.

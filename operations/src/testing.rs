@@ -41,6 +41,32 @@ pub fn path_context(root: &str) -> DriverContext {
     test_context(aruna_storage::FjallStorage::open(root).expect("open the test store"))
 }
 
+/// A storage-only driver context on a fresh temporary store.
+pub fn temp_context() -> (tempfile::TempDir, DriverContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let context = path_context(dir.path().to_str().expect("temp path"));
+    (dir, context)
+}
+
+/// Writes one value outside a transaction; panics on any other answer.
+pub async fn write_value(
+    storage: &StorageHandle,
+    key_space: &str,
+    key: impl Into<ByteView>,
+    value: impl Into<ByteView>,
+) {
+    let write = StorageEffect::Write {
+        key_space: key_space.to_string(),
+        key: key.into(),
+        value: value.into(),
+        txn_id: None,
+    };
+    match storage.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected storage event: {other:?}"),
+    }
+}
+
 /// Writes `writes` in one batch outside a transaction; panics on any other answer.
 pub async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
     match storage

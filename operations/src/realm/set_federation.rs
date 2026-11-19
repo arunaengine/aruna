@@ -494,8 +494,6 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentDot;
     use aruna_core::document::DocumentOutboxRecord;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_core::reducer::{AdminConflict, AdminConflictValue};
     use aruna_core::structs::identity::realm::{
@@ -544,19 +542,7 @@ mod tests {
     }
 
     async fn write(ctx: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                value: value.into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
     }
 
     async fn seed(ctx: &DriverContext, actor: &Actor, kind: RealmNodeKind, admin: bool) {

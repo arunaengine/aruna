@@ -27,15 +27,7 @@ pub fn temp_storage() -> (TempDir, StorageHandle) {
 }
 
 pub fn context(storage: &StorageHandle) -> DriverContext {
-    DriverContext {
-        storage_handle: storage.clone(),
-        net_handle: None,
-        blob_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    }
+    aruna_drivers::testing::test_context(storage.clone())
 }
 
 pub fn context_with_storage() -> (TempDir, DriverContext) {

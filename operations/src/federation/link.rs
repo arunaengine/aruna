@@ -427,7 +427,6 @@ mod tests {
     use super::*;
     use crate::users::update_user::{UserWrite, UserWritten};
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-    use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{
         AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode,
     };
@@ -527,13 +526,7 @@ mod tests {
     }
 
     async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        let effect = StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        };
-        context.storage_handle.send_storage_effect(effect).await;
+        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     /// Two active local accounts and a realm that admits logins of every realm.

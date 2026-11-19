@@ -208,15 +208,7 @@ mod tests {
     use ulid::Ulid;
 
     fn context_at(path: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: storage::FjallStorage::open(path).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
+        crate::testing::path_context(path)
     }
 
     fn admin_record(secret_hash: &str) -> OnboardingSecretRecord {

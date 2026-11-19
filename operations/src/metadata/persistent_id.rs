@@ -289,7 +289,6 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
     };
-    use aruna_storage::storage;
     use tempfile::tempdir;
 
     fn context() -> (DriverContext, tempfile::TempDir) {
@@ -299,15 +298,7 @@ mod tests {
     }
 
     fn context_at(path: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: storage::FjallStorage::open(path).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
+        crate::testing::path_context(path)
     }
 
     fn realm() -> RealmId {
