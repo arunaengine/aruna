@@ -53,7 +53,6 @@ use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{
@@ -61,6 +60,7 @@ use aruna_operations::s3::object::put::{
 };
 use aruna_operations::tasks::job_context::JobContext;
 use aruna_operations::tasks::rocrate_jobs::{run_export_job, run_rocrate_import};
+use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::replay_event_log;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;

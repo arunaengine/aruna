@@ -243,6 +243,34 @@ pub async fn schedule_projection_drain(
     crate::driver::drive(wake, context).await
 }
 
+/// Runs one pass of the metadata materialization drain, as the drain task does.
+pub async fn process_materialization_batch(
+    context: &DriverContext,
+) -> Result<
+    crate::metadata::materialization_queue::MetadataDrainResult,
+    crate::metadata::materialization_queue::MetadataMaterializationError,
+> {
+    use crate::metadata::materialization_queue::{
+        MaterializationBatchOperation, materialization_group_concurrency,
+    };
+    let node = crate::git::GitNode {
+        ids: context.node_and_realm(),
+        routing: crate::driver::node_routing(context),
+    };
+    let concurrency = materialization_group_concurrency();
+    let batch =
+        MaterializationBatchOperation::new(node, concurrency, context.task_handle.is_some());
+    drive(batch, context).await
+}
+
+/// Whether a live metadata materialization job is queued; dead ones it meets are deleted.
+pub async fn materialization_jobs_exist(
+    context: &DriverContext,
+) -> Result<bool, crate::metadata::materialization_queue::MetadataMaterializationError> {
+    let probe = crate::metadata::materialization_queue::JobsExistOperation::new();
+    drive(probe, context).await
+}
+
 /// Runs one pass of the graph prune drain.
 pub async fn process_prune_batch(
     context: &DriverContext,

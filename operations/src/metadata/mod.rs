@@ -42,7 +42,6 @@ pub(crate) mod prune_jobs;
 pub mod prune_queue;
 pub mod public_preview;
 mod query_cache;
-mod queue_storage;
 pub(crate) mod raw_events;
 pub mod raw_revision;
 pub mod realm_counts;

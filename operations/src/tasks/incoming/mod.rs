@@ -80,9 +80,9 @@ use crate::jobs::store::job_calls;
 use crate::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::data_links::RetryUnverifiedOperation;
 use crate::metadata::materialization_queue::{
-    MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER, MetadataDrainResult, NEXT_BATCH_AFTER,
-    materialization_jobs_exist, process_materialization_batch, requeue_dead_letters,
-    restore_materialization_timer,
+    JobsExistOperation, MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER,
+    MaterializationBatchOperation, MetadataDrainResult, NEXT_BATCH_AFTER, NextTimerOperation,
+    RequeueDeadLettersOperation, materialization_group_concurrency,
 };
 use crate::metadata::projection::{
     DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
