@@ -13,19 +13,20 @@ use aruna_core::storage_entries::{create_event_entry, raw_revision_key};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::worker::FjallStorage;
 use std::collections::BTreeSet;
 use std::thread;
 use tempfile::tempdir;
 
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::StorageEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_drivers::testing::write_entries;
+use aruna_drivers::testing::{read_value, write_entries};
 use aruna_test_support::metadata::process_materialization_batch;
 
+use crate::stepper::Stepper;
 use crate::tests::metadata::storage_key_exists;
 
 pub(super) fn node(seed: u8) -> NodeId {
@@ -107,21 +108,44 @@ async fn next_timer_after(
     drive(NextTimerOperation::new(), &context(storage)).await
 }
 
-async fn plan_finish_chunk(
+async fn finish_chunk(
     context: &DriverContext,
-    finished: Vec<FinishedMaterializationJob>,
-) -> Result<FinishPlan, MetadataMaterializationError> {
-    drive(PlanFinishOperation::new(finished), context).await
-}
-
-async fn commit_finish(
-    storage: &StorageHandle,
-    plan: FinishPlan,
+    chunk: Vec<FinishedMaterializationJob>,
 ) -> Result<(), MetadataMaterializationError> {
-    drive(CommitFinishOperation::new(plan), &context(storage)).await
+    let build = move || CommitFinishOperation::new(chunk.clone());
+    drive_retry(build, context, b"materialization-finish").await
 }
 
-// Plans and commits the finished jobs in chunks, as the drain does after its groups.
+/// Steps one finish commit against `storage` and writes `racing` inside its transaction,
+/// right before the commit writes its own rows.
+async fn finish_racing(
+    storage: &StorageHandle,
+    chunk: Vec<FinishedMaterializationJob>,
+    racing: Vec<(String, ByteView, ByteView)>,
+) -> Result<(), MetadataMaterializationError> {
+    let (mut run, mut effects) = Stepper::new(CommitFinishOperation::new(chunk));
+    let mut racing = Some(racing);
+    while !run.is_complete() {
+        let Some(Effect::Storage(effect)) = effects.pop() else {
+            panic!("the commit asks one storage call at a time");
+        };
+        if matches!(effect, StorageEffect::BatchWrite { .. })
+            && let Some(rows) = racing.take()
+        {
+            write_entries(storage, rows).await;
+        }
+        effects = run.step(storage.send_storage_effect(effect).await);
+    }
+    run.finish()
+}
+
+async fn stored_status(storage: &StorageHandle, document_id: Ulid) -> Option<Status> {
+    let key = materialization_status_key(document_id).to_vec();
+    let value = read_value(storage, MATERIALIZATION_STATUS_KEYSPACE, key).await;
+    value.map(|value| postcard::from_bytes(&value).unwrap())
+}
+
+// Settles the finished jobs in chunks, as the drain does after its groups.
 async fn finish_completed_jobs(
     context: &DriverContext,
     finished: Vec<FinishedMaterializationJob>,
@@ -132,8 +156,7 @@ async fn finish_completed_jobs(
             .by_ref()
             .take(MATERIALIZATION_FINISH_CHUNK)
             .collect();
-        let plan = plan_finish_chunk(context, chunk).await?;
-        drive(CommitFinishOperation::new(plan), context).await?;
+        finish_chunk(context, chunk).await?;
     }
     Ok(())
 }
@@ -1238,27 +1261,15 @@ async fn park_skips_superseded() {
         unix_timestamp_millis(),
     );
     assert!(matches!(parked, FinishedMaterializationJob::Parked { .. }));
-    let plan = plan_finish_chunk(
-        &aruna_drivers::testing::test_context(storage.clone()),
-        vec![parked],
-    )
-    .await
-    .unwrap();
+    let context = aruna_drivers::testing::test_context(storage.clone());
+    finish_chunk(&context, vec![parked]).await.unwrap();
 
-    assert!(
-        !plan
-            .writes
-            .iter()
-            .any(|(key_space, _, _)| key_space == DEAD_LETTER_KEYSPACE)
-    );
-    assert!(
-        plan.deletes
-            .contains(&(MATERIALIZATION_JOB_KEYSPACE.to_string(), job_key.clone()))
-    );
-    assert!(plan.deletes.contains(&(
-        DOCUMENT_JOB_KEYSPACE.to_string(),
-        document_job_key(document_id, old_event_id)
-    )));
+    let dead_letter = dead_letter_key(document_id, old_event_id).to_vec();
+    assert!(!storage_key_exists(&storage, DEAD_LETTER_KEYSPACE, dead_letter).await);
+    let job_row = job_key.to_vec();
+    assert!(!storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, job_row).await);
+    let document_row = document_job_key(document_id, old_event_id).to_vec();
+    assert!(!storage_key_exists(&storage, DOCUMENT_JOB_KEYSPACE, document_row).await);
 }
 
 #[test]
@@ -1538,17 +1549,11 @@ async fn finish_commits_chunks() {
 
 #[tokio::test]
 async fn finish_avoids_conflicts() {
-    // A status write landing between the guard snapshot and the commit must
-    // not conflict: the finish transaction only writes.
+    // A status write for a document outside the chunk, landing inside the finish
+    // transaction, must not conflict: the transaction reads only the chunk's guard rows.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let finished = reschedule_batch(&storage, 4).await;
-    let plan = plan_finish_chunk(
-        &aruna_drivers::testing::test_context(storage.clone()),
-        finished,
-    )
-    .await
-    .unwrap();
 
     let document_id = Ulid::from_bytes([120u8; 16]);
     let racing = MaterializationStatusRecord {
@@ -1563,19 +1568,16 @@ async fn finish_avoids_conflicts() {
         last_error: None,
         updated_at_ms: 9,
     };
-    write_entries(
-        &storage,
-        vec![materialization_status_entry(&racing).unwrap()],
-    )
-    .await;
+    let racing = vec![materialization_status_entry(&racing).unwrap()];
 
-    commit_finish(&storage, plan).await.unwrap();
+    finish_racing(&storage, finished, racing).await.unwrap();
     assert_eq!(storage.snapshot_metrics().conflicts_total, 0);
 }
 
 #[tokio::test]
 async fn finish_keeps_newer() {
-    // A newer job remains due if an older completion overwrites its status.
+    // A newer event landing inside an older completion's finish transaction makes the commit
+    // lose its conflict; the rerun keeps the newer status and its job stays due.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let document_id = Ulid::from_bytes([77u8; 16]);
@@ -1619,14 +1621,6 @@ async fn finish_keeps_newer() {
             merge: false,
         },
     )];
-    let plan = plan_finish_chunk(
-        &aruna_drivers::testing::test_context(storage.clone()),
-        finished,
-    )
-    .await
-    .unwrap();
-
-    // The newer event lands after the snapshot was taken.
     let newer_job = MetadataMaterializationRecord {
         document_id,
         event_id: newer_event_id,
@@ -1635,19 +1629,20 @@ async fn finish_keeps_newer() {
         failures: 0,
         parks: 0,
     };
-    write_entries(
-        &storage,
-        vec![
-            create_event_entry(&newer_event).unwrap(),
-            materialization_status_entry(&MaterializationStatusRecord::pending(&newer_event, 2))
-                .unwrap(),
-            materialization_job_entry(&newer_job).unwrap(),
-            document_job_entry(&newer_job).unwrap(),
-        ],
-    )
-    .await;
+    let newer_status = MaterializationStatusRecord::pending(&newer_event, 2);
+    let racing = vec![
+        create_event_entry(&newer_event).unwrap(),
+        materialization_status_entry(&newer_status).unwrap(),
+        materialization_job_entry(&newer_job).unwrap(),
+        document_job_entry(&newer_job).unwrap(),
+    ];
 
-    commit_finish(&storage, plan).await.unwrap();
+    let lost = finish_racing(&storage, finished.clone(), racing).await;
+    assert!(lost.is_err_and(|error| CommitFinishOperation::is_conflict(&error)));
+    let context = aruna_drivers::testing::test_context(storage.clone());
+    finish_chunk(&context, finished).await.unwrap();
+
+    assert_eq!(stored_status(&storage, document_id).await, Some(newer_status));
 
     let (jobs, _, _) = scan_due_jobs(
         &storage,

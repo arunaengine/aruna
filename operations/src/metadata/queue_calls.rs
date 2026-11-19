@@ -345,40 +345,45 @@ fn plan_parks_job() {
         job: job(1),
         status,
     };
-    let mut plan = PlanFinishOperation::new(vec![parked]);
-    plan.stamp(5);
+    let mut commit = CommitFinishOperation::new(vec![parked]);
+    commit.stamp(5);
     let dead_letter = (
         DEAD_LETTER_KEYSPACE.to_string(),
         dead_letter_key(document_id, event_id),
     );
     let reads = vec![status_read(document_id), dead_letter];
-    assert_eq!(plan.first(), Ok(Next::Call(IoCall::Read(reads))));
-    let Ok(Next::Done(rows)) = plan.next(IoResult::Values(vec![None, None])) else {
-        panic!("expected the finish plan");
+    assert_eq!(commit.first(), Ok(Next::Call(IoCall::Read(reads))));
+    let written = commit.next(IoResult::Values(vec![None, None]));
+    let Ok(Next::Call(IoCall::Write(writes))) = written else {
+        panic!("expected the finish writes, got {written:?}");
     };
-    let parks = (rows.writes.iter()).any(|(space, _, _)| space == DEAD_LETTER_KEYSPACE);
-    assert!(parks);
-    assert!(rows.deletes.contains(&global_row(job_key())));
+    assert!((writes.iter()).any(|(space, _, _)| space == DEAD_LETTER_KEYSPACE));
+    let deleted = commit.next(IoResult::Done);
+    let Ok(Next::Call(IoCall::Delete(deletes))) = deleted else {
+        panic!("expected the finish deletes, got {deleted:?}");
+    };
+    assert!(deletes.contains(&global_row(job_key())));
 }
 
+// The guard reads run in the write transaction, so a status written meanwhile fails the
+// commit with a conflict the drain's retry reruns, and the writes come before the deletes.
 #[test]
 fn commit_writes_first() {
-    let row = (
-        MATERIALIZATION_STATUS_KEYSPACE.to_string(),
-        Key::from(vec![1]),
-        Value::from(vec![2]),
-    );
-    let delete = global_row(job_key());
-    let plan = FinishPlan {
-        writes: vec![row.clone()],
-        deletes: vec![delete.clone()],
+    let status = materialization_failure_status(&job(1), &event(), ("boom".into(), 10), true, 5);
+    let parked = FinishedMaterializationJob::Parked {
+        job_key: job_key(),
+        job: job(1),
+        status,
     };
-    let mut commit = CommitFinishOperation::new(plan);
+    let mut commit = CommitFinishOperation::new(vec![parked]);
     assert_eq!(commit.transaction(), TransactionMode::Write);
-    assert_eq!(commit.first(), Ok(Next::Call(IoCall::Write(vec![row]))));
-    let deleted = commit.next(IoResult::Done);
-    assert_eq!(deleted, Ok(Next::Call(IoCall::Delete(vec![delete]))));
+    assert!(matches!(commit.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let written = commit.next(IoResult::Values(vec![None, None]));
+    assert!(matches!(written, Ok(Next::Call(IoCall::Write(_)))));
+    assert!(matches!(commit.next(IoResult::Done), Ok(Next::Call(IoCall::Delete(_)))));
     assert_eq!(commit.next(IoResult::Done), Ok(Next::Done(())));
+    let conflict = Error::from(IoError::Conflict);
+    assert!(CommitFinishOperation::is_conflict(&conflict));
 }
 
 fn drain_result(turn: MaterializationTurn<MetadataDrainResult>) -> MetadataDrainResult {
@@ -429,11 +434,6 @@ fn syncing(graph_iri: &str) -> MaterializationBatchOperation {
         ..MaterializationGroupOutcome::default()
     };
     assert!(is_child(&batch.next(group_answer(outcome))));
-    let plan = FinishPlan {
-        writes: Vec::new(),
-        deletes: vec![global_row(job_key())],
-    };
-    assert!(is_child(&batch.next(child(Ok::<_, Error>(plan)))));
     let sync = GraphSyncOperation::new(graph_iri.to_string(), vec![node(2)]);
     let call = IoCall::background(sync);
     same_call(batch.next(child(Ok::<(), Error>(()))), Ok(Next::Call(call)));
