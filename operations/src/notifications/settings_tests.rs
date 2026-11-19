@@ -82,7 +82,13 @@ fn notice() -> NotificationRecord {
         group_id: Ulid::from_bytes([2u8; 16]),
         actor_user_id: owner(),
     };
-    NotificationRecord::new(owner(), NotificationClass::Direct, kind, 1)
+    NotificationRecord::new(
+        ulid::Ulid::new(),
+        owner(),
+        NotificationClass::Direct,
+        kind,
+        1,
+    )
 }
 
 /// The bytes of an on webhook setting written on another node.

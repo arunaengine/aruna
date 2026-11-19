@@ -11,6 +11,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
@@ -72,6 +73,7 @@ pub struct AddRoleOperation {
     step: Step,
     added: Option<AddedRole>,
     now_ms: u64,
+    ids: IdMint,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -189,6 +191,7 @@ impl AddRoleOperation {
             step: Step::Check,
             added: None,
             now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -244,7 +247,7 @@ impl AddRoleOperation {
     /// The group and its document, with the drain wake and the new members' notices made after
     /// it; their failures are only logged, as the change is already durable.
     fn finish(
-        &self,
+        &mut self,
         added: AddedRole,
         drain: Option<IoCall>,
     ) -> Next<(Group, GroupAuthorizationDocument)> {
@@ -260,7 +263,7 @@ impl AddRoleOperation {
 
     /// The notices to the members the role newly added.
     fn added_notice(
-        &self,
+        &mut self,
         auth_doc: &GroupAuthorizationDocument,
         new_members: &[UserId],
     ) -> Option<IoCall> {
@@ -278,6 +281,7 @@ impl AddRoleOperation {
                         realm_id: self.input.actor.realm_id,
                     },
                     self.now_ms,
+                    &mut self.ids,
                 )
             })
             .collect::<Vec<_>>();
@@ -297,6 +301,10 @@ impl Operation for AddRoleOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn first(&mut self) -> Result<Next<(Group, GroupAuthorizationDocument)>, AddRoleError> {

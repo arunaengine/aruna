@@ -9,11 +9,8 @@ use aruna_core::structs::execution::notification::{NotificationOutboxRecord, Not
 use aruna_core::task::{TaskEffect, TaskKey};
 use ulid::Ulid;
 
-pub fn new_outbox_record(record: NotificationRecord) -> NotificationOutboxRecord {
-    NotificationOutboxRecord {
-        outbox_id: Ulid::generate(),
-        record,
-    }
+pub fn new_outbox_record(outbox_id: Ulid, record: NotificationRecord) -> NotificationOutboxRecord {
+    NotificationOutboxRecord { outbox_id, record }
 }
 
 pub(crate) fn schedule_drain_effect() -> Effect {

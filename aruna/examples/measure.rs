@@ -521,6 +521,7 @@ async fn drain_outbox(realm_id: RealmId, nodes: &[TestNode]) -> Result<f64, BoxE
 
 fn notification(realm_id: RealmId) -> NotificationRecord {
     NotificationRecord::new(
+        Ulid::generate(),
         UserId::local(Ulid::generate(), realm_id),
         NotificationClass::Direct,
         NotificationKind::AddedToGroup {

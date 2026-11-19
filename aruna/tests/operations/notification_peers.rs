@@ -257,6 +257,7 @@ async fn read_inbox(node: &Node) -> Vec<NotificationRecord> {
 fn watch_record(recipient: UserId, seed: u8) -> NotificationRecord {
     let key = format!("object-{seed}");
     let mut record = NotificationRecord::new(
+        ulid::Ulid::new(),
         recipient,
         NotificationClass::Transient,
         NotificationKind::DataUploaded {
@@ -323,7 +324,13 @@ fn share_upload(from: &Node, recipient: UserId, bucket: &str, at: u64) -> Notifi
         key: "a.csv".to_string(),
         size_bytes: 1,
     };
-    NotificationRecord::new(recipient, NotificationClass::Direct, kind, at)
+    NotificationRecord::new(
+        ulid::Ulid::new(),
+        recipient,
+        NotificationClass::Direct,
+        kind,
+        at,
+    )
 }
 
 async fn webhook_queued(node: &Node, record: &NotificationRecord) -> bool {
@@ -472,7 +479,13 @@ async fn dropped_upload_unqueued() {
         node_id: a.net.node_id(),
         group_id: data_group_id(),
     };
-    let deletion = NotificationRecord::new(recipient, NotificationClass::Direct, deleted, at);
+    let deletion = NotificationRecord::new(
+        ulid::Ulid::new(),
+        recipient,
+        NotificationClass::Direct,
+        deleted,
+        at,
+    );
     deliver_remote(&a.context, b.net.node_id(), vec![deletion])
         .await
         .expect("deletion delivered");
