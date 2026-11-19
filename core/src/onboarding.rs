@@ -11,6 +11,7 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
 use ulid::Ulid;
@@ -45,7 +46,7 @@ pub enum OnboardingPurpose {
     InitialAdministrator,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardingSecret {
     pub seed_url: String,
     pub enrollment_id: Ulid,
@@ -90,7 +91,7 @@ impl OnboardingSecretState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapOnboardingRequest {
     pub onboarding_secret: String,
     pub node_id: String,
@@ -107,7 +108,7 @@ pub struct BootstrapOnboardingRequest {
     pub node_labels: std::collections::BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapOnboardingResponse {
     pub realm_id: String,
     pub mode: OnboardingMode,
@@ -171,7 +172,7 @@ pub struct CreateSecretRequest {
     pub expires_in_seconds: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateSecretResponse {
     pub onboarding_secret: String,
     /// Identifier of the minted enrollment, the handle the status and revoke
@@ -182,6 +183,61 @@ pub struct CreateSecretResponse {
     /// `aruna://enroll` deep link a device app opens to claim this secret;
     /// `None` for infrastructure modes, which have no device app.
     pub enroll_url: Option<String>,
+}
+
+impl fmt::Debug for OnboardingSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnboardingSecret")
+            .field("seed_url", &self.seed_url)
+            .field("enrollment_id", &self.enrollment_id)
+            .field("mode", &self.mode)
+            .field("realm_id", &self.realm_id)
+            .field("purpose", &self.purpose)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for BootstrapOnboardingRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BootstrapOnboardingRequest")
+            .field("node_id", &self.node_id)
+            .field("node_proof", &self.node_proof)
+            .field("transport_public_key", &self.transport_public_key)
+            .field("issuer_public_key", &self.issuer_public_key)
+            .field("issuer_proof", &self.issuer_proof)
+            .field("node_location", &self.node_location)
+            .field("node_weight", &self.node_weight)
+            .field("node_labels", &self.node_labels)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Leaves out the wrapped realm key, its nonce and the sync ticket.
+impl fmt::Debug for BootstrapOnboardingResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BootstrapOnboardingResponse")
+            .field("realm_id", &self.realm_id)
+            .field("mode", &self.mode)
+            .field(
+                "temporary_bootstrap_endpoint",
+                &self.temporary_bootstrap_endpoint,
+            )
+            .field("wrapping_public_key", &self.wrapping_public_key)
+            .field("delegation_signature", &self.delegation_signature)
+            .field("realm_endpoints", &self.realm_endpoints)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Leaves out the secret and the deep link that carries it.
+impl fmt::Debug for CreateSecretResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateSecretResponse")
+            .field("enrollment_id", &self.enrollment_id)
+            .field("mode", &self.mode)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -323,12 +379,77 @@ pub fn issuer_proof_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingTicket, credential_hash,
+        BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateSecretResponse,
+        OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingTicket,
+        RequestedOnboardingMode, credential_hash,
     };
     use crate::document::DocumentTarget;
     use crate::structs::identity::realm::RealmId;
     use ed25519_dalek::SigningKey;
     use ulid::Ulid;
+
+    #[test]
+    fn secret_debug_hidden() {
+        let secret = OnboardingSecret {
+            seed_url: "http://127.0.0.1:3000".to_string(),
+            enrollment_id: Ulid::from_bytes([1; 16]),
+            secret: [201; 32],
+            mode: OnboardingMode::Server,
+            realm_id: RealmId::from_bytes([5; 32]),
+            purpose: OnboardingPurpose::NodeEnrollment,
+        };
+        assert!(!format!("{secret:?}").contains("201, 201"));
+    }
+
+    #[test]
+    fn request_debug_hidden() {
+        let request = BootstrapOnboardingRequest {
+            onboarding_secret: "hidden-value".to_string(),
+            node_id: "node".to_string(),
+            node_proof: "proof".to_string(),
+            transport_public_key: None,
+            issuer_public_key: None,
+            issuer_proof: None,
+            node_location: None,
+            node_weight: None,
+            node_labels: Default::default(),
+        };
+        assert!(!format!("{request:?}").contains("hidden-value"));
+    }
+
+    #[test]
+    fn response_debug_hidden() {
+        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let response = BootstrapOnboardingResponse {
+            realm_id: "realm".to_string(),
+            mode: OnboardingMode::Management,
+            temporary_bootstrap_endpoint: iroh::EndpointAddr::new(node),
+            wrapped_realm_key: Some("hidden-key".to_string()),
+            wrapped_key_nonce: Some("hidden-nonce".to_string()),
+            wrapping_public_key: None,
+            delegation_signature: None,
+            onboarding_sync_ticket: "hidden-ticket".to_string(),
+            realm_endpoints: Vec::new(),
+        };
+        let shown = format!("{response:?}");
+        for hidden in ["hidden-key", "hidden-nonce", "hidden-ticket"] {
+            assert!(!shown.contains(hidden));
+        }
+    }
+
+    #[test]
+    fn created_debug_hidden() {
+        let response = CreateSecretResponse {
+            onboarding_secret: "hidden-value".to_string(),
+            enrollment_id: "enrollment".to_string(),
+            mode: RequestedOnboardingMode::User,
+            expires_at: 1,
+            enroll_url: Some("aruna://enroll?secret=hidden-link".to_string()),
+        };
+        let shown = format!("{response:?}");
+        assert!(!shown.contains("hidden-value"));
+        assert!(!shown.contains("hidden-link"));
+    }
 
     #[test]
     fn onboarding_secret_roundtrip() {

@@ -5,6 +5,7 @@
 use aruna_core::UserId;
 use aruna_core::auth::valid_token_lifetime;
 use aruna_core::calls::{IoError, IoResult, Next};
+use aruna_core::compute::Secret;
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::validate_restriction_limits;
 use aruna_core::structs::identity::auth::{
@@ -146,14 +147,14 @@ impl CreateTokenOperation {
 }
 
 impl Operation for CreateTokenOperation {
-    type Output = String;
+    type Output = Secret;
     type Error = CreateTokenError;
 
-    fn first(&mut self) -> Result<Next<String>, CreateTokenError> {
-        mint_token(&self.config).map(Next::Done)
+    fn first(&mut self) -> Result<Next<Secret>, CreateTokenError> {
+        mint_token(&self.config).map(Secret::new).map(Next::Done)
     }
 
-    fn next(&mut self, _result: IoResult) -> Result<Next<String>, CreateTokenError> {
+    fn next(&mut self, _result: IoResult) -> Result<Next<Secret>, CreateTokenError> {
         Err(CreateTokenError::NotFinished)
     }
 }
@@ -211,6 +212,26 @@ mod test {
 
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         drive(token_operation, &context).await.unwrap();
+    }
+
+    #[test]
+    fn output_hides_token() {
+        let signing_key: SigningKey = generate_signing_key();
+        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        let mut operation = CreateTokenOperation::new(CreateTokenConfig {
+            time: 1_000_000,
+            expiry: None,
+            user_id: UserId::local(Ulid::from_bytes([1; 16]), realm_id),
+            realm_id,
+            node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
+            session: None,
+            restrictions: None,
+        })
+        .unwrap();
+        let Ok(aruna_core::calls::Next::Done(token)) = operation.first() else {
+            panic!("expected a token");
+        };
+        assert!(!format!("{token:?}").contains(token.expose()));
     }
 
     #[test]

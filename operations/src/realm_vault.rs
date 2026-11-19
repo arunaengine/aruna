@@ -284,7 +284,7 @@ pub(crate) fn sealed_setting(
 }
 
 /// What a peer asks a management node to open.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub enum ServeRequest {
     /// The current revision of a realm vault entry, for a peer in the purpose's fetch scope.
     Secret(RealmSecretRef),
@@ -293,6 +293,19 @@ pub enum ServeRequest {
         target: DocumentTarget,
         bytes: Vec<u8>,
     },
+}
+
+impl std::fmt::Debug for ServeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Secret(reference) => f.debug_tuple("Secret").field(reference).finish(),
+            Self::Setting { target, bytes } => f
+                .debug_struct("Setting")
+                .field("target", target)
+                .field("sealed_len", &bytes.len())
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]

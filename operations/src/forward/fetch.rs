@@ -71,7 +71,7 @@ pub enum FetchError {
 #[derive(Debug, PartialEq)]
 pub struct HolderFetchOperation<T> {
     holders: Vec<NodeId>,
-    frame: Vec<u8>,
+    frame: PeerFrame,
     remaining: Duration,
     budget: Budget,
     asked: Option<usize>,
@@ -86,9 +86,9 @@ impl<T: HolderRecord> HolderFetchOperation<T> {
         deadline: Duration,
         budget: Budget,
     ) -> Self {
-        let (frame, output) = match encode_message(request) {
+        let (frame, output) = match PeerFrame::encode(request) {
             Ok(frame) => (frame, None),
-            Err(error) => (Vec::new(), Some(Ok(Fetched::Unavailable(error)))),
+            Err(error) => (PeerFrame::default(), Some(Ok(Fetched::Unavailable(error)))),
         };
         Self {
             holders: holders.to_vec(),
@@ -116,7 +116,7 @@ impl<T: HolderRecord> HolderFetchOperation<T> {
         smallvec![Effect::Net(NetEffect::MetadataRequest(Box::new(
             MetadataRequestEffect {
                 peer,
-                frame: self.frame.clone(),
+                frame: self.frame.bytes(),
                 timeout,
             }
         )))]
@@ -216,6 +216,28 @@ impl<T: HolderRecord + std::fmt::Debug + PartialEq + Send> EffectOperation
     }
 }
 
+/// An encoded request held for sending. Debug shows its size only: it can carry a bearer token.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct PeerFrame(Vec<u8>);
+
+impl PeerFrame {
+    pub(crate) fn encode(message: &MetadataTransportMessage) -> Result<Self, String> {
+        encode_message(message).map(Self)
+    }
+
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        self.0.clone()
+    }
+}
+
+impl std::fmt::Debug for PeerFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerFrame")
+            .field("frame_bytes", &self.0.len())
+            .finish()
+    }
+}
+
 /// The call that sends one encoded request to `peer`; [`peer_reply`] reads its answer.
 pub(crate) fn peer_call(peer: NodeId, frame: Vec<u8>, timeout: Duration) -> IoCall {
     let request = MetadataRequestEffect {
@@ -256,7 +278,7 @@ pub type PeerAnswer = (NodeId, Result<MetadataTransportMessage, String>);
 /// Asks every peer at once, at most `limit` at a time, and answers once all of them answered.
 #[derive(Debug, PartialEq)]
 pub struct FanoutOperation {
-    requests: Vec<(NodeId, Result<Vec<u8>, String>)>,
+    requests: Vec<(NodeId, Result<PeerFrame, String>)>,
     limit: usize,
     timeout: Duration,
 }
@@ -268,7 +290,7 @@ impl FanoutOperation {
         timeout: Duration,
     ) -> Self {
         let requests = (requests.into_iter())
-            .map(|(peer, message)| (peer, encode_message(&message)))
+            .map(|(peer, message)| (peer, PeerFrame::encode(&message)))
             .collect();
         Self {
             requests,
@@ -317,7 +339,7 @@ impl Operation for FanoutOperation {
     fn first(&mut self) -> Result<Next<Vec<PeerAnswer>>, FetchError> {
         let members: Vec<Effect> = (self.requests.iter())
             .filter_map(|(peer, frame)| {
-                let frame = frame.as_ref().ok()?.clone();
+                let frame = frame.as_ref().ok()?.bytes();
                 Some(Effect::Net(NetEffect::MetadataRequest(Box::new(
                     MetadataRequestEffect {
                         peer: *peer,

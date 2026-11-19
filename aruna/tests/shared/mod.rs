@@ -316,7 +316,9 @@ pub(crate) async fn create_bearer_token(
         })?,
         context,
     )
-    .await?)
+    .await?
+    .expose()
+    .to_string())
 }
 
 /// Stores the user row registration writes; grants wait while a recipient has none.

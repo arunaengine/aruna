@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::fetch::{peer_call, peer_reply};
+use super::fetch::{PeerFrame, peer_call, peer_reply};
 use super::transport::MetadataWriteError;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError, encode_message};
+use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
 use aruna_core::NodeId;
 use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::events::PeerRequestError;
@@ -162,7 +162,7 @@ type HolderTurn = Result<Next<MetadataTransportMessage>, HolderWriteError>;
 /// the walk, so the write is never replayed on another one.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ForwardHoldersOperation {
-    frame: Result<Vec<u8>, String>,
+    frame: Result<PeerFrame, String>,
     holder_count: usize,
     /// Reversed, so the next holder pops off the end.
     remaining: Vec<NodeId>,
@@ -192,7 +192,7 @@ impl ForwardHoldersOperation {
             .collect();
         remaining.reverse();
         Self {
-            frame: encode_message(message),
+            frame: PeerFrame::encode(message),
             holder_count: holders.len(),
             remaining,
             asked: None,
@@ -218,7 +218,11 @@ impl ForwardHoldersOperation {
         };
         let frame = (self.frame.clone()).map_err(HolderWriteError::Undeliverable)?;
         self.asked = Some(holder);
-        Ok(Next::Call(peer_call(holder, frame, HOLDER_ATTEMPT_TIMEOUT)))
+        Ok(Next::Call(peer_call(
+            holder,
+            frame.bytes(),
+            HOLDER_ATTEMPT_TIMEOUT,
+        )))
     }
 
     /// No holder took the write: every holder's capacity or miss, or an undeliverable write.
