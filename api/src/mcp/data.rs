@@ -26,6 +26,7 @@ use aruna_operations::metadata::api::search_types::BucketSearchRequest;
 use aruna_operations::placement::policy::GateOperation;
 use aruna_operations::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::pages::ListRequest;
@@ -33,7 +34,6 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use aruna_operations::s3::object::read::GetRoutedOperation;
-use aruna_operations::staging::bucket_guard::BucketGuardOperation;
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};

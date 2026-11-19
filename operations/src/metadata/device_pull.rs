@@ -52,6 +52,7 @@ use crate::replication::live_queue::{CompletePutInput, CompletePutOperation, Que
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::queue::LiveVersionInput;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::write_guard::{BucketGuardError, BucketGuardOperation};
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
@@ -62,8 +63,6 @@ use crate::s3::object::versions::{
     ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
     ListVersionsResult,
 };
-use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};
-use crate::staging::offered_directory::OfferedDirectoryError;
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, encode_message, peer_call, peer_reply,
 };
@@ -350,8 +349,8 @@ fn read_bucket(result: IoResult, bucket: &str) -> Result<BucketInfo, SyncRefusal
 
 /// A pull writes like a client, so a bucket that is read-only for clients refuses it too.
 fn guard_refusal(error: BucketGuardError, bucket: &str) -> SyncRefusal {
-    match OfferedDirectoryError::from(error) {
-        OfferedDirectoryError::ReadOnly(_) => SyncRefusal::Forbidden,
+    match error {
+        BucketGuardError::ReadOnly(_) => SyncRefusal::Forbidden,
         error => {
             debug!(error = %error, bucket = %bucket, "A sync pull could not check its target bucket");
             SyncRefusal::Unavailable

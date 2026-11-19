@@ -25,7 +25,7 @@ use crate::replication::sync_relationship::{
 };
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};
+use crate::s3::bucket::write_guard::{BucketGuardError, BucketGuardOperation};
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::request_policy::PolicyRequestExtras;
 

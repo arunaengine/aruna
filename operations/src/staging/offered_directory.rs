@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::bucket::create::CreateBucketError;
+use crate::s3::bucket::write_guard::BucketGuardError;
 use crate::s3::usage::UsageUpdateError;
-use crate::staging::bucket_guard::BucketGuardError;
 use crate::staging::offer::list::ListOffersError;
 use aruna_core::UserId;
 use aruna_core::calls::IoError;
@@ -140,8 +140,8 @@ impl From<BucketGuardError> for OfferedDirectoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::s3::bucket::write_guard::BucketGuardOperation;
     use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
-    use crate::staging::bucket_guard::BucketGuardOperation;
     use crate::staging::offer::list::ListOffersOperation;
     use crate::tests::staging::setup_driver_context;
     use aruna_core::effects::StorageEffect;

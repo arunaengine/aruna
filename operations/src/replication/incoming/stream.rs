@@ -43,8 +43,7 @@ use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::{BaoReadError, IncomingBaoOperation, IncomingBaoResult};
 use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};
-use crate::staging::offered_directory::OfferedDirectoryError;
+use crate::s3::bucket::write_guard::{BucketGuardError, BucketGuardOperation};
 use aruna_core::replication_protocol::{
     BaoReadRequest, BaoReadTarget, LocationSummaryRequest, VersionReplicationManifest,
     VersionReplicationMessage,
@@ -797,9 +796,9 @@ impl Operation for ManifestPolicyOperation {
                 // Denied like a missing policy, so the sender stops and no destination is
                 // created. An unbound folder stays `Deleting` until its row is gone.
                 let guard = result.child::<(), BucketGuardError>()?;
-                match guard.map_err(OfferedDirectoryError::from) {
+                match guard {
                     Ok(()) => {}
-                    Err(OfferedDirectoryError::ReadOnly(_)) => return Ok(Next::Done((None, None))),
+                    Err(BucketGuardError::ReadOnly(_)) => return Ok(Next::Done((None, None))),
                     Err(error) => return Err(policy_failed(error)),
                 }
                 let bucket = GetBucketOperation::new(self.manifest.bucket.clone());

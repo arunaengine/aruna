@@ -21,6 +21,7 @@ use aruna_core::structs::storage::share::{
 };
 use aruna_drivers::driver::{drive, drive_retry};
 use aruna_operations::distribution::nonce::SpendNonceOperation;
+use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
 use aruna_operations::s3::object::get::GetObjectInput;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::read::GetRoutedOperation;
@@ -32,7 +33,6 @@ use aruna_operations::shares::rules::{
     NodeScope, numbered_key, relative_path, scope_pattern, upload_key, visit_context,
 };
 use aruna_operations::shares::store::GetShareOperation;
-use aruna_operations::staging::bucket_guard::BucketGuardOperation;
 use aruna_operations::sync::notification_outbox::{
     EmitNotificationsInput, EmitNotificationsOperation,
 };
