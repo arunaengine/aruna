@@ -6,6 +6,7 @@ use super::*;
 use crate::s3::object::search::{ObjectInventoryHit, ObjectKeyMatch, SearchNodeHit};
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::blob::BlobHeadKey;
 use ulid::Ulid;
 
 fn realm() -> RealmId {
@@ -45,6 +46,11 @@ fn started(request: SearchQueryRequest) -> ObjectSearchOperation {
     search
 }
 
+// Resume positions are object head keys, as a node's key index pages them.
+fn head_key(key: &str) -> Vec<u8> {
+    BlobHeadKey::new("data", key).to_bytes().unwrap()
+}
+
 fn page(keys: &[&str], next: Option<&str>) -> SearchNodePage {
     let hit = |key: &&str| SearchNodeHit {
         hit: ObjectInventoryHit {
@@ -58,11 +64,11 @@ fn page(keys: &[&str], next: Option<&str>) -> SearchNodePage {
             updated_at: None,
             metadata: Default::default(),
         },
-        cursor_key: key.as_bytes().to_vec(),
+        cursor_key: head_key(key),
     };
     SearchNodePage {
         hits: keys.iter().map(hit).collect(),
-        next_start_after: next.map(|key| key.as_bytes().to_vec()),
+        next_start_after: next.map(head_key),
         observed_at: UNIX_EPOCH,
         incomplete_ranges: 0,
         remote_ranges: 0,
