@@ -302,7 +302,7 @@ impl TaskQueues {
         // holder would hand back.
         if context.graph_handle.is_some() {
             drive(
-                aruna_operations::device::edit::replay_queued_edits(),
+                aruna_operations::metadata::device::edit::replay_queued_edits(),
                 &context,
             )
             .await

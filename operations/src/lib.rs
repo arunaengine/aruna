@@ -13,6 +13,7 @@ pub mod auth;
 pub mod blob;
 pub mod connectors;
 pub mod device;
+pub mod device_node;
 pub mod distribution;
 pub mod document_repository;
 pub(crate) mod endpoint_screening;

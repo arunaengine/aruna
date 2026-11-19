@@ -12,8 +12,8 @@ use aruna_core::operation::{Operation, Runnable, boxed_suboperation};
 use aruna_core::types::{Key, Value};
 use tracing::warn;
 
-use super::drain::DrainOutcome;
 use super::retry::RetryView;
+use crate::device::publish_queue::DrainOutcome;
 
 /// What forwarding one due queue entry asks of the drain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

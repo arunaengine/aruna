@@ -15,7 +15,7 @@ use aruna_core::placement::target_placement_ref;
 use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::{NodeId, UserId};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_operations::device::realm_documents::fetch_from_peers;
+use aruna_operations::device_node::realm_documents::fetch_from_peers;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::node::api_state::{LoadStateOperation, SaveStateOperation};
 use aruna_operations::notifications::watch::digest::InterestOperation;

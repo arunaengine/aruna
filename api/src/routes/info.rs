@@ -28,7 +28,7 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_drivers::driver::drive;
-use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
+use aruna_operations::device_node::realm_documents::{installed_displays, installed_management_urls};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::federation::totals::DataTotalsOperation;
 use aruna_operations::groups::routing::UsageOperation;

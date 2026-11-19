@@ -19,7 +19,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::VaultRecords;
 use tracing::warn;
 
-use crate::device::forward::{apply_device_batch, serve_graph_state, serve_realm_documents};
 use crate::distribution::forward::{serve_admission, serve_publish};
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
@@ -29,6 +28,7 @@ use crate::groups::forward::ApplyGroupOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::audit::AUDIT_DEADLINE_SECS;
 use crate::metadata::audit_entry::ServeAuditOperation;
+use crate::metadata::device::serve::{apply_device_batch, serve_graph_state, serve_realm_documents};
 use crate::metadata::persistent_id::forward::ServePidOperation;
 use crate::metadata::read_peer::ReadPeerOperation;
 use crate::placement::policy::transport::PolicyAnswer;

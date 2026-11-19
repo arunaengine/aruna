@@ -20,8 +20,8 @@ use tracing::debug;
 use ulid::Ulid;
 
 use super::install_graph::{InstallError, InstallGraphOperation};
-use super::replica::{ReplicaRecord, ReplicaScanError, ReplicaState};
-use super::replica_store::{list_replicas, read_replica, store_replica};
+use crate::device::replica::{ReplicaRecord, ReplicaScanError, ReplicaState};
+use crate::device::replica_store::{list_replicas, read_replica, store_replica};
 use crate::document_repository::{config_of, realm_config};
 use crate::forward::transport::{peer_call_within, timed_answer};
 use crate::metadata::create_document::resolve_metadata_id;

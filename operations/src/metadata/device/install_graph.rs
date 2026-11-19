@@ -15,7 +15,7 @@ use byteview::ByteView;
 use thiserror::Error;
 use tracing::warn;
 
-use super::replica::{ReplicaRecord, ReplicaState, replica_entry, replica_key};
+use crate::device::replica::{ReplicaRecord, ReplicaState, replica_entry, replica_key};
 use crate::metadata::deletion_guard::metadata_call;
 use aruna_core::metadata::protocol::GraphState;
 

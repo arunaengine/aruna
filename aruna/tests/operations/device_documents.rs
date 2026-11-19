@@ -20,7 +20,7 @@ use aruna_drivers::driver::node_facts;
 use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
-use aruna_operations::device::realm_documents::{fetch_realm_documents, realm_removed};
+use aruna_operations::device_node::realm_documents::{fetch_realm_documents, realm_removed};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::sync::replicate_documents::{

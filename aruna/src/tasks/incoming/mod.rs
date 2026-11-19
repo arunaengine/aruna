@@ -66,12 +66,12 @@ use aruna_operations::blob::reclaim_sweep::{
     RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, ReclaimSweepOperation,
 };
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
-use aruna_operations::device::drain::{DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER};
+use aruna_operations::device::publish_queue::DrainOutcome;
 use aruna_operations::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
     UPLOAD_DEFER_AFTER,
 };
-use aruna_operations::device::sync_note::{NoteSyncOperation, SyncNote};
+use aruna_operations::device_node::sync_note::{NoteSyncOperation, SyncNote};
 use aruna_operations::distribution::sharding::MaintainCursors;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::forward::realm::RelayAdminOperation;
@@ -89,6 +89,7 @@ use aruna_operations::jobs::prune::{
 use aruna_operations::jobs::store::job_calls;
 use aruna_operations::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use aruna_operations::metadata::data_links::RetryUnverifiedOperation;
+use aruna_operations::metadata::device::drain::{PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER};
 use aruna_operations::metadata::materialization_queue::{
     JobsExistOperation, MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER,
     MaterializationBatchOperation, MetadataDrainResult, NEXT_BATCH_AFTER, NextTimerOperation,
@@ -771,7 +772,7 @@ impl OperationsTaskHandler {
             }
         }
         let fetched = drive(
-            aruna_operations::device::realm_documents::fetch_realm_documents(
+            aruna_operations::device_node::realm_documents::fetch_realm_documents(
                 self.context.node_and_realm(),
                 REALM_DOCUMENTS_BUDGET,
             ),
@@ -805,8 +806,9 @@ impl OperationsTaskHandler {
     /// Refreshes the metadata replicas this device keeps, on the same beat the
     /// folders run on. A node that keeps none does nothing.
     async fn refresh_device_replicas(&self) {
-        let pass =
-            aruna_operations::device::refresh::refresh_replicas(self.context.node_and_realm());
+        let pass = aruna_operations::metadata::device::refresh::refresh_replicas(
+            self.context.node_and_realm(),
+        );
         if drive(pass, &self.context).await.unwrap_or(0) > 0 {
             let note = NoteSyncOperation::new(SyncNote::Finished, unix_timestamp_millis());
             if let Err(error) = drive(note, &self.context).await {
@@ -1176,7 +1178,7 @@ impl OperationsTaskHandler {
                 }
             }),
             TaskKey::DrainDeviceIntake => Box::pin(async move {
-                let drain = aruna_operations::device::drain::drain_publish_queue(
+                let drain = aruna_operations::metadata::device::drain::drain_publish_queue(
                     self.context.node_and_realm(),
                 );
                 let after = match drive(drain, &self.context)

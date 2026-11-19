@@ -26,12 +26,12 @@ use super::replica::{
     DocumentState, ReplicaRecord, ReplicaScanError, ReplicaState, document_state,
 };
 use super::replica_store::list_replicas;
-use super::scan_rows::{ScanRowsError, ScanRowsOperation};
 use super::sync::folders::FolderError;
 use super::sync::folders::reads::{folder_bases, list_folders, list_transfers};
 use super::sync::outbox::RequeueUploadsOperation;
 use super::sync::repository::SyncUpload;
-use super::sync_note::{DeviceSyncState, sync_state_key};
+use crate::device_node::scan_rows::{ScanRowsError, ScanRowsOperation};
+use crate::device_node::sync_note::{DeviceSyncState, sync_state_key};
 
 /// One selected document in the Sync view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -546,7 +546,7 @@ mod tests {
     use super::*;
     use crate::device::publish_queue::publish_entry;
     use crate::device::replica::ReplicaOrigin;
-    use crate::device::sync_note::{NoteSyncOperation, SyncNote};
+    use crate::device_node::sync_note::{NoteSyncOperation, SyncNote};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;

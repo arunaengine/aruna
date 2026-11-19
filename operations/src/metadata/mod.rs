@@ -15,6 +15,7 @@ pub mod create_entry;
 pub mod data_links;
 pub mod delete_document;
 pub mod deletion_guard;
+pub mod device;
 pub mod device_pull;
 pub mod forward;
 pub mod get_document;

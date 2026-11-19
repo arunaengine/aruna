@@ -31,9 +31,9 @@ use ulid::Ulid;
 use crate::device::backlog::{
     DrainOperation, DrainQueue, ForwardOutcome, forward_member, outcome_rechecks,
 };
-use crate::device::drain::DrainOutcome;
+use crate::device::publish_queue::DrainOutcome;
 use crate::device::retry::{exhausted, retry_due_at};
-use crate::device::scan_rows::{ScanRowsError, ScanRowsOperation};
+use crate::device_node::scan_rows::{ScanRowsError, ScanRowsOperation};
 use crate::document_repository::{config_of, realm_config};
 use aruna_core::structs::identity::realm::NodeRealm;
 
@@ -689,7 +689,7 @@ mod tests {
         ForwardOutcome, ForwardUploadOperation, SettleUploadOperation, StoreUploadOperation,
         SyncPullAck, SyncUpload, UploadState, drain_sync_outbox,
     };
-    use crate::device::drain::DrainOutcome;
+    use crate::device::publish_queue::DrainOutcome;
     use crate::device::sync::repository::requeued;
     use crate::device::sync::repository::{base_key, upload_entry};
     use crate::tests::device::{context, read_value, store_folder, write_rows};

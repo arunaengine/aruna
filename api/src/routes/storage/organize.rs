@@ -16,7 +16,7 @@ use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::auth::error::token_grant;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::unify;
-use aruna_operations::device::scan_rows::ScanRowsOperation;
+use aruna_operations::device_node::scan_rows::ScanRowsOperation;
 use aruna_operations::s3::bucket::linked::{
     BucketJob, BucketJobOperation, LinkedAction, LinkedError, RenameTotalOperation,
     ShownJobOperation,

@@ -21,14 +21,14 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::edit::{DeviceEditError, read_actor, reject_edit};
-use super::publish_queue::{
-    ClaimError, ClaimStateOperation, MAX_PUBLISH_ATTEMPTS, PUBLISH_PAGE_SIZE, PublishEntry,
-    PublishKind, PublishState, entry_with_state, publish_entry, publish_key,
-};
-use super::replica::{ReplicaRecord, SelectionError};
-use super::replica_store::{read_replica, store_replica};
-use super::retry::{exhausted, retry_due_at};
 use super::selection::track_created;
+use crate::device::publish_queue::{
+    ClaimError, ClaimStateOperation, DrainOutcome, MAX_PUBLISH_ATTEMPTS, PUBLISH_PAGE_SIZE,
+    PublishEntry, PublishKind, PublishState, entry_with_state, publish_entry, publish_key,
+};
+use crate::device::replica::{ReplicaRecord, SelectionError};
+use crate::device::replica_store::{read_replica, store_replica};
+use crate::device::retry::{exhausted, retry_due_at};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
@@ -46,17 +46,6 @@ pub const PUBLISH_DEFER_AFTER: Duration = Duration::from_secs(15);
 
 /// Delay between passes while entries are still due.
 pub const PUBLISH_CONTINUE_AFTER: Duration = Duration::from_millis(250);
-
-/// What one drain pass achieved, so the caller knows how soon to look again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DrainOutcome {
-    /// The pass could not complete; earlier pages may already be forwarded.
-    Deferred,
-    /// At least one entry asked for another pass; it does not prove entries remain.
-    Recheck,
-    /// No entry asked for another pass.
-    Idle,
-}
 
 fn queue_page(after: Option<Key>, limit: usize) -> IoCall {
     outside_call(IoCall::Page {
