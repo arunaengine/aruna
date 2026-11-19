@@ -15,16 +15,15 @@ use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_drivers::driver::DriverContext;
+use std::sync::Arc;
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::export::ExportFailure;
 use aruna_operations::jobs::export::resolve::ExportCandidate;
 use aruna_operations::jobs::export::*;
 use aruna_operations::jobs::key_locks::AskWaitsOperation;
 use aruna_operations::replication::bao_read::BaoReadOutput;
-use aruna_operations::tests::export::{
-    BaoNode, FIXTURE_BYTES, byte_stream, encrypting_bucket, export_node, open_candidate,
-    remote_spec, seed_bao,
-};
+use aruna_operations::jobs::export::open::OpenCandidateOperation;
+use aruna_test_support::export::{BaoNode, FIXTURE_BYTES, byte_stream, encrypting_bucket, export_node, remote_spec, seed_bao};
 use futures_util::StreamExt;
 use ulid::Ulid;
 
@@ -117,11 +116,16 @@ async fn remote_read_ephemeral() {
         size,
         blake3,
         ..
-    }) = open_candidate(
+    }) = drive(
+        OpenCandidateOperation::new(
+            SourceScope {
+                spec: Arc::new(remote_spec(realm_id, owner)),
+                owner_node: iroh::SecretKey::from_bytes(&[7; 32]).public(),
+            },
+            candidate.clone(),
+            false,
+        ),
         client.driver.as_ref(),
-        &remote_spec(realm_id, owner),
-        &candidate,
-        false,
     )
     .await
     .unwrap()
@@ -191,11 +195,16 @@ async fn locked_remote_export() {
     .unwrap();
     let candidate = ExportCandidate::remote_exact(source.net.node_id(), exact, version_id, hash);
 
-    let opened = open_candidate(
+    let opened = drive(
+        OpenCandidateOperation::new(
+            SourceScope {
+                spec: Arc::new(remote_spec(realm_id, owner)),
+                owner_node: iroh::SecretKey::from_bytes(&[7; 32]).public(),
+            },
+            candidate.clone(),
+            false,
+        ),
         client.driver.as_ref(),
-        &remote_spec(realm_id, owner),
-        &candidate,
-        false,
     )
     .await;
     let Err(ExportFailure::RemoteLocked {
@@ -287,11 +296,16 @@ async fn plaintext_export_parks() {
     )
     .unwrap();
     let candidate = ExportCandidate::remote_exact(source.net.node_id(), exact, version_id, hash);
-    let opened = open_candidate(
+    let opened = drive(
+        OpenCandidateOperation::new(
+            SourceScope {
+                spec: Arc::new(remote_spec(realm_id, owner)),
+                owner_node: iroh::SecretKey::from_bytes(&[7; 32]).public(),
+            },
+            candidate.clone(),
+            false,
+        ),
         client.driver.as_ref(),
-        &remote_spec(realm_id, owner),
-        &candidate,
-        false,
     )
     .await;
     let Err(ExportFailure::RemoteLocked {

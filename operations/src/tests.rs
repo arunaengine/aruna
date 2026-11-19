@@ -9,7 +9,8 @@ pub(crate) mod calls;
 pub(crate) mod connectors;
 #[cfg(test)]
 pub(crate) mod device;
-pub mod export;
+#[cfg(test)]
+pub(crate) mod export;
 #[cfg(test)]
 pub(crate) mod groups;
 #[cfg(test)]

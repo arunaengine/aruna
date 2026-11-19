@@ -73,6 +73,7 @@ CRATE_TARGETS = {
     "aruna-test-support": (
         "aruna-core",
         "aruna-blob",
+        "aruna-graph",
         "aruna-net",
         "aruna-operations",
         "aruna-drivers",

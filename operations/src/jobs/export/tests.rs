@@ -14,10 +14,8 @@ use crate::blob::permission_paths::MAX_HASH_ALIASES;
 use crate::jobs::repository::test_support::{
     artifact, job_id, job_scope as scoped_job, local_scope, other_node, owner_node, realm,
 };
-use crate::tests::export::{
-    FIXTURE_BYTES, crate_document, job_context, probe_sources, recognized_entities, remote_spec,
-    scope_of,
-};
+use crate::tests::export::{crate_document, job_context, probe_sources, recognized_entities, scope_of};
+use aruna_test_support::export::{FIXTURE_BYTES, remote_spec};
 use aruna_blob::archive::zip_date;
 use aruna_blob::archive::zip_entry;
 use aruna_core::archive_path::safe_zip_path;

@@ -15,11 +15,13 @@ publish = false
 aruna-blob = { workspace = true }
 aruna-core = { workspace = true }
 aruna-drivers = { workspace = true, features = ["test-hooks"] }
+aruna-graph = { workspace = true }
 aruna-net = { workspace = true }
 aruna-operations = { workspace = true }
 aruna-storage = { workspace = true }
 aruna-tasks = { workspace = true }
 axum = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
 irokle = { workspace = true }
