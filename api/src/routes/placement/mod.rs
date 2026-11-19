@@ -72,6 +72,10 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_object_placement, mint_object_placement))
         .routes(routes!(run_bucket_placement))
         .routes(routes!(get_placement_coverage))
+        .routes(routes!(
+            count::get_coverage_count,
+            count::start_coverage_count
+        ))
         .routes(routes!(resolve_placement_quarantine))
 }
 
@@ -1620,7 +1624,7 @@ async fn coverage_here(
             scope,
             start_after: decode_cursor(cursor)?,
             limit: query.limit.unwrap_or(SCAN_DEFAULT_LIMIT),
-            auth_context: auth,
+            auth_context: Some(auth),
         }),
         &state.get_ctx(),
     )
@@ -1945,6 +1949,7 @@ fn quarantine_release(request: &QuarantineResolveRequest) -> ServerResult<Option
 mod tests;
 
 mod coordinators;
+mod count;
 
 #[cfg(test)]
 #[path = "routes_tests.rs"]
