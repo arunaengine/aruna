@@ -503,6 +503,8 @@ pub enum NetEvent {
     InboxWoken,
     /// This node's id, or `None` on a node without a net handle.
     LocalNode(Option<crate::NodeId>),
+    /// The realm this node serves, `None` without a network.
+    LocalRealm(Option<crate::structs::identity::realm::RealmId>),
     /// This node's id and the holders its watch interest matches; `None` without a net handle.
     WatchHolders(Option<(crate::NodeId, Vec<crate::NodeId>)>),
     Heartbeat(crate::heartbeat::HeartbeatEvent),
@@ -527,12 +529,8 @@ pub enum NetEvent {
     HolderAvoided,
     /// The cursor signature, or `None` when this node cannot sign the cursor.
     CursorSigned(Option<iroh::Signature>),
-    /// The caller a forwarded token stands for, or why it is not accepted from that peer.
-    WritePeerAuth(Result<Box<crate::structs::identity::auth::AuthContext>, PeerAuthRefusal>),
     /// The peer's last-contact time is refreshed.
     PeerContact,
-    /// The JSON-LD summary of a dataset, or why it could not be read.
-    DatasetSummary(Result<String, crate::structs::storage::dataset_description::DescriptionError>),
     Shard(Box<ShardNetEvent>),
     /// Whether sync topics took the requested peers.
     TopicPeers(Result<(), TopicPeerError>),
@@ -541,8 +539,6 @@ pub enum NetEvent {
     MissingTopicPeers(Result<Option<Vec<crate::NodeId>>, String>),
     /// This node's signature over a group deletion plan.
     DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
-    /// The verified claims of a token named for revocation, or why it is invalid.
-    RevocationClaims(Result<Box<crate::structs::identity::auth::TokenClaims>, String>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
 }
@@ -1065,8 +1061,6 @@ impl Event {
                     DocumentPeers,
                     GrantedRead,
                     DelegatedRead,
-                    DatasetSummary,
-                    WritePeerAuth,
                     PeerContact,
                     GrantSign,
                     DelegationSign,
@@ -1076,10 +1070,10 @@ impl Event {
                     TopicPeers,
                     MissingTopicPeers,
                     DeletePlanSigned,
-                    RevocationClaims,
                     Notification,
                     InboxWoken,
                     LocalNode,
+                    LocalRealm,
                     WatchHolders,
                     Heartbeat,
                     HeartbeatSilence,

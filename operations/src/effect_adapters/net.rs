@@ -190,6 +190,15 @@ fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Eve
     Ok(Event::Net(NetEvent::Recorded))
 }
 
+/// Refreshes a peer's last-contact time where the net handle keeps it.
+pub(super) fn note_contact(peer: NodeId, context: &DriverContext) -> Event {
+    if let Some(net) = &context.net_handle {
+        net.peer_contacts()
+            .note(peer, aruna_core::time::unix_timestamp_millis());
+    }
+    Event::Net(NetEvent::PeerContact)
+}
+
 /// Runs the topic peer effects through the handle; hands any other effect back.
 async fn set_topic_peers(effect: NetEffect, context: &DriverContext) -> Result<Event, NetEffect> {
     let Some(net) = &context.net_handle else {

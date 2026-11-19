@@ -10,6 +10,7 @@ mod config;
 mod connection_pool;
 mod connectivity;
 mod construction;
+pub mod contacts;
 pub mod device_limits;
 pub mod dht;
 mod discovery;
@@ -129,6 +130,7 @@ struct NetInner {
     inbound_admission: streams::InboundAdmission,
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     heartbeats: Arc<heartbeat::HeartbeatTable>,
+    peer_contacts: contacts::PeerContacts,
     download_gauge: Arc<aruna_core::download_slots::DownloadGauge>,
     avoided_holders: aruna_core::download_slots::AvoidList,
     notification_watch_metrics: NotificationWatchMetrics,
@@ -543,6 +545,11 @@ impl NetHandle {
     }
 
     /// Time since the last heartbeat of `node`, or since this node started without one.
+    /// When this node last saw each authorized peer.
+    pub fn peer_contacts(&self) -> contacts::PeerContacts {
+        self.inner.peer_contacts.clone()
+    }
+
     pub fn heartbeat_silence(&self, node: NodeId) -> Duration {
         self.inner.heartbeats.silence(&node)
     }
@@ -1091,8 +1098,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::RefreshDocumentPeers(_)) => "refresh_document_peers",
         Effect::Net(NetEffect::GrantedRead(_)) => "granted_read",
         Effect::Net(NetEffect::DelegatedRead(_)) => "delegated_read",
-        Effect::Net(NetEffect::DatasetSummary(_)) => "dataset_summary",
-        Effect::Net(NetEffect::WritePeerAuth(_)) => "write_peer_auth",
         Effect::Net(NetEffect::PeerContact(_)) => "peer_contact",
         Effect::Net(NetEffect::GrantSign(_)) => "grant_sign",
         Effect::Net(NetEffect::DelegationSign(_)) => "delegation_sign",
@@ -1103,7 +1108,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::AllowTopicPeers { .. }) => "allow_topic_peers",
         Effect::Net(NetEffect::SyncTopic { .. }) => "sync_topic",
         Effect::Net(NetEffect::MissingTopicPeers { .. }) => "missing_topic_peers",
-        Effect::Net(NetEffect::RevocationClaims(_)) => "revocation_claims",
         Effect::Net(NetEffect::Notification(_)) => "notification",
         Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
         Effect::Net(NetEffect::Heartbeat(_)) => "heartbeat",
@@ -1111,6 +1115,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::DashboardChanged) => "dashboard_changed",
         Effect::Net(NetEffect::RecordSuppression(_)) => "record_suppression",
         Effect::Net(NetEffect::LocalNode) => "local_node",
+        Effect::Net(NetEffect::LocalRealm) => "local_realm",
         Effect::Net(NetEffect::WatchHolders { .. }) => "watch_holders",
         Effect::Net(NetEffect::RegisterInterest { .. }) => "register_interest",
         Effect::Net(NetEffect::RetractInterest(_)) => "retract_interest",

@@ -1986,7 +1986,7 @@ async fn reports_device_seen() {
             });
     }
     let now_ms = 1_000_000;
-    let window = aruna_operations::metadata::PEER_CONTACT_WINDOW.as_millis() as u64;
+    let window = aruna_net::contacts::PEER_CONTACT_WINDOW.as_millis() as u64;
     let contacts = PeerContacts::default();
     contacts.note(recent, now_ms - window);
     contacts.note(stale, now_ms - window - 1);

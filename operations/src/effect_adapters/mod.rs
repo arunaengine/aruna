@@ -128,21 +128,10 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::MetadataRequest(request)) => {
             Box::pin(metadata::dispatch_request(*request, context)).await
         }
-        // Token validation state lives in the metadata handle the runner holds.
-        Effect::Net(NetEffect::WritePeerAuth(request)) => {
-            Box::pin(metadata::dispatch_peer_auth(*request, context)).await
-        }
-        // Peer contacts live in the metadata handle the runner holds.
-        Effect::Net(NetEffect::PeerContact(peer)) => metadata::dispatch_contact(peer, context),
-        // The routed export reads through the handles the runner holds.
-        Effect::Net(NetEffect::DatasetSummary(request)) => {
-            metadata::dispatch_summary(*request, context).await
-        }
+        // Peer contacts live on the net handle the runner holds.
+        Effect::Net(NetEffect::PeerContact(peer)) => net::note_contact(peer, context),
         Effect::Net(NetEffect::Shard(effect)) => {
             Box::pin(shard::dispatch_shard(*effect, context)).await
-        }
-        Effect::Net(NetEffect::RevocationClaims(token)) => {
-            Box::pin(metadata::dispatch_revocation_claims(*token, context)).await
         }
         // Notification frames and inbox wakes need the net handle the runner holds.
         Effect::Net(NetEffect::Notification(request)) => {
@@ -169,6 +158,10 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::LocalNode) => {
             let node = context.net_handle.as_ref().map(|net| net.node_id());
             Event::Net(NetEvent::LocalNode(node))
+        }
+        Effect::Net(NetEffect::LocalRealm) => {
+            let realm = context.net_handle.as_ref().map(|net| *net.realm_id());
+            Event::Net(NetEvent::LocalRealm(realm))
         }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
         Effect::Outbound(OutboundEffect::ListRange(listing)) => {

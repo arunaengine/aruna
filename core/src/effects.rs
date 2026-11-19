@@ -844,14 +844,9 @@ pub enum NetEffect {
     /// Signs the signing bytes of a search cursor; only a cursor naming this node as signer.
     /// Answers `NetEvent::CursorSigned`.
     CursorSign(Vec<u8>),
-    /// Checks a forwarded caller's token for a write from `peer`; answers
-    /// `NetEvent::WritePeerAuth`.
-    WritePeerAuth(Box<WritePeerRequest>),
     /// Refreshes the last-contact time of a peer whose request was just accepted; answers
     /// `NetEvent::PeerContact`.
     PeerContact(NodeId),
-    /// Reads a dataset's summary from its holders; answers `NetEvent::DatasetSummary`.
-    DatasetSummary(Box<crate::structs::storage::dataset_description::DatasetSummaryRequest>),
     /// Asks how long each node has been silent; answers `NetEvent::HeartbeatSilence`.
     HeartbeatSilence(Vec<NodeId>),
     /// Works on this node's shard topics; answers `NetEvent::Shard`.
@@ -880,15 +875,14 @@ pub enum NetEffect {
     /// Signs this node's statement that it is ready for a group deletion plan; answers
     /// `NetEvent::DeletePlanSigned`.
     SignDeletePlan(Box<crate::structs::identity::group_delete::GroupDeletePlan>),
-    /// Verifies a token that may already be revoked and reads its claims; answers
-    /// `NetEvent::RevocationClaims`.
-    RevocationClaims(Box<crate::metadata::AuthToken>),
     /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
     DashboardChanged,
     /// Records one suppressed watch delivery in this node's watch metrics.
     RecordSuppression(crate::metrics::WatchMetricReason),
     /// Asks for this node's id; answers `NetEvent::LocalNode`.
     LocalNode,
+    /// Asks for the realm this node serves; answers `NetEvent::LocalRealm`.
+    LocalRealm,
     /// Asks which holders this node's watch interest matches; answers `NetEvent::WatchHolders`.
     WatchHolders {
         realm_id: crate::structs::identity::realm::RealmId,
@@ -978,15 +972,6 @@ pub struct MetadataRequestEffect {
     pub peer: NodeId,
     pub frame: Vec<u8>,
     pub timeout: Duration,
-}
-
-/// A forwarded caller's credential and the peer that forwarded it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WritePeerRequest {
-    pub peer: NodeId,
-    pub token: crate::metadata::AuthToken,
-    /// Whether an accepted caller refreshes the peer's last-contact time.
-    pub contact: bool,
 }
 
 /// Shows the frame size only: a frame can carry credentials or the realm key.

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::tests::calls::{called, child, node, runs_child};
+use crate::tests::calls::{child, node, runs_child};
 use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use ulid::Ulid;
@@ -82,20 +82,13 @@ fn verifying(auth: AuthContext, token: &str) -> ApplyRevokeOperation {
     let mut operation = operation(message(token));
     assert!(runs_child(operation.next(config_read())));
     assert_eq!(operation.stage, ApplyStage::Caller);
-    let IoCall::Effect(effect) = called(operation.next(child(Ok::<_, ForwardAuthError>(auth))))
-    else {
-        panic!("expected the token check");
-    };
-    assert!(matches!(
-        *effect,
-        Effect::Net(NetEffect::RevocationClaims(_))
-    ));
+    let check = operation.next(child(Ok::<_, ForwardAuthError>(auth)));
+    assert!(runs_child(check));
     operation
 }
 
 fn verified(claims: TokenClaims) -> IoResult {
-    let event = NetEvent::RevocationClaims(Ok(Box::new(claims)));
-    IoResult::Event(Box::new(Event::Net(event)))
+    child(Ok::<_, ArunaBearerError>(claims))
 }
 
 fn own_claims() -> TokenClaims {
@@ -154,8 +147,7 @@ fn internal_token_denied() {
 
 #[test]
 fn invalid_target_rejected() {
-    let event = NetEvent::RevocationClaims(Err("bad signature".to_string()));
-    let answer = IoResult::Event(Box::new(Event::Net(event)));
+    let answer = child(Err::<TokenClaims, _>(ArunaBearerError::TokenRevoked));
     assert!(is_rejected(verifying(caller(), "target").next(answer)));
 }
 

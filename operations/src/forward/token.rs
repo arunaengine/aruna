@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::error::AuthorizeError;
+use crate::auth::bearer_token::DecodeTokenOperation;
+use crate::auth::error::{ArunaBearerError, AuthorizeError};
 use crate::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
@@ -15,16 +16,15 @@ use crate::forward::routing::distinct_holders;
 use crate::forward::transport::{ForwardError, reject};
 use crate::metadata::message_kind::transport_message_kind;
 use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
+use crate::metadata::write_peer::forwarded_checks;
 use aruna_core::NodeId;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::Secret;
-use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent, PeerRequestError};
+use aruna_core::events::PeerRequestError;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::placement::selector::select_top_peers;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, TokenClaims};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use std::str::FromStr;
@@ -261,13 +261,16 @@ impl ApplyRevokeOperation {
             return done(reject("unexpected token revocation message"));
         };
         let target = match AuthToken::bearer(token.expose()) {
-            Ok(target) => target,
+            Ok(AuthToken::Bearer(target)) => target,
+            Ok(_) => return done(reject("only a bearer token can be revoked")),
             Err(error) => return done(reject(format!("invalid token revocation target: {error}"))),
         };
         self.auth = Some(auth);
         self.stage = ApplyStage::Claims;
-        let effect = Effect::Net(NetEffect::RevocationClaims(Box::new(target)));
-        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
+        // The named token may already be revoked; its claims are read without that check.
+        let checks = forwarded_checks(self.local.map(|(_, realm_id)| realm_id), true);
+        let decode = DecodeTokenOperation::new(target.as_str(), checks);
+        Ok(Next::Call(IoCall::child(decode)))
     }
 
     /// A path-restricted caller may retire only the token it presented, never another one.
@@ -359,15 +362,9 @@ impl Operation for ApplyRevokeOperation {
                 Ok(auth) => self.read_claims(auth),
                 Err(error) => done(forward_auth_error(error)),
             },
-            ApplyStage::Claims => match event(result)? {
-                Event::Net(NetEvent::RevocationClaims(Ok(claims))) => self.admit(*claims),
-                Event::Net(NetEvent::RevocationClaims(Err(error))) => {
-                    done(reject(format!("invalid token revocation target: {error}")))
-                }
-                other => Err(IoError::Unexpected {
-                    expected: "the claims of a token",
-                    got: other.label(),
-                }),
+            ApplyStage::Claims => match result.child::<TokenClaims, ArunaBearerError>()? {
+                Ok(claims) => self.admit(claims),
+                Err(error) => done(reject(format!("invalid token revocation target: {error}"))),
             },
             ApplyStage::Write => match result.child::<(), AuthorizeError>()? {
                 Ok(()) => self.revoke_token(),

@@ -3,161 +3,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::effects::{StorageEffect, WritePeerRequest};
-use aruna_core::events::{Event, PeerAuthRefusal, StorageEvent};
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::identity::auth::{AuthContext, TokenClaims};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 
-use super::{AuthValidationState, MetadataHandle, WritePeerError};
-use crate::auth::bearer_token::UserCutoffOperation;
-use crate::auth::error::ArunaBearerError;
+use super::AuthValidationState;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::metadata::contact::PeerContacts;
 use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
 use aruna_core::metadata::AuthToken;
-
-impl MetadataHandle {
-    /// Validates a forwarded caller's bearer token and confirms the forwarding
-    /// peer belongs to the token's realm, exactly as the query/search paths do.
-    pub(crate) async fn authorize_remote_peer(
-        &self,
-        peer: NodeId,
-        auth_token: Option<AuthToken>,
-    ) -> Result<Option<AuthContext>, MetadataError> {
-        authorize_peer(
-            &self.inner.auth_validation,
-            &self.inner.storage_handle,
-            peer,
-            self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
-            auth_token,
-            true,
-        )
-        .await
-    }
-
-    pub(crate) async fn authorize_write_peer(
-        &self,
-        peer: NodeId,
-        auth_token: Option<AuthToken>,
-    ) -> Result<AuthContext, WritePeerError> {
-        let Some(auth_token) = auth_token else {
-            return Err(WritePeerError::Unauthorized);
-        };
-        let AuthToken::Bearer(token) = auth_token else {
-            let auth_token = replay_authority(&self.inner.storage_handle, auth_token).await?;
-            let auth = self
-                .authorize_remote_peer(peer, Some(auth_token))
-                .await
-                .map_err(WritePeerError::Unavailable)?
-                .ok_or(WritePeerError::Unauthorized)?;
-            return Ok(auth);
-        };
-        let auth = self
-            .inner
-            .auth_validation
-            .validate(token.as_str())
-            .await
-            .map_err(|_| WritePeerError::Unauthorized)?;
-        let local_realm_id = self
-            .inner
-            .net_handle
-            .as_ref()
-            .map(|net| *net.realm_id())
-            .ok_or_else(|| {
-                WritePeerError::Unavailable(MetadataError::InvalidInput(
-                    "forwarded metadata auth requires a local serving realm".to_string(),
-                ))
-            })?;
-        if auth.realm_id == local_realm_id {
-            ensure_peer_configured(
-                &self.inner.storage_handle,
-                peer,
-                auth.realm_id,
-                PeerTrust::Member,
-            )
-            .await
-            .map_err(WritePeerError::Unavailable)?;
-        }
-        Ok(auth)
-    }
-
-    /// The answer to a forwarded token, in the terms an operation receives. An accepted caller
-    /// refreshes the peer's last-contact time when the request asks for it.
-    pub(crate) async fn check_write_peer(
-        &self,
-        request: WritePeerRequest,
-    ) -> Result<Box<AuthContext>, PeerAuthRefusal> {
-        let (peer, contact) = (request.peer, request.contact);
-        self.authorize_write_peer(peer, Some(request.token))
-            .await
-            .inspect(|_| {
-                if contact {
-                    self.note_peer_contact(peer);
-                }
-            })
-            .map(Box::new)
-            .map_err(|error| match error {
-                WritePeerError::Unauthorized => PeerAuthRefusal::Unauthorized,
-                WritePeerError::Unavailable(error) => {
-                    PeerAuthRefusal::Unavailable(error.to_string())
-                }
-            })
-    }
-
-    /// This node's own liveness observation, taken where the peer identity is
-    /// authorized. Never realm state: it is neither replicated nor published.
-    pub(crate) fn note_peer_contact(&self, peer: NodeId) {
-        self.inner.peer_contacts.note(peer, unix_timestamp_millis());
-    }
-
-    /// When this node last saw each authorized peer.
-    pub fn peer_contacts(&self) -> PeerContacts {
-        self.inner.peer_contacts.clone()
-    }
-
-    pub(crate) async fn claims_for_revocation(
-        &self,
-        token: &str,
-    ) -> Result<TokenClaims, ArunaBearerError> {
-        self.inner.auth_validation.decode(token, true).await
-    }
-}
-
-/// Unwraps a device replay into the owner authority it carries. A replay is as old as the
-/// earlier of its token issue time and its authoring time; one older than the owner's token
-/// cutoff is refused.
-pub(super) async fn replay_authority(
-    storage_handle: &StorageHandle,
-    auth_token: AuthToken,
-) -> Result<AuthToken, WritePeerError> {
-    let AuthToken::Replay {
-        auth,
-        issued_at,
-        authored_at_ms,
-    } = auth_token
-    else {
-        return Ok(auth_token);
-    };
-    let cutoff = drive(
-        UserCutoffOperation::new(auth.realm_id, &auth.user_id),
-        &DriverContext::storage_only(storage_handle.clone()),
-    )
-    .await
-    .map_err(|error| WritePeerError::Unavailable(MetadataError::Backend(error.to_string())))?;
-    let issued = issued_at.min(authored_at_ms / 1000);
-    match cutoff.is_some_and(|cutoff| issued < cutoff) {
-        true => Err(WritePeerError::Unauthorized),
-        false => Ok(AuthToken::Internal(auth)),
-    }
-}
 
 pub(super) async fn remote_auth_context(
     state: &AuthValidationState,
