@@ -1,27 +1,25 @@
-//! Reads a key of a distributed bucket where an S3 GET of the caller would be answered: a current
-//! version at the range's coordinator or a copy, a pinned one at a holder of its records.
+//! Decides where a GET or HEAD of a distributed bucket's key is answered: a current version at
+//! the range's coordinator or a copy, a pinned one at a holder of its records (D33).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect, NetEffect};
-use aruna_core::events::{BlobEvent, Event, NetEvent};
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::holder_choice::{HolderCandidate, HolderChoiceError, HolderChoiceOperation, pick};
-use aruna_core::jobs::ByteStream;
-use aruna_core::member_read::{MemberAnswer, MemberGet};
+use aruna_core::member_read::{MemberAnswer, MemberBody, MemberFetch};
 use aruna_core::node_state::{NodeInfoError, NodeUrlsOperation};
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::outbound::{OutboundEffect, OutboundEvent};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::delegation::{
-    COPY_READ_HEADER, DELEGATION_HEADER, Delegation, Payload, SignedDelegation, request_digest,
+    COPY_READ_HEADER, DELEGATION_HEADER, Payload, SignedDelegation, request_digest,
 };
 use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute, RouteError};
 use aruna_core::structs::storage::node_info::NodeUrls;
-use aruna_core::types::GroupId;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use ulid::Ulid;
 
@@ -29,15 +27,15 @@ use crate::distribution::delegate::{DelegationInput, unsigned_delegation};
 use crate::distribution::guard::GuardError;
 use crate::distribution::resolve::key_holders;
 use crate::distribution::routing::{copy_readers, read_coordinator, route_read};
-use crate::s3::object::archive::EntryStatus;
+use crate::s3::object::range_list::DelegatedCaller;
 
 /// How long a delegation lets a caller without a credential act.
 const ANONYMOUS_SECS: u64 = 60;
 const ACCEPT_ANY: &str = "*/*";
 const NOT_FOUND: u16 = 404;
-/// The status of a member that gave no answer, as of a coordinator out of reach.
-const UNREACHED: u16 = 503;
+const CONFLICT: u16 = 409;
 const FAILED_HERE: u16 = 500;
+const UNREACHED: u16 = 503;
 
 /// Characters a key keeps unescaped in a forwarded path; `/` separates its segments.
 const KEY_SET: &AsciiSet = &NON_ALPHANUMERIC
@@ -47,83 +45,141 @@ const KEY_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~')
     .remove(b'/');
 
-/// Where a member of a distributed bucket reads a key for the caller.
+type Header = (String, String);
+
+/// Where a read of a key is answered.
 #[derive(Debug, PartialEq)]
 pub enum MemberRead {
-    /// This node reads its own records; `Some` names a range its copy serves while the
-    /// coordinator cannot, so the version may be behind.
+    /// This node answers; `Some` names the range whose copy here stands in for a coordinator
+    /// that cannot answer, so the answer may be behind.
     Local(Option<Ulid>),
-    /// The member that serves the key answered with this version and its bytes.
+    /// Another member answered; `stale` names the range when a copy did.
     Remote {
-        version: Ulid,
-        blob: ByteStream,
+        body: MemberBody,
         stale: Option<Ulid>,
     },
 }
 
-/// The caller this node verified and sends other members under a delegation.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MemberCaller {
-    pub auth: AuthContext,
-    pub group_id: GroupId,
-    /// Unix seconds at which the caller's credential expires.
-    pub credential_expiry: u64,
-}
-
-/// The key and, when pinned, the version a read asks for.
+/// The read a member receives: `version` pins it, and `query` and `headers` travel with it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemberKey {
     pub bucket: String,
     pub key: String,
     pub version: Option<Ulid>,
+    pub head: bool,
+    pub query: Option<String>,
+    /// Lowercase names; a later value of a name replaces an earlier one.
+    pub headers: Vec<Header>,
 }
 
-/// Why a member gave no bytes, as the status and S3 code of its answer.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MemberRefusal {
-    status: u16,
-    code: Option<String>,
-}
-
-impl MemberRefusal {
-    fn new(status: u16) -> Self {
-        Self { status, code: None }
+impl MemberKey {
+    fn plain(bucket: &str, key: &str, version: Option<Ulid>, head: bool) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version,
+            head,
+            query: version.map(|version| format!("versionId={version}")),
+            headers: Vec::new(),
+        }
     }
 
-    fn unreachable(&self) -> bool {
-        self.status >= FAILED_HERE
+    pub fn get(bucket: &str, key: &str, version: Option<Ulid>) -> Self {
+        Self::plain(bucket, key, version, false)
     }
 
-    fn entry_status(&self) -> EntryStatus {
-        match self.code.as_deref() {
-            Some("NoSuchKey" | "NoSuchVersion" | "MethodNotAllowed") => EntryStatus::Missing,
-            Some("AccessDenied") => EntryStatus::Denied,
-            _ => EntryStatus::Unavailable,
+    pub fn head(bucket: &str, key: &str) -> Self {
+        Self::plain(bucket, key, None, true)
+    }
+
+    fn operation(&self) -> &'static str {
+        match self.head {
+            true => "HeadObject",
+            false => "GetObject",
         }
     }
 }
 
-impl From<IoError> for MemberRefusal {
-    fn from(_: IoError) -> Self {
-        Self::new(FAILED_HERE)
+/// Why no member's bytes came back.
+#[derive(Debug, PartialEq)]
+pub enum MemberRefusal {
+    /// The member answered with this refusal.
+    Refused {
+        node_id: NodeId,
+        status: u16,
+        code: Option<String>,
+        message: String,
+    },
+    /// The member has no published endpoint, cannot be reached or started no answer in time.
+    Unreachable {
+        set_id: Ulid,
+        range_id: Ulid,
+        node_id: NodeId,
+        late: bool,
+    },
+    /// The key could not be routed.
+    Route(GuardError),
+    /// This node could not send the read.
+    Failed(String),
+}
+
+impl MemberRefusal {
+    /// The HTTP status this refusal stands for.
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::Refused { status, .. } => *status,
+            Self::Unreachable { .. } => UNREACHED,
+            Self::Failed(_) => FAILED_HERE,
+            Self::Route(
+                GuardError::NotCoordinator { .. }
+                | GuardError::RecordMissing(_)
+                | GuardError::Unreadable(_)
+                | GuardError::Route(
+                    RouteError::Pending(_) | RouteError::Moving(_) | RouteError::StaleRange(_),
+                ),
+            ) => UNREACHED,
+            Self::Route(
+                GuardError::Route(
+                    RouteError::Deleting(_) | RouteError::NotMember(_) | RouteError::NoRange(_),
+                )
+                | GuardError::Unbound(_),
+            ) => CONFLICT,
+            Self::Route(GuardError::Conversion(_)) => FAILED_HERE,
+        }
+    }
+
+    /// Whether another member may answer in its place.
+    fn unreachable(&self) -> bool {
+        self.status() >= FAILED_HERE
     }
 }
 
-/// A routing failure as a refusal; only a retryable one lets a copy answer instead.
-fn guard_refusal(error: &GuardError) -> MemberRefusal {
-    MemberRefusal::new(match error {
-        GuardError::NotCoordinator { .. }
-        | GuardError::RecordMissing(_)
-        | GuardError::Unreadable(_)
-        | GuardError::Route(
-            RouteError::Pending(_) | RouteError::Moving(_) | RouteError::StaleRange(_),
-        ) => UNREACHED,
-        GuardError::Route(
-            RouteError::Deleting(_) | RouteError::NotMember(_) | RouteError::NoRange(_),
-        )
-        | GuardError::Unbound(_) => 409,
-        GuardError::Conversion(_) => FAILED_HERE,
-    })
+impl From<IoError> for MemberRefusal {
+    fn from(error: IoError) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
+
+/// A failed read; `stale` names the range when a standing-in copy refused it.
+#[derive(Debug, PartialEq)]
+pub struct MemberFailure {
+    pub refusal: MemberRefusal,
+    pub stale: Option<Ulid>,
+}
+
+impl From<IoError> for MemberFailure {
+    fn from(error: IoError) -> Self {
+        MemberRefusal::from(error).into()
+    }
+}
+
+impl From<MemberRefusal> for MemberFailure {
+    fn from(refusal: MemberRefusal) -> Self {
+        Self {
+            refusal,
+            stale: None,
+        }
+    }
 }
 
 /// The range and member one read goes to.
@@ -134,44 +190,42 @@ struct MemberTarget {
     node_id: NodeId,
 }
 
-/// What a member answered: its bytes and the version it names for them.
 #[derive(Debug, PartialEq)]
-struct MemberBody {
-    version: Option<String>,
-    stream: ByteStream,
-}
-
-#[derive(Debug, PartialEq)]
-enum GetStep {
+enum FetchStep {
     Urls,
     Sign { base: String, headers: Vec<Header> },
     Answer,
     Avoid(MemberRefusal),
 }
 
-type Header = (String, String);
-type GetTurn = Result<Next<MemberBody>, MemberRefusal>;
+type FetchTurn = Result<Next<MemberBody>, MemberRefusal>;
 
-/// One GET at one member under a delegation bound to exactly this request. A member that fails
+/// One read at one member under a delegation bound to exactly this request. A member that fails
 /// is skipped in holder choices for a while.
 #[derive(Debug, PartialEq)]
-struct MemberGetOperation {
+struct MemberFetchOperation {
     ids: Option<(NodeId, RealmId)>,
-    caller: MemberCaller,
+    caller: DelegatedCaller,
     target: MemberTarget,
     object: MemberKey,
     /// Asks a copy to answer while the range's coordinator cannot.
     copy_read: bool,
     now_ms: u64,
-    step: GetStep,
+    step: FetchStep,
 }
 
-impl MemberGetOperation {
-    fn query(&self) -> Option<String> {
-        (self.object.version).map(|version| format!("versionId={version}"))
+impl MemberFetchOperation {
+    fn unreached(&self, late: bool) -> MemberRefusal {
+        let target = &self.target;
+        MemberRefusal::Unreachable {
+            set_id: target.set_id,
+            range_id: target.range_id,
+            node_id: target.node_id,
+            late,
+        }
     }
 
-    fn failed(&mut self, refusal: MemberRefusal) -> GetTurn {
+    fn failed(&mut self, refusal: MemberRefusal) -> FetchTurn {
         if !refusal.unreachable() {
             return Err(refusal);
         }
@@ -179,111 +233,129 @@ impl MemberGetOperation {
             node_id: self.target.node_id,
             now_ms: self.now_ms,
         };
-        self.step = GetStep::Avoid(refusal);
+        self.step = FetchStep::Avoid(refusal);
         Ok(Next::Call(Effect::Net(avoid).into()))
     }
 
-    /// The delegation for exactly this GET and the headers it binds.
-    fn sign(&mut self, base: String) -> GetTurn {
+    /// The delegation for exactly this read and the headers it binds.
+    fn sign(&mut self, base: String) -> FetchTurn {
         let Some(ids) = self.ids else {
-            return self.failed(MemberRefusal::new(FAILED_HERE));
+            let refusal = MemberRefusal::Failed("this node has no signing key".to_string());
+            return self.failed(refusal);
         };
-        let mut headers = vec![("accept".to_string(), ACCEPT_ANY.to_string())];
+        let object = &self.object;
+        let mut headers: BTreeMap<String, String> = object.headers.iter().cloned().collect();
+        (headers.entry("accept".to_string())).or_insert_with(|| ACCEPT_ANY.to_string());
         if self.copy_read {
-            headers.push((COPY_READ_HEADER.to_string(), "1".to_string()));
+            headers.insert(COPY_READ_HEADER.to_string(), "1".to_string());
         }
         let bound: Vec<_> = (headers.iter())
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
-        let object = &self.object;
-        let query = self.query();
-        let digest = request_digest("GET", &object.bucket, &object.key, query.as_deref(), &bound);
+        let method = if object.head { "HEAD" } else { "GET" };
+        let query = object.query.as_deref();
+        let digest = request_digest(method, &object.bucket, &object.key, query, &bound);
         let now_secs = self.now_ms / 1000;
-        let auth = &self.caller.auth;
-        let credential_expiry = match auth.user_id.is_nil() {
+        let caller = &self.caller;
+        let credential_expiry = match caller.user_id.is_nil() {
             true => now_secs.saturating_add(ANONYMOUS_SECS),
-            false => self.caller.credential_expiry,
+            false => caller.credential_expiry,
         };
         let input = DelegationInput {
             set_id: self.target.set_id,
             range_id: self.target.range_id,
             target: self.target.node_id,
-            user_id: auth.user_id,
-            group_id: self.caller.group_id,
-            credential_id: String::new(),
-            restrictions: auth.path_restrictions.clone(),
+            user_id: caller.user_id,
+            group_id: caller.group_id,
+            credential_id: caller.credential_id.clone(),
+            restrictions: caller.restrictions.clone(),
             credential_expiry,
-            operation: "GetObject".to_string(),
+            operation: object.operation().to_string(),
             bucket: object.bucket.clone(),
             key: object.key.clone(),
             copy_source: None,
             request_digest: digest,
             payload: Payload::Empty,
         };
-        let delegation: Delegation = unsigned_delegation(ids, input, now_secs);
-        self.step = GetStep::Sign { base, headers };
+        let delegation = unsigned_delegation(ids, input, now_secs);
+        let headers = headers.into_iter().collect();
+        self.step = FetchStep::Sign { base, headers };
         let sign = NetEffect::DelegationSign(Box::new(delegation));
         Ok(Next::Call(Effect::Net(sign).into()))
     }
 
-    fn send(&mut self, base: &str, mut headers: Vec<Header>, signed: SignedDelegation) -> GetTurn {
-        let Ok(delegation) = signed.encode() else {
-            return self.failed(MemberRefusal::new(FAILED_HERE));
+    fn send(
+        &mut self,
+        base: &str,
+        mut headers: Vec<Header>,
+        signed: SignedDelegation,
+    ) -> FetchTurn {
+        let delegation = match signed.encode() {
+            Ok(delegation) => delegation,
+            Err(error) => return self.failed(MemberRefusal::Failed(error.to_string())),
         };
         headers.push((DELEGATION_HEADER.to_string(), delegation));
         let object = &self.object;
         let path = utf8_percent_encode(&object.key, KEY_SET);
         let mut url = format!("{}/{}/{path}", base.trim_end_matches('/'), object.bucket);
-        if let Some(query) = self.query() {
+        if let Some(query) = &object.query {
             url = format!("{url}?{query}");
         }
-        self.step = GetStep::Answer;
-        let get = BlobEffect::MemberGet(Box::new(MemberGet { url, headers }));
-        Ok(Next::Call(Effect::Blob(get).into()))
+        let head = object.head;
+        self.step = FetchStep::Answer;
+        let fetch = MemberFetch { head, url, headers };
+        let fetch = OutboundEffect::MemberFetch(Box::new(fetch));
+        Ok(Next::Call(Effect::Outbound(fetch).into()))
     }
 }
 
-impl Operation for MemberGetOperation {
+impl Operation for MemberFetchOperation {
     type Output = MemberBody;
     type Error = MemberRefusal;
 
-    fn first(&mut self) -> GetTurn {
+    fn first(&mut self) -> FetchTurn {
         let urls = NodeUrlsOperation::new(self.target.node_id);
         Ok(Next::Call(IoCall::child(urls)))
     }
 
-    fn next(&mut self, result: IoResult) -> GetTurn {
-        match std::mem::replace(&mut self.step, GetStep::Answer) {
-            GetStep::Urls => {
+    fn next(&mut self, result: IoResult) -> FetchTurn {
+        match std::mem::replace(&mut self.step, FetchStep::Answer) {
+            FetchStep::Urls => {
                 let urls = result.child::<Option<NodeUrls>, NodeInfoError>()?;
                 match urls.ok().flatten().and_then(|urls| urls.s3) {
                     Some(base) => self.sign(base),
-                    None => self.failed(MemberRefusal::new(UNREACHED)),
+                    None => self.failed(self.unreached(false)),
                 }
             }
-            GetStep::Sign { base, headers } => match result.event()? {
+            FetchStep::Sign { base, headers } => match result.event()? {
                 Event::Net(NetEvent::DelegationSign(Some(signed))) => {
                     self.send(&base, headers, *signed)
                 }
                 Event::Net(NetEvent::DelegationSign(None)) => {
-                    self.failed(MemberRefusal::new(FAILED_HERE))
+                    let refusal = MemberRefusal::Failed("this node did not sign".to_string());
+                    self.failed(refusal)
                 }
                 other => Err(unexpected("Event::Net(NetEvent::DelegationSign)", &other)),
             },
-            GetStep::Answer => match result.event()? {
-                Event::Blob(BlobEvent::MemberAnswered(answer)) => match *answer {
-                    MemberAnswer::Body { version, stream } => {
-                        Ok(Next::Done(MemberBody { version, stream }))
-                    }
-                    MemberAnswer::Refused { status, code } => {
-                        self.failed(MemberRefusal { status, code })
-                    }
-                    MemberAnswer::Silent => self.failed(MemberRefusal::new(UNREACHED)),
+            FetchStep::Answer => match result.event()? {
+                Event::Outbound(OutboundEvent::MemberAnswered(answer)) => match *answer {
+                    MemberAnswer::Body(body) => Ok(Next::Done(body)),
+                    MemberAnswer::Refused {
+                        status,
+                        code,
+                        message,
+                    } => self.failed(MemberRefusal::Refused {
+                        node_id: self.target.node_id,
+                        status,
+                        code,
+                        message,
+                    }),
+                    MemberAnswer::Silent => self.failed(self.unreached(false)),
+                    MemberAnswer::Late => self.failed(self.unreached(true)),
                 },
-                Event::Blob(BlobEvent::Error(_)) => self.failed(MemberRefusal::new(FAILED_HERE)),
-                other => Err(unexpected("Event::Blob(BlobEvent::MemberAnswered)", &other)),
+                other => Err(unexpected("OutboundEvent::MemberAnswered", &other)),
             },
-            GetStep::Avoid(refusal) => {
+            FetchStep::Avoid(refusal) => {
                 result.event()?;
                 Err(refusal)
             }
@@ -303,6 +375,20 @@ fn unexpected(expected: &'static str, got: &Event) -> MemberRefusal {
     .into()
 }
 
+/// Who asks for the read, which decides how far it may travel.
+#[derive(Debug, PartialEq)]
+enum ReadOrigin {
+    Caller,
+    /// A member sent the read here, so it is never sent on.
+    Delegated {
+        copy_read: bool,
+    },
+    /// This node missed the key and asks the coordinator; a delegated read stops here.
+    AfterMiss {
+        delegated: bool,
+    },
+}
+
 #[derive(Debug, PartialEq)]
 enum ReadStep {
     Coordinator,
@@ -312,20 +398,22 @@ enum ReadStep {
     /// The chosen holder; on a miss at a replica the coordinator is asked.
     Holder,
     Coordinating,
+    Missed,
     Readers(MemberRefusal),
     Copy(MemberRefusal),
 }
 
-type ReadTurn = Result<Next<MemberRead>, EntryStatus>;
+type ReadTurn = Result<Next<MemberRead>, MemberFailure>;
 
-/// Reads `key` for a caller this node verified. A member's refusal ends the read with the entry
-/// status it stands for; only a current version may come from a copy.
+/// Finds where `object` is answered and reads it there for a caller this node verified. Only a
+/// current version may come from a copy, and only while its coordinator cannot answer.
 #[derive(Debug, PartialEq)]
 pub struct MemberReadOperation {
     ids: Option<(NodeId, RealmId)>,
-    caller: MemberCaller,
+    caller: DelegatedCaller,
     binding: DistributionBinding,
     object: MemberKey,
+    origin: ReadOrigin,
     seed: u128,
     now_ms: u64,
     range_id: Option<Ulid>,
@@ -338,7 +426,7 @@ pub struct MemberReadOperation {
 impl MemberReadOperation {
     pub fn new(
         ids: Option<(NodeId, RealmId)>,
-        caller: MemberCaller,
+        caller: DelegatedCaller,
         binding: DistributionBinding,
         object: MemberKey,
     ) -> Self {
@@ -347,6 +435,7 @@ impl MemberReadOperation {
             caller,
             binding,
             object,
+            origin: ReadOrigin::Caller,
             seed: rand::random(),
             now_ms: 0,
             range_id: None,
@@ -357,12 +446,26 @@ impl MemberReadOperation {
         }
     }
 
+    /// For a read another member delegated here: answered here or refused. A current one is
+    /// refused unless this node coordinates the range or `copy_read` asks this copy.
+    pub fn delegated(mut self, copy_read: bool) -> Self {
+        self.origin = ReadOrigin::Delegated { copy_read };
+        self
+    }
+
+    /// For a key this node missed, since a copy may lag behind the coordinator. `Local(None)`
+    /// leaves the miss as it is, `Local(Some(range))` keeps it while the coordinator is silent.
+    pub fn after_miss(mut self, delegated: bool) -> Self {
+        self.origin = ReadOrigin::AfterMiss { delegated };
+        self
+    }
+
     fn pinned(&self) -> bool {
         self.object.version.is_some()
     }
 
-    fn get(&self, node_id: NodeId, range_id: Ulid, copy_read: bool) -> IoCall {
-        IoCall::child(MemberGetOperation {
+    fn fetch(&self, node_id: NodeId, range_id: Ulid, copy_read: bool) -> IoCall {
+        IoCall::child(MemberFetchOperation {
             ids: self.ids,
             caller: self.caller.clone(),
             target: MemberTarget {
@@ -373,7 +476,7 @@ impl MemberReadOperation {
             object: self.object.clone(),
             copy_read,
             now_ms: self.now_ms,
-            step: GetStep::Urls,
+            step: FetchStep::Urls,
         })
     }
 
@@ -381,24 +484,48 @@ impl MemberReadOperation {
         let range_id = self.range_id.ok_or(IoError::Unfinished)?;
         self.holder = Some(node_id);
         self.step = ReadStep::Holder;
-        Ok(Next::Call(self.get(node_id, range_id, false)))
+        Ok(Next::Call(self.fetch(node_id, range_id, false)))
+    }
+
+    fn ask_coordinator(&self) -> Result<IoCall, IoError> {
+        let coordinator = self.coordinator.ok_or(IoError::Unfinished)?;
+        let range_id = self.range_id.ok_or(IoError::Unfinished)?;
+        Ok(self.fetch(coordinator, range_id, false))
     }
 
     fn remote(body: MemberBody, stale: Option<Ulid>) -> ReadTurn {
-        let version = (body.version.as_deref())
-            .and_then(|version| Ulid::from_string(version).ok())
-            .ok_or(EntryStatus::Unavailable)?;
-        Ok(Next::Done(MemberRead::Remote {
-            version,
-            blob: body.stream,
-            stale,
-        }))
+        Ok(Next::Done(MemberRead::Remote { body, stale }))
     }
 
-    /// While the coordinator cannot answer, a current version comes from a copy.
+    fn coordinator_known(&mut self, coordinator: Option<(Ulid, NodeId)>) -> ReadTurn {
+        let Some((range_id, node_id)) = coordinator else {
+            return Ok(Next::Done(MemberRead::Local(None)));
+        };
+        self.range_id = Some(range_id);
+        self.coordinator = Some(node_id);
+        match self.origin {
+            ReadOrigin::Caller => self.ask_holder(node_id),
+            ReadOrigin::Delegated { .. } => {
+                let error = GuardError::NotCoordinator {
+                    set_id: self.binding.set_id,
+                    range_id,
+                    node_id,
+                };
+                Err(MemberRefusal::Route(error).into())
+            }
+            ReadOrigin::AfterMiss { delegated: true } => Ok(Next::Done(MemberRead::Local(None))),
+            ReadOrigin::AfterMiss { delegated: false } => {
+                self.step = ReadStep::Missed;
+                Ok(Next::Call(self.ask_coordinator()?))
+            }
+        }
+    }
+
+    /// While the coordinator cannot answer a caller, a current version comes from a copy.
     fn failed(&mut self, refusal: MemberRefusal) -> ReadTurn {
-        if self.pinned() || !refusal.unreachable() {
-            return Err(refusal.entry_status());
+        let origin_caller = self.origin == ReadOrigin::Caller;
+        if self.pinned() || !origin_caller || !refusal.unreachable() {
+            return Err(refusal.into());
         }
         let readers = copy_readers(&self.binding, &self.object.key);
         self.step = ReadStep::Readers(refusal);
@@ -407,38 +534,41 @@ impl MemberReadOperation {
 
     fn next_copy(&mut self, first_refusal: MemberRefusal) -> ReadTurn {
         let Some(node_id) = self.copies.pop_front() else {
-            return Err(first_refusal.entry_status());
+            return Err(first_refusal.into());
         };
         let range_id = self.range_id.ok_or(IoError::Unfinished)?;
         self.step = ReadStep::Copy(first_refusal);
-        Ok(Next::Call(self.get(node_id, range_id, true)))
+        Ok(Next::Call(self.fetch(node_id, range_id, true)))
     }
 }
 
 impl Operation for MemberReadOperation {
     type Output = MemberRead;
-    type Error = EntryStatus;
+    type Error = MemberFailure;
 
     fn first(&mut self) -> ReadTurn {
         let (binding, key) = (&self.binding, &self.object.key);
-        if self.pinned() {
-            self.step = ReadStep::Route;
-            return Ok(Next::Call(IoCall::child(route_read(binding, key, false))));
+        let pinned = self.object.version.is_some();
+        match self.origin {
+            ReadOrigin::Delegated { copy_read } if pinned || copy_read => {
+                Ok(Next::Done(MemberRead::Local(None)))
+            }
+            ReadOrigin::Caller if pinned => {
+                self.step = ReadStep::Route;
+                Ok(Next::Call(IoCall::child(route_read(binding, key, false))))
+            }
+            _ => {
+                self.step = ReadStep::Coordinator;
+                Ok(Next::Call(IoCall::child(read_coordinator(binding, key))))
+            }
         }
-        self.step = ReadStep::Coordinator;
-        Ok(Next::Call(IoCall::child(read_coordinator(binding, key))))
     }
 
     fn next(&mut self, result: IoResult) -> ReadTurn {
         match std::mem::replace(&mut self.step, ReadStep::Holder) {
             ReadStep::Coordinator => match result.child::<Option<(Ulid, NodeId)>, GuardError>()? {
-                Ok(None) => Ok(Next::Done(MemberRead::Local(None))),
-                Ok(Some((range_id, node_id))) => {
-                    self.range_id = Some(range_id);
-                    self.coordinator = Some(node_id);
-                    self.ask_holder(node_id)
-                }
-                Err(error) => self.failed(guard_refusal(&error)),
+                Ok(coordinator) => self.coordinator_known(coordinator),
+                Err(error) => self.failed(MemberRefusal::Route(error)),
             },
             ReadStep::Route => match result.child::<ReadRoute, GuardError>()? {
                 Ok(ReadRoute::Holder { range_id, node_id }) => {
@@ -449,7 +579,7 @@ impl Operation for MemberReadOperation {
                     Ok(Next::Call(IoCall::child(holders)))
                 }
                 Ok(ReadRoute::Local { .. }) => Ok(Next::Done(MemberRead::Local(None))),
-                Err(error) => self.failed(guard_refusal(&error)),
+                Err(error) => self.failed(MemberRefusal::Route(error)),
             },
             ReadStep::Holders => {
                 let holders = result.child::<Vec<NodeId>, IoError>()?.unwrap_or_default();
@@ -466,11 +596,11 @@ impl Operation for MemberReadOperation {
             ReadStep::Holder => match result.child::<MemberBody, MemberRefusal>()? {
                 Ok(body) => Self::remote(body, None),
                 // A replica may lag behind the coordinator, which is asked once.
-                Err(refusal) if refusal.status == NOT_FOUND && self.holder != self.coordinator => {
-                    let coordinator = self.coordinator.ok_or(IoError::Unfinished)?;
-                    let range_id = self.range_id.ok_or(IoError::Unfinished)?;
+                Err(refusal)
+                    if refusal.status() == NOT_FOUND && self.holder != self.coordinator =>
+                {
                     self.step = ReadStep::Coordinating;
-                    Ok(Next::Call(self.get(coordinator, range_id, false)))
+                    Ok(Next::Call(self.ask_coordinator()?))
                 }
                 Err(refusal) => self.failed(refusal),
             },
