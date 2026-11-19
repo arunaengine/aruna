@@ -61,9 +61,7 @@ fn replaced_bucket_lasts() {
 fn seed_failure_fails() {
     let mut stage = StageItemOperation::new(test_run(), paths(), Vec::new(), 0);
     stage.step = StageStep::Replicate(4);
-    let failed = child_answer(Err::<QueueBlobResult, _>(BlobQueueError::UnexpectedEvent(
-        "full".to_string(),
-    )));
+    let failed = child_answer(Err::<bool, _>(IoError::Codec("full".to_string())));
     assert!(matches!(stage.next(failed), Err(ItemFailure::Stage(_))));
 }
 

@@ -1017,7 +1017,6 @@ impl OperationsTaskHandler {
             }),
             key @ TaskKey::RecordAudit { .. } => Box::pin(async move {
                 use aruna_operations::s3::bucket::audit_retry::{AUDIT_RETRY, StoreAuditOperation};
-                use aruna_operations::transfer::sharding::{maintain_ranges, maintain_retry};
                 // The key change already applies; only its record waits for storage.
                 let store = StoreAuditOperation::new(key.clone());
                 if let Err(error) = drive(store, &self.context).await {
@@ -1066,6 +1065,7 @@ impl OperationsTaskHandler {
                 }
             }),
             TaskKey::MaintainRanges => Box::pin(async move {
+                use aruna_operations::transfer::sharding::{maintain_ranges, maintain_retry};
                 let context = &self.context;
                 let kept = (RANGE_CURSORS.lock().ok()).and_then(|cursors| cursors.clone());
                 let mut after = match aruna_drivers::driver::drive(

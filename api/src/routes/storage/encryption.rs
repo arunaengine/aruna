@@ -1071,7 +1071,6 @@ mod tests {
         use aruna_core::structs::storage::abe_access::{
             GrantContext, KeyGrant, KeyIssuer, KeyRequest,
         };
-        use aruna_operations::transfer::abe_rekey::RekeyProgress;
         let bucket_id = Ulid::from_bytes([4; 16]);
         let realm = RealmId::from_bytes([1; 32]);
         let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm);
@@ -1267,6 +1266,7 @@ mod tests {
 
     #[test]
     fn reports_abe_state() {
+        use aruna_operations::transfer::abe_rekey::RekeyProgress;
         let mut abe = snapshot();
         abe.abe = Some(AbeSnapshot {
             epoch: 4,

@@ -763,7 +763,7 @@ mod tests {
         install(
             &handle,
             set,
-            &[super::crate::distribution::test_store::range(1, "", None)],
+            &[crate::distribution::test_store::range(1, "", None)],
         )
         .await;
         assert!(apply(&handle, write(set, "a", 1, 5)).await.unwrap());
@@ -806,7 +806,7 @@ mod tests {
         install(
             &handle,
             set,
-            &[super::crate::distribution::test_store::range(1, "", None)],
+            &[crate::distribution::test_store::range(1, "", None)],
         )
         .await;
         for (key, seed) in [("a", 1), ("x", 2)] {
@@ -830,7 +830,7 @@ mod tests {
             account,
         );
         assert_eq!(drive(tend, &context).await, Ok(super::Tended::Busy));
-        let marker = super::crate::distribution::test_store::get(
+        let marker = crate::distribution::test_store::get(
             &handle,
             NODE_STATS_KEYSPACE,
             dirty_group_key(snapshot.config.owner_group),
