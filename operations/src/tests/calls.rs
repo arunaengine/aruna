@@ -5,8 +5,9 @@
 use std::fmt::Debug;
 
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, NetEffect, ShardNetEffect};
-use aruna_core::events::{Event, NetEvent, ShardNetEvent};
+use aruna_core::effects::{Effect, NetEffect, ShardNetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, ShardNetEvent, StorageEvent};
+use aruna_core::request_policy::{CompiledPolicySet, CompiledSets};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -98,4 +99,20 @@ pub(crate) fn bucket_realm(
     }
     config.snapshot_candidate_map();
     config
+}
+
+/// The storage handle's answer to a policy compile call, compiled here without its cache.
+pub(crate) fn compiled(call: IoCall) -> IoResult {
+    let sets = match call {
+        IoCall::Effect(effect) => match *effect {
+            Effect::Storage(StorageEffect::CompilePolicies(sets)) => sets,
+            other => panic!("expected the policy compile, got {other:?}"),
+        },
+        other => panic!("expected the policy compile, got {other:?}"),
+    };
+    let sets = (sets.iter())
+        .map(|set| CompiledPolicySet::compile(set).map(std::sync::Arc::new))
+        .collect();
+    let event = Event::Storage(StorageEvent::PoliciesCompiled(CompiledSets(sets)));
+    IoResult::Event(Box::new(event))
 }
