@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use crate::metadata_calls::get_metadata_routed;
 use crate::metadata_calls::route_metadata_update;
-use aruna_core::StructuredId;
 use aruna_core::metadata::api::{RoCrateExportView, UpdateDocumentMutation};
+use aruna_core::structured_id::StructuredId;
 use aruna_operations::device::replica_store::read_replica;
 use aruna_operations::device_node::realm_documents::fetch_realm_documents;
 use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, GetVisibleRequest};

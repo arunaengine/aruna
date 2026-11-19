@@ -6,7 +6,6 @@ use std::path::{Component, Path as FsPath};
 use std::sync::{Arc, Mutex};
 
 use crate::job_service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
-use aruna_core::StructuredId;
 use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::repository::RepositoryPull;
 use aruna_core::stream::BackendStream;
@@ -17,6 +16,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structured_id::StructuredId;
 use aruna_drivers::driver::{drive, drive_until};
 use aruna_operations::federation::import::ReadImportOperation;
 use aruna_operations::jobs::import::upload::{

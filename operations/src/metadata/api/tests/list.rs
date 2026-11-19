@@ -6,13 +6,13 @@ use super::export::{seed_registry_cache, write_entry, write_pending_marker};
 use super::*;
 use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::live_records::LiveRecordsOperation;
-use aruna_core::StructuredId;
 use aruna_core::keyspaces::DOCUMENT_LIFECYCLE_KEYSPACE;
 use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
 use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::storage_entries::document_lifecycle_key;
 use aruna_core::storage_entries::graph_lifecycle_key;
+use aruna_core::structured_id::StructuredId;
 use aruna_drivers::driver::drive;
 
 #[tokio::test]

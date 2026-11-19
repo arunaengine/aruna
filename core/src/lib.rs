@@ -113,7 +113,4 @@ pub use document::{
     DocumentEvictedDocument, DocumentNetEvent, DocumentSyncRevision, DocumentTarget,
 };
 pub use keyspaces::*;
-pub use structured_id::{
-    BucketId, ClockHealthError, IdEnvironment, JobId, MetaResourceId, PlacementHandle, StructuredId,
-};
 pub use trace_context::DistributedTraceContext;

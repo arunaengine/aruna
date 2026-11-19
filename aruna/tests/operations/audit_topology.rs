@@ -5,8 +5,8 @@
 use crate::topology;
 
 use crate::metadata_calls::list_audit;
-use aruna_core::StructuredId;
 use aruna_core::metadata::api::CreateDocumentPayload;
+use aruna_core::structured_id::StructuredId;
 use aruna_drivers::driver::drive;
 use aruna_operations::metadata::audit::{
     AUDIT_DEADLINE_SECS, AUDIT_PAGE_LIMIT, AuditAggregate, ListAuditOperation, ListAuditRequest,

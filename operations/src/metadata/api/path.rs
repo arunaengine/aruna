@@ -30,8 +30,8 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer, read_answer};
 use aruna_core::metadata::protocol::encode_message;
 
-use aruna_core::StructuredId;
 use aruna_core::metadata::protocol::metadata_request;
+use aruna_core::structured_id::StructuredId;
 
 pub(super) fn select_forward_peers(
     config: &RealmConfigDocument,

@@ -7,7 +7,7 @@ use crate::admin::{AdminState, RealmStatus};
 use crate::store::tests::{realm_id, registration};
 use crate::store::{Entry, Store};
 use aruna_core::egress::EgressPolicy;
-use aruna_core::{BucketId, PlacementHandle, StructuredId};
+use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 use axum::extract::State;
 use std::collections::HashMap;
 use std::net::IpAddr;

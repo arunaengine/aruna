@@ -22,7 +22,7 @@ use aruna_core::metadata::{
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::{MetaResourceId, StructuredId};
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::git::linked::unreadable_file;

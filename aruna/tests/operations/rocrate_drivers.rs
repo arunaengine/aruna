@@ -80,8 +80,7 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::blob_node::{seed_config, write_value};
-use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_core::{MetaResourceId, StructuredId};
+use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 
 /// A fixed structured id (handle 1, bucket 0). The single-node import fixture
 /// holds every bucket, so bucket 0 is always held and the create resolves.

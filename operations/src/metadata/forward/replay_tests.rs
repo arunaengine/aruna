@@ -6,9 +6,8 @@ use super::*;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::METADATA_HANDLE;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 use aruna_core::types::Value;
-use aruna_core::{MetaResourceId, StructuredId};
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()

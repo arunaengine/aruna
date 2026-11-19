@@ -8,7 +8,6 @@ use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata_calls::{
     mint_pid_routed, read_mapping, resolve_pid_routed, route_metadata_delete, withdraw_pid_routed,
 };
-use aruna_core::StructuredId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -22,6 +21,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{
     PersistentIdMapping, PersistentIdRevision, PersistentIdStatus, persistent_id_key,
 };
+use aruna_core::structured_id::StructuredId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{

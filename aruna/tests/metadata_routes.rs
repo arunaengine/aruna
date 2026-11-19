@@ -13,10 +13,10 @@ use aruna_api::server::state::ServerState;
 use aruna_api::tests::metadata_fixtures::{
     create_test_document, drain_metadata_background, state_realm_nodes, test_realm_id, write_doc,
 };
-use aruna_core::MetaResourceId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structured_id::MetaResourceId;
 use aruna_drivers::driver::drive;
 use aruna_drivers::testing::installed_graph_handle;
 use aruna_operations::metadata::api::MetadataApiError;

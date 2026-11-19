@@ -3,10 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::structured_id::{MetaResourceId, StructuredId};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-
-use crate::{MetaResourceId, StructuredId};
 
 /// Domain tag separating the path-claim winner digest from every other hash in
 /// the system (a MetaResourceId or event id must never be reusable as a winner

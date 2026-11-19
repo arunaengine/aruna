@@ -20,7 +20,8 @@ use aruna_core::structs::placement::record::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeUrls;
-use aruna_core::{DocumentEffect, DocumentNetEvent, StructuredId};
+use aruna_core::structured_id::StructuredId;
+use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_drivers::driver::drive;
 use aruna_drivers::driver::node_facts;
 use aruna_operations::document_repository::GetConfigOperation;

@@ -14,7 +14,6 @@ use crate::job_calls::{
 };
 use crate::metadata_calls::route_metadata_update;
 use crate::metadata_calls::{create_with_id, route_metadata_delete};
-use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::job_request::{SubmissionScope, SubmitJobError, submission_of};
@@ -33,7 +32,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::record::band_start;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::document_repository::GetConfigOperation;

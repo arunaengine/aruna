@@ -7,7 +7,6 @@ use ulid::Ulid;
 
 use super::reads::realm_config;
 use super::{ApplyError, PlacementOutcome, Step, invalid};
-use crate::MetaResourceId;
 use crate::deferred_topics::DocumentSyncDependency;
 use crate::document::{DocumentChange, DocumentTarget};
 use crate::keyspaces::{
@@ -37,6 +36,7 @@ use crate::structs::{
     PersistentIdMapping, persistent_id_change, persistent_id_key, persistent_id_target,
     secondary_index_deletes, secondary_index_entries,
 };
+use crate::structured_id::MetaResourceId;
 use crate::types::{Key, KeySpace, Value};
 
 /// A row to write: key space, key and value.

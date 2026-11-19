@@ -12,8 +12,6 @@ use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::forward::holders::holds_metadata_id;
 use crate::metadata::forward::replay::{create_record_matches, routed_record_matches};
 use crate::realm::peer_trust::peer_acts_for;
-use aruna_core::MetaResourceId;
-use aruna_core::StructuredId;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataMergedRevision;
 use aruna_core::metadata::ProfileValidationStatus;
@@ -25,6 +23,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use aruna_core::user::id::UserId;
 use ulid::Ulid;
 

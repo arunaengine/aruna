@@ -64,8 +64,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use aruna_core::StructuredId;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 
 const BUCKET: &str = "remote";
 const KEY: &str = "payload";

@@ -24,7 +24,7 @@ use aruna_core::structs::storage::data::identity::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::{MetaResourceId, StructuredId};
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
 use aruna_core::structs::storage::release::{RELEASE_INCOMPLETE, RELEASE_MEMBERSHIP};

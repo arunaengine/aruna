@@ -577,8 +577,8 @@ mod tests {
         // resolved the old holders must not commit its outbox row afterwards.
         let (ctx, _dir) = context();
         let config = activated_config();
-        use aruna_core::StructuredId;
-        let document_id = aruna_core::MetaResourceId::from_parts(
+        use aruna_core::structured_id::StructuredId;
+        let document_id = aruna_core::structured_id::MetaResourceId::from_parts(
             13,
             aruna_core::structured_id::PlacementHandle::new(
                 aruna_core::structs::placement::record::METADATA_HANDLE,

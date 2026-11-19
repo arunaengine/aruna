@@ -5,7 +5,6 @@
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::api::CreateDocumentPayload;
 
-use aruna_core::MetaResourceId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
@@ -34,7 +33,9 @@ use aruna_core::structs::placement::record::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
-use aruna_core::structured_id::{BucketId, ClockHealthError, PlacementHandle, StructuredId};
+use aruna_core::structured_id::{
+    BucketId, ClockHealthError, MetaResourceId, PlacementHandle, StructuredId,
+};
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
@@ -946,7 +947,6 @@ mod tests {
 
     use std::sync::Arc;
 
-    use aruna_core::StructuredId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
@@ -963,6 +963,7 @@ mod tests {
     use aruna_core::structs::placement::record::{
         FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, PlacementBinding,
     };
+    use aruna_core::structured_id::StructuredId;
     use aruna_storage::storage::handle::{EffectReceiver, StorageHandle};
     use aruna_storage::storage::worker::FjallStorage;
 

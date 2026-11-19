@@ -2,8 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::MetaResourceId;
-use aruna_core::StructuredId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
@@ -18,6 +16,7 @@ use aruna_core::structs::placement::record::{
     DocumentClass, FIRST_GRANTABLE_HANDLE, PlacementScope,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -786,7 +785,7 @@ mod tests {
     use aruna_core::structs::placement::record::{
         FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, METADATA_HANDLE, PlacementBinding,
     };
-    use aruna_core::{BucketId, PlacementHandle, StructuredId};
+    use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 
     fn minted(handle: u32) -> Ulid {
         let handle = PlacementHandle::new(handle).unwrap();

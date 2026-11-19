@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_clock::testing::poll_until;
-use aruna_core::StructuredId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
@@ -706,9 +706,8 @@ fn incident_target(
     ),
     BoxError,
 > {
-    use aruna_core::MetaResourceId;
     use aruna_core::document::DocumentTarget;
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
+    use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle};
 
     let placement = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: strategy.strategy_id,

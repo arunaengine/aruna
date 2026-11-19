@@ -5,7 +5,6 @@
 
 use std::time::Duration;
 
-use aruna_core::MetaResourceId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
@@ -14,7 +13,7 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structured_id::StructuredId;
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use aruna_core::types::GroupId;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
