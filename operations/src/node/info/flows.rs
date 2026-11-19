@@ -1181,6 +1181,9 @@ mod tests {
             created_at_ms: 1,
             subject_generation: 1,
             subject_digest: [0; 32],
+            backend: "default".to_string(),
+            config_generation: 0,
+            config_digest: [0; 32],
         }
     }
 

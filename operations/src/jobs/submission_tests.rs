@@ -78,6 +78,7 @@ fn submission(serving: Option<(NodeId, RealmId)>) -> ExecutionSubmission {
             env: Default::default(),
             resources: Default::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
@@ -140,6 +141,7 @@ async fn caps_declared_outputs() {
         env: Default::default(),
         resources: Default::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: (0..=MAX_EXECUTION_OUTPUTS)
@@ -213,6 +215,7 @@ fn refuses_pathless_input() {
         env: Default::default(),
         resources: Default::default(),
         executor_constraint: None,
+        backend: None,
         inputs: vec![aruna_core::structs::execution::job::InputSelection {
             source: aruna_core::structs::execution::job::InputSource::S3 {
                 bucket: "data".to_string(),
@@ -257,6 +260,7 @@ fn refuses_shared_destination() {
         env: Default::default(),
         resources: Default::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: vec![aruna_core::structs::execution::job::OutputSelection {
             container_path: "/out/result.txt".to_string(),

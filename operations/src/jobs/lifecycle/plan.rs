@@ -597,7 +597,8 @@ mod tests {
                     executor_kind: None,
                     local_to_controller: true,
                 };
-                ExecutorCapability::new(format!("k{index}"), subject).expect("subject is valid")
+                ExecutorCapability::new(format!("k{index}"), format!("k{index}"), subject)
+                    .expect("subject is valid")
             })
             .collect();
         NodeInfoDocument {
@@ -809,7 +810,8 @@ mod tests {
             local_to_controller: true,
         };
         let mut capability =
-            ExecutorCapability::new("docker".to_string(), subject).expect("subject is valid");
+            ExecutorCapability::new("docker".to_string(), "docker".to_string(), subject)
+                .expect("subject is valid");
         capability.file_staging = true;
         capability
     }
@@ -900,6 +902,7 @@ mod tests {
             plan.selected.map(|selection| selection.target),
             Some(ExecutionTargetId {
                 node_id: node(1),
+                backend: "docker".to_string(),
                 executor_kind: "docker".to_string(),
             })
         );

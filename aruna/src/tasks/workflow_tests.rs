@@ -68,7 +68,7 @@ fn with_backend(context: &DriverContext, backend: &Arc<dyn ExecutorBackend>) -> 
     let held = (context.compute_handle.as_ref())
         .is_some_and(|registry| registry.get(&backend.kind()).is_some());
     if !held {
-        let registry = ExecutorRegistry::new().with_backend(backend.clone());
+        let registry = ExecutorRegistry::new().with_backend("docker", backend.clone());
         context.compute_handle = Some(Arc::new(registry));
     }
     context
@@ -603,6 +603,9 @@ async fn ready_with_intent(context: &DriverContext) -> (JobRecord, ulid::Ulid, A
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
         attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
     let record = record_attempt_intent(context, job_id, token, intent, None, None, 5)
         .await
@@ -1109,7 +1112,7 @@ async fn session_context(
     Arc<ExecutorRegistry>,
 ) {
     let (context, net) = net_context(storage).await;
-    let registry = Arc::new(ExecutorRegistry::new().with_backend(backend));
+    let registry = Arc::new(ExecutorRegistry::new().with_backend("docker", backend));
     let mut context = context;
     Arc::get_mut(&mut context).unwrap().compute_handle = Some(registry.clone());
     (context, net, registry)
@@ -1644,9 +1647,12 @@ async fn recovery_reuses_credential() {
     let (mut ctx, net) = net_context(storage.clone()).await;
     let backend = StubBackend::new(StubReconcile::NotFound);
     backend.mounts.store(true, Ordering::Relaxed);
-    let registry = ExecutorRegistry::new()
-        .with_backend(backend.clone())
-        .with_workspace_endpoint(Some("http://s3.test".to_string()), String::new());
+    let workspace = aruna_compute::registry::WorkspaceEndpoint {
+        endpoint: Some("http://s3.test".to_string()),
+        region: String::new(),
+        session_endpoint: None,
+    };
+    let registry = ExecutorRegistry::new().with_workspace("docker", backend.clone(), workspace);
     Arc::get_mut(&mut ctx).unwrap().compute_handle = Some(Arc::new(registry));
     let (record, token, attempt) = ready_with_intent(&context).await;
     let local = net.node_id();
@@ -1726,9 +1732,12 @@ async fn workspace_run_credential() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let (mut ctx, net) = net_context(storage.clone()).await;
     let backend = StubBackend::new(StubReconcile::NotFound);
-    let registry = ExecutorRegistry::new()
-        .with_backend(backend.clone())
-        .with_workspace_endpoint(Some("http://s3.test".to_string()), String::new());
+    let workspace = aruna_compute::registry::WorkspaceEndpoint {
+        endpoint: Some("http://s3.test".to_string()),
+        region: String::new(),
+        session_endpoint: None,
+    };
+    let registry = ExecutorRegistry::new().with_workspace("docker", backend.clone(), workspace);
     Arc::get_mut(&mut ctx).unwrap().compute_handle = Some(Arc::new(registry));
     let (record, _token, _attempt) = ready_with_intent(&context).await;
     let local = net.node_id();
@@ -1896,6 +1905,9 @@ async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, dig
         created_at_ms: 1,
         subject_generation: generation,
         subject_digest: digest,
+        backend: "default".to_string(),
+        config_generation: 0,
+        config_digest: [0; 32],
     };
     let _ = context
         .storage_handle
@@ -1928,7 +1940,12 @@ async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, dig
 
 fn compute_context(storage: StorageHandle) -> Arc<DriverContext> {
     let mut registry = aruna_compute::ExecutorRegistry::new();
-    registry.register(StubBackend::new(StubReconcile::NotFound));
+    let workspace = aruna_compute::registry::WorkspaceEndpoint::default();
+    registry.register(
+        "docker",
+        StubBackend::new(StubReconcile::NotFound),
+        workspace,
+    );
     Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,
@@ -2024,7 +2041,8 @@ async fn stored_site_starts() {
     })
     .unwrap()
     .subject;
-    let registry = ExecutorRegistry::new().with_backend(StubBackend::new(StubReconcile::NotFound));
+    let stub = StubBackend::new(StubReconcile::NotFound);
+    let registry = ExecutorRegistry::new().with_backend("docker", stub);
     let capability: ExecutorCapability = registry
         .capabilities(&subject, false)
         .unwrap()
@@ -2059,8 +2077,9 @@ async fn claimed_execution(
 ) {
     let (context, net) = net_context(context.storage_handle.clone()).await;
     let mut context = context;
-    Arc::get_mut(&mut context).unwrap().compute_handle =
-        Some(Arc::new(ExecutorRegistry::new().with_backend(backend)));
+    Arc::get_mut(&mut context).unwrap().compute_handle = Some(Arc::new(
+        ExecutorRegistry::new().with_backend("docker", backend),
+    ));
 
     let job_id = job_id();
     let record = JobRecord::new(

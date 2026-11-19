@@ -1202,6 +1202,9 @@ mod tests {
             created_at_ms: 21,
             subject_generation: 3,
             subject_digest: [9u8; 32],
+            backend: "default".to_string(),
+            config_generation: 0,
+            config_digest: [0; 32],
         };
         let decoded = decode_entry(
             JOB_RESERVATION_KEYSPACE,

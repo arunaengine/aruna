@@ -1297,6 +1297,7 @@ fn map_execution_spec(
         env: executor.env.clone(),
         resources,
         executor_constraint: task.tags.get(EXECUTOR_TAG_KEY).cloned(),
+        backend: None,
         inputs,
         file_outputs,
         workspace_outputs: Vec::new(),

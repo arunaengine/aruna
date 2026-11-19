@@ -195,6 +195,7 @@ impl Family {
     pub fn target_id(&self) -> ExecutionTargetId {
         ExecutionTargetId {
             node_id: self.target.public(),
+            backend: "docker".to_string(),
             executor_kind: "docker".to_string(),
         }
     }
@@ -215,6 +216,8 @@ impl Family {
             subject_generation: 1,
             subject_digest: [6u8; 32],
             accepted_at_ms: 1_003,
+            config_generation: 0,
+            config_digest: [0; 32],
         }
     }
 
@@ -366,6 +369,7 @@ pub fn payload() -> ExecutionSpec {
         env: Default::default(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),

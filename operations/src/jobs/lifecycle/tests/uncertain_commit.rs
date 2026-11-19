@@ -128,7 +128,8 @@ fn advertised(local: NodeId, draining: bool) -> NodeInfoDocument {
     NodeInfoDocument {
         node_id: local,
         executors: vec![
-            ExecutorCapability::new("docker".to_string(), subject).expect("capability is valid"),
+            ExecutorCapability::new("docker".to_string(), "docker".to_string(), subject)
+                .expect("capability is valid"),
         ],
         labels: BTreeMap::new(),
         urls: NodeUrls {

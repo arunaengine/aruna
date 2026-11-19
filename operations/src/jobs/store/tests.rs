@@ -226,6 +226,9 @@ async fn adopt_spares_live() {
                 "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                     .to_string(),
             attempt_epoch: 0,
+            backend: "docker".to_string(),
+            config_generation: 0,
+            home_digest: aruna_core::compute::identity::home_digest("docker", None),
         },
         None,
         None,
@@ -1206,6 +1209,7 @@ fn execution_record(job_id: JobId, token: Ulid, state: JobState) -> JobRecord {
             env: Default::default(),
             resources: ComputeResources::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
@@ -1258,6 +1262,9 @@ async fn fence_attempt(context: &DriverContext, job_id: JobId, token: Ulid) -> A
             executor_kind: "docker".to_string(),
             pinned_image: "alpine@sha256:0".to_string(),
             attempt_epoch: 0,
+            backend: "docker".to_string(),
+            config_generation: 0,
+            home_digest: aruna_core::compute::identity::home_digest("docker", None),
         },
         None,
         None,
@@ -1516,6 +1523,9 @@ async fn terminal_enqueues_cleanup() {
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
         attempt_epoch: 1,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
     let mut record = JobRecord::new(
         job_id,
@@ -1531,6 +1541,7 @@ async fn terminal_enqueues_cleanup() {
             env: Default::default(),
             resources: ComputeResources::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
@@ -1611,6 +1622,7 @@ async fn run_delete_rules() {
                 env: Default::default(),
                 resources: ComputeResources::default(),
                 executor_constraint: None,
+                backend: None,
                 inputs: Vec::new(),
                 file_outputs: Vec::new(),
                 workspace_outputs: Vec::new(),
@@ -1742,6 +1754,7 @@ async fn session_skips_crate() {
                 env: Default::default(),
                 resources: ComputeResources::default(),
                 executor_constraint: None,
+                backend: None,
                 inputs: Vec::new(),
                 file_outputs: Vec::new(),
                 workspace_outputs: Vec::new(),
@@ -1855,6 +1868,9 @@ async fn external_never_requeued() {
         executor_kind: "docker".to_string(),
         pinned_image: "alpine@sha256:digest".to_string(),
         attempt_epoch: 1,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     });
     insert_job(&context, &record).await.unwrap();
 
@@ -1888,6 +1904,9 @@ async fn park_sweep_budget() {
         executor_kind: "docker".to_string(),
         pinned_image: "alpine@sha256:digest".to_string(),
         attempt_epoch: 1,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     });
     insert_job(&context, &record).await.unwrap();
 
@@ -2072,6 +2091,9 @@ async fn attempt_intent_persists() {
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
         attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
     let committed = record_attempt_intent(&context, job_id, token, intent, None, None, 6_000)
         .await
@@ -2105,6 +2127,9 @@ async fn cancel_blocks_intent() {
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
         attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
     let error = record_attempt_intent(&context, job_id, token, intent, None, None, 6_000)
         .await
@@ -2130,6 +2155,9 @@ async fn cancel_blocks_running() {
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
         attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
     let committed = record_attempt_intent(&context, job_id, token, intent, None, None, 4_000)
         .await
@@ -2151,6 +2179,7 @@ fn sample_launch() -> LaunchRecord {
     LaunchRecord {
         node_id: node_id(5),
         executor_kind: "docker".to_string(),
+        backend: "default".to_string(),
         location: "giessen".to_string(),
         resources: Default::default(),
         workdir: None,
@@ -2168,6 +2197,9 @@ fn plain_intent(job_id: JobId) -> AttemptIntent {
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
         attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     }
 }
 
@@ -2554,12 +2586,16 @@ fn marks_launch_once() {
         executor_kind: "docker".to_string(),
         pinned_image: "alpine@sha256:digest".to_string(),
         attempt_epoch: 3,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     });
     let mut rows = seeded_rows(&record);
     let key = attempt_control_key(record.job_id, 3);
     let launch = LaunchRecord {
         node_id: node_id(7),
         executor_kind: "docker".to_string(),
+        backend: "default".to_string(),
         location: String::new(),
         resources: Default::default(),
         workdir: None,
@@ -2607,6 +2643,9 @@ fn draft() -> AttemptIntent {
         executor_kind: "docker".to_string(),
         pinned_image: "alpine@sha256:0".to_string(),
         attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     }
 }
 

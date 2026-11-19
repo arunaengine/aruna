@@ -171,6 +171,7 @@ fn execution_spec(group_id: GroupId) -> ExecutionSpec {
         env: Default::default(),
         resources: Default::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -216,6 +217,9 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
             executor_kind: "docker".to_string(),
             pinned_image: "alpine@sha256:digest".to_string(),
             attempt_epoch: 0,
+            backend: "docker".to_string(),
+            config_generation: 0,
+            home_digest: aruna_core::compute::identity::home_digest("docker", None),
         },
         None,
         None,
@@ -455,7 +459,7 @@ async fn capture_outputs(
     (node_id, cancel): (NodeId, &CancellationToken),
 ) -> Result<Vec<OutputObject>, JobError> {
     let mut driver = driver.clone();
-    let registry = ExecutorRegistry::new().with_backend(backend.clone());
+    let registry = ExecutorRegistry::new().with_backend("docker", backend.clone());
     driver.compute_handle = Some(Arc::new(registry));
     let realm_id = driver.serving_realm(record.created_by.realm_id);
     let capture = CaptureOutputsOperation::new(CaptureScope {

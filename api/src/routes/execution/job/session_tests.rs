@@ -184,6 +184,7 @@ fn session_spec() -> ExecutionSpec {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -201,7 +202,7 @@ async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexS
     let backend = Arc::new(FakeBackend {
         helper: AsyncMutex::new(Some(node_side)),
     });
-    let registry = Arc::new(ExecutorRegistry::new().with_backend(backend.clone()));
+    let registry = Arc::new(ExecutorRegistry::new().with_backend("docker", backend.clone()));
     let ctx = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,

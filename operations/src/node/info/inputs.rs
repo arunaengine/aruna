@@ -545,7 +545,8 @@ pub(super) mod tests {
     fn offers_need_subject() {
         let mut facts = facts();
         let caps = aruna_core::compute::offer::BackendCaps::default();
-        facts.offers = vec![ExecutorOffer::new("local".to_string(), caps)];
+        let names = ("local".to_string(), "local".to_string());
+        facts.offers = vec![ExecutorOffer::new(names, [0; 32], caps)];
         let mut operation = telemetry(facts.clone());
         let read = IoCall::child(SubjectRecordOperation);
         assert_eq!(operation.first(), Ok(Next::Call(read)));

@@ -362,6 +362,7 @@ async fn workspace_credential_writes() -> TestResult<()> {
             env: Default::default(),
             resources: ComputeResources::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),

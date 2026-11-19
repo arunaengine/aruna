@@ -649,6 +649,7 @@ fn spec_record(realm_id: RealmId, family: JobFamilyId, group_id: Ulid) -> JobRec
             env: Default::default(),
             resources: Default::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
@@ -744,6 +745,9 @@ async fn write_reservation(ctx: &DriverContext, execution_id: Ulid, cpu: u32) {
         created_at_ms: 5,
         subject_generation: 1,
         subject_digest: [0u8; 32],
+        backend: "default".to_string(),
+        config_generation: 0,
+        config_digest: [0; 32],
     };
     write_row(
         ctx,

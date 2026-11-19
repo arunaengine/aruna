@@ -651,6 +651,7 @@ mod tests {
     fn target() -> ExecutionTargetId {
         ExecutionTargetId {
             node_id: secret().public(),
+            backend: "docker".to_string(),
             executor_kind: "kubernetes".to_string(),
         }
     }
@@ -668,6 +669,7 @@ mod tests {
             env: Default::default(),
             resources: Default::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
@@ -821,6 +823,8 @@ mod tests {
             subject_generation: 1,
             subject_digest: [12u8; 32],
             accepted_at_ms: 3_000,
+            config_generation: 0,
+            config_digest: [0; 32],
         };
         signed(JobFamilyRecord::Receipt(Box::new(receipt)))
     }

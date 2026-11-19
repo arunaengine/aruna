@@ -290,6 +290,7 @@ pub(crate) async fn admit_execution(
             preemptible: false,
         },
         executor_constraint: command.executor_constraint,
+        backend: None,
         inputs,
         file_outputs,
         workspace_outputs,

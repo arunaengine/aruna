@@ -695,6 +695,9 @@ mod pure_tests {
             created_at_ms: 10,
             subject_generation: 0,
             subject_digest: [0; 32],
+            backend: "default".to_string(),
+            config_generation: 0,
+            config_digest: [0; 32],
         }
     }
 

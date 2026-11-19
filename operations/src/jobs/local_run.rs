@@ -871,7 +871,7 @@ mod tests {
         DriverContext {
             compute_handle: Some(std::sync::Arc::new(
                 aruna_compute::ExecutorRegistry::new()
-                    .with_backend(std::sync::Arc::new(StubBackend)),
+                    .with_backend("docker", std::sync::Arc::new(StubBackend)),
             )),
             ..test_ctx(root)
         }
