@@ -19,7 +19,6 @@ from check_style import CHAR_RE, iter_rust_files, read_source, scan_block
 
 OPERATIONS_SRC = "operations/src"
 BASELINE_PATH = "scripts/dev/layers_baseline.json"
-RUNNER = frozenset()
 # Domain groups of target-architecture.md section 5, lowest first. A module may
 # use its own group and lower groups only.
 GROUPS = (
@@ -128,7 +127,6 @@ COUNTS = (
     ("upward_refs", "upward references between domain groups"),
     ("group_mutual_pairs", "mutual module pairs inside a domain group"),
     ("group_cycle_modules", "modules in cycle groups inside a domain group"),
-    ("runner_refs", "runner references into domain modules"),
     ("core_clocks", "clock and random calls in core production code"),
     ("operation_clocks", "clock, random and id-mint calls in operations production code"),
     ("trigger_arms", "trigger shell arms that do more than drive one operation"),
@@ -456,9 +454,9 @@ def cycle_groups(edges):
 
 
 def layer_counts(ops):
-    """Counts and details for mixed files, references, groups and the runner."""
+    """Counts and details for mixed files, references and groups."""
     details = collections.defaultdict(list)
-    upward, inside, pure_async, runner = collections.Counter(), collections.Counter(), 0, collections.Counter()
+    upward, inside, pure_async = collections.Counter(), collections.Counter(), 0
     for rel, info in sorted(ops.files.items()):
         if info["kind"] == "mixed":
             details["mixed_files"].append(rel)
@@ -470,8 +468,6 @@ def layer_counts(ops):
                 details["pure_async_refs"].append(f"{rel} -> {target}")
             if source_mod == target_mod or source_mod is None or target_mod is None:
                 continue
-            if source_mod in RUNNER and target_mod not in RUNNER:
-                runner[(source_mod, target_mod)] += 1
             source_rank, target_rank = group_rank(source_mod), group_rank(target_mod)
             if source_rank is None or target_rank is None:
                 continue
@@ -484,14 +480,12 @@ def layer_counts(ops):
     details["upward_refs"] = [f"{a} -> {b}: {count}" for (a, b), count in sorted(upward.items())]
     details["group_mutual_pairs"] = [f"{a} <-> {b}" for a, b in mutual]
     details["group_cycle_modules"] = [", ".join(group) for group in cycles]
-    details["runner_refs"] = [f"{a} -> {b}: {count}" for (a, b), count in sorted(runner.items())]
     counts = {
         "mixed_files": len(details["mixed_files"]),
         "pure_async_refs": pure_async,
         "upward_refs": sum(upward.values()),
         "group_mutual_pairs": len(mutual),
         "group_cycle_modules": sum(len(group) for group in cycles),
-        "runner_refs": sum(runner.values()),
     }
     return counts, details
 

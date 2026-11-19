@@ -184,14 +184,6 @@ class ReferencesTest(unittest.TestCase):
         self.assertEqual(details["group_cycle_modules"], ["abe, auth, realm"])
         self.assertEqual(counts["group_mutual_pairs"], 0)
 
-    def test_runner_refs(self):
-        counts, details = self.counts(
-            {"operations/src/driver.rs": "use crate::jobs::run;\nuse crate::storage_read::read;\n",
-             "operations/src/storage_read.rs": "pub fn read() {}\n"}
-        )
-        self.assertEqual(counts["runner_refs"], 1)
-        self.assertEqual(details["runner_refs"], ["driver -> jobs: 1"])
-
 
 class TriggerTest(unittest.TestCase):
     def test_arms(self):
