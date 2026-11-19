@@ -631,6 +631,10 @@ impl AdmitLaunchOperation {
             let settle = SettleLaunchOperation::new(decision);
             return Ok(Next::Call(IoCall::child(settle)));
         }
+        // After the window no admission path accepts this launch, which lets holders close it.
+        if intent.expired(self.node.now_ms) {
+            return Ok(Next::Done(Err(LaunchDecline::Expired)));
+        }
         if cancelled(family, &records) {
             return Ok(Next::Done(Err(LaunchDecline::Cancelled)));
         }

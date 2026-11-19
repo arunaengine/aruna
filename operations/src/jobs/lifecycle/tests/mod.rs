@@ -14,6 +14,7 @@ mod run_link;
 mod scheduling;
 mod terminal;
 mod uncertain_commit;
+mod window;
 
 use aruna_core::UserId;
 use aruna_core::effects::{LaunchFrame, ReceiptFrame};

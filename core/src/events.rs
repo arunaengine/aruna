@@ -858,6 +858,9 @@ pub enum LaunchDecline {
     /// This node already runs, or already ran successfully, an execution of the
     /// same family. Retryable: another target may still take the launch.
     AlreadyRunning,
+    /// The launch window passed on the target's clock, so no target accepts this launch any
+    /// more. A new launch may still be accepted.
+    Expired,
 }
 
 /// Reply to a [`crate::effects::JobControlEffect`]: the owner's response, or an

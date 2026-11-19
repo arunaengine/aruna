@@ -749,7 +749,8 @@ fn permanent_decline(reason: &LaunchDecline) -> bool {
         | LaunchDecline::Capacity
         | LaunchDecline::Draining
         | LaunchDecline::Cancelled
-        | LaunchDecline::AlreadyRunning => false,
+        | LaunchDecline::AlreadyRunning
+        | LaunchDecline::Expired => false,
     }
 }
 

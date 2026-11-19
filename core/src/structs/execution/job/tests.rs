@@ -2115,3 +2115,18 @@ fn stop_rejects_signer() {
         Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt))
     );
 }
+
+#[test]
+fn launch_window_target() {
+    // The window counts on the deciding target's clock: a target whose clock is five minutes
+    // behind the scheduler's still accepts the launch five minutes longer in real time.
+    let launch = sample_launch();
+    let created = launch.created_at_ms;
+    assert!(!launch.expired(created));
+    assert!(!launch.expired(created + LAUNCH_WINDOW_MS));
+    assert!(launch.expired(created + LAUNCH_WINDOW_MS + 1));
+    let target_clock = |scheduler_ms: u64| scheduler_ms - 5 * 60 * 1000;
+    let passed = created + LAUNCH_WINDOW_MS + 1;
+    assert!(!launch.expired(target_clock(passed)));
+    assert!(launch.expired(target_clock(passed + 5 * 60 * 1000)));
+}

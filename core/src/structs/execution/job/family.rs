@@ -297,6 +297,16 @@ pub struct LaunchIntent {
     pub created_at_ms: u64,
 }
 
+/// How long after its creation a target may still accept a launch, counted on the target's clock.
+pub const LAUNCH_WINDOW_MS: u64 = 60 * 60 * 1000;
+
+impl LaunchIntent {
+    /// Whether the launch window passed at `now_ms` on the clock of the node that decides.
+    pub fn expired(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.created_at_ms) > LAUNCH_WINDOW_MS
+    }
+}
+
 /// The target's acceptance of one exact launch, authenticated by the executor's
 /// envelope signature. It binds the subject it was accepted under, so a later
 /// placement change cannot rewrite that history or authorize unrelated work.
