@@ -51,6 +51,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use crate::testing::task_context;
 use crate::tests::workflow::{execution_spec, node_id};
 
 /// The context of a call about `backend`: one whose registry holds it.
@@ -500,19 +501,6 @@ fn fence(attempt: &AttemptRef) -> FenceContext {
     }
 }
 
-fn context(storage: StorageHandle) -> Arc<DriverContext> {
-    Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: Some(TaskHandle::new()),
-        compute_handle: None,
-        outbound_handle: None,
-    })
-}
-
 #[test]
 fn exit_message_bounds() {
     // An over-long detail must not push the message past the stored cap,
@@ -536,7 +524,7 @@ async fn denied_write_blocks() {
     // Queued execution must not outlive the submitter's group write access.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = context(storage);
+    let context = task_context(storage);
     let spec = execution_spec();
     let job_id = job_id();
     let mut record = JobRecord::new(
@@ -620,7 +608,7 @@ async fn ready_with_intent(context: &DriverContext) -> (JobRecord, ulid::Ulid, A
 async fn ambiguous_submit_parks() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let ctx = context(storage.clone());
+    let ctx = task_context(storage.clone());
     let (record, token, attempt) = ready_with_intent(&ctx).await;
     let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::Unavailable);
 
@@ -720,7 +708,7 @@ async fn inventory_failure_parks() {
 async fn system_error_parks() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let mut ctx = context(storage.clone());
+    let mut ctx = task_context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
     let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
@@ -766,7 +754,7 @@ async fn system_error_parks() {
 async fn cancel_lost_evidence() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let mut ctx = context(storage.clone());
+    let mut ctx = task_context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
     let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
@@ -800,7 +788,7 @@ async fn cancel_lost_evidence() {
 async fn capture_failure_caps() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let mut ctx = context(storage.clone());
+    let mut ctx = task_context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
     let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
@@ -964,7 +952,7 @@ async fn cancelled_capture_settles() {
 async fn cancelled_exhaustion_settles() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let mut ctx = context(storage.clone());
+    let mut ctx = task_context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
     let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
@@ -1006,7 +994,7 @@ async fn cancelled_exhaustion_settles() {
 async fn finalize_renews_lease() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let mut ctx = context(storage.clone());
+    let mut ctx = task_context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
     let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
@@ -1476,7 +1464,7 @@ async fn cancel_beats_success() {
 async fn walltime_fails_job() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let mut ctx = context(storage.clone());
+    let mut ctx = task_context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
     let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
@@ -1514,7 +1502,7 @@ async fn arms_missing_start() {
     // anchored at the moment supervision begins.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let mut ctx = context(storage.clone());
+    let mut ctx = task_context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
     let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
@@ -1580,7 +1568,7 @@ async fn anchor_survives_restart() {
 async fn reconcile_skips_submit() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let mut ctx = context(storage.clone());
+    let mut ctx = task_context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
     let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
@@ -1611,7 +1599,7 @@ async fn reconcile_skips_submit() {
 async fn absent_retries_same() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let ctx = context(storage.clone());
+    let ctx = task_context(storage.clone());
     let (record, token, attempt) = ready_with_intent(&ctx).await;
     let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
 
@@ -1774,7 +1762,7 @@ async fn workspace_run_credential() {
 async fn crate_write_idempotent() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let driver = context(storage.clone());
+    let driver = task_context(storage.clone());
     let (record, token, _attempt) = ready_with_intent(&driver).await;
     let job_id = record.job_id;
 
@@ -1789,7 +1777,7 @@ async fn crate_write_idempotent() {
     .unwrap();
 
     let ctx = JobContext {
-        driver: context(storage.clone()),
+        driver: task_context(storage.clone()),
         job_id,
         owner_node_id: record.owner_node_id,
         claim_token: token,

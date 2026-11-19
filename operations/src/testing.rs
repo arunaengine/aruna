@@ -41,6 +41,14 @@ pub fn test_context(storage: StorageHandle) -> DriverContext {
     }
 }
 
+/// A storage driver context with a task plane, shared behind an `Arc`.
+pub fn task_context(storage: StorageHandle) -> std::sync::Arc<DriverContext> {
+    std::sync::Arc::new(DriverContext {
+        task_handle: Some(TaskHandle::new()),
+        ..test_context(storage)
+    })
+}
+
 /// A storage-only driver context on a store opened at `root`.
 pub fn path_context(root: &str) -> DriverContext {
     test_context(aruna_storage::FjallStorage::open(root).expect("open the test store"))

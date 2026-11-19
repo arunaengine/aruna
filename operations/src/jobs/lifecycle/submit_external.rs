@@ -314,7 +314,7 @@ impl Operation for SubmitExternalOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::records::{Family, REALM, node, payload, user};
+    use crate::tests::records::{Family, REALM, local_ingress, node, payload, user};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::errors::StorageError;
 
@@ -330,17 +330,8 @@ mod tests {
         }
     }
 
-    fn here() -> IngressNode {
-        IngressNode {
-            local: node(1),
-            realm_id: REALM,
-            now_ms: 0,
-            fresh: BTreeMap::new(),
-        }
-    }
-
     fn operation() -> SubmitExternalOperation {
-        SubmitExternalOperation::new(submission(None), Some(here()))
+        SubmitExternalOperation::new(submission(None), Some(local_ingress()))
     }
 
     fn child<T, E>(result: Result<T, E>) -> IoResult

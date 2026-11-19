@@ -193,7 +193,7 @@ impl Operation for ServeInputsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::records::{REALM, captured_input, node, user};
+    use crate::tests::records::{REALM, captured_input, node, user, user_auth};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::job::{InputMode, SubmissionId};
     use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
@@ -234,15 +234,6 @@ mod tests {
         AuthToken::bearer("token").unwrap()
     }
 
-    fn auth() -> AuthContext {
-        AuthContext {
-            user_id: user(),
-            realm_id: REALM,
-            path_restrictions: None,
-            session: None,
-        }
-    }
-
     fn config() -> RealmConfigDocument {
         let mut config = RealmConfigDocument::new(REALM, Vec::new(), 1);
         config.nodes.push(RealmNode {
@@ -264,7 +255,7 @@ mod tests {
     fn admitted(inputs: Vec<InputSelection>) -> (ServeInputsOperation, ServeNext) {
         let mut serve = operation(bearer(), inputs);
         serve.first().expect("the token is checked");
-        let read = serve.next(child(Ok::<_, PeerAuthRefusal>(auth())));
+        let read = serve.next(child(Ok::<_, PeerAuthRefusal>(user_auth())));
         assert!(matches!(read, Ok(Next::Call(IoCall::Child(_)))));
         let next = serve.next(child(Ok::<_, GetConfigError>(config())));
         (serve, next)
@@ -273,7 +264,7 @@ mod tests {
     // Only a bearer validated here can vouch for grants.
     #[test]
     fn needs_bearer_token() {
-        let internal = AuthToken::Internal(auth());
+        let internal = AuthToken::Internal(user_auth());
         assert_eq!(
             operation(internal, Vec::new()).first(),
             Err(SubmissionRefusal::Unauthorized)

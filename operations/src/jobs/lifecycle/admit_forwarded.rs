@@ -329,11 +329,10 @@ impl Operation for AdmitForwardedOperation {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use super::*;
     use crate::jobs::lifecycle::ids::SubmissionScope;
-    use crate::tests::records::{Family, REALM, node, payload, user};
+    use crate::tests::records::{Family, REALM, local_ingress, node, payload, user};
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::job::JobId;
@@ -349,15 +348,6 @@ mod tests {
             captured_inputs: Vec::new(),
             output_policies: Vec::new(),
             input_pages: None,
-        }
-    }
-
-    fn here() -> IngressNode {
-        IngressNode {
-            local: node(1),
-            realm_id: REALM,
-            now_ms: 0,
-            fresh: BTreeMap::new(),
         }
     }
 
@@ -391,7 +381,7 @@ mod tests {
     // A relay may not attribute the plan to another caller.
     #[test]
     fn refuses_other_submitter() {
-        let mut admit = operation(Some(here()));
+        let mut admit = operation(Some(local_ingress()));
         calls_child(admit.first());
         let other = auth(UserId::local(Ulid::from_parts(9, 9), REALM));
         assert_eq!(
@@ -415,7 +405,7 @@ mod tests {
     #[test]
     fn group_check_refuses() {
         let answer = |result: Result<bool, IoError>| {
-            let mut admit = operation(Some(here()));
+            let mut admit = operation(Some(local_ingress()));
             let config = Family::new([4; 32]).config;
             admit.step = ForwardedStep::Group(Box::new(config));
             admit.next(child(result))
@@ -430,7 +420,7 @@ mod tests {
     // A recomputed identity that differs from the forwarded one is refused.
     #[test]
     fn identity_must_match() {
-        let mut admit = operation(Some(here()));
+        let mut admit = operation(Some(local_ingress()));
         admit.submission_id = SubmissionId([9; 32]);
         let config = Family::new([4; 32]).config;
         assert_eq!(
@@ -443,7 +433,7 @@ mod tests {
     #[test]
     fn admission_outcomes() {
         let answer = |error| {
-            let mut admit = operation(Some(here()));
+            let mut admit = operation(Some(local_ingress()));
             admit.step = ForwardedStep::Admit;
             admit.next(child(Err::<AcceptedSubmission, _>(error)))
         };

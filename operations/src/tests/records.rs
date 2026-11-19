@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::ExecutionTargetId;
@@ -21,12 +23,13 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::TempDir;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::launch_checks::LocalCapabilityOperation;
+use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::jobs::records::verify::FamilyView;
 use crate::metadata::protocol::MetadataTransportMessage;
@@ -474,5 +477,25 @@ pub async fn read_row(
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {}", other.label())),
+    }
+}
+
+/// An ingress node at node 1 of `REALM` without fresh peers.
+pub(crate) fn local_ingress() -> IngressNode {
+    IngressNode {
+        local: node(1),
+        realm_id: REALM,
+        now_ms: 0,
+        fresh: BTreeMap::new(),
+    }
+}
+
+/// The auth of `user` in `REALM`.
+pub(crate) fn user_auth() -> AuthContext {
+    AuthContext {
+        user_id: user(),
+        realm_id: REALM,
+        path_restrictions: None,
+        session: None,
     }
 }
