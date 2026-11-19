@@ -41,6 +41,7 @@ mod notification_delivery;
 mod notification_peers;
 mod output_versioning;
 mod placement_determinism;
+mod plugin_tasks;
 mod profile_contract;
 mod propagation_tail;
 mod quarantine_capacity;
