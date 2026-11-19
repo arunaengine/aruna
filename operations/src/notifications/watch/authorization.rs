@@ -23,7 +23,8 @@ mod tests {
     use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use ulid::Ulid;
 
     use aruna_core::NodeId;

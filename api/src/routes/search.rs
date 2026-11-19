@@ -5,9 +5,8 @@
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{
-    MetadataQueryMode, SearchHitResponse, map_api_error, map_query_mode, map_search_hit,
-};
+use crate::metadata::model::{MetadataQueryMode, SearchHitResponse};
+use crate::metadata::{map_api_error, map_query_mode, map_search_hit};
 use crate::routes::access::users::MIN_QUERY_CHARS;
 use crate::server::state::ServerState;
 use aruna_core::UserId;

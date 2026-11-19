@@ -600,7 +600,7 @@ mod tests {
         MetadataAuditOperation, MetadataAuditRecord,
     };
     use aruna_drivers::driver::DriverContext;
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use std::collections::BTreeSet;
     use std::time::Duration;

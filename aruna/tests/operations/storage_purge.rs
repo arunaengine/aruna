@@ -76,7 +76,8 @@ use aruna_operations::transfer::copy::{
     CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };
 use aruna_operations::transfer::part_copy::{PartCopyError, PartCopyInput, PartCopyOperation};
-use aruna_storage::{StorageHandle, storage};
+use aruna_storage::storage;
+use aruna_storage::storage::handle::StorageHandle;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;

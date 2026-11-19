@@ -23,7 +23,8 @@ use ulid::Ulid;
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_drivers::driver::DriverContext;
-use aruna_storage::storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use tempfile::{TempDir, tempdir};
 
 pub fn test_storage() -> (TempDir, StorageHandle) {

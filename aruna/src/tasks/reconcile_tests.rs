@@ -6,7 +6,7 @@ use aruna_clock::unix_timestamp_millis;
 
 use super::workflow_fixtures::{execution_spec, node_id};
 use crate::tasks::runner::ComputeReconciler;
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::UserId;
 use aruna_core::structs::execution::job::{
     AttemptIntent, JobClaim, JobId, JobPayload, JobRecord, JobState,
@@ -18,7 +18,7 @@ use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::context::ExternalReconciler;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::JOB_MAX_ATTEMPTS;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_test_support::jobs::{insert_job, read_job_record, record_attempt_intent};
 use std::sync::Arc;

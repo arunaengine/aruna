@@ -272,7 +272,7 @@ mod tests {
     use aruna_core::structs::{SyncMode, SyncRelationship, SyncState};
     use aruna_core::time::unix_timestamp_millis;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
 
     use super::super::drain::{
         AdvanceCursorOperation, BlobDrainResult, BlobJobScan, JobRelationshipsOperation,
@@ -537,7 +537,7 @@ mod tests {
     use aruna_core::structs::{ReferenceHandling, SyncStatusSnapshot, sync_relationship_key};
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_net::NetHandle;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
 

@@ -15,7 +15,7 @@ use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_graph::GraphHandle;
 use aruna_net::{FORCED_INBOUND_DRAIN, NetHandle, NetShutdownOutcome};
 use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
 use std::sync::Arc;
@@ -620,7 +620,7 @@ mod tests {
     }
 
     fn open_storage(dir: &tempfile::TempDir) -> StorageHandle {
-        aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
             .expect("storage opens")
     }
 

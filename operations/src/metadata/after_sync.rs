@@ -180,12 +180,12 @@ mod tests {
     use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
     use aruna_core::task::PersistedTaskTimer;
     use aruna_drivers::driver::DriverContext;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
 
     async fn read_timer(
-        storage: &aruna_storage::StorageHandle,
+        storage: &aruna_storage::storage::handle::StorageHandle,
         key: &TaskKey,
     ) -> Option<PersistedTaskTimer> {
         let event = storage

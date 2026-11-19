@@ -211,7 +211,8 @@ mod process {
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::io::{Read, Seek, SeekFrom};
     use std::net::{TcpListener, UdpSocket};
     use std::path::{Path, PathBuf};
@@ -847,7 +848,7 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
 }
 
 async fn load_state(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
 ) -> TestResult<aruna_core::structs::identity::node_state::PersistedNodeState> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -871,7 +872,7 @@ async fn load_state(
 }
 
 async fn load_realm(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
 ) -> TestResult<aruna_core::structs::identity::realm::RealmConfigDocument> {
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -896,7 +897,7 @@ async fn load_realm(
     }
 }
 
-async fn clear_space(storage: &aruna_storage::StorageHandle, key_space: &str) -> TestResult<()> {
+async fn clear_space(storage: &aruna_storage::storage::handle::StorageHandle, key_space: &str) -> TestResult<()> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
 

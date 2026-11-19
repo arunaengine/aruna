@@ -179,10 +179,10 @@ mod tests {
             let _ = actor_done_tx.send(());
         });
         let net_handle = aruna_net::NetHandle::new(
-            aruna_net::NetConfig {
-                discovery_method: aruna_net::DiscoveryMethod::None,
-                relay_method: aruna_net::RelayMethod::None,
-                ..aruna_net::NetConfig::default()
+            aruna_net::config::NetConfig {
+                discovery_method: aruna_net::config::DiscoveryMethod::None,
+                relay_method: aruna_net::config::RelayMethod::None,
+                ..aruna_net::config::NetConfig::default()
             },
             storage_handle.clone(),
         )
@@ -273,11 +273,11 @@ mod tests {
         let storage_handle =
             storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let net_handle = aruna_net::NetHandle::new(
-            aruna_net::NetConfig {
-                discovery_method: aruna_net::DiscoveryMethod::None,
-                relay_method: aruna_net::RelayMethod::None,
+            aruna_net::config::NetConfig {
+                discovery_method: aruna_net::config::DiscoveryMethod::None,
+                relay_method: aruna_net::config::RelayMethod::None,
                 sync_storage_path: Some(directory.path().join("sync")),
-                ..aruna_net::NetConfig::default()
+                ..aruna_net::config::NetConfig::default()
             },
             storage_handle.clone(),
         )

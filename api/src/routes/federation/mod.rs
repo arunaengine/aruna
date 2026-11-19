@@ -11,7 +11,7 @@ use crate::auth::RealmAuth;
 use crate::auth::ensure_permission;
 use crate::error::{ServerError, ServerResult};
 use crate::lookup::actor;
-use crate::routes::git::expected;
+use crate::routes::git::versions::expected;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::errors::StorageError;

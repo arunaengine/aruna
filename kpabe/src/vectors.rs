@@ -9,6 +9,11 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::encoding::encode_key;
+use crate::envelope::{Envelope, open, seal};
+use crate::policy::{Attribute, Policy};
+use crate::scheme::{
+    Ciphertext, PublicParameters, UserKey, decapsulate, encapsulate, issue, setup_from_seed,
+};
 use crate::*;
 
 fn cases() -> Value {

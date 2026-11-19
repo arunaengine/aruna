@@ -8,13 +8,10 @@ mod attributes;
 mod bucket;
 mod copy;
 mod encryption;
-mod forward;
+pub(crate) mod forward;
 mod listing;
 mod payload;
 mod pinned;
-
-pub(crate) use forward::forwarded_digest;
-pub(crate) use forward::reads::delegated_caller;
 
 use crate::s3::auth::DelegatedRequest;
 use aruna_core::structs::storage::distribution::delegation::{
@@ -25,9 +22,9 @@ mod link;
 mod multipart;
 mod object;
 mod response;
-mod view;
+pub(crate) mod view;
 
-pub(crate) use self::view::InputView;
+use self::view::InputView;
 
 use self::attributes::{
     RequestedAttributes, attributes_checksum, attributes_output, attributes_parts, parse_max_parts,
@@ -63,7 +60,7 @@ use crate::s3::multipart_join::{
     completion_registry, conflicting_completion,
 };
 use crate::s3::scope::SubpathScope;
-use crate::s3::server::DeleteObjectsBody;
+use crate::s3::server::body::DeleteObjectsBody;
 use crate::s3::util::{
     check_sse, checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
     location_sse, map_checksum_type, parse_checksum_hint, parse_checksum_type,

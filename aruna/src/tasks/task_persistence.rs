@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
 use aruna_core::task::{PersistedTaskTimer, TaskEffect};
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::task_timers::delete_timer_key;
 use aruna_tasks::TaskHandle;
 use tracing::warn;
@@ -81,7 +81,7 @@ pub async fn restore_task_timers(storage: &StorageHandle, task_handle: &TaskHand
 mod tests {
     use super::*;
     use aruna_core::task::TaskKey;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_storage::task_timers::{persist_task_effect, read_timer};
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna::tasks::incoming::start_task_queues;
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_core::StructuredId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
@@ -40,7 +40,7 @@ use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOper
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
 use aruna_operations::metadata::registry_cache::RegistryReadOperation;
 use aruna_operations::metadata::update_document::{UpdateDocumentConfig, UpdateDocumentOperation};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_test_support::metadata::process_materialization_batch;
 use aruna_test_support::projection::{drain_projection_queue, project_create_events};
@@ -1071,7 +1071,7 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
 }
 
 async fn seed_realm_config(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     actor: &Actor,
 ) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);

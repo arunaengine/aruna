@@ -12,7 +12,7 @@ use aruna_core::onboarding::{
     OnboardingSecret, OnboardingTicket, issuer_proof_message, node_proof_message,
 };
 use aruna_core::structs::identity::realm::{RealmId, StaticRealmEndpoint};
-use aruna_net::parse_endpoint_config;
+use aruna_net::config::parse_endpoint_config;
 use base64::Engine;
 use crypto_box::{
     PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey,

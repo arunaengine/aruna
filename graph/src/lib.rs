@@ -25,14 +25,13 @@ mod convert;
 pub mod merge;
 mod persist;
 mod profiles;
-mod read;
+pub mod read;
 mod run;
 mod scope_reads;
-mod shacl;
+pub mod shacl;
 mod summaries;
 
-pub use crate::read::{Properties, ReadScope};
-pub use crate::shacl::ProfileShaclEngine;
+use crate::shacl::ProfileShaclEngine;
 
 /// Store calls at or above this duration are logged as slow.
 const SLOW_CALL: Duration = Duration::from_millis(100);

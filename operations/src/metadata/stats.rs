@@ -214,7 +214,8 @@ mod tests {
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::types::GroupId;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use byteview::ByteView;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;

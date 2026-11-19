@@ -2,10 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::persistence::FjallPersistPolicy;
 use super::tests::{
     assert_read_result, assert_write_result, commit_transaction, start_write_transaction,
 };
-use super::{FjallPersistPolicy, FjallStorage};
+use super::worker::FjallStorage;
 use aruna_core::effects::StorageEffect;
 use std::{env, process::Command};
 use tempfile::tempdir;

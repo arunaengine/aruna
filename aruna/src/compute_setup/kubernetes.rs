@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::ExecutorRegistry;
 use tracing::info;
 
 use super::settings::{
@@ -27,7 +27,7 @@ pub(super) async fn build(
         kubernetes.mount_driver.clone(),
     );
     let backend = aruna_compute::executor::kubernetes::KubernetesBackend::with_config(
-        aruna_compute::KubernetesConfig {
+        aruna_compute::executor::config::KubernetesConfig {
             namespace: kubernetes.namespace.clone(),
             storage_class: kubernetes.storage_class.clone(),
             helper_image: kubernetes.helper_image.clone(),
@@ -45,7 +45,7 @@ pub(super) async fn build(
                 .clone()
                 .zip(workspace.clone())
                 .map(|(driver, endpoint)| {
-                    Box::new(aruna_compute::KubedalMount {
+                    Box::new(aruna_compute::executor::config::KubedalMount {
                         driver,
                         endpoint,
                         region: "us-east-1".to_string(),
@@ -60,12 +60,12 @@ pub(super) async fn build(
             envelope: settings
                 .envelope
                 .expect("a selected kubernetes backend has an envelope"),
-            ..aruna_compute::KubernetesConfig::default()
+            ..aruna_compute::executor::config::KubernetesConfig::default()
         },
     )
     .await
     .map_err(|error| error.to_string())?;
-    aruna_compute::ExecutorBackend::health(&backend)
+    aruna_compute::executor::ExecutorBackend::health(&backend)
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
     // Pods keep the policy they started with, so already running sessions only

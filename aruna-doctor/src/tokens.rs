@@ -524,7 +524,7 @@ mod tests {
     use crate::tests::fixtures::env_lock;
     use aruna::bootstrap::ensure_onboarding_secret;
     use aruna::inbound::initialize_net_holder;
-    use aruna::tasks::incoming::start_task_queues;
+    use aruna::tasks::incoming::restore::start_task_queues;
     use aruna_api::auth::OidcValidator;
     use aruna_api::routes::onboarding::ListSecretsResponse;
     use aruna_api::server::state::ServerState;
@@ -541,13 +541,14 @@ mod tests {
     use aruna_core::structs::identity::user::User;
     use aruna_core::testing::EnvGuard;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
     use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use axum::extract::State;
     use axum::routing::{get, post};

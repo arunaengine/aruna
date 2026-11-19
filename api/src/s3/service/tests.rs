@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::*;
 use super::bucket::MAX_REPLICATION_TARGETS;
 use super::listing::next_marker_of;
-use super::*;
 use crate::s3::checksum::UploadChecksumRequest;
 use crate::s3::scope::resolve_scope;
 use aruna_core::UserId;
@@ -44,7 +44,8 @@ use aruna_core::structs::storage::object_read::ObjectInfo;
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::read_value;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::notifications::watch::drain::WatchDrainOperation;
 use aruna_operations::notifications::watch::store::StoreWatchOperation;

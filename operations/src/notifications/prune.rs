@@ -509,7 +509,7 @@ mod tests {
     use aruna_core::storage_entries::{inbox_update_entry, inbox_write_entries};
     use aruna_core::time::unix_timestamp_millis;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
     use aruna_tasks::InboundTaskHandler;
     use aruna_tasks::TaskHandle;
     use async_trait::async_trait;

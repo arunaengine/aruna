@@ -395,7 +395,7 @@ async fn s3_bucketless_framed() {
     // A group storage without a fixed bucket: parts stream into its default bucket, and the
     // short last part waits in that bucket's own parts folder.
     use super::{s3_config, unique_name};
-    use crate::blob::NodeBackend;
+    use crate::blob::registry::NodeBackend;
     use crate::s3::make_bucket;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
     use aruna_core::structs::storage::group_backend::{

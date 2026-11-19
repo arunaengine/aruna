@@ -15,14 +15,15 @@ use aruna_plugin_types::calls::{
 };
 use aruna_plugin_types::manifest::Manifest;
 use aruna_plugin_types::permission::Permission;
+use aruna_plugins::CancellationToken;
 use aruna_plugins::broker::{
     Broker, CallContext, FileChange, JobCopy, JobDownload, JobUpload, MetadataCreate,
     MetadataPatch, SendRequest, StatePut, StateRemove,
 };
+use aruna_plugins::host::Limit;
+use aruna_plugins::host::wit::aruna::plugin::types::{FailureKind, Trigger, WatchEvent};
 use aruna_plugins::limits::{Limits, RuntimeConfig};
-use aruna_plugins::{
-    CancellationToken, FailureKind, Invocation, InvokeError, Limit, Runtime, Trigger, WatchEvent,
-};
+use aruna_plugins::runtime::{Invocation, InvokeError, Runtime};
 use wasm_encoder::{ComponentSection, CustomSection};
 
 const FIXTURE: &[u8] = include_bytes!("fixture.wasm");

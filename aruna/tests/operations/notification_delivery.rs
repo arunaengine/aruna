@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use aruna::inbound::initialize_net_holder;
-use aruna::tasks::incoming::{drain_notification_outbox, start_task_queues};
+use aruna::tasks::incoming::restore::{drain_notification_outbox, start_task_queues};
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::compute::SecretBytes;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -24,7 +24,8 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::{NodeId, UserId};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::notifications::client::{
     HolderRequestOperation, marked_read, unread_counted,
@@ -39,7 +40,8 @@ use aruna_operations::notifications::webhook::{
 use aruna_operations::sync::notification_outbox::{
     EmitNotificationsInput, EmitNotificationsOperation,
 };
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;

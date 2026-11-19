@@ -9,8 +9,8 @@ use rand_core::TryCryptoRng;
 use zeroize::Zeroizing;
 
 use crate::crypto::{derive_key, fingerprint, master_scalar, oracle, random_pair, random_scalar};
-use crate::policy::canonical_attributes;
-use crate::{Attribute, Error, MAX_ATTRIBUTES, MAX_BYTES, Policy, check_context};
+use crate::policy::{Attribute, Policy, canonical_attributes};
+use crate::{Error, MAX_ATTRIBUTES, MAX_BYTES, check_context};
 
 /// Public parameters bound to one profile and caller context by their fingerprint.
 #[derive(Debug, Clone)]
@@ -92,11 +92,11 @@ impl KemKey {
     /// Derives 32 bytes with HKDF-SHA256; refuses empty or oversized contexts.
     #[doc = ""]
     /// ```compile_fail,E0277
-    /// fn check(k: &aruna_kpabe::KemKey) { format!("{:?}", k.derive(b"ctx").unwrap()); }
+    /// fn check(k: &aruna_kpabe::scheme::KemKey) { format!("{:?}", k.derive(b"ctx").unwrap()); }
     /// ```
     #[doc = ""]
     /// ```compile_fail,E0599
-    /// fn check(k: &aruna_kpabe::KemKey) { k.derive(b"ctx").unwrap().clone(); }
+    /// fn check(k: &aruna_kpabe::scheme::KemKey) { k.derive(b"ctx").unwrap().clone(); }
     /// ```
     pub fn derive(&self, context: &[u8]) -> Result<SecretKey, Error> {
         check_context(context)?;

@@ -26,9 +26,8 @@ use crate::connection_pool::{ConnectionLease, ConnectionPool};
 use crate::device_limits::{DeviceLimiter, DeviceLimits, DevicePermit, DeviceRefusal};
 use crate::document_sync::DocumentSyncService;
 use crate::error::{NetError, Result};
-use crate::telemetry::{
-    duration_ms, record_duration_ms, record_selected_path, warn_iroh_phase, warn_iroh_request,
-};
+use crate::telemetry::{record_selected_path, warn_iroh_phase, warn_iroh_request};
+use aruna_core::telemetry::{duration_ms, record_duration_ms};
 
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const INBOUND_CONNECTION_LIMIT: usize = 256;

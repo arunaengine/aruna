@@ -6,7 +6,7 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::types::{Key, TxnId, Value};
 
-use crate::StorageHandle;
+use crate::storage::handle::StorageHandle;
 
 /// One page of `key_space` under `prefix` after `start_after`, and the key the next page
 /// starts after.

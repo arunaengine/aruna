@@ -12,9 +12,9 @@ use ulid::Ulid;
 
 use super::*;
 use crate::auth::RealmAuth;
-use crate::routes::storage::relay::RELAY_NODE_HEADER;
 use crate::tests::assistant::spawn_mock;
 use crate::tests::distributed::{LOCAL, Node, PEER, node_id, node_state, publish_api};
+use aruna_operations::s3::object::member_rest::RELAY_NODE_HEADER;
 
 async fn run(
     node: &Node,

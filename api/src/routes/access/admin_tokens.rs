@@ -168,7 +168,7 @@ async fn run_revocation(
     .await
     .map_err(map_tokens_error)?;
     if revocation.credentials > 0 {
-        crate::routes::storage::abe::epoch_due(state, &auth, Some(group_id)).await;
+        crate::routes::storage::abe::records::epoch_due(state, &auth, Some(group_id)).await;
     }
     Ok(RevocationResponse {
         revoked: revocation.revoked,

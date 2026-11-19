@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::ExecutorRegistry;
 use tracing::info;
 
 use super::settings::compute_s3_endpoint;
@@ -15,7 +15,7 @@ pub(super) async fn build(
     config: &Config,
 ) -> Result<ExecutorRegistry, ComputeBuildError> {
     let backend = aruna_compute::executor::apptainer::slurm::SlurmBackend::with_config(
-        aruna_compute::SlurmConfig {
+        aruna_compute::executor::config::SlurmConfig {
             state_root: slurm.state_root.clone(),
             partition: slurm.partition.clone(),
             account: slurm.account.clone(),
@@ -24,11 +24,11 @@ pub(super) async fn build(
             envelope: settings
                 .envelope
                 .expect("a selected slurm backend has an envelope"),
-            ..aruna_compute::SlurmConfig::default()
+            ..aruna_compute::executor::config::SlurmConfig::default()
         },
     )
     .map_err(|error| error.to_string())?;
-    aruna_compute::ExecutorBackend::health(&backend)
+    aruna_compute::executor::ExecutorBackend::health(&backend)
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
     info!("Slurm executor backend enabled");

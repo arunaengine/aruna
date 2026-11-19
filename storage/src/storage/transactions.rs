@@ -22,7 +22,8 @@ use crate::compaction::{DELETE_THRESHOLD, compactable, sweep_due};
 
 use super::rebuild::shadow_row;
 
-use super::{CleanupEntry, CleanupKind, FjallStorage, MAX_TRANSACTION_CLEANUP, Txn};
+use super::worker::FjallStorage;
+use super::{CleanupEntry, CleanupKind, MAX_TRANSACTION_CLEANUP, Txn};
 
 /// A transaction's pending counter changes, keyed by key space and key in sorted order.
 pub(super) type PendingChanges = BTreeMap<(String, ByteView), CounterChange>;

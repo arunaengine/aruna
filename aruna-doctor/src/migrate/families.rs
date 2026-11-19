@@ -529,7 +529,7 @@ mod tests {
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::jobs::runtime::JobsRuntime;
     use aruna_operations::jobs::store::list_jobs::ListJobsOperation;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use serde::Serialize;
     use std::collections::BTreeMap;
     use std::path::Path;

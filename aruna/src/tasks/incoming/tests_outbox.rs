@@ -4,6 +4,7 @@
 
 use super::harness::*;
 use super::*;
+use crate::tasks::incoming::restore::start_task_queues;
 use aruna_clock::testing::poll_until;
 use aruna_drivers::testing::freeze_clock;
 
@@ -1223,7 +1224,7 @@ async fn retry_publishes_once() {
 
 struct ConfigHarness {
     _dir: tempfile::TempDir,
-    storage: aruna_storage::StorageHandle,
+    storage: aruna_storage::storage::handle::StorageHandle,
     net: NetHandle,
     handler: OperationsTaskHandler,
     config: RealmConfigDocument,
@@ -1526,7 +1527,7 @@ fn shard_topic_record(origin_seq: u64) -> DocumentOutboxRecord {
 
 struct BoundaryHarness {
     _dir: tempfile::TempDir,
-    storage: aruna_storage::StorageHandle,
+    storage: aruna_storage::storage::handle::StorageHandle,
     net: NetHandle,
     task_handle: TaskHandle,
     handler: OperationsTaskHandler,

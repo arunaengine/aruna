@@ -19,8 +19,9 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_drivers::driver::DriverContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_storage::FjallStorage;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_storage::storage::worker::FjallStorage;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use tempfile::TempDir;

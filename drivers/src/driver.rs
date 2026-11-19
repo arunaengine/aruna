@@ -2,9 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_blob::blob::{BlobHandle, GroupHold};
+use aruna_blob::blob::BlobHandle;
+use aruna_blob::blob::group::GroupHold;
 use aruna_clock::unix_timestamp_millis;
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
 use aruna_core::calls::CallRun;

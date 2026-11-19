@@ -21,8 +21,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_net::{NetConfig, NetHandle};
-use aruna_storage::FjallStorage;
+use aruna_net::NetHandle;
+use aruna_net::config::NetConfig;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use async_trait::async_trait;
 use byteview::ByteView;
@@ -35,8 +36,6 @@ use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::sync::outbox_record::write_outbox_effect;
 use aruna_tasks::InboundTaskHandler;
-
-pub(crate) use aruna_drivers::testing::RecordingTaskHandler;
 
 pub(crate) fn job_id() -> JobId {
     aruna_operations::testing::fresh_job_id(
@@ -69,7 +68,7 @@ pub(crate) async fn shutdown_net(net: &NetHandle) {
 
 pub(crate) struct InstalledHarness {
     pub(crate) _dir: tempfile::TempDir,
-    pub(crate) storage: aruna_storage::StorageHandle,
+    pub(crate) storage: aruna_storage::storage::handle::StorageHandle,
     pub(crate) net: NetHandle,
     pub(crate) task_handle: TaskHandle,
     pub(crate) context: Arc<DriverContext>,
@@ -202,7 +201,7 @@ pub(crate) fn change() -> DocumentChange {
 }
 
 pub(crate) async fn read_graph_jobs(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
 ) -> Vec<GraphPruneRecord> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
@@ -223,7 +222,7 @@ pub(crate) async fn read_graph_jobs(
 }
 
 pub(crate) async fn write_outbox_record(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     record: &DocumentOutboxRecord,
 ) {
     match storage
@@ -237,7 +236,7 @@ pub(crate) async fn write_outbox_record(
 
 pub(crate) async fn make_net_handle(
     realm_id: RealmId,
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     secret: [u8; 32],
 ) -> NetHandle {
     NetHandle::new(
@@ -253,7 +252,7 @@ pub(crate) async fn make_net_handle(
 }
 
 pub(crate) async fn write_realm_config(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     realm_id: RealmId,
     config: &RealmConfigDocument,
     node_id: aruna_core::NodeId,

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna::tasks::incoming::drain_notification_outbox;
+use aruna::tasks::incoming::restore::drain_notification_outbox;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -48,7 +48,8 @@ use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObje
 use aruna_operations::sync::notification_outbox::{
     EmitNotificationsInput, EmitNotificationsOperation,
 };
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_test_support::projection::project_logged_events;
 use convergence::{NO_PROGRESS_TIMEOUT, wait_empty_queues, wait_for_visibility};
 use futures_util::StreamExt;

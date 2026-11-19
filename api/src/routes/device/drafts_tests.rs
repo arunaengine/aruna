@@ -5,7 +5,7 @@
 use super::{DeviceDraft, preview_draft};
 use crate::auth::OwnerAuth;
 use crate::error::ServerError;
-use crate::metadata::ProfilePreviewRequest;
+use crate::metadata::model::ProfilePreviewRequest;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -16,7 +16,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::device::publish_queue::{PublishEntry, PublishState};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::Json;
 use axum::extract::State;

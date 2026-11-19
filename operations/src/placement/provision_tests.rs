@@ -29,7 +29,7 @@ fn actor(realm_id: RealmId) -> Actor {
 
 fn context(root: &str) -> DriverContext {
     DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
+        storage_handle: aruna_storage::storage::worker::FjallStorage::open(root).unwrap(),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,

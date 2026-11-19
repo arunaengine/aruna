@@ -315,11 +315,11 @@ async fn publish_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::incoming::install_task_queues;
+    use crate::tasks::incoming::restore::install_task_queues;
 
     async fn test_background() -> (Background, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("temp dir");
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
+        let storage = aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
             .expect("storage opens");
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,

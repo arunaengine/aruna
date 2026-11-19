@@ -6,7 +6,7 @@ use super::*;
 use crate::auth::RealmAuth;
 use crate::auth::extract;
 use crate::error::ServerError;
-use crate::metadata::{
+use crate::metadata::model::{
     CreateMetadataRequest, CreateScaffoldRequest, MetadataQueryMode, ReplaceRoCrateRequest,
 };
 use crate::routes::metadata::documents::create_metadata_document;

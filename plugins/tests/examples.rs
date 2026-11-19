@@ -16,16 +16,17 @@ use aruna_plugin_types::calls::{
     ObjectInfo, ObjectPage, Response, merge_into,
 };
 use aruna_plugin_types::permission::Permission;
+use aruna_plugins::CancellationToken;
 use aruna_plugins::broker::{
     Broker, CallContext, FileChange, JobCopy, JobDownload, JobUpload, MetadataCreate,
     MetadataPatch, SendRequest, StatePut, StateRemove,
 };
+use aruna_plugins::host::wit::aruna::plugin::types::{
+    Failure, FailureKind, Trigger, WatchEvent, WebhookDelivery, WebhookRequest,
+};
 use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
-use aruna_plugins::{
-    CancellationToken, Compiled, Failure, FailureKind, Invocation, InvokeError, Runtime, Trigger,
-    WatchEvent, WebhookDelivery, WebhookRequest,
-};
+use aruna_plugins::runtime::{Compiled, Invocation, InvokeError, Runtime};
 
 use common::{limits, require};
 

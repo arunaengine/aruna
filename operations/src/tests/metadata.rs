@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use byteview::ByteView;
 
 pub(crate) async fn storage_key_exists(

@@ -10,7 +10,7 @@ pub mod state;
 use crate::forwarded::DirectOrigin;
 use crate::https::listener::CombinedListener;
 use crate::https::{HostRoute, check_host};
-pub(crate) use crate::server::state::{ServerState, swagger_ui};
+use crate::server::state::{ServerState, swagger_ui};
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
@@ -217,7 +217,7 @@ mod tests {
         use aruna_core::structs::identity::realm::RealmId;
 
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId::from_bytes(
             ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
                 .verifying_key()
@@ -280,7 +280,7 @@ mod tests {
         use aruna_core::structs::identity::realm::RealmId;
 
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId::from_bytes(
             ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
                 .verifying_key()

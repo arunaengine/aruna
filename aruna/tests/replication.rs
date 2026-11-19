@@ -4,8 +4,8 @@
 
 use crate::shared;
 
-use aruna_api::routes::credentials::CreatePathRestriction;
-use aruna_api::routes::groups::AddMemberRequest;
+use aruna_api::routes::access::credentials::CreatePathRestriction;
+use aruna_api::routes::access::groups::AddMemberRequest;
 use aruna_api::routes::info::{RealmInfoResponse, RealmQuotaConfig, RealmQuotaOverride};
 use aruna_api::routes::sync::{
     ApiReferenceHandling, ApiSyncMode, CreateSyncRequest, SyncDetailResponse,
@@ -38,9 +38,9 @@ use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, SyncMirrorRe
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
-use aruna_drivers::driver::DriverContext;
-use aruna_drivers::driver::drive;
-use aruna_kpabe::{Envelope, UserKey};
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_kpabe::envelope::Envelope;
+use aruna_kpabe::scheme::UserKey;
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aws_sdk_s3::Client as S3Client;
@@ -2206,7 +2206,7 @@ async fn encrypted_sync_regrants() -> TestResult<()> {
         let decode = |value: &serde_json::Value| STANDARD.decode(value.as_str().unwrap());
         let cipher = Envelope::from_bytes(&parameters, &decode(&envelopes[0]["envelope"]["abe"])?)?;
         let context = decode(&envelopes[0]["context"]["bytes"])?;
-        let object = aruna_kpabe::open(&parameters, &scoped, &cipher, &context)?;
+        let object = aruna_kpabe::envelope::open(&parameters, &scoped, &cipher, &context)?;
         let header = STANDARD.encode(object.as_bytes());
         let row = VersionKey::new(target, key, version.parse::<Ulid>()?).to_bytes()?;
         let content = format!("{base}/api/v1/data/blobs/content");

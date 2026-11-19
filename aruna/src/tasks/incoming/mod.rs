@@ -184,15 +184,11 @@ use aruna_operations::triggers::{TimerInput, timer_operation};
 use aruna_storage::task_timers::{delete_persisted_timer, persist_task_effect};
 use folder_pass::{restore_publish_timer, restore_sync_timers};
 
-mod drained;
+pub(crate) mod drained;
 pub mod folder_pass;
 pub mod git_drain;
-mod outbox;
-pub(crate) use drained::remove_drained_backends;
-mod restore;
-
-pub use outbox::drive_sync_drain;
-pub use restore::{drain_notification_outbox, install_task_queues, start_task_queues};
+pub mod outbox;
+pub mod restore;
 
 /// Process-wide tally of document sync outbox records ever classified
 /// undeliverable. The drain already error-logs each one; this exposes the count

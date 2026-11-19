@@ -4,7 +4,7 @@
 
 use crate::shared;
 
-use aruna_api::routes::groups::{
+use aruna_api::routes::access::groups::{
     AddMemberRequest, CreateRoleRequest, GroupInfoResponse, GroupMembersResponse,
     GroupRolesResponse, RoleResponse,
 };

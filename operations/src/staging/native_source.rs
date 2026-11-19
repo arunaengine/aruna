@@ -645,7 +645,7 @@ mod tests {
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{ReferenceHandling, SyncMode, SyncStatusSnapshot};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
     where

@@ -713,7 +713,7 @@ mod tests {
     use crate::blob::unlocked::KeyUnlockedOperation;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::test_context;
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
 
     async fn next_blob_timer(storage: &StorageHandle) -> Result<Option<Duration>, BlobQueueError> {
         let context = test_context(storage.clone());
@@ -778,7 +778,7 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         let blob_root = format!("{root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
-        let storage = aruna_storage::FjallStorage::open(root).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(root).unwrap();
         let net = aruna_net::NetHandle::new(aruna_drivers::testing::local_net(), storage.clone())
             .await
             .unwrap();
@@ -1072,7 +1072,7 @@ mod tests {
     async fn parked_job_wakes() {
         // A locked source parks the job without an attempt; the unlock makes it due again.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = test_context(storage.clone());
         let relationship = Ulid::from_parts(5, 5);
         let mut record = job(relationship);
@@ -1507,7 +1507,7 @@ mod tests {
         for (failed_page, job_count) in [(1, WAIT_PAGE + 1), (2, WAIT_PAGE + 1), (2, WAIT_PAGE)] {
             let dir = tempfile::tempdir().unwrap();
             let mut context = test_context(
-                aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
+                aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
             );
             let tasks = aruna_tasks::TaskHandle::new();
             let (scheduled, mut drains) = tokio::sync::mpsc::unbounded_channel();

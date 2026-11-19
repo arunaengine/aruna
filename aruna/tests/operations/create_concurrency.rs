@@ -14,7 +14,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_drivers::driver::DriverContext;
 use aruna_operations::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
 use aruna_operations::metadata::create_entry::CreateEntryOperation;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use ulid::Ulid;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;

@@ -12,7 +12,7 @@ use aruna_core::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
 };
 use aruna_core::structs::identity::auth::PathRestriction;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use tempfile::tempdir;
 
 use super::*;

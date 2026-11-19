@@ -20,7 +20,7 @@ fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("install rustls ring crypto provider");
-    if let Some(code) = aruna_compute::dispatch_helper() {
+    if let Some(code) = aruna_compute::executor::dispatch_helper() {
         std::process::exit(code);
     }
     if std::env::args().nth(1).as_deref() == Some("--git-hook")

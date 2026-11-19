@@ -10,7 +10,7 @@ use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 use aruna_core::plugin_runs::RunState;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 #[allow(unused_imports)]
 use aruna_test_support::plugins::queued;
 use tempfile::{TempDir, tempdir};

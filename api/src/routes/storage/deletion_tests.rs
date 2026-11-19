@@ -15,7 +15,7 @@ use aruna_core::structs::{
 };
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_storage::storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use std::time::SystemTime;
 
 #[tokio::test]

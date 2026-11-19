@@ -32,7 +32,7 @@ use aruna_core::structs::storage::distribution::delegation::{
 use aruna_core::structs::storage::read_grant::SignedRequest;
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 use aruna_net::NetHandle;
-use aruna_outbound::ListingSigner;
+use aruna_outbound::range_listing::ListingSigner;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 use tracing::warn;
@@ -56,7 +56,7 @@ impl ListingSigner for NodeSigner<'_> {
 /// Lists one key range through the outbound backend, signing with the net handle's key.
 pub(super) async fn dispatch_listing(listing: RangeListing, context: &DriverContext) -> Event {
     let signer = NodeSigner(context.net_handle.as_ref());
-    let answer = aruna_outbound::list_range(listing, &signer).await;
+    let answer = aruna_outbound::range_listing::list_range(listing, &signer).await;
     Event::Outbound(OutboundEvent::RangeListed(Box::new(answer)))
 }
 
@@ -73,7 +73,7 @@ impl TrailerSeal for NodeSeal {
 /// Sends one request to another member through the outbound backend.
 pub(super) async fn dispatch_fetch(request: MemberFetch, context: &DriverContext) -> Event {
     let seal = Arc::new(NodeSeal(context.net_handle.clone()));
-    let answer = aruna_outbound::fetch_member(request, seal).await;
+    let answer = aruna_outbound::member_read::fetch_member(request, seal).await;
     Event::Outbound(OutboundEvent::MemberAnswered(Box::new(answer)))
 }
 

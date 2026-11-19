@@ -4,7 +4,7 @@
 
 use crate::shared;
 
-use aruna_api::routes::groups::AddMemberRequest;
+use aruna_api::routes::access::groups::AddMemberRequest;
 use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
 use reqwest::StatusCode;

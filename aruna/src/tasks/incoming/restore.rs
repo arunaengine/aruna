@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::drained::remove_drained_backends;
 use super::*;
 use crate::tasks::runner::{claim_producer, spawn_job};
 use aruna_drivers::driver::node_routing;
@@ -1027,7 +1028,7 @@ async fn restore_info_timer(task_handle: &TaskHandle) {
 /// Arms the registration timer at startup without postponing a restored due time. The due
 /// time is persisted, so repeated restarts do not keep moving the first publication.
 async fn restore_registration_timer(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     task_handle: &TaskHandle,
 ) {
     let effect = TaskEffect::ShortenTimer {
@@ -1045,7 +1046,7 @@ async fn restore_registration_timer(
 }
 
 /// Re-arms the debounced publish task when dirty markers survived a restart.
-async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle: &TaskHandle) {
+async fn restore_usage_timer(storage: &aruna_storage::storage::handle::StorageHandle, task_handle: &TaskHandle) {
     let has_markers = match storage
         .send_storage_effect(aruna_core::effects::StorageEffect::Iter {
             key_space: aruna_core::keyspaces::NODE_STATS_KEYSPACE.to_string(),
@@ -1097,7 +1098,7 @@ async fn arm_prune_timer(context: &DriverContext) {
 #[cfg(test)]
 mod stop_tests {
     use super::*;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
 
     async fn restore_queues() -> (tempfile::TempDir, TaskHandle, TaskQueues, Shutdown) {

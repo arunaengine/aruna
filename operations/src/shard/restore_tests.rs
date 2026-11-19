@@ -18,7 +18,7 @@ use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::record::PlacementStrategy;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_storage::storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use tempfile::tempdir;
 
 fn node(seed: u8) -> NodeId {

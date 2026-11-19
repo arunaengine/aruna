@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::config::NetConfig;
 
 #[path = "tests_document_sync.rs"]
 pub(crate) mod document_sync_support;
@@ -111,7 +112,7 @@ impl InboundEventHandler for RecordingEvictedHandler {
 async fn eviction_test_service() -> (TempDir, Arc<DocumentSyncService>) {
     let dir = tempfile::tempdir().expect("eviction service tempdir");
     let storage =
-        aruna_storage::FjallStorage::open(dir.path().join("storage").to_str().expect("utf-8 path"))
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().join("storage").to_str().expect("utf-8 path"))
             .expect("storage opens");
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(iroh::SecretKey::from_bytes(&[123u8; 32]))
@@ -133,7 +134,7 @@ async fn eviction_test_service() -> (TempDir, Arc<DocumentSyncService>) {
         &[],
         vec![Alpn::DocumentSync.as_bytes().to_vec()],
         ::irokle::net::IrohRuntimeConfig::default(),
-        aruna_storage::FjallPersistPolicy::Buffer,
+        aruna_storage::storage::persistence::FjallPersistPolicy::Buffer,
         RealmId::from_bytes([123u8; 32]),
     )
     .expect("document sync service opens");
@@ -488,7 +489,7 @@ fn invalid_announcement_timing() {
 #[tokio::test]
 async fn net_handle_creates() -> Result<()> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::FjallStorage::open(
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
         temp_dir
             .path()
             .to_str()
@@ -520,7 +521,7 @@ async fn net_handle_creates() -> Result<()> {
 
 async fn notification_wake_handle() -> Result<(TempDir, NetHandle)> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::FjallStorage::open(
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
         temp_dir
             .path()
             .to_str()
@@ -582,14 +583,14 @@ async fn dashboard_wake_arrives() -> Result<()> {
 async fn endpoint_only_unauthorized() -> Result<()> {
     let temp_a = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
     let temp_b = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage_a = aruna_storage::FjallStorage::open(
+    let storage_a = aruna_storage::storage::worker::FjallStorage::open(
         temp_a
             .path()
             .to_str()
             .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
     )
     .map_err(|e| NetError::Io(e.to_string()))?;
-    let storage_b = aruna_storage::FjallStorage::open(
+    let storage_b = aruna_storage::storage::worker::FjallStorage::open(
         temp_b
             .path()
             .to_str()
@@ -668,7 +669,7 @@ impl InboundEventHandler for HoldingInboundHandler {
 
 pub(crate) async fn test_net_handle() -> Result<(NetHandle, TempDir)> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::FjallStorage::open(
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
         temp_dir
             .path()
             .to_str()
@@ -1149,7 +1150,7 @@ async fn repeat_shutdown_joins() -> Result<()> {
 #[tokio::test]
 async fn peer_warnings() -> Result<()> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::FjallStorage::open(
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
         temp_dir
             .path()
             .to_str()

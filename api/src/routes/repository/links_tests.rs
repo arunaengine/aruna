@@ -5,7 +5,7 @@
 use super::*;
 use crate::auth::extract;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
-use crate::metadata::{CreateMetadataRequest, CreateRoCrateRequest};
+use crate::metadata::model::{CreateMetadataRequest, CreateRoCrateRequest};
 use crate::routes::link_routes::*;
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::repositories::delete_repository;
@@ -911,7 +911,7 @@ async fn viewer(linked: &Linked) -> AuthContext {
 
 #[tokio::test]
 async fn readers_cannot_push() {
-    use crate::metadata::RepositoryExportRequest;
+    use crate::metadata::model::RepositoryExportRequest;
     use crate::routes::repository::{SubmitRepositoryExport, export_record};
     let linked = setup().await;
     let reader = viewer(&linked).await;

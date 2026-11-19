@@ -8,9 +8,11 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::job_service::submit_export_job;
 use crate::jobs::job_urls;
 use crate::lookup::actor;
-use crate::metadata::{
+use crate::metadata::model::{
     JsonLdObject, MetadataDocumentSummary, MetadataRoCrateResponse, MetadataRoCrateView,
     ReplaceRoCrateRequest, RoCrateExportParams, SubmitExportRequest, SubmitExportResponse,
+};
+use crate::metadata::{
     commit_message, crate_entities, ensure_readable_files, forwarded_auth_token,
     load_document_record, local_write_record, map_api_error, map_export_response, map_export_view,
     map_write_error, parse_document_id, serialize_jsonld_object, with_global_ids,

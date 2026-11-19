@@ -9,7 +9,8 @@ use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::structs::identity::group_delete::{
     GroupDeletePhase, GroupDeleteRecord, GroupDeletionError,
 };
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 
 use ulid::Ulid;
 

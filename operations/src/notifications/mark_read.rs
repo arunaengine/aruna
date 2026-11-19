@@ -196,7 +196,7 @@ mod tests {
     use aruna_core::keyspaces::PRUNE_INDEX_KEYSPACE;
     use aruna_core::structs::execution::notification::{NotificationClass, notification_inbox_key};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
 
     fn record(recipient: UserId, created_at_ms: u64) -> NotificationRecord {
         crate::tests::notifications::record(recipient, NotificationClass::Direct, created_at_ms)

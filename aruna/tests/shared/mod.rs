@@ -14,17 +14,22 @@ use aruna::config::{Config, resolve_settings};
 use aruna::identity::{mark_onboarding_phase, mark_state_complete};
 use aruna::inbound::initialize_incoming_fixture;
 use aruna::settings::read_settings_from;
-use aruna::tasks::incoming::start_task_queues;
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::cors::CorsConfig;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
-use aruna_api::routes::credentials::{CreatePathRestriction, CreateS3Request, CreateS3Response};
-use aruna_api::routes::groups::{CreateGroupRequest, CreateGroupResponse, GroupInfoResponse};
+use aruna_api::routes::access::credentials::{
+    CreatePathRestriction, CreateS3Request, CreateS3Response,
+};
+use aruna_api::routes::access::groups::{
+    CreateGroupRequest, CreateGroupResponse, GroupInfoResponse,
+};
 use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
-use aruna_blob::blob::{BackendRegistry, BlobHandler};
+use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::registry::BackendRegistry;
 use aruna_clock::testing::poll_until;
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::keys::generate_signing_key;
@@ -42,7 +47,8 @@ use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_drivers::driver::node_facts;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::placement::policy::{SubjectScanMode, SubjectSyncOperation, SubjectTrigger};
@@ -53,7 +59,8 @@ use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperat
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::s3::access::get::GetAccessOperation;
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
@@ -1355,14 +1362,14 @@ pub(crate) async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client
 /// one owner lock. The tests that need it are ignored by default, so a missing daemon fails them.
 #[cfg(feature = "docker")]
 pub async fn docker_backend() -> aruna_compute::executor::docker::DockerBackend {
-    use aruna_compute::ExecutorBackend;
+    use aruna_compute::executor::ExecutorBackend;
     use aruna_compute::executor::docker::DockerBackend;
-    let config = aruna_compute::DockerConfig {
+    let config = aruna_compute::executor::config::DockerConfig {
         keep_failed: std::env::var("ARUNA_KEEP_FAILED").is_ok(),
         state_root: std::env::temp_dir()
             .join("aruna-compute-tests")
             .join(ulid::Ulid::generate().to_string()),
-        ..aruna_compute::DockerConfig::default()
+        ..aruna_compute::executor::config::DockerConfig::default()
     };
     let backend = DockerBackend::with_config(config)
         .unwrap_or_else(|error| panic!("no reachable docker daemon: {error}"));

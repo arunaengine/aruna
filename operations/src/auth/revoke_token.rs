@@ -685,7 +685,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::{Key, Value};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::config::NetConfig;
 use crate::test_support::make_secret;
 use crate::tests::test_net_handle;
 use aruna_core::events::StorageEvent;
@@ -113,7 +114,7 @@ async fn poll_once<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
 #[tokio::test]
 async fn stale_read_repaired() -> Result<()> {
     let dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let real = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+    let real = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
         .map_err(|e| NetError::Io(e.to_string()))?;
     // The proxy shares the real worker's change count and holds one realm config reply.
     let (proxy, receivers) = real.proxy_channels();

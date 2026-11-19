@@ -18,7 +18,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, MAX_KEY_LEN, PARTS_PREFIX};
 use aruna_core::types::TxnId;
-use aruna_storage::storage::TransactionOwner;
+use aruna_storage::storage::owner::TransactionOwner;
 use byteview::ByteView;
 use opendal::Operator;
 use std::path::PathBuf;

@@ -457,7 +457,7 @@ mod tests {
     async fn bound_entries_globalized() {
         let dir = tempfile::tempdir().unwrap();
         let context = aruna_drivers::driver::DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
                 .unwrap(),
             net_handle: None,
             blob_handle: None,

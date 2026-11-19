@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BackendRef;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 
 use super::*;
 use crate::distribution::inventory::{InventoryChange, InventoryUpdate};

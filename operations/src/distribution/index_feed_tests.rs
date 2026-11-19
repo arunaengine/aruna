@@ -19,8 +19,8 @@ use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
 use aruna_core::structs::storage::distribution::inventory::HeadEntry;
 use aruna_core::structs::storage::distribution::inventory::head_position;
 use aruna_core::structs::storage::distribution::search::IndexState;
-use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
+use aruna_storage::storage::handle::StorageHandle;
 use tempfile::TempDir;
 use ulid::Ulid;
 

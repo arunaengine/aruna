@@ -18,7 +18,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::transactions::{CounterChange, PendingChanges, warn_clamped};
-use super::{FjallStorage, Store, iterate_page};
+use super::worker::FjallStorage;
+use super::{Store, iterate_page};
 
 /// Rows read per page while a rebuild clears or replaces counter rows.
 const REBUILD_PAGE: usize = 1024;

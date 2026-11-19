@@ -20,7 +20,7 @@ mod kubernetes;
 #[cfg(all(feature = "slurm", unix))]
 mod slurm;
 
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::compute::ResourceEnvelope;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -119,7 +119,7 @@ pub(super) struct KubernetesSettings {
     /// KubeDAL driver for run input views and session data, which mount through this node's gateway.
     pub(super) kubedal_driver: Option<String>,
     /// KubeDAL worker cache for cached run inputs, set by its scope.
-    pub(super) kubedal_cache: Option<aruna_compute::KubedalCache>,
+    pub(super) kubedal_cache: Option<aruna_compute::executor::config::KubedalCache>,
     /// The node's S3 endpoint as task pods reach it, used for their S3 env instead of the
     /// public one.
     pub(super) session_endpoint: Option<String>,

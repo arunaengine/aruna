@@ -12,4 +12,3 @@ pub mod resources;
 mod sweeps;
 pub mod test_hooks;
 
-pub use resources::NodeResources;
