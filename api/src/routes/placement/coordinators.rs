@@ -45,7 +45,7 @@ impl SpreadCursor {
 }
 
 /// The nodes that coordinate a range of the set, from this node's record, each with one range.
-async fn coordinators(
+pub(super) async fn coordinators(
     state: &ServerState,
     binding: &DistributionBinding,
 ) -> ServerResult<Vec<RestForward>> {
@@ -167,7 +167,7 @@ fn collect<T: Paged>(
     })
 }
 
-fn bucket_path(bucket: &str, route: &str) -> String {
+pub(super) fn bucket_path(bucket: &str, route: &str) -> String {
     let bucket: String = url::form_urlencoded::byte_serialize(bucket.as_bytes()).collect();
     format!("/data/buckets/{bucket}/placement/{route}")
 }
