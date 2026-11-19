@@ -205,6 +205,7 @@ fn map_provider_error(error: SetProviderError) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::realms::state_auth;
     use crate::tests::routes::{test_state, test_storage};
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
@@ -259,15 +260,6 @@ mod tests {
         (dir, state, actor.user_id)
     }
 
-    fn auth(state: &ServerState, user_id: UserId) -> Option<AuthContext> {
-        Some(AuthContext {
-            user_id,
-            realm_id: state.get_realm_id(),
-            path_restrictions: None,
-            session: None,
-        })
-    }
-
     fn body(issuer: &str) -> Json<ProviderRequest> {
         Json(ProviderRequest {
             issuer: issuer.to_string(),
@@ -284,7 +276,7 @@ mod tests {
     ) -> ServerResult<Vec<String>> {
         let Json(list) = set_provider(
             State(state.clone()),
-            RealmAuth(auth(state, user).expect("a signed-in caller")),
+            RealmAuth(state_auth(state, user).expect("a signed-in caller")),
             Path(id.to_string()),
             body(issuer),
         )
@@ -302,7 +294,7 @@ mod tests {
 
         let Json(list) = remove_provider(
             State(state.clone()),
-            RealmAuth(auth(&state, admin).expect("a signed-in caller")),
+            RealmAuth(state_auth(&state, admin).expect("a signed-in caller")),
             Path("lifescience".to_string()),
         )
         .await
@@ -312,7 +304,7 @@ mod tests {
 
         let last = remove_provider(
             State(state.clone()),
-            RealmAuth(auth(&state, admin).expect("a signed-in caller")),
+            RealmAuth(state_auth(&state, admin).expect("a signed-in caller")),
             Path("main".to_string()),
         )
         .await;
@@ -327,7 +319,7 @@ mod tests {
         assert!(matches!(error, Err(ServerError::Forbidden)));
         let error = remove_provider(
             State(state.clone()),
-            RealmAuth(auth(&state, member).expect("a signed-in caller")),
+            RealmAuth(state_auth(&state, member).expect("a signed-in caller")),
             Path("main".to_string()),
         )
         .await;
