@@ -17,14 +17,14 @@ use aruna_core::types::{GroupId, Key, Value};
 use tracing::warn;
 use ulid::Ulid;
 
-use super::job_progress::{JobStep, StoreProgressError, StoreProgressOperation};
-use super::rename::RenameError;
 use crate::auth::bearer_token::GrantValidOperation;
 use crate::auth::error::{ArunaBearerError, AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::{AuthorizeOperation, BucketAccess, BucketAccessOperation};
 use crate::blob::migration::shared::MigrationError;
 use crate::blob::unify::UnifyJobOperation;
+use crate::s3::bucket::job_progress::{JobStep, StoreProgressError, StoreProgressOperation};
 use crate::s3::bucket::remap::{RemapJobOperation, RemapScope};
+use crate::s3::bucket::rename::RenameError;
 use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Delay between pages of a running job, and before a waiting job tries again.
@@ -346,7 +346,7 @@ impl Operation for StillAdminOperation {
 
 /// Stores a page's progress on the job it ran for; a pause or an abort meanwhile stays.
 #[derive(Debug, PartialEq)]
-pub(super) struct StoreJobOperation {
+pub(crate) struct StoreJobOperation {
     bucket: String,
     job_id: Ulid,
     step: JobStep,
@@ -356,7 +356,7 @@ pub(super) struct StoreJobOperation {
 }
 
 impl StoreJobOperation {
-    pub(super) fn new(
+    pub(crate) fn new(
         bucket: &str,
         job: &LinkedJob,
         step: JobStep,

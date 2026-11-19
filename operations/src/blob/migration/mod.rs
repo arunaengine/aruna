@@ -7,6 +7,7 @@ mod batch;
 pub mod broken;
 pub mod check;
 pub mod drain;
+pub(crate) mod job_pages;
 pub mod misplaced;
 pub mod queue;
 pub mod rewrite;

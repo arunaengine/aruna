@@ -14,7 +14,6 @@ pub mod delete;
 pub mod encryption;
 pub(crate) mod forward;
 pub mod holders;
-pub(crate) mod job_pages;
 pub(crate) mod job_progress;
 pub mod key;
 pub mod linked;
