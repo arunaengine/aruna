@@ -22,7 +22,6 @@ use ulid::Ulid;
 use super::pinned::PinnedCreate;
 use super::route_create::RouteCreateOperation;
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{AuthorizeCreateOperation, CreateScope};
 use crate::forward::replay::create_record_matches;
@@ -39,6 +38,7 @@ use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Errors of the shared authorized create flow. Every variant maps onto the
 /// same transport status the former REST-local sequence produced.

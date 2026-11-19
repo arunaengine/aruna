@@ -21,11 +21,11 @@ use ulid::Ulid;
 
 use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluator, PolicyLoadOperation};
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::StorageReadError;
 use crate::metadata::updated_page::{UpdatedPageError, UpdatedPageOperation, UpdatedRecordsPage};
 use crate::storage_read::parse_storage_scan;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Registry rows evaluated per rebuild batch, and index rows per scan batch.
 const BUILD_BATCH: usize = 256;

@@ -33,7 +33,6 @@ use ulid::Ulid;
 
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::delegate::{DelegationInput, unsigned_delegation};
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -49,6 +48,7 @@ use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation, Sync
 use crate::sync::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// This node and its realm.
 type Ids = (NodeId, RealmId);

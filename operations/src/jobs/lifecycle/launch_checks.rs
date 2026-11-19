@@ -31,11 +31,11 @@ use super::ids;
 use super::plan::{REALM_STAGING, network_access};
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{PolicySets, compiled_policies, policy_reads, read_policies};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::placement::policy::{
     GateContext, GateContextError, GateOperation, PolicySetError, PolicySetResolver, Resolutions,
     ResolveMode,
 };
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// What a check answers: the capability that runs the launch, or why this target refuses it.
 pub(crate) type Verdict = Result<ExecutorCapability, LaunchDecline>;

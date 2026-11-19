@@ -13,13 +13,13 @@ use aruna_core::onboarding::{
     OnboardingSecretRecord, OnboardingSecretState, RequestedOnboardingMode, issuer_proof_message,
     node_proof_message,
 };
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, StaticRealmEndpoint,
 };
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::enforcement::EnforcePolicyOperation;
-use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::onboarding::consume_secret::ConsumeSecretError;
 use aruna_operations::onboarding::create_secret::{

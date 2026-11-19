@@ -38,7 +38,6 @@ use ulid::Ulid;
 
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::{bound_view, local_fence, route_write};
 use crate::distribution::versions::{
@@ -68,6 +67,7 @@ use crate::s3::object::versions::{
 };
 use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};
 use crate::staging::offered_directory::OfferedDirectoryError;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// How long a forwarded listing waits for the holder of a range.
 const HOLDER_TIMEOUT: Duration = Duration::from_secs(15);

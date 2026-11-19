@@ -22,7 +22,6 @@ use super::host_steps::{Granted, ReadyCreate};
 use super::rows::{StoreError, decode, done, encode, read_call, row, values};
 use super::unavailable;
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::GetVisibleRequest;
@@ -32,6 +31,7 @@ use crate::metadata::forward::authorized_create::PinnedCreateOperation;
 use crate::metadata::forward::pinned::PinnedCreate;
 use crate::metadata::forward::routed::read::RoutedReadOperation;
 use crate::metadata::update_document::UpdateDocumentError;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// How the key row of a create was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

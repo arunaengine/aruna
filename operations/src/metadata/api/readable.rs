@@ -16,8 +16,8 @@ use aruna_core::types::GroupId;
 use super::MetadataApiError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::errors::AuthorizationError;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Whether the caller may read `record`: the realm and group policies, and for a private record
 /// the caller's read permission on its path. Every denial reads as not found, so read-by-id is

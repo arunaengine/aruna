@@ -73,6 +73,7 @@ use crate::s3::util::{
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::compute::session::{SessionRequest, TouchedObject};
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::job::{RoCrateLimits, credential_job_id};
@@ -93,7 +94,6 @@ use aruna_operations::auth::enforcement::PolicyLoadOperation;
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::auth::request_authorization::BucketAccessOperation;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::placement::policy::GateOperation;
@@ -3004,7 +3004,7 @@ impl S3 for ArunaS3Service {
             )
             .await
             .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
-            let policy_request = aruna_operations::auth::request_policy::policy_request_with(
+            let policy_request = aruna_core::request_policy::policy_request_with(
                 &object_path,
                 &Permission::WRITE,
                 Some(&replication_auth),

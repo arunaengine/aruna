@@ -4,7 +4,6 @@
 
 use super::LocationSummaryError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::realm::peer_trust::ensure_realm_peer;
 use crate::replication::protocol::{
     CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
@@ -21,7 +20,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::managed_copy::{CopyRequest, read_effect, registration_for, serve_reads};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
+use aruna_core::request_policy::{
+    CompiledPolicySet, PolicyDecision, PolicyRequestExtras, policy_request_with,
+};
 use aruna_core::rows::read_row;
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::identity::auth::Permission;

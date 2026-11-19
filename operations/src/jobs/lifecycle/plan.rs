@@ -32,12 +32,12 @@ use super::advertised::{Advertised, AdvertisementsOperation};
 use super::ids;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{PolicyEvaluator, compiled_policies, policy_reads, read_policies};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::placement::policy::{PolicySetError, PolicySetResolver, Resolutions, ResolveMode};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
 use aruna_core::operation::Operation;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::types::Value;
 
 /// Tag that pins the container network mode, shared with the executor path.

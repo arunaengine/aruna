@@ -28,7 +28,7 @@ use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_policy::PolicyRequestExtras;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchBucketsInput {

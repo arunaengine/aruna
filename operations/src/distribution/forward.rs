@@ -35,7 +35,6 @@ use super::publish::PublishError;
 use super::submit::PublishLocalOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{config_of, realm_config};
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::pull_refusal;
@@ -46,6 +45,7 @@ use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::dataset::DatasetSummaryOperation;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Why the publisher refused or could not take a request.
 #[derive(Clone, Debug, Error, Eq, PartialEq, Serialize, Deserialize)]

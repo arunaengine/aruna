@@ -42,7 +42,6 @@ use ulid::Ulid;
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::held::{HeldElsewhere, kept_location, kept_reads};
 use crate::placement::policy::{
@@ -55,6 +54,7 @@ use crate::s3::object::put::abe::keyed;
 use aruna_core::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 #[derive(Debug, PartialEq)]
 pub enum BaoReadOutput {

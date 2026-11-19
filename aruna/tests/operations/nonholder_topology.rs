@@ -21,6 +21,7 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::placement::resolve_shard_holders;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::storage_entries::registry_delete_entries;
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
@@ -31,7 +32,6 @@ use aruna_core::structs::placement::record::band_start;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::forward::routing::origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;

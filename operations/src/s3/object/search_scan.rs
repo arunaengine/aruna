@@ -29,8 +29,8 @@ use aruna_core::types::{Key, Value};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 #[path = "index_search.rs"]
 mod index_search;

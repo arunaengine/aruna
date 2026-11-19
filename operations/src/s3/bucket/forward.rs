@@ -4,7 +4,6 @@
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::{pull_refusal, refusal_kind};
@@ -19,6 +18,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::PeerAuthRefusal;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};

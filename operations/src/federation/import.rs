@@ -34,13 +34,13 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::federation::access::{AccessCheckOperation, access_granted};
 use crate::federation::records::{
     ImportRecord, RecordChange, RecordError, RecordOutcome, StaleUpload, change_call,
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::request_policy::PolicyRequestExtras;
 
 const IMPORT_OPERATION: &str = "federation.import";
 

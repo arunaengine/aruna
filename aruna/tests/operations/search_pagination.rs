@@ -11,12 +11,12 @@ use std::time::UNIX_EPOCH;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::search::ObjectKeyMatch;
 use aruna_core::structs::storage::blob::{
     BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_drivers::driver::drive;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
 use aruna_operations::metadata::api::object_search::search_objects;
 use aruna_operations::metadata::api::search_types::{

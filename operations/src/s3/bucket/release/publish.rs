@@ -43,7 +43,6 @@ use super::{
 };
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
 use crate::distribution::status::{StatusError, read_view};
@@ -60,6 +59,7 @@ use crate::s3::object::origin::{OriginError, OriginView, ReadOriginOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_core::request_policy::PolicyRequestExtras;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PublishError {

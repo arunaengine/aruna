@@ -27,13 +27,13 @@ use super::submission_rules::{
 use super::submit_external::IngressNode;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::pages::{LoadChainOperation, PageReadError, StoreEntriesOperation};
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::peer_acts_for;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Whether the caller may write in a group: its grants, then the request policies.
 #[derive(Debug, PartialEq)]

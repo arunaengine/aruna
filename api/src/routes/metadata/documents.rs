@@ -14,9 +14,9 @@ use crate::metadata::{
     serialize_jsonld_object, with_global_ids,
 };
 use crate::server::state::ServerState;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_drivers::driver::drive;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::git::GitError;
 use aruna_operations::metadata::api::export_types::GetVisibleRequest;
 use aruna_operations::metadata::api::path::LookupPathOperation;

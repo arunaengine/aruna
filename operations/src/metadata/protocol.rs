@@ -35,13 +35,13 @@ use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::jobs::lifecycle::ids::SubmissionRequest;
 use crate::metadata::api::export_types::RoCrateExportView;
 use crate::metadata::api::preflight_types::{ReferenceNodeExecution, ReferenceNodeRequest};
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::search::{BucketPage, ObjectKeyMatch, SearchNodePage};
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
@@ -158,7 +158,7 @@ pub enum MetadataTransportMessage {
         /// Admits a bucket by READ on this key or key prefix inside it instead of on its root.
         key: Option<String>,
         /// An MCP tool's policy context whose policies must also allow each hit.
-        extras: Option<crate::auth::request_policy::PolicyRequestExtras>,
+        extras: Option<aruna_core::request_policy::PolicyRequestExtras>,
         limit: usize,
         group_id: Option<GroupId>,
         /// Continues after this bucket name or this node's sealed scan position.

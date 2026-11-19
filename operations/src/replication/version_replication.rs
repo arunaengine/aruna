@@ -4,7 +4,6 @@
 
 use crate::auth::enforcement::PolicyEvaluator;
 use crate::auth::permission_rules::PermissionRules;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
@@ -37,6 +36,7 @@ use aruna_core::managed_copy::{
 };
 use aruna_core::native_reference::NATIVE_RELATIONSHIP_ID;
 use aruna_core::operation::Operation;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::unmatched_checksum;
 use aruna_core::structs::execution::source_access::{

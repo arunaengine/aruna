@@ -31,7 +31,6 @@ use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::auth::request_authorization::{AuthorizeOperation, GroupRulesOperation};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::distribution::resolve::{
     MAX_CONTENT_VERSIONS, ResolveError, content_versions, indexed_key,
@@ -50,6 +49,7 @@ use crate::replication::protocol::{
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};
 use crate::staging::offered_directory::OfferedDirectoryError;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 type StreamTurn = Result<Next<()>, IoError>;
 type ManifestPaths = (Option<String>, Option<String>);

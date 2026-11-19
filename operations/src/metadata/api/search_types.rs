@@ -8,7 +8,7 @@ use super::{
     MetadataSearchHit, NodeId, ObjectInventoryHit, ObjectKeyMatch, Serialize, SignedCursor,
     SystemTime,
 };
-use crate::auth::request_policy::PolicyRequestExtras;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::storage::distribution::search::IndexProgress;
 
 #[derive(Clone, PartialEq)]

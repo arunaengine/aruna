@@ -717,7 +717,7 @@ async fn metadata_probe(
     server: &McpServer,
     auth: &AuthContext,
     _tool: &str,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(&server.state, auth, Permission::READ, extras)
         .await
@@ -733,7 +733,7 @@ async fn authorize_summary(
     auth: &AuthContext,
     (group_id, path): (&str, &str),
     (document_id, public): (&str, bool),
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     let group_id = crate::auth::parse_group_id(group_id).map_err(server_error)?;
     let document_id = crate::metadata::parse_document_id(document_id).map_err(server_error)?;
@@ -753,7 +753,7 @@ async fn authorize_document(
     server: &McpServer,
     auth: &AuthContext,
     document: (&str, bool),
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     let (context, realm_id) = (server.state.get_ctx(), server.state.get_realm_id());
     drive(

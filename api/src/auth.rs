@@ -658,7 +658,7 @@ pub(crate) async fn ensure_permission(
         auth,
         path,
         required_permission,
-        aruna_operations::auth::request_policy::PolicyRequestExtras::rest(),
+        aruna_core::request_policy::PolicyRequestExtras::rest(),
     )
     .await
 }
@@ -671,7 +671,7 @@ pub(crate) async fn ensure_permission_with(
     auth: &AuthContext,
     path: String,
     required_permission: Permission,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> ServerResult<()> {
     time_stage(
         "permission",

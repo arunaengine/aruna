@@ -32,7 +32,6 @@ use super::super::store::row_calls::read_purge_checkpoint;
 use super::storage_audit::{WriteAuditOperation, purge_audit_record};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::pause::{PauseError, PausePurgeOperation, PausedOperation};
 use crate::blob::purge::{PlanFilesOperation, PurgeFilesError, StorageFile, StorageFilesOperation};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
@@ -54,6 +53,7 @@ use crate::s3::object::versions::{
 };
 use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::jobs::JobRunOutcome;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 const PURGE_BATCH_SIZE: usize = 1_000;
 /// How often a paused purge looks whether it was resumed.

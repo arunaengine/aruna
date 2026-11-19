@@ -1375,7 +1375,7 @@ mod tests {
             &auth,
             &path,
             &aruna_core::structs::identity::auth::Permission::WRITE,
-            crate::auth::request_policy::PolicyRequestExtras::rest(),
+            aruna_core::request_policy::PolicyRequestExtras::rest(),
         );
         let result = aruna_drivers::driver::drive(check, &context)
             .await

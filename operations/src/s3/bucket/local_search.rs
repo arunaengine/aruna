@@ -20,7 +20,7 @@ use super::search::{
 use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::search::{BucketPage, BucketSearchHit};
 
 #[derive(Debug, PartialEq)]

@@ -24,8 +24,8 @@ use super::unavailable;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, group_from_path, policy_reads, read_policies};
 use crate::auth::error::{AuthorizeError, check_error};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// A host call's refusal or fault, as the operations behind the call report it.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

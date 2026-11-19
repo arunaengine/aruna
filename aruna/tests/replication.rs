@@ -21,6 +21,7 @@ use aruna_core::keyspaces::{
     RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
@@ -40,7 +41,6 @@ use aruna_drivers::driver::drive;
 use aruna_kpabe::{Envelope, UserKey};
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::metadata::protocol::mirror_created_answer;
 use aruna_operations::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use aws_sdk_s3::Client as S3Client;
