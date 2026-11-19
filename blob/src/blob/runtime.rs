@@ -184,7 +184,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
     )
 }
 
-/// The bytes of `blob`, read to its end.
+/// The bytes of `blob`, read to its end. A chunk past `limit` is refused before it is copied.
 async fn collect_stream(
     mut blob: BackendStream<Result<Bytes, StreamError>>,
     limit: Option<u64>,
@@ -192,14 +192,17 @@ async fn collect_stream(
     let mut bytes = Vec::new();
     while let Some(chunk) = futures::StreamExt::next(&mut blob).await {
         match chunk {
-            Ok(chunk) => bytes.extend_from_slice(&chunk),
+            Ok(chunk) => {
+                let size = bytes.len().saturating_add(chunk.len()) as u64;
+                if let Some(limit) = limit.filter(|limit| size > *limit) {
+                    return BlobEvent::StreamTooLarge { limit };
+                }
+                bytes.extend_from_slice(&chunk);
+            }
             Err(error) => {
                 let bytes = Err(error.to_string());
                 return BlobEvent::StreamCollected { bytes };
             }
-        }
-        if let Some(limit) = limit.filter(|limit| bytes.len() as u64 > *limit) {
-            return BlobEvent::StreamTooLarge { limit };
         }
     }
     BlobEvent::StreamCollected { bytes: Ok(bytes) }
@@ -1418,5 +1421,8 @@ mod tests {
         let open = collect_stream(chunks(&[4, 4]), None).await;
         let bytes = Ok(vec![7u8; 8]);
         assert_eq!(open, BlobEvent::StreamCollected { bytes });
+        // One chunk far past the limit is refused as it arrives.
+        let large = collect_stream(chunks(&[2, 1 << 20]), Some(5)).await;
+        assert_eq!(large, BlobEvent::StreamTooLarge { limit: 5 });
     }
 }
