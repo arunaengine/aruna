@@ -9,7 +9,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugins::PublishedPlugin;
+use aruna_core::plugins::{MemoryPermit, PluginEvent, PublishedPlugin};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use serde_json::{Value, json};
@@ -96,6 +96,12 @@ pub(crate) fn is_child<T, E>(next: &Result<Next<T>, E>) -> bool {
 
 pub(crate) fn is_effect<T, E>(next: &Result<Next<T>, E>) -> bool {
     matches!(next, Ok(Next::Call(IoCall::Effect(_))))
+}
+
+/// The plugin host's answer to a memory reservation: one MiB, or none while the budget is spent.
+pub(crate) fn memory_answer(granted: bool) -> IoResult {
+    let permit = granted.then(|| MemoryPermit::new(1, || {}));
+    IoResult::Event(Box::new(Event::Plugin(PluginEvent::Reserved(permit))))
 }
 
 fn answer_of(peer: NodeId, result: Result<Vec<u8>, PeerRequestError>) -> IoResult {
