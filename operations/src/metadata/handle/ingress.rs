@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_net::streams::BiStream;
 use tracing::Span;
@@ -18,62 +17,16 @@ use super::transport::{
     write_body_at, write_message_at, write_stream_body, write_transport_message,
 };
 use crate::driver::{DriverContext, drive};
-use crate::forward::realm::ApplyRelayOperation;
-use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
 use crate::metadata::message_kind::transport_message_kind;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
-use crate::metadata::read_peer::ReadPeerOperation;
-use crate::metadata::serve::{ServeError, ServeNode, ServeRequestOperation};
-use aruna_core::metadata::AuthToken;
+use crate::metadata::protocol::MetadataTransportMessage;
+use crate::metadata::serve::{ServeError, ServeNode, ServeRequestOperation, needs_here};
 
 impl MetadataHandle {
-    /// The caller of a read `peer` forwarded, as [`ReadPeerOperation`] checks it.
-    async fn read_caller(
-        &self,
-        context: &DriverContext,
-        peer: NodeId,
-        auth_token: Option<AuthToken>,
-        trusted: bool,
-    ) -> Result<Option<AuthContext>, MetadataReadError> {
-        let net = self.inner.net_handle.as_ref();
-        let realm_id = net
-            .map(|net| *net.realm_id())
-            .ok_or(MetadataReadError::Unavailable)?;
-        let check = ReadPeerOperation::new((peer, realm_id), auth_token, trusted);
-        drive(check, context).await
-    }
-}
-
-impl MetadataHandle {
-    /// This node's audit page for a peer, under its forwarded caller and the merge deadline.
-    async fn serve_audit(
-        &self,
-        context: &Arc<DriverContext>,
-        peer: NodeId,
-        request: aruna_core::audit::AuditPageRequest,
-        deadline: tokio::time::Instant,
-    ) -> Result<aruna_core::audit::AuditPageResponse, MetadataReadError> {
-        use crate::metadata::audit_entry::{ServeAuditOperation, inbound_admission};
-        let _admission = inbound_admission().ok_or(MetadataReadError::Unavailable)?;
-        let node = context
-            .node_and_realm()
-            .ok_or(MetadataReadError::Unavailable)?;
-        let auth_token = request.auth_token.clone();
-        let auth =
-            tokio::time::timeout_at(deadline, self.read_caller(context, peer, auth_token, false))
-                .await
-                .map_err(|_| MetadataReadError::Unavailable)??
-                .ok_or(MetadataReadError::Unauthorized)?;
-        let serve = ServeAuditOperation::new((node.1, node.0), auth, request);
-        crate::driver::drive_until(serve, context.as_ref(), deadline).await
-    }
-
     async fn forward_request(
         &self,
         context: &Arc<DriverContext>,
         peer: NodeId,
-        audit_deadline: tokio::time::Instant,
         message: MetadataTransportMessage,
     ) -> MetadataTransportMessage {
         match message {
@@ -86,86 +39,6 @@ impl MetadataHandle {
                     super::forward_serve::apply_forwarded_write(context, peer, forward).await
                 })
                 .await
-            }
-            MetadataTransportMessage::ForwardAuditPage { request } => {
-                let result =
-                    Box::pin(self.serve_audit(context, peer, request, audit_deadline)).await;
-                MetadataTransportMessage::ForwardedAuditPage { result }
-            }
-            forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
-                Box::pin(async {
-                    drive(
-                        ApplyRevokeOperation::new(context.node_and_realm(), peer, forward),
-                        context,
-                    )
-                    .await
-                    .unwrap_or_else(|error| reject(format!("token revocation failed: {error}")))
-                })
-                .await
-            }
-            forward @ MetadataTransportMessage::ForwardPersistentId { .. } => {
-                use crate::metadata::persistent_id::forward::ServePidOperation;
-                let Some((node_id, realm_id)) = context.node_and_realm() else {
-                    return MetadataTransportMessage::ForwardedWriteUnavailable;
-                };
-                match ServePidOperation::new(peer, (realm_id, node_id), forward) {
-                    Some(serve) => Box::pin(drive(serve, context))
-                        .await
-                        .unwrap_or_else(|error| {
-                            reject(format!("persistent id request failed: {error}"))
-                        }),
-                    None => reject("unexpected forwarded persistent id message"),
-                }
-            }
-            MetadataTransportMessage::ForwardPlacementPolicy { policy_ref } => {
-                let result = match context.net_handle.as_ref() {
-                    Some(net) => {
-                        let serve = crate::placement::policy::ServePolicyOperation::new(
-                            *net.realm_id(),
-                            peer,
-                            policy_ref,
-                        );
-                        crate::driver::drive(serve, context.as_ref())
-                            .await
-                            .and_then(|answer| answer)
-                    }
-                    None => Err(MetadataReadError::Unavailable),
-                };
-                MetadataTransportMessage::ForwardedPlacementPolicy { result }
-            }
-            forward @ MetadataTransportMessage::ForwardVaultChange { .. } => {
-                let apply = crate::users::vault_route::ApplyVaultOperation::new(
-                    context.node_and_realm(),
-                    peer,
-                    forward,
-                );
-                Box::pin(crate::driver::drive(apply, context.as_ref()))
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(%error, "Forwarded vault change failed");
-                        MetadataTransportMessage::ForwardedWriteUnavailable
-                    })
-            }
-            MetadataTransportMessage::FetchVaultRecords { user_id, query } => {
-                let serve = crate::users::vault_route::ServeVaultOperation::new(
-                    context.node_and_realm(),
-                    peer,
-                    user_id,
-                    query,
-                );
-                MetadataTransportMessage::FetchedVaultRecords {
-                    result: Box::pin(crate::driver::drive(serve, context.as_ref())).await,
-                }
-            }
-            forward @ MetadataTransportMessage::ForwardCreatePolicy { .. } => {
-                let apply = crate::placement::policy::ApplyPolicyOperation::new(
-                    context.node_and_realm(),
-                    peer,
-                    forward,
-                );
-                Box::pin(crate::driver::drive(apply, context.as_ref()))
-                    .await
-                    .unwrap_or_else(|error| reject(error.to_string()))
             }
             pull @ MetadataTransportMessage::ForwardSyncPull { .. } => {
                 Box::pin(async { super::pull_serve::serve_sync_pull(context, peer, pull).await })
@@ -180,130 +53,6 @@ impl MetadataHandle {
                     super::pull_serve::serve_list_versions(context, peer, listing).await
                 })
                 .await
-            }
-            bucket @ (MetadataTransportMessage::ForwardCheckBucket { .. }
-            | MetadataTransportMessage::ForwardCreateBucket { .. }
-            | MetadataTransportMessage::ForwardNewBucket { .. }) => {
-                Box::pin(async {
-                    let local = context.node_and_realm();
-                    let answer = crate::s3::bucket::forward::BucketForwardOperation::new(
-                        local, peer, bucket,
-                    );
-                    crate::driver::drive(answer, context)
-                        .await
-                        .unwrap_or_else(|error| {
-                            crate::forward::transport::reject(error.to_string())
-                        })
-                })
-                .await
-            }
-            admit @ MetadataTransportMessage::ForwardAdmitMember { .. } => {
-                Box::pin(async {
-                    let serve =
-                        crate::distribution::forward::serve_admission(context.here(), peer, admit);
-                    crate::driver::drive(serve, context)
-                        .await
-                        .unwrap_or_else(|error| {
-                            crate::forward::transport::reject(error.to_string())
-                        })
-                })
-                .await
-            }
-            publish @ (MetadataTransportMessage::ForwardDistributionRequest { .. }
-            | MetadataTransportMessage::SubmitDistributionStatement { .. }) => {
-                Box::pin(async {
-                    let serve = crate::distribution::forward::serve_publish(
-                        context.node_and_realm(),
-                        peer,
-                        publish,
-                    );
-                    crate::driver::drive(serve, context)
-                        .await
-                        .unwrap_or_else(|error| {
-                            crate::forward::transport::reject(error.to_string())
-                        })
-                })
-                .await
-            }
-            fetch @ MetadataTransportMessage::FetchRealmDocuments { .. } => {
-                Box::pin(async {
-                    drive(
-                        crate::device::forward::serve_realm_documents(
-                            context.node_and_realm(),
-                            peer,
-                            fetch,
-                        ),
-                        context,
-                    )
-                    .await
-                    .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
-                })
-                .await
-            }
-            fetch @ MetadataTransportMessage::FetchGraphState { .. } => {
-                Box::pin(async {
-                    drive(
-                        crate::device::forward::serve_graph_state(
-                            context.node_and_realm(),
-                            peer,
-                            fetch,
-                        ),
-                        context,
-                    )
-                    .await
-                    .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
-                })
-                .await
-            }
-            forward @ MetadataTransportMessage::ForwardApplyBatch { .. } => {
-                Box::pin(async {
-                    drive(
-                        crate::device::forward::apply_device_batch(
-                            context.node_and_realm(),
-                            peer,
-                            forward,
-                        ),
-                        context,
-                    )
-                    .await
-                    .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
-                })
-                .await
-            }
-            forward @ MetadataTransportMessage::ForwardAdminEvent { .. } => {
-                Box::pin(async {
-                    drive(
-                        ApplyRelayOperation::new(context.node_and_realm(), peer, forward),
-                        context,
-                    )
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(%error, "Failed to persist a relayed admin event");
-                        MetadataTransportMessage::ForwardedWriteUnavailable
-                    })
-                })
-                .await
-            }
-            forward @ MetadataTransportMessage::ForwardGroupCreate { .. } => {
-                let apply = crate::groups::forward::ApplyGroupOperation::new(
-                    context.node_and_realm(),
-                    peer,
-                    forward,
-                );
-                Box::pin(crate::driver::drive(apply, context.as_ref()))
-                    .await
-                    .unwrap_or_else(|error| reject(format!("group create failed: {error}")))
-            }
-            request @ MetadataTransportMessage::GroupDeletion { .. } => {
-                let apply = crate::groups::deletion::ApplyRequestOperation::new(
-                    context.node_and_realm(),
-                    peer,
-                    request,
-                    ulid::Ulid::generate(),
-                );
-                MetadataTransportMessage::GroupDeletionResult {
-                    result: Box::pin(crate::driver::drive(apply, context.as_ref())).await,
-                }
             }
             _ => unreachable!("request family routed incorrectly"),
         }
@@ -334,7 +83,7 @@ impl MetadataHandle {
         context: &Arc<DriverContext>,
         peer: NodeId,
         metadata_bytes: u64,
-        audit_deadline: tokio::time::Instant,
+        _audit_deadline: tokio::time::Instant,
         message: MetadataTransportMessage,
     ) -> (MetadataTransportMessage, Option<Vec<u8>>) {
         let serving = ServeNode {
@@ -342,6 +91,7 @@ impl MetadataHandle {
             graph: context.graph_handle.is_some(),
             indexed: context.storage_handle.range_indexes().is_some(),
             metadata_bytes,
+            here: needs_here(&message).then(|| context.here()),
         };
         let serve = ServeRequestOperation::new(peer, serving, message);
         let message = match drive(serve, context.as_ref()).await {
@@ -355,32 +105,11 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardDeleteDocument { .. }
             | MetadataTransportMessage::ForwardReadDocument { .. }
             | MetadataTransportMessage::ForwardValidationStatus { .. }
-            | MetadataTransportMessage::ForwardAuditPage { .. }
-            | MetadataTransportMessage::ForwardTokenRevocation { .. }
-            | MetadataTransportMessage::ForwardPersistentId { .. }
-            | MetadataTransportMessage::ForwardPlacementPolicy { .. }
-            | MetadataTransportMessage::ForwardVaultChange { .. }
-            | MetadataTransportMessage::FetchVaultRecords { .. }
-            | MetadataTransportMessage::ForwardCreatePolicy { .. }
             | MetadataTransportMessage::ForwardSyncPull { .. }
             | MetadataTransportMessage::ForwardPullStatus { .. }
-            | MetadataTransportMessage::ForwardListVersions { .. }
-            | MetadataTransportMessage::ForwardCreateBucket { .. }
-            | MetadataTransportMessage::ForwardNewBucket { .. }
-            | MetadataTransportMessage::ForwardCheckBucket { .. }
-            | MetadataTransportMessage::ForwardAdmitMember { .. }
-            | MetadataTransportMessage::ForwardDistributionRequest { .. }
-            | MetadataTransportMessage::SubmitDistributionStatement { .. }
-            | MetadataTransportMessage::FetchRealmDocuments { .. }
-            | MetadataTransportMessage::FetchGraphState { .. }
-            | MetadataTransportMessage::ForwardApplyBatch { .. }
-            | MetadataTransportMessage::ForwardAdminEvent { .. }
-            | MetadataTransportMessage::ForwardGroupCreate { .. }
-            | MetadataTransportMessage::GroupDeletion { .. }) => (
-                self.forward_request(context, peer, audit_deadline, message)
-                    .await,
-                None,
-            ),
+            | MetadataTransportMessage::ForwardListVersions { .. }) => {
+                (self.forward_request(context, peer, message).await, None)
+            }
             _ => (
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string()),
                 None,
