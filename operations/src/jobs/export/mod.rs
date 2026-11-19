@@ -282,4 +282,6 @@ impl From<IoError> for ExportFailure {
 }
 
 #[cfg(test)]
+mod candidate_tests;
+#[cfg(test)]
 mod tests;
