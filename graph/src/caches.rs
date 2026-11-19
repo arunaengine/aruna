@@ -447,7 +447,8 @@ fn results_bytes(results: &MetadataQueryResults) -> usize {
 }
 
 impl crate::GraphHandle {
-    /// Answers a cache effect, or hands any other effect back.
+    /// Answers a cache effect, or hands any other effect back unchanged, which is no failure.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn run_cache(
         &self,
         effect: aruna_core::metadata::MetadataEffect,
