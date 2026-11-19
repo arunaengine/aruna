@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use super::api::MetadataApiError;
 use super::api::list::{GroupRecordsOperation, RecordSummaryOperation};
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::profile::rules::{
     PROFILE_TYPE_IRI, collect_conforms_terms, jsonld_contains_iri,
 };
@@ -126,9 +127,7 @@ impl Operation for GroupPurposeOperation {
         let probe = MetadataEffect::CachedGroup {
             group_id: self.group_id,
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            probe,
-        )))))
+        Ok(Next::Call(metadata_call(probe)))
     }
 
     fn next(

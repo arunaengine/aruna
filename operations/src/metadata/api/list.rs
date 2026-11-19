@@ -5,7 +5,6 @@
 use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::Effect;
 use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
 use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::operation::Operation;
@@ -26,6 +25,7 @@ use super::{
     REGISTRY_CANDIDATE_LIMIT, RealmId, event_log_key, pending_projection_target,
 };
 use crate::groups::list_groups::ListGroupError;
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 use crate::metadata::record_reads::RecordMaterializedOperation;
 use crate::metadata::repository::StorageReadError;
@@ -88,9 +88,7 @@ impl Operation for GroupRecordsOperation {
         let effect = MetadataEffect::CachedGroup {
             group_id: self.group_id,
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            effect,
-        )))))
+        Ok(Next::Call(metadata_call(effect)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Records>, MetadataApiError> {
@@ -656,9 +654,7 @@ mod call_tests {
     fn group_cache_answers() {
         let mut records = GroupRecordsOperation::new(group(), 2);
         let cached = MetadataEffect::CachedGroup { group_id: group() };
-        let first = Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            cached,
-        )))));
+        let first = Ok(Next::Call(metadata_call(cached)));
         assert_eq!(records.first(), first);
         let hit = answer(MetadataEvent::CachedGroup {
             records: Some(vec![record(group(), 1)]),

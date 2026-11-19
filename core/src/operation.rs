@@ -34,6 +34,9 @@ pub enum HoldScope {
     RunPublish,
     /// Filling this node's registry cache, so two fills never read the registry at once.
     RegistryFill,
+    /// Changes to the metadata graphs of one of 32 shards, so a graph's deletion check and its
+    /// change never interleave with a prune of that graph.
+    GraphFence(u8),
 }
 
 /// One use case as decisions without I/O: `first` and `next` return the next call or the

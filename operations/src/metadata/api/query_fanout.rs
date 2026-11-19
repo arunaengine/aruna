@@ -32,6 +32,7 @@ use super::node_fanout::{FanoutParts, NodeCalls, NodeFanoutOperation};
 use super::read_types::MetadataQueryExecution;
 use super::{ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
 use crate::forward::fetch::{peer_call, peer_reply};
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
 use crate::metadata::query_cache::{RemoteKeyInput, credential_digest, remote_key};
@@ -50,7 +51,7 @@ pub(super) enum Partition {
 
 fn merge_call(job: MergeJob, budget: Duration) -> IoCall {
     let effect = MetadataEffect::MergeRows { job, budget };
-    IoCall::Effect(Box::new(Effect::Metadata(effect)))
+    metadata_call(effect)
 }
 
 /// The merged rows or tie count of a [`merge_call`].
@@ -574,7 +575,7 @@ impl DistributedQueryOperation {
         };
         Next::Then {
             output: execution(results, stats),
-            calls: vec![IoCall::Effect(Box::new(Effect::Metadata(store)))],
+            calls: vec![metadata_call(store)],
         }
     }
 
@@ -641,7 +642,7 @@ impl Operation for DistributedQueryOperation {
         };
         self.stage = DistributedStage::Cache;
         let read = MetadataEffect::QueryCacheGet { key };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(read)))))
+        Ok(Next::Call(metadata_call(read)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<QueryAnswer>, MetadataApiError> {

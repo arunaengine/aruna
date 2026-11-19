@@ -35,7 +35,6 @@ use aruna_core::structs::identity::auth::TokenClaims;
 mod effects;
 mod forward_serve;
 pub(crate) mod frames;
-use self::effects::metadata_graph_fence;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
 pub use self::pull_serve::{accept_pull, pull_status};
 mod ingress;

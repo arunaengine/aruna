@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE, METADATA_INDEX_KEYSPACE,
@@ -23,6 +22,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::call_results::effect_event;
+use crate::metadata::deletion_guard::metadata_call;
 
 /// Reads the registry row, then its graph lifecycle and materialization status in one batch,
 /// then exports the graph. A deleted graph or a graph not yet materialized for the row's last
@@ -103,8 +103,8 @@ impl GetDocumentOperation {
         }
         let graph_iri = record.graph_iri.clone();
         self.step = Step::Export;
-        let export = Effect::Metadata(MetadataEffect::ExportRoCrate { graph_iri });
-        Ok(Next::Call(IoCall::Effect(Box::new(export))))
+        let export = MetadataEffect::ExportRoCrate { graph_iri };
+        Ok(Next::Call(metadata_call(export)))
     }
 
     fn exported(&mut self, result: IoResult) -> GetTurn {
@@ -278,8 +278,8 @@ mod tests {
 
         fn export_call() -> GetTurn {
             let graph_iri = record().graph_iri;
-            let export = Effect::Metadata(MetadataEffect::ExportRoCrate { graph_iri });
-            Ok(Next::Call(IoCall::Effect(Box::new(export))))
+            let export = MetadataEffect::ExportRoCrate { graph_iri };
+            Ok(Next::Call(metadata_call(export)))
         }
 
         fn exported(event: MetadataEvent) -> IoResult {

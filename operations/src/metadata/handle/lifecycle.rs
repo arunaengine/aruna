@@ -1,40 +1,16 @@
-//! Guards effects against deleted graphs, prunes deleted graphs and syncs graphs best effort.
+//! Reconciles document sync into the graph store and syncs graphs with peers best effort.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::sync::sync_graph_once;
 
 use aruna_core::NodeId;
-use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
+use aruna_core::metadata::{MetadataError, MetadataEvent};
 use tokio::time::sleep;
 use tracing::warn;
 
-use super::{GRAPH_SYNC_AFTER, GRAPH_SYNC_ATTEMPTS, MetadataHandle, handles, metadata_graph_fence};
-use crate::driver::{DriverContext, drive};
-use crate::metadata::graph_deleted::GraphDeletedOperation;
-
-/// Removes the local copy of `graph_iri` when its lifecycle record says it is deleted.
-pub(crate) async fn prune_if_deleted(
-    context: &DriverContext,
-    graph_iri: String,
-) -> Result<bool, MetadataError> {
-    let (_, graph) = handles(context)?;
-    let _graph_fence = metadata_graph_fence(&graph_iri)
-        .acquire()
-        .await
-        .map_err(|error| {
-            MetadataError::Backend(format!("metadata graph fence unavailable: {error}"))
-        })?;
-    if !drive(GraphDeletedOperation::new(&graph_iri), context).await? {
-        return Ok(false);
-    }
-    graph.forget_graph(graph_iri.clone());
-    if !graph.contains_graph(graph_iri.clone()).await? {
-        return Ok(true);
-    }
-    graph.delete_graph(graph_iri).await?;
-    Ok(true)
-}
+use super::{GRAPH_SYNC_AFTER, GRAPH_SYNC_ATTEMPTS, MetadataHandle};
+use crate::driver::DriverContext;
 
 impl MetadataHandle {
     /// Applies document sync updates from peers; returns how many graphs changed.
@@ -47,24 +23,6 @@ impl MetadataHandle {
             .as_ref()
             .ok_or(MetadataError::HandleMissing)?;
         Ok(graph.reconcile().await?.len())
-    }
-
-    /// Removes the local copy of every deleted graph; returns how many were removed.
-    pub async fn prune_deleted_graphs(
-        &self,
-        context: &DriverContext,
-    ) -> Result<usize, MetadataError> {
-        let graph = context
-            .graph_handle
-            .as_ref()
-            .ok_or(MetadataError::HandleMissing)?;
-        let mut pruned = 0usize;
-        for graph_iri in graph.graphs().await? {
-            if prune_if_deleted(context, graph_iri).await? {
-                pruned += 1;
-            }
-        }
-        Ok(pruned)
     }
 }
 
@@ -112,39 +70,4 @@ pub(super) fn sync_best_effort(
     });
 
     MetadataEvent::GraphSyncScheduled { graph_iri, peers }
-}
-
-pub(super) async fn metadata_graph_deleted(
-    context: &DriverContext,
-    graph_iri: &str,
-) -> Result<bool, MetadataError> {
-    let (_, graph) = handles(context)?;
-    if let Some((true, _)) = graph.cached_lifecycle(graph_iri) {
-        return Ok(true);
-    }
-    let deleted = drive(GraphDeletedOperation::new(graph_iri), context).await?;
-    graph.store_lifecycle(graph_iri.to_string(), deleted);
-    Ok(deleted)
-}
-
-pub(super) fn effect_rejects_deleted(effect: &MetadataEffect) -> bool {
-    matches!(
-        effect,
-        MetadataEffect::ValidateCreateCrate { .. }
-            | MetadataEffect::ValidateRoCrate { .. }
-            | MetadataEffect::CreateCrate { .. }
-            | MetadataEffect::ApplyRoCrate { .. }
-            | MetadataEffect::UpsertDataEntity { .. }
-            | MetadataEffect::UpsertContextualEntity { .. }
-            | MetadataEffect::SetGraphPolicy { .. }
-            | MetadataEffect::AddGraphPeer { .. }
-            | MetadataEffect::GetGraphPolicy { .. }
-            | MetadataEffect::ExportRoCrate { .. }
-            | MetadataEffect::ExportRoCrateSummary { .. }
-            | MetadataEffect::ExportSummaryAt { .. }
-            | MetadataEffect::DescribeTitle { .. }
-            | MetadataEffect::ExportRoCratePage { .. }
-            | MetadataEffect::PlanBatch { .. }
-            | MetadataEffect::MergeBatch { .. }
-    )
 }

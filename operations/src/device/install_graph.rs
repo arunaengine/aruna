@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::DEVICE_GRAPH_KEYSPACE;
 use aruna_core::metadata::{
@@ -17,6 +16,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use super::replica::{ReplicaRecord, ReplicaState, replica_entry, replica_key};
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::protocol::GraphState;
 
 #[derive(Debug, Error, PartialEq)]
@@ -103,9 +103,7 @@ impl Operation for InstallGraphOperation {
             return Ok(Next::Done(false));
         };
         let install = self.join(graph);
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            install,
-        )))))
+        Ok(Next::Call(metadata_call(install)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, InstallError> {
@@ -177,12 +175,7 @@ mod tests {
         let mut joined = InstallGraphOperation::new(replica(), graph(1), 9);
         let snapshot = joined.join(graph(1));
         let rows = joined.store_rows();
-        assert_eq!(
-            install.first(),
-            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-                snapshot
-            )))))
-        );
+        assert_eq!(install.first(), Ok(Next::Call(metadata_call(snapshot))));
         assert_eq!(install.next(installed()), Ok(rows));
         assert_eq!(joined.replica.last_synced_ms, Some(9));
         assert_eq!(joined.replica.displayed_jsonld, "{}");

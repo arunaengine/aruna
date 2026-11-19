@@ -35,6 +35,7 @@ use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeReco
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::after_sync::AfterSyncOperation;
+use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
 use aruna_operations::metadata::protocol::MetadataTransportMessage;
 use aruna_operations::node::heartbeat::ReceiveHeartbeatOperation;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
@@ -996,7 +997,7 @@ async fn run_maintenance(context: &DriverContext, source: &'static str, attempt:
             "Metadata document sync reconciliation failed"
         );
     }
-    match metadata_handle.prune_deleted_graphs(context).await {
+    match drive(PruneGraphsOperation::new(), context).await {
         Ok(pruned) if pruned > 0 => {
             debug!(source, attempt, pruned, "Metadata graph prune completed")
         }

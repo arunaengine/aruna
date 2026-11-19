@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::effects::Effect;
 use aruna_core::events::{Event, PeerRequestError};
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource, MetadataEffect};
 use aruna_core::operation::{Operation, boxed_retry};
@@ -29,6 +28,7 @@ use crate::forward::routing::{
 use crate::forward::transport::{MetadataWriteError, unexpected_response};
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::realm::load_config::config_unavailable;
@@ -160,7 +160,7 @@ impl Operation for RouteDeleteOperation {
                 };
                 Ok(Next::Then {
                     output: (),
-                    calls: vec![IoCall::Effect(Box::new(Effect::Metadata(uncache)))],
+                    calls: vec![metadata_call(uncache)],
                 })
             }
             DeleteStage::Forward => {

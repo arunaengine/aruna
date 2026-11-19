@@ -42,11 +42,11 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::metadata::send_metadata_effect;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
 use aruna_operations::metadata::update_entry::UpdateEntryOperation;
+use aruna_operations::metadata::{export_rocrate_jsonld, send_metadata_effect};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -1604,16 +1604,8 @@ async fn wait_metadata_absence(
             )
             .await
             .is_err();
-            let graph_absent = matches!(
-                send_metadata_effect(
-                    &node.context,
-                    MetadataEffect::ExportRoCrate {
-                        graph_iri: graph_iri.to_string(),
-                    },
-                )
-                .await,
-                Event::Metadata(MetadataEvent::Error { .. })
-            );
+            let export = export_rocrate_jsonld(&node.context, graph_iri.to_string());
+            let graph_absent = export.await.is_err();
             if !(document_absent && graph_absent) {
                 pending += 1;
             }

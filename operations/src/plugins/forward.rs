@@ -12,7 +12,6 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 
 use aruna_core::NodeId;
-use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
@@ -40,6 +39,7 @@ use super::rows::{
     Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, values,
 };
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 /// Forward rows of one install read for sending in one pass at most.
@@ -503,7 +503,7 @@ impl Operation for Unreadable {
                     actor: batch.actor,
                     counter: batch.counter,
                 };
-                return Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(dot)))));
+                return Ok(Next::Call(metadata_call(dot)));
             }
             (_, None) => facts.logged && facts.materialized(|id| id == event_id),
         };

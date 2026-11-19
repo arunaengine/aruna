@@ -29,6 +29,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::MetadataPhaseSource;
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::id_mapping::{MappingRoute, mapping_route_for, tombstone_transition};
 use crate::metadata::repository::{audit_entry, lifecycle_revision_entries, schedule_prune_drain};
 use crate::sync::outbox_record::{
@@ -420,7 +421,7 @@ impl DeleteDocumentOperation {
             output: (),
             calls: vec![
                 IoCall::Effect(Box::new(schedule_prune_drain())),
-                IoCall::Effect(Box::new(aruna_core::effects::Effect::Metadata(prune))),
+                metadata_call(prune),
                 IoCall::Effect(Box::new(schedule_drain_effect())),
             ],
         })
@@ -650,7 +651,7 @@ mod call_tests {
                 output: (),
                 calls: vec![
                     IoCall::Effect(Box::new(schedule_prune_drain())),
-                    IoCall::Effect(Box::new(Effect::Metadata(prune))),
+                    metadata_call(prune),
                     IoCall::Effect(Box::new(schedule_drain_effect())),
                 ],
             })

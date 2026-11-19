@@ -81,6 +81,13 @@ impl Operation for DeletedGraphsOperation {
     }
 }
 
+/// The registry records a caller may read here, with the number of groups its read rules cover.
+#[derive(Debug, PartialEq)]
+pub(crate) struct VisibleRecords {
+    pub(crate) records: Vec<MetadataRegistryRecord>,
+    pub(crate) readable_groups: usize,
+}
+
 #[derive(Debug, PartialEq)]
 enum ScopeStage {
     Generation,
@@ -131,7 +138,7 @@ impl ReadScopeOperation {
         }
     }
 
-    fn refresh(&mut self, generation: u64) -> Turn<Vec<MetadataRegistryRecord>> {
+    fn refresh(&mut self, generation: u64) -> Turn<VisibleRecords> {
         let lifecycle = (self.candidates.iter())
             .map(|record| {
                 let deleted = self.deleted.contains(&record.graph_iri);
@@ -172,14 +179,14 @@ impl ReadScopeOperation {
 }
 
 impl Operation for ReadScopeOperation {
-    type Output = Vec<MetadataRegistryRecord>;
+    type Output = VisibleRecords;
     type Error = MetadataError;
 
     fn stamp(&mut self, now_ms: u64) {
         self.timing.stamp(now_ms);
     }
 
-    fn first(&mut self) -> Turn<Vec<MetadataRegistryRecord>> {
+    fn first(&mut self) -> Turn<VisibleRecords> {
         self.timing.open(debug_span!(
             "metadata.authorization.select_records",
             record_count = self.counts.0 as u64,
@@ -199,7 +206,7 @@ impl Operation for ReadScopeOperation {
         Ok(Next::Call(IoCall::Effect(Box::new(generation))))
     }
 
-    fn next(&mut self, result: IoResult) -> Turn<Vec<MetadataRegistryRecord>> {
+    fn next(&mut self, result: IoResult) -> Turn<VisibleRecords> {
         match std::mem::replace(&mut self.stage, ScopeStage::Access) {
             ScopeStage::Generation => match cache_answer(result)? {
                 MetadataEvent::CacheGeneration { generation } => {
@@ -235,7 +242,10 @@ impl Operation for ReadScopeOperation {
             ScopeStage::Access => {
                 let access = result.child::<ReadAccess, MetadataApiError>()?;
                 let access = access.map_err(|error| MetadataError::Backend(error.to_string()))?;
-                Ok(Next::Done(self.visible(&access)))
+                Ok(Next::Done(VisibleRecords {
+                    records: self.visible(&access),
+                    readable_groups: access.group_count(),
+                }))
             }
         }
     }

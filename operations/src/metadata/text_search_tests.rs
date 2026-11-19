@@ -34,7 +34,11 @@ fn scoped(operation: &mut LocalSearchOperation, visible: Vec<MetadataRegistryRec
     assert!(runs_child(
         operation.next(child(Ok::<_, MetadataError>(registry)))
     ));
-    operation.next(child(Ok::<_, MetadataError>(visible)))
+    let scope = VisibleRecords {
+        records: visible,
+        readable_groups: 0,
+    };
+    operation.next(child(Ok::<_, MetadataError>(scope)))
 }
 
 #[test]
@@ -89,7 +93,10 @@ fn reference_listing_describes() {
     assert!(runs_child(
         listing.next(child(Ok::<_, MetadataIriError>(found)))
     ));
-    let visible = child(Ok::<_, MetadataError>(vec![first.clone(), second.clone()]));
+    let visible = child(Ok::<_, MetadataError>(VisibleRecords {
+        records: vec![first.clone(), second.clone()],
+        readable_groups: 0,
+    }));
     let mut targets = vec![
         (first, "urn:s:b".to_string()),
         (second, "urn:s:a".to_string()),

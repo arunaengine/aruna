@@ -35,6 +35,7 @@ use super::rules::{
 use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
 use crate::metadata::call_results::effect_event;
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::forward::profile_export::ProfileExportOperation;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::raw_events::{RawReadError, RawRevisionState};
@@ -567,9 +568,7 @@ impl ProfileAssessOperation {
         };
         self.registered = Some(record);
         self.stage = AssessStage::Cached;
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            cached,
-        )))))
+        Ok(Next::Call(metadata_call(cached)))
     }
 
     fn registered(&self) -> Result<&MetadataRegistryRecord, MetadataError> {
@@ -666,9 +665,7 @@ impl ProfileAssessOperation {
             revision,
             shapes,
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            store,
-        )))))
+        Ok(Next::Call(metadata_call(store)))
     }
 
     fn evaluate(&mut self, profile: ResolvedProfile) -> AssessTurn {
@@ -681,9 +678,7 @@ impl ProfileAssessOperation {
         };
         self.profile = Some(profile);
         self.stage = AssessStage::Evaluate;
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            check,
-        )))))
+        Ok(Next::Call(metadata_call(check)))
     }
 
     fn evaluated(&mut self, result: IoResult) -> AssessTurn {
@@ -713,7 +708,10 @@ impl ProfileAssessOperation {
         let report =
             checked(effect_event(result)?, None)?.map_err(|error| shacl_failure(error, None))?;
         Ok(Next::Done(MetadataProfilePreview {
-            status: not_profiled_status(self.document_id),
+            status: ProfileValidationStatus {
+                validated_at_ms: Some(self.now_ms),
+                ..not_profiled_status(self.document_id)
+            },
             structural_violations: report
                 .structural
                 .into_iter()
@@ -770,9 +768,7 @@ impl Operation for ProfileAssessOperation {
         let check = MetadataEffect::CheckStructure {
             jsonld: self.jsonld.clone(),
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            check,
-        )))))
+        Ok(Next::Call(metadata_call(check)))
     }
 
     fn next(&mut self, result: IoResult) -> AssessTurn {

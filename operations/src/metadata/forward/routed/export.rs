@@ -28,6 +28,7 @@ use crate::metadata::api::export_types::{
 use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::resolve_metadata_id;
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::metadata::revision_read::MetadataRawView;
 use crate::realm::mutate_placement::node_kind;
@@ -157,9 +158,7 @@ impl DeviceExportOperation {
                 after: self.request.after.clone(),
             },
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(
-            effect,
-        )))))
+        Ok(Next::Call(metadata_call(effect)))
     }
 
     fn raw(

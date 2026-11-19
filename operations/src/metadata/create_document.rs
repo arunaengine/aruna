@@ -42,7 +42,8 @@ use ulid::Ulid;
 use crate::metadata::call_results::{effect_event, read_value, read_values};
 use crate::metadata::id_mapping::{mapping_revision, mapping_route_for, transition_entries};
 use crate::metadata::profile::rules::{
-    crate_is_profile, not_profiled_status, profile_path_rule, submission_profile_tag,
+    crate_is_profile, not_profiled_status, profile_path_rule, stamp_unprofiled,
+    submission_profile_tag,
 };
 use crate::metadata::repository::create_projection_entries;
 use crate::sync::shard_placement::sort_node_ids;
@@ -347,6 +348,7 @@ impl CreateDocumentOperation {
             stage: CommitStage::Fence,
             pending: None,
             created: None,
+            now_ms: 0,
         }
     }
 }
@@ -426,6 +428,7 @@ pub struct CreateCommitOperation {
     stage: CommitStage,
     pending: Option<Resolved>,
     created: Option<CreateDocumentResult>,
+    now_ms: u64,
 }
 
 impl CreateCommitOperation {
@@ -475,7 +478,7 @@ impl CreateCommitOperation {
         holder_node_ids: Vec<NodeId>,
         placement: PlacementRef,
     ) -> MetadataRegistryRecord {
-        let now = self.phase_source.now_ms();
+        let now = self.now_ms;
         MetadataRegistryRecord {
             realm_id: self.config.actor.realm_id,
             group_id: self.config.group_id,
@@ -643,13 +646,13 @@ impl CreateCommitOperation {
         };
         status.document_id = create_event.record.document_id;
         status.dataset_revision = create_event.event_id;
+        stamp_unprofiled(&mut status, self.now_ms);
         let mut writes = create_projection_entries(&create_event)?;
         writes.push(raw_budget_entry(&raw_budget)?);
         writes.push(create_acceptance_entry(&create_event)?);
         writes.push(profile_validation_entry(&status)?);
         // The accepting node journals the creation for plugins in its commit batch.
-        let now = aruna_core::time::unix_timestamp_millis();
-        let created = SourceEvent::dataset_created(&create_event, now);
+        let created = SourceEvent::dataset_created(&create_event, self.now_ms);
         writes.extend(journal_entries(&created)?);
         if let Some(message) = &self.message {
             writes.push(commit_message_entry(&create_event, message)?);
@@ -728,6 +731,10 @@ type CommitTurn = Result<Next<CreateDocumentResult>, CreateDocumentError>;
 impl Operation for CreateCommitOperation {
     type Output = CreateDocumentResult;
     type Error = CreateDocumentError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -1291,6 +1298,24 @@ mod tests {
     }
 
     #[test]
+    fn unprofiled_status_stamped() {
+        // The not-profiled status reads no clock when built, so equal inputs give equal
+        // operations, and the commit stamps it with the runner's time.
+        let (actor, realm_config, config) = held_create(13, "datasets/fast-create");
+        let built = CreateDocumentOperation::new_generated_id(config.clone());
+        assert_eq!(built, CreateDocumentOperation::new_generated_id(config));
+        let mut commit = built.commit_operation();
+        commit.stamp(7);
+        let Ok(Next::Call(IoCall::Write(rows))) = commit_turn(&mut commit, &actor, &realm_config)
+        else {
+            panic!("expected the create writes");
+        };
+        let (_, _, value) = row(&rows, aruna_core::keyspaces::VALIDATION_STATUS_KEYSPACE);
+        let status: ProfileValidationStatus = postcard::from_bytes(value).unwrap();
+        assert_eq!(status.validated_at_ms, Some(7));
+    }
+
+    #[test]
     fn create_conflict_fence() {
         // A rerun after a lost conflict goes straight to the commit; its fence read replays an
         // identical accepted create and refuses a different one.
@@ -1337,23 +1362,24 @@ mod tests {
         );
     }
 
-    // The phase source is sampled when the record and event are built, not in
-    // the constructor, so a fixed source pins the whole create trace.
+    // The record and event take the runner's time and the phase source's id, so a stamp and a
+    // fixed source pin the whole create trace.
     #[test]
     fn create_source_pinned() {
         let realm_id = RealmId([43u8; 32]);
         let actor = actor(realm_id, 5);
         let document_id = Ulid::from_bytes([43; 16]);
-        let commit = CreateDocumentOperation::new(config(
+        let mut commit = CreateDocumentOperation::new(config(
             actor,
             GroupId::from_bytes([0x43; 16]),
             document_id,
         ))
         .with_phase_source(crate::metadata::MetadataPhaseSource::fixed(
-            || 1_700_000_000_000,
+            || 0,
             || Ulid::from_bytes([0x77; 16]),
         ))
         .commit_operation();
+        commit.stamp(1_700_000_000_000);
 
         let record = commit.build_record(Vec::new(), PlacementRef::NIL);
         assert_eq!(record.created_at_ms, 1_700_000_000_000);
@@ -1372,9 +1398,7 @@ mod tests {
         operation.next(validation_result(document_id)).unwrap();
         operation.conflict_recheck = true;
 
-        let mut expected = CreateDocumentOperation::new_generated_id(config);
-        // The status carries its construction time; the copy keeps the original's.
-        expected.route_profile_status = operation.route_profile_status.clone();
+        let expected = CreateDocumentOperation::new_generated_id(config);
         assert_eq!(operation.fresh_copy(), expected);
     }
 

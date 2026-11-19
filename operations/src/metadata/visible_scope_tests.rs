@@ -91,5 +91,9 @@ fn scope_drops_deleted() {
     assert!(runs_child(scope.next(stored)));
     let access = access_for(&records[..2], None);
     let visible = scope.next(child(Ok::<_, MetadataApiError>(access)));
-    assert_eq!(visible, Ok(Next::Done(vec![records[1].clone()])));
+    let expected = VisibleRecords {
+        records: vec![records[1].clone()],
+        readable_groups: 0,
+    };
+    assert_eq!(visible, Ok(Next::Done(expected)));
 }

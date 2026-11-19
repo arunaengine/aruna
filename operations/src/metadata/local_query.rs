@@ -21,7 +21,7 @@ use crate::metadata::api::fanout_types::pattern_contains_service;
 use crate::metadata::query_cache::{LocalScopeKind, ScopeDigest, graphs_digest, local_key};
 use crate::metadata::registry_cache::{Registry, RegistryReadOperation, cache_answer};
 use crate::metadata::span_timing::ReadTiming;
-use crate::metadata::visible_scope::ReadScopeOperation;
+use crate::metadata::visible_scope::{ReadScopeOperation, VisibleRecords};
 
 /// The longest SPARQL text a metadata query may have.
 pub(crate) const QUERY_MAX_BYTES: usize = 64 * 1024;
@@ -224,7 +224,7 @@ impl LocalQueryOperation {
                 Ok(Next::Call(IoCall::child(scope)))
             }
             QueryStage::Scope => {
-                let visible = result.child::<Vec<MetadataRegistryRecord>, MetadataError>()??;
+                let visible = result.child::<VisibleRecords, MetadataError>()??.records;
                 self.timing.lap("authorization_ms");
                 self.lookup(visible)
             }

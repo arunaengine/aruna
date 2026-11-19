@@ -31,7 +31,11 @@ fn looked_up(
     assert!(runs_child(
         query.next(child(Ok::<_, MetadataError>(registry)))
     ));
-    let lookup = query.next(child(Ok::<_, MetadataError>(visible)));
+    let scope = VisibleRecords {
+        records: visible,
+        readable_groups: 0,
+    };
+    let lookup = query.next(child(Ok::<_, MetadataError>(scope)));
     (query, lookup)
 }
 

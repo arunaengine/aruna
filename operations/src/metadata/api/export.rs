@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -16,6 +15,7 @@ use super::export_types::{
 use super::readable::RecordReadableOperation;
 use super::{MetadataApiError, RealmId, Ulid, map_event_error};
 use crate::metadata::call_results::effect_event;
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::raw_events::RawReadError;
 use crate::metadata::record_reads::RecordMaterializedOperation;
@@ -34,7 +34,7 @@ fn embedded<T, U>(turn: Next<T>) -> Result<T, Next<U>> {
 }
 
 fn graph_effect(effect: MetadataEffect) -> IoCall {
-    IoCall::Effect(Box::new(Effect::Metadata(effect)))
+    metadata_call(effect)
 }
 
 /// The answer of a graph export, or why there is none.
@@ -554,7 +554,7 @@ mod call_tests {
     #[test]
     fn full_rechecks_cursor() {
         let (mut export, turn) = at_export(RoCrateExportView::Full);
-        assert!(matches!(turn, Ok(Next::Call(IoCall::Effect(_)))));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         let full = answer(MetadataEvent::RoCrateExportResult {
             graph_iri: record(5).graph_iri,
             jsonld: "{}".to_string(),
