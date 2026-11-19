@@ -14,6 +14,7 @@ use super::fixtures::{
     actor, check_plan, config_target, config_topic, node, realm, signature, single_event,
     snapshot_event,
 };
+use super::followups::{FollowUpNode, QueuedApply, followup_row};
 use super::links::LinkPlan;
 use super::quarantine::CursorEvidencePlan;
 use super::reads::{dependency_available, relay_allowed};
@@ -26,8 +27,8 @@ use crate::calls::{IoCall, IoResult, Next};
 use crate::config_authority::AdminEventValidation;
 use crate::deferred_topics::DocumentSyncDependency;
 use crate::document::{
-    AppliedStep, AppliedSync, DocumentChange, DocumentChangeKind, DocumentEvent,
-    DocumentReconcileResult, DocumentSyncRevision, DocumentTarget, applied_sync_entry,
+    DocumentChange, DocumentChangeKind, DocumentEvent, DocumentReconcileResult,
+    DocumentSyncRevision, DocumentTarget,
 };
 use crate::effects::{Effect, StorageEffect};
 use crate::events::{Event, StorageEvent};
@@ -430,6 +431,49 @@ fn lifecycle_stores_delete() {
     assert!(!ran.output());
 }
 
+// A pulled delete stores its follow-up row in its own transaction, so a replay that finds the
+// delete applied and skips it leaves the queued graph prune in place.
+#[test]
+fn delete_queues_followups() {
+    let target = DocumentTarget::MetadataDocumentLifecycle {
+        document_id: document_id(),
+    };
+    let record = MetadataLifecycleRecord::Delete {
+        event: delete_record(),
+    };
+    let plan = ApplyEventPlan {
+        topic_id: config_topic(),
+        actor_id: actor(),
+        realm_id: realm(),
+        identity: identity(),
+        event: DocumentEvent::Upsert {
+            event_id: Ulid::from_parts(8, 8),
+            target: target.clone(),
+            bytes: postcard::to_allocvec(&record).unwrap(),
+            change: change(DocumentChangeKind::Upsert, placed()),
+        },
+    };
+    let queued = QueuedApply {
+        plan,
+        node: followup_node(),
+        identity: identity(),
+    };
+    let ran = run(queued.clone(), &nothing());
+    let result = DocumentReconcileResult {
+        targets: vec![target],
+        metadata_graph_tombstones: vec![tombstone(10)],
+        ..DocumentReconcileResult::default()
+    };
+    let row = followup_row(&followup_node(), &identity(), result).unwrap();
+    assert!(ran.writes.contains(&row));
+    let stored: Stored = (ran.writes.iter())
+        .map(|(space, key, value)| ((space.clone(), key.clone()), value.clone()))
+        .collect();
+    let replayed = run(queued, &stored);
+    assert!(replayed.unchanged());
+    assert_eq!(replayed.output(), ApplyOutcome::Skipped);
+}
+
 #[test]
 fn lifecycle_refuses_mismatch() {
     let mut event = create_event();
@@ -625,30 +669,33 @@ fn accepted_create() -> (PendingCreateApply, Stored) {
     (pending, stored)
 }
 
-// An accepted create writes the follow-up row with its target and event in the create
+fn followup_node() -> FollowUpNode {
+    FollowUpNode {
+        node_id: node(),
+        realm_id: realm(),
+    }
+}
+
+// An accepted create writes its follow-up row, keyed by its sync identity, in the create
 // transaction; moving cursors alone queues none.
 #[test]
 fn batch_queues_accepted() {
-    let followups = AppliedSync {
-        id: Ulid::from_parts(1, 1),
-        node_id: node(),
-        realm_id: Some(realm()),
-        result: DocumentReconcileResult::default(),
-        next: AppliedStep::Usage,
-    };
     let (pending, stored) = accepted_create();
     let accepted = (pending.target.clone(), pending.record.clone());
     let plan = CreateBatchPlan::new(vec![pending], Vec::new(), Vec::new()).unwrap();
-    let ran = run(plan.queuing(Some(followups.clone())), &stored);
-    let mut queued = followups.clone();
-    queued.result.targets.push(accepted.0.clone());
-    queued.result.metadata_create_events.push(accepted.1.clone());
-    assert!(ran.writes.contains(&applied_sync_entry(&queued).unwrap()));
+    let ran = run(plan.queuing(Some(followup_node())), &stored);
+    let result = DocumentReconcileResult {
+        targets: vec![accepted.0.clone()],
+        metadata_create_events: vec![accepted.1.clone()],
+        ..DocumentReconcileResult::default()
+    };
+    let row = followup_row(&followup_node(), &identity(), result).unwrap();
+    assert!(ran.writes.contains(&row));
     assert_eq!(ran.output().accepted, vec![accepted]);
 
     let cursor = vec![(config_topic(), cursor_row())];
     let plan = CreateBatchPlan::new(Vec::new(), cursor, Vec::new()).unwrap();
-    let ran = run(plan.queuing(Some(followups)), &nothing());
+    let ran = run(plan.queuing(Some(followup_node())), &nothing());
     assert_eq!(ran.writes, vec![cursor_row()]);
 }
 

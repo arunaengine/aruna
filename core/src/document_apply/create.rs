@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use byteview::ByteView;
 use ulid::Ulid;
 
+use super::followups::{FollowUpNode, followup_row};
 use super::quarantine::quarantine_entries;
 use super::registry::{
     Row, accepted_create, create_fence, event_logged, lifecycle_stale, placement_fence,
@@ -14,9 +15,7 @@ use super::registry::{
 };
 use super::{ApplyError, PlacementOutcome, Step, invalid};
 use crate::deferred_topics::DocumentSyncDependency;
-use crate::document::{
-    AppliedSync, DocumentChange, DocumentEvent, DocumentTarget, applied_sync_entry,
-};
+use crate::document::{DocumentChange, DocumentEvent, DocumentReconcileResult, DocumentTarget};
 use crate::metadata::MetadataEventRecord;
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
 use crate::storage_entries::{
@@ -95,7 +94,7 @@ pub struct CreateBatchPlan {
     cursor_writes: Vec<(irokle::TopicId, Row)>,
     rejections: Vec<SyncRejection>,
     notes: Vec<CreateNote>,
-    followups: Option<AppliedSync>,
+    followups: Option<FollowUpNode>,
 }
 
 impl CreateBatchPlan {
@@ -131,10 +130,10 @@ impl CreateBatchPlan {
         })
     }
 
-    /// Also writes `followups`, filled with the accepted creates, in the same transaction, so
-    /// the drain runs their follow-ups once they and their cursors are stored.
-    pub fn queuing(mut self, followups: Option<AppliedSync>) -> Self {
-        self.followups = followups;
+    /// Also writes the follow-up row of each accepted create for `node`'s drain in the same
+    /// transaction, keyed by the create's own sync identity.
+    pub fn queuing(mut self, node: Option<FollowUpNode>) -> Self {
+        self.followups = node;
         self
     }
 
@@ -312,6 +311,14 @@ impl RowPlan for CreateBatchPlan {
                     if with_revision {
                         writes.extend(candidate.revision.iter().cloned());
                     }
+                    if let Some(node) = &self.followups {
+                        let result = DocumentReconcileResult {
+                            targets: vec![apply.target.clone()],
+                            metadata_create_events: vec![apply.record.clone()],
+                            ..DocumentReconcileResult::default()
+                        };
+                        writes.push(followup_row(node, &apply.identity, result)?);
+                    }
                     outcome
                         .accepted
                         .push((apply.target.clone(), apply.record.clone()));
@@ -348,17 +355,6 @@ impl RowPlan for CreateBatchPlan {
                 .filter(|(topic, _)| !held.contains(topic))
                 .map(|(_, write)| write.clone()),
         );
-        let followups = self
-            .followups
-            .clone()
-            .filter(|_| !outcome.accepted.is_empty());
-        if let Some(mut followups) = followups {
-            for (target, record) in &outcome.accepted {
-                followups.result.targets.push(target.clone());
-                followups.result.metadata_create_events.push(record.clone());
-            }
-            writes.push(applied_sync_entry(&followups).map_err(invalid)?);
-        }
         Ok(Planned::changes(outcome, Vec::new(), writes))
     }
 }

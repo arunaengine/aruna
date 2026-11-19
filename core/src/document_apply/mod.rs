@@ -9,6 +9,7 @@ pub mod distribution;
 pub mod events;
 #[cfg(test)]
 mod fixtures;
+pub mod followups;
 pub mod links;
 pub mod overflow;
 #[cfg(test)]

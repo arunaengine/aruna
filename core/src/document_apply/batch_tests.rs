@@ -84,6 +84,30 @@ fn identity() -> SyncQuarantineIdentity {
     }
 }
 
+// A batch that queues follow-ups runs each apply with its follow-up row, keyed by the event.
+#[test]
+fn queued_apply_event() {
+    let event = upsert(config_target());
+    let followups = FollowUpNode {
+        node_id: node(),
+        realm_id: realm(),
+    };
+    let mut batch = operation(vec![event.clone()]).queuing(Some(followups));
+    let plan = ApplyEventPlan {
+        topic_id: config_topic(),
+        actor_id: actor(),
+        realm_id: realm(),
+        identity: identity(),
+        event,
+    };
+    let queued = QueuedApply {
+        plan,
+        node: followups,
+        identity: identity(),
+    };
+    assert_eq!(batch.first(), Ok(Next::Call(plan_call(queued))));
+}
+
 #[test]
 fn applies_document_event() {
     let event = upsert(config_target());
