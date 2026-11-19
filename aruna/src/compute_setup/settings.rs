@@ -197,7 +197,7 @@ fn collect_kubernetes(
         policy_manifests,
         service_account: env
             .var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
-            .unwrap_or_else(|| aruna_compute::DEFAULT_WORKLOAD_SA.to_string()),
+            .unwrap_or_else(|| aruna_compute::executor::config::DEFAULT_WORKLOAD_SA.to_string()),
         execution_location: env
             .var("ARUNA_COMPUTE_K8S_EXECUTION_LOCATION")
             .unwrap_or_default(),
@@ -220,7 +220,7 @@ fn collect_kubernetes(
 /// The KubeDAL worker cache: a scope enables it, worker labels are optional.
 fn kubedal_cache(
     env: &dyn crate::settings::SettingsEnv,
-) -> Result<Option<aruna_compute::KubedalCache>, String> {
+) -> Result<Option<aruna_compute::executor::config::KubedalCache>, String> {
     let Some(scope) = parse_nonempty(env.var("ARUNA_COMPUTE_K8S_KUBEDAL_CACHE_SCOPE").as_deref())
     else {
         return Ok(None);
@@ -230,7 +230,7 @@ fn kubedal_cache(
         env.var("ARUNA_COMPUTE_K8S_KUBEDAL_CACHE_WORKER_LABELS")
             .as_deref(),
     )?;
-    Ok(Some(aruna_compute::KubedalCache {
+    Ok(Some(aruna_compute::executor::config::KubedalCache {
         scope,
         worker_labels,
     }))
@@ -244,7 +244,7 @@ pub(super) fn session_s3_address(
     s3_address: Option<&str>,
     subnet: &str,
 ) -> Option<std::net::SocketAddr> {
-    use aruna_compute::executor::docker::session_gateway;
+    use aruna_compute::executor::docker::session::session_gateway;
 
     let port = s3_address?.parse::<std::net::SocketAddr>().ok()?.port();
     match session_gateway(subnet) {

@@ -277,8 +277,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
 
-    use aruna_compute::ExecutorBackend;
-    use aruna_compute::ExecutorRegistry;
+    use aruna_compute::executor::ExecutorBackend;
+    use aruna_compute::registry::ExecutorRegistry;
     use aruna_core::UserId;
     use aruna_core::compute::{
         AttemptRef, AttemptStatus, CancelEvidence, FenceContext, LogLimits, LogTails, NOBODY,

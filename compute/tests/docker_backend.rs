@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_clock::testing::poll_until;
-use aruna_compute::DockerConfig;
+use aruna_compute::executor::config::DockerConfig;
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, FenceContext, LogLimits,
@@ -67,8 +67,12 @@ impl DockerTestExt for DockerBackend {
         spec: &TaskSpec,
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
-        let image =
-            aruna_compute::ExecutorBackend::resolve_image(self, &spec.image, cancel).await?;
+        let image = aruna_compute::executor::ExecutorBackend::resolve_image(
+            self,
+            &spec.image,
+            cancel,
+        )
+        .await?;
         let inputs = spec
             .inputs
             .iter()
@@ -105,11 +109,17 @@ impl DockerTestExt for DockerBackend {
             session: spec.session,
             session_mount: spec.session_mount.clone(),
         };
-        aruna_compute::ExecutorBackend::submit(self, &fence(&spec.attempt), &pinned, cancel).await
+        aruna_compute::executor::ExecutorBackend::submit(
+            self,
+            &fence(&spec.attempt),
+            &pinned,
+            cancel,
+        )
+        .await
     }
 
     async fn status(&self, attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
-        aruna_compute::ExecutorBackend::status(self, &fence(attempt)).await
+        aruna_compute::executor::ExecutorBackend::status(self, &fence(attempt)).await
     }
 
     async fn wait(
@@ -117,11 +127,11 @@ impl DockerTestExt for DockerBackend {
         attempt: &AttemptRef,
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
-        aruna_compute::ExecutorBackend::wait(self, &fence(attempt), cancel).await
+        aruna_compute::executor::ExecutorBackend::wait(self, &fence(attempt), cancel).await
     }
 
     async fn cancel(&self, attempt: &AttemptRef) -> Result<CancelEvidence, BackendError> {
-        aruna_compute::ExecutorBackend::cancel(self, &fence(attempt)).await
+        aruna_compute::executor::ExecutorBackend::cancel(self, &fence(attempt)).await
     }
 
     async fn fetch_logs(
@@ -129,7 +139,7 @@ impl DockerTestExt for DockerBackend {
         attempt: &AttemptRef,
         limits: &LogLimits,
     ) -> Result<LogTails, BackendError> {
-        aruna_compute::ExecutorBackend::fetch_logs(self, &fence(attempt), limits).await
+        aruna_compute::executor::ExecutorBackend::fetch_logs(self, &fence(attempt), limits).await
     }
 
     async fn fetch_output(
@@ -137,7 +147,7 @@ impl DockerTestExt for DockerBackend {
         attempt: &AttemptRef,
         path: &str,
     ) -> Result<TaskOutput, BackendError> {
-        aruna_compute::ExecutorBackend::fetch_output(self, &fence(attempt), path).await
+        aruna_compute::executor::ExecutorBackend::fetch_output(self, &fence(attempt), path).await
     }
 
     async fn list_outputs(
@@ -145,15 +155,15 @@ impl DockerTestExt for DockerBackend {
         attempt: &AttemptRef,
         pattern: &str,
     ) -> Result<Vec<String>, BackendError> {
-        aruna_compute::ExecutorBackend::list_outputs(self, &fence(attempt), pattern).await
+        aruna_compute::executor::ExecutorBackend::list_outputs(self, &fence(attempt), pattern).await
     }
 
     async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileEvidence {
-        aruna_compute::ExecutorBackend::reconcile(self, &fence(attempt)).await
+        aruna_compute::executor::ExecutorBackend::reconcile(self, &fence(attempt)).await
     }
 
     async fn cleanup(&self, attempt: &AttemptRef) -> Result<(), BackendError> {
-        aruna_compute::ExecutorBackend::cleanup(self, &fence(attempt)).await
+        aruna_compute::executor::ExecutorBackend::cleanup(self, &fence(attempt)).await
     }
 }
 
@@ -184,7 +194,7 @@ async fn daemon() -> DockerBackend {
         Ok(backend) => backend,
         Err(error) => panic!("docker backend unavailable: daemon setup failed: {error}"),
     };
-    match aruna_compute::ExecutorBackend::health(&backend).await {
+    match aruna_compute::executor::ExecutorBackend::health(&backend).await {
         Ok(()) => backend,
         Err(error) => panic!("docker backend unavailable: daemon unhealthy: {error}"),
     }

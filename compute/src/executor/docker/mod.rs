@@ -57,14 +57,14 @@ const MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 
 mod archive;
 mod control;
-mod session;
+pub mod session;
 
 use archive::{
     ArchivePlan, BuildError, UPLOAD_LIMIT, build_archive, container_path, count_limited,
     list_archive, output_spec, stream_output,
 };
 use control::{ControlGuard, ControlRecord, DaemonLock};
-pub use session::session_gateway;
+use session::session_gateway;
 
 /// Local Docker/OCI executor backend over bollard.
 pub struct DockerBackend {

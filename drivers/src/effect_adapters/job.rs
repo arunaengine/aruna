@@ -9,7 +9,7 @@ use std::io;
 use std::sync::Arc;
 
 use aruna_blob::archive::{self, EntrySpan};
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_compute::session::Session;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;

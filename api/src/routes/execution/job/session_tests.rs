@@ -5,8 +5,8 @@
 use super::*;
 use crate::auth::UnrestrictedAuth;
 use crate::tests::execution::auth_for;
-use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::{ExecutorBackend, SessionChannel};
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_compute::session::{Session, SessionConfig};
 use aruna_core::UserId;
 use aruna_core::compute::offer::BackendCaps;

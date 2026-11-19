@@ -12,7 +12,8 @@ use crate::job_calls::reserve_output_commits;
 use aruna::tasks::runner::under_lease;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
-use aruna_compute::{ExecutorBackend, ExecutorRegistry};
+use aruna_compute::executor::ExecutorBackend;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::UserId;
 use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,

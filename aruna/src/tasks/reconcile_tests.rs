@@ -6,7 +6,7 @@ use aruna_clock::unix_timestamp_millis;
 
 use super::workflow_fixtures::{execution_spec, node_id};
 use crate::tasks::runner::ComputeReconciler;
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::UserId;
 use aruna_core::structs::execution::job::{
     AttemptIntent, JobClaim, JobId, JobPayload, JobRecord, JobState,

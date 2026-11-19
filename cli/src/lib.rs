@@ -6,7 +6,7 @@ pub mod args;
 mod client;
 mod commands;
 mod config;
-mod error;
+pub mod error;
 mod output;
 mod remote;
 mod rocrate;
@@ -15,8 +15,8 @@ mod transfer;
 
 use clap::Parser;
 
-pub use args::Cli;
-pub use error::CliError;
+use args::Cli;
+use error::CliError;
 
 /// Runs one parsed command line and writes its results to `out`.
 pub async fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<(), CliError> {

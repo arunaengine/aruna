@@ -785,7 +785,7 @@ mod tests {
     struct StubBackend;
 
     #[async_trait::async_trait]
-    impl aruna_compute::ExecutorBackend for StubBackend {
+    impl aruna_compute::executor::ExecutorBackend for StubBackend {
         fn kind(&self) -> ExecutorKind {
             ExecutorKind::Docker
         }
@@ -861,7 +861,7 @@ mod tests {
     fn device_ctx(root: &str) -> DriverContext {
         DriverContext {
             compute_handle: Some(std::sync::Arc::new(
-                aruna_compute::ExecutorRegistry::new()
+                aruna_compute::registry::ExecutorRegistry::new()
                     .with_backend(std::sync::Arc::new(StubBackend)),
             )),
             ..test_ctx(root)
