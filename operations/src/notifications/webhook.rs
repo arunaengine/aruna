@@ -78,12 +78,8 @@ pub struct SetWebhookOperation {
 }
 
 impl SetWebhookOperation {
-    pub fn new(owner: UserId, local: NodeId, url: String, now_ms: u64) -> Self {
-        let secret: [u8; 32] = rand::random();
-        Self::with_secret(owner, local, url, SecretBytes::new(secret.to_vec()), now_ms)
-    }
-
-    fn with_secret(
+    /// `secret` is the new signing secret; the caller draws its random bytes.
+    pub fn new(
         owner: UserId,
         local: NodeId,
         url: String,

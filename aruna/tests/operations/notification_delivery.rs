@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use aruna::inbound::initialize_net_holder;
 use aruna::tasks::incoming::{drain_notification_outbox, start_task_queues};
+use aruna_core::compute::SecretBytes;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -744,7 +745,8 @@ impl SettingRealm {
 
     async fn set(&self, index: usize, owner: UserId, url: &str) -> TestResult<WebhookOutcome> {
         let now_ms = unix_timestamp_millis();
-        let set = SetWebhookOperation::new(owner, self.id(index), url.to_string(), now_ms);
+        let secret = SecretBytes::new(rand::random::<[u8; 32]>().to_vec());
+        let set = SetWebhookOperation::new(owner, self.id(index), url.to_string(), secret, now_ms);
         Ok(drive(set, self.context(index)).await?)
     }
 

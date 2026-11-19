@@ -21,7 +21,6 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, read_effect};
 use crate::notifications::setting_rows::{
@@ -54,7 +53,7 @@ impl From<IoError> for EmailError {
     }
 }
 
-/// One email opt-in with its ids and time.
+/// One email opt-in and its time.
 #[derive(Debug, PartialEq)]
 pub struct EmailOptIn {
     pub owner: UserId,
@@ -62,13 +61,11 @@ pub struct EmailOptIn {
     /// The trimmed address.
     pub address: String,
     pub categories: BTreeSet<String>,
-    pub write_id: Ulid,
-    pub event_id: Ulid,
     pub now_ms: u64,
 }
 
 impl EmailOptIn {
-    /// An opt-in of the trimmed `address` with new ids.
+    /// An opt-in of the trimmed `address`.
     pub fn new(
         owner: UserId,
         local: NodeId,
@@ -82,8 +79,6 @@ impl EmailOptIn {
             local,
             address,
             categories,
-            write_id: Ulid::generate(),
-            event_id: Ulid::generate(),
             now_ms,
         }
     }
@@ -107,6 +102,9 @@ type Turn = Result<Next<EmailPreference>, EmailError>;
 pub struct SetEmailOperation {
     opt_in: Option<EmailOptIn>,
     state: OptInState,
+    /// The runner's stamp and entropy, passed on to the setting write it runs inline.
+    now_ms: u64,
+    entropy: u128,
 }
 
 impl SetEmailOperation {
@@ -114,6 +112,8 @@ impl SetEmailOperation {
         Self {
             opt_in: Some(opt_in),
             state: OptInState::Config,
+            now_ms: 0,
+            entropy: 0,
         }
     }
 
@@ -159,8 +159,6 @@ impl SetEmailOperation {
         let write = SettingWrite {
             owner: opt_in.owner,
             local: opt_in.local,
-            write_id: opt_in.write_id,
-            event_id: opt_in.event_id,
             now_ms: opt_in.now_ms,
             value: SettingValue::Email {
                 categories: opt_in.categories,
@@ -168,6 +166,8 @@ impl SetEmailOperation {
             },
         };
         let mut write = Box::new(WriteSettingOperation::new(write));
+        write.stamp(self.now_ms);
+        write.seed(self.entropy);
         let turn = write.first();
         self.state = OptInState::Write(write);
         written(turn)
@@ -190,6 +190,20 @@ fn written(turn: Result<Next<Vec<u8>>, SettingError>) -> Turn {
 impl Operation for SetEmailOperation {
     type Output = EmailPreference;
     type Error = EmailError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        if let OptInState::Write(write) = &mut self.state {
+            write.stamp(now_ms);
+        }
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.entropy = entropy;
+        if let OptInState::Write(write) = &mut self.state {
+            write.seed(entropy);
+        }
+    }
 
     fn first(&mut self) -> Turn {
         let opt_in = self.opt_in.as_ref().ok_or(EmailError::NotVerified)?;
@@ -240,8 +254,6 @@ mod tests {
                 .iter()
                 .map(|category| category.to_string())
                 .collect(),
-            write_id: Ulid::from_parts(1, 1),
-            event_id: Ulid::from_parts(2, 2),
             now_ms: 1_000,
         }
     }
@@ -325,8 +337,22 @@ mod tests {
             set.next(IoResult::Values(vec![Some(row.clone().into())])),
             Ok(Next::Call(IoCall::from(Effect::Outbound(check))))
         );
+        set.stamp(5_000);
+        set.seed(42);
         assert!(matches!(set.next(address_checked(true)), Ok(Next::Call(_))));
-        assert!(matches!(set.state, OptInState::Write(_)));
+        let mut expected = WriteSettingOperation::new(SettingWrite {
+            owner: user(1, 2),
+            local: node_id(1),
+            now_ms: 1_000,
+            value: SettingValue::Email {
+                categories: ["share.upload".to_string()].into(),
+                address: Some(SecretBytes::new(b"ada@example.org".to_vec())),
+            },
+        });
+        expected.stamp(5_000);
+        expected.seed(42);
+        expected.first().unwrap();
+        assert_eq!(set.state, OptInState::Write(Box::new(expected)));
 
         let mut malformed = at_user(&["share.upload"]);
         malformed
