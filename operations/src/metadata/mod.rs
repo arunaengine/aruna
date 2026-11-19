@@ -114,7 +114,7 @@ pub use builtin::builtin_shapes;
 pub use handle::{
     MetadataHandle, MetadataHandleOptions, export_rocrate_jsonld, send_metadata_effect,
 };
-pub(crate) use message_kind::transport_message_kind;
+pub use message_kind::transport_message_kind;
 pub use protocol::{
     MetadataPathWinner, MetadataReadError, PersistentIdOutcome, PersistentIdRequest,
     PersistentIdResolution,

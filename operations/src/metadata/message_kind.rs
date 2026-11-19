@@ -5,7 +5,7 @@
 use super::protocol::MetadataTransportMessage;
 
 /// A stable label of `message` for logs and traces.
-pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'static str {
+pub fn transport_message_kind(message: &MetadataTransportMessage) -> &'static str {
     match message {
         MetadataTransportMessage::QueryGraphs { .. } => "query_graphs",
         MetadataTransportMessage::QueryResults { .. } => "query_results",
