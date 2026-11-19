@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use aruna_core::task::PullProgress;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -498,17 +500,6 @@ fn pull_fence(request: &SyncPull) -> Result<FenceRows, SyncRefusal> {
     let key = receipt_of(request)?;
     let space = SYNC_RECEIPT_KEYSPACE.to_string();
     Ok((vec![(space.clone(), key.clone(), None)], vec![(space, key)]))
-}
-
-/// The bytes of a pull that arrived so far, shared with the poll that reports them.
-#[derive(Clone, Debug, Default)]
-pub struct PullProgress(pub Arc<AtomicU64>);
-
-/// Two progress counters are the same when they count the same pull.
-impl PartialEq for PullProgress {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
 }
 
 #[derive(Debug, PartialEq)]

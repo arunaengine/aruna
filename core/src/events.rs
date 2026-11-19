@@ -1118,6 +1118,7 @@ impl Event {
                     TimerCancelled,
                     BackgroundStarted,
                     RunningHandlersAborted,
+                    Pull,
                     Error,
                 }
             ),

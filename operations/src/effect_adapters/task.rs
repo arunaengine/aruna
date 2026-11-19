@@ -40,6 +40,7 @@ fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
         | TaskEffect::ScheduleIdleTimer { key, .. }
         | TaskEffect::CancelTimer { key }
         | TaskEffect::AbortRunningHandlers { key } => Some(key.clone()),
+        TaskEffect::Pull(_) => None,
     }
 }
 
