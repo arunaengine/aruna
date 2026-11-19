@@ -702,7 +702,10 @@ pub mod test {
     };
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    };
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
@@ -712,7 +715,6 @@ pub mod test {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::RoleId;
     use aruna_core::user::id::UserId;
-    use aruna_core::{DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;

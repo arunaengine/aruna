@@ -540,11 +540,10 @@ fn should_seed_role(state: &AdminDocumentState, role_id: RoleId) -> bool {
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
-    use aruna_core::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::execution::notification::NotificationRecord;
     use aruna_core::structs::identity::auth::Actor;

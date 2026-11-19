@@ -571,6 +571,9 @@ pub mod test {
     };
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    };
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::{
         AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
@@ -583,9 +586,6 @@ pub mod test {
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::RoleId;
     use aruna_core::user::id::UserId;
-    use aruna_core::{
-        AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-    };
     use aruna_net::NetHandle;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;

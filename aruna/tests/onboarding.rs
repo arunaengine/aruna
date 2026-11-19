@@ -31,7 +31,7 @@ async fn read_user(
     match context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: aruna_core::USER_KEYSPACE.to_string(),
+            key_space: aruna_core::keyspaces::USER_KEYSPACE.to_string(),
             key: ByteView::from(user_id.to_bytes()),
             txn_id: None,
         }))

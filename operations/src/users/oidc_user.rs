@@ -11,7 +11,9 @@ use aruna_core::document::{
 };
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::keyspaces::{
+    REALM_CONFIG_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE,
+};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::{PrefixPages, values};
@@ -22,7 +24,6 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::user::id::UserId;
 use aruna_core::user::validation::EMAIL_HASH_ATTRIBUTE;
-use aruna_core::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -398,6 +399,7 @@ mod tests {
         DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
         DocumentTarget,
     };
+    use aruna_core::keyspaces::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::storage_entries::{reducer_state_key, sync_revision_key};
@@ -405,7 +407,6 @@ mod tests {
     use aruna_core::structs::identity::user::User;
     use aruna_core::types::{Key, KeySpace, Value};
     use aruna_core::user::id::UserId;
-    use aruna_core::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
     use std::collections::BTreeSet;
     use ulid::Ulid;
 
@@ -482,18 +483,18 @@ mod tests {
         assert_eq!(writes.len(), 7);
         let user_write = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == aruna_core::USER_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == aruna_core::keyspaces::USER_KEYSPACE)
             .expect("user write is included");
         let stored_user = User::from_bytes(user_write.2.as_ref()).unwrap();
         assert_eq!(stored_user, expected_user);
         assert!(
             writes
                 .iter()
-                .any(|(keyspace, _, _)| keyspace == aruna_core::SYNC_REVISION_KEYSPACE)
+                .any(|(keyspace, _, _)| keyspace == aruna_core::keyspaces::SYNC_REVISION_KEYSPACE)
         );
         let reducer_state_write = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == aruna_core::DOCUMENT_STATE_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE)
             .expect("reducer state write is included");
         assert_eq!(reducer_state_write.1, reducer_state_key(&admin_target));
         let reducer_state: AdminDocumentState =
@@ -514,7 +515,7 @@ mod tests {
 
         let outbox_records: Vec<DocumentOutboxRecord> = writes
             .iter()
-            .filter(|(keyspace, _, _)| keyspace == aruna_core::SYNC_OUTBOX_KEYSPACE)
+            .filter(|(keyspace, _, _)| keyspace == aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE)
             .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
             .collect();
         assert_eq!(outbox_records.len(), 2);
@@ -597,12 +598,12 @@ mod tests {
         assert!(
             writes
                 .iter()
-                .any(|(keyspace, _, _)| keyspace == aruna_core::USER_KEYSPACE)
+                .any(|(keyspace, _, _)| keyspace == aruna_core::keyspaces::USER_KEYSPACE)
         );
 
         let (revision_key, revision): (_, DocumentChange) = writes
             .iter()
-            .find(|(keyspace, _, _)| keyspace == aruna_core::SYNC_REVISION_KEYSPACE)
+            .find(|(keyspace, _, _)| keyspace == aruna_core::keyspaces::SYNC_REVISION_KEYSPACE)
             .map(|(_, key, value)| {
                 (
                     key,

@@ -4,11 +4,11 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::keyspaces::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::user::User;
 use aruna_core::user::id::UserId;
-use aruna_core::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
 use thiserror::Error;
 

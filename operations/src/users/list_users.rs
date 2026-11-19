@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::USER_KEYSPACE;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -229,7 +229,7 @@ mod pure_tests {
             Ok(Next::Call(IoCall::Child(_)))
         ));
         let scan = IoCall::Page {
-            space: aruna_core::USER_KEYSPACE.to_string(),
+            space: aruna_core::keyspaces::USER_KEYSPACE.to_string(),
             prefix: UserId::storage_prefix(realm_id),
             after: None,
             limit: 11,

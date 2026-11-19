@@ -11,7 +11,10 @@ use aruna_core::document::{
 };
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
-use aruna_core::keyspaces::{FEDERATION_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{
+    DOCUMENT_STATE_KEYSPACE, FEDERATION_KEYSPACE, REALM_CONFIG_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE,
+    SUBJECT_INDEX_KEYSPACE, SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
+};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -29,10 +32,6 @@ use aruna_core::user::id::UserId;
 use aruna_core::user::validation::{
     UserAttributeError, counted_attributes, is_reserved_attribute, validate_attribute_count,
     validate_attribute_key, validate_attribute_value,
-};
-use aruna_core::{
-    DOCUMENT_STATE_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
-    SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
 };
 use byteview::ByteView;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -900,7 +899,10 @@ mod pure_tests {
         DocumentSyncRevision, DocumentTarget,
     };
     use aruna_core::errors::AuthorizationError;
-    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::keyspaces::{
+        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
+    };
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::{AdminConflict, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key, sync_revision_key};
@@ -910,10 +912,6 @@ mod pure_tests {
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::{Key, KeySpace, Value};
     use aruna_core::user::id::UserId;
-    use aruna_core::{
-        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-        SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
-    };
     use byteview::ByteView;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use ulid::Ulid;
