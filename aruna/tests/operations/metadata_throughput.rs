@@ -100,7 +100,7 @@ fn convergence_gate() -> Result<(), BoxError> {
             .collect();
 
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
-        let result = wait_for_visibility(&contexts, &last, Duration::from_millis(200)).await;
+        let result = wait_for_visibility(&contexts, &last).await;
         shutdown_nodes(nodes).await;
         Ok::<(), BoxError>(result?)
     })?;
@@ -143,7 +143,7 @@ fn production_convergence_gate() -> Result<(), BoxError> {
             .map(|(group_id, document_id, _)| (*group_id, *document_id))
             .collect();
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
-        wait_for_visibility(&contexts, &pairs, Duration::from_millis(200)).await?;
+        wait_for_visibility(&contexts, &pairs).await?;
         wait_empty_queues(&contexts).await?;
         shutdown_nodes(nodes).await;
         Ok::<(), BoxError>(())
@@ -224,7 +224,7 @@ async fn churn_convergence_body() -> Result<(), BoxError> {
     let initial_pair = vec![(initial[0].0, initial[0].1)];
     {
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
-        wait_for_visibility(&contexts, &initial_pair, Duration::from_millis(200)).await?;
+        wait_for_visibility(&contexts, &initial_pair).await?;
     }
     println!("initial doc converged to all 3 nodes");
 
@@ -276,12 +276,7 @@ async fn churn_convergence_body() -> Result<(), BoxError> {
     .await?;
     println!("node 2 respawned, polling for catch-up");
 
-    let result = wait_for_visibility(
-        std::slice::from_ref(&node2.context),
-        &pairs,
-        Duration::from_millis(500),
-    )
-    .await;
+    let result = wait_for_visibility(std::slice::from_ref(&node2.context), &pairs).await;
     nodes.push(node2);
     shutdown_nodes(nodes).await;
     Ok(result?)

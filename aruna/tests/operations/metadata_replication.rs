@@ -37,6 +37,7 @@ use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, StructuredId};
 use aruna_drivers::driver::drive;
+use aruna_drivers::testing::poll_until;
 use aruna_drivers::testing::send_metadata_effect;
 use aruna_drivers::testing::send_metadata_effect;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -73,8 +74,8 @@ use crate::topology::store_realm_config;
 use crate::topology::{TestNode, spawn_replica, spawn_replica_with, wait_node_convergence};
 use convergence::wait_for_convergence;
 
-/// Retries of a write that lost a commit race to background work; 20 ms apart.
-const CONFLICT_ATTEMPTS: usize = 500;
+/// How long a write that loses commit races to background work is tried again: a hang cap.
+const CONFLICT_CAP: Duration = Duration::from_secs(120);
 
 /// Mints the held-bucket structured id a local create embeds on `node_id`.
 fn mint_local(
@@ -706,12 +707,12 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // The create's background drain may commit alongside; the write succeeds on a retry.
-    let mut updated = None;
-    for _ in 0..CONFLICT_ATTEMPTS {
+    let (first, jsonld) = (&nodes[0], &updated_jsonld);
+    let updated = poll_until(CONFLICT_CAP, move || async move {
         let outcome = drive(
             UpdateDocumentOperation::new(UpdateDocumentConfig {
                 actor: Actor {
-                    node_id: nodes[0].net.node_id(),
+                    node_id: first.net.node_id(),
                     user_id: UserId::local(Ulid::generate(), realm_id),
                     realm_id,
                 },
@@ -719,24 +720,20 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
                 document_id,
                 public: true,
                 mutation: UpdateDocumentMutation::ReplaceRoCrate {
-                    jsonld: updated_jsonld.clone(),
+                    jsonld: jsonld.clone(),
                 },
                 expected_revision: None,
             }),
-            nodes[0].context.as_ref(),
+            first.context.as_ref(),
         )
         .await;
         match outcome {
-            Err(UpdateDocumentError::StorageError(StorageError::TransactionConflict)) => {
-                sleep(Duration::from_millis(20)).await
-            }
-            outcome => {
-                updated = Some(outcome?);
-                break;
-            }
+            Err(UpdateDocumentError::StorageError(StorageError::TransactionConflict)) => None,
+            outcome => Some(outcome),
         }
-    }
-    assert!(updated.ok_or("the update kept conflicting")?.public);
+    })
+    .await;
+    assert!(updated.ok_or("the update kept conflicting")??.public);
 
     wait_metadata_state(
         &nodes,
@@ -748,33 +745,27 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let mut deleted = false;
-    for _ in 0..CONFLICT_ATTEMPTS {
+    let deleted = poll_until(CONFLICT_CAP, move || async move {
         let outcome = drive(
             DeleteDocumentOperation::new(
                 Actor {
-                    node_id: nodes[0].net.node_id(),
+                    node_id: first.net.node_id(),
                     user_id: UserId::local(Ulid::generate(), realm_id),
                     realm_id,
                 },
                 group_id,
                 document_id,
             ),
-            nodes[0].context.as_ref(),
+            first.context.as_ref(),
         )
         .await;
         match outcome {
-            Err(DeleteDocumentError::StorageError(StorageError::TransactionConflict)) => {
-                sleep(Duration::from_millis(20)).await
-            }
-            outcome => {
-                outcome?;
-                deleted = true;
-                break;
-            }
+            Err(DeleteDocumentError::StorageError(StorageError::TransactionConflict)) => None,
+            outcome => Some(outcome),
         }
-    }
-    assert!(deleted, "the delete kept conflicting");
+    })
+    .await;
+    deleted.ok_or("the delete kept conflicting")??;
 
     wait_metadata_absence(&nodes, group_id, document_id, &created.record.graph_iri).await?;
     shutdown_nodes(nodes).await;
@@ -847,7 +838,8 @@ async fn long_history() -> Result<(), Box<dyn std::error::Error>> {
 {{"@id":"https://w3id.org/aruna/{document_id}","@type":"Dataset","name":"{name}","description":"Long history","datePublished":"2026-02-01","license":{{"@id":"https://creativecommons.org/licenses/by/4.0/"}}}}]}}"#
         );
         // A burst can outrun materialization; the window opens again once it catches up.
-        loop {
+        let jsonld = &jsonld;
+        let written = poll_until(CONFLICT_CAP, move || async move {
             let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
                 actor: actor(node),
                 group_id,
@@ -871,17 +863,19 @@ async fn long_history() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => Some(Ok(())),
                 // Backpressure and write conflicts are both answered by retrying.
                 Err(
                     UpdateDocumentError::RawLimit
                     | UpdateDocumentError::StorageError(
                         aruna_core::errors::StorageError::TransactionConflict,
                     ),
-                ) => sleep(Duration::from_millis(20)).await,
-                Err(error) => return Err(error.into()),
+                ) => None,
+                Err(error) => Some(Err(error)),
             }
-        }
+        })
+        .await;
+        Ok(written.ok_or("the write kept being refused")??)
     };
     let written = std::sync::atomic::AtomicUsize::new(0);
     let history = async {

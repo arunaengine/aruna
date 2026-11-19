@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aruna_core::StructuredId;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -13,6 +13,7 @@ use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::poll_until;
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
@@ -20,7 +21,6 @@ use aruna_operations::realm::announce_presence::{
 use aruna_operations::shard::restore::RestoreTopicsOperation;
 use aruna_operations::shard::restore_plan::RESTORE_TOPIC_COUNT;
 use tempfile::TempDir;
-use tokio::time::sleep;
 use ulid::Ulid;
 
 use crate::convergence;
@@ -146,7 +146,7 @@ async fn finish_restart(
     let fresh: Vec<(GroupId, Ulid)> = fresh.into_iter().map(|(g, d, _)| (g, d)).collect();
     wait_auto_outbox(&nodes[0]).await?;
     let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|node| node.context.clone()).collect();
-    wait_for_visibility(&contexts, &fresh, Duration::from_millis(200)).await?;
+    wait_for_visibility(&contexts, &fresh).await?;
     println!("fresh write converged to all nodes after restart");
 
     shutdown_nodes(nodes).await;
@@ -1031,56 +1031,53 @@ async fn wait_outbox(
     drainer: &aruna::tasks::incoming::OutboxDrainer,
     nodes: &[TestNode],
 ) -> Result<(), BoxError> {
-    let wait_cap = HANG_CAP.saturating_mul(3);
-    let mut previous = outbox_snapshot(&nodes[0]).await?;
-    let mut deadline = Instant::now() + wait_cap;
-    loop {
-        if previous.0.is_none() && previous.1.is_none() {
-            return Ok(());
-        }
-        tokio::time::timeout(wait_cap, drainer.run_once())
-            .await
-            .map_err(|_| "outbox drain invocation stalled")?;
-        let current = outbox_snapshot(&nodes[0]).await?;
-        if current.0.is_none() && current.1.is_none() {
-            return Ok(());
-        }
-        if current != previous {
-            previous = current;
-            deadline = Instant::now() + wait_cap;
-        } else if Instant::now() >= deadline {
-            return Err(format!(
-                "outbox did not drain without progress (first: {:?}, last: {:?})",
-                current.0, current.1
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    wait_drained(&nodes[0], Some(drainer), "outbox did not drain without progress").await
 }
 
 async fn wait_auto_outbox(node: &TestNode) -> Result<(), BoxError> {
+    wait_drained(node, None, "automatic outbox drain made no progress").await
+}
+
+/// Waits until the outbox of `node` is empty, running `drainer` before each look when given.
+/// Fails only when a whole window passes without the outbox ends changing.
+async fn wait_drained(
+    node: &TestNode,
+    drainer: Option<&aruna::tasks::incoming::OutboxDrainer>,
+    stalled: &str,
+) -> Result<(), BoxError> {
     let wait_cap = HANG_CAP.saturating_mul(3);
-    let mut previous = outbox_snapshot(node).await?;
-    let mut deadline = Instant::now() + wait_cap;
+    let first = outbox_snapshot(node).await?;
+    let previous = &std::sync::Mutex::new(first);
     loop {
-        if previous.0.is_none() && previous.1.is_none() {
+        if *previous.lock().unwrap() == (None, None) {
             return Ok(());
         }
-        sleep(Duration::from_millis(50)).await;
-        let current = outbox_snapshot(node).await?;
-        if current.0.is_none() && current.1.is_none() {
-            return Ok(());
-        }
-        if current != previous {
-            previous = current;
-            deadline = Instant::now() + wait_cap;
-        } else if Instant::now() >= deadline {
-            return Err(format!(
-                "automatic outbox drain made no progress (first: {:?}, last: {:?})",
-                current.0, current.1
-            )
-            .into());
+        let seen = poll_until(wait_cap, move || async move {
+            if let Some(drainer) = drainer {
+                let run = tokio::time::timeout(wait_cap, drainer.run_once()).await;
+                if run.is_err() {
+                    return Some(Err("outbox drain invocation stalled".to_string()));
+                }
+            }
+            let current = match outbox_snapshot(node).await {
+                Ok(current) => current,
+                Err(error) => return Some(Err(error.to_string())),
+            };
+            let mut previous = previous.lock().unwrap();
+            if current == *previous {
+                return None;
+            }
+            *previous = current;
+            Some(Ok(()))
+        })
+        .await;
+        match seen {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Err(error.into()),
+            None => {
+                let last = previous.lock().unwrap().clone();
+                return Err(format!("{stalled} (first: {:?}, last: {:?})", last.0, last.1).into());
+            }
         }
     }
 }

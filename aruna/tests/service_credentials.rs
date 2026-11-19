@@ -180,7 +180,6 @@ async fn joiner_issues_credential() -> TestResult<()> {
     wait_until(
         "the issuing token to expire",
         WAIT_CAP,
-        Duration::from_millis(500),
         || async move {
             let response = reqwest::Client::new()
                 .get(group_path)
@@ -280,7 +279,6 @@ async fn account_changes_apply() -> TestResult<()> {
     wait_until(
         "the role reduction to narrow the key",
         WAIT_CAP,
-        Duration::from_millis(200),
         || async move { put(service, "shared-bucket", "late.txt").await.is_err() },
     )
     .await?;
@@ -297,7 +295,6 @@ async fn account_changes_apply() -> TestResult<()> {
     wait_until(
         "deactivation to end the key",
         WAIT_CAP,
-        Duration::from_millis(200),
         || async move { get(service, "shared-bucket", "entry.txt").await.is_err() },
     )
     .await?;

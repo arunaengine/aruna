@@ -252,7 +252,6 @@ async fn check_recovery(
         wait_until(
             "metadata fan-out recovery",
             shared::WAIT_CAP,
-            Duration::from_millis(100),
             || {
                 let seed_url = seed.base_url.clone();
                 let token = token.to_string();
