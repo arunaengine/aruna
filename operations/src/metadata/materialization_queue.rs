@@ -10,7 +10,7 @@ use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, GroupEvent, GroupResult, TaskEvent};
+use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::keyspaces::{
     DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE,
     MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
@@ -29,6 +29,7 @@ use aruna_core::storage_entries::{
     event_log_key, materialization_job_entry, materialization_job_key,
     materialization_status_entry, materialization_status_key, profile_validation_entry,
 };
+use aruna_core::task::TaskEvent;
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;

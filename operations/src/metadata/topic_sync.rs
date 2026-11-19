@@ -134,7 +134,7 @@ impl GraphSyncOperation {
 
     fn joined(&self, result: IoResult) -> Result<(), MetadataError> {
         if let NetEvent::TopicPeers(Err(error)) = net_answer(result)? {
-            debug!(graph_iri = %self.graph_iri, error = %error, "graph topic join attempt failed");
+            debug!(graph_iri = %self.graph_iri, error = ?error, "graph topic join attempt failed");
         }
         Ok(())
     }
@@ -283,7 +283,9 @@ impl GraphSyncOperation {
             }
             SyncStage::Sync => match net_answer(result)? {
                 NetEvent::TopicPeers(Ok(())) => Ok(Next::Done(())),
-                NetEvent::TopicPeers(Err(error)) => Err(MetadataError::Backend(error.to_string())),
+                NetEvent::TopicPeers(Err(error)) => {
+                    Err(MetadataError::Backend(format!("{error:?}")))
+                }
                 other => Err(unexpected(Event::Net(other).label())),
             },
             SyncStage::Wait => self.start(),
