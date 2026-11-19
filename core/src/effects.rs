@@ -967,11 +967,25 @@ pub enum ShardNetEffect {
     },
 }
 
+/// One encoded metadata peer request with the bounds its answer is read within; no shape marks
+/// a frame its operation could not read back, which is never sent.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MetadataRequestEffect {
     pub peer: NodeId,
     pub frame: Vec<u8>,
     pub timeout: Duration,
+    pub shape: Option<FrameShape>,
+}
+
+/// How one peer request travels: the frame class it is sent in, how long stream I/O and the
+/// answer may take, how large the answer frame may be, and the cap of a body read after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameShape {
+    pub class: u8,
+    pub io_wait: Duration,
+    pub answer_wait: Duration,
+    pub answer_cap: usize,
+    pub body_cap: Option<u64>,
 }
 
 /// Shows the frame size only: a frame can carry credentials or the realm key.
@@ -981,6 +995,7 @@ impl std::fmt::Debug for MetadataRequestEffect {
             .field("peer", &self.peer)
             .field("frame_bytes", &self.frame.len())
             .field("timeout", &self.timeout)
+            .field("shape", &self.shape)
             .finish()
     }
 }

@@ -12,6 +12,10 @@ rust-version.workspace = true
 # Integration tests build as one binary; declare each new tests/ file in tests/main.rs.
 autotests = false
 
+[features]
+# Test seams for integration tests; only dev-dependencies enable it.
+test-hooks = []
+
 [dependencies]
 aruna-core = { workspace = true }
 aruna-storage = { workspace = true }

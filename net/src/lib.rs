@@ -18,6 +18,7 @@ pub(crate) mod document_sync;
 mod effect_handlers;
 pub mod error;
 mod eviction;
+pub mod frames;
 mod heartbeat;
 pub mod job_control;
 pub mod notification;
@@ -131,6 +132,9 @@ struct NetInner {
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     heartbeats: Arc<heartbeat::HeartbeatTable>,
     peer_contacts: contacts::PeerContacts,
+    /// Test hook: the payload of the next answer a frame request drops as if lost.
+    #[cfg(feature = "test-hooks")]
+    dropped_answer: parking_lot::Mutex<Option<Vec<u8>>>,
     download_gauge: Arc<aruna_core::download_slots::DownloadGauge>,
     avoided_holders: aruna_core::download_slots::AvoidList,
     notification_watch_metrics: NotificationWatchMetrics,
@@ -548,6 +552,23 @@ impl NetHandle {
     /// When this node last saw each authorized peer.
     pub fn peer_contacts(&self) -> contacts::PeerContacts {
         self.inner.peer_contacts.clone()
+    }
+
+    /// Test hook: the next frame request whose answer payload is `payload` fails as if the
+    /// answer was lost after the peer acted on the request.
+    #[cfg(feature = "test-hooks")]
+    pub fn drop_answer(&self, payload: Vec<u8>) {
+        *self.inner.dropped_answer.lock() = Some(payload);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn take_dropped(&self, answer: &[u8]) -> bool {
+        let mut dropped = self.inner.dropped_answer.lock();
+        let matches = dropped.as_deref() == answer.get(1..);
+        if matches {
+            dropped.take();
+        }
+        matches
     }
 
     pub fn heartbeat_silence(&self, node: NodeId) -> Duration {
