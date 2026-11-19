@@ -453,8 +453,7 @@ impl JobsRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::jobs::import_record;
-    use crate::tests::locations::node_id;
+    use crate::testing::import_record;
     use aruna_core::jobs::JobTarget;
     use aruna_core::structs::execution::job::JobProgress;
     use ulid::Ulid;
@@ -493,7 +492,10 @@ mod tests {
         {
             let mut state = runtime.state();
             let job = state.running.get_mut(&job_id).unwrap();
-            job.view = RunningJobView::new(&import_record(job_id, node_id(7)), 42);
+            job.view = RunningJobView::new(
+                &import_record(job_id, iroh::SecretKey::from_bytes(&[7; 32]).public()),
+                42,
+            );
             job.progress = Some(reporter.clone());
         }
         let listed = runtime.running_list();

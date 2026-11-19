@@ -1,4 +1,5 @@
-//! Builds a job record that imports an RO-Crate, for the job runtime and runner tests.
+//! Builds storage-only driver contexts, a local net config, a frozen clock and an RO-Crate import
+//! job record for the driver, job runtime and node tests.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,7 +11,11 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_storage::StorageHandle;
 use ulid::Ulid;
+
+use crate::driver::DriverContext;
 
 /// An upload import into bucket `target` under `crate`, owned by a fixed user.
 pub fn import_record(job_id: JobId, node: NodeId) -> JobRecord {
@@ -45,4 +50,43 @@ pub fn import_record(job_id: JobId, node: NodeId) -> JobRecord {
         1,
         None,
     )
+}
+
+/// A driver context with storage and no other plane.
+pub fn test_context(storage: StorageHandle) -> DriverContext {
+    DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    }
+}
+
+/// A net on loopback without relays or discovery, so a test reaches no outside service. A relay
+/// connection's timers also read the real clock and spin forever under paused time.
+pub fn local_net() -> NetConfig {
+    NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback address"),
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    }
+}
+
+/// Tokio inhibits paused-clock auto-advance while a blocking task is alive.
+/// Storage and net answer from their own threads, so without this the clock
+/// races ahead of every round trip. `tokio::time::advance` still applies.
+pub struct ClockGuard {
+    _stop: std::sync::mpsc::Sender<()>,
+}
+
+pub fn freeze_clock() -> ClockGuard {
+    let (stop, wait) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        let _ = wait.recv();
+    });
+    ClockGuard { _stop: stop }
 }

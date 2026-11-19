@@ -51,7 +51,7 @@ threshold, the shared-prefix exception, term limits, and hoisting.
   under `operations/src/s3/<family>/`; routes under
   `api/src/routes/{execution,access,storage}/`; records under
   `core/src/structs/{placement,identity,storage,execution}/`; effect adapters
-  under `operations/src/effect_adapters/`. See
+  under `drivers/src/effect_adapters/`. See
   [REPO_STRUCTURE.md](REPO_STRUCTURE.md) for the full map.
 
 ### Workflow

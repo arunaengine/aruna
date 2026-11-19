@@ -14,19 +14,26 @@ autotests = false
 
 [features]
 # Test seams and shared test helpers; only dev-dependencies enable it.
-test-hooks = ["dep:tempfile", "dep:axum", "aruna-net/test-hooks"]
+test-hooks = [
+    "dep:tempfile",
+    "dep:axum",
+    "dep:aruna-drivers",
+    "dep:aruna-tasks",
+    "aruna-drivers/test-hooks",
+    "aruna-net/test-hooks",
+]
 
 [dependencies]
 axum = { workspace = true, optional = true }
 aruna-blob = { workspace = true }
-aruna-compute = { workspace = true, default-features = false }
 aruna-core = { workspace = true }
+aruna-drivers = { workspace = true, optional = true }
 aruna-graph = { workspace = true }
 aruna-plugins = { workspace = true, features = ["runtime"] }
 aruna-storage = { workspace = true }
 aruna-net = { workspace = true }
 aruna-outbound = { workspace = true }
-aruna-tasks = { workspace = true }
+aruna-tasks = { workspace = true, optional = true }
 craqle = { workspace = true }
 async-compression = { workspace = true }
 async-trait = { workspace = true }
@@ -59,7 +66,6 @@ serde_json = { workspace = true }
 smallvec = { workspace = true }
 spareval = { workspace = true }
 spargebra = { workspace = true }
-sysinfo = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
@@ -76,9 +82,12 @@ url = { workspace = true }
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+aruna-compute = { workspace = true, default-features = false }
 aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-drivers = { workspace = true, features = ["test-hooks"] }
 aruna-operations = { workspace = true, features = ["test-hooks"] }
 aruna-storage = { workspace = true, features = ["test-hooks"] }
+aruna-tasks = { workspace = true }
 axum = { workspace = true }
 flate2 = { workspace = true }
 proptest = { workspace = true }

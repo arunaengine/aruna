@@ -1,5 +1,4 @@
-//! Builds storage-only driver contexts, a local net config, raw storage reads and writes, and
-//! signed tokens for tests.
+//! Builds storage driver contexts, raw storage reads and writes, and signed tokens for tests.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -13,7 +12,6 @@ use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -22,25 +20,13 @@ use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
-use crate::driver::{DriverContext, drive};
 use crate::metadata::deletion_guard::DeletionGuardOperation;
 use crate::sync::document_outbox::{
     OutboxPagePlan, OutboxReadBatch, OutboxTailsOperation, OutboxTimerOperation, ReadOutboxPlan,
 };
 use crate::sync::reconcile::SyncTopicsOperation;
-
-/// A driver context with storage and no other plane.
-pub fn test_context(storage: StorageHandle) -> DriverContext {
-    DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    }
-}
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::test_context;
 
 /// A storage driver context with a task plane, shared behind an `Arc`.
 pub fn task_context(storage: StorageHandle) -> std::sync::Arc<DriverContext> {
@@ -53,17 +39,6 @@ pub fn task_context(storage: StorageHandle) -> std::sync::Arc<DriverContext> {
 /// A storage-only driver context on a store opened at `root`.
 pub fn path_context(root: &str) -> DriverContext {
     test_context(aruna_storage::FjallStorage::open(root).expect("open the test store"))
-}
-
-/// A net on loopback without relays or discovery, so a test reaches no outside service. A relay
-/// connection's timers also read the real clock and spin forever under paused time.
-pub fn local_net() -> NetConfig {
-    NetConfig {
-        bind_addr: "127.0.0.1:0".parse().expect("loopback address"),
-        discovery_method: DiscoveryMethod::None,
-        relay_method: RelayMethod::None,
-        ..NetConfig::default()
-    }
 }
 
 /// Writes `writes` in one batch outside a transaction; panics on any other answer.
@@ -193,7 +168,7 @@ pub async fn replay_event_log(
     let mut projected = 0usize;
     loop {
         let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
-        let (count, next) = crate::driver::drive(page, context).await?;
+        let (count, next) = aruna_drivers::driver::drive(page, context).await?;
         projected = projected.saturating_add(count);
         match next {
             Some(next) => after = Some(next),
@@ -212,7 +187,7 @@ pub async fn drain_projection_queue(
     use crate::metadata::projection::{DrainProjectionOperation, max_clock_skew};
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let drain = DrainProjectionOperation::new(local_node, max_clock_skew());
-    crate::driver::drive(drain, context).await
+    aruna_drivers::driver::drive(drain, context).await
 }
 
 /// Projects carried events.
@@ -223,7 +198,7 @@ pub async fn project_create_events(
 ) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
     use crate::metadata::projection::{ProjectEventsOperation, max_clock_skew};
     let project = ProjectEventsOperation::new(events, local_node_id, max_clock_skew());
-    crate::driver::drive(project, context).await
+    aruna_drivers::driver::drive(project, context).await
 }
 
 /// Projects logged events by their document and event ids.
@@ -234,7 +209,9 @@ pub async fn project_logged_events(
     use crate::metadata::projection::{ProjectLoggedOperation, max_clock_skew};
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let project = ProjectLoggedOperation::new(targets, false, local_node, max_clock_skew());
-    Ok(crate::driver::drive(project, context).await?.projected)
+    Ok(aruna_drivers::driver::drive(project, context)
+        .await?
+        .projected)
 }
 
 /// Projects one logged event.
@@ -254,7 +231,7 @@ pub async fn schedule_projection_drain(
     after: std::time::Duration,
 ) -> Result<(), crate::metadata::projection::MetadataProjectionError> {
     let wake = crate::metadata::projection::ProjectionWakeOperation::new(after);
-    crate::driver::drive(wake, context).await
+    aruna_drivers::driver::drive(wake, context).await
 }
 
 /// Runs one pass of the metadata materialization drain, as the drain task does.
@@ -269,7 +246,7 @@ pub async fn process_materialization_batch(
     };
     let node = crate::git::GitNode {
         ids: context.node_and_realm(),
-        routing: crate::driver::node_routing(context),
+        routing: aruna_drivers::driver::node_routing(context),
     };
     let concurrency = materialization_group_concurrency();
     let batch =
@@ -293,7 +270,7 @@ pub async fn process_prune_batch(
     crate::metadata::prune_queue::MetadataGraphError,
 > {
     let batch = crate::metadata::prune_queue::PruneBatchOperation::new(context.node_scope());
-    crate::driver::drive(batch, context).await
+    aruna_drivers::driver::drive(batch, context).await
 }
 
 /// Queues and runs the prunes for deleted graphs.
@@ -302,7 +279,7 @@ pub async fn process_graph_tombstones(
     tombstones: impl IntoIterator<Item = aruna_core::metadata::GraphLifecycleRecord>,
 ) -> crate::metadata::prune_queue::TombstoneProcessingResult {
     let tombstones = crate::metadata::prune_queue::TombstonesOperation::new(tombstones);
-    crate::driver::drive(tombstones, context)
+    aruna_drivers::driver::drive(tombstones, context)
         .await
         .unwrap_or_default()
 }
@@ -311,7 +288,8 @@ pub async fn process_graph_tombstones(
 pub async fn prune_jobs_exist(
     context: &DriverContext,
 ) -> Result<bool, crate::metadata::prune_queue::MetadataGraphError> {
-    let due = crate::driver::drive(crate::metadata::prune_queue::jobs_queued(), context).await?;
+    let due =
+        aruna_drivers::driver::drive(crate::metadata::prune_queue::jobs_queued(), context).await?;
     Ok(!due.jobs.is_empty())
 }
 
@@ -324,21 +302,6 @@ impl aruna_tasks::InboundTaskHandler for RecordingTaskHandler {
     async fn handle_timer(&self, key: aruna_core::task::TaskKey) {
         let _ = self.seen.send(key).await;
     }
-}
-
-/// Tokio inhibits paused-clock auto-advance while a blocking task is alive.
-/// Storage and net answer from their own threads, so without this the clock
-/// races ahead of every round trip. `tokio::time::advance` still applies.
-pub struct ClockGuard {
-    _stop: std::sync::mpsc::Sender<()>,
-}
-
-pub fn freeze_clock() -> ClockGuard {
-    let (stop, wait) = std::sync::mpsc::channel::<()>();
-    tokio::task::spawn_blocking(move || {
-        let _ = wait.recv();
-    });
-    ClockGuard { _stop: stop }
 }
 
 /// The graph handle a test installed on its context.
