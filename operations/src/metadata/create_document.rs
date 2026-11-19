@@ -478,7 +478,7 @@ impl CreateCommitOperation {
         holder_node_ids: Vec<NodeId>,
         placement: PlacementRef,
     ) -> MetadataRegistryRecord {
-        let now = self.phase_source.now_ms();
+        let now = self.now_ms;
         MetadataRegistryRecord {
             realm_id: self.config.actor.realm_id,
             group_id: self.config.group_id,
@@ -652,8 +652,7 @@ impl CreateCommitOperation {
         writes.push(create_acceptance_entry(&create_event)?);
         writes.push(profile_validation_entry(&status)?);
         // The accepting node journals the creation for plugins in its commit batch.
-        let now = aruna_core::time::unix_timestamp_millis();
-        let created = SourceEvent::dataset_created(&create_event, now);
+        let created = SourceEvent::dataset_created(&create_event, self.now_ms);
         writes.extend(journal_entries(&created)?);
         if let Some(message) = &self.message {
             writes.push(commit_message_entry(&create_event, message)?);
@@ -1363,23 +1362,24 @@ mod tests {
         );
     }
 
-    // The phase source is sampled when the record and event are built, not in
-    // the constructor, so a fixed source pins the whole create trace.
+    // The record and event take the runner's time and the phase source's id, so a stamp and a
+    // fixed source pin the whole create trace.
     #[test]
     fn create_source_pinned() {
         let realm_id = RealmId([43u8; 32]);
         let actor = actor(realm_id, 5);
         let document_id = Ulid::from_bytes([43; 16]);
-        let commit = CreateDocumentOperation::new(config(
+        let mut commit = CreateDocumentOperation::new(config(
             actor,
             GroupId::from_bytes([0x43; 16]),
             document_id,
         ))
         .with_phase_source(crate::metadata::MetadataPhaseSource::fixed(
-            || 1_700_000_000_000,
+            || 0,
             || Ulid::from_bytes([0x77; 16]),
         ))
         .commit_operation();
+        commit.stamp(1_700_000_000_000);
 
         let record = commit.build_record(Vec::new(), PlacementRef::NIL);
         assert_eq!(record.created_at_ms, 1_700_000_000_000);
@@ -1398,9 +1398,7 @@ mod tests {
         operation.next(validation_result(document_id)).unwrap();
         operation.conflict_recheck = true;
 
-        let mut expected = CreateDocumentOperation::new_generated_id(config);
-        // The status carries its construction time; the copy keeps the original's.
-        expected.route_profile_status = operation.route_profile_status.clone();
+        let expected = CreateDocumentOperation::new_generated_id(config);
         assert_eq!(operation.fresh_copy(), expected);
     }
 
