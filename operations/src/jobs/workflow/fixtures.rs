@@ -9,6 +9,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::compute::effect::{BackendFacts, ComputeAnswer};
 use aruna_core::compute::identity::home_digest;
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::compute::{
     ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, ExecutorKind, FenceContext, NOBODY,
     ReconcileEvidence, StagingMode,
@@ -17,7 +18,8 @@ use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobEvent, JobStops};
 use aruna_core::structs::execution::job::{
-    AttemptControl, AttemptIntent, ExecutionSpec, JobClaim, JobId, JobPayload, JobRecord,
+    AttemptControl, AttemptIntent, EffectiveResources, ExecutionSpec, JobClaim, JobId, JobPayload,
+    JobRecord,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::routing::NodeRouting;
@@ -160,6 +162,28 @@ pub(super) fn scope_of(spec: ExecutionSpec) -> Arc<AttemptScope> {
             encryption_key: None,
         },
     })
+}
+
+/// The reservation of the test job's receipted execution at `subject_generation`.
+pub(super) fn reservation(subject_generation: u64) -> JobReservationRecord {
+    JobReservationRecord {
+        execution_id: control().execution_id,
+        job_id: job(),
+        logical_job_id: job(),
+        resources: EffectiveResources {
+            cpu_cores: 1,
+            ram_bytes: 1,
+            disk_bytes: 0,
+            max_walltime_ms: 1,
+            preemptible: false,
+        },
+        created_at_ms: 1,
+        subject_generation,
+        subject_digest: [4; 32],
+        backend: "docker".to_string(),
+        config_generation: 1,
+        config_digest: [0; 32],
+    }
 }
 
 pub(super) fn scope() -> Arc<AttemptScope> {

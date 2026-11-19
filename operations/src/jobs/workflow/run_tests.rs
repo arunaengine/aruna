@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::{AttemptPhase, NOBODY};
-use aruna_core::structs::execution::job::EffectiveResources;
+use aruna_core::structs::execution::job::LocalAdmission;
 
 use super::fixtures::{
     child, claimed, compute, control, facts, is_child, job, node, prepared, realm, record,
-    scope_of, spec, status, token,
+    reservation, scope_of, spec, status, token,
 };
 use super::*;
 
@@ -34,27 +34,6 @@ fn resolve() -> ResolveBackendOperation {
 
 fn selected() -> IoResult {
     compute(ComputeAnswer::Selected(Some(facts())))
-}
-
-fn reservation(subject_generation: u64) -> JobReservationRecord {
-    JobReservationRecord {
-        execution_id: control().execution_id,
-        job_id: job(),
-        logical_job_id: job(),
-        resources: EffectiveResources {
-            cpu_cores: 1,
-            ram_bytes: 1,
-            disk_bytes: 0,
-            max_walltime_ms: 1,
-            preemptible: false,
-        },
-        created_at_ms: 1,
-        subject_generation,
-        subject_digest: [4; 32],
-        backend: "docker".to_string(),
-        config_generation: 1,
-        config_digest: [0; 32],
-    }
 }
 
 fn held(reservations: Vec<JobReservationRecord>) -> IoResult {
@@ -387,6 +366,29 @@ fn unresolved_backend_settles() {
     let error = JobError::retryable("no backend");
     let reply = child(Err::<ResolvedBackend, _>(error.clone()));
     assert_eq!(run.next(reply), Ok(failure(error, false)));
+}
+
+// A device job rechecks its admission before it resolves; a refusal settles before submit.
+#[test]
+fn device_rechecks_first() {
+    let mut device = claimed();
+    device.local_admission = Some(LocalAdmission {
+        backend: "docker".to_string(),
+        config_generation: 1,
+        config_digest: [0; 32],
+        home_digest: [0; 32],
+        subject: None,
+    });
+    let mut run = run_of(device.clone());
+    let recheck = RecheckAdmission::of_job(&device, token(), Arc::new(spec())).unwrap();
+    assert_eq!(run.first(), Ok(Next::Call(IoCall::child(recheck))));
+    let passed = run.next(child(Ok::<(), JobError>(())));
+    assert_eq!(passed, Ok(Next::Call(IoCall::child(resolve()))));
+    let mut refused = run_of(device);
+    refused.first().unwrap();
+    let error = JobError::retryable("compute backend docker is not available here");
+    let reply = child(Err::<(), _>(error.clone()));
+    assert_eq!(refused.next(reply), Ok(failure(error, false)));
 }
 
 // A lost claim stops the run before it prepares anything.

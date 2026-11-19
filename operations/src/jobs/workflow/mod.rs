@@ -55,7 +55,7 @@ use settle::{
 };
 use supervise::SuperviseOperation;
 
-use super::device_admission::session_network;
+use super::device_admission::{RecheckAdmission, session_network};
 use super::key_locks::ParkLockedOperation;
 use super::lifecycle::LifecycleError;
 use super::lifecycle::held::HeldReservations;
@@ -238,6 +238,7 @@ impl Operation for ResolveBackendOperation {
 #[derive(Debug, PartialEq)]
 enum RunStep {
     FreshCancel,
+    Recheck,
     Resolve,
     Preparing,
     Published,
@@ -379,6 +380,11 @@ impl ExecutionRunOperation {
     fn supervise(&mut self) -> RunNext {
         let supervise = SuperviseOperation::new(self.scope()?);
         self.call(RunStep::Last, IoCall::child(supervise))
+    }
+
+    fn resolve(&mut self) -> RunNext {
+        let resolve = ResolveBackendOperation::new(&*self.execution()?, self.job_id());
+        self.call(RunStep::Resolve, IoCall::child(resolve))
     }
 
     fn backend_ready(&mut self, facts: BackendFacts) -> RunNext {
@@ -571,14 +577,22 @@ impl Operation for ExecutionRunOperation {
             let end = EndRunOperation::new(self.job_id(), self.claim()?, ending, settle);
             return self.call(RunStep::Last, IoCall::child(end));
         }
-        let resolve = ResolveBackendOperation::new(&spec, self.job_id());
-        self.call(RunStep::Resolve, IoCall::child(resolve))
+        // A device job's admission is rechecked first: a backend config change, including lost
+        // session support, is retryable, and the backend may be restored.
+        if let Some(recheck) = RecheckAdmission::of_job(&self.record, self.claim()?, spec) {
+            return self.call(RunStep::Recheck, IoCall::child(recheck));
+        }
+        self.resolve()
     }
 
     fn next(&mut self, result: IoResult) -> RunNext {
         let job_id = self.job_id();
         match std::mem::replace(&mut self.step, RunStep::Last) {
             RunStep::FreshCancel => self.cancelled(result, "Fresh cancellation write failed"),
+            RunStep::Recheck => match result.child::<(), JobError>()? {
+                Ok(()) => self.resolve(),
+                Err(error) => self.pre_submit(error, false),
+            },
             // A fenced refusal is retryable: the site may come back or another target may
             // take the job.
             RunStep::Resolve => match result.child::<ResolvedBackend, JobError>()? {

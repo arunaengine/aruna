@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect, ComputeRequest};
+use aruna_core::compute::offer::ExecutorOffer;
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, FenceContext, ReconcileEvidence,
 };
@@ -28,6 +30,9 @@ use super::settle::{
     EndRunOperation, ParkAttemptOperation, RunEnding, SubmitFailureOperation, execution_result,
 };
 use super::supervise::SuperviseOperation;
+use crate::jobs::device_admission::{RecheckAdmission, backend_refusal};
+use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::store::job_calls::{
     AdoptOutcome, ReleaseOutcome, adopt_external_attempt, begin_external_running,
     handoff_external_attempt, record_attempt_started, record_attempt_tombstone, release_job,
@@ -420,8 +425,93 @@ impl Operation for SettleAdoptedOperation {
 }
 
 #[derive(Debug, PartialEq)]
+enum FenceStep {
+    Offers,
+    Held(Box<ExecutorOffer>),
+}
+
+/// The fences a start applies, before recovery creates or starts work again: the config digest
+/// a receipt was accepted under, then the rules the backend admits work by.
+#[derive(Debug, PartialEq)]
+pub struct RecoveryFence {
+    job_id: JobId,
+    backend: String,
+    spec: Arc<ExecutionSpec>,
+    step: FenceStep,
+}
+
+impl RecoveryFence {
+    pub fn new(scope: &AttemptScope) -> Self {
+        Self {
+            job_id: scope.job_id,
+            backend: scope.backend.clone(),
+            spec: scope.spec.clone(),
+            step: FenceStep::Offers,
+        }
+    }
+
+    fn held(&self, offer: &ExecutorOffer, held: Vec<JobReservationRecord>) -> Result<(), JobError> {
+        let name = &self.backend;
+        if let Some(stored) = held.first()
+            && stored.config_digest != offer.config_digest()
+        {
+            let stored = stored.config_generation;
+            return Err(JobError::retryable(format!(
+                "compute backend {name} changed its config since the receipt (stored generation {stored})"
+            )));
+        }
+        match backend_refusal(offer, &self.spec) {
+            Some(verdict) => Err(JobError::retryable(format!(
+                "compute backend {name} no longer takes the job: {}",
+                verdict.reason()
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Operation for RecoveryFence {
+    type Output = ();
+    type Error = JobError;
+
+    fn first(&mut self) -> Result<Next<()>, JobError> {
+        Ok(Next::Call(compute_call(ComputeEffect::Offers)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, JobError> {
+        let retryable = |error: String| JobError::retryable(error);
+        match std::mem::replace(&mut self.step, FenceStep::Offers) {
+            FenceStep::Offers => {
+                let answer =
+                    compute_answer(result).map_err(|error| retryable(error.to_string()))?;
+                let ComputeAnswer::Offers(offers) = answer else {
+                    return Err(retryable("no compute backend configured".to_string()));
+                };
+                let name = &self.backend;
+                let Some(offer) = offers.into_iter().find(|offer| offer.name() == name) else {
+                    return Err(retryable(format!(
+                        "compute backend {name} is not available here"
+                    )));
+                };
+                self.step = FenceStep::Held(Box::new(offer));
+                let held = HeldReservations::of_job(self.job_id);
+                Ok(Next::Call(IoCall::child(held)))
+            }
+            FenceStep::Held(offer) => {
+                let held = result.child::<Vec<JobReservationRecord>, LifecycleError>();
+                let held = held.map_err(|error| retryable(error.to_string()))?;
+                let held = held.map_err(|error| retryable(error.to_string()))?;
+                self.held(&offer, held)?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 enum ResumeStep {
     Current,
+    Fence,
     Prepare,
     Submit,
     Started(Box<AttemptStatus>),
@@ -486,6 +576,16 @@ impl ResumeAttemptOperation {
         let settle = scope.settle(self.now_ms);
         let end = EndRunOperation::new(scope.job_id, scope.token, ending, settle);
         self.call(ResumeStep::Last, IoCall::child(end))
+    }
+
+    /// Recovery may create or start work, so the backend must still take it.
+    fn fence(&mut self, current: &JobRecord) -> ResumeNext {
+        let scope = &self.scope;
+        let call = match RecheckAdmission::of_job(current, scope.token, scope.spec.clone()) {
+            Some(recheck) => IoCall::child(recheck),
+            None => IoCall::child(RecoveryFence::new(scope)),
+        };
+        self.call(ResumeStep::Fence, call)
     }
 
     fn prepare(&mut self) -> ResumeNext {
@@ -558,12 +658,21 @@ impl Operation for ResumeAttemptOperation {
         match std::mem::replace(&mut self.step, ResumeStep::Last) {
             ResumeStep::Current => match result.child::<Option<JobRecord>, JobMutationError>()? {
                 Ok(Some(current)) if current.cancel_requested => self.cancel(),
-                Ok(Some(_)) if matches!(self.phase, AttemptPhase::Submitted) => self.prepare(),
+                Ok(Some(current)) if matches!(self.phase, AttemptPhase::Submitted) => {
+                    self.fence(&current)
+                }
                 Ok(Some(_)) => self.supervise(),
                 Ok(None) => Ok(Next::Done(())),
                 Err(error) => {
                     warn!(job_id = %job_id, error = %error, "Recovered job lookup failed");
                     Ok(Next::Done(()))
+                }
+            },
+            ResumeStep::Fence => match result.child::<(), JobError>()? {
+                Ok(()) => self.prepare(),
+                Err(error) => {
+                    warn!(job_id = %job_id, error = %error.message, "Recovery refused by its backend");
+                    self.park(error)
                 }
             },
             ResumeStep::Prepare => match result.child::<PreparedTask, JobError>()? {
