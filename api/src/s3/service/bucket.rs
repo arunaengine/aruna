@@ -7,6 +7,7 @@ use super::object::restrictions_reach;
 use crate::s3::auth::map_authorize_error;
 use crate::s3::error::IntoS3Error;
 use crate::s3::scope::resolve_scope;
+use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::metadata::AuthToken;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -26,7 +27,6 @@ use aruna_operations::replication::sync_relationship::{
     DeleteRelationshipOperation, ListRelationshipsOperation, StoreRelationshipOperation,
     SyncRelationshipDirection,
 };
-use aruna_operations::s3::bucket::get::GetBucketOperation;
 use s3s::dto::{
     DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
     ReplicationRule, ReplicationRuleStatus,

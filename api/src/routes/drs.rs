@@ -11,6 +11,7 @@ use crate::rate_limit::LocalKey;
 use crate::server::state::{RestInterfaceRuntime, ServerState};
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::holder_choice::{HolderChoiceOperation, pick};
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::replication_protocol::LocationSummaryRequest;
@@ -32,7 +33,6 @@ use aruna_operations::distribution::ticket::{
 };
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::body::Body;

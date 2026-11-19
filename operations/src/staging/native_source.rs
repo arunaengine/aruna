@@ -34,13 +34,13 @@ use crate::replication::mirror_repair::{
 use crate::replication::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
 };
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::request_policy::PolicyRequestExtras;
 
 /// This node and its realm.

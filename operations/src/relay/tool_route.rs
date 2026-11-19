@@ -23,7 +23,7 @@ use crate::distribution::routing::route_read;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::bucket_search::search_buckets_distributed;
 use crate::metadata::api::search_types::{BucketSearchExecution, BucketSearchRequest};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 const SEARCH_PAGE: usize = 50;
 /// How long finding the node that holds a bucket may take, every search page included.

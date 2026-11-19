@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::jobs::staging::pure_tests::{child_answer, test_bucket, test_run};
-use crate::s3::bucket::get::GetBucketError;
+use aruna_core::bucket_read::GetBucketError;
 
 fn paths() -> (String, String) {
     ("src/a".to_string(), "copy/a".to_string())

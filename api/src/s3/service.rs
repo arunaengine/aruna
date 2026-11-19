@@ -72,6 +72,7 @@ use crate::s3::util::{
 };
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
+use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::compute::session::{SessionRequest, TouchedObject};
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::stream::BackendStream;
@@ -106,7 +107,6 @@ use aruna_operations::replication::sync_relationship::{
 use aruna_operations::s3::bucket::cors::{DeleteCorsOperation, GetCorsOperation, PutCorsOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_operations::s3::bucket::list::{ListBucketsInput as LBI, ListBucketsOperation};
 use aruna_operations::s3::multipart::abort::{AbortUploadInput as AMUI, AbortUploadOperation};
 use aruna_operations::s3::multipart::complete::{

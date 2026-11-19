@@ -31,9 +31,9 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::backends::query::{GetBackendOperation, GroupQueryError};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::imports::folders::shares_folder;
 use crate::s3::imports::shared::SharedRule;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::jobs::JobRunOutcome;
 
 /// Rule rows one page of the group's rules reads.

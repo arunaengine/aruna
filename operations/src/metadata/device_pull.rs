@@ -49,7 +49,6 @@ use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation, QueueLiveOperation};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::queue::LiveVersionInput;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::write_guard::{BucketGuardError, BucketGuardOperation};
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
@@ -61,6 +60,7 @@ use crate::s3::object::versions::{
     ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
     ListVersionsResult,
 };
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, encode_message, peer_call, peer_reply,
 };

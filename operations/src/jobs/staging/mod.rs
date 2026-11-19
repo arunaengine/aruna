@@ -32,7 +32,7 @@ use ulid::Ulid;
 pub use self::job::StagingJobOperation;
 use super::run_rows::SettledRowsOperation;
 use super::store::mutation_error::JobMutationError;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 /// Queue rows one cleanup pass deletes.
 const QUEUE_CLEANUP_PAGE: usize = 256;

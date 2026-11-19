@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::checksum::checksum_mismatch_error;
+use aruna_core::bucket_read::GetBucketError;
 use aruna_core::errors::{
     BlobError, ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
@@ -19,7 +20,6 @@ use aruna_operations::placement::policy::PolicyGateError;
 use aruna_operations::s3::bucket::cors::{DeleteCorsError, GetCorsError, PutCorsError};
 use aruna_operations::s3::bucket::create::CreateBucketError;
 use aruna_operations::s3::bucket::delete::DeleteBucketError;
-use aruna_operations::s3::bucket::get::GetBucketError;
 use aruna_operations::s3::bucket::list::ListBucketsError;
 use aruna_operations::s3::imports::ImportRuleError;
 use aruna_operations::s3::multipart::abort::AbortUploadError;

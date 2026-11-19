@@ -35,7 +35,6 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::blob::pause::{PauseError, PausePurgeOperation, PausedOperation};
 use crate::blob::purge::{PlanFilesOperation, PurgeFilesError, StorageFile, StorageFilesOperation};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::BucketScope;
 use crate::s3::fence_store::AcquireFenceOperation;
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
@@ -52,6 +51,7 @@ use crate::s3::object::versions::{
     ListVersionsResult,
 };
 use crate::s3::purge_fence::PurgeFenceError;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::request_policy::PolicyRequestExtras;
 

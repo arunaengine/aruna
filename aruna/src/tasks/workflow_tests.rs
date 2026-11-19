@@ -9,6 +9,7 @@ use aruna_compute::ExecutorBackend;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::session::{Session, SessionConfig};
 use aruna_core::UserId;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::compute::session::EndReason;
 use aruna_core::compute::{
     AdoptableEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence,
@@ -42,7 +43,6 @@ use aruna_operations::jobs::workflow::settle::{ParkAttemptOperation, SettleScope
 use aruna_operations::jobs::workflow::supervise::{SuperviseOperation, WalltimeAnchorOperation};
 use aruna_operations::jobs::workflow::*;
 use aruna_operations::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use aruna_test_support::jobs::{

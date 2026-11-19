@@ -50,7 +50,6 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::list::{
     ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
 };
@@ -58,6 +57,7 @@ use crate::s3::object::origin::{OriginError, OriginView, ReadOriginOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::request_policy::PolicyRequestExtras;
 

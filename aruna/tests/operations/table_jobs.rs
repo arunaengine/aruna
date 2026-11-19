@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::lane_jobs::run_staging_job;
+use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::execution::table::SEARCH_EXACT_KEY;
 use aruna_core::structs::storage::origin::VersionOrigin;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_test_support::staging::{
     COLI, Fixture, HUMAN, STRUCTURE, Site, serve, summary_table, write_object,
 };

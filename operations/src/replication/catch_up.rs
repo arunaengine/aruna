@@ -33,7 +33,7 @@ use super::queue::BlobQueueError;
 use crate::distribution::lifecycle::SettleMarkerOperation;
 use crate::distribution::purge_steps::PurgeError;
 use crate::distribution::submit::SubmitOperation;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::storage::distribution::request::PublishRefusal;
 use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
 

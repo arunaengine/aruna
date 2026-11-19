@@ -5,8 +5,8 @@
 use super::*;
 use crate::document_repository::GetConfigError;
 use crate::metadata::api::MetadataApiError;
-use crate::s3::bucket::get::GetBucketError;
 use crate::tests::calls::{caller_of, child, node, runs_child};
+use aruna_core::bucket_read::GetBucketError;
 use aruna_core::metadata::protocol::MetadataPathCandidate;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;

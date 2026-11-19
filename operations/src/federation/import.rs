@@ -39,7 +39,7 @@ use crate::federation::access::{AccessCheckOperation, access_granted};
 use crate::federation::records::{
     ImportRecord, RecordChange, RecordError, RecordOutcome, StaleUpload, change_call,
 };
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::request_policy::PolicyRequestExtras;
 
 const IMPORT_OPERATION: &str = "federation.import";

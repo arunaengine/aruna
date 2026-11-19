@@ -109,7 +109,7 @@ async fn content_page_bounded() {
 fn spent_deadline_stops() {
     // Members are asked only while the runner clock is before the deadline.
     use super::{AskSetOperation, SetAnswer};
-    use crate::s3::bucket::get::GetBucketError;
+    use aruna_core::bucket_read::GetBucketError;
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;

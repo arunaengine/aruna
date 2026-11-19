@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::release::MembershipQuery;
 use aruna_drivers::driver::drive;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_operations::s3::bucket::release::BucketScope;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use aruna_operations::s3::object::delete::pinned::{

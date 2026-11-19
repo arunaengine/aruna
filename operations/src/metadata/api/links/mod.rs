@@ -37,7 +37,7 @@ use super::{
 };
 use crate::metadata::forward::write::read_error;
 use crate::metadata::object_version::{ObjectVersion, ObjectVersionError, ObjectVersionOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 
 /// The output of a local link child; its API error reads as the node's read error.

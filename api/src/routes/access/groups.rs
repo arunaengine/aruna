@@ -14,6 +14,7 @@ use crate::routes::plugin_installs::{refuse_plugin_account, refuse_plugin_role};
 use crate::routes::storage::objects::object_page;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -49,7 +50,6 @@ use aruna_operations::groups::update_group::{
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use aruna_operations::metadata::stats::GroupPurposeOperation;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};

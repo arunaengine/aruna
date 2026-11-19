@@ -42,7 +42,6 @@ use ulid::Ulid;
 use super::feed_walks::split_key;
 use super::imports::{jobs_key, resume_prefix};
 use super::inventory::{Walk, route};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
@@ -52,6 +51,7 @@ use crate::s3::object::versions::{
     ListVersionsResult,
 };
 use crate::s3::usage::{MarkDirtyError, MarkDirtyOperation, dirty_rows};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 /// Inventory rows one page purges at most.
 const PAGE_ROWS: usize = 64;

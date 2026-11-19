@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aruna_blob::blob::BlobHandler;
+use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, NODE_INFO_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
@@ -30,7 +31,6 @@ use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::distribution::admit::{AdmitConfig, AdmitOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;

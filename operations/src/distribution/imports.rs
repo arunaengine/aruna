@@ -33,7 +33,7 @@ use crate::connectors::list_connectors::{
     ListSourceError, ListSourceInput, ListSourceOperation, ListSourceResult,
 };
 use crate::forward::transport::{peer_answer, peer_call};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use aruna_core::staging_checkpoint::{ReadCheckpointOperation, handed_checkpoint};
 

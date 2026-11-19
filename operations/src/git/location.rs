@@ -28,7 +28,7 @@ use super::state::reduce;
 use super::{GitError, records};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::git_state::Ancestry;
 use aruna_core::request_policy::PolicyRequestExtras;
 

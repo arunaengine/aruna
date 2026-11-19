@@ -302,7 +302,7 @@ mod tests {
     use super::*;
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
-    use crate::s3::bucket::get::GetBucketOperation;
+    use aruna_core::bucket_read::GetBucketOperation;
     use aruna_core::jobs::ProgressReporter;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::jobs::context::JobContext;

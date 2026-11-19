@@ -23,9 +23,9 @@ use super::host_steps::{Granted, GrantedCall};
 use super::marks::{MARKED, is_marked};
 use super::rows::{StoreError, mapped_child};
 use super::unavailable;
-use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_core::bucket_read::GetBucketOperation;
 
 /// Whether a head found no such object or version.
 pub fn absent(error: &HeadObjectError) -> bool {
