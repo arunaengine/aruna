@@ -410,6 +410,13 @@ impl From<IoError> for UploadClaimError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitJobResult {
+    pub job_id: JobId,
+    /// `false` when a job with the same `dedup_key` already existed.
+    pub created: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::structs::execution::job::ComputeResources;

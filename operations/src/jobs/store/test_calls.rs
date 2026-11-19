@@ -622,7 +622,7 @@ pub async fn submit_execution_job(
     workspace_bucket: Option<String>,
     retention_ms: u64,
     active_cap: Option<u32>,
-) -> Result<crate::jobs::submit::SubmitJobResult, aruna_core::job_request::SubmitJobError> {
+) -> Result<aruna_core::job_request::SubmitJobResult, aruna_core::job_request::SubmitJobError> {
     use crate::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
     let submission = ExecutionSubmission {
         spec,

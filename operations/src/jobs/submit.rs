@@ -30,7 +30,7 @@ use tracing::warn;
 use super::import::upload::claim_upload;
 use crate::harvest::repository::source_key;
 use crate::s3::imports::cron::is_running;
-use aruna_core::job_request::{SubmitJobError, UploadClaimError};
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult, UploadClaimError};
 use aruna_core::structs::execution::job::upload_key;
 use aruna_core::structs::execution::job::{dedup_index_key, job_insert_entries};
 
@@ -55,13 +55,6 @@ pub struct SubmitJobSpec {
     /// Unfinished jobs of this user this node admits, counted in the admitting
     /// transaction. `None` leaves the payload's own limit in charge.
     pub active_cap: Option<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubmitJobResult {
-    pub job_id: JobId,
-    /// `false` when a job with the same `dedup_key` already existed.
-    pub created: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

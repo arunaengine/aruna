@@ -19,13 +19,12 @@ use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::store::list_jobs::{ListJobsError, ListJobsOperation};
-use crate::jobs::submit::SubmitJobResult;
 use crate::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use aruna_core::job_request::SubmitJobError;
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 
 /// Unfinished runs one status scan counts before it stops. A device queues its
 /// owner's work, not a realm's, so the count is bounded instead of paged.

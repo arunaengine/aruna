@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
-use aruna_core::job_request::SubmitJobError;
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::protocol::{PersistentIdRequest, PersistentIdResolution};
 use aruna_core::request_policy::PolicyRequestExtras;
@@ -16,7 +16,6 @@ use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_operations::jobs::submit::SubmitJobResult;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export_types::GetVisibleRequest;
 use aruna_operations::metadata::forward::authorized_create::CreateAuthorizedError;

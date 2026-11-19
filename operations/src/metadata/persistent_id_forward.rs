@@ -31,7 +31,6 @@ use crate::forward::authorize::forward_auth_error;
 use crate::forward::authorize::write_check;
 use crate::forward::routing::{ForwardHoldersOperation, HolderWriteError};
 use crate::forward::transport::reject;
-use crate::jobs::submit::SubmitJobResult;
 use crate::jobs::submit_local::SubmitLocalOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::readable::RecordReadableOperation;
@@ -43,7 +42,7 @@ use crate::metadata::pid_transition::PidTransition;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::StorageReadError;
 use crate::realm::load_config::config_unavailable;
-use aruna_core::job_request::SubmitJobError;
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, PersistentIdOutcome, PersistentIdRequest,
     PersistentIdResolution,
