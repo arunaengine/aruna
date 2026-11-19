@@ -391,51 +391,10 @@ pub(crate) async fn relay_get<T: DeserializeOwned>(
         timed: true,
         any_status: false,
     };
-    sent.insert(RELAY_HOP_HEADER, hop);
-    sent.insert(RELAY_SET_HEADER, set);
-    get_node(state, forward.node_id, path, bearer, sent).await
-}
-
-/// Sends a GET of `path` with the caller's token, if any, and `sent` headers to `node_id`;
-/// `None` when it did not answer.
-pub(crate) async fn get_node(
-    state: &ServerState,
-    node_id: NodeId,
-    path: &str,
-    bearer: Option<&ValidatedBearer>,
-    sent: HeaderMap,
-) -> ServerResult<Option<reqwest::Response>> {
-    let urls = drive(NodeUrlsOperation::new(node_id), state.get_ctx().as_ref())
-        .await
-        .ok()
-        .flatten();
-    let Some(base) = urls.and_then(|urls| urls.api) else {
-        return Ok(None);
-    };
-    let mut request = CLIENT.get(relay_url(&base, path)).headers(sent);
-    // Without a token the target answers as for any signed-out caller.
-    if let Some(bearer) = bearer {
-        request = request.header(header::AUTHORIZATION, format!("Bearer {}", bearer.as_str()));
-    }
-    let response = request.send();
-    match tokio::time::timeout(ANSWER_TIMEOUT, response).await {
-        Ok(Ok(response)) => Ok(Some(response)),
-        Err(_) => {
-            warn!(
-                node_id = %node_id,
-                "A node did not start answering a relayed read in time"
-            );
-            Ok(None)
-        }
-        Ok(Err(error)) => {
-            warn!(
-                node_id = %node_id,
-                connect = error.is_connect(),
-                error = %error,
-                "A node did not take a relayed read"
-            );
-            Ok(None)
-        }
+    match call_node(state, call).await? {
+        RestAnswer::Body(body) => Ok(Some(decoded(state, body).await?.1)),
+        RestAnswer::Refused { status, body } => Err(refusal_of(forward, status, &body)),
+        RestAnswer::Silent => Ok(None),
     }
 }
 
@@ -449,20 +408,28 @@ pub(crate) async fn node_read<T: DeserializeOwned>(
     deadline: tokio::time::Instant,
 ) -> ServerResult<T> {
     let silent = || ServerError::ServiceUnavailableReason(format!("node {node_id} did not answer"));
-    let mut sent = HeaderMap::new();
-    let named = HeaderValue::try_from(node_id.to_string())
-        .map_err(|error| ServerError::InternalError(error.into()))?;
-    sent.insert(RELAY_NODE_HEADER, named);
     let forward = RestForward {
         set_id: Ulid::nil(),
         range_id: Ulid::nil(),
         node_id,
     };
+    let call = RestCall {
+        node_id,
+        path: path.to_string(),
+        bearer: bearer_secret(bearer),
+        relay: None,
+        headers: vec![(RELAY_NODE_HEADER.to_string(), node_id.to_string())],
+        json: None,
+        timed: true,
+        any_status: false,
+    };
     // The deadline covers the answer's body too, not only the connection.
     let read = async {
-        let response = get_node(state, node_id, path, bearer, sent).await?;
-        let response = response.ok_or_else(silent)?;
-        Ok(answer(&forward, response).await?.1)
+        match call_node(state, call).await? {
+            RestAnswer::Body(body) => Ok(decoded(state, body).await?.1),
+            RestAnswer::Refused { status, body } => Err(refusal_of(&forward, status, &body)),
+            RestAnswer::Silent => Err(silent()),
+        }
     };
     tokio::time::timeout_at(deadline, read)
         .await
