@@ -825,6 +825,10 @@ impl Operation for ServeEvents {
     type Output = Decisions;
     type Error = MetadataReadError;
 
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
+
     fn first(&mut self) -> Result<Next<Decisions>, MetadataReadError> {
         let read = GetConfigOperation::new(self.node.0);
         Ok(Next::Call(IoCall::child(read)))

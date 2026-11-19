@@ -206,7 +206,7 @@ mod operations {
     #[test]
     fn store_checks_peer() {
         let mut stranger = ServeStore::new(serving(1), node(3), stored_chunk(), 5);
-        assert_eq!(stranger.hold_scope(), None);
+        assert_eq!(stranger.hold_scope(), Some(HoldScope::PluginCopies));
         assert!(is_child(&stranger.first()));
         let refused = stranger.next(config_result(realm_config()));
         assert_eq!(refused, Err(MetadataReadError::Forbidden));

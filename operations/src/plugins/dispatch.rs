@@ -10,7 +10,7 @@ use std::time::Instant;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::injection::verify_request;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall};
 use aruna_core::plugin_runs::{HookRequest, MAX_INPUT, PluginRun, RunTrigger};
 use aruna_core::plugins::{ReleaseRequest, Released};
@@ -146,6 +146,10 @@ impl Operation for StartRun {
     type Output = PluginRun;
     type Error = StartError;
 
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
+
     fn first(&mut self) -> Result<Next<PluginRun>, StartError> {
         let read = GetConfigOperation::new(self.realm_id);
         Ok(Next::Call(IoCall::child(read)))
@@ -216,6 +220,10 @@ impl EnqueueTimers {
 impl Operation for EnqueueTimers {
     type Output = usize;
     type Error = StoreError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
 
     fn first(&mut self) -> Result<Next<usize>, StoreError> {
         Ok(self.advance())

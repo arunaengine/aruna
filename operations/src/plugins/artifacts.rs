@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, VecDeque};
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugins::{ArtifactBytes, Chunk, PublishedPlugin};
 use aruna_core::realm_vault::FetchScope;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -305,6 +305,10 @@ impl ServeStore {
 impl Operation for ServeStore {
     type Output = bool;
     type Error = MetadataReadError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginCopies)
+    }
 
     fn first(&mut self) -> Result<Next<bool>, MetadataReadError> {
         let read = GetConfigOperation::new(self.node.0);

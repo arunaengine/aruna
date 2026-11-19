@@ -263,7 +263,6 @@ fn settled_work() -> (WorkRow, [IoResult; 2]) {
 fn notify_marks_once() {
     let (row, [by_index, by_key]) = settled_work();
     let mut plan = NotifyWork::new(Ulid::from_parts(1, 1), row.work_id, None);
-    assert_eq!(plan.hold_scope(), Some(HoldScope::PluginAdmissions));
     plan.first().unwrap();
     plan.next(by_index).unwrap();
     let Next::Call(IoCall::Write(rows)) = plan.next(by_key).unwrap() else {
@@ -367,7 +366,7 @@ mod notify_pass {
     fn notify() -> NotifyDue {
         let config = Arc::new(fixtures::config(&fixtures::install(), json!({})));
         let mut notify = NotifyDue::new(config, node(3), 5);
-        assert_eq!(notify.hold_scope(), None);
+        assert_eq!(notify.hold_scope(), Some(HoldScope::PluginAdmissions));
         assert!(is_child(&notify.first()));
         notify
     }

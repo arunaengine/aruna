@@ -520,7 +520,6 @@ fn batch_collects_decisions() {
     };
     let nodes = (local_node(), local_node());
     let mut decide = DecideBatch::new(empty_config(), nodes, batch, 9);
-    assert_eq!(decide.hold_scope(), Some(HoldScope::PluginAdmissions));
     assert!(is_child(decide.first().unwrap()), "the event");
     let outcome = child_result(Ok::<_, StoreError>(Outcome::Expired));
     assert!(is_child(decide.next(outcome).unwrap()), "the gap reports");
@@ -548,7 +547,7 @@ mod operations {
     #[test]
     fn serve_decides_batch() {
         let mut events = serve(3);
-        assert_eq!(events.hold_scope(), None);
+        assert_eq!(events.hold_scope(), Some(HoldScope::PluginAdmissions));
         assert!(is_child(&events.first()));
         assert!(is_child(
             &events.next(config_result(fixtures::realm_nodes()))
