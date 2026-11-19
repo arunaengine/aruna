@@ -206,3 +206,17 @@ fn join_refuses_oversize() {
     let refused = join_rows(&plan, rows, Vec::new(), &Default::default());
     assert!(matches!(refused, Err(MergeError::Refused(_))));
 }
+
+#[test]
+fn plan_names_sides() {
+    // A bounded join answers its side queries; any other query has none.
+    let sides = join_plan(JOIN_QUERY).map(|plan| plan.sides);
+    let planned = |query: &str| {
+        let job = MergeJob::Plan {
+            query: query.to_string(),
+        };
+        merge(job, &Default::default())
+    };
+    assert_eq!(planned(JOIN_QUERY), Ok(MergeOutput::Sides(sides)));
+    assert_eq!(planned(ORDERED), Ok(MergeOutput::Sides(None)));
+}

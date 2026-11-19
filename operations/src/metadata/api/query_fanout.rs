@@ -329,6 +329,7 @@ fn execution(results: MetadataQueryResults, fanout_stats: MetadataFanoutStats) -
 #[derive(Debug, PartialEq)]
 enum DistributedStage {
     Start,
+    Plan,
     Join,
     Joined(MetadataFanoutStats),
     Cache,
@@ -444,10 +445,22 @@ impl DistributedQueryOperation {
         self.mode() == ApiQueryMode::Local || self.graph_iris.is_some()
     }
 
+    // The graph store plans the bounded join, which answers with its two side queries.
     fn join(&mut self) -> Result<Next<QueryAnswer>, MetadataApiError> {
-        let plan =
-            aruna_graph::merge::join_plan(&self.query).ok_or(MetadataApiError::BadRequest)?;
-        let members = (plan.sides.iter())
+        self.stage = DistributedStage::Plan;
+        let plan = MergeJob::Plan {
+            query: self.query.clone(),
+        };
+        Ok(Next::Call(merge_call(plan, self.remaining())))
+    }
+
+    fn planned(&mut self, result: IoResult) -> Result<Next<QueryAnswer>, MetadataApiError> {
+        let sides = match merged(result).map_err(merge_error)? {
+            MergeOutput::Sides(Some(sides)) => sides,
+            MergeOutput::Sides(None) => return Err(MetadataApiError::BadRequest),
+            _ => return Err(MetadataApiError::ServiceUnavailable),
+        };
+        let members = (sides.iter())
             .map(|side| {
                 let query = Self::new(
                     (self.realm_id, self.local_node),
@@ -650,10 +663,13 @@ impl Operation for DistributedQueryOperation {
             DistributedStage::Start => {
                 Err(MetadataApiError::Internal("query not started".to_string()))
             }
+            DistributedStage::Plan => self.planned(result),
             DistributedStage::Join => self.sides_answered(result),
             DistributedStage::Joined(stats) => match merged(result).map_err(merge_error)? {
                 MergeOutput::Rows(rows) => Ok(Next::Done(execution(rows, stats))),
-                MergeOutput::Tied(_) => Err(MetadataApiError::ServiceUnavailable),
+                MergeOutput::Tied(_) | MergeOutput::Sides(_) => {
+                    Err(MetadataApiError::ServiceUnavailable)
+                }
             },
             DistributedStage::Cache => self.cache_read(result),
             DistributedStage::Fanout => {

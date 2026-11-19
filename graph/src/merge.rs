@@ -91,6 +91,9 @@ pub fn merge(
             let order = order_of(&partition)?;
             tied_rows(&rows, &order, cancel).map(MergeOutput::Tied)
         }
+        MergeJob::Plan { query } => {
+            Ok(MergeOutput::Sides(join_plan(&query).map(|plan| plan.sides)))
+        }
         MergeJob::Join { query, left, right } => {
             let plan = join_plan(&query)
                 .ok_or_else(|| MergeError::Failed("the query is no bounded join".to_string()))?;

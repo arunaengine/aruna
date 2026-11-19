@@ -139,6 +139,14 @@ impl GraphHandle {
                     },
                 };
             }
+            // A join plan only parses the query, so it skips the merge pool and its wait.
+            MetadataEffect::MergeRows {
+                job: job @ aruna_core::metadata::MergeJob::Plan { .. },
+                ..
+            } => {
+                let result = crate::merge::merge(job, &Default::default());
+                return MetadataEvent::RowsMerged { result };
+            }
             MetadataEffect::MergeRows { job, budget } => {
                 let result = crate::merge::run_merge(job, budget).await;
                 return MetadataEvent::RowsMerged { result };

@@ -202,7 +202,22 @@ fn merge_refusal_maps() {
 #[test]
 fn join_runs_sides() {
     let mut query = query(ApiQueryMode::Distributed, JOIN_QUERY, None);
-    let Ok(Next::Call(IoCall::Group(group))) = query.first() else {
+    let MetadataEffect::MergeRows {
+        job: MergeJob::Plan { query: planned },
+        ..
+    } = effect(query.first())
+    else {
+        panic!("expected the join plan first");
+    };
+    assert_eq!(planned, JOIN_QUERY);
+    let sides = [
+        "SELECT ?a WHERE { ?a ?b ?c }",
+        "SELECT ?a WHERE { ?a ?d ?e }",
+    ];
+    let plan = MetadataEvent::RowsMerged {
+        result: Ok(MergeOutput::Sides(Some(sides.map(str::to_string)))),
+    };
+    let Ok(Next::Call(IoCall::Group(group))) = query.next(metadata(plan)) else {
         panic!("expected both sides at once");
     };
     assert_eq!(group.members.len(), 2);
@@ -260,6 +275,19 @@ fn join_runs_sides() {
 fn join_sides_safe() {
     let plan = aruna_graph::merge::join_plan(JOIN_QUERY).unwrap();
     assert!(plan.sides.iter().all(|side| query_union_safe(side)));
+}
+
+#[test]
+fn unplanned_join_refused() {
+    let mut query = query(ApiQueryMode::Distributed, JOIN_QUERY, None);
+    query.first().unwrap();
+    let plan = MetadataEvent::RowsMerged {
+        result: Ok(MergeOutput::Sides(None)),
+    };
+    assert_eq!(
+        query.next(metadata(plan)),
+        Err(MetadataApiError::BadRequest)
+    );
 }
 
 #[test]
