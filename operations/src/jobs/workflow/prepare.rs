@@ -31,10 +31,10 @@ pub const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 /// What one attempt needs of its preparation.
 #[derive(Debug, PartialEq)]
 pub struct PreparedTask {
-    pub(super) inputs: Vec<TaskInput>,
+    pub inputs: Vec<TaskInput>,
     pub mounts: Vec<S3Mount>,
     pub secrets: BTreeMap<String, Secret>,
-    pub(super) staging: StagingMode,
+    pub staging: StagingMode,
     /// Set for a session or a batch run inside its bucket: the bucket and endpoint its
     /// credential reaches.
     pub workspace: Option<WorkspaceBinding>,

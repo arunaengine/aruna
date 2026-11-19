@@ -60,6 +60,7 @@ impl Operation for DocumentTitleOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::calls::IoCall;
     use ulid::Ulid;
 
     fn title() -> DocumentTitleOperation {
