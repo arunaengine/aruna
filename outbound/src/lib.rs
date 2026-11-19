@@ -19,7 +19,7 @@ use aruna_core::outbound::{
 use backoff::Backoffs;
 pub use connection::ConnectionSender;
 use connection::ScreenedSender;
-pub use mail::{MailBuilder, MailSender, SmtpMailer, valid_address};
+pub use mail::{MailBuilder, MailSender, SmtpMailer, check_smtp, valid_address};
 use mail::{MailProfiles, smtp_builder};
 pub use member_read::fetch_member;
 pub use range_listing::{ListingSigner, list_range};
@@ -96,6 +96,12 @@ impl OutboundHandle {
             },
             OutboundEffect::Request(request) => OutboundEvent::Answered {
                 result: self.request(*request).await,
+            },
+            OutboundEffect::CheckSmtp(settings) => OutboundEvent::SmtpChecked {
+                result: check_smtp(&settings),
+            },
+            OutboundEffect::CheckAddress(address) => OutboundEvent::AddressChecked {
+                valid: valid_address(&address),
             },
             OutboundEffect::RefreshMail(current) => {
                 self.inner.mail.refresh(current);

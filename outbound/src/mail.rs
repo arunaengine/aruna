@@ -89,6 +89,11 @@ fn status(error: &lettre::transport::smtp::Error) -> String {
 }
 
 /// Whether `address` is one mail address a sender can send to.
+/// Whether a mail sender can be built from `settings`: a valid sender address and host.
+pub fn check_smtp(settings: &SmtpSettings) -> Result<(), String> {
+    SmtpMailer::new(settings).map(|_| ())
+}
+
 pub fn valid_address(address: &str) -> bool {
     address.parse::<lettre::Address>().is_ok()
 }

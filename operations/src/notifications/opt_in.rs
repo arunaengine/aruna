@@ -9,10 +9,12 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SecretBytes;
 use aruna_core::document::DocumentTarget;
+use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::outbound::{OutboundEffect, OutboundEvent};
 use aruna_core::rows::{read_row, values};
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailPreference};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -52,14 +54,13 @@ impl From<IoError> for EmailError {
     }
 }
 
-/// One email opt-in with its ids, time and address format check.
+/// One email opt-in with its ids and time.
 #[derive(Debug, PartialEq)]
 pub struct EmailOptIn {
     pub owner: UserId,
     pub local: NodeId,
     /// The trimmed address.
     pub address: String,
-    pub address_valid: bool,
     pub categories: BTreeSet<String>,
     pub write_id: Ulid,
     pub event_id: Ulid,
@@ -79,7 +80,6 @@ impl EmailOptIn {
         Self {
             owner,
             local,
-            address_valid: aruna_outbound::valid_address(&address),
             address,
             categories,
             write_id: Ulid::generate(),
@@ -94,6 +94,8 @@ enum OptInState {
     #[default]
     Config,
     User,
+    /// The account holds the address; its format is checked before the write.
+    Address,
     Write(Box<WriteSettingOperation>),
 }
 
@@ -135,12 +137,23 @@ impl SetEmailOperation {
         Ok(Next::Call(read_row(USER_KEYSPACE, opt_in.owner.to_bytes())))
     }
 
-    /// Writes the opt-in when `user` holds the address its sign-in provider verified.
+    /// Checks the address format when `user` holds the address its sign-in provider verified.
     fn checked(&mut self, user: Option<User>) -> Turn {
-        let opt_in = self.opt_in.take().ok_or(EmailError::NotVerified)?;
+        let opt_in = self.opt_in.as_ref().ok_or(EmailError::NotVerified)?;
         let hash = user.and_then(|user| user.attributes.get(EMAIL_HASH_ATTRIBUTE).cloned());
         let verified = hash.is_some_and(|hash| hash == email_hash(&opt_in.address));
-        if !verified || !opt_in.address_valid {
+        if !verified {
+            return Err(EmailError::NotVerified);
+        }
+        self.state = OptInState::Address;
+        let check = OutboundEffect::CheckAddress(opt_in.address.clone());
+        Ok(Next::Call(IoCall::from(Effect::Outbound(check))))
+    }
+
+    /// Writes the opt-in of a well-formed address.
+    fn write(&mut self, valid: bool) -> Turn {
+        let opt_in = self.opt_in.take().ok_or(EmailError::NotVerified)?;
+        if !valid {
             return Err(EmailError::NotVerified);
         }
         let write = SettingWrite {
@@ -202,6 +215,10 @@ impl Operation for SetEmailOperation {
                 let user = value.as_deref().map(User::from_bytes).transpose()?;
                 self.checked(user)
             }
+            (OptInState::Address, result) => match result.event()? {
+                Event::Outbound(OutboundEvent::AddressChecked { valid }) => self.write(valid),
+                other => Err(unexpected_event("OutboundEvent::AddressChecked", &other).into()),
+            },
             (OptInState::Write(write), result) => written(write.next(result)),
             (_, other) => Err(unexpected("a config, account or setting result", &other).into()),
         }
@@ -219,7 +236,6 @@ mod tests {
             owner: user(1, 2),
             local: node_id(1),
             address: "ada@example.org".to_string(),
-            address_valid: true,
             categories: categories
                 .iter()
                 .map(|category| category.to_string())
@@ -274,6 +290,50 @@ mod tests {
         let mut set = at_user(&["share.upload"]);
         assert_eq!(
             set.next(IoResult::Values(vec![None])),
+            Err(EmailError::NotVerified)
+        );
+    }
+
+    fn verified_user() -> User {
+        let hash = email_hash("ada@example.org");
+        User {
+            user_id: user(1, 2),
+            name: "Ada".to_string(),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: [(EMAIL_HASH_ATTRIBUTE.to_string(), hash)].into(),
+        }
+    }
+
+    fn address_checked(valid: bool) -> IoResult {
+        let checked = OutboundEvent::AddressChecked { valid };
+        IoResult::Event(Box::new(Event::Outbound(checked)))
+    }
+
+    /// A verified address has its format checked; only a well-formed one is written.
+    #[test]
+    fn address_checked_first() {
+        let actor = aruna_core::structs::identity::auth::Actor {
+            node_id: node_id(1),
+            user_id: user(1, 2),
+            realm_id: user(1, 2).realm_id,
+        };
+        let row = verified_user().to_bytes(&actor).unwrap();
+        let mut set = at_user(&["share.upload"]);
+        let check = OutboundEffect::CheckAddress("ada@example.org".to_string());
+        assert_eq!(
+            set.next(IoResult::Values(vec![Some(row.clone().into())])),
+            Ok(Next::Call(IoCall::from(Effect::Outbound(check))))
+        );
+        assert!(matches!(set.next(address_checked(true)), Ok(Next::Call(_))));
+        assert!(matches!(set.state, OptInState::Write(_)));
+
+        let mut malformed = at_user(&["share.upload"]);
+        malformed
+            .next(IoResult::Values(vec![Some(row.into())]))
+            .unwrap();
+        assert_eq!(
+            malformed.next(address_checked(false)),
             Err(EmailError::NotVerified)
         );
     }
