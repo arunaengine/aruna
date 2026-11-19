@@ -19,12 +19,12 @@ pub(crate) use peer::ApplyRequestOperation;
 
 #[cfg(test)]
 mod barrier_tests;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod check_tests;
+#[cfg(test)]
+mod check_tests;
 #[cfg(test)]
 mod recovery_tests;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod tests;
+#[cfg(test)]
+mod tests;
 
 /// The reads of the permission rules on `path`.
 fn auth_call(path: &str) -> Result<aruna_core::calls::IoCall, GroupDeletionError> {

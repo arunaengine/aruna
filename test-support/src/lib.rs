@@ -4,6 +4,7 @@
 
 pub mod documents;
 pub mod export;
+pub mod groups;
 pub mod jobs;
 pub mod metadata;
 pub mod projection;

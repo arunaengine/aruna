@@ -21,7 +21,8 @@ use tempfile::tempdir;
 use ulid::Ulid;
 
 use super::prepare::PrepareOperation;
-use super::tests::{Fixture, context, node, read, write};
+use super::tests::{commit, prepare};
+use aruna_test_support::groups::{Fixture, context, node, read, write};
 use crate::groups::fence::GroupWriteOperation;
 use crate::onboarding::issue_ticket::{IssueSyncInput, IssueSyncOperation};
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
@@ -62,7 +63,7 @@ async fn enroll_fixture() -> Fixture {
 #[tokio::test]
 async fn prepare_blocks_enrollment() {
     let fixture = enroll_fixture().await;
-    fixture.prepare(1).await.unwrap();
+    prepare(&fixture, 1).await.unwrap();
     assert_eq!(
         drive(enrollment(&fixture), &fixture.context).await,
         Err(EnsureConfigError::DeletionPending)
@@ -94,7 +95,7 @@ async fn enrollment_conflicts_prepare() {
         };
         if matches!(effect, StorageEffect::CommitTransaction { .. }) {
             assert!(!prepared);
-            fixture.prepare(1).await.unwrap();
+            prepare(&fixture, 1).await.unwrap();
             prepared = true;
         }
         let event = fixture
@@ -118,7 +119,7 @@ async fn enrollment_invalidates_prepare() {
     let fixture = enroll_fixture().await;
     drive(enrollment(&fixture), &fixture.context).await.unwrap();
     assert!(matches!(
-        fixture.prepare(1).await,
+        prepare(&fixture, 1).await,
         Err(GroupDeletionError::Conflict(_))
     ));
     assert!(
@@ -135,8 +136,8 @@ async fn enrollment_invalidates_prepare() {
 #[tokio::test]
 async fn commit_reopens_enrollment() {
     let fixture = enroll_fixture().await;
-    let proof = fixture.prepare(1).await.unwrap();
-    fixture.commit(vec![proof]).await.unwrap();
+    let proof = prepare(&fixture, 1).await.unwrap();
+    commit(&fixture, vec![proof]).await.unwrap();
     assert!(
         drive(enrollment(&fixture), &fixture.context)
             .await
@@ -160,8 +161,8 @@ async fn commit_reopens_enrollment() {
 #[tokio::test]
 async fn ticket_installs_tombstone() {
     let fixture = enroll_fixture().await;
-    let proof = fixture.prepare(1).await.unwrap();
-    fixture.commit(vec![proof]).await.unwrap();
+    let proof = prepare(&fixture, 1).await.unwrap();
+    commit(&fixture, vec![proof]).await.unwrap();
     drive(enrollment(&fixture), &fixture.context).await.unwrap();
     let ticket = drive(
         IssueSyncOperation::new(IssueSyncInput {
@@ -295,8 +296,8 @@ async fn replacement_cannot_reopen() {
                 )
                 .await
                 .unwrap();
-                let proof = fixture.prepare(1).await.unwrap();
-                fixture.commit(vec![proof]).await.unwrap();
+                let proof = prepare(&fixture, 1).await.unwrap();
+                commit(&fixture, vec![proof]).await.unwrap();
                 deleted = true;
             }
             let event = fixture
