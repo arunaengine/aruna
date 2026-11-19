@@ -466,6 +466,8 @@ pub(crate) mod tests {
         Ok(plan)
     }
     use crate::metadata::raw_events::{RAW_EVENT_LIMIT, RAW_PAGE_SIZE};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::storage_entries::create_event_entry;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;

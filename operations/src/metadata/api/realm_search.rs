@@ -30,9 +30,7 @@ use super::node_fanout::{
 };
 use super::path_types::{deduplicate_fanout_nodes, select_fanout_nodes};
 use super::search_types::{MetadataSearchExecution, MetadataSearchRequest};
-use super::{
-    ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError, map_read_error,
-};
+use super::{ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
 use crate::forward::fetch::{peer_call, peer_reply};
 use crate::metadata::profile::validation::equivalent_profile_iris;
 use crate::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
@@ -374,7 +372,6 @@ impl MetadataSearchOperation {
             scope,
             MetadataFanoutOperation::Search,
             calls,
-            map_read_error,
         )
         .until(self.deadline());
         self.stage = SearchStage::Fanout;
@@ -569,7 +566,7 @@ mod call_tests {
     //! Drives the metadata search through its checks, cursor, discovery, fanout and signature.
 
     use super::*;
-    use aruna_core::events::GroupResult;
+    use aruna_core::events::{GroupEvent, GroupResult};
 
     fn realm() -> RealmId {
         RealmId::from_bytes([1; 32])
