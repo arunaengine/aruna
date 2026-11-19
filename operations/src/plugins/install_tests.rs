@@ -405,7 +405,11 @@ async fn keeps_receiver() {
     entry.unwrap().draining = true;
     assert!(!eligible(&config, actor.node_id));
     assert_eq!(
-        pick_receiver(&config, actor.realm_id, fixture.group_id),
+        pick_receiver(
+            &config,
+            (actor.realm_id, fixture.group_id),
+            &BTreeSet::new()
+        ),
         None
     );
 }
@@ -441,17 +445,36 @@ async fn picks_among_holders() {
     reordered.placement_map.reverse();
     config.snapshot_candidate_map();
     reordered.snapshot_candidate_map();
-    let picked = pick_receiver(&config, realm, group).unwrap();
+    let picked = pick_receiver(&config, (realm, group), &BTreeSet::new()).unwrap();
     assert!(eligible(&config, picked));
-    assert_eq!(pick_receiver(&reordered, realm, group), Some(picked));
+    let none = BTreeSet::new();
+    assert_eq!(
+        pick_receiver(&reordered, (realm, group), &none),
+        Some(picked)
+    );
 
     let entry = (config.placement_map.iter_mut()).find(|entry| entry.node_id == picked);
     entry.unwrap().draining = true;
-    let next = pick_receiver(&config, realm, group);
+    let next = pick_receiver(&config, (realm, group), &BTreeSet::new());
     assert!(
         next.is_some_and(|next| next != picked && eligible(&config, next)),
         "{next:?}"
     );
+    // A plugin with tasks prefers a holder with an executor, then any node with one.
+    let holder = next.unwrap();
+    let executors = BTreeSet::from([holder]);
+    assert_eq!(
+        pick_receiver(&config, (realm, group), &executors),
+        Some(holder)
+    );
+    let outside = (config.nodes.iter())
+        .filter_map(|node| node.node_id.parse::<aruna_core::NodeId>().ok())
+        .find(|node| *node != holder && *node != picked && eligible(&config, *node));
+    if let Some(outside) = outside {
+        let executors = BTreeSet::from([outside]);
+        let chosen = pick_receiver(&config, (realm, group), &executors);
+        assert_eq!(chosen, Some(outside));
+    }
 }
 
 fn summary_scope() -> InstallScope {
@@ -551,6 +574,7 @@ mod operations {
             secrets: BTreeMap::new(),
             warnings: Vec::new(),
             request: install.request.clone(),
+            executors: BTreeSet::new(),
         }
     }
 

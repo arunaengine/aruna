@@ -17,7 +17,7 @@ use super::records::verify::FamilyView;
 pub mod admit;
 pub mod admit_forwarded;
 pub mod admit_here;
-mod advertised;
+pub(crate) mod advertised;
 pub mod alias;
 pub mod cancel;
 pub mod chain;
