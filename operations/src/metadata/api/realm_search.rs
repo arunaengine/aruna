@@ -39,7 +39,9 @@ use crate::metadata::search_cursor::{
     query_fingerprint, resume_fetch_limit,
 };
 use crate::metadata::text_search::LocalSearchOperation;
-use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, encode_message, metadata_read_error,
+};
 
 /// Where one node's search runs.
 #[derive(Clone, Debug, PartialEq)]

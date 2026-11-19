@@ -31,7 +31,10 @@ fn plan_after_admission() {
     assert!(is_child(&cancel.next(admitted())), "then the cancel");
     assert_eq!(cancel.plan, None);
     let expected = CancelWork::new(&fixtures::install(), &id, 42);
-    assert_eq!(CancelAsk { id }.call(&fixtures::install(), 42), Ok(expected));
+    assert_eq!(
+        CancelAsk { id }.call(&fixtures::install(), 42),
+        Ok(expected)
+    );
     let done = cancel.next(child_result(Ok::<(), CallError>(())));
     assert_eq!(done, Ok(Next::Done(())));
 }

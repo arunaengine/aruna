@@ -10,8 +10,8 @@ use crate::shared;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::ExecutorRegistry;
+use aruna_compute::executor::docker::DockerBackend;
 use aruna_core::structs::execution::job::JobId;
 use aws_sdk_s3::primitives::ByteStream;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig, ProtocolVersion};

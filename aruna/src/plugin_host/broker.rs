@@ -158,7 +158,11 @@ impl RunBroker {
         mutation: UpdateDocumentMutation,
         file: Option<Value>,
     ) -> Result<Checked<PrepareChange, ChangePlan>, HostError> {
-        let target = (change.resource.as_str(), change.expected.as_str(), &change.intent);
+        let target = (
+            change.resource.as_str(),
+            change.expected.as_str(),
+            &change.intent,
+        );
         let input = (ChangeInput::File(file), ChangeMutation::Given(mutation));
         self.change(cx, target, input)
     }
@@ -286,8 +290,15 @@ impl Broker for RunBroker {
         cx: &CallContext,
         patch: MetadataPatch,
     ) -> Result<String, HostError> {
-        let target = (patch.resource.as_str(), patch.expected.as_str(), &patch.intent);
-        let input = (ChangeInput::Patch(patch.patch.clone()), ChangeMutation::Dataset);
+        let target = (
+            patch.resource.as_str(),
+            patch.expected.as_str(),
+            &patch.intent,
+        );
+        let input = (
+            ChangeInput::Patch(patch.patch.clone()),
+            ChangeMutation::Dataset,
+        );
         let change = self.change(cx, target, input)?;
         let written = drive(change, &self.ctx).await;
         written.map_err(|failure| self.failed(failure))

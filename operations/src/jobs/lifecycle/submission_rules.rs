@@ -127,7 +127,7 @@ pub(super) fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
     for output in &mut spec.file_outputs {
         output.destination_node_id = Some(node_id);
     }
-    let (mode, bucket) = ids::workspace_of(spec);
+    let (mode, bucket) = job_request::workspace_of(spec);
     if mode == WorkspaceMode::Existing
         && let Some(bucket) = bucket
     {
@@ -199,7 +199,7 @@ pub(super) fn caller_of(
     let expires_at = now_ms.saturating_add(retention_ms) / 1000;
     (
         created_by,
-        ids::submission_of(created_by, scope),
+        job_request::submission_of(created_by, scope),
         expires_at,
     )
 }
@@ -346,6 +346,6 @@ pub(super) fn forwarded_request_fits(request: &SubmissionRequest, ingress: NodeI
             .file_outputs
             .iter()
             .all(|output| output.destination_node_id == Some(ingress))
-        && (ids::workspace_of(spec).0 != WorkspaceMode::Existing
+        && (job_request::workspace_of(spec).0 != WorkspaceMode::Existing
             || spec.workspace_outputs.is_empty())
 }

@@ -119,4 +119,3 @@ pub struct SearchNodePage {
     #[serde(default)]
     pub layout: Option<(ulid::Ulid, [u8; 32])>,
 }
-

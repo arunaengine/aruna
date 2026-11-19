@@ -37,6 +37,7 @@ use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, StructuredId};
 use aruna_drivers::driver::drive;
+use aruna_drivers::testing::send_metadata_effect;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
@@ -55,13 +56,12 @@ use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };
 use aruna_operations::sync::shard_placement::sort_node_ids;
-use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::export_rocrate_jsonld;
-use aruna_drivers::testing::send_metadata_effect;
+use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::project_create_events;
-use aruna_test_support::projection::replay_event_log;
 use aruna_operations::testing::read_outbox_records;
 use aruna_test_support::documents::reconcile_topics;
+use aruna_test_support::projection::replay_event_log;
 use tokio::time::sleep;
 use ulid::Ulid;
 

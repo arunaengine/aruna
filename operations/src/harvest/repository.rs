@@ -130,9 +130,7 @@ pub fn parse_connector_read(event: Event) -> Result<Option<RepositoryConnector>,
     parse_storage_read(event, RepositoryConnector::from_bytes)
 }
 
-pub fn parse_secret_read(
-    event: Event,
-) -> Result<Option<SourceConnectorSecret>, StorageReadError> {
+pub fn parse_secret_read(event: Event) -> Result<Option<SourceConnectorSecret>, StorageReadError> {
     parse_storage_read(event, SourceConnectorSecret::from_bytes)
 }
 

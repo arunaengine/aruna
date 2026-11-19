@@ -12,8 +12,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::api::ReferenceNodeExecution;
 use aruna_core::metadata::{
-    MetadataError, MetadataEventRecord, MetadataQueryResults, MetadataRoCratePage,
-    MetadataSearchHit,
+    MetadataError, MetadataEventRecord, MetadataQueryResults, MetadataSearchHit,
 };
 use aruna_core::storage_entries::{event_log_key, pending_projection_target};
 use aruna_core::structs::PathClaimRecord;

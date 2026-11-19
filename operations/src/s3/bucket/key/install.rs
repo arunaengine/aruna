@@ -875,7 +875,6 @@ mod tests {
     async fn unlock_resumes_rewrite() {
         use crate::blob::migration::queue::{ProcessTransitionsOperation, RECHECK};
         use crate::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
-        use aruna_drivers::testing::RecordingTaskHandler;
         use crate::tests::records::read_row;
         use aruna_core::handle::Handle;
         use aruna_core::keyspaces::{
@@ -889,6 +888,7 @@ mod tests {
             EncryptionTransition, TransitionKind, TransitionState, TransitionTarget,
         };
         use aruna_core::task::{TaskEffect, TaskKey};
+        use aruna_drivers::testing::RecordingTaskHandler;
         use aruna_drivers::testing::freeze_clock;
 
         let (_dir, mut context, enabled) = enabled_context().await;

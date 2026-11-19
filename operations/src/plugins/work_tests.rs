@@ -280,7 +280,10 @@ fn prune_keeps_held() {
     };
     let done = IoResult::Child(ChildOutcome::new(Ok::<_, PruneError>(outcome)));
     let pruned = prune.next(done).unwrap();
-    assert!(matches!(pruned, Next::Done(JobPruneOutcome { pruned: 1, .. })));
+    assert!(matches!(
+        pruned,
+        Next::Done(JobPruneOutcome { pruned: 1, .. })
+    ));
 }
 
 #[test]
@@ -402,7 +405,9 @@ async fn prunes_settled_rows() {
         rows.push((run.run_id, row));
     }
     assert_eq!(settle_work(ctx, 1).await, Ok(2));
-    let pruned = drive(PruneKeepingWork::new(JOB_PRUNE_PAGE), ctx).await.unwrap();
+    let pruned = drive(PruneKeepingWork::new(JOB_PRUNE_PAGE), ctx)
+        .await
+        .unwrap();
     assert_eq!(pruned.pruned, 2);
     // Delivered as `job_finished`; an undelivered row is never pruned.
     for (_, row) in &rows {

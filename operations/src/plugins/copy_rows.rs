@@ -459,12 +459,7 @@ impl StoreCopy {
     }
 
     /// A store bounded by the digests the realm keeps, as [`kept_digests`] reads them.
-    pub(crate) fn keeping(
-        kept: BTreeSet<String>,
-        digest: &str,
-        bytes: Bytes,
-        now_ms: u64,
-    ) -> Self {
+    pub(crate) fn keeping(kept: BTreeSet<String>, digest: &str, bytes: Bytes, now_ms: u64) -> Self {
         Self {
             kept,
             digest: digest.to_string(),

@@ -96,7 +96,11 @@ impl AdmitPlan for OutputsAsk {
     type Error = CallError;
 
     fn call(self, install: &PluginInstall, _: u64) -> Result<JobOutputs, CallError> {
-        Ok(JobOutputs::new((install, self.local), &self.id, self.cursor))
+        Ok(JobOutputs::new(
+            (install, self.local),
+            &self.id,
+            self.cursor,
+        ))
     }
 }
 
@@ -142,7 +146,10 @@ impl AdmitPlan for ChangeAsk {
     type Error = CallFailure;
 
     fn call(self, install: &PluginInstall, _: u64) -> Result<StateCall, CallFailure> {
-        Ok(StateCall::new((self.run_id, install.install_id), self.change))
+        Ok(StateCall::new(
+            (self.run_id, install.install_id),
+            self.change,
+        ))
     }
 }
 
@@ -160,7 +167,9 @@ impl AdmitPlan for InfoAsk {
 
     fn call(self, install: &PluginInstall, _: u64) -> Result<ObjectInfoCall, CallFailure> {
         let version = self.version.as_deref();
-        Ok(ObjectInfoCall::new(self.place, install, &self.path, version)?)
+        Ok(ObjectInfoCall::new(
+            self.place, install, &self.path, version,
+        )?)
     }
 }
 
@@ -199,7 +208,12 @@ impl AdmitPlan for NativeAsk {
     type Error = CallFailure;
 
     fn call(self, _: &PluginInstall, _: u64) -> Result<NativeCall, CallFailure> {
-        Ok(NativeCall::new(&self.scope, self.intent, self.request, self.place))
+        Ok(NativeCall::new(
+            &self.scope,
+            self.intent,
+            self.request,
+            self.place,
+        ))
     }
 }
 
