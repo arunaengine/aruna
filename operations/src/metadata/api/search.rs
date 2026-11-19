@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::hidden_token;
 use super::search_types::{
     ObjectCursor, ObjectCursorPartition, ObjectCursorPayload, ObjectExecution,
     ObjectPartitionCoverage, ObjectPartitionState, ObjectQueryMode, PendingBucket, RangeLayout,
@@ -176,7 +177,7 @@ impl SignedCursor<ObjectCursorPayload> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub(super) struct ObjectSearchPlan {
     pub(super) auth: AuthContext,
     pub(super) bearer_token: Option<String>,
@@ -188,6 +189,25 @@ pub(super) struct ObjectSearchPlan {
     pub(super) mode: ObjectQueryMode,
     pub(super) target_nodes: Option<Vec<NodeId>>,
     pub(super) fingerprint: [u8; 32],
+}
+
+/// Shows whether a bearer is forwarded, never its value.
+impl std::fmt::Debug for ObjectSearchPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectSearchPlan")
+            .field("auth", &self.auth)
+            .field("bearer_token", &hidden_token(&self.bearer_token))
+            .field("query", &self.query)
+            .field("key_match", &self.key_match)
+            .field("bucket", &self.bucket)
+            .field("limit", &self.limit)
+            .field("cursor", &self.cursor)
+            .field("mode", &self.mode)
+            .field("target_nodes", &self.target_nodes)
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
 }
 
 #[derive(Debug, PartialEq)]

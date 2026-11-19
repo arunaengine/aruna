@@ -114,6 +114,11 @@ use self::search_types::ObjectQueryMode;
 #[cfg(test)]
 use self::search_types::{ObjectCursor, ObjectPartitionState, PendingBucket};
 
+/// A forwarded bearer as Debug output shows it: whether there is one, never its value.
+pub(crate) fn hidden_token(token: &Option<String>) -> Option<&'static str> {
+    token.as_ref().map(|_| "<hidden>")
+}
+
 const REFERENCES_LIMIT: usize = 25;
 
 const REFERENCES_MAX_LIMIT: usize = 100;

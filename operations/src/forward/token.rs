@@ -14,7 +14,9 @@ use crate::forward::fetch::{peer_call, peer_reply};
 use crate::forward::routing::distinct_holders;
 use crate::forward::transport::{ForwardError, reject};
 use crate::metadata::message_kind::transport_message_kind;
-use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError, encode_message};
+use crate::metadata::protocol::{
+    MetadataTransportMessage, RevocationTarget, WriteAuthError, encode_message,
+};
 use aruna_core::NodeId;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -65,6 +67,7 @@ impl ForwardRevokeOperation {
     ) -> Self {
         let mut subject = bearer_token_hash(&token).into_bytes();
         subject.extend_from_slice(&salt.to_bytes());
+        let token = RevocationTarget(token);
         let message = MetadataTransportMessage::ForwardTokenRevocation { auth_token, token };
         Self {
             realm_id,
@@ -258,7 +261,7 @@ impl ApplyRevokeOperation {
         let MetadataTransportMessage::ForwardTokenRevocation { token, .. } = &self.message else {
             return done(reject("unexpected token revocation message"));
         };
-        let target = match AuthToken::bearer(token) {
+        let target = match AuthToken::bearer(token.0.as_str()) {
             Ok(target) => target,
             Err(error) => return done(reject(format!("invalid token revocation target: {error}"))),
         };
@@ -280,7 +283,7 @@ impl ApplyRevokeOperation {
         let AuthToken::Bearer(caller_token) = auth_token else {
             return denied(WriteAuthError::Unauthorized);
         };
-        let token_hash = bearer_token_hash(token);
+        let token_hash = bearer_token_hash(&token.0);
         let self_hash = bearer_token_hash(caller_token.as_str()) == token_hash;
         let expires_at = claims.exp;
         let now = self.now_ms / 1000;
@@ -560,7 +563,7 @@ mod tests {
     fn apply_message(token: &str) -> MetadataTransportMessage {
         MetadataTransportMessage::ForwardTokenRevocation {
             auth_token: AuthToken::bearer("caller-token").unwrap(),
-            token: token.to_string(),
+            token: RevocationTarget(token.to_string()),
         }
     }
 

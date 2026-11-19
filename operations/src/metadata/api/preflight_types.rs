@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::hidden_token;
 use super::{
     ARUNA_DATA_PREFIX, ApiQueryMode, AuthContext, ConversionError, Deserialize, HashSet, NodeId,
     RealmConfigDocument, Serialize, Ulid,
@@ -44,7 +45,7 @@ pub enum MetadataStorageOperation {
     AllVersionsPurge,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ReferenceRequest {
     pub auth: AuthContext,
     pub bearer_token: Option<String>,
@@ -55,6 +56,23 @@ pub struct ReferenceRequest {
     pub mode: Option<ApiQueryMode>,
     pub target_nodes: Option<Vec<NodeId>>,
     pub allow_partial: bool,
+}
+
+/// Shows whether a bearer is forwarded, never its value.
+impl std::fmt::Debug for ReferenceRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReferenceRequest")
+            .field("auth", &self.auth)
+            .field("bearer_token", &hidden_token(&self.bearer_token))
+            .field("target", &self.target)
+            .field("limit", &self.limit)
+            .field("cursor", &self.cursor)
+            .field("mode", &self.mode)
+            .field("target_nodes", &self.target_nodes)
+            .field("allow_partial", &self.allow_partial)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

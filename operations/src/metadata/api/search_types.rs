@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::hidden_token;
 use super::{
     ApiQueryMode, AuthContext, BucketSearchHit, Deserialize, GroupId, MetadataFanoutStats,
     MetadataSearchHit, NodeId, ObjectInventoryHit, ObjectKeyMatch, Serialize, SignedCursor,
@@ -10,7 +11,7 @@ use super::{
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::feed_walks::IndexProgress;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct MetadataSearchRequest {
     pub auth: Option<AuthContext>,
     pub bearer_token: Option<String>,
@@ -24,6 +25,25 @@ pub struct MetadataSearchRequest {
     pub target_nodes: Option<Vec<NodeId>>,
 }
 
+/// Shows whether a bearer is forwarded, never its value.
+impl std::fmt::Debug for MetadataSearchRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetadataSearchRequest")
+            .field("auth", &self.auth)
+            .field("bearer_token", &hidden_token(&self.bearer_token))
+            .field("graph_iris", &self.graph_iris)
+            .field("query", &self.query)
+            .field("conforms_to", &self.conforms_to)
+            .field("group_id", &self.group_id)
+            .field("limit", &self.limit)
+            .field("cursor", &self.cursor)
+            .field("mode", &self.mode)
+            .field("target_nodes", &self.target_nodes)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetadataSearchExecution {
     pub hits: Vec<MetadataSearchHit>,
@@ -32,7 +52,7 @@ pub struct MetadataSearchExecution {
     pub fanout_stats: MetadataFanoutStats,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct BucketSearchRequest {
     pub auth: AuthContext,
     pub bearer_token: Option<String>,
@@ -51,6 +71,25 @@ pub struct BucketSearchRequest {
     pub target_nodes: Option<Vec<NodeId>>,
     /// Only buckets whose metadata marks them as a database.
     pub database: bool,
+}
+
+/// Shows whether a bearer is forwarded, never its value.
+impl std::fmt::Debug for BucketSearchRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BucketSearchRequest")
+            .field("auth", &self.auth)
+            .field("bearer_token", &hidden_token(&self.bearer_token))
+            .field("query", &self.query)
+            .field("key", &self.key)
+            .field("extras", &self.extras)
+            .field("limit", &self.limit)
+            .field("group_id", &self.group_id)
+            .field("cursor", &self.cursor)
+            .field("target_nodes", &self.target_nodes)
+            .field("database", &self.database)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,7 +120,7 @@ impl ObjectQueryMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct SearchQueryRequest {
     pub auth: AuthContext,
     pub bearer_token: Option<String>,
@@ -92,6 +131,24 @@ pub struct SearchQueryRequest {
     pub cursor: Option<String>,
     pub mode: ObjectQueryMode,
     pub target_nodes: Option<Vec<NodeId>>,
+}
+
+/// Shows whether a bearer is forwarded, never its value.
+impl std::fmt::Debug for SearchQueryRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SearchQueryRequest")
+            .field("auth", &self.auth)
+            .field("bearer_token", &hidden_token(&self.bearer_token))
+            .field("query", &self.query)
+            .field("key_match", &self.key_match)
+            .field("bucket", &self.bucket)
+            .field("limit", &self.limit)
+            .field("cursor", &self.cursor)
+            .field("mode", &self.mode)
+            .field("target_nodes", &self.target_nodes)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -183,3 +240,29 @@ pub(super) struct PendingBucket {
 }
 
 pub(super) type ObjectCursor = SignedCursor<ObjectCursorPayload>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+
+    // The run recorder prints every operation with Debug, so a forwarded bearer never shows.
+    #[test]
+    fn debug_hides_bearer() {
+        let request = BucketSearchRequest {
+            auth: AuthContext::anonymous(RealmId::from_bytes([1; 32])),
+            bearer_token: Some("secret-bearer-value".to_string()),
+            query: String::new(),
+            key: None,
+            extras: None,
+            limit: 10,
+            group_id: None,
+            cursor: None,
+            target_nodes: None,
+            database: false,
+        };
+        let printed = format!("{request:?}");
+        assert!(!printed.contains("secret-bearer-value"));
+        assert!(printed.contains("<hidden>"));
+    }
+}
