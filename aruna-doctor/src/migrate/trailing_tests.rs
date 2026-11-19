@@ -9,7 +9,7 @@ use crate::error::CliError;
 use aruna_core::id::NodeId;
 use aruna_core::secrets::{SecretName, SecretScope};
 use aruna_core::structs::execution::harvest::{HarvestSelector, HarvestSource};
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::admin_audit::{
     AdminAuditAction, AdminAuditRecord, PluginAudit, SecretAudit,
 };
@@ -17,7 +17,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
+use aruna_core::structs::sync_relationship::{
+    SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
+};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;

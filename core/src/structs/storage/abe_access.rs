@@ -502,8 +502,9 @@ mod tests {
 
     #[test]
     fn scope_grammar() {
-        use super::super::abe::{EnvelopePlan, SysRng, create_envelope, create_parameters};
+        use super::super::abe::{EnvelopePlan, create_envelope, create_parameters};
         use crate::structs::storage::encryption::public_key_of;
+        use getrandom::SysRng;
         let secret = SecretBytes::new(vec![9; 32]);
         let bucket_public = public_key_of(&secret).unwrap();
         let (node, other) = (iroh::SecretKey::from_bytes(&[4; 32]).public(), [5; 32]);

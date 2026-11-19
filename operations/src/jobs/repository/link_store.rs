@@ -8,10 +8,9 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::repository::credential::RepositoryCredential;
+use aruna_core::repository::link::{LinkStatus, RepositoryLink, link_key, link_prefix};
 use aruna_core::repository::remote::NodeScope;
-use aruna_core::repository::{
-    LinkStatus, RepositoryCredential, RepositoryLink, link_key, link_prefix,
-};
 use aruna_core::rows::PrefixPages;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;

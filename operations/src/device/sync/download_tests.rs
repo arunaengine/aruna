@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::ChildOutcome;
-use aruna_core::structs::WriteGuard;
+use aruna_core::structs::synced_folder::WriteGuard;
 use byteview::ByteView;
 
 use super::super::reconcile::pure_tests::folder;

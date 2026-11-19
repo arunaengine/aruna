@@ -13,7 +13,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::distribution::Publication;
+use aruna_core::structs::storage::distribution::delivery::Publication;
 use tracing::{info, warn};
 
 use super::PAGE_RECORDS;

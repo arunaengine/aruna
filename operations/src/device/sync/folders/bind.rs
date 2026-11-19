@@ -10,7 +10,7 @@ use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::rows::{outside_answer, outside_call, read_row};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     FolderState, RemoteBinding, SyncPageLimit, SyncRefusal, SyncVersionPage, SyncedFolder,
 };
 use aruna_core::task::TaskKey;
@@ -292,14 +292,14 @@ pub(in crate::device::sync) struct RequestVersionsOperation {
     auth: AuthContext,
     bucket: String,
     prefix: String,
-    cursor: Option<aruna_core::structs::SyncListCursor>,
+    cursor: Option<aruna_core::structs::synced_folder::SyncListCursor>,
     limit: SyncPageLimit,
 }
 
 impl RequestVersionsOperation {
     pub(in crate::device::sync) fn new(
         (remote, auth): (&RemoteBinding, AuthContext),
-        cursor: Option<aruna_core::structs::SyncListCursor>,
+        cursor: Option<aruna_core::structs::synced_folder::SyncListCursor>,
         limit: SyncPageLimit,
     ) -> Self {
         Self {

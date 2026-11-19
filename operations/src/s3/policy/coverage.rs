@@ -17,7 +17,8 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey,
     ManagedCopyRecord, VersionKey,
 };
-use aruna_core::structs::storage::distribution::{DistributionBinding, RouteError};
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::route::RouteError;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;

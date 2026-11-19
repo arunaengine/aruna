@@ -21,7 +21,7 @@ use aruna_core::outbound::{
 };
 use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
-use aruna_core::structs::execution::job::user_dedup_key;
+use aruna_core::structs::execution::job::local::user_dedup_key;
 use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::notification::{NotificationClass, NotificationKind};
 use aruna_core::structs::identity::auth::Actor;

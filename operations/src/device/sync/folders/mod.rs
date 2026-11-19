@@ -12,7 +12,7 @@ use aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
+use aruna_core::structs::synced_folder::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
@@ -257,8 +257,9 @@ mod tests {
     use crate::tests::device::{context, delete_rows, store_folder, write_rows};
     use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, UPLOAD_KEYSPACE};
     use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-    use aruna_core::structs::synced_folder::folder_bucket;
-    use aruna_core::structs::{EntrySide, EntryState, SyncBase, SyncedBytes};
+    use aruna_core::structs::synced_folder::{
+        EntrySide, EntryState, SyncBase, SyncedBytes, folder_bucket,
+    };
     use aruna_drivers::driver::{DriverContext, drive};
 
     fn realm() -> RealmId {
@@ -382,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn actions_refuse_deleting() {
         use super::super::actions::{ActionError, ApplyActionInput, apply_action};
-        use aruna_core::structs::{ActionKind, ActionScope};
+        use aruna_core::structs::synced_folder::{ActionKind, ActionScope};
 
         let (_dir, context) = context().await;
         let context = Arc::new(context);

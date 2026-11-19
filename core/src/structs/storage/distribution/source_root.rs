@@ -12,7 +12,7 @@ use ulid::Ulid;
 
 use crate::errors::ConversionError;
 use crate::repository::invenio::{REFERENCE_FILE, REFERENCE_RECORD};
-use crate::structs::execution::job::{StagingJobCheckpoint, StagingJobSpec};
+use crate::structs::execution::job::input::{StagingJobCheckpoint, StagingJobSpec};
 use crate::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use crate::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,

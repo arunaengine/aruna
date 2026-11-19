@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::{AttemptPhase, NOBODY};
-use aruna_core::structs::execution::job::EffectiveResources;
+use aruna_core::structs::execution::job::family::EffectiveResources;
 
 use super::fixtures::{
     child, claimed, compute, control, facts, is_child, job, node, prepared, realm, record,

@@ -6,7 +6,7 @@ use ulid::Ulid;
 
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentEvent, DocumentTarget};
 use crate::id::NodeId;
-use crate::repository::RepositoryLink;
+use crate::repository::link::RepositoryLink;
 use crate::structs::execution::notification_watch::{
     INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP, MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest,
     WatchSubscription, interest_node_id, interest_realm_id,
@@ -14,16 +14,16 @@ use crate::structs::execution::notification_watch::{
 use crate::structs::execution::setting::validate_setting;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::vault::{UserKeyRecord, VaultRevision};
+use crate::structs::persistent_id::{
+    PersistentIdKind, PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
+    persistent_id_change,
+};
 use crate::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_change,
 };
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::NodeInfoDocument;
 use crate::structs::storage::usage::{NodeUsageSnapshot, usage_node_id};
-use crate::structs::{
-    PersistentIdKind, PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
-    persistent_id_change,
-};
 use crate::user::id::UserId;
 
 /// Validates a replicated node-usage snapshot against its target: the payload

@@ -14,12 +14,12 @@ use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::record_keys::kind_prefix;
-use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     EffectiveResources, JobFamilyId, JobFamilyRecord, JobProjection, JobRecordEnvelope,
     JobRecordKind, LogicalJobState, SubmissionId,
 };
+use aruna_core::structs::execution::job::record_keys::kind_prefix;
+use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
 use aruna_core::structs::storage::node_info::AdvertisementEpoch;
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;

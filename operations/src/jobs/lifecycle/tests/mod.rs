@@ -18,9 +18,10 @@ mod uncertain_commit;
 use aruna_core::effects::{LaunchFrame, ReceiptFrame};
 use aruna_core::events::LaunchDecline;
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::execution::job::{
-    EffectiveResources, ExecutionSpec, JobId, JobRecord, WorkspaceMode,
-};
+use aruna_core::structs::execution::job::family::EffectiveResources;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::ExecutionSpec;
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::user::id::UserId;

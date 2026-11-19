@@ -9,7 +9,7 @@ use crate::tests::notifications::user;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::compute::SecretBytes;
 use aruna_core::register::RegisterStamp;
-use aruna_core::structs::execution::job::{JobError, JobErrorKind};
+use aruna_core::structs::execution::job::local::{JobError, JobErrorKind};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };

@@ -27,7 +27,7 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::data::link::{DataLink, LinkScope};
-use aruna_core::structs::storage::distribution::DistributionView;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::types::GroupId;
 
 use super::node_fanout::{FanoutParts, NodeCalls, NodeFanoutOperation, peer_answer, peer_request};

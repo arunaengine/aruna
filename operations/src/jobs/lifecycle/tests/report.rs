@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::JobRecordFrame;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobState,
     PhysicalExecutionState, SubmissionId,
 };

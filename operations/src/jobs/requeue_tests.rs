@@ -9,10 +9,12 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobClaim,
-    JobError, JobErrorKind, JobId, JobPayload, JobRecord, JobState, RoCrateLimits,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
+    RoCrateLimits,
 };
+use aruna_core::structs::execution::job::local::{JobClaim, JobError, JobErrorKind, JobRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;

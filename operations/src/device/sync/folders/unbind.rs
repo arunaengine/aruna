@@ -16,7 +16,7 @@ use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-use aruna_core::structs::{FolderState, SyncedFolder};
+use aruna_core::structs::synced_folder::{FolderState, SyncedFolder};
 use aruna_core::task::TaskKey;
 use aruna_core::types::Key;
 use ulid::Ulid;

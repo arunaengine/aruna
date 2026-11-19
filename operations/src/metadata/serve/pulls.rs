@@ -11,7 +11,9 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::{SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal, SyncVersionPage};
+use aruna_core::structs::synced_folder::{
+    SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal, SyncVersionPage,
+};
 use aruna_core::task::{PullEffect, PullEvent, PullProgress, TaskEffect, TaskEvent};
 use tracing::warn;
 use ulid::Ulid;

@@ -14,7 +14,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::{EntryState, SyncBase, SyncedFolder};
+use aruna_core::structs::synced_folder::{EntryState, SyncBase, SyncedFolder};
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, warn};

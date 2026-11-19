@@ -635,11 +635,11 @@ async fn dataset_part_group() {
 async fn index_content(state: &ServerState, set_id: Ulid, hash: [u8; 32]) -> Ulid {
     use crate::tests::distributed::write;
     use aruna_core::keyspaces::{CONTENT_INDEX_KEYSPACE, VERSION_INDEX_KEYSPACE};
-    use aruna_core::structs::storage::distribution::hint::mint_version;
+    use aruna_core::structs::storage::distribution::OriginalEpoch;
+    use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
     use aruna_core::structs::storage::distribution::inventory::{
         IndexEntry, VersionEntry, content_key, index_key, version_position,
     };
-    use aruna_core::structs::storage::distribution::{OriginalEpoch, SetHint};
     let version = mint_version(Ulid::generate(), Some(SetHint::of_set(set_id)));
     let position = version_position(set_id, "x/a.txt", OriginalEpoch(1), 1, version);
     let entry = IndexEntry {
@@ -777,7 +777,7 @@ async fn content_skips_unreadable() {
     use crate::tests::distributed::{LOCAL, PEER, distribute, node_id, publish_urls};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::storage::data::identity::content_id;
-    use aruna_core::structs::storage::distribution::SetRoot;
+    use aruna_core::structs::storage::distribution::statement::SetRoot;
     let test = crate::routes::metadata::tests::setup_network_state().await;
     let state = test.state.clone();
     let set_of = |owner_group| {

@@ -12,9 +12,11 @@ use aruna_core::effects::Effect;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::native_reference::GrantedBody;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputSelection, InputSource, JobError, JobId, JobRecord,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ExecutionSpec, InputSelection, InputSource,
 };
+use aruna_core::structs::execution::job::local::{JobError, JobRecord};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::HashIndex;

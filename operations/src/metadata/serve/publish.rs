@@ -8,12 +8,12 @@ use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::operation::Operation;
-use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::NodeRealm;
 use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
-use aruna_core::structs::storage::distribution::request::PublishRefusal;
-use aruna_core::structs::storage::distribution::{DistributionRequest, DistributionRevision};
+use aruna_core::structs::storage::distribution::DistributionRevision;
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, PublishRefusal};
+use aruna_core::structs::synced_folder::SyncRefusal;
 use ulid::Ulid;
 
 use crate::distribution::submit::PublishLocalOperation;

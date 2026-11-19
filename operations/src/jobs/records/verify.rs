@@ -6,11 +6,11 @@
 use std::collections::BTreeSet;
 
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{
-    ExecutionReceipt, ExecutionUpdate, HolderView, JobFamilyId, JobFamilyRecord, JobId,
-    JobRecordContext, JobRecordKey, JobRecordKind, LaunchIntent, LocalExecution, LogicalJobSpec,
-    WitnessBudgetRecord,
+use aruna_core::structs::execution::job::family::{
+    ExecutionReceipt, ExecutionUpdate, HolderView, JobFamilyId, JobFamilyRecord, JobRecordContext,
+    JobRecordKey, JobRecordKind, LaunchIntent, LocalExecution, LogicalJobSpec, WitnessBudgetRecord,
 };
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use ulid::Ulid;

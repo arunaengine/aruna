@@ -126,17 +126,17 @@ fn stamped(mut event: MetadataEventRecord, config: &RealmConfigDocument) -> Meta
     let target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: event.record.document_id,
     };
-    let context = aruna_core::placement::PlacementResolutionContext {
+    let context = aruna_core::placement::resolver::PlacementResolutionContext {
         group_id: Some(event.record.group_id),
         metadata_path: Some(event.record.document_path.as_str()),
     };
-    let (strategy, _) = aruna_core::placement::strategy_for_target(config, &target, context)
+    let (strategy, _) = aruna_core::placement::resolver::strategy_for_target(config, &target, context)
         .expect("strategy resolves");
     event.record.placement = aruna_core::placement::choose_origin_bucket(
         config,
         strategy,
         event.node_id,
-        &aruna_core::placement::subject_bytes(&target),
+        &aruna_core::placement::resolver::subject_bytes(&target),
     )
     .expect("origin holds a bucket");
     event

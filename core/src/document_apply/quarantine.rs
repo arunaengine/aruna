@@ -11,7 +11,7 @@ use super::registry::Row;
 use super::{ApplyError, Step, invalid};
 use crate::keyspaces::{QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
-use crate::structs::{
+use crate::structs::sync_quarantine::{
     QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineInput,
     SyncQuarantineUsage, SyncRejection, build_quarantine_entries, quarantine_usage_entry,
 };

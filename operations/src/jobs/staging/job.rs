@@ -8,9 +8,8 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::jobs::{JobEffect, JobEvent, JobReport, JobStops};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    JobError, JobErrorKind, JobResultPayload, StagingJobCheckpoint, StagingJobPhase,
-};
+use aruna_core::structs::execution::job::input::{StagingJobCheckpoint, StagingJobPhase};
+use aruna_core::structs::execution::job::local::{JobError, JobErrorKind, JobResultPayload};
 use aruna_core::structs::execution::staging::StagingStrategy;
 
 use super::item::RunItemOperation;

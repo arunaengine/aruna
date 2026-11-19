@@ -14,9 +14,8 @@ use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::{RealmDescriptor, Signed};
-use aruna_core::structs::execution::job::{
-    ExportRoCrateSpec, ExportSelection, JobId, JobPayload, JobState,
-};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{ExportRoCrateSpec, ExportSelection, JobPayload};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::transfer::{
     ExportGrant, GrantError, ImportIntent, TransferError, check_remote, intent_digest,

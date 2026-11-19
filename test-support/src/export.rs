@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
     GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{ExportRoCrateSpec, RoCrateLimits};
+use aruna_core::structs::execution::job::input::{ExportRoCrateSpec, RoCrateLimits};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{

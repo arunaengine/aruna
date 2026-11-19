@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PURGE_FENCE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
 use aruna_core::types::{Key, Value};
 

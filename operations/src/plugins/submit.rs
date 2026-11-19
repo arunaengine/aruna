@@ -10,7 +10,7 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
-use aruna_core::structs::execution::job::{PluginWorkAction, PluginWorkSpec, UploadForm};
+use aruna_core::structs::execution::job::input::{PluginWorkAction, PluginWorkSpec, UploadForm};
 use aruna_core::structs::identity::auth::Permission as Access;
 use aruna_core::user::id::UserId;
 use aruna_plugin_types::calls::{ErrorKind, HostError};

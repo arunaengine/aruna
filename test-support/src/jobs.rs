@@ -6,9 +6,12 @@ use std::collections::BTreeMap;
 
 use aruna_core::id::NodeId;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
-use aruna_core::structs::execution::job::{
-    AttemptControl, AttemptIntent, JobError, JobId, JobProgress, JobRecord, JobRecordEnvelope,
-    JobResultPayload, KeyWait, LaunchRecord,
+use aruna_core::structs::execution::job::family::JobRecordEnvelope;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::launch::LaunchRecord;
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, AttemptIntent, JobError, JobProgress, JobRecord, JobResultPayload,
 };
 use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
@@ -292,8 +295,8 @@ pub async fn persist_output_record(
 pub async fn put_crate_outcome(
     context: &DriverContext,
     job_id: JobId,
-    status: &aruna_core::structs::execution::job::RunCrateStatus,
-    link: &aruna_core::structs::execution::job::RunLink,
+    status: &aruna_core::structs::execution::job::local::RunCrateStatus,
+    link: &aruna_core::structs::execution::job::local::RunLink,
 ) -> Result<(), String> {
     drive(row_calls::put_crate_outcome(job_id, status, link), context)
         .await
@@ -303,7 +306,7 @@ pub async fn put_crate_outcome(
 pub async fn put_crate_status(
     context: &DriverContext,
     job_id: JobId,
-    status: &aruna_core::structs::execution::job::RunCrateStatus,
+    status: &aruna_core::structs::execution::job::local::RunCrateStatus,
 ) -> Result<(), String> {
     drive(row_calls::put_crate_status(job_id, status), context)
         .await
@@ -355,7 +358,7 @@ pub async fn read_attempt_control(
 pub async fn read_crate_status(
     context: &DriverContext,
     job_id: JobId,
-) -> Result<Option<aruna_core::structs::execution::job::RunCrateStatus>, String> {
+) -> Result<Option<aruna_core::structs::execution::job::local::RunCrateStatus>, String> {
     drive(row_calls::read_crate_status(job_id), context)
         .await
         .map_err(|error| error.to_string())
@@ -404,7 +407,7 @@ pub async fn read_output_record(
 pub async fn read_run_link(
     context: &DriverContext,
     job_id: JobId,
-) -> Result<Option<aruna_core::structs::execution::job::RunLink>, String> {
+) -> Result<Option<aruna_core::structs::execution::job::local::RunLink>, String> {
     drive(row_calls::read_run_link(job_id), context)
         .await
         .map_err(|error| error.to_string())
@@ -588,11 +591,11 @@ pub async fn wake_key_waits(
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_execution_job(
     context: &DriverContext,
-    spec: aruna_core::structs::execution::job::ExecutionSpec,
+    spec: aruna_core::structs::execution::job::input::ExecutionSpec,
     created_by: aruna_core::user::id::UserId,
     owner_node_id: aruna_core::id::NodeId,
     idempotency_key: Option<String>,
-    workspace_mode: aruna_core::structs::execution::job::WorkspaceMode,
+    workspace_mode: aruna_core::structs::execution::job::local::WorkspaceMode,
     workspace_bucket: Option<String>,
     retention_ms: u64,
     active_cap: Option<u32>,

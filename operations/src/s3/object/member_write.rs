@@ -12,10 +12,10 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::delegation::{COPY_CONTEXT_HEADER, CopyContext};
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionView, ReadRoute, RouteError, WriteRoute,
-};
+use aruna_core::structs::storage::distribution::route::{ReadRoute, RouteError, WriteRoute};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use thiserror::Error;
 use ulid::Ulid;
 

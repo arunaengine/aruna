@@ -24,7 +24,7 @@ use crate::routes::repository::links::{
 use crate::server::state::ServerState;
 use aruna_core::metadata::api::UpdateDocumentMutation;
 use aruna_core::request_policy::PolicyRequestExtras;
-use aruna_core::structs::execution::job::ExportRoCrateSpec;
+use aruna_core::structs::execution::job::input::ExportRoCrateSpec;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::repository::{Action, TransferError, seal_token};

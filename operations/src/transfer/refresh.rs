@@ -21,9 +21,9 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionView, KeyRange, WriteRoute,
-};
+use aruna_core::structs::storage::distribution::route::WriteRoute;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
+use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

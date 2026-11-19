@@ -681,7 +681,7 @@ pub enum VaultSignEvent {
 /// whose set names this node as publisher.
 #[derive(Debug, PartialEq)]
 pub enum SnapshotSignEvent {
-    Signed(Box<crate::structs::storage::distribution::SignedSnapshot>),
+    Signed(Box<crate::structs::storage::distribution::snapshot::SignedSnapshot>),
     Unavailable(String),
 }
 
@@ -689,7 +689,7 @@ pub enum SnapshotSignEvent {
 /// that names this node as signer.
 #[derive(Debug, PartialEq)]
 pub enum StatementSignEvent {
-    Signed(Box<crate::structs::storage::distribution::SignedStatement>),
+    Signed(Box<crate::structs::storage::distribution::statement::SignedStatement>),
     Unavailable(String),
 }
 
@@ -697,7 +697,7 @@ pub enum StatementSignEvent {
 /// that names this node as publisher.
 #[derive(Debug, PartialEq)]
 pub enum ExecutionSignEvent {
-    Signed(Box<crate::structs::execution::job::JobRecordEnvelope>),
+    Signed(Box<crate::structs::execution::job::family::JobRecordEnvelope>),
     Unavailable(String),
 }
 

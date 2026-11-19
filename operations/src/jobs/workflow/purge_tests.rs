@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use aruna_core::calls::ChildOutcome;
-use aruna_core::structs::execution::job::JobErrorKind;
+use aruna_core::structs::execution::job::local::JobErrorKind;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::multipart::MultipartUploadStatus;

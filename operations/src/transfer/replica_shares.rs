@@ -12,12 +12,11 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::accounting::{
     CounterOverflow, RangeAccount, RangeCounters,
 };
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionSnapshot, DistributionView,
-};
+use aruna_core::structs::storage::distribution::snapshot::{DistributionSnapshot, DistributionView};
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::types::{GroupId, Key, Value};
 use ulid::Ulid;

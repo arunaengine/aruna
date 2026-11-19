@@ -17,7 +17,7 @@ use aruna_core::managed_copy::{
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::ExportReportSource;
+use aruna_core::structs::execution::job::input::ExportReportSource;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BucketInfo, HashIndex, ManagedCopyKey, VersionKey,

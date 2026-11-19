@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use aruna_core::repository::invenio::normalize_metadata;
+use aruna_core::repository::invenio::projection::normalize_metadata;
 use aruna_core::repository::remote::FileDigests;
 use serde_json::{Value, json};
 

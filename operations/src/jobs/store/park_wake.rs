@@ -6,7 +6,7 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::{KeyWait, key_wait_key};
+use aruna_core::structs::execution::job::key_wait::{KeyWait, key_wait_key};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 
 use super::mutation::{MutateJobCalls, NoGuard, forward};

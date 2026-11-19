@@ -8,7 +8,8 @@ use ulid::Ulid;
 
 use crate::admin_documents::AdminDocumentDot;
 use crate::reducer::{AdminConflict, AdminConflictValue};
-use crate::structs::execution::job::{ImportReportDetail, ImportReportRow, JobId, ReasonCode};
+use crate::structs::execution::job::identity::JobId;
+use crate::structs::execution::job::input::{ImportReportDetail, ImportReportRow, ReasonCode};
 use crate::structs::identity::realm::{OidcProviderConfig, RealmId};
 use crate::structs::placement::record::{FIRST_GRANTABLE_HANDLE, PlacementRef};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;

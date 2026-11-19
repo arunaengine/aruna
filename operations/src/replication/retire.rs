@@ -12,7 +12,7 @@ use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::replication_queue::{BlobJobRecord, ReplicateScopeTarget};
-use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
+use aruna_core::structs::sync_relationship::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_core::types::Value;
 
 use super::queue::BlobQueueError;

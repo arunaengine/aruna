@@ -17,7 +17,7 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, HolderOrigin, UnlockStatus};

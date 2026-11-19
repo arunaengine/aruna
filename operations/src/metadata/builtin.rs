@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::metadata::CRATE_PROFILE_IRI;
-use aruna_core::repository::builtin_profile;
+use aruna_core::repository::kind::builtin_profile;
 
 /// Revision reported for every built-in Profile: the shapes change only when
 /// the node binary does, so there is nothing per-realm to pin.
@@ -27,7 +27,7 @@ mod pure_tests {
 
     #[test]
     fn shapes_parse() {
-        let repository = aruna_core::repository::kinds()
+        let repository = aruna_core::repository::kind::kinds()
             .iter()
             .flat_map(|kind| kind.profiles)
             .map(|profile| profile.iri);

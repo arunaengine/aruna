@@ -8,7 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::member_read::{MemberBody, MemberMethod};
 use aruna_core::operation::Operation;
-use aruna_core::structs::CENTRAL_PROVIDER_ID;
+use aruna_core::structs::central_assistant::CENTRAL_PROVIDER_ID;
 use aruna_core::structs::identity::realm::RealmId;
 use bytes::Bytes;
 use tracing::{debug, warn};

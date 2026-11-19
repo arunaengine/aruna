@@ -691,7 +691,7 @@ mod tests {
     };
     use aruna_core::node_vault::NodeVaultKey;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::execution::source_connector::{
         SourceConnectorKind, SourceConnectorSecret,
     };

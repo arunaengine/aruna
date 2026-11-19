@@ -100,7 +100,7 @@ pub enum VersionOrigin {
 impl VersionOrigin {
     /// The origin of an S3 write: a run's workspace credential writes as its job.
     pub fn s3_write(node_id: NodeId, access_key: &str, user_id: UserId) -> Self {
-        use crate::structs::execution::job::credential_job_id;
+        use crate::structs::execution::job::local::credential_job_id;
         match credential_job_id(access_key) {
             Some(job_id) => Self::Job {
                 run_id: Ulid::from_bytes(job_id.to_bytes()),
@@ -117,7 +117,7 @@ impl VersionOrigin {
     /// The job a copy signed with `access_key` runs as: a run's workspace credential copies as
     /// its run, any other credential as no job.
     pub fn copy_job(access_key: &str) -> Option<Ulid> {
-        use crate::structs::execution::job::credential_job_id;
+        use crate::structs::execution::job::local::credential_job_id;
         credential_job_id(access_key).map(|job_id| Ulid::from_bytes(job_id.to_bytes()))
     }
 

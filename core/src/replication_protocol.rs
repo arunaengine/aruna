@@ -12,7 +12,8 @@ use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::{MAX_REF_INPUT, PlacementPolicyRef, PlacementSubject};
 use crate::structs::storage::blob::{BackendLocation, CopyOrigin};
-use crate::structs::storage::distribution::{OriginalEpoch, Publication};
+use crate::structs::storage::distribution::OriginalEpoch;
+use crate::structs::storage::distribution::delivery::Publication;
 use crate::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
 };

@@ -8,7 +8,7 @@ use crate::jobs::repository::test_support::{
 };
 use crate::jobs::store::mutation::{Rows, run_in_memory};
 use aruna_core::events::StorageEvent;
-use aruna_core::repository::{LinkFailure, LinkPush, link_change_entry};
+use aruna_core::repository::link::{LinkFailure, LinkPush, link_change_entry};
 
 fn entry(due_at_ms: u64) -> LinkQueueEntry {
     LinkQueueEntry {
@@ -307,7 +307,7 @@ fn limited_push_retries() {
 fn queued_job(job_id: JobId) -> JobRecord {
     JobRecord::new(
         job_id,
-        aruna_core::structs::execution::job::JobPayload::Probe {
+        aruna_core::structs::execution::job::input::JobPayload::Probe {
             steps: 1,
             step_sleep_ms: 0,
             fail_at: None,

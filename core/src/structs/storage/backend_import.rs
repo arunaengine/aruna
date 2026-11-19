@@ -5,7 +5,7 @@
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::checksum::HASH_MD5;
-use crate::structs::execution::job::JobId;
+use crate::structs::execution::job::identity::JobId;
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::{BackendLocation, BackendRef};

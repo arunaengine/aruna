@@ -7,7 +7,7 @@ use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{LocalFileEvent, LocalFileRefusal};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::offered_directory::{FileStat, weak_fingerprint};
-use aruna_core::structs::{SYNC_TRASH_DIR, WriteGuard};
+use aruna_core::structs::synced_folder::{SYNC_TRASH_DIR, WriteGuard};
 use bytes::Bytes;
 use futures::StreamExt;
 use std::path::{Component, Path, PathBuf};

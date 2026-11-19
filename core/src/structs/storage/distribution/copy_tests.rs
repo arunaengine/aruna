@@ -6,10 +6,12 @@
 use ulid::Ulid;
 
 use super::*;
-use crate::structs::storage::distribution::split::split_ids;
-use crate::structs::storage::distribution::{
-    DistributionRequest, KeyRange, ReadRoute, TransferRole, next_snapshot,
+use crate::structs::storage::distribution::KeyRange;
+use crate::structs::storage::distribution::request::{
+    DistributionRequest, TransferRole, next_snapshot,
 };
+use crate::structs::storage::distribution::route::ReadRoute;
+use crate::structs::storage::distribution::split::split_ids;
 
 fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])

@@ -13,9 +13,8 @@ use aruna_core::events::Event;
 #[cfg(test)]
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::reducer::{
-    AdminDocumentError, AdminDocumentState, CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH,
-};
+use aruna_core::reducer::paths::{CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 #[cfg(test)]
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::storage_entries::{

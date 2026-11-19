@@ -11,7 +11,9 @@ use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use aruna_core::rows::read_row;
-use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
+use aruna_core::structs::sync_quarantine::{
+    QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage,
+};
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use thiserror::Error;

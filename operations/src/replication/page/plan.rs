@@ -18,15 +18,15 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::delivery::AdmissionError;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::distribution::source_root::{RootEntry, SourceRoot};
-use aruna_core::structs::storage::distribution::{
-    AdmissionError, DistributionBinding, DistributionView,
-};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::structs::tagged_receipt;
+use aruna_core::structs::synced_folder::tagged_receipt;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use thiserror::Error;
 use ulid::Ulid;

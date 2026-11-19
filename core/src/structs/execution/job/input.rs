@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::identity::{JobExecutionClass, RETENTION_MS};
+use super::local::AttemptIntent;
 use super::*;
 
 /// How an input is exposed to the task. Reference modes stage a copy today; the

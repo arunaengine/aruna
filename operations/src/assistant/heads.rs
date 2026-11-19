@@ -9,7 +9,7 @@ use super::{
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::{AssistantChatHead, MAX_ASSISTANT_CHATS};
+use aruna_core::structs::assistant_chat::{AssistantChatHead, MAX_ASSISTANT_CHATS};
 use aruna_core::user::id::UserId;
 
 /// Lists one user's live chat heads, newest change first.

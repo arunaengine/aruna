@@ -360,7 +360,7 @@ mod tests {
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
-    use aruna_core::structs::execution::job::RoCrateLimits;
+    use aruna_core::structs::execution::job::input::RoCrateLimits;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::{BucketKeyError, public_key_of};
     use aruna_drivers::driver::DriverContext;
@@ -754,9 +754,10 @@ mod tests {
         use crate::jobs::store::job_calls::ClaimOutcome;
         use aruna_core::keyspaces::KEY_COPY_KEYSPACE;
         use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-        use aruna_core::structs::execution::job::{
-            JobId, JobPayload, JobRecord, JobState, KeyWait, due_index_key,
-        };
+        use aruna_core::structs::execution::job::identity::{JobId, JobState};
+        use aruna_core::structs::execution::job::input::JobPayload;
+        use aruna_core::structs::execution::job::key_wait::KeyWait;
+        use aruna_core::structs::execution::job::local::{JobRecord, due_index_key};
         use aruna_test_support::jobs::{insert_job, read_job_record};
 
         let (_dir, context, enabled) = enabled_context().await;

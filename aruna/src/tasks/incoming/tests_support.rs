@@ -14,7 +14,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{PRUNE_JOB_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::GraphPruneRecord;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;

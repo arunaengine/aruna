@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobFamilyRecord;
+use aruna_core::structs::execution::job::family::JobFamilyRecord;
 use aruna_core::structs::execution::job::record_keys::record_key;
 use aruna_core::structs::execution::job::record_rows::{OutboxEntry, to_bytes};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};

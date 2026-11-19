@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::jobs::JobStops;
-use aruna_core::structs::execution::job::{ExportReportDetail, ReasonCode};
+use aruna_core::structs::execution::job::input::{ExportReportDetail, ReasonCode};
 
 use super::super::tests::{export_scope, op_spec};
 use super::*;

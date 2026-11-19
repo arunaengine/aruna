@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::identity::auth::NodeCapabilities;
-use aruna_core::structs::{
+use aruna_core::structs::info::{
     ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState, Status,
 };
 use serde::{Deserialize, Serialize};

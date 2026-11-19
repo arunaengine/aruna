@@ -19,7 +19,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::node_facts::NodeFacts;
 use aruna_core::operation::Operation;
-use aruna_core::placement::{build_view, held_buckets};
+use aruna_core::placement::held_buckets;
+use aruna_core::placement::resolver::build_view;
 use aruna_core::rows::{PrefixPages, decode, read_row, values};
 use aruna_core::storage_entries::sync_revision_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};

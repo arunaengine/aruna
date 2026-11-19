@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::errors::ConversionError;
-use crate::structs::AssistantProvider;
+use crate::structs::assistant_provider::AssistantProvider;
 use serde::{Deserialize, Serialize};
 
 /// Reserved provider id; stored provider ids are 26-character ULIDs and never collide with it.

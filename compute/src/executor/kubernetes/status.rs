@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use aruna_core::compute::{AttemptPhase, AttemptStatus};
-use aruna_core::structs::execution::job::tail_str;
+use aruna_core::structs::execution::job::family::tail_str;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ContainerState, ContainerStateTerminated, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;

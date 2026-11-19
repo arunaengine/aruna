@@ -16,10 +16,14 @@ use aruna_core::compute::{
     ResumePoint, StagingMode, TaskOutput, TaskSpec, UserSpec,
 };
 use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
-use aruna_core::structs::execution::job::{
-    AttemptIntent, ExecutionSpec, JobError, JobErrorKind, JobId, JobPayload, JobRecord,
-    JobResultPayload, JobState, MAX_MESSAGE_BYTES, OutputDestination, OutputSelection,
-    SessionReportDetail, SessionReportRow, WorkspaceMode,
+use aruna_core::structs::execution::job::family::MAX_MESSAGE_BYTES;
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    ExecutionSpec, JobPayload, OutputDestination, OutputSelection, SessionReportDetail,
+    SessionReportRow,
+};
+use aruna_core::structs::execution::job::local::{
+    AttemptIntent, JobError, JobErrorKind, JobRecord, JobResultPayload, WorkspaceMode,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
@@ -204,8 +208,8 @@ async fn collect_or_park(
     token: ulid::Ulid,
     spec: &ExecutionSpec,
     bucket: &str,
-    control: &aruna_core::structs::execution::job::AttemptControl,
-) -> Option<Vec<aruna_core::structs::execution::job::OutputObject>> {
+    control: &aruna_core::structs::execution::job::local::AttemptControl,
+) -> Option<Vec<aruna_core::structs::execution::job::local::OutputObject>> {
     let node = context.net_handle.as_ref().map(|net| net.node_id());
     let collect = CollectOutputsOperation::new(spec, bucket, control.clone(), node);
     match drive(collect, context).await {
@@ -844,11 +848,11 @@ async fn capture_failure_caps() {
 fn capture_spec(node: aruna_core::id::NodeId) -> ExecutionSpec {
     let mut spec = execution_spec();
     spec.file_outputs
-        .push(aruna_core::structs::execution::job::OutputSelection {
+        .push(aruna_core::structs::execution::job::input::OutputSelection {
             container_path: "/out/*".to_string(),
             path_prefix: Some("/out".to_string()),
             destination_node_id: Some(node),
-            destination: aruna_core::structs::execution::job::OutputDestination::S3 {
+            destination: aruna_core::structs::execution::job::input::OutputDestination::S3 {
                 bucket: "dest".to_string(),
                 key: "results/".to_string(),
             },
@@ -1636,7 +1640,7 @@ async fn absent_retries_same() {
 // with that credential, which carries the workspace and the input view together.
 #[tokio::test]
 async fn recovery_reuses_credential() {
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::input::{
         CapturedInput, InputContent, InputMode, InputSelection, InputSource,
     };
     let dir = tempdir().unwrap();
@@ -1778,7 +1782,7 @@ async fn crate_write_idempotent() {
     put_crate_status(
         &driver,
         job_id,
-        &aruna_core::structs::execution::job::RunCrateStatus::Written {
+        &aruna_core::structs::execution::job::local::RunCrateStatus::Written {
             resource: "already-there".to_string(),
         },
     )
@@ -1889,7 +1893,7 @@ async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, dig
         execution_id: Ulid::from_bytes([0xA1; 16]),
         job_id,
         logical_job_id: job_id,
-        resources: aruna_core::structs::execution::job::EffectiveResources {
+        resources: aruna_core::structs::execution::job::family::EffectiveResources {
             cpu_cores: 1,
             ram_bytes: 1,
             disk_bytes: 0,

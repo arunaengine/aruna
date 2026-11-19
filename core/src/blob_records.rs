@@ -12,7 +12,7 @@ use crate::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE, COPY_OWNER_KEYSPACE,
     PATHS_INDEX_KEYSPACE,
 };
-use crate::structs::execution::job::RoCrateLimits;
+use crate::structs::execution::job::input::RoCrateLimits;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::{
     ArchiveKey, BlobHeadKey, BlobVersion, CopyOwner, CurrentVersionPointer, HashIndex, VersionKey,

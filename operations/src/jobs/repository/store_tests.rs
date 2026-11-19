@@ -6,7 +6,7 @@ use super::*;
 use crate::jobs::repository::test_support::{
     NOW_MS, child, link, link_bytes, local_scope, other_node, scope,
 };
-use aruna_core::repository::{LinkDirection, LinkPatch};
+use aruna_core::repository::link::{LinkDirection, LinkPatch};
 
 fn pages() -> IoCall {
     PrefixPages::new(
@@ -90,11 +90,11 @@ fn lineage_refuses_opposite() {
     assert_eq!(operation.next(answer), Err(LinkError::Lineage));
 }
 
-fn pull_state() -> aruna_core::repository::LinkPull {
-    aruna_core::repository::LinkPull {
+fn pull_state() -> aruna_core::repository::link::LinkPull {
+    aruna_core::repository::link::LinkPull {
         auto_update: false,
         options: Default::default(),
-        target: aruna_core::structs::execution::job::ImportRoCrateTarget {
+        target: aruna_core::structs::execution::job::input::ImportRoCrateTarget {
             bucket: "b".into(),
             prefix: String::new(),
         },

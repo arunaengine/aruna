@@ -7,7 +7,7 @@ use aruna_core::keyspaces::{RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
+use aruna_core::structs::sync_relationship::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use ulid::Ulid;

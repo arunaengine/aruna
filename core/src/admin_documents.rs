@@ -415,7 +415,7 @@ pub enum AdminDocumentOperation {
     },
     /// The publisher's signed full snapshot of one distributed bucket's revision.
     DistributionPublished {
-        snapshot: Box<crate::structs::storage::distribution::SignedSnapshot>,
+        snapshot: Box<crate::structs::storage::distribution::snapshot::SignedSnapshot>,
     },
     /// Replaces whether replicas count toward group quotas. Its own operation, so quota events
     /// signed before the setting keep their encoding.

@@ -4,7 +4,7 @@
 
 use aruna_core::id::NodeId;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{InputContent, InputMode};
+use aruna_core::structs::execution::job::input::{InputContent, InputMode};
 
 use super::super::fixtures::{child, claimed, is_child, job, node, realm, record, spec, token};
 use super::*;

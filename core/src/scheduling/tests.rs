@@ -2,6 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::cost::UNKNOWN_PERMILLE;
+use super::eligibility::PolicyVerdict;
+use super::inputs::{MAX_PLAN_ALTERNATIVES, MAX_PLAN_CANDIDATES, MAX_PLAN_REJECTIONS};
 use super::*;
 use crate::compute::{ExecutorAvailability, NetworkAccess, ResourceEnvelope, StagingMode};
 use crate::id::NodeId;

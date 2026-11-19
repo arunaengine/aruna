@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::structs::storage::distribution::Statement;
 use crate::structs::storage::distribution::presets::replica_layout;
+use crate::structs::storage::distribution::statement::Statement;
 
 fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])

@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::{
-    ExecutionRole, JobFamilyRecord, JobId, JobProjection, JobRecordBody, JobRecordEnvelope,
-    LogicalJobState, PhysicalExecutionState, canonical_execution_key,
-};
-
 use crate::jobs::records::reduce::{canonical_binding, reduce_family, submission_families};
 use crate::tests::records::Family;
+use aruna_core::structs::execution::job::family::{
+    ExecutionRole, JobFamilyRecord, JobProjection, JobRecordBody, JobRecordEnvelope,
+    LogicalJobState, PhysicalExecutionState, canonical_execution_key,
+};
+use aruna_core::structs::execution::job::identity::JobId;
 
 /// Deterministic shuffle: an index rotation plus every record duplicated once,
 /// so replay and batching are covered without unseeded randomness.

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::JobState;
+use aruna_core::structs::execution::job::identity::JobState;
 use chrono::{DateTime, Utc};
 use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};

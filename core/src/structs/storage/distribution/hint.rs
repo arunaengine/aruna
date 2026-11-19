@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::{DistributionBinding, DistributionSnapshot};
+use super::DistributionBinding;
+use crate::structs::storage::distribution::snapshot::DistributionSnapshot;
 
 /// Hint bits sit right below the 48 timestamp bits, leaving 60 random bits.
 pub const HINT_BITS: u32 = 20;

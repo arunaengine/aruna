@@ -190,10 +190,12 @@ fn check_scans_snapshot() {
 async fn finished_jobs_pass() {
     // A purge job a bucket delete leaves behind must not block the group until it expires.
     use aruna_core::keyspaces::JOB_KEYSPACE;
-    use aruna_core::structs::execution::job::{
-        ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId,
-        JobPayload, JobRecord, JobState, RoCrateLimits,
+    use aruna_core::structs::execution::job::identity::{JobId, JobState};
+    use aruna_core::structs::execution::job::input::{
+        ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
+        JobPayload, RoCrateLimits,
     };
+    use aruna_core::structs::execution::job::local::JobRecord;
     use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     let fixture = Fixture::new(&[1]).await;

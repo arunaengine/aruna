@@ -9,7 +9,7 @@ use aruna_core::keyspaces::{
     SYNC_BASE_KEYSPACE, SYNC_LOG_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::{SyncActionRecord, SyncBase, SyncedFolder};
+use aruna_core::structs::synced_folder::{SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::types::{Key, TxnId, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};

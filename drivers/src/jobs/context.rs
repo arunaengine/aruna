@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::JobRecord;
 use futures_util::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 

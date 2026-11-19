@@ -7,10 +7,10 @@ use super::turns::{ReadChatOperation, WriteTurnOperation};
 use super::*;
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{
+use aruna_core::structs::assistant_chat::{
     AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS, MAX_TURN_BYTES,
 };
+use aruna_core::structs::identity::realm::RealmId;
 use ulid::Ulid;
 
 const CHAT: &str = "c-1";

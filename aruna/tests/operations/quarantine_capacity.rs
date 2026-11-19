@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
-use aruna_core::structs::{
+use aruna_core::structs::sync_quarantine::{
     QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineRecord,
     SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };

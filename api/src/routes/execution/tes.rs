@@ -14,11 +14,15 @@ use crate::routes::routes_at;
 use aruna_core::compute::{
     directory_pattern, has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
 };
-use aruna_core::structs::execution::job::{
-    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId, JobPayload,
-    JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
-    OutputSelection, PhysicalExecutionResult, ResultMessage, WorkspaceMode,
+use aruna_core::structs::execution::job::family::{
+    MAX_EXECUTION_OUTPUTS, PhysicalExecutionResult, ResultMessage,
 };
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobPayload,
+    OutputDestination, OutputSelection,
+};
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload, WorkspaceMode};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;

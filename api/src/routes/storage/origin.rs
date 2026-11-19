@@ -5,18 +5,18 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::SyncMode;
 use aruna_core::structs::execution::source_access::{DigestOrigin, DigestScope};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::identity::content_id;
-use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
+use aruna_core::structs::storage::distribution::route::ReadRoute;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, UploadClient, VersionOrigin,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
+use aruna_core::structs::sync_relationship::SyncMode;
 use aruna_drivers::driver::{drive, drive_until};
 use aruna_operations::blob::migration::misplaced::AccessRule;
 use aruna_operations::distribution::guard::GuardError;

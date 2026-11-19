@@ -12,7 +12,8 @@ use crate::jobs::export::*;
 use crate::jobs::repository::test_support::owner_node;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::ProgressReporter;
-use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::ExportRoCrateSpec;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
@@ -41,7 +42,7 @@ pub fn job_context(driver: Arc<DriverContext>, owner_node_id: NodeId) -> JobCont
         cancel: tokio_util::sync::CancellationToken::new(),
         shutdown: tokio_util::sync::CancellationToken::new(),
         progress: ProgressReporter::from_progress(
-            &aruna_core::structs::execution::job::JobProgress {
+            &aruna_core::structs::execution::job::local::JobProgress {
                 current: 0,
                 total: None,
                 unit: "entries".to_string(),

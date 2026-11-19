@@ -13,7 +13,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::id::NodeId;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};

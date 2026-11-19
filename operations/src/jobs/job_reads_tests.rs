@@ -4,8 +4,8 @@
 
 use aruna_core::calls::ChildOutcome;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id::MintPersistentSpec;
 use aruna_core::structs::placement::record::PlacementRef;
 
 use super::*;

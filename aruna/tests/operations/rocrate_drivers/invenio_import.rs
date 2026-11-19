@@ -514,7 +514,8 @@ async fn start_update(
     use super::driven::current_event;
     use super::driven::start_pull;
     use super::driven::{change_link, list_links};
-    use aruna_core::repository::{ImportOptions, PullCheck, RepositoryPull};
+    use aruna_core::repository::link::PullCheck;
+    use aruna_core::repository::{ImportOptions, RepositoryPull};
     use aruna_operations::jobs::repository::links::LinkChange;
     let connector_id = connector(fixture, server).await;
     let spec = spec_with_source(
@@ -706,7 +707,7 @@ async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
 async fn pause_stops_pull() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::{change_link, list_links};
     use aruna_core::repository::invenio::crate_versions;
-    use aruna_core::repository::{LinkPatch, LinkStatus};
+    use aruna_core::repository::link::{LinkPatch, LinkStatus};
     use aruna_operations::jobs::repository::links::LinkChange;
     use aruna_operations::metadata::revision_read::RawViewOperation;
     let fixture = build_fixture(false).await?;

@@ -6,9 +6,9 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    EffectiveResources, JobFamilyRecord, JobPayload, JobRecord,
-};
+use aruna_core::structs::execution::job::family::{EffectiveResources, JobFamilyRecord};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::JobRecord;
 
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};

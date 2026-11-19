@@ -13,7 +13,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
-use aruna_core::structs::execution::job::{JobId, JobRecord, job_record_key};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::{JobRecord, job_record_key};
 use aruna_core::structs::storage::backend_import::{BackendImport, RenameRequest, RenameTotal};
 use aruna_core::structs::storage::broken::StorageCheck;
 use aruna_core::structs::storage::format::CompressionMigration;

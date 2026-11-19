@@ -10,7 +10,7 @@ use aruna_core::backoff::capped_backoff;
 
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{
+use aruna_core::structs::info::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState,
     NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState,
 };

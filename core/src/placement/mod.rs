@@ -22,9 +22,9 @@ use ulid::Ulid;
 
 use crate::placement::selector::{ROLE_SHARD, rank_weighted};
 
-pub use resolver::{
-    PlacementResolutionContext, PlacementView, ResolvedNode, build_view, document_class,
-    meta_bucket_subject, resolve_holders, strategy_for_target, subject_bytes, view_from_map,
+use resolver::{
+    PlacementResolutionContext, PlacementView, build_view, resolve_holders, strategy_for_target,
+    subject_bytes, view_from_map,
 };
 
 /// Canonical rendezvous subject for a shard's holder resolution:
@@ -711,7 +711,8 @@ pub fn choose_origin_bucket(
 mod pure_tests {
     use super::*;
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-    use crate::reducer::{AdminDocumentState, overlay_placement};
+    use crate::reducer::AdminDocumentState;
+    use crate::reducer::placement::overlay_placement;
     use crate::structs::identity::auth::Actor;
     use crate::structs::identity::realm::{RealmId, RealmNodeKind};
     use crate::structs::placement::record::{

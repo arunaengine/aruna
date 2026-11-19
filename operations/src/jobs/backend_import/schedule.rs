@@ -14,7 +14,7 @@ use aruna_core::id::NodeId;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::keyspaces::IMPORT_REMOVAL_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::{BackendImport, BackendImportSpec};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};

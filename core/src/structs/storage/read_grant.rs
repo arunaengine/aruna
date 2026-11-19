@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::id::NodeId;
-use crate::structs::execution::job::SubmissionId;
+use crate::structs::execution::job::family::SubmissionId;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::replication::VersionedObjectArn;

@@ -14,10 +14,12 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionSnapshot, KeyRange, MemberState, Statement, StatementClaim,
-    StatementKind, TransferRole,
+use aruna_core::structs::storage::distribution::request::TransferRole;
+use aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot;
+use aruna_core::structs::storage::distribution::statement::{
+    Statement, StatementClaim, StatementKind,
 };
+use aruna_core::structs::storage::distribution::{DataStrategy, KeyRange, MemberState};
 use tracing::{info, warn};
 use ulid::Ulid;
 

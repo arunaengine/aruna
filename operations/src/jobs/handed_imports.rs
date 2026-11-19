@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::StagingJobSpec;
+use aruna_core::structs::execution::job::input::StagingJobSpec;
 use aruna_core::structs::storage::blob::BucketIdentity;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
@@ -141,7 +141,8 @@ mod tests {
 
     use aruna_core::calls::ChildOutcome;
     use aruna_core::id::NodeId;
-    use aruna_core::structs::execution::job::{JobId, StagingJobCheckpoint};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::StagingJobCheckpoint;
     use aruna_core::structs::execution::staging::StagingStrategy;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;

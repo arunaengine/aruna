@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::job_service::cancel_owned_job;
-use aruna_core::repository::{LinkPatch, LinkStatus, RepositoryLink};
+use aruna_core::repository::link::{LinkPatch, LinkStatus, RepositoryLink};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::repository::connector::ConnectorViewOperation;
@@ -52,7 +52,7 @@ async fn push_current(
     context: &DriverContext,
     link: &RepositoryLink,
     publish: bool,
-) -> Result<aruna_core::structs::execution::job::JobId, LinkError> {
+) -> Result<aruna_core::structs::execution::job::identity::JobId, LinkError> {
     let revision = drive(PushRevisionOperation::new(link.document_id), context).await?;
     let event = revision_event(revision)?;
     let push = StartPushOperation::new(context.node_scope(), link.clone(), event, publish);

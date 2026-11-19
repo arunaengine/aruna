@@ -15,7 +15,9 @@ use aruna_core::calls::{IoCall, IoError};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::rows::PrefixPages;
-use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
+use aruna_core::structs::sync_relationship::{
+    SyncRelationship, sync_relationship_key, sync_relationship_prefix,
+};
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use thiserror::Error;

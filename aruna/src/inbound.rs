@@ -20,7 +20,7 @@ use aruna_core::metadata::protocol::{
     INBOUND_FRAME_BYTES, MetadataReadError, MetadataTransportMessage,
 };
 use aruna_core::native_reference::{NativeAuthority, NativeReferenceResponse};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;

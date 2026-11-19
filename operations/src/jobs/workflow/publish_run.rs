@@ -11,15 +11,17 @@ use aruna_core::keyspaces::RUN_PUBLISH_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::rows::read_row;
-use aruna_core::structs::execution::job::{
-    JobError, JobId, JobPayload, JobRecord, JobResultPayload, LocalCrate, OutputObject,
-    RunCrateStatus, run_crate_key,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::launch::LocalCrate;
+use aruna_core::structs::execution::job::local::{
+    JobError, JobRecord, JobResultPayload, OutputObject, RunCrateStatus, run_crate_key,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{NodeRealm, RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::data::identity::parse_hash;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::{RemoteBinding, SyncPull, SyncPullAck, SyncRefusal};
+use aruna_core::structs::synced_folder::{RemoteBinding, SyncPull, SyncPullAck, SyncRefusal};
 use aruna_core::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

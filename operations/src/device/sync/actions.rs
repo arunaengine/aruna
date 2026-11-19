@@ -13,7 +13,7 @@ use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::{outside_answer, outside_call, read_row};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, FolderState, SyncActionRecord,
     SyncBase, SyncedFolder, WriteGuard,
 };
@@ -577,7 +577,7 @@ mod operation_tests;
 #[cfg(test)]
 mod pure_tests {
     use super::queued_upload;
-    use aruna_core::structs::{EntrySide, EntryState, SyncBase};
+    use aruna_core::structs::synced_folder::{EntrySide, EntryState, SyncBase};
     use ulid::Ulid;
 
     fn base(local: Option<EntrySide>) -> SyncBase {

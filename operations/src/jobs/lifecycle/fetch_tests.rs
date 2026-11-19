@@ -12,7 +12,7 @@ use aruna_core::events::{
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobFamilyRecord;
+use aruna_core::structs::execution::job::family::JobFamilyRecord;
 
 use super::FetchFamilyOperation;
 use crate::jobs::lifecycle::LifecycleError;

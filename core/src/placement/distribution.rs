@@ -6,13 +6,12 @@
 use std::collections::BTreeMap;
 
 use crate::id::NodeId;
+use crate::placement::resolver::{PlacementView, ResolvedNode, resolve_holders};
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::record::{
     AffinityEffect, AffinityRule, LabelMatch, PlacementStrategy,
 };
 use ulid::Ulid;
-
-use crate::placement::{PlacementView, ResolvedNode, resolve_holders};
 
 const SUBJECTS: u64 = 10_000;
 

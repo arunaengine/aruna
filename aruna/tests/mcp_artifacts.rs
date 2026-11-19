@@ -13,7 +13,7 @@ use std::time::Duration;
 use aruna_clock::testing::poll_until;
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::registry::ExecutorRegistry;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aws_sdk_s3::primitives::ByteStream;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig, ProtocolVersion};
 use rmcp::service::RunningService;

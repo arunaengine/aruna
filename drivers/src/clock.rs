@@ -7,7 +7,7 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 
 use aruna_clock::SystemEnvironment;
 use aruna_core::id_mint::run_entropy;
-use aruna_core::structured_id::{IdEnvironment, MAX_ID_SKEW};
+use aruna_core::structured_id::clock_health::{IdEnvironment, MAX_ID_SKEW};
 use tracing::error;
 
 /// The clock every drive of this process stamps from.
@@ -113,7 +113,7 @@ impl<E: IdEnvironment> RunClock<E> {
 mod tests {
     use super::RunClock;
     use aruna_core::id_mint::{COUNTER_BITS, IdMint};
-    use aruna_core::structured_id::IdEnvironment;
+    use aruna_core::structured_id::clock_health::IdEnvironment;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 

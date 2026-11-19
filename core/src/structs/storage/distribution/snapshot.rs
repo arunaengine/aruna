@@ -11,10 +11,13 @@ use ulid::Ulid;
 use super::split::{RetiredRange, check_retired};
 use super::validate::validate_config;
 use super::{
-    DistributionConfig, DistributionError, DistributionMember, DistributionRevision, KeyRange,
-    MAX_RECORD_BYTES, MemberState, SetPhase, SetRoot, SignedStatement, StatementKind, TransferRole,
+    DistributionConfig, DistributionMember, DistributionRevision, KeyRange, MAX_RECORD_BYTES,
+    MemberState, SetPhase,
 };
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::distribution::request::TransferRole;
+use crate::structs::storage::distribution::statement::{SetRoot, SignedStatement, StatementKind};
+use crate::structs::storage::distribution::validate::DistributionError;
 
 const SNAPSHOT_DOMAIN: &str = "aruna-distribution-snapshot-v1";
 const DIGEST_DOMAIN: &[u8] = b"aruna-distribution-revision-v2";

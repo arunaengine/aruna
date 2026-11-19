@@ -15,7 +15,7 @@ use aruna_core::plugin_runs::RunTrigger;
 use aruna_core::plugin_runs::SourceKind;
 use aruna_core::plugin_runs::StateRemoval;
 use aruna_core::plugin_runs::StateWrite;
-use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::identity::admin_audit::AdminAuditAction;
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_drivers::driver::DriverContext;
@@ -200,7 +200,7 @@ async fn run_copy(fixture: &Fixture, blob: &DriverContext, install: &PluginInsta
     };
     // The jobs runtime is not running here, so the finished record is written as it would.
     let mut finished = record;
-    finished.state = aruna_core::structs::execution::job::JobState::Succeeded;
+    finished.state = aruna_core::structs::execution::job::identity::JobState::Succeeded;
     (finished.result, finished.finished_at_ms) = (Some(result), Some(1));
     drive(row_calls::insert_job(&finished), blob).await.unwrap();
     assert_eq!(drive(SettleWork::new(2), blob).await.unwrap(), 1);

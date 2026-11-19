@@ -11,7 +11,7 @@ use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::structs::storage::blob::{BucketInfo, incarnation};
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, StoredMetadata};
-use aruna_core::structs::storage::distribution::DistributionView;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;

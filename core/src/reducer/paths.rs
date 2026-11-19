@@ -2,6 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::placement::{
+    activation_path, band_pool_path, candidate_map_path, handle_range_path, placement_binding_path,
+    placement_node_path, placement_override_path, placement_strategy_path, strategy_binding_path,
+    transition_abort_path, transition_barrier_path, transition_drain_path, transition_force_path,
+    transition_path, transition_proof_path, transition_stall_path,
+};
+use super::revocation::revoked_token_path;
 use super::*;
 
 pub const USER_NAME_PATH: &str = "user.name";

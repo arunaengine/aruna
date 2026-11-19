@@ -9,7 +9,7 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::SyncState;
+use aruna_core::structs::sync_relationship::SyncState;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 
 use super::ensure::EnsureMirrorOperation;
@@ -297,7 +297,7 @@ mod tests {
     use super::super::tests::relationship;
     use super::*;
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::SyncRelationship;
+    use aruna_core::structs::sync_relationship::SyncRelationship;
 
     fn node() -> NodeId {
         relationship().source.node_id

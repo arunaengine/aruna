@@ -10,7 +10,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, GroupEvent, GroupResult};
 use aruna_core::jobs::{JobEffect, JobEvent, ZipFailure, ZipWork};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::execution::job::ArtifactRef;
+use aruna_core::structs::execution::job::input::ArtifactRef;
 
 use super::archive::snapshot_moment;
 use super::open::OpenCandidateOperation;

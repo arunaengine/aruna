@@ -10,7 +10,8 @@ use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::id_mint::named_id;
 use crate::reducer::{AdminDocumentState, RevocationIndex};
-use crate::structs::execution::job::{JobId, SubmissionId};
+use crate::structs::execution::job::family::SubmissionId;
+use crate::structs::execution::job::identity::JobId;
 use crate::structs::identity::auth::Actor;
 use crate::structs::identity::auth::{Permission, Role};
 use crate::structs::placement::binding_directory::{BindingDirectory, BindingError};
@@ -1275,7 +1276,7 @@ mod test {
     use crate::id::NodeId;
     use crate::reducer::AdminDocumentState;
     use crate::request_policy::{PolicyKind, RequestPolicy};
-    use crate::structs::execution::job::SubmissionId;
+    use crate::structs::execution::job::family::SubmissionId;
     use crate::structs::identity::auth::Actor;
     use crate::structs::identity::realm::{
         DynamicDiscoveryMethod, MetadataPathOverride, MetadataReplicationOverride,
@@ -2085,7 +2086,7 @@ mod test {
     fn owner_survives_rebalance() {
         // The derived owner is a pure function of band + binding; arbitrary
         // placement-map, strategy, and override changes never move it.
-        use crate::structs::execution::job::JobId;
+        use crate::structs::execution::job::identity::JobId;
         use crate::structs::identity::realm::JobOwnerError;
         use crate::structs::placement::record::{
             DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange,

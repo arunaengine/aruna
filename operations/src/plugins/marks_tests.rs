@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::plugins::calls::*;
-use aruna_core::structs::execution::job::PluginWorkSpec;
+use aruna_core::structs::execution::job::input::PluginWorkSpec;
 use aruna_drivers::driver::drive;
 
 use super::*;

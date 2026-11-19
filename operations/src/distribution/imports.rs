@@ -10,13 +10,13 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, JOB_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::{PrefixPages, read_row};
-use aruna_core::structs::execution::job::{
-    JobId, JobPayload, JobRecord, RECORD_KEY_PREFIX, StagingJobCheckpoint, StagingJobSpec,
-};
+use aruna_core::structs::execution::job::identity::{JobId, RECORD_KEY_PREFIX};
+use aruna_core::structs::execution::job::input::{JobPayload, StagingJobCheckpoint, StagingJobSpec};
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::distribution::snapshot::{DistributionSnapshot, DistributionView};
 use aruna_core::structs::storage::distribution::source_root::{HandedImport, SourceRoot};
-use aruna_core::structs::storage::distribution::{DistributionSnapshot, DistributionView};
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

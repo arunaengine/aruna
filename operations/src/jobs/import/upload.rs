@@ -11,8 +11,9 @@ use aruna_core::keyspaces::{ROCRATE_UPLOAD_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{
-    JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord, upload_key,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord, upload_key,
 };
 use aruna_core::structs::storage::blob::HiddenBlobKey;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -305,7 +306,7 @@ pub(crate) fn claim_upload(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use aruna_core::structs::execution::job::RoCrateMediaType;
+    use aruna_core::structs::execution::job::input::RoCrateMediaType;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::format::StoredFormat;

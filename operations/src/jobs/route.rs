@@ -10,7 +10,7 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::realm::{JobOwnerError, RealmConfigDocument, RealmId};
 use thiserror::Error;
 
@@ -186,7 +186,8 @@ mod pure_tests {
     use super::*;
     use aruna_core::jobs::{JobKind, JobResponse, JobStatusView};
     use aruna_core::metadata::AuthToken;
-    use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::local::{JobProgress, WorkspaceMode};
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::placement::record::{
         DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, PlacementBinding,

@@ -14,7 +14,7 @@ use crate::test_support::make_secret;
 use aruna_clock::testing::poll_until;
 use aruna_core::events::DhtEntry;
 use aruna_core::structs::identity::realm::{RealmEndpointAnnouncement, endpoint_signing_bytes};
-use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus};
+use aruna_core::structs::info::{ConnectionAddressStatus, PeerConnectionStatus};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
 use std::sync::Arc;

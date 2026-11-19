@@ -12,7 +12,7 @@ use aruna_api::https::HostRoutes;
 use aruna_api::portal::{LegalDocument, LegalSource, PortalLogin};
 use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::federation::valid_federation_url;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::backends::{BackendsFile, NodeBackendsConfig};
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BlobTimeoutConfig};

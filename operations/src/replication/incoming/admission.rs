@@ -6,8 +6,9 @@
 // So a record installed in between conflicts the apply or refuses it.
 
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::structs::storage::distribution::delivery::AdmissionError;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
-use aruna_core::structs::storage::distribution::{AdmissionError, DistributionView};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 
 use crate::distribution::guard::{authority_read, authority_rows};
 

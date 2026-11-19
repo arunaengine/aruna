@@ -155,7 +155,7 @@ impl CorsConfig {
                     HeaderName::from_static("mcp-name"),
                     HeaderName::from_static("mcp-protocol-version"),
                     HeaderName::from_static("mcp-session-id"),
-                    HeaderName::from_static(aruna_core::structs::SESSION_HEADER),
+                    HeaderName::from_static(aruna_core::structs::central_assistant::SESSION_HEADER),
                     HeaderName::from_static(GRANT_HEADER),
                     HeaderName::from_static(INTENT_HEADER),
                     header::IF_MATCH,

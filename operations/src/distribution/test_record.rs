@@ -4,9 +4,13 @@
 
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::presets::shard_layout;
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot,
+};
+use aruna_core::structs::storage::distribution::statement::{SetRoot, Statement};
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionConfig, DistributionRequest, DistributionSettings,
-    DistributionSnapshot, DistributionView, SetRoot, SignedSnapshot, Statement, next_snapshot,
+    DistributionBinding, DistributionConfig, DistributionSettings,
 };
 use ulid::Ulid;
 

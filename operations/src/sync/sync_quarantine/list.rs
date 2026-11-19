@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
-use aruna_core::structs::SyncQuarantineRecord;
+use aruna_core::structs::sync_quarantine::SyncQuarantineRecord;
 
 use super::{
     QuarantineAdminError, QuarantinePage, QuarantinePageRequest, decode_usage, page_call,
@@ -61,7 +61,7 @@ mod tests {
     use super::super::tests::{record, record_bytes, usage_bytes};
     use super::*;
     use aruna_core::calls::{IoCall, IoError};
-    use aruna_core::structs::SyncQuarantineUsage;
+    use aruna_core::structs::sync_quarantine::SyncQuarantineUsage;
 
     fn request() -> QuarantinePageRequest {
         QuarantinePageRequest {

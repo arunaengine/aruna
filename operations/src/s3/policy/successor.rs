@@ -921,7 +921,7 @@ mod pure_tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;

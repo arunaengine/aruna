@@ -4,8 +4,9 @@
 
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
 use crate::id::NodeId;
+use crate::scheduling::inputs::{InputHolder, PlanRequest, ResolvedInput, TargetCandidate};
 use crate::scheduling::*;
-use crate::structs::execution::job::{EffectiveResources, SubmissionId};
+use crate::structs::execution::job::family::{EffectiveResources, SubmissionId};
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::compute_config::{LocationLink, RealmComputeConfig};
 use crate::structs::placement::policy::{
@@ -80,7 +81,7 @@ pub(crate) fn resolved_input(key: &str, seed: u8) -> ResolvedInput {
             version,
         },
         version_id: version,
-        content: crate::structs::execution::job::InputContent::Blake3([seed; 32]),
+        content: crate::structs::execution::job::input::InputContent::Blake3([seed; 32]),
         bytes: 1_000,
         policies: Vec::new(),
         holders: Vec::new(),

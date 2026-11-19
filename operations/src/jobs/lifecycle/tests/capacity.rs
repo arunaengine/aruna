@@ -7,10 +7,11 @@ use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::execution::job::{
-    CapturedInput, JobFamilyRecord, JobPayload, JobRecord, JobRecordBody, LaunchIntent,
-    LogicalJobSpec, PhysicalExecutionState,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordBody, LaunchIntent, LogicalJobSpec, PhysicalExecutionState,
 };
+use aruna_core::structs::execution::job::input::{CapturedInput, JobPayload};
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use ulid::Ulid;
 
@@ -121,8 +122,8 @@ fn holds_static_ceilings() {
     // concurrency ceiling admits nothing at all.
     let held = vec![JobReservationRecord {
         execution_id: Ulid::from_bytes([1u8; 16]),
-        job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
-        logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
+        job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([2u8; 16]),
+        logical_job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([2u8; 16]),
         resources: resources(),
         created_at_ms: 1,
         subject_generation: 1,
@@ -344,7 +345,7 @@ fn accepts_copy_pin() {
         destination_key: "in/reads.fastq".to_string(),
         source_node_id: ingress,
         version_id: Ulid::from_bytes([4u8; 16]),
-        content: aruna_core::structs::execution::job::InputContent::Blake3([5u8; 32]),
+        content: aruna_core::structs::execution::job::input::InputContent::Blake3([5u8; 32]),
         bytes: 128,
         policies: Vec::new(),
         source_group_id: Default::default(),
@@ -373,7 +374,7 @@ fn accepts_copy_pin() {
     here.source_node_id = Some(local);
     assert!(!pin_matches(&captured, &here, ingress, local));
     let mut other_bytes = pin.clone();
-    other_bytes.content = aruna_core::structs::execution::job::InputContent::Blake3([6u8; 32]);
+    other_bytes.content = aruna_core::structs::execution::job::input::InputContent::Blake3([6u8; 32]);
     assert!(!pin_matches(&captured, &other_bytes, ingress, local));
 }
 

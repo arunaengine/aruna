@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aruna_core::structs::checksum::ChecksumAlgorithm;
-use aruna_core::structs::execution::job::{JobErrorKind, PluginWorkAction};
+use aruna_core::structs::execution::job::input::PluginWorkAction;
+use aruna_core::structs::execution::job::local::JobErrorKind;
 use axum::http::{HeaderMap, StatusCode};
 use serde_json::json;
 

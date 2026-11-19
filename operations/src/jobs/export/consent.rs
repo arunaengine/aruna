@@ -11,7 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::ExportRoCrateSpec;
+use aruna_core::structs::execution::job::input::ExportRoCrateSpec;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use serde_json::Value as JsonValue;
 

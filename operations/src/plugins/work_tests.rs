@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::structs::execution::job::{JobId, PluginWorkAction};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::PluginWorkAction;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::user::id::UserId;
@@ -15,7 +16,7 @@ use crate::plugins::rows::page_call;
 use crate::plugins::rows::read_call;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::test_support::edit_work;
-use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_drivers::driver::drive;
 use aruna_test_support::plugins::Fixture;
@@ -189,7 +190,7 @@ async fn dispatch_records_once() {
 fn record(spec: PluginWorkSpec, job: JobId, state: JobState) -> JobRecord {
     let account = UserId::local(Ulid::from_parts(1, 1), spec.realm_id);
     let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-    let payload = aruna_core::structs::execution::job::JobPayload::PluginWork(spec);
+    let payload = aruna_core::structs::execution::job::input::JobPayload::PluginWork(spec);
     let mut record = JobRecord::new(job, payload, account, node, 1, 1, None);
     record.state = state;
     record
@@ -201,7 +202,7 @@ fn spec_of(install: &PluginInstall, row: &WorkRow) -> PluginWorkSpec {
         install_id: install.install_id,
         work_id: row.work_id,
         group_id: install.group_id,
-        action: aruna_core::structs::execution::job::PluginWorkAction::Copy {
+        action: aruna_core::structs::execution::job::input::PluginWorkAction::Copy {
             source: "a".into(),
             source_version: None,
             target: "b".into(),

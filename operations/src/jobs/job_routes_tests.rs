@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::jobs::JobKind;
-use aruna_core::structs::execution::job::JobRecord;
+use aruna_core::structs::execution::job::local::JobRecord;
 
 use super::*;
 use crate::jobs::job_reads::tests::{

@@ -11,7 +11,8 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{InputResolveRequest, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{CapturedInput, InputSelection, SubmissionId};
+use aruna_core::structs::execution::job::family::SubmissionId;
+use aruna_core::structs::execution::job::input::{CapturedInput, InputSelection};
 use aruna_core::user::id::UserId;
 
 use super::submission_rules::{batch_len, resolve_answer};
@@ -151,7 +152,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{node, user};
     use aruna_core::events::PeerRequestError;
-    use aruna_core::structs::execution::job::{InputMode, InputSource};
+    use aruna_core::structs::execution::job::input::{InputMode, InputSource};
 
     fn input() -> InputSelection {
         InputSelection {

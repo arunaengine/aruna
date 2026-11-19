@@ -9,10 +9,11 @@ use crate::job_service::{lookup_job_dedup, read_owned_job, submit_rocrate_import
 use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::repository::RepositoryPull;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::input::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
-    RoCrateMediaType, RoCrateUploadRecord, user_dedup_key,
+    RoCrateMediaType, RoCrateUploadRecord,
 };
+use aruna_core::structs::execution::job::local::user_dedup_key;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;

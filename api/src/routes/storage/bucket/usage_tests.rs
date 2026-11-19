@@ -209,9 +209,11 @@ async fn answers_held_ranges() {
 // group's: objects, versions and referenced bytes.
 #[tokio::test]
 async fn reference_import_counted() {
-    use aruna_core::structs::execution::job::{
-        JobClaim, JobId, JobPayload, JobRecord, StagingJobCheckpoint, StagingJobPhase,
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::{
+        JobPayload, StagingJobCheckpoint, StagingJobPhase,
     };
+    use aruna_core::structs::execution::job::local::{JobClaim, JobRecord};
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_drivers::driver::drive;

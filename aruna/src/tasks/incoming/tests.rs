@@ -12,7 +12,9 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
 use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::storage_entries::outbox_write_entry;
-use aruna_core::structs::execution::job::{JobPayload, JobRecord, JobState};
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationOutboxRecord,
 };

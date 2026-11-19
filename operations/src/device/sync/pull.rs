@@ -9,7 +9,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal};
+use aruna_core::structs::synced_folder::{SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal};
 use tracing::warn;
 
 use crate::forward::transport::{peer_answer, peer_call};

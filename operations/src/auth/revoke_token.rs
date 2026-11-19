@@ -13,9 +13,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::reducer::{
-    AdminDocumentError, AdminDocumentState, REVOCATIONS_PER_ORIGIN, RevocationIndex,
-};
+use aruna_core::reducer::revocation::REVOCATIONS_PER_ORIGIN;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, RevocationIndex};
 use aruna_core::rows::PrefixPages;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,

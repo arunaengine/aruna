@@ -8,7 +8,8 @@ use std::time::Duration;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::calls::IoError;
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{JobError, JobPayload, JobResultPayload};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 
 use super::job_host::{run_backend_import, run_hosted, run_staging_job, run_storage_purge};
 use aruna_core::jobs::JobRunOutcome;

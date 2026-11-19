@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::StagingJobCheckpoint;
+use aruna_core::structs::execution::job::input::StagingJobCheckpoint;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::SourceMirror;
 use aruna_core::structs::execution::table::mirror_path;

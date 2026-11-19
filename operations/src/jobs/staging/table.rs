@@ -14,7 +14,7 @@ use aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::input::{
     StagingJobCheckpoint, StagingJobDirectory, StagingJobPhase, TableRead,
 };
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};

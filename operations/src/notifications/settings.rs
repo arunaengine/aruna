@@ -15,7 +15,7 @@ use aruna_core::operation::Operation;
 use aruna_core::outbound::{
     BackoffChange, BackoffRequest, OutboundEffect, OutboundEvent, StoredBackoff,
 };
-use aruna_core::structs::execution::job::{JobError, JobResultPayload};
+use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};

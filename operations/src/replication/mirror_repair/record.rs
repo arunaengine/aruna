@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::SyncRelationship;
+use aruna_core::structs::sync_relationship::SyncRelationship;
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 

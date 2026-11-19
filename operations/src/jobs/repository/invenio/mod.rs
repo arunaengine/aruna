@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult};
-use aruna_core::repository::LinkFailure;
+use aruna_core::repository::link::LinkFailure;
 use aruna_core::repository::remote::{
     InvenioAccess, InvenioError, InvenioMethod, JobStop, RemoteAnswer, RemoteCall, RemoteFailure,
 };
-use aruna_core::structs::execution::job::ArtifactRef;
+use aruna_core::structs::execution::job::input::ArtifactRef;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use serde_json::Value;
 use url::Url;

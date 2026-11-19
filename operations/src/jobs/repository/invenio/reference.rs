@@ -13,7 +13,7 @@ use aruna_core::repository::invenio::{
 };
 use aruna_core::repository::remote::{NodeScope, RemoteCall};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{ImportRoCrateSource, ImportRoCrateSpec};
+use aruna_core::structs::execution::job::input::{ImportRoCrateSource, ImportRoCrateSpec};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::execution::staging::StagingStrategy;

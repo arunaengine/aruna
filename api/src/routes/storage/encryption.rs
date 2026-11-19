@@ -13,7 +13,7 @@ use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::errors::BlobError;
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::abe_access::KeyScope;

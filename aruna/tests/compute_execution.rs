@@ -17,10 +17,12 @@ use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
-    JobPayload, JobRecord, JobState, OutputDestination, OutputSelection, RunCrateStatus,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource,
+    JobPayload, OutputDestination, OutputSelection,
 };
+use aruna_core::structs::execution::job::local::{JobRecord, RunCrateStatus};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_drivers::driver::{DriverContext, drive};
@@ -209,7 +211,7 @@ async fn capture_inputs(
                 .resolved_version_id
                 .or(head.version_id)
                 .expect("input has a version"),
-            content: aruna_core::structs::execution::job::InputContent::Blake3(
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3(
                 <[u8; 32]>::try_from(
                     location
                         .hashes

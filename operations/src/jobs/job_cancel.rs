@@ -7,7 +7,10 @@ use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::jobs::{JobRequest, JobResponse, JobStatusView};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobPayload, JobRecord};
+use aruna_core::structs::execution::job::family::JobFamilyId;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::user::id::UserId;
 

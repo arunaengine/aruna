@@ -24,7 +24,7 @@ fn document(entities: Vec<Value>) -> Value {
 #[test]
 fn shipped_rules_consistent() {
     assert!(rules(RepositoryConnectorKind::OaiPmh).unwrap().is_none());
-    for descriptor in crate::repository::kinds() {
+    for descriptor in crate::repository::kind::kinds() {
         let kind = descriptor.kind;
         let rules = descriptor.rules().expect("embedded rules parse");
         for endpoint in ["https://zenodo.org/api/", "https://repo.example/api/"] {

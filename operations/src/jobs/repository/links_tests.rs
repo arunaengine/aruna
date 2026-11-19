@@ -7,8 +7,9 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::keyspaces::{
     SHARD_MANIFEST_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE, WRITE_FENCE_KEYSPACE,
 };
-use aruna_core::repository::{LinkFailure, LinkRemote, RepositoryRecord};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::repository::RepositoryRecord;
+use aruna_core::repository::link::{LinkDirection, LinkFailure, LinkPull, LinkRemote};
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::user::id::UserId;
@@ -46,7 +47,7 @@ fn link() -> RepositoryLink {
         updated_at: SystemTime::UNIX_EPOCH,
         generation: 0,
         warning: None,
-        direction: aruna_core::repository::LinkDirection::Push,
+        direction: aruna_core::repository::link::LinkDirection::Push,
         kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
     }
 }
@@ -494,7 +495,7 @@ fn finish_requeues_link() {
     let entry = queued_entry(&step).expect("auto_publish waits for a quiet draft");
     assert_eq!(
         entry.due_at_ms,
-        NOW_MS + aruna_core::repository::PUBLISH_QUIET_MS
+        NOW_MS + aruna_core::repository::link::PUBLISH_QUIET_MS
     );
 
     // A change queued during the push keeps its earlier check.
@@ -546,22 +547,21 @@ fn draft_needs_push() {
 
 fn pulling() -> RepositoryLink {
     let mut link = link();
-    link.direction =
-        aruna_core::repository::LinkDirection::Pull(Box::new(aruna_core::repository::LinkPull {
-            auto_update: false,
-            options: Default::default(),
-            target: aruna_core::structs::execution::job::ImportRoCrateTarget {
-                bucket: "research".into(),
-                prefix: "zenodo".into(),
-            },
-            latest_remote_id: None,
-            latest_revision: None,
-            last_checked_at: None,
-            next_check_ms: u64::MAX,
-            failures: 0,
-            revision: None,
-            local_changed: false,
-        }));
+    link.direction = LinkDirection::Pull(Box::new(LinkPull {
+        auto_update: false,
+        options: Default::default(),
+        target: aruna_core::structs::execution::job::input::ImportRoCrateTarget {
+            bucket: "research".into(),
+            prefix: "zenodo".into(),
+        },
+        latest_remote_id: None,
+        latest_revision: None,
+        last_checked_at: None,
+        next_check_ms: u64::MAX,
+        failures: 0,
+        revision: None,
+        local_changed: false,
+    }));
     link
 }
 

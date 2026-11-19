@@ -22,10 +22,10 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::staging_checkpoint::MAX_ERROR_SAMPLE;
-use aruna_core::structs::execution::job::ClaimGuard;
-use aruna_core::structs::execution::job::{
-    JobId, StagingJobCheckpoint, StagingJobError, job_record_key,
-};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{StagingJobCheckpoint, StagingJobError};
+use aruna_core::structs::execution::job::local::job_record_key;
+use aruna_core::structs::execution::job::rows::ClaimGuard;
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{

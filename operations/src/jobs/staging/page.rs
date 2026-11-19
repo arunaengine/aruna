@@ -14,7 +14,7 @@ use aruna_core::jobs::{JobEffect, JobEvent, JobReport};
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::structs::checksum::ExpectedChecksum;
-use aruna_core::structs::execution::job::StagingJobCheckpoint;
+use aruna_core::structs::execution::job::input::StagingJobCheckpoint;
 use aruna_core::structs::execution::source_access::{ResolvedSourceConnector, SourceMetadata};
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::storage::blob::BucketInfo;

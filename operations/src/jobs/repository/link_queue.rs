@@ -11,13 +11,15 @@ use aruna_core::events::Event;
 use aruna_core::keyspaces::{LINK_CHANGE_KEYSPACE, LINK_QUEUE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
-use aruna_core::repository::remote::NodeScope;
-use aruna_core::repository::{
+use aruna_core::repository::link::{
     LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS, RemoteState,
     RepositoryLink, link_change_document, schedule_drain,
 };
+use aruna_core::repository::remote::NodeScope;
 use aruna_core::rows::PrefixPages;
-use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::ExportRoCrateSpec;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::TaskEvent;

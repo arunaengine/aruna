@@ -11,7 +11,7 @@ use super::*;
 async fn pid_placement_fence() {
     use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, SHARD_MANIFEST_KEYSPACE};
     use aruna_core::storage_entries::shard_manifest_key;
-    use aruna_core::structs::PersistentIdRevision;
+    use aruna_core::structs::persistent_id::PersistentIdRevision;
 
     let (_storage_dir, storage) = test_storage();
     let doc_dir = tempfile::tempdir().expect("doc dir");

@@ -7,10 +7,10 @@ use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    ExecutionReceipt, JobFamilyId, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope,
-    JobRecordKind,
+use aruna_core::structs::execution::job::family::{
+    ExecutionReceipt, JobFamilyId, JobFamilyRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind,
 };
+use aruna_core::structs::execution::job::identity::JobId;
 use tracing::warn;
 use ulid::Ulid;
 

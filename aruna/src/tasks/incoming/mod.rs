@@ -17,7 +17,8 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::structs::execution::job::{JobExecutionClass, RoCrateLimits};
+use aruna_core::structs::execution::job::identity::JobExecutionClass;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};

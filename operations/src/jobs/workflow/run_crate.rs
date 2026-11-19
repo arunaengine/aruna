@@ -8,10 +8,13 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
 use aruna_core::rows::{outside_answer, outside_call};
-use aruna_core::structs::ORIGIN_DEVICE_TAG;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputContent, InputSource, JobError, JobId, JobPayload,
-    JobRecord, JobResultPayload, JobState, LaunchRecord, LocalCrate, RunCrateStatus, RunLink,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ExecutionSpec, InputContent, InputSource, JobPayload,
+};
+use aruna_core::structs::execution::job::launch::{LaunchRecord, LocalCrate};
+use aruna_core::structs::execution::job::local::{
+    JobError, JobRecord, JobResultPayload, RunCrateStatus, RunLink,
 };
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, schedule_watch_drain, watch_event_entry,
@@ -24,6 +27,7 @@ use aruna_core::structs::storage::data::identity::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::structs::synced_folder::ORIGIN_DEVICE_TAG;
 use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
@@ -1374,9 +1378,8 @@ mod pure_tests {
         assert!(is_transient(&profile_rejection("validator_unavailable")));
     }
 
-    use aruna_core::structs::execution::job::{
-        AttemptIntent, CapturedInput, InputMode, InputSelection, OutputObject,
-    };
+    use aruna_core::structs::execution::job::input::{CapturedInput, InputMode, InputSelection};
+    use aruna_core::structs::execution::job::local::{AttemptIntent, OutputObject};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::user::id::UserId;
     use serde_json::Value;
@@ -1578,7 +1581,7 @@ mod pure_tests {
             destination_key: "inputs/in.txt".to_string(),
             source_node_id: record.owner_node_id,
             version_id: Ulid::from_bytes([13; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([9; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_group_id: group,
@@ -1905,7 +1908,7 @@ mod pure_tests {
             destination_key: "inputs/in.txt".to_string(),
             source_node_id: record.owner_node_id,
             version_id: Ulid::from_bytes([13; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([9; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_group_id: Default::default(),
@@ -1935,7 +1938,7 @@ mod pure_tests {
             destination_key: "inputs/in.txt".to_string(),
             source_node_id: record.owner_node_id,
             version_id: Ulid::from_bytes([13; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([9; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_group_id: Default::default(),

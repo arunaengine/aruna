@@ -65,7 +65,7 @@ fn promotion_check_answered() {
 fn staging_spec_refused() {
     let request = MetadataTransportMessage::StagingSpec {
         transfer_id: ulid::Ulid::from_bytes([3u8; 16]),
-        job_id: aruna_core::structs::execution::job::JobId::from_bytes([4u8; 16]),
+        job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([4u8; 16]),
     };
     let mut serve = ServeRequestOperation::new(node(2), local(), request);
     assert!(runs_child(serve.first()));
@@ -237,11 +237,11 @@ fn lookup_rechecks_config() {
     );
 }
 
-fn relationship(source_bucket: &str) -> aruna_core::structs::SyncRelationship {
+fn relationship(source_bucket: &str) -> aruna_core::structs::sync_relationship::SyncRelationship {
     use aruna_core::structs::storage::replication::ArunaArn;
-    use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
+    use aruna_core::structs::sync_relationship::{SyncMode, SyncState, SyncStatusSnapshot};
     let realm_id = RealmId([1u8; 32]);
-    aruna_core::structs::SyncRelationship {
+    aruna_core::structs::sync_relationship::SyncRelationship {
         id: ulid::Ulid::from_bytes([7u8; 16]),
         source: ArunaArn::s3_bucket(realm_id, node(1), source_bucket).unwrap(),
         target: ArunaArn::s3_bucket(realm_id, node(2), "target").unwrap(),

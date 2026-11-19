@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::ChildOutcome;
-use aruna_core::structs::execution::job::{JobPayload, lease_index_key};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::lease_index_key;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::Value;
 use aruna_core::user::id::UserId;
@@ -42,7 +43,7 @@ fn record(class: JobExecutionClass, claimed: bool) -> JobRecord {
     let user = UserId::local(Ulid::from_bytes([5; 16]), RealmId([1; 32]));
     let mut record = JobRecord::new(job(), payload, user, node_id, 1, 1, None);
     record.execution_class = class;
-    record.claim = claimed.then_some(aruna_core::structs::execution::job::JobClaim {
+    record.claim = claimed.then_some(aruna_core::structs::execution::job::local::JobClaim {
         holder_node_id: node_id,
         claim_token: token(),
         lease_expires_ms: 1,

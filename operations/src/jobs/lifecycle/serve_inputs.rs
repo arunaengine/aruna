@@ -9,7 +9,7 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{InputResolveRequest, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{CapturedInput, InputSelection, InputSource};
+use aruna_core::structs::execution::job::input::{CapturedInput, InputSelection, InputSource};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -195,7 +195,8 @@ mod tests {
     use super::*;
     use crate::tests::records::{REALM, captured_input, node, user, user_auth};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{InputMode, SubmissionId};
+    use aruna_core::structs::execution::job::family::SubmissionId;
+    use aruna_core::structs::execution::job::input::InputMode;
     use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
 
     fn input(key: &str, holder: Option<NodeId>) -> InputSelection {

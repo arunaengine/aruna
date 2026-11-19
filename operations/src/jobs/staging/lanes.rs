@@ -9,8 +9,9 @@ use aruna_core::events::GroupEvent;
 use aruna_core::jobs::{JobEffect, JobReport};
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    JobId, StagingJobCheckpoint, StagingJobPhase, StagingJobSpec, StagingWalk,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    StagingJobCheckpoint, StagingJobPhase, StagingJobSpec, StagingWalk,
 };
 use aruna_core::structs::execution::source_access::ListRequest;
 use aruna_core::structs::execution::staging::StagingStrategy;

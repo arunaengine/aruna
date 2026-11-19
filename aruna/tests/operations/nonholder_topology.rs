@@ -24,10 +24,13 @@ use aruna_core::metadata::api::{
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::storage_entries::registry_delete_entries;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::LogicalJobState;
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::execution::job::input::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
-    ImportRoCrateTarget, JobState, LogicalJobState, RoCrateLimits, WorkspaceMode, user_dedup_key,
+    ImportRoCrateTarget, RoCrateLimits,
 };
+use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::record::band_start;
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
@@ -97,7 +100,7 @@ const JOB_BUDGET: JobClassBudget = JobClassBudget {
 /// Owner derivation as every node performs it: pure, from the replicated config.
 fn derived_owner(
     realm: &Topology,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
 ) -> TestResult<aruna_core::id::NodeId> {
     Ok(realm.config.job_owner(job_id)?)
 }
@@ -208,7 +211,7 @@ async fn record_routes_owner() -> TestResult<()> {
 #[allow(clippy::too_many_arguments)]
 async fn submit_external_job(
     context: &aruna_drivers::driver::DriverContext,
-    spec: aruna_core::structs::execution::job::ExecutionSpec,
+    spec: aruna_core::structs::execution::job::input::ExecutionSpec,
     created_by: aruna_core::user::id::UserId,
     idempotency_key: Option<String>,
     workspace_mode: WorkspaceMode,
@@ -411,13 +414,13 @@ async fn seed_upload(
         blob_size: 1,
         hashes: Default::default(),
     };
-    let record = aruna_core::structs::execution::job::RoCrateUploadRecord {
+    let record = aruna_core::structs::execution::job::input::RoCrateUploadRecord {
         upload_id: Ulid::from_bytes([seed; 16]),
         owner,
         location,
         blake3: [seed; 32],
         size: 1,
-        media_type: aruna_core::structs::execution::job::RoCrateMediaType::Zip,
+        media_type: aruna_core::structs::execution::job::input::RoCrateMediaType::Zip,
         expires_at_ms: u64::MAX,
         claimed_by: None,
     };

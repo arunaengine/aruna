@@ -12,18 +12,23 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
-use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::distribution::capacity::{RangeSize, with_unopened};
 use aruna_core::structs::storage::distribution::presets::{
     Layout, add_edges, replica_layout, shard_layout,
 };
-use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionConfig, DistributionError, DistributionMember, DistributionRequest,
-    DistributionRevision, DistributionSettings, DistributionSnapshot, DistributionView, SetPhase,
-    SetRoot, SignedSnapshot, SignedStatement,
+use aruna_core::structs::storage::distribution::request::DistributionRequest;
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot,
 };
+use aruna_core::structs::storage::distribution::statement::{SetRoot, SignedStatement};
+use aruna_core::structs::storage::distribution::validate::DistributionError;
+use aruna_core::structs::storage::distribution::{
+    DataStrategy, DistributionConfig, DistributionMember, DistributionRevision,
+    DistributionSettings, SetPhase,
+};
+use aruna_core::structs::synced_folder::SyncRefusal;
 use aruna_core::types::GroupId;
 use thiserror::Error;
 use tracing::warn;

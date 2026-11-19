@@ -18,22 +18,24 @@ use crate::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataError, MetadataQueryResults, MetadataSearchHit,
     ProfileValidationFinding, ProfileValidationStatus,
 };
-use crate::structs::execution::job::SubmissionId;
+use crate::structs::execution::job::family::SubmissionId;
 use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
+use crate::structs::path_claim::PathClaimRecord;
+use crate::structs::persistent_id::{PersistentIdFailure, PersistentIdMapping};
 use crate::structs::placement::policy::document::PlacementPolicyDocument;
 use crate::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef};
 use crate::structs::placement::record::PlacementRef;
+use crate::structs::storage::distribution::DistributionRevision;
 use crate::structs::storage::distribution::capacity::RangeSize;
-use crate::structs::storage::distribution::request::PublishRefusal;
+use crate::structs::storage::distribution::request::{DistributionRequest, PublishRefusal};
+use crate::structs::storage::distribution::snapshot::SignedSnapshot;
 use crate::structs::storage::distribution::source_root::HandedImport;
-use crate::structs::storage::distribution::{
-    DistributionRequest, DistributionRevision, SignedSnapshot, SignedStatement,
-};
+use crate::structs::storage::distribution::statement::SignedStatement;
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::NodeInfoDocument;
-use crate::structs::{
-    PathClaimRecord, PersistentIdFailure, PersistentIdMapping, SyncListCursor, SyncPageLimit,
-    SyncPull, SyncPullStatus, SyncRefusal, SyncRelationship, SyncVersionPage,
+use crate::structs::sync_relationship::SyncRelationship;
+use crate::structs::synced_folder::{
+    SyncListCursor, SyncPageLimit, SyncPull, SyncPullStatus, SyncRefusal, SyncVersionPage,
 };
 use crate::types::GroupId;
 use crate::user::id::UserId;
@@ -611,7 +613,7 @@ pub enum MetadataTransportMessage {
     /// A staging job the former coordinator of a range hands over in transfer `transfer_id`.
     StagingSpec {
         transfer_id: Ulid,
-        job_id: crate::structs::execution::job::JobId,
+        job_id: crate::structs::execution::job::identity::JobId,
     },
     StagingSpecResult {
         result: Result<Box<HandedImport>, MetadataReadError>,
@@ -637,11 +639,11 @@ pub enum MetadataTransportMessage {
     },
     /// One input page of a job family by its digest; only realm infrastructure nodes ask.
     JobInputPage {
-        submission: crate::structs::execution::job::SubmissionId,
+        submission: crate::structs::execution::job::family::SubmissionId,
         digest: [u8; 32],
     },
     InputPageResult {
-        page: Option<Box<crate::structs::execution::job::InputPage>>,
+        page: Option<Box<crate::structs::execution::job::pages::InputPage>>,
     },
     /// Inputs an ingress asks their source node to resolve and grant, under the caller's bearer.
     ResolveJobInputs {
@@ -651,8 +653,8 @@ pub enum MetadataTransportMessage {
     ResolvedJobInputs {
         result: Result<
             Vec<(
-                crate::structs::execution::job::InputSelection,
-                crate::structs::execution::job::CapturedInput,
+                crate::structs::execution::job::input::InputSelection,
+                crate::structs::execution::job::input::CapturedInput,
             )>,
             crate::jobs::SubmissionRefusal,
         >,

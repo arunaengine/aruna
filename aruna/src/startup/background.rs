@@ -338,7 +338,7 @@ mod tests {
             driver_ctx.clone(),
             task_handle.clone(),
             jobs_runtime.clone(),
-            aruna_core::structs::execution::job::RoCrateLimits::default(),
+            aruna_core::structs::execution::job::input::RoCrateLimits::default(),
             None,
         )
         .await;

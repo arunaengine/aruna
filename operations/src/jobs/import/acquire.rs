@@ -9,7 +9,7 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::jobs::{ByteStream, JobEffect, JobEvent};
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::repository::RepositoryPull;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::input::{
     ImportRoCrateSource, RoCrateMediaType, RoCrateUploadRecord,
 };
 use aruna_core::structs::identity::auth::Permission;

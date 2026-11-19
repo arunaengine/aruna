@@ -13,9 +13,10 @@ use aruna_core::compute::{
 };
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    AttemptControl, AttemptIntent, ExecutionSpec, JobError, JobErrorKind, JobId, JobPayload,
-    JobRecord, JobState,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, AttemptIntent, JobError, JobErrorKind, JobRecord,
 };
 use tracing::{info, warn};
 use ulid::Ulid;

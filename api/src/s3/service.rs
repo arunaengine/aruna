@@ -76,7 +76,8 @@ use aruna_core::id::NodeId;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::execution::job::{RoCrateLimits, credential_job_id};
+use aruna_core::structs::execution::job::input::RoCrateLimits;
+use aruna_core::structs::execution::job::local::credential_job_id;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
@@ -85,7 +86,9 @@ use aruna_core::structs::storage::mirror_repair::SyncMirrorIntent;
 use aruna_core::structs::storage::multipart::COMPLETION_DEADLINE_MS;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
+use aruna_core::structs::sync_relationship::{
+    SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
+};
 use aruna_drivers::driver::{DriverContext, drive, drive_retry, drive_until, node_routing};
 use aruna_drivers::position::open_cursor;
 use aruna_operations::auth::check_permissions::{

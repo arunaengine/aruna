@@ -2,6 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::input::{CapturedInput, ExecutionSpec};
+use super::local::OutputObject;
+use super::pages::PageManifest;
 use super::*;
 
 const SUBMISSION_KEYED_DOMAIN: &[u8] = b"aruna-submission-id-v1";

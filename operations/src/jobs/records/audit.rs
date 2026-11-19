@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, FetchCursor, PageLimit, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_CONFLICT_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobRecordEnvelope, JobRecordKey, SubmissionId,
 };
 use aruna_core::types::{Key, Value};
@@ -171,7 +171,7 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::execution::job::SubmissionId;
+    use aruna_core::structs::execution::job::family::SubmissionId;
 
     use super::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
     use crate::jobs::records::RecordStoreError;

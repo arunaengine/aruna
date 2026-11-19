@@ -19,11 +19,13 @@ use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::execution::job::{
-    ExecutionClaim, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobId, JobPayload,
-    JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionState, WorkspaceMode,
+use aruna_core::structs::execution::job::family::{
+    ExecutionClaim, ExecutionReceipt, JobFamilyId, JobFamilyRecord, JobRecordBody,
+    JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec, PhysicalExecutionState,
 };
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{InputSource, JobPayload};
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use std::collections::BTreeMap;
@@ -873,7 +875,7 @@ impl Operation for AdmitLaunchOperation {
 fn materialize_local(
     spec: &LogicalJobSpec,
     intent: &LaunchIntent,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
     local: NodeId,
     now_ms: u64,
 ) -> Result<JobRecord, LaunchDecline> {
@@ -941,7 +943,7 @@ pub(crate) fn existing_receipt(
     records: &[JobRecordEnvelope],
     intent: &LaunchIntent,
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {
-    let digest = aruna_core::structs::execution::job::JobRecordBody::digest(intent).ok()?;
+    let digest = aruna_core::structs::execution::job::family::JobRecordBody::digest(intent).ok()?;
     records.iter().find_map(|envelope| match &envelope.record {
         JobFamilyRecord::Receipt(receipt) if receipt.launch_id == intent.launch_id => {
             match receipt.launch_digest == digest {
@@ -986,7 +988,8 @@ fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
 mod tests {
     use aruna_core::job_request;
     use aruna_core::scheduling::PlannedInput;
-    use aruna_core::structs::execution::job::{InputMode, InputSelection, JobId, WorkspaceOutput};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::{InputMode, InputSelection, WorkspaceOutput};
 
     use super::*;
     use crate::tests::records::{Family, REALM};
@@ -1169,7 +1172,7 @@ mod tests {
         launch.inputs.push(PlannedInput {
             destination_key: "reads.fastq".to_string(),
             version_id,
-            content: aruna_core::structs::execution::job::InputContent::Blake3([12u8; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([12u8; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_node_id: None,

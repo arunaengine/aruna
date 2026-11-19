@@ -20,15 +20,14 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::distribution::fence::LocalFence;
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionView, KeyRange, RouteError, WriteRoute,
-};
+use aruna_core::structs::storage::distribution::route::{RouteError, WriteRoute};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
+use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
 use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
-use aruna_core::structs::synced_folder::refusal_kind;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ORIGIN_DEVICE_TAG, RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull,
-    SyncPullAck, SyncRefusal, SyncVersionPage,
+    SyncPullAck, SyncRefusal, SyncVersionPage, refusal_kind,
 };
 use aruna_core::types::{GroupId, Key, Value};
 use tracing::{debug, warn};
@@ -1444,8 +1443,9 @@ mod tests {
         use crate::staging::offer::run::{offer_directory, withdraw_offer};
         use crate::staging::offered_directory::{OfferDirectoryInput, WithdrawOfferInput};
         use crate::tests::device::store_folder;
-        use aruna_core::structs::synced_folder::folder_bucket;
-        use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
+        use aruna_core::structs::synced_folder::{
+            FolderMode, FolderState, RemoteBinding, SyncedFolder, folder_bucket,
+        };
 
         let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);

@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ASSISTANT_USAGE_KEYSPACE, CENTRAL_ASSISTANT_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::{
+use aruna_core::structs::central_assistant::{
     AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, QuotaReached, charge,
 };
 use aruna_core::types::{Key, Value};

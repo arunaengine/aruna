@@ -5,10 +5,11 @@
 use ulid::Ulid;
 
 use super::*;
-use crate::structs::storage::distribution::snapshot::OpenTransfer;
-use crate::structs::storage::distribution::{
-    DistributionRequest, DistributionSettings, TransferRole, next_snapshot,
+use crate::structs::storage::distribution::DistributionSettings;
+use crate::structs::storage::distribution::request::{
+    DistributionRequest, TransferRole, next_snapshot,
 };
+use crate::structs::storage::distribution::snapshot::OpenTransfer;
 
 fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])

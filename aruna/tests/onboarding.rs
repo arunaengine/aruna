@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase};
-use aruna_core::placement::build_view;
+use aruna_core::placement::resolver::build_view;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::node_state::PersistedNodeIdentity;
 use aruna_core::structs::identity::user::User;

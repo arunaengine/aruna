@@ -21,7 +21,9 @@ use aruna_core::structs::execution::harvest::{
     HarvestJobSpec, HarvestProvenance, HarvestRecordState, HarvestSelector, HarvestSource,
     RepositoryConnector, RepositoryConnectorKind,
 };
-use aruna_core::structs::execution::job::{JobError, JobErrorKind, JobProgress, JobResultPayload};
+use aruna_core::structs::execution::job::local::{
+    JobError, JobErrorKind, JobProgress, JobResultPayload,
+};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};

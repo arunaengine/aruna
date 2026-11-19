@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::JobRecordError;
-use aruna_core::structs::execution::job::JobTransitionError;
+use aruna_core::structs::execution::job::family::JobRecordError;
+use aruna_core::structs::execution::job::local::JobTransitionError;
 use thiserror::Error;
 
 #[derive(Debug, PartialEq, Error)]

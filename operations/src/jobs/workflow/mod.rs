@@ -34,10 +34,11 @@ use aruna_core::compute::{
 };
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, LaunchRecord,
-    PhysicalExecutionState, recorded_env,
-};
+use aruna_core::structs::execution::job::family::PhysicalExecutionState;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::launch::{LaunchRecord, recorded_env};
+use aruna_core::structs::execution::job::local::{AttemptIntent, JobError, JobRecord};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
 use tracing::warn;

@@ -4,9 +4,8 @@
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::id::NodeId;
-use aruna_core::placement::{
-    PlacementResolutionContext, resolve_shard_holders, target_placement_ref,
-};
+use aruna_core::placement::resolver::PlacementResolutionContext;
+use aruna_core::placement::{resolve_shard_holders, target_placement_ref};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};

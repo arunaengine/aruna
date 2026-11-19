@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::execution::job::{ExportRoCrateSpec, ImportRoCrateSpec};
+use aruna_core::structs::execution::job::input::{ExportRoCrateSpec, ImportRoCrateSpec};
 use rand::RngExt;
 
 use super::job_host::{job_scope, run_hosted};

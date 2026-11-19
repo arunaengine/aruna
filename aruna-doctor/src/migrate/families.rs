@@ -12,15 +12,19 @@ use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, RUN_CRATE_KEYSPACE,
 };
-use aruna_core::structs::execution::job::prune_delete_entries;
+use aruna_core::structs::execution::job::family::{
+    EffectiveResources, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
+    JobRetryPolicy, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::local::{
+    JobRecord, RunCrateStatus, cleanup_job_id, job_entry_prefix,
+};
 use aruna_core::structs::execution::job::record_rows::{
     ConflictRecord, PendingNeed, PendingRecord,
 };
-use aruna_core::structs::execution::job::{
-    EffectiveResources, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobId,
-    JobPayload, JobRecord, JobRecordEnvelope, JobRetryPolicy, RunCrateStatus, SubmissionClaim,
-    SubmissionId, WitnessBudgetRecord, cleanup_job_id, job_entry_prefix,
-};
+use aruna_core::structs::execution::job::rows::prune_delete_entries;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -514,14 +518,16 @@ mod tests {
         JOB_RESERVATION_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
         WITNESS_DEADLINE_KEYSPACE,
     };
-    use aruna_core::structs::execution::job::job_insert_entries;
-    use aruna_core::structs::execution::job::record_rows::{PendingNeed, PendingRecord};
-    use aruna_core::structs::execution::job::{
-        EffectiveResources, ExecutionReceipt, ExecutionSpec, JobAdmissionRecord, JobFamilyId,
-        JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, JobRecordKey,
-        JobRecordKind, JobRetryPolicy, LaunchIntent, RunCrateStatus, SubmissionClaim, SubmissionId,
-        WitnessBudgetRecord,
+    use aruna_core::structs::execution::job::family::{
+        EffectiveResources, ExecutionReceipt, JobAdmissionRecord, JobFamilyId, JobFamilyRecord,
+        JobRecordEnvelope, JobRecordKey, JobRecordKind, JobRetryPolicy, LaunchIntent,
+        SubmissionClaim, SubmissionId, WitnessBudgetRecord,
     };
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::{JobRecord, RunCrateStatus};
+    use aruna_core::structs::execution::job::record_rows::{PendingNeed, PendingRecord};
+    use aruna_core::structs::execution::job::rows::job_insert_entries;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::placement::record::PlacementRef;

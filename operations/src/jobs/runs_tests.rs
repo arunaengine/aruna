@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
-use aruna_core::structs::execution::job::{RunCrateStatus, RunLink};
+use aruna_core::structs::execution::job::local::{RunCrateStatus, RunLink};
 use aruna_core::structs::identity::auth::{Actor, PathRestriction, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};

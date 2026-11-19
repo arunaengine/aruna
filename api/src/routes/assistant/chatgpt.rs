@@ -9,7 +9,7 @@ use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;
-use aruna_core::structs::{
+use aruna_core::structs::assistant_provider::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
     AssistantProviderStatus,
 };

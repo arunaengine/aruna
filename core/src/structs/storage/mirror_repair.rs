@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::ConversionError;
 use crate::keyspaces::MIRROR_REPAIR_KEYSPACE;
-use crate::structs::SyncRelationship;
+use crate::structs::sync_relationship::SyncRelationship;
 use crate::types::{Key, KeySpace, Value};
 
 pub const RECONCILE_GRACE: Duration = Duration::from_secs(30);

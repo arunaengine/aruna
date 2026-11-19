@@ -2884,7 +2884,7 @@ async fn oidc_conflict_withholds() {
     let providers = config_oidc_providers(&config);
     assert!(!providers.contains_key("default"));
     assert_eq!(providers.get("untouched"), Some(&untouched));
-    let path = aruna_core::reducer::config_oidc_path("default");
+    let path = aruna_core::reducer::paths::config_oidc_path("default");
     assert!(
         read_storage_value(
             &storage,

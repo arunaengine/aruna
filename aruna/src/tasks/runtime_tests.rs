@@ -14,10 +14,11 @@ use aruna_core::heartbeat::RunningJobs;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::ProgressReporter;
 use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    AttemptIntent, JobClaim, JobExecutionClass, JobId, JobPayload, JobRecord, JobResultPayload,
+use aruna_core::structs::execution::job::identity::{JobExecutionClass, JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    AttemptIntent, JobClaim, JobError, JobRecord, JobResultPayload,
 };
-use aruna_core::structs::execution::job::{JobError, JobState};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};

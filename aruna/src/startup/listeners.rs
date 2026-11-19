@@ -153,7 +153,7 @@ struct SessionS3 {
     realm_id: aruna_core::structs::identity::realm::RealmId,
     node_id: iroh::PublicKey,
     key: aruna_core::credential_encryption::CredentialEncryptionKey,
-    rocrate_limits: aruna_core::structs::execution::job::RoCrateLimits,
+    rocrate_limits: aruna_core::structs::execution::job::input::RoCrateLimits,
 }
 
 /// Serves the node's S3 plane on the session bridge gateway too. A bind failure
@@ -553,7 +553,7 @@ mod tests {
     #[tokio::test]
     async fn session_exit_reports() {
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_tasks::shutdown::Shutdown;
 
@@ -867,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn session_listener_completes() {
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_tasks::shutdown::Shutdown;
 
@@ -919,7 +919,7 @@ mod tests {
     #[tokio::test]
     async fn abort_awaits_children() {
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_tasks::shutdown::Shutdown;
 

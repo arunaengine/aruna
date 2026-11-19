@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::structs::{FolderState, SyncedFolder};
+use aruna_core::structs::synced_folder::{FolderState, SyncedFolder};
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_tasks::TaskHandle;
 use tracing::warn;

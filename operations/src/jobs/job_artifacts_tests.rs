@@ -7,7 +7,7 @@ use std::time::UNIX_EPOCH;
 
 use aruna_core::jobs::WireArtifact;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::ExportOmissionCounts;
+use aruna_core::structs::execution::job::input::ExportOmissionCounts;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredFormat;
@@ -61,7 +61,7 @@ fn export_record(artifact: Option<ArtifactRef>) -> JobRecord {
     let mut record = record_of(JobPayload::ExportRoCrate(export_spec(auth_of(owner()))));
     record.state = JobState::Succeeded;
     record.result = Some(JobResultPayload::ExportRoCrate(
-        aruna_core::structs::execution::job::ExportRoCrateResult {
+        aruna_core::structs::execution::job::input::ExportRoCrateResult {
             repository: None,
             artifact,
             included: 0,

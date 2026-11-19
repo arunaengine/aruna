@@ -26,16 +26,16 @@ use crate::storage_entries::{
 };
 use crate::structs::identity::group_delete::{GroupWriteError, check_group_write};
 use crate::structs::identity::realm::RealmId;
+use crate::structs::persistent_id::{
+    PersistentIdMapping, persistent_id_change, persistent_id_key, persistent_id_target,
+    secondary_index_deletes, secondary_index_entries,
+};
 use crate::structs::placement::binding_directory::BindingError;
 use crate::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_change, placement_policy_target,
 };
 use crate::structs::placement::record::{DocumentClass, PlacementRef, PlacementScope};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
-use crate::structs::{
-    PersistentIdMapping, persistent_id_change, persistent_id_key, persistent_id_target,
-    secondary_index_deletes, secondary_index_entries,
-};
 use crate::structured_id::MetaResourceId;
 use crate::types::{Key, KeySpace, Value};
 

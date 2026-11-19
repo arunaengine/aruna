@@ -14,9 +14,9 @@ use aruna_core::compute::{
 use aruna_core::events::Event;
 use aruna_core::jobs::JobEvent;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    AttemptControl, JobError, JobErrorKind, JobProgress, JobRecord, JobResultPayload,
-    MAX_MESSAGE_BYTES, OutputObject, tail_str,
+use aruna_core::structs::execution::job::family::{MAX_MESSAGE_BYTES, tail_str};
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, JobError, JobErrorKind, JobProgress, JobRecord, JobResultPayload, OutputObject,
 };
 use tracing::{info, warn};
 

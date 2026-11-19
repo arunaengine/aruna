@@ -5,7 +5,6 @@
 use super::storage::*;
 use super::*;
 use crate::test_support::test_endpoint;
-use ::irokle::sync::SyncData;
 use aruna_clock::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::admin_checks::{has_write_permission, revocation_origin_known};
 use aruna_core::admin_documents::{
@@ -34,18 +33,21 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, GraphPruneRecord, MetadataDeleteRecord, MetadataEventPayload,
     MetadataEventRecord, MetadataLifecycleRecord,
 };
-use aruna_core::reducer::{
-    AdminDocumentState, CONFIG_DESCRIPTION_PATH, CONFIG_STRATEGY_PATH, METADATA_REPLICATION_PATH,
-    REVOCATIONS_PER_ORIGIN, USER_NAME_PATH, config_node_path, decode_reducer_state,
-    group_user_path, materialize_user_operation, needs_revocation_index, overlay_realm_config,
-    realm_user_path, user_attribute_path,
+use aruna_core::reducer::overlay::{
+    materialize_user_operation, needs_revocation_index, overlay_realm_config,
 };
+use aruna_core::reducer::paths::{
+    CONFIG_DESCRIPTION_PATH, CONFIG_STRATEGY_PATH, METADATA_REPLICATION_PATH, USER_NAME_PATH,
+    config_node_path, group_user_path, realm_user_path, user_attribute_path,
+};
+use aruna_core::reducer::revocation::REVOCATIONS_PER_ORIGIN;
+use aruna_core::reducer::{AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{
     create_acceptance_key, event_log_key, metadata_document_key, metadata_registry_key,
     reducer_conflict_key, reducer_state_entry, reducer_state_key, registry_write_entries,
     subject_index_key, subject_index_value,
 };
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::notification_watch::WatchInterestDigest;
 use aruna_core::structs::identity::auth::{Actor, Permission, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument, owner_group_key};
@@ -55,6 +57,9 @@ use aruna_core::structs::identity::realm::{
     UserCapOverride,
 };
 use aruna_core::structs::identity::user::User;
+use aruna_core::structs::persistent_id::{
+    PersistentIdMapping, persistent_id_change, persistent_id_key, persistent_id_target,
+};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_target,
 };
@@ -65,9 +70,8 @@ use aruna_core::structs::placement::record::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::usage::NodeUsageSnapshot;
-use aruna_core::structs::{
-    PersistentIdMapping, QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord,
-    SyncQuarantineUsage, persistent_id_change, persistent_id_key, persistent_id_target,
+use aruna_core::structs::sync_quarantine::{
+    QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord, SyncQuarantineUsage,
 };
 use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 use aruna_core::sync_checks::{
@@ -75,6 +79,7 @@ use aruna_core::sync_checks::{
     validate_watch_upsert,
 };
 use aruna_core::user::id::UserId;
+use ::irokle::sync::SyncData;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use tempfile::TempDir;

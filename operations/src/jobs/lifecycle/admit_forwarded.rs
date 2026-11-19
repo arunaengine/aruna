@@ -11,7 +11,8 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{InputPage, PageManifest, SubmissionId, spec_entries};
+use aruna_core::structs::execution::job::family::SubmissionId;
+use aruna_core::structs::execution::job::pages::{InputPage, PageManifest, spec_entries};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::group_permission_path;
@@ -363,7 +364,7 @@ mod tests {
     use crate::tests::records::{Family, REALM, local_ingress, node, payload, user};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::job_request::SubmissionScope;
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::user::id::UserId;
     use ulid::Ulid;
 

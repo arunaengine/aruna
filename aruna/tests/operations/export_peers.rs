@@ -10,7 +10,7 @@ use aruna_core::events::Event;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::user::id::UserId;

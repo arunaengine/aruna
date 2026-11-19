@@ -26,11 +26,12 @@ use aruna_core::jobs::{JobEffect, JobEvent, JobStops};
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::repository::RepositoryPull;
 use aruna_core::rocrate_archive::{ArchiveCompression, ArchiveInspection};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::identity::{JobId, SYSTEM_ENTRY_PREFIX};
+use aruna_core::structs::execution::job::input::{
     ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
-    ImportRoCrateSpec, JobError, JobId, JobResultPayload, ReasonCode, RoCrateCheckpointRefs,
-    SYSTEM_ENTRY_PREFIX,
+    ImportRoCrateSpec, ReasonCode, RoCrateCheckpointRefs,
 };
+use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo, HiddenBlobKey};
@@ -683,7 +684,7 @@ pub(crate) mod tests {
     use crate::jobs::repository::test_support::{
         artifact, job_id, job_scope, local_scope, owner_node, realm,
     };
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::input::{
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateTarget, RoCrateLimits,
     };
     use aruna_core::structs::identity::auth::AuthContext;

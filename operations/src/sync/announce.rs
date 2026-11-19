@@ -11,12 +11,11 @@ use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
 use aruna_core::operation::Operation;
-use aruna_core::repository::RepositoryLink;
+use aruna_core::repository::link::RepositoryLink;
 use aruna_core::rows::{read_row, values};
 use aruna_core::storage_entries::lifecycle_revision_change;
-use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRevision};
-use aruna_core::structs::persistent_id_change;
+use aruna_core::structs::persistent_id::{PersistentIdMapping, persistent_id_change};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_change,
 };

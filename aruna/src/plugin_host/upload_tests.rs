@@ -7,8 +7,8 @@ use aruna_drivers::driver::drive;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aruna_core::structs::execution::job::UploadForm;
-use aruna_core::structs::execution::job::{JobErrorKind, PluginWorkAction};
+use aruna_core::structs::execution::job::input::{PluginWorkAction, UploadForm};
+use aruna_core::structs::execution::job::local::JobErrorKind;
 use axum::http::{HeaderMap, StatusCode};
 use serde_json::json;
 

@@ -28,10 +28,10 @@ mod tests {
     };
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::storage::blob::BucketInfo;
-    use aruna_core::structs::storage::distribution::DistributionSnapshot;
     use aruna_core::structs::storage::distribution::accounting::{
         Charge, RangeAccount, RangeCounters, account_key, generation_key, pending_key,
     };
+    use aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot;
     use aruna_core::structs::storage::usage::UsageCounters;
     use aruna_core::types::{GroupId, Value};
     use aruna_drivers::driver::{DriverContext, drive};

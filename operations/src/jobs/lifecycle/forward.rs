@@ -12,7 +12,7 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::SubmissionId;
+use aruna_core::structs::execution::job::family::SubmissionId;
 use tracing::{debug, warn};
 
 use super::admit_here::AcceptedSubmission;
@@ -158,7 +158,8 @@ mod tests {
     use crate::tests::records::{node, payload, user};
     use aruna_core::events::PeerRequestError;
     use aruna_core::job_request::SubmissionScope;
-    use aruna_core::structs::execution::job::{JobId, LogicalJobState};
+    use aruna_core::structs::execution::job::family::LogicalJobState;
+    use aruna_core::structs::execution::job::identity::JobId;
 
     fn request() -> SubmissionRequest {
         SubmissionRequest {

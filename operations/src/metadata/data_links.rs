@@ -25,8 +25,9 @@ use aruna_core::structs::storage::data::link::{
     DataLink, LinkPosting, MAX_DOCUMENT_LINKS, MAX_LINK_SUBJECTS, document_key, posting_document,
     posting_key,
 };
+use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::distribution::inventory::index_key;
-use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::types::Key;
 use byteview::ByteView;
 use thiserror::Error;

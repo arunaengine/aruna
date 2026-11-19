@@ -4,15 +4,18 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::repository::remote::NodeScope;
-use aruna_core::repository::{
+use aruna_core::repository::link::{
     LinkDirection, LinkFailure, LinkPull, LinkRemote, LinkStatus, PULL_CHECK_MS, PullCheck,
-    PushOutcome, RepositoryLink, RepositoryPull, RepositoryRecord,
+    PushOutcome, RepositoryLink,
 };
+use aruna_core::repository::remote::NodeScope;
+use aruna_core::repository::{RepositoryPull, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{
-    ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobRecord, JobState,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
 };
+use aruna_core::structs::execution::job::local::JobRecord;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

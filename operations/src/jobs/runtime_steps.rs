@@ -9,9 +9,10 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    JobError, JobErrorKind, JobExecutionClass, JobId, JobProgress, JobRecord, JobResultPayload,
-    KeyWait, LEASE_INDEX_PREFIX, parse_schedule_key,
+use aruna_core::structs::execution::job::identity::{JobExecutionClass, JobId, LEASE_INDEX_PREFIX};
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::local::{
+    JobError, JobErrorKind, JobProgress, JobRecord, JobResultPayload, parse_schedule_key,
 };
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::types::Key;

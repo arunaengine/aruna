@@ -23,9 +23,9 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BucketInfo, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::storage::distribution::{
-    DistributionSettings, DistributionSnapshot, OriginalEpoch, Publication,
-};
+use aruna_core::structs::storage::distribution::delivery::Publication;
+use aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot;
+use aruna_core::structs::storage::distribution::{DistributionSettings, OriginalEpoch};
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
 use aruna_storage::storage::handle::StorageHandle;

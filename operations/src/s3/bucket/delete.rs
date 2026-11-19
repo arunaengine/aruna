@@ -37,7 +37,9 @@ use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRecord
 use aruna_core::structs::storage::group_backend::{BUCKET_DELETING, BUCKET_STATE, GroupStorage};
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::usage::{UsageDelta, usage_bucket_key};
-use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
+use aruna_core::structs::sync_relationship::{
+    SyncRelationship, sync_relationship_key, sync_relationship_prefix,
+};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::user::id::UserId;
@@ -912,7 +914,9 @@ mod test {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::storage::usage::BucketCounters;
-    use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot, sync_relationship_key};
+    use aruna_core::structs::sync_relationship::{
+        SyncMode, SyncState, SyncStatusSnapshot, sync_relationship_key,
+    };
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::time::SystemTime;

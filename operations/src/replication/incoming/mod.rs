@@ -41,7 +41,7 @@ use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::replication_protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use aruna_core::rows::read_row;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::NODE_SUBJECT_KEY;
@@ -56,11 +56,10 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::bucket_metadata::strip_release_keys;
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::distribution::delivery::AdmissionError;
 use aruna_core::structs::storage::distribution::inventory::{VersionEntry, logical_identity};
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
-use aruna_core::structs::storage::distribution::{
-    AdmissionError, DistributionBinding, OriginalEpoch,
-};
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
@@ -80,7 +79,7 @@ use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
 };
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::structs::tagged_receipt;
+use aruna_core::structs::synced_folder::tagged_receipt;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{GroupId, Key, Value};
 use std::time::{Duration, SystemTime};

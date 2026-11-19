@@ -17,12 +17,17 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
 use aruna_core::structs::storage::distribution::capacity::RangeSize;
-use aruna_core::structs::storage::distribution::snapshot::RangeFill;
+use aruna_core::structs::storage::distribution::request::{
+    DistributionRequest, TransferRole, next_snapshot,
+};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, RangeFill,
+};
 use aruna_core::structs::storage::distribution::split::split_ids;
+use aruna_core::structs::storage::distribution::validate::DistributionError;
 use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionError, DistributionMember, DistributionRequest, DistributionRevision,
-    DistributionSettings, DistributionSnapshot, DistributionView, MemberState, MetadataCoverage,
-    RangeBehaviour, TransferRole, next_snapshot,
+    DataStrategy, DistributionMember, DistributionRevision, DistributionSettings, MemberState,
+    MetadataCoverage, RangeBehaviour,
 };
 use ulid::Ulid;
 

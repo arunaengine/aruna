@@ -10,7 +10,9 @@ use aruna_core::compute::{ExecutorKind, FenceContext, UserSpec};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::Effect;
 use aruna_core::jobs::JobEffect;
-use aruna_core::structs::execution::job::{ExecutionSpec, JobId, JobRecord};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::ExecutionSpec;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::storage::routing::NodeRouting;
 use ulid::Ulid;
 

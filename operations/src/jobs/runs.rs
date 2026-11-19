@@ -4,7 +4,8 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{JobId, RunCrateStatus, RunLink};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::{RunCrateStatus, RunLink};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;

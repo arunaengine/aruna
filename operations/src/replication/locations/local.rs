@@ -23,7 +23,6 @@ use aruna_core::request_policy::{
     CompiledPolicySet, PolicyDecision, PolicyRequestExtras, policy_request_with,
 };
 use aruna_core::rows::read_row;
-use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -35,6 +34,7 @@ use aruna_core::structs::storage::blob::{
     object_permission_path,
 };
 use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::synced_folder::ORIGIN_DEVICE_TAG;
 use aruna_core::types::Value;
 use aruna_core::user::id::UserId;
 use std::time::SystemTime;
@@ -871,7 +871,7 @@ mod pure_tests {
         let version_id = Ulid::from_bytes([3u8; 16]);
         let mut version = materialized();
         version.metadata.insert(
-            aruna_core::structs::ORIGIN_DEVICE_TAG.to_string(),
+            aruna_core::structs::synced_folder::ORIGIN_DEVICE_TAG.to_string(),
             "device-ada".to_string(),
         );
         let mut operation = authorized(Some(version_id));

@@ -9,9 +9,8 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputSelection, SubmissionId,
-};
+use aruna_core::structs::execution::job::family::SubmissionId;
+use aruna_core::structs::execution::job::input::{CapturedInput, ExecutionSpec, InputSelection};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 
@@ -253,7 +252,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{REALM, captured_input, node, payload, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{InputMode, InputSource};
+    use aruna_core::structs::execution::job::input::{InputMode, InputSource};
     use ulid::Ulid;
 
     fn input(key: &str, version: Option<&str>, holder: Option<NodeId>) -> InputSelection {

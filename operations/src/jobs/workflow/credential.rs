@@ -12,9 +12,9 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::validate_restriction_limits;
-use aruna_core::structs::execution::job::{
-    ExecutionSpec, JobError, JobId, JobRecord, workspace_credential_id,
-};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::ExecutionSpec;
+use aruna_core::structs::execution::job::local::{JobError, JobRecord, workspace_credential_id};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{

@@ -6,14 +6,18 @@ use std::collections::BTreeMap;
 
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{
-    CancelAuthority, CollisionPolicy, ComputeResources, EffectiveResources, ExecutionOutputRecord,
-    ExecutionReceipt, ExecutionSpec, ExecutionUpdate, JobAdmissionRecord, JobCancelRecord,
-    JobFamilyId, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope, JobRetryPolicy,
-    LaunchIntent, LogicalJobSpec, OutputObject, OutputSet, PhysicalExecutionResult,
-    PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+use aruna_core::structs::execution::job::family::{
+    CancelAuthority, EffectiveResources, ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate,
+    JobAdmissionRecord, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobRecordBody,
+    JobRecordEnvelope, JobRetryPolicy, LaunchIntent, LogicalJobSpec, OutputSet,
+    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId,
+    WitnessBudgetRecord,
 };
-use aruna_core::structs::execution::job::{CapturedInput, InputContent, InputSelection};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, CollisionPolicy, ComputeResources, ExecutionSpec, InputContent, InputSelection,
+};
+use aruna_core::structs::execution::job::local::OutputObject;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::user::id::UserId;
@@ -125,7 +129,7 @@ impl Family {
             group_id: Ulid::from_bytes([2u8; 16]),
             created_by: user(),
             created_at_ms: 1_000,
-            retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::identity::RETENTION_MS,
             payload: payload(),
             request_digest: self.request_digest,
             spec_digest: [0u8; 32],

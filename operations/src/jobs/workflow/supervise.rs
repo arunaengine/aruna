@@ -14,7 +14,8 @@ use aruna_core::compute::{AttemptStatus, BackendError};
 use aruna_core::events::Event;
 use aruna_core::jobs::JobEvent;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{JobId, JobRecord};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::JobRecord;
 use tracing::warn;
 use ulid::Ulid;
 

@@ -7,12 +7,16 @@ use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
+use aruna_core::repository::ImportMode;
+use aruna_core::repository::credential::RepositoryCredential;
+use aruna_core::repository::kind::descriptor;
+use aruna_core::repository::link::LinkFailure;
 use aruna_core::repository::remote::{
     JobStop, NodeScope, RemoteAnswer, RemoteCall, RemoteFailure, RemoteRequest, StopReason,
 };
-use aruna_core::repository::{ImportMode, LinkFailure, RepositoryCredential, descriptor};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{ImportRoCrateSource, ImportRoCrateSpec, JobId};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ImportRoCrateSource, ImportRoCrateSpec};
 use ulid::Ulid;
 
 use crate::harvest::read_connector::ConnectorView;

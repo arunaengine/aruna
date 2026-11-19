@@ -17,8 +17,7 @@ use crate::metadata::MetadataEffect;
 use crate::node_vault::VaultEntry;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::WriteGuard;
-use crate::structs::execution::job::{JobRecordEnvelope, JobRecordKind};
+use crate::structs::execution::job::family::{JobRecordEnvelope, JobRecordKind};
 use crate::structs::execution::source_access::{ListRequest, ResolvedSourceAccess, SourceMetadata};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
@@ -33,6 +32,7 @@ use crate::structs::storage::format::Compression;
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use crate::structs::storage::multipart::{BackendUpload, MultipartPart, WorkingShare};
 use crate::structs::storage::usage::{BucketDelta, UsageDelta};
+use crate::structs::synced_folder::WriteGuard;
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
 use crate::user::id::UserId;
@@ -822,9 +822,9 @@ pub enum NetEffect {
     /// Signs a distribution snapshot; only a snapshot naming this node as publisher.
     SnapshotSign(Box<crate::structs::storage::distribution::snapshot::SnapshotClaim>),
     /// Signs a member statement; only a claim naming this node as signer.
-    StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
+    StatementSign(Box<crate::structs::storage::distribution::statement::StatementClaim>),
     /// Signs one job record of an execution; only a claim naming this node as publisher.
-    ExecutionSign(Box<crate::structs::execution::job::ExecutionClaim>),
+    ExecutionSign(Box<crate::structs::execution::job::family::ExecutionClaim>),
     /// Sends one notification request frame to a holder and reads its answer frame.
     Notification(Box<crate::structs::execution::notification::NotificationRequest>),
     /// Wakes the live inbox streams of these local recipients.

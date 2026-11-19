@@ -10,10 +10,12 @@ use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{ARTIFACT_TOMBSTONE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    JobDeletes, JobId, JobPayload, JobRecord, JobResultPayload, PRUNE_INDEX_PREFIX, cleanup_job_id,
-    parse_schedule_key, prune_delete_entries,
+use aruna_core::structs::execution::job::identity::{JobId, PRUNE_INDEX_PREFIX};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    JobRecord, JobResultPayload, cleanup_job_id, parse_schedule_key,
 };
+use aruna_core::structs::execution::job::rows::{JobDeletes, prune_delete_entries};
 use aruna_core::structs::storage::blob::HiddenBlobKey;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -433,11 +435,12 @@ pub(crate) mod tests {
         ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
         STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE,
     };
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::identity::{JobId, JobState};
+    use aruna_core::structs::execution::job::input::{
         ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateResult,
-        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload,
-        JobProgress, JobRecord, JobResultPayload, JobState, RoCrateLimits,
+        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, RoCrateLimits,
     };
+    use aruna_core::structs::execution::job::local::{JobProgress, JobRecord, JobResultPayload};
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::TaskEvent;
@@ -477,7 +480,7 @@ pub(crate) mod tests {
     }
 
     fn prune_key(expiry_ms: u64, job_id: JobId) -> Key {
-        aruna_core::structs::execution::job::job_prune_key(expiry_ms, job_id)
+        aruna_core::structs::execution::job::local::job_prune_key(expiry_ms, job_id)
     }
 
     fn is_child(next: &PruneNext) -> bool {

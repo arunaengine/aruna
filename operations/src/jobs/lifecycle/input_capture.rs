@@ -14,9 +14,8 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputContent, InputSelection, SubmissionId,
-};
+use aruna_core::structs::execution::job::family::SubmissionId;
+use aruna_core::structs::execution::job::input::{CapturedInput, InputContent, InputSelection};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
@@ -648,7 +647,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{REALM, captured_input, node, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{InputMode, InputSource};
+    use aruna_core::structs::execution::job::input::{InputMode, InputSource};
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::MultipartChecksumType;

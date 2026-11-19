@@ -15,9 +15,8 @@ use aruna_core::federation::{
 };
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::reducer::{
-    AdminDocumentError, AdminDocumentState, CONFIG_DESCRIPTION_PATH, CONFIG_FEDERATION_PATH,
-};
+use aruna_core::reducer::paths::{CONFIG_DESCRIPTION_PATH, CONFIG_FEDERATION_PATH};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };

@@ -9,11 +9,13 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::JobStatusView;
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE};
 use aruna_core::scheduling::{PlanCandidate, PlannedInput};
-use aruna_core::structs::execution::job::{
-    CancelAuthority, JobFamilyId, JobFamilyRecord, JobId, JobProjection, JobRecordEnvelope,
-    JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
-    PhysicalExecutionResult, PhysicalExecutionState, ProjectedExecution, SubmissionId,
+use aruna_core::structs::execution::job::family::{
+    CancelAuthority, JobFamilyId, JobFamilyRecord, JobProjection, JobRecordEnvelope, JobRecordKey,
+    JobRecordKind, LogicalJobSpec, LogicalJobState, PhysicalExecutionResult, PhysicalExecutionState,
+    ProjectedExecution, SubmissionId,
 };
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::OutputObject;
 use aruna_core::types::Key;
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::debug;
@@ -428,7 +430,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{Family, node};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{CancelAuthority, OutputSet};
+    use aruna_core::structs::execution::job::family::{CancelAuthority, OutputSet};
 
     fn projection(fixture: &Family) -> JobProjection {
         let family = fixture.family();

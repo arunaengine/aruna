@@ -3,13 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::OutputObject;
-
 use super::*;
 use crate::plugins::calls::*;
 use crate::plugins::submit::WorkRequest;
 use crate::plugins::test_support::{edit_work, request, scope};
 use crate::plugins::work::{FinalState, WorkState};
+use aruna_core::structs::execution::job::local::OutputObject;
 use aruna_test_support::plugins::Fixture;
 use aruna_test_support::plugins::ready;
 
@@ -120,7 +119,7 @@ async fn cancel_stops_job() {
 }
 
 mod operations {
-    use aruna_core::structs::execution::job::JobRecord;
+    use aruna_core::structs::execution::job::local::JobRecord;
     use serde_json::json;
 
     use super::*;

@@ -14,7 +14,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::storage::distribution::Publication;
+use aruna_core::structs::storage::distribution::delivery::Publication;
 use aruna_core::structs::storage::distribution::source_root::SourceRoot;
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};

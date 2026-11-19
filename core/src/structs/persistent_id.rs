@@ -6,7 +6,7 @@ use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, 
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::keyspaces::SECONDARY_ID_KEYSPACE;
-use crate::structs::execution::job::JobId;
+use crate::structs::execution::job::identity::JobId;
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::secondary_id::{SecondaryIdentifier, insert_identifier};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;

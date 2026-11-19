@@ -44,13 +44,14 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::node_state::DrainStateOperation;
 use aruna_core::node_state::SetDrainOperation;
-use aruna_core::placement::{build_view, held_buckets};
+use aruna_core::placement::held_buckets;
+use aruna_core::placement::resolver::build_view;
 use aruna_core::storage_entries::metadata_registry_key;
-use aruna_core::structs::execution::job::record_keys::kind_prefix;
-use aruna_core::structs::execution::job::record_rows::ProjectionCache;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LogicalJobState,
 };
+use aruna_core::structs::execution::job::record_keys::kind_prefix;
+use aruna_core::structs::execution::job::record_rows::ProjectionCache;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::node_subject::NODE_SUBJECT_KEY;
 use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
@@ -612,22 +613,22 @@ async fn counts_held_documents() {
 
 fn family(seed: u8) -> JobFamilyId {
     JobFamilyId {
-        submission_id: aruna_core::structs::execution::job::SubmissionId([seed; 32]),
+        submission_id: aruna_core::structs::execution::job::family::SubmissionId([seed; 32]),
         request_digest: [seed; 32],
     }
 }
 
 fn spec_record(realm_id: RealmId, family: JobFamilyId, group_id: Ulid) -> JobRecordEnvelope {
-    let resources = aruna_core::structs::execution::job::EffectiveResources {
+    let resources = aruna_core::structs::execution::job::family::EffectiveResources {
         cpu_cores: 2,
         ram_bytes: 1_024,
         disk_bytes: 2_048,
         max_walltime_ms: 60_000,
         preemptible: false,
     };
-    let job_id = aruna_core::structs::execution::job::JobId::from_bytes([9u8; 16]);
+    let job_id = aruna_core::structs::execution::job::identity::JobId::from_bytes([9u8; 16]);
     let origin = node(1);
-    let spec = aruna_core::structs::execution::job::LogicalJobSpec {
+    let spec = aruna_core::structs::execution::job::family::LogicalJobSpec {
         submission_id: family.submission_id,
         job_id,
         origin_node_id: origin,
@@ -636,8 +637,8 @@ fn spec_record(realm_id: RealmId, family: JobFamilyId, group_id: Ulid) -> JobRec
         group_id,
         created_by: aruna_core::user::id::UserId::nil(realm_id),
         created_at_ms: 1_000,
-        retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
-        payload: aruna_core::structs::execution::job::ExecutionSpec {
+        retention_ms: aruna_core::structs::execution::job::identity::RETENTION_MS,
+        payload: aruna_core::structs::execution::job::input::ExecutionSpec {
             group_id,
             name: None,
             description: None,
@@ -658,10 +659,10 @@ fn spec_record(realm_id: RealmId, family: JobFamilyId, group_id: Ulid) -> JobRec
         request_digest: family.request_digest,
         spec_digest: [0u8; 32],
         resources,
-        retry: aruna_core::structs::execution::job::JobRetryPolicy {
+        retry: aruna_core::structs::execution::job::family::JobRetryPolicy {
             launches_per_witness: 2,
         },
-        admission: aruna_core::structs::execution::job::JobAdmissionRecord {
+        admission: aruna_core::structs::execution::job::family::JobAdmissionRecord {
             submission_id: family.submission_id,
             request_digest: family.request_digest,
             job_id,
@@ -697,15 +698,15 @@ async fn write_family(
         version: aruna_core::structs::execution::job::record_rows::PROJECTION_CACHE_VERSION,
         revision: 1,
         stale: false,
-        projection: Some(aruna_core::structs::execution::job::JobProjection {
+        projection: Some(aruna_core::structs::execution::job::family::JobProjection {
             submission_id: family.submission_id,
             request_digest: family.request_digest,
-            canonical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([9u8; 16]),
+            canonical_job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([9u8; 16]),
             aliases: Vec::new(),
             state,
             canonical_execution_id: None,
             executions: Vec::new(),
-            outputs: aruna_core::structs::execution::job::OutputSet::new(Vec::new())
+            outputs: aruna_core::structs::execution::job::family::OutputSet::new(Vec::new())
                 .expect("empty outputs"),
             cancel_requested: false,
         }),
@@ -732,9 +733,9 @@ async fn write_family(
 async fn write_reservation(ctx: &DriverContext, execution_id: Ulid, cpu: u32) {
     let record = JobReservationRecord {
         execution_id,
-        job_id: aruna_core::structs::execution::job::JobId::from_bytes([9u8; 16]),
-        logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([9u8; 16]),
-        resources: aruna_core::structs::execution::job::EffectiveResources {
+        job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([9u8; 16]),
+        logical_job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([9u8; 16]),
+        resources: aruna_core::structs::execution::job::family::EffectiveResources {
             cpu_cores: cpu,
             ram_bytes: 512,
             disk_bytes: 0,
@@ -874,7 +875,7 @@ async fn merges_group_demand() {
     let shared = DemandFamily {
         submission_id: family(1).submission_id,
         request_digest: family(1).request_digest,
-        resources: aruna_core::structs::execution::job::EffectiveResources {
+        resources: aruna_core::structs::execution::job::family::EffectiveResources {
             cpu_cores: 2,
             ram_bytes: 1_024,
             disk_bytes: 2_048,
@@ -1131,7 +1132,7 @@ fn indexed_family(index: usize) -> JobFamilyId {
     let mut request_digest = [0u8; 32];
     request_digest[..8].copy_from_slice(&(index as u64).to_be_bytes());
     JobFamilyId {
-        submission_id: aruna_core::structs::execution::job::SubmissionId([1u8; 32]),
+        submission_id: aruna_core::structs::execution::job::family::SubmissionId([1u8; 32]),
         request_digest,
     }
 }

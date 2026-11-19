@@ -19,11 +19,13 @@ use super::snapshot::{DistributionSnapshot, Lifecycle};
 use super::split::{admin_split, apply_split};
 use super::validate::validate_config;
 use super::{
-    DistributionConfig, DistributionError, DistributionMember, DistributionSettings,
-    MAX_RECORD_BYTES, MemberState, SetPhase, SetRoot, SignedStatement, StatementKind,
+    DistributionConfig, DistributionMember, DistributionSettings, MAX_RECORD_BYTES, MemberState,
+    SetPhase,
 };
 use crate::calls::IoError;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::distribution::statement::{SetRoot, SignedStatement, StatementKind};
+use crate::structs::storage::distribution::validate::DistributionError;
 
 /// What the former coordinator becomes after a transfer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]

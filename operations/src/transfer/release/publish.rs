@@ -20,8 +20,9 @@ use aruna_core::structs::storage::bucket_metadata::{
     RELEASE_PREFIX_TAG, RELEASE_TAG, ReleasePointer, curator_path, release_prefix,
 };
 use aruna_core::structs::storage::data::identity::content_id;
+use aruna_core::structs::storage::distribution::KeyRange;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
-use aruna_core::structs::storage::distribution::{DistributionView, KeyRange};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::origin::{OriginVersion, SourcePin};
 use aruna_core::structs::storage::release::{
     CrateBytes, CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk, RangeFiles,

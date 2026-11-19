@@ -5,7 +5,9 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
-use aruna_core::structs::{SyncQuarantineRecord, quarantine_row_entry, quarantine_usage_entry};
+use aruna_core::structs::sync_quarantine::{
+    SyncQuarantineRecord, quarantine_row_entry, quarantine_usage_entry,
+};
 use aruna_core::types::{Key, KeySpace, Value};
 
 use super::{QuarantineAdminError, decode_usage, row_read, usage_read};
@@ -106,7 +108,7 @@ mod tests {
     use super::super::tests::{record, record_bytes, usage_bytes};
     use super::*;
     use aruna_core::calls::IoError;
-    use aruna_core::structs::SyncQuarantineUsage;
+    use aruna_core::structs::sync_quarantine::SyncQuarantineUsage;
 
     fn read(value: Option<Value>) -> IoResult {
         IoResult::Values(vec![value])

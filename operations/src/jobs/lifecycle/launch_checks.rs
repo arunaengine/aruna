@@ -15,9 +15,8 @@ use aruna_core::node_state::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputSource, LaunchIntent, LogicalJobSpec,
-};
+use aruna_core::structs::execution::job::family::{LaunchIntent, LogicalJobSpec};
+use aruna_core::structs::execution::job::input::{CapturedInput, InputSource};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::{

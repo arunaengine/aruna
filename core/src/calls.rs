@@ -311,7 +311,7 @@ pub enum IoError {
 }
 
 /// A runner failure says nothing about the request, so the node counts as unavailable.
-impl From<IoError> for crate::structs::SyncRefusal {
+impl From<IoError> for crate::structs::synced_folder::SyncRefusal {
     fn from(_: IoError) -> Self {
         Self::Unavailable
     }

@@ -7,9 +7,9 @@ use aruna_clock::unix_timestamp_millis;
 use super::workflow_fixtures::{execution_spec, node_id};
 use crate::tasks::runner::ComputeReconciler;
 use aruna_compute::registry::ExecutorRegistry;
-use aruna_core::structs::execution::job::{
-    AttemptIntent, JobClaim, JobId, JobPayload, JobRecord, JobState,
-};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{AttemptIntent, JobClaim, JobRecord};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};

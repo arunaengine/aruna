@@ -9,10 +9,11 @@ use aruna_core::events::Event;
 use aruna_core::jobs::{ArchiveRead, JobEffect, JobEvent};
 use aruna_core::metadata::{MetadataError, ProfileValidationFinding};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::repository::{LinkFailure, RepositoryDestination, RepositoryRecord};
+use aruna_core::repository::link::LinkFailure;
+use aruna_core::repository::{RepositoryDestination, RepositoryRecord};
 use aruna_core::rocrate_archive::ArchiveInspection;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{ArtifactRef, ExportReportRow, ExportRoCrateSpec};
+use aruna_core::structs::execution::job::input::{ArtifactRef, ExportReportRow, ExportRoCrateSpec};
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use byteview::ByteView;
 

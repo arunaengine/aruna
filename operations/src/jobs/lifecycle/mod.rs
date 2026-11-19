@@ -5,7 +5,8 @@
 
 use aruna_core::compute::quota::QuotaDenied;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobRecordError};
+use aruna_core::structs::execution::job::family::{JobFamilyId, JobRecordError};
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::realm::{JobFamilyError, RealmConfigDocument, RealmId};
 use aruna_core::types::Value;
 use thiserror::Error;

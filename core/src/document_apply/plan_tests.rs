@@ -40,16 +40,17 @@ use crate::row_plan::{PlanOperation, PlanRows, RowPlan};
 use crate::storage_entries::{
     document_lifecycle_key, registry_delete_entries, registry_write_entries, sync_revision_key,
 };
-use crate::structs::execution::job::JobId;
+use crate::structs::execution::job::identity::JobId;
+use crate::structs::persistent_id::{PersistentIdMapping, PersistentIdRevision};
 use crate::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyPublicationClaim,
 };
 use crate::structs::placement::policy::{PlacementPolicy, PlacementSelector, VerifiedPolicy};
 use crate::structs::placement::record::{LabelMatch, PlacementRef};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
-use crate::structs::{
-    PersistentIdMapping, PersistentIdRevision, QUARANTINE_MAX_RECORDS, SyncQuarantineIdentity,
-    SyncQuarantineUsage, SyncRejection, quarantine_usage_entry,
+use crate::structs::sync_quarantine::{
+    QUARANTINE_MAX_RECORDS, SyncQuarantineIdentity, SyncQuarantineUsage, SyncRejection,
+    quarantine_usage_entry,
 };
 use crate::types::{Key, KeySpace, Value};
 use crate::user::id::UserId;

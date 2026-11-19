@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ActionKind, ActionOutcome, ActionScope, EntrySide, EntryState, FolderMode, FolderState,
     ReplaceReason, SyncActionRecord, SyncBase, SyncedFolder,
 };

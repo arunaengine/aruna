@@ -9,7 +9,7 @@ use nix::{sys::time::TimeValLike, time::ClockId};
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aruna_core::structured_id::IdEnvironment;
+use aruna_core::structured_id::clock_health::IdEnvironment;
 use ulid::Ulid;
 
 #[cfg(feature = "test-hooks")]

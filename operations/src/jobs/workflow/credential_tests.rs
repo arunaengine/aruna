@@ -5,8 +5,9 @@
 use aruna_core::calls::ChildOutcome;
 use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::execution::job::{
-    AttemptIntent, JobErrorKind, JobPayload, workspace_credential_id,
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    AttemptIntent, JobErrorKind, workspace_credential_id,
 };
 use ulid::Ulid;
 

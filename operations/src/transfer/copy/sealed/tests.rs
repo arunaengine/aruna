@@ -507,7 +507,8 @@ mod abe;
 
 #[test]
 fn copy_carries_hint() {
-    use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::storage::distribution::hint::SetHint;
     use aruna_core::structs::storage::format::Compression;
 
     let mut operation = SealedCopyOperation::new(input(&sealed_location(), Ulid::generate()));

@@ -14,11 +14,11 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{read_row, values};
 use aruna_core::structs::storage::blob::BackendLocation;
-use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::on_use::{
     Attachment, CACHE_TOTALS_KEY, CacheEntry, CacheTotals, FillClaim, KeptKind, attachment_key,
 };
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;

@@ -6,10 +6,10 @@ use ulid::Ulid;
 
 use super::*;
 use crate::structs::storage::distribution::presets::replica_layout;
-use crate::structs::storage::distribution::{
-    DistributionConfig, DistributionRequest, DistributionSettings, RouteError, SetRoot, WriteRoute,
-    next_snapshot,
-};
+use crate::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use crate::structs::storage::distribution::route::{RouteError, WriteRoute};
+use crate::structs::storage::distribution::statement::SetRoot;
+use crate::structs::storage::distribution::{DistributionConfig, DistributionSettings};
 
 fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])

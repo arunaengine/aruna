@@ -30,8 +30,9 @@ use aruna_core::structs::placement::policy::{
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
-use aruna_core::structs::storage::distribution::{DistributionBinding, RouteError};
+use aruna_core::structs::storage::distribution::route::RouteError;
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -1518,7 +1519,7 @@ mod tests {
         // key goes on and a later pass decides the refused key again.
         use crate::distribution::guard::GuardError;
         use crate::s3::policy::successor::SuccessorError;
-        use aruna_core::structs::storage::distribution::RouteError;
+        use aruna_core::structs::storage::distribution::route::RouteError;
         let range_id = Ulid::from_bytes([7; 16]);
         for refusal in [
             GuardError::Route(RouteError::StaleRange(range_id)),

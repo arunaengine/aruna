@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{
+use aruna_core::structs::sync_relationship::{
     ReferenceHandling, SyncMode, SyncRelationship, sync_relationship_key, sync_relationship_prefix,
 };
 use aruna_core::types::{Key, Value};

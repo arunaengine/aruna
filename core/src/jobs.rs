@@ -22,10 +22,14 @@ use crate::metadata::AuthToken;
 use crate::operation::SubOperation;
 use crate::rocrate_archive::{ArchiveCompression, ArchiveInspection};
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::execution::job::RoCrateLimits;
-use crate::structs::execution::job::{
-    InputSelection, JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload,
-    JobState, KeyWait, LogicalJobState, StagingJobCheckpoint, SubmissionId, WorkspaceMode,
+use crate::structs::execution::job::family::{LogicalJobState, SubmissionId};
+use crate::structs::execution::job::identity::{JobId, JobState};
+use crate::structs::execution::job::input::{
+    InputSelection, JobPayload, RoCrateLimits, StagingJobCheckpoint,
+};
+use crate::structs::execution::job::key_wait::KeyWait;
+use crate::structs::execution::job::local::{
+    JobError, JobProgress, JobRecord, JobResultPayload, WorkspaceMode,
 };
 use crate::structs::execution::table::GzipCursor;
 use crate::structs::storage::blob::BackendLocation;

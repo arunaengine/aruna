@@ -357,6 +357,7 @@ dependencies = [
  "fjall",
  "flate2",
  "futures-util",
+ "getrandom 0.4.3",
  "hex",
  "ipnet",
  "iroh",

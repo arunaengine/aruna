@@ -9,7 +9,7 @@ use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::LaunchFrame;
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::JobFamilyRecord;
+use aruna_core::structs::execution::job::family::JobFamilyRecord;
 use aruna_core::structs::identity::realm::RealmId;
 use ulid::Ulid;
 

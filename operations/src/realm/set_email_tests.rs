@@ -264,7 +264,7 @@ fn delete_tombstones_candidates() {
     assert_eq!(state.materialized_realm_email(), None);
     assert!(state.materialized_realm_vault().is_empty());
     for entry in entries {
-        let path = aruna_core::reducer::vault_entry_path(&entry);
+        let path = aruna_core::reducer::paths::vault_entry_path(&entry);
         assert_eq!(state.user_subject_ids[&path].value, None);
     }
 }

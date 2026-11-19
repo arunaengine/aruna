@@ -13,7 +13,7 @@ use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId, TopicId};
 use aruna_core::keys::realm_presence_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::{ConnectionAddressStatus, NetState, PeerConnectionStatus};
+use aruna_core::structs::info::{ConnectionAddressStatus, NetState, PeerConnectionStatus};
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_net::error::NetError;
 use aruna_net::streams::BiStream;

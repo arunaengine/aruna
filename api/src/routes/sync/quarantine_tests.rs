@@ -13,7 +13,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::{
+use aruna_core::structs::sync_quarantine::{
     SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage,
     build_quarantine_entries, quarantine_usage_entry,
 };

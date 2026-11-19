@@ -28,8 +28,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::structs::execution::job::ExportReportSource;
-use aruna_core::structs::execution::job::ExportRoCrateSpec;
+use aruna_core::structs::execution::job::input::{ExportReportSource, ExportRoCrateSpec};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmId;
@@ -270,7 +269,7 @@ async fn selection_reads_locally() {
         expected_blake3: Some(hash),
     };
     let mut spec = remote_spec(realm_id, UserId::nil(realm_id));
-    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+    spec.selection = Some(aruna_core::structs::execution::job::input::ExportSelection {
         files: vec!["data.csv".to_string()],
         audience: RealmId::from_bytes([67; 32]),
         intent_digest: String::new(),
@@ -421,7 +420,7 @@ async fn sealed_local_export() {
     };
     driver.storage_handle.send_storage_effect(write).await;
     let mut spec = remote_spec(realm_id, reader);
-    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+    spec.selection = Some(aruna_core::structs::execution::job::input::ExportSelection {
         files: Vec::new(),
         audience: RealmId::from_bytes([117; 32]),
         intent_digest: String::new(),
@@ -672,7 +671,7 @@ async fn unheld_copy_skipped() {
     let (node, _, viewer, candidates) = two_copies().await;
     let ctx = job_context(node.driver.clone(), node.net.node_id());
     let mut spec = remote_spec(viewer.realm_id, viewer);
-    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+    spec.selection = Some(aruna_core::structs::execution::job::input::ExportSelection {
         files: vec!["data/payload".to_string()],
         audience: RealmId::from_bytes([138; 32]),
         intent_digest: String::new(),
@@ -726,7 +725,7 @@ async fn consent_resolves_hashes() {
     let jsonld = jsonld.to_string();
     let spec = |user_id| {
         let mut spec = remote_spec(viewer.realm_id, user_id);
-        spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+        spec.selection = Some(aruna_core::structs::execution::job::input::ExportSelection {
             files: vec![file.clone()],
             audience: RealmId::from_bytes([138; 32]),
             intent_digest: String::new(),

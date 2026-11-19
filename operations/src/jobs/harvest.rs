@@ -20,7 +20,7 @@ use aruna_core::structs::execution::harvest::{
     IncomingRecord, ProvenanceDecision, RepositoryConnector, RepositoryConnectorKind,
     provenance_decision,
 };
-use aruna_core::structs::execution::job::{JobError, JobResultPayload};
+use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;

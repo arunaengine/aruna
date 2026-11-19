@@ -5,11 +5,11 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::repository::invenio::{record_id, validate_id};
-use aruna_core::repository::remote::{InvenioError, NodeScope};
-use aruna_core::repository::{
-    LinkFailure, LinkReview, LinkTarget, PullCheck, RemoteState, RepositoryDestination,
-    RepositoryLink, RepositoryRecord,
+use aruna_core::repository::link::{
+    LinkFailure, LinkReview, LinkTarget, PullCheck, RemoteState, RepositoryLink,
 };
+use aruna_core::repository::remote::{InvenioError, NodeScope};
+use aruna_core::repository::{RepositoryDestination, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use serde_json::Value;

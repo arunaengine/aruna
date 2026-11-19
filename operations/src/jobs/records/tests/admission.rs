@@ -4,13 +4,12 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
-};
-
 use crate::jobs::records::admit::{Admission, FamilyState, plan_append, relayable};
 use crate::jobs::records::verify::FamilyView;
 use crate::tests::records::{Family, node, secret};
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
+};
 use aruna_core::structs::execution::job::record_rows::{PendingNeed, PendingRecord};
 
 type Stored = BTreeMap<JobRecordKey, JobRecordEnvelope>;
@@ -265,7 +264,7 @@ fn waits_for_predecessor() {
         &receipt,
         1,
         [9u8; 32],
-        aruna_core::structs::execution::job::PhysicalExecutionState::Running,
+        aruna_core::structs::execution::job::family::PhysicalExecutionState::Running,
         None,
     );
     let candidate = family.sign(&family.target, JobFamilyRecord::Update(Box::new(update)));

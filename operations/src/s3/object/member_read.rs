@@ -20,11 +20,12 @@ use aruna_core::node_state::{NodeInfoError, NodeUrlsOperation};
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{OutboundEffect, OutboundEvent, xml_field};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::delegation::{
     COPY_READ_HEADER, DELEGATION_HEADER, Payload, SignedDelegation, TRAILER_BYTES, body_digest,
     bound_header, request_digest,
 };
-use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute, RouteError};
+use aruna_core::structs::storage::distribution::route::{ReadRoute, RouteError};
 use aruna_core::structs::storage::node_info::NodeUrls;
 use bytes::Bytes;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};

@@ -7,10 +7,11 @@ use aruna_core::effects::{Effect, JobRecordFrame, NetEffect};
 use aruna_core::events::{Event, ExecutionSignEvent, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    AttemptControl, ExecutionClaim, ExecutionOutputRecord, JobError, JobFamilyRecord, JobRecord,
-    JobRecordEnvelope, LocalExecution, OutputObject, OutputSet, SubmissionId,
+use aruna_core::structs::execution::job::family::{
+    ExecutionClaim, ExecutionOutputRecord, JobFamilyRecord, JobRecordEnvelope, LocalExecution,
+    OutputSet, SubmissionId,
 };
+use aruna_core::structs::execution::job::local::{AttemptControl, JobError, JobRecord, OutputObject};
 use aruna_core::structs::identity::realm::RealmId;
 use tracing::{debug, warn};
 
@@ -335,9 +336,9 @@ impl Operation for StoreOutputsOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::structs::execution::job::{
-        AttemptIntent, ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobState,
-    };
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::{AttemptIntent, JobClaim};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::user::id::UserId;
     use aruna_storage::storage::handle::StorageHandle;
@@ -346,7 +347,7 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_test_support::jobs::insert_job;
 

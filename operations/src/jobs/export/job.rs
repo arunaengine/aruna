@@ -7,9 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::jobs::{JobEffect, JobReport, JobStops};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    ArtifactRef, ExportRoCrateResult, JobResultPayload, KeyWait,
-};
+use aruna_core::structs::execution::job::input::{ArtifactRef, ExportRoCrateResult};
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::local::JobResultPayload;
 use aruna_core::types::GroupId;
 
 use super::archive::{

@@ -15,7 +15,9 @@ use aruna_core::compute::session::{
 use aruna_core::job_request::session_of;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{CopyJobSpec, JobId, JobPayload, JobRecord, JobState};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{CopyJobSpec, JobPayload};
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_drivers::driver::{drive, node_routing};

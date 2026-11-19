@@ -9,8 +9,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{OFFERED_DIRECTORY_KEYSPACE, SYNCED_FOLDER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::offered_directory::OfferedDirectory;
-use aruna_core::structs::synced_folder::bucket_folder;
-use aruna_core::structs::{FolderState, SyncedFolder};
+use aruna_core::structs::synced_folder::{FolderState, SyncedFolder, bucket_folder};
 use aruna_core::types::Value;
 use thiserror::Error;
 

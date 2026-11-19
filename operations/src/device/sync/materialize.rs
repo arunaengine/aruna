@@ -9,7 +9,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ActionOutcome, EntrySide, EntryState, PendingMark, ReplaceReason, SyncActionRecord, SyncBase,
     SyncedBytes, SyncedFolder, WriteGuard,
 };

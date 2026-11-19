@@ -16,9 +16,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::rows::{PrefixPages, outside_call, read_row};
-use aruna_core::structs::execution::job::{
-    JobId, JobRecord, RoCrateLimits, decode_job_record, job_record_key,
-};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
+use aruna_core::structs::execution::job::local::{JobRecord, decode_job_record, job_record_key};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, CopyOwner,
@@ -1088,7 +1088,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, UPLOAD_KEYSPACE};
-    use aruna_core::structs::execution::job::RoCrateLimits;
+    use aruna_core::structs::execution::job::input::RoCrateLimits;
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
     };

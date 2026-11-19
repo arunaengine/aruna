@@ -44,7 +44,7 @@ use crate::jobs::import::rewrite::{RewriteTarget, rewrite_document, validate_doc
 use aruna_blob::archive::{inspect_archive, open_archive, read_metadata};
 use aruna_blob::blob::BlobHandle;
 use aruna_core::rocrate_archive::{file_id_candidates, payload_entries, signature_entry};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::data::identity::{ObjectLocation, normalized_id};
@@ -555,7 +555,7 @@ async fn selection_skips_discovery() {
         iroh::SecretKey::from_bytes(&[152; 32]).public(),
     );
     let mut spec = remote_spec(user.realm_id, user);
-    let selection = aruna_core::structs::execution::job::ExportSelection {
+    let selection = aruna_core::structs::execution::job::input::ExportSelection {
         files: Vec::new(),
         audience: RealmId::from_bytes([153; 32]),
         intent_digest: String::new(),
@@ -1828,7 +1828,7 @@ pub(super) fn op_spec() -> ExportRoCrateSpec {
 
 pub(super) fn selected_spec() -> ExportRoCrateSpec {
     let mut spec = op_spec();
-    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+    spec.selection = Some(aruna_core::structs::execution::job::input::ExportSelection {
         files: vec!["a".to_string()],
         audience: RealmId::from_bytes([9; 32]),
         intent_digest: String::new(),

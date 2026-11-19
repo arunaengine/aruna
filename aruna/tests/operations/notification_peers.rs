@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     WATCH_INTEREST_KEYSPACE,
 };
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-use aruna_core::structs::execution::job::user_dedup_key;
+use aruna_core::structs::execution::job::local::user_dedup_key;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord, NotificationTransportMessage,
 };

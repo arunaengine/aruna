@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::execution::job::StagingJobItem;
+use aruna_core::structs::execution::job::input::StagingJobItem;
 use byteview::ByteView;
 
 use super::*;

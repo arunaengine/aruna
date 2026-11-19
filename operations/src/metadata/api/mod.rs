@@ -16,9 +16,9 @@ use aruna_core::metadata::{
     MetadataError, MetadataEventRecord, MetadataQueryResults, MetadataSearchHit,
 };
 use aruna_core::storage_entries::{event_log_key, pending_projection_target};
-use aruna_core::structs::PathClaimRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::path_claim::PathClaimRecord;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, VersionKey, bucket_permission_path,
@@ -58,12 +58,13 @@ use aruna_core::metadata::protocol::{
     MetadataTransportMessage,
 };
 use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT};
+use aruna_core::placement::resolver::meta_bucket_subject;
 use aruna_core::placement::selector::{
     ROLE_NODE, neg_log2_q48, peer_rank, select_top_peers, selector_hash,
 };
 use aruna_core::placement::{
-    holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
-    registry_strategy, resolve_holders_limit, resolve_shard_holders,
+    holds_placement, registry_placement, registry_placement_for, registry_strategy,
+    resolve_holders_limit, resolve_shard_holders,
 };
 use aruna_core::search::{
     BucketPage, BucketSearchHit, ObjectInventoryHit, ObjectKeyMatch, SearchNodePage,

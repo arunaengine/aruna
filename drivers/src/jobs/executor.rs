@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::execution::job::input::JobPayload;
 use ulid::Ulid;
 
 /// One turn per distribution range, shared by every job on this node: page imports into one

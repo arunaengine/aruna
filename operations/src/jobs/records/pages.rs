@@ -14,12 +14,15 @@ use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::rows::read_row;
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::execution::job::record_keys::submission_prefix;
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputPage, InputSelection, JobFamilyRecord, LaunchIntent, LogicalJobSpec,
-    PageEntries, PageError, PageManifest, SubmissionId, launch_entries, needs_pages, paginate,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, LaunchIntent, LogicalJobSpec, SubmissionId,
+};
+use aruna_core::structs::execution::job::input::{CapturedInput, InputSelection};
+use aruna_core::structs::execution::job::pages::{
+    InputPage, PageEntries, PageError, PageManifest, launch_entries, needs_pages, paginate,
     spec_entries, verify_chain,
 };
+use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
@@ -564,7 +567,7 @@ impl Operation for ServePageOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::structs::execution::job::InputContent;
+    use aruna_core::structs::execution::job::input::InputContent;
     use ulid::Ulid;
 
     use super::*;
@@ -721,14 +724,14 @@ mod tests {
         for index in 0..400u32 {
             let key = format!("db/{index:05}-{}", "x".repeat(800));
             inputs.push(InputSelection {
-                source: aruna_core::structs::execution::job::InputSource::S3 {
+                source: aruna_core::structs::execution::job::input::InputSource::S3 {
                     bucket: "bakta".to_string(),
                     key: key.clone(),
                     version_id: Some(Ulid::from_parts(u64::from(index), 1).to_string()),
                 },
                 source_node_id: None,
                 dest_key: key.clone(),
-                mode: aruna_core::structs::execution::job::InputMode::Mount,
+                mode: aruna_core::structs::execution::job::input::InputMode::Mount,
                 container_path: Some(format!("/{key}")),
                 name: None,
                 description: None,

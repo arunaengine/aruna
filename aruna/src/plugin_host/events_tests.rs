@@ -16,10 +16,6 @@ use aruna_core::plugin_runs::Outcome;
 use aruna_core::plugin_runs::RunState;
 use aruna_core::plugin_runs::RunTrigger;
 use aruna_core::storage_entries::reducer_state_key;
-use aruna_core::structs::SyncMode;
-use aruna_core::structs::SyncRelationship;
-use aruna_core::structs::SyncState;
-use aruna_core::structs::SyncStatusSnapshot;
 use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
@@ -27,6 +23,9 @@ use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeInput;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 use aruna_core::structs::storage::replication_queue::ReplicationMode;
+use aruna_core::structs::sync_relationship::{
+    SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
+};
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::plugins::install::InstallCaller;
 use aruna_operations::plugins::lifecycle::{SetGrants, match_targets};

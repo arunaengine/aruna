@@ -41,7 +41,7 @@ use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::rows::read_row;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};

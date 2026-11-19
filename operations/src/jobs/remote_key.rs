@@ -15,7 +15,9 @@ use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::rows::read_row;
-use aruna_core::structs::execution::job::{JobId, JobRecord, JobState, KeyWait};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, HashIndex, VersionKey, object_permission_path,
@@ -665,8 +667,8 @@ mod tests {
     use super::*;
     use crate::jobs::store::job_calls::ClaimOutcome;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-    use aruna_core::structs::execution::job::JobPayload;
-    use aruna_core::structs::execution::job::JobRecord;
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::JobRecord;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::HashIndex;
     use aruna_core::time::unix_timestamp_millis;

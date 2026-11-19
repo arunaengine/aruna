@@ -15,12 +15,12 @@ use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, PENDING_PROJECTION_KEYSPACE};
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::metadata::protocol::PersistentIdResolution;
 use aruna_core::storage_entries::pending_projection_key;
-use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::persistent_id::{
     PersistentIdMapping, PersistentIdRevision, PersistentIdStatus, persistent_id_key,
 };
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::api::MetadataApiError;
@@ -688,7 +688,7 @@ async fn mint_routed(
     realm: &Topology,
     node: &TestNode,
     document_id: Ulid,
-) -> TestResult<(aruna_core::structs::PersistentIdMapping, bool)> {
+) -> TestResult<(aruna_core::structs::persistent_id::PersistentIdMapping, bool)> {
     let minted = std::cell::RefCell::new(None);
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "no routed mint reached the authority",
@@ -723,7 +723,7 @@ async fn withdraw_routed(
     realm: &Topology,
     node: &TestNode,
     document_id: Ulid,
-) -> TestResult<aruna_core::structs::PersistentIdMapping> {
+) -> TestResult<aruna_core::structs::persistent_id::PersistentIdMapping> {
     let withdrawn = std::cell::RefCell::new(None);
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "no routed withdrawal reached the authority",

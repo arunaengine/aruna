@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::{OutputDestination, OutputSelection};
+use aruna_core::structs::execution::job::input::{OutputDestination, OutputSelection};
 use ulid::Ulid;
 
 use super::super::fixtures::{

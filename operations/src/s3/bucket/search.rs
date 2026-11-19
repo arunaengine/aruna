@@ -21,7 +21,7 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, incarnation, object_permission_path,
 };
 use aruna_core::structs::storage::bucket_metadata::StoredMetadata;
-use aruna_core::structs::storage::distribution::DistributionView;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;

@@ -2,9 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::{
-    ComputeResources, EffectiveResources, ExecutionSpec, SubmissionId,
-};
+use aruna_core::structs::execution::job::family::{EffectiveResources, SubmissionId};
+use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec};
 use ulid::Ulid;
 
 use super::*;

@@ -18,14 +18,13 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::operation::Operation;
 use aruna_core::request_policy::PolicyRequestExtras;
-use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::format::Compression;
-use aruna_core::structs::synced_folder::refusal_kind;
+use aruna_core::structs::synced_folder::{SyncRefusal, refusal_kind};
 use aruna_core::types::GroupId;
 use std::time::{Duration, UNIX_EPOCH};
 use tracing::warn;

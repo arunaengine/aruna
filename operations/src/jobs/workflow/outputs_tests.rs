@@ -6,9 +6,8 @@ use std::collections::HashMap;
 
 use aruna_core::compute::BackendError;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{
-    InputMode, InputSelection, InputSource, OutputCommitIntent,
-};
+use aruna_core::structs::execution::job::input::{InputMode, InputSelection, InputSource};
+use aruna_core::structs::execution::job::local::OutputCommitIntent;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredFormat;
 

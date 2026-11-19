@@ -4,9 +4,10 @@
 
 use crate::lookup::map_guard_error;
 use aruna_core::id::NodeId;
-use aruna_core::structs::storage::distribution::RouteError;
+use aruna_core::structs::storage::distribution::DistributionRevision;
+use aruna_core::structs::storage::distribution::route::RouteError;
 use aruna_core::structs::storage::distribution::search::IndexProgress;
-use aruna_core::structs::storage::distribution::{DistributionError, DistributionRevision};
+use aruna_core::structs::storage::distribution::validate::DistributionError;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::replication::members::CopyLag;
 use aruna_operations::transfer::status_view::{

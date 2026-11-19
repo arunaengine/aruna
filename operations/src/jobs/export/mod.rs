@@ -10,10 +10,12 @@ use aruna_core::calls::IoError;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::WaitTarget;
 use aruna_core::metadata::MetadataValidationViolation;
-use aruna_core::structs::execution::job::{
-    ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, JobId, KeyWait,
-    ReasonCode, RoCrateCheckpointRefs,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, ReasonCode,
+    RoCrateCheckpointRefs,
 };
+use aruna_core::structs::execution::job::key_wait::KeyWait;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -76,7 +78,7 @@ pub struct ExportCheckpoint {
     pub(crate) repository: Option<aruna_core::repository::RepositoryRecord>,
     /// A link's resolved lineage base: the latest published version it continues.
     pub(crate) repository_base: Option<String>,
-    pub(crate) link_failure: Option<aruna_core::repository::LinkFailure>,
+    pub(crate) link_failure: Option<aruna_core::repository::link::LinkFailure>,
     /// File keys the repository record holds after the upload.
     pub(crate) repository_files: Vec<String>,
     /// The dataset's identifiers when the snapshot was taken.
@@ -128,8 +130,8 @@ impl ExportCheckpoint {
     }
 
     /// Why a push failed: a recorded refusal, left-out files, or the job message.
-    pub(crate) fn push_failure(&self, message: &str) -> aruna_core::repository::LinkFailure {
-        use aruna_core::repository::LinkFailure;
+    pub(crate) fn push_failure(&self, message: &str) -> aruna_core::repository::link::LinkFailure {
+        use aruna_core::repository::link::LinkFailure;
         if let Some(failure) = &self.link_failure {
             return failure.clone();
         }
@@ -148,13 +150,13 @@ impl ExportCheckpoint {
     }
 
     /// The finished push as a link outcome, once the repository holds the complete record.
-    pub(crate) fn pushed_outcome(&self) -> Option<aruna_core::repository::PushOutcome> {
+    pub(crate) fn pushed_outcome(&self) -> Option<aruna_core::repository::link::PushOutcome> {
         let record = self
             .repository
             .clone()
             .filter(|_| self.repository_complete)?;
         let (event_id, dataset_digest) = self.pushed_revision()?;
-        Some(aruna_core::repository::PushOutcome::Pushed {
+        Some(aruna_core::repository::link::PushOutcome::Pushed {
             record: Box::new(record),
             event_id,
             dataset_digest,

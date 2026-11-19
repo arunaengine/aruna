@@ -11,7 +11,7 @@ use crate::routes::metadata::repositories::{
 use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_state, test_storage,
 };
-use aruna_core::structs::execution::job::JobState;
+use aruna_core::structs::execution::job::identity::JobState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::user::id::UserId;

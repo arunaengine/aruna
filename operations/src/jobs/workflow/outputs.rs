@@ -16,10 +16,9 @@ use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobEffect, JobEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    AttemptControl, ExecutionSpec, JobError, JobRecord, MAX_EXECUTION_OUTPUTS, OutputDestination,
-    OutputObject, OutputSelection,
-};
+use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
+use aruna_core::structs::execution::job::input::{ExecutionSpec, OutputDestination, OutputSelection};
+use aruna_core::structs::execution::job::local::{AttemptControl, JobError, JobRecord, OutputObject};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;

@@ -11,7 +11,7 @@ use crate::structs::secondary_id::{SecondaryIdKind, SecondaryIdentifier};
 #[test]
 fn binds_repository_login() {
     use crate::credential_encryption::CredentialEncryptionKey;
-    use crate::structs::execution::job::{ExportRoCrateSpec, JobPayload, RoCrateLimits};
+    use crate::structs::execution::job::input::{ExportRoCrateSpec, JobPayload, RoCrateLimits};
     use crate::structs::identity::auth::AuthContext;
     use crate::structs::identity::realm::RealmId;
     let key = CredentialEncryptionKey::derive(&[1; 32]);

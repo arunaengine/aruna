@@ -15,7 +15,10 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
-use aruna_core::structs::execution::job::{CapturedInput, JobError, JobId, JobRecord, KeyWait};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::CapturedInput;
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::local::{JobError, JobRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobVersion, BlobVersionState, HashIndex, VersionKey,
@@ -595,7 +598,9 @@ mod tests {
     use super::*;
     use crate::tests::records::{REALM, captured_input, node, payload, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{InputMode, InputSelection, InputSource, JobPayload};
+    use aruna_core::structs::execution::job::input::{
+        InputMode, InputSelection, InputSource, JobPayload,
+    };
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
     where

@@ -433,7 +433,8 @@ fn binding_strategy<'a>(
 mod pure_tests {
     use super::*;
     use crate::admin_documents::AdminDocumentTarget;
-    use crate::reducer::{AdminDocumentState, overlay_placement};
+    use crate::reducer::AdminDocumentState;
+    use crate::reducer::placement::overlay_placement;
     use crate::structs::identity::realm::{RealmId, RealmNode, RealmNodeKind};
     use crate::structs::placement::record::{
         AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, NodePlacementEntry, StrategyBinding,

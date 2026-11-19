@@ -15,7 +15,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permission_path};
 use aruna_core::structs::storage::mirror_repair::SyncMirrorIntent;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{SyncMode, SyncRelationship};
+use aruna_core::structs::sync_relationship::{SyncMode, SyncRelationship};
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;

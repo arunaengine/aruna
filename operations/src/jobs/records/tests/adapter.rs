@@ -8,7 +8,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, PageLimit, StorageEffect};
 use aruna_core::events::{JobRecordRejection, LaunchDecline};
 use aruna_core::handle::Handle;
-use aruna_core::structs::execution::job::JobFamilyRecord;
+use aruna_core::structs::execution::job::family::JobFamilyRecord;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_net::NetHandle;
@@ -142,9 +142,10 @@ async fn separates_peer_authority() {
 async fn holds_bound_pages() {
     // A holder acknowledges a spec that binds input pages only once it keeps those pages, so
     // the publisher retries until every holder can serve them after the admitting node is gone.
-    use aruna_core::structs::execution::job::{
-        CapturedInput, InputContent, InputMode, InputSelection, InputSource, PageEntries, paginate,
+    use aruna_core::structs::execution::job::input::{
+        CapturedInput, InputContent, InputMode, InputSelection, InputSource,
     };
+    use aruna_core::structs::execution::job::pages::{PageEntries, paginate};
     let (_dir, context, net, family) = fixture().await;
     let version_id = ulid::Ulid::from_parts(1, 1);
     let pair = (

@@ -7,7 +7,8 @@ use std::collections::{HashSet, VecDeque};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{AttemptControl, ExecutionSpec, JobError, OutputObject};
+use aruna_core::structs::execution::job::input::ExecutionSpec;
+use aruna_core::structs::execution::job::local::{AttemptControl, JobError, OutputObject};
 use aruna_core::types::GroupId;
 use ulid::Ulid;
 

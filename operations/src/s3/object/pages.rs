@@ -19,9 +19,8 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BucketInfo, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::distribution::fence::LocalFence;
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionMember, DistributionView, KeyRange,
-};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
+use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionMember, KeyRange};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;

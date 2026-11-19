@@ -8,11 +8,11 @@ use aruna_core::events::PeerAuthRefusal;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::sync_relationship::SyncRelationship;
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
 

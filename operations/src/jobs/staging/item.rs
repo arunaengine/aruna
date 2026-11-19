@@ -9,7 +9,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::structs::checksum::ExpectedChecksum;
-use aruna_core::structs::execution::job::{StagingJobCheckpoint, StagingJobItem};
+use aruna_core::structs::execution::job::input::{StagingJobCheckpoint, StagingJobItem};
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::realm::RealmConfigDocument;

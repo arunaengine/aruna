@@ -9,9 +9,11 @@ use aruna_core::effects::Effect;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    DUE_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord, LEASE_INDEX_PREFIX,
-    lease_index_key, parse_schedule_key,
+use aruna_core::structs::execution::job::identity::{
+    DUE_INDEX_PREFIX, JobExecutionClass, JobId, LEASE_INDEX_PREFIX,
+};
+use aruna_core::structs::execution::job::local::{
+    JobError, JobRecord, lease_index_key, parse_schedule_key,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
@@ -522,9 +524,9 @@ mod tests {
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::Event;
     use aruna_core::handle::Handle;
-    use aruna_core::structs::execution::job::{
-        AttemptIntent, JobClaim, JobPayload, JobState, due_index_key,
-    };
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::{AttemptIntent, JobClaim, due_index_key};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::TaskEvent;
     use aruna_core::time::unix_timestamp_millis;

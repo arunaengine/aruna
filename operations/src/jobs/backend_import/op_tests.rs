@@ -11,7 +11,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::jobs::{JobEffect, JobEvent, JobReport, JobStops};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobResultPayload;
+use aruna_core::structs::execution::job::local::JobResultPayload;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;

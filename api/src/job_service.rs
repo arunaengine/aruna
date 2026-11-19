@@ -9,10 +9,11 @@ use aruna_core::id::NodeId;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
-use aruna_core::structs::execution::job::{
-    CopyJobSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId, JobRecord, StagingJobCheckpoint,
-    StagingJobSpec,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CopyJobSpec, ExportRoCrateSpec, ImportRoCrateSpec, StagingJobCheckpoint, StagingJobSpec,
 };
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
