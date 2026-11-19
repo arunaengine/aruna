@@ -123,6 +123,10 @@ TOKEN_RE = re.compile(r"//|/\*|(?<!\w)(?:[bc]?r#*|[bc])?\"|'")
 STRING_RE = re.compile(r'(?:[^"\\]|\\.)*"', re.S)
 TEST_ATTR = re.compile(r"#\[\s*(?:cfg\s*\(\s*test\s*\)|test|rstest|tokio::test\b[^\]]*)\s*\]")
 FILE_TEST = re.compile(r"#!\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+HOOK_ATTR = re.compile(
+    r'#\[\s*cfg\s*\(\s*(?:any\s*\(\s*test\s*,\s*)?feature\s*=\s*"test-hooks"\s*\)?\s*\)\s*\]'
+)
+HOOK_MOD = re.compile(r"\bmod\s+(\w+)\s*;")
 ATTR_RE = re.compile(r"\s*#\[")
 BRACE_RE = re.compile(r"[{}]")
 BRACKET_RE = re.compile(r"[\[\]]")
@@ -139,7 +143,7 @@ STATE_CLONE = re.compile(r"\bmatch\s+self\s*\.\s*state\s*\.\s*clone\s*\(\s*\)")
 PARALLEL_RE = re.compile(r"\b(?:join_all|FuturesUnordered|buffer_unordered|JoinSet|try_join\w*)\b")
 SLEEP_RE = re.compile(r"(?<![\w.:])(?:(?:std::)?thread::|(?:tokio::)?time::)?sleep\s*\(")
 CLOCK_RE = re.compile(
-    r"\b(?:(?:SystemTime|Instant|Utc)::now|unix_timestamp_(?:secs|millis)|now_ms(?=\s*\()"
+    r"\b(?:(?:SystemTime|Instant|Utc)::now|unix_timestamp_(?:secs|millis)|(?<!\.)(?<!fn )now_ms(?=\s*\()"
     r"|Ulid::(?:new|generate)|thread_rng|OsRng|rand::random|getrandom)\b"
 )
 EFFECT_OP_RE = re.compile(r"\bimpl(?:\s*<[^{;]*?>)?\s+(?:[\w:]+::)?EffectOperation\s+for\b")
@@ -708,14 +712,39 @@ def clock_calls(ops):
     return found
 
 
-def core_clocks(sources):
-    """Clock and random calls in production code of the core crate; the runner and inputs own them."""
+def hook_spans(source):
+    """Spans of items that only tests or the test-hooks feature compile."""
     return [
-        f"{source.rel}:{source.masked.count(chr(10), 0, hit.start()) + 1}"
-        for source in sources
-        if source.rel.startswith("core/src/")
-        for hit in CLOCK_RE.finditer(source.masked)
+        (found.start(), item_end(source.masked, found.end()))
+        for found in HOOK_ATTR.finditer(source.code)
     ]
+
+
+def hook_modules(sources):
+    """Path prefixes of module files declared under a test-hooks gate."""
+    prefixes = []
+    for source in sources:
+        stem = source.rel[:-3]
+        base = os.path.dirname(stem) if os.path.basename(stem) in ("lib", "mod", "main") else stem
+        for start, end in hook_spans(source):
+            for found in HOOK_MOD.finditer(source.masked, start, end):
+                prefixes.append(f"{base}/{found.group(1)}")
+    return prefixes
+
+
+def core_clocks(sources):
+    """Clock and random calls in core production code; test-hooks items are test helpers."""
+    core = [source for source in sources if source.rel.startswith("core/src/")]
+    hooked = hook_modules(core)
+    found = []
+    for source in core:
+        if any(source.rel == f"{prefix}.rs" or source.rel.startswith(f"{prefix}/") for prefix in hooked):
+            continue
+        spans = hook_spans(source)
+        for hit in CLOCK_RE.finditer(source.masked):
+            if not any(start <= hit.start() < end for start, end in spans):
+                found.append(f"{source.rel}:{source.masked.count(chr(10), 0, hit.start()) + 1}")
+    return found
 
 
 def clean_findings(ops, clean):

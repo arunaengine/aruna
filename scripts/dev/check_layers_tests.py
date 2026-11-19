@@ -218,6 +218,24 @@ class TriggerTest(unittest.TestCase):
         self.assertEqual(check_layers.trigger_arms({rel: source}), [f"{rel}: Broker::get"])
 
 
+class ClocksTest(unittest.TestCase):
+    def test_core_hooks(self):
+        hook = '#[cfg(any(test, feature = "test-hooks"))]\n'
+        files = {
+            "core/src/lib.rs": f"{hook}pub mod time;\npub mod rows;\n",
+            "core/src/time.rs": "pub fn now() -> u64 { unix_timestamp_millis() }\n",
+            "core/src/rows.rs": (
+                f"{hook}pub fn key() -> u8 {{ getrandom::fill(&mut b); 1 }}\n"
+                "pub fn now_ms(&self) -> u64 { self.now_ms }\nfn at(rows: &R) -> u64 { rows.now_ms() }\n"
+                "fn read() -> u64 { SystemTime::now(); now_ms() }\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, files)
+            sources = [check_layers.load_source(root, rel) for rel in check_layers.rust_files(root)]
+        self.assertEqual(check_layers.core_clocks(sources), ["core/src/rows.rs:5", "core/src/rows.rs:5"])
+
+
 class HabitsTest(unittest.TestCase):
     def habits(self, text, rel="net/tests/probe.rs"):
         with tempfile.TemporaryDirectory() as root:

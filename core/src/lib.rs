@@ -87,6 +87,7 @@ pub mod task;
 pub mod telemetry;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod testing;
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod time;
 pub mod trace_context;
 pub mod transfer;
