@@ -89,6 +89,7 @@ aruna-storage = { workspace = true, features = ["test-hooks"] }
 async_zip = { workspace = true }
 bytes = { workspace = true }
 craqle = { workspace = true }
+getrandom = { workspace = true }
 oxrdf = { workspace = true }
 percent-encoding = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
