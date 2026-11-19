@@ -257,8 +257,7 @@ mod pure_tests {
         };
 
         let prefix = prefix.expect("expected prefix");
-        let expected =
-            crate::structs::storage::blob::HashIndex::hash_prefix(&[7u8; 32]).unwrap();
+        let expected = crate::structs::storage::blob::HashIndex::hash_prefix(&[7u8; 32]).unwrap();
         assert_eq!(prefix.as_ref(), expected.as_slice());
     }
 

@@ -106,7 +106,11 @@ impl AppliedDrainOperation {
             AppliedStep::Mail => IoCall::child(RefreshMailOperation::applied(targets)),
             AppliedStep::Metadata => {
                 let result = std::mem::take(&mut applied.result);
-                IoCall::child(AfterSyncOperation::new(Some(applied.node_id), result, false))
+                IoCall::child(AfterSyncOperation::new(
+                    Some(applied.node_id),
+                    result,
+                    false,
+                ))
             }
         };
         self.step = DrainStep::Run(step);
@@ -262,16 +266,25 @@ mod tests {
         let generation = Ulid::from_parts(1_000, 7);
         let usage = RefreshUsageOperation::new(node(), realm_id, &targets(), generation);
         let row = applied(realm_id, AppliedStep::Usage);
-        assert_eq!(drain.next(queued(&row)), Ok(Next::Call(IoCall::child(usage))));
+        assert_eq!(
+            drain.next(queued(&row)),
+            Ok(Next::Call(IoCall::child(usage)))
+        );
         let failed = RefreshUsageError::Io(IoError::Aborted);
         let turn = drain.next(child::<(), _>(Err(failed)));
         assert_eq!(turn, progress(realm_id, AppliedStep::Interest));
         let interest = RefreshInterestOperation::new(&targets(), realm());
-        assert_eq!(drain.next(IoResult::Done), Ok(Next::Call(IoCall::child(interest))));
+        assert_eq!(
+            drain.next(IoResult::Done),
+            Ok(Next::Call(IoCall::child(interest)))
+        );
         let turn = drain.next(child::<(), IoError>(Ok(())));
         assert_eq!(turn, progress(realm_id, AppliedStep::Mail));
         let mail = RefreshMailOperation::applied(&targets());
-        assert_eq!(drain.next(IoResult::Done), Ok(Next::Call(IoCall::child(mail))));
+        assert_eq!(
+            drain.next(IoResult::Done),
+            Ok(Next::Call(IoCall::child(mail)))
+        );
         let turn = drain.next(child::<(), IoError>(Ok(())));
         assert_eq!(turn, progress(realm_id, AppliedStep::Metadata));
         assert_eq!(drain.next(IoResult::Done), Ok(Next::Call(after_sync())));
@@ -298,11 +311,16 @@ mod tests {
     fn realmless_skips_interest() {
         let mut drain = AppliedDrainOperation::new();
         drain.first().unwrap();
-        drain.next(queued(&applied(None, AppliedStep::Usage))).unwrap();
+        drain
+            .next(queued(&applied(None, AppliedStep::Usage)))
+            .unwrap();
         let turn = drain.next(child::<(), RefreshUsageError>(Ok(())));
         assert_eq!(turn, progress(None, AppliedStep::Interest));
         let mail = RefreshMailOperation::applied(&targets());
-        assert_eq!(drain.next(IoResult::Done), Ok(Next::Call(IoCall::child(mail))));
+        assert_eq!(
+            drain.next(IoResult::Done),
+            Ok(Next::Call(IoCall::child(mail)))
+        );
     }
 
     #[test]

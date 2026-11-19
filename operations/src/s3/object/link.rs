@@ -40,9 +40,7 @@ use crate::s3::object::reference::{
 };
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
-use aruna_core::structs::storage::read_grant::{
-    self, GrantScope, HEAD_OPERATION, READ_OPERATION,
-};
+use aruna_core::structs::storage::read_grant::{self, GrantScope, HEAD_OPERATION, READ_OPERATION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LinkError {
