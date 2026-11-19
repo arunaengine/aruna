@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_plugins::broker::HostError;
+use aruna_plugin_types::calls::HostError;
 use serde_json::json;
 
 use super::*;

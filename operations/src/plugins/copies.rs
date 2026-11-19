@@ -2,20 +2,45 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use tokio::sync::{Semaphore, SemaphorePermit};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Memory one node spends at most on artifact uploads and assemblies, in MiB.
 const MEMORY_MIB: u32 = 256;
 
-static MEMORY: Semaphore = Semaphore::const_new(MEMORY_MIB as usize);
+/// MiB of the budget reserved now.
+static RESERVED: AtomicU32 = AtomicU32::new(0);
 
 /// Memory reserved for one artifact upload or assembly, released when dropped.
-pub type MemoryPermit = SemaphorePermit<'static>;
+#[derive(Debug)]
+pub struct MemoryPermit {
+    mib: u32,
+}
+
+impl MemoryPermit {
+    /// MiB this reservation holds of the node's budget.
+    pub fn mib(&self) -> u32 {
+        self.mib
+    }
+}
+
+impl Drop for MemoryPermit {
+    fn drop(&mut self) {
+        RESERVED.fetch_sub(self.mib, Ordering::AcqRel);
+    }
+}
 
 /// Reserves memory for `bytes`, or `None` while the node spends its budget elsewhere.
 pub fn reserve(bytes: usize) -> Option<MemoryPermit> {
     let mib = u32::try_from(bytes.div_ceil(1 << 20).max(1)).ok()?;
-    MEMORY.try_acquire_many(mib).ok()
+    let fits = |reserved: u32| {
+        reserved
+            .checked_add(mib)
+            .filter(|total| *total <= MEMORY_MIB)
+    };
+    RESERVED
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, fits)
+        .ok()?;
+    Some(MemoryPermit { mib })
 }
 
 /// A whole artifact in memory together with the memory reserved for it; dropping it releases
@@ -32,7 +57,7 @@ impl Assembled {
 
     /// MiB this artifact holds of the node's budget.
     pub fn reserved_mib(&self) -> u32 {
-        self.memory.num_permits() as u32
+        self.memory.mib()
     }
 }
 

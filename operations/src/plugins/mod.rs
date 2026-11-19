@@ -55,7 +55,7 @@ pub mod waiting;
 pub mod work;
 pub mod work_calls;
 
-use aruna_plugins::broker::{ErrorKind, HostError};
+use aruna_plugin_types::calls::{ErrorKind, HostError};
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[path = "calls_tests.rs"]

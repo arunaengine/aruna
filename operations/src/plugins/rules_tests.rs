@@ -262,7 +262,9 @@ async fn installs_with_secrets() {
 
 /// The bound install moved to a version whose `catalog` and `mirror` connections inject the
 /// slots `api_key` and `other_key`, both bound to the group secret `api-key`.
-async fn shared_install(fixture: &Fixture) -> (PluginInstall, aruna_plugins::manifest::Manifest) {
+async fn shared_install(
+    fixture: &Fixture,
+) -> (PluginInstall, aruna_plugin_types::manifest::Manifest) {
     use aruna_core::plugin_installs::SecretBinding;
     let install = bound(fixture).await;
     secret(fixture, &install).await;
@@ -323,19 +325,20 @@ async fn shared_secret_slots() {
 async fn equal_rules_collapse() {
     let fixture = Fixture::keyed().await;
     let (mut install, _) = shared_install(&fixture).await;
-    let manifest: aruna_plugins::manifest::Manifest = serde_json::from_value(serde_json::json!({
-        "name": "announcer", "version": "0.4.0",
-        "settings": { "catalog_url": { "title": "Catalog", "type": "url" } },
-        "secrets": { "api_key": { "title": "API key", "kind": "bearer" } },
-        "connections": {
-            "ids": { "url": "{catalog_url}/api/", "auth": "api_key" },
-            "names": { "url": "{catalog_url}/api/", "auth": "api_key" },
-            "deep": { "url": "{catalog_url}/api/v2/", "auth": "api_key" },
-            "whole": { "url": "{catalog_url}/files/", "auth": "api_key" },
-            "brief": { "url": "{catalog_url}/files/", "auth": "api_key" }
-        }
-    }))
-    .unwrap();
+    let manifest: aruna_plugin_types::manifest::Manifest =
+        serde_json::from_value(serde_json::json!({
+            "name": "announcer", "version": "0.4.0",
+            "settings": { "catalog_url": { "title": "Catalog", "type": "url" } },
+            "secrets": { "api_key": { "title": "API key", "kind": "bearer" } },
+            "connections": {
+                "ids": { "url": "{catalog_url}/api/", "auth": "api_key" },
+                "names": { "url": "{catalog_url}/api/", "auth": "api_key" },
+                "deep": { "url": "{catalog_url}/api/v2/", "auth": "api_key" },
+                "whole": { "url": "{catalog_url}/files/", "auth": "api_key" },
+                "brief": { "url": "{catalog_url}/files/", "auth": "api_key" }
+            }
+        }))
+        .unwrap();
     let scope = super::super::grants::InstallScope {
         realm_id: install.account.realm_id,
         group_id: install.group_id,

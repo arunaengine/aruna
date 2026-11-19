@@ -281,7 +281,7 @@ mod tests {
     use crate::plugins::intents::{Begun, begin};
     use crate::plugins::rows::tests::{page_result, values_result};
     use crate::plugins::runs::tests::opened;
-    use aruna_plugins::broker::Intent;
+    use aruna_plugin_types::calls::Intent;
 
     fn put(key: &str, value: &[u8], expected: Option<u64>, ordinal: u32) -> StateWrite {
         StateWrite {

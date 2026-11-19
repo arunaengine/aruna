@@ -25,7 +25,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::types::{Key, KeySpace, Value};
-use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
+use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
 use thiserror::Error;
 use tracing::{info, warn};
 

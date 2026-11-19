@@ -15,8 +15,8 @@ use aruna_core::plugins::NodeCheckError;
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
 use aruna_core::secrets::{SecretKind, SecretName, SecretRecord, SecretSettings};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-use aruna_plugins::manifest::Manifest;
-use aruna_plugins::trigger::TriggerKind;
+use aruna_plugin_types::manifest::Manifest;
+use aruna_plugin_types::trigger::TriggerKind;
 
 use super::artifacts::ServingNode;
 use super::entry::{EntryError, ReadEntry};
@@ -28,7 +28,7 @@ use crate::realm::mutate_placement::node_kind;
 use crate::secrets::node::record_key;
 
 /// The vault kind a manifest slot kind names.
-pub fn vault_kind(kind: aruna_plugins::manifest::SecretKind) -> Option<SecretKind> {
+pub fn vault_kind(kind: aruna_plugin_types::manifest::SecretKind) -> Option<SecretKind> {
     let name = serde_json::to_value(kind).ok()?;
     SecretKind::parse(name.as_str()?).ok()
 }
@@ -44,7 +44,7 @@ pub struct BindPlace {
 /// Whether the webhook that `slot` verifies reads its delivery id from the header the secret
 /// checks, so the id would carry the credential. Install and receiver both refuse it.
 pub(crate) fn delivery_clash(
-    manifest: &aruna_plugins::manifest::Manifest,
+    manifest: &aruna_plugin_types::manifest::Manifest,
     slot: &str,
     settings: &SecretSettings,
 ) -> bool {

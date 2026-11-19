@@ -83,7 +83,7 @@ async fn pruned_runs() {
     use crate::plugins::intents::{begin, open_intent, settled_row};
     use crate::plugins::rows::write_rows;
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
-    use aruna_plugins::broker::Intent;
+    use aruna_plugin_types::calls::Intent;
     let (_dir, ctx) = opened();
     let install = Ulid::from_parts(1, 1);
     let mut ended = Vec::new();
@@ -184,7 +184,7 @@ async fn keeps_open_calls() {
     use crate::plugins::intents::unknown_row;
     use crate::plugins::rows::write_rows;
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
-    use aruna_plugins::broker::Intent;
+    use aruna_plugin_types::calls::Intent;
     let (_dir, ctx) = opened();
     let install = Ulid::from_parts(1, 1);
     let mut run = queued(install, 1);
@@ -247,7 +247,7 @@ async fn resolved_expire() {
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
     use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_plugins::broker::Intent;
+    use aruna_plugin_types::calls::Intent;
     let (_dir, ctx) = opened();
     let install = Ulid::from_parts(1, 1);
     let mut run = queued(install, 1);

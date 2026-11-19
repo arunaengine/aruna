@@ -27,7 +27,7 @@ use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::unfinished;
 use crate::plugins::store::Txn;
 use crate::plugins::test_support::{created, installed, scoped};
-use aruna_plugins::broker::HostError;
+use aruna_plugin_types::calls::HostError;
 
 /// Decides `rows` as one batch from this node.
 async fn decided(fixture: &Fixture, rows: &[ForwardRow]) -> Vec<Outcome> {

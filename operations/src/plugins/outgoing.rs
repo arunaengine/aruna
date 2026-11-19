@@ -12,9 +12,9 @@ use aruna_core::outbound::{
     ConnectionAnswer, ConnectionCall, ConnectionError, OutboundEffect, OutboundEvent,
 };
 use aruna_core::secrets::header_name;
-use aruna_plugins::broker::{ErrorKind, Field, HostError, Response};
-use aruna_plugins::connection::{Method, relative_path};
-use aruna_plugins::manifest::Manifest;
+use aruna_plugin_types::calls::{ErrorKind, Field, HostError, Response};
+use aruna_plugin_types::connection::{Method, relative_path};
+use aruna_plugin_types::manifest::Manifest;
 use base64::Engine;
 use serde_json::Value;
 use url::Url;
@@ -97,9 +97,11 @@ fn guest_header(name: &str) -> bool {
 }
 
 /// The manifest's name of a method the guest called.
-pub fn declared_method(method: aruna_plugins::broker::Method) -> aruna_plugins::connection::Method {
-    use aruna_plugins::broker::Method as Called;
-    use aruna_plugins::connection::Method;
+pub fn declared_method(
+    method: aruna_plugin_types::calls::Method,
+) -> aruna_plugin_types::connection::Method {
+    use aruna_plugin_types::calls::Method as Called;
+    use aruna_plugin_types::connection::Method;
     match method {
         Called::Get => Method::Get,
         Called::Head => Method::Head,

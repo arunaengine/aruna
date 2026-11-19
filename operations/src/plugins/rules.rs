@@ -13,9 +13,9 @@ use aruna_core::secrets::{Delivery, ResponseExposure, SecretConsumer, SecretName
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::GroupId;
-use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::Grant;
-use aruna_plugins::trigger::TriggerKind;
+use aruna_plugin_types::manifest::Manifest;
+use aruna_plugin_types::permission::Grant;
+use aruna_plugin_types::trigger::TriggerKind;
 use tracing::warn;
 use ulid::Ulid;
 

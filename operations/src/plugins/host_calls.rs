@@ -12,8 +12,8 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{CallIntent, StateRefusal, StateRemoval, StateWrite};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_plugins::broker::{ErrorKind, HostError, Intent, ObjectInfo, ObjectPage};
-use aruna_plugins::permission::Permission;
+use aruna_plugin_types::calls::{ErrorKind, HostError, Intent, ObjectInfo, ObjectPage};
+use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
 
 use super::check::{Authorize, CallError, matching};

@@ -15,7 +15,7 @@ use aruna_core::structs::execution::job::{
     JobId, JobPayload, JobRecord, PluginWorkSpec, RETENTION_MS, WorkspaceMode,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_plugins::broker::{ErrorKind, Field, HostError, JobStatus};
+use aruna_plugin_types::calls::{ErrorKind, Field, HostError, JobStatus};
 use base64::Engine;
 use serde_json::Value;
 use tracing::warn;

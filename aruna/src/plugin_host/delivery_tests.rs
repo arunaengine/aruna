@@ -44,7 +44,7 @@ use aruna_operations::s3::object::put::PutObjectOperation;
 use aruna_operations::testing_objects::put_config;
 use aruna_operations::testing_objects::seed_bucket;
 use aruna_operations::testing_objects::with_blob;
-use aruna_plugins::broker::Intent;
+use aruna_plugin_types::calls::Intent;
 use std::sync::Arc;
 use ulid::Ulid;
 

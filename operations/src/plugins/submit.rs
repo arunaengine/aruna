@@ -12,8 +12,8 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::job::{PluginWorkAction, PluginWorkSpec, UploadForm};
 use aruna_core::structs::identity::auth::Permission as Access;
-use aruna_plugins::broker::{ErrorKind, HostError};
-use aruna_plugins::permission::Permission;
+use aruna_plugin_types::calls::{ErrorKind, HostError};
+use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
 
 use super::check::{Authorize, CallError, CheckCall, CopyGrants, RunScope, matching};

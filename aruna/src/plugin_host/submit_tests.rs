@@ -15,7 +15,7 @@ use aruna_operations::plugins::work::Identity;
 use aruna_operations::plugins::work::WorkKind;
 use aruna_operations::plugins::work::WorkRow;
 use aruna_operations::plugins::work::read_work;
-use aruna_plugins::broker::ErrorKind;
+use aruna_plugin_types::calls::ErrorKind;
 use ulid::Ulid;
 
 #[tokio::test]
@@ -24,7 +24,8 @@ async fn broker_starts_copies() {
     // rerun of the call gets the same job id.
     use std::sync::Arc;
 
-    use aruna_plugins::broker::{Broker, CallContext, Intent, JobCopy};
+    use aruna_plugin_types::calls::Intent;
+    use aruna_plugins::broker::{Broker, CallContext, JobCopy};
 
     use crate::plugin_host::broker::RunBroker;
     let fixture = Fixture::new().await;
@@ -60,7 +61,8 @@ async fn shifted_copy_refused() {
     // call is refused before any work is reserved, and the run fails as changed.
     use std::sync::Arc;
 
-    use aruna_plugins::broker::{Broker, CallContext, Intent, JobCopy, StatePut};
+    use aruna_plugin_types::calls::Intent;
+    use aruna_plugins::broker::{Broker, CallContext, JobCopy, StatePut};
 
     use crate::plugin_host::broker::RunBroker;
     use aruna_operations::plugins::work::list_work;
@@ -103,7 +105,8 @@ async fn broker_starts_downloads() {
     // call gets the same job; a checksum it cannot check is invalid input.
     use std::sync::Arc;
 
-    use aruna_plugins::broker::{Broker, CallContext, Field, Intent, JobDownload};
+    use aruna_plugin_types::calls::{Field, Intent};
+    use aruna_plugins::broker::{Broker, CallContext, JobDownload};
 
     use crate::plugin_host::broker::RunBroker;
     let fixture = Fixture::new().await;
@@ -168,7 +171,8 @@ async fn narrowed_download_refused() {
     use std::sync::Arc;
 
     use aruna_core::secrets::ResponseExposure;
-    use aruna_plugins::broker::{Broker, CallContext, Intent, JobDownload};
+    use aruna_plugin_types::calls::Intent;
+    use aruna_plugins::broker::{Broker, CallContext, JobDownload};
 
     use crate::plugin_host::broker::RunBroker;
     use aruna_operations::plugins::test_support::{ORIGIN, hold_keys, secret_with};
@@ -299,7 +303,8 @@ async fn broker_starts_uploads() {
     // An upload is a PUT or a POST; a form names its file part after the source's file name.
     use std::sync::Arc;
 
-    use aruna_plugins::broker::{Broker, CallContext, Field, Intent, JobUpload, Method};
+    use aruna_plugin_types::calls::{Field, Intent, Method};
+    use aruna_plugins::broker::{Broker, CallContext, JobUpload};
 
     use crate::plugin_host::broker::RunBroker;
     use aruna_operations::plugins::work::read_work;

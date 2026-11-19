@@ -16,11 +16,10 @@ use aruna_core::plugin_runs::{
 };
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_plugins::trigger::{Trigger, TriggerKind};
+use aruna_plugin_types::trigger::{Trigger, TriggerKind};
 use std::time::Duration;
 
 use aruna_core::backoff::capped_backoff;
-use aruna_plugins::{FailureKind, InvokeError};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -556,24 +555,6 @@ pub enum Ended {
     Busy(String),
     /// The node stops; the run starts again from the top at the next start.
     Stopped,
-}
-
-/// How an invocation ended. A runtime without a free slot never entered the guest, so the run
-/// waits without using an attempt.
-pub fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool) -> Ended {
-    match invoked {
-        Ok(output) => Ended::Output(output),
-        Err(InvokeError::Guest(failure)) => match failure.kind {
-            FailureKind::Permanent | FailureKind::InvalidInput => Ended::Failed(failure.message),
-            FailureKind::Retryable => Ended::Retry(failure.message),
-        },
-        Err(InvokeError::Cancelled) if stopping => Ended::Stopped,
-        Err(InvokeError::Cancelled) => Ended::Cancelled("the run was cancelled".into()),
-        Err(error @ (InvokeError::Overloaded | InvokeError::Closed)) => {
-            Ended::Busy(error.to_string())
-        }
-        Err(error) => Ended::Failed(error.to_string()),
-    }
 }
 
 /// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown

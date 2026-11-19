@@ -7,11 +7,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_core::NodeId;
-use aruna_core::plugin_runs::{EVENTS_QUEUED, PluginRun};
+use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::plugin_runs::{EVENTS_QUEUED, PluginRun, RunTrigger};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::limits::{Limits, RuntimeConfig};
-use aruna_plugins::{CancellationToken, Supervisor};
+use aruna_plugins::{
+    CancellationToken, FailureKind, Field, Invocation, InvokeError, Supervisor, Trigger,
+    WatchEvent, WebhookDelivery, WebhookRequest,
+};
 use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
@@ -19,7 +23,7 @@ use super::broker::RunBroker;
 use super::{read_config, ready_artifact};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::plugins::attempt::{
-    AttemptStart, BeginAttempt, ClaimRuns, ClaimedRuns, FinishRun, invocation, revocation,
+    AttemptStart, BeginAttempt, ClaimRuns, ClaimedRuns, FinishRun, guest_access, revocation,
 };
 use aruna_operations::plugins::check::RunScope;
 use aruna_operations::plugins::cleanup::sweep_events;
@@ -27,6 +31,7 @@ use aruna_operations::plugins::decide::prune_seen;
 use aruna_operations::plugins::dispatch::EnqueueTimers;
 use aruna_operations::plugins::finished::NotifyDue;
 use aruna_operations::plugins::forward::{Backoff, OutboxRoute, SendOutbox};
+use aruna_operations::plugins::grants::short_path;
 use aruna_operations::plugins::job_work::{RetireWork, SettleWork};
 use aruna_operations::plugins::journal::JOURNAL_PAGE;
 use aruna_operations::plugins::journal::prune_journal;
@@ -35,7 +40,7 @@ use aruna_operations::plugins::marks::SweepMarks;
 use aruna_operations::plugins::matcher::MatchJournal;
 use aruna_operations::plugins::prune::{PruneAudit, prune_hooks};
 use aruna_operations::plugins::replay::{PlanReplays, RunReplays};
-use aruna_operations::plugins::runs::{Ended, PruneRuns, TICK, ended};
+use aruna_operations::plugins::runs::{Ended, PruneRuns, TICK};
 use aruna_operations::plugins::waiting::RecheckWaiting;
 use aruna_operations::plugins::work::prune_work;
 
@@ -251,6 +256,70 @@ impl Worker {
         let call = invocation(run, (&install, self.local), limits, cancel);
         let invoked = self.supervisor.invoke(&compiled, call, broker).await;
         ended(invoked, self.supervisor.stopping())
+    }
+}
+
+/// How an invocation ended. A runtime without a free slot never entered the guest, so the run
+/// waits without using an attempt.
+pub fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool) -> Ended {
+    match invoked {
+        Ok(output) => Ended::Output(output),
+        Err(InvokeError::Guest(failure)) => match failure.kind {
+            FailureKind::Permanent | FailureKind::InvalidInput => Ended::Failed(failure.message),
+            FailureKind::Retryable => Ended::Retry(failure.message),
+        },
+        Err(InvokeError::Cancelled) if stopping => Ended::Stopped,
+        Err(InvokeError::Cancelled) => Ended::Cancelled("the run was cancelled".into()),
+        Err(error @ (InvokeError::Overloaded | InvokeError::Closed)) => {
+            Ended::Busy(error.to_string())
+        }
+        Err(error) => Ended::Failed(error.to_string()),
+    }
+}
+
+/// The handler call of a run: its saved invocation and the install's grants. An event's object on
+/// this node is named by its short `bucket/key` path; `path` keeps the permission path.
+pub fn invocation(
+    run: &PluginRun,
+    (install, local): (&PluginInstall, NodeId),
+    limits: Limits,
+    cancel: CancellationToken,
+) -> Invocation {
+    let (permissions, connections) = guest_access(install);
+    let trigger = match &run.trigger {
+        RunTrigger::Manual { input, .. } => Trigger::Manual(input.clone()),
+        RunTrigger::Timer { occurrence_ms } => Trigger::Timer(*occurrence_ms),
+        RunTrigger::Event(event) => Trigger::Event(WatchEvent {
+            kind: event.kind.name().into(),
+            path: event.path.clone(),
+            resource: short_path(&event.resource, (install, local)),
+            revision: event.revision.clone(),
+        }),
+        RunTrigger::Webhook(hook) => Trigger::Webhook(WebhookDelivery {
+            delivery_id: hook.delivery_id.clone(),
+            request: WebhookRequest {
+                method: hook.method.clone(),
+                query: hook.query.clone(),
+                headers: (hook.headers.iter())
+                    .map(|(name, value)| Field {
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                body: hook.body.clone(),
+            },
+        }),
+    };
+    Invocation {
+        run: run.run_id.to_string(),
+        install: run.install_id.to_string(),
+        group: install.group_id.to_string(),
+        settings: run.settings.clone(),
+        trigger,
+        permissions,
+        connections,
+        limits,
+        cancel,
     }
 }
 

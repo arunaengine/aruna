@@ -12,7 +12,7 @@ use aruna_core::plugin_runs::CallIntent;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{NodeId, UserId};
-use aruna_plugins::broker::{Created, ErrorKind, HostError};
+use aruna_plugin_types::calls::{Created, ErrorKind, HostError};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;

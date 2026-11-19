@@ -276,7 +276,7 @@ mod tests {
     use crate::plugins::rows::tests::{page_result, values_result};
     use crate::plugins::rows::{delete_rows, scan_rows, write_rows};
     use crate::plugins::runs::tests::opened;
-    use aruna_plugins::broker::Intent;
+    use aruna_plugin_types::calls::Intent;
 
     #[tokio::test]
     async fn intent_outcomes() {

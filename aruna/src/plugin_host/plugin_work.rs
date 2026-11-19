@@ -11,7 +11,7 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::execution::job::{
     JobError, JobPayload, JobResultPayload, PluginWorkAction, PluginWorkSpec,
 };
-use aruna_plugins::broker::{ErrorKind, HostError};
+use aruna_plugin_types::calls::{ErrorKind, HostError};
 use futures_util::future::BoxFuture;
 use ulid::Ulid;
 

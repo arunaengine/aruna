@@ -19,7 +19,7 @@ use aruna_core::plugin_runs::{
     RECEIVER_GAP, RUNS_QUEUED, SourceKind, WAITING_ROW, queue_key, reported_key,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_plugins::broker::ErrorKind;
+use aruna_plugin_types::calls::ErrorKind;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
