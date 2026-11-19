@@ -2,20 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::plugin_host::plugin_work::tests::scope;
 use aruna_drivers::driver::drive;
-use aruna_operations::plugins::flow_support::submit::fetcher;
-use aruna_operations::plugins::flow_support::submit::send;
-use aruna_operations::plugins::flow_support::submit::stored_object;
-use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::edit_config;
-use aruna_operations::plugins::test_support::path;
-use aruna_operations::plugins::test_support::ready;
-use aruna_operations::plugins::test_support::scope;
 use aruna_operations::plugins::work::Identity;
 use aruna_operations::plugins::work::WorkKind;
 use aruna_operations::plugins::work::WorkRow;
 use aruna_operations::plugins::work::read_work;
 use aruna_plugin_types::calls::ErrorKind;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::edit_config;
+use aruna_test_support::plugins::flows::submit::fetcher;
+use aruna_test_support::plugins::flows::submit::stored_object;
+use aruna_test_support::plugins::path;
+use aruna_test_support::plugins::ready;
 use ulid::Ulid;
 
 #[tokio::test]
@@ -175,8 +174,8 @@ async fn narrowed_download_refused() {
     use aruna_plugins::broker::{Broker, CallContext, JobDownload};
 
     use crate::plugin_host::broker::RunBroker;
-    use aruna_operations::plugins::test_support::{ORIGIN, hold_keys, secret_with};
     use aruna_operations::plugins::work::list_work;
+    use aruna_test_support::plugins::{ORIGIN, hold_keys, secret_with};
     let fixture = Fixture::keyed().await;
     let install = fetcher(&fixture).await;
     secret_with(&fixture, &install, ResponseExposure::Status).await;
@@ -217,14 +216,12 @@ async fn reply_rechecked() {
     // with the state kept, once the rule shows the status only.
     use std::sync::Arc;
 
-    use aruna_core::secrets::{ResponseExposure, SecretName};
+    use aruna_core::secrets::ResponseExposure;
     use aruna_plugins::broker::{Broker, CallContext};
 
     use crate::plugin_host::broker::RunBroker;
-    use aruna_operations::plugins::rules::{RuleGuard, consumer};
-    use aruna_operations::plugins::test_support::edit_rules;
-    use aruna_operations::plugins::test_support::{ORIGIN, hold_keys, rule_for, secret_with};
-    use aruna_operations::plugins::work::{WorkChange, reserve, update_work};
+    use aruna_operations::plugins::work::{RequestContext, WorkChange, reserve, update_work};
+    use aruna_test_support::plugins::{ORIGIN, hold_keys, replace_rules, rule_for, secret_with};
     let fixture = Fixture::keyed().await;
     fetcher(&fixture).await;
     let puts = serde_json::json!({
@@ -237,8 +234,7 @@ async fn reply_rechecked() {
         (config.installs[0].digest, config.installs[0].version) = (digest, "0.3.0".into());
     })
     .await;
-    let config =
-        aruna_operations::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let config = crate::plugin_host::read_config(&fixture.ctx, fixture.actor.realm_id);
     let install = config.await.unwrap().installs.remove(0);
     secret_with(&fixture, &install, ResponseExposure::Full).await;
     let mut row = WorkRow::reserved(
@@ -247,9 +243,14 @@ async fn reply_rechecked() {
         (Ulid::from_parts(9, 9), Ulid::generate()),
         1,
     );
-    let mut context = send(&fixture, &install, None).context;
-    context.base = format!("{ORIGIN}/api/");
-    row.context = Some(context);
+    row.context = Some(RequestContext {
+        connection: "catalog".into(),
+        base: format!("{ORIGIN}/api/"),
+        method: "PUT".into(),
+        path: "a.txt".into(),
+        query: Vec::new(),
+        headers: Vec::new(),
+    });
     let identity = Identity::Call {
         run_id: row.run_id,
         ordinal: 0,
@@ -282,22 +283,8 @@ async fn reply_rechecked() {
     assert_eq!(shown.reply_status, Some(201));
     assert_eq!(shown.reply_body.as_deref(), Some(&br#"{"id":7}"#[..]));
     assert_eq!(shown.reply_headers[0].value, "e1");
-    let name = SecretName::try_from("api-key".to_string()).unwrap();
-    let guard = RuleGuard::Revision {
-        install_id: install.install_id,
-        revision: install.revision,
-    };
     let rule = rule_for(&install, ResponseExposure::Status);
-    let target = (install.group_id, &name);
-    edit_rules(
-        &fixture.ctx,
-        &fixture.actor,
-        target,
-        (&consumer(&install), vec![rule]),
-        guard,
-    )
-    .await
-    .unwrap();
+    replace_rules(&fixture, &install, vec![rule]).await;
     let narrowed = broker.jobs_get(&cx, &id).await.unwrap();
     assert_eq!((narrowed.reply_status, narrowed.reply_body), (None, None));
     assert_eq!(narrowed.state, shown.state);
@@ -324,8 +311,7 @@ async fn broker_starts_uploads() {
         (config.installs[0].digest, config.installs[0].version) = (digest, "0.3.0".into());
     })
     .await;
-    let config =
-        aruna_operations::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let config = crate::plugin_host::read_config(&fixture.ctx, fixture.actor.realm_id);
     let install = (config.await.unwrap().installs.into_iter())
         .find(|found| found.install_id == install.install_id)
         .unwrap();

@@ -13,8 +13,8 @@ use crate::metadata::api::list_types::ListedMetadataDocument;
 use crate::plugins::fixtures::{self, config_result, is_child, node};
 use crate::plugins::rate::tests::rate_answer;
 use crate::plugins::rows::tests::child_result;
-use crate::plugins::runs::tests::queued;
 use crate::plugins::submit::CopyRequest;
+use aruna_test_support::plugins::queued;
 
 fn meta_root() -> String {
     let install = fixtures::install();

@@ -7,11 +7,12 @@ use aruna_core::structs::execution::job::OutputObject;
 
 use super::*;
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::submit::WorkRequest;
-use crate::plugins::submit::tests::{ready, request, scope};
+use crate::plugins::submit::tests::{request, scope};
 use crate::plugins::work::tests::edit_work;
 use crate::plugins::work::{FinalState, WorkState};
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::ready;
 
 fn output(node: NodeId, key: &str) -> OutputObject {
     OutputObject {

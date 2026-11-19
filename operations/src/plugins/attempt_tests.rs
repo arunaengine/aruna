@@ -9,8 +9,8 @@ use serde_json::json;
 use super::*;
 use crate::plugins::fixtures::{self, config_result, is_child, node};
 use crate::plugins::rows::tests::child_result;
-use crate::plugins::runs::tests::queued;
-use crate::plugins::test_support::created;
+use aruna_test_support::plugins::created;
+use aruna_test_support::plugins::queued;
 
 fn config() -> Arc<RealmConfigDocument> {
     Arc::new(fixtures::config(&fixtures::install(), json!({})))

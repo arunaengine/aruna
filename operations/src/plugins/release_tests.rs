@@ -10,16 +10,16 @@ use aruna_core::secrets::{ResponseExposure, SecretFields, SecretKind, SecretSett
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AuditIndex, audit_prefix};
 
 use super::*;
-use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, hold_keys, secret};
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::store::Txn;
 use crate::secrets::SecretChange;
 use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
 use aruna_core::plugin_installs::{InstallState, PluginInstall, SecretBinding};
 use aruna_core::plugins::Refusal;
 use aruna_core::secrets::{Delivery, SecretConsumer, SecretName};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::rows::Txn;
+use aruna_test_support::plugins::{ORIGIN, TOKEN, bound, edit_config, hold_keys, secret};
 use ulid::Ulid;
 
 fn request(install: &PluginInstall, url: &str) -> ReleaseRequest {

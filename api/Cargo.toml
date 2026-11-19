@@ -94,9 +94,9 @@ aruna-drivers = { workspace = true, features = ["test-hooks"] }
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
 tokio = { workspace = true, features = ["test-util"] }
-aruna-net = { workspace = true }
+aruna-net = { workspace = true, features = ["test-hooks"] }
 tracing-subscriber = { workspace = true }
-aruna-storage = { workspace = true }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
 aruna-tasks = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",

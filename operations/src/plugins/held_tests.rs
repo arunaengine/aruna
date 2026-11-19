@@ -7,10 +7,10 @@ use aruna_core::compute::Secret;
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretKind, SecretSettings};
 
 use super::*;
-use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, hold_keys, secret};
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
 use aruna_core::plugins::Refusal;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::{ORIGIN, TOKEN, bound, hold_keys, secret};
 
 fn request(slot: &str) -> ReleaseRequest {
     ReleaseRequest {

@@ -85,6 +85,7 @@ CRATE_TARGETS = {
         "aruna-operations",
         "aruna-drivers",
         "aruna-outbound",
+        "aruna-plugin-types",
         "aruna-storage",
         "aruna-tasks",
     ),

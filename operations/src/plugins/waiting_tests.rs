@@ -13,15 +13,16 @@ use aruna_drivers::driver::drive;
 
 use super::*;
 use crate::plugins::decide::{SeenRow, seen_key};
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::matcher::tests::config;
 use crate::plugins::rows::decode;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::runs::list_runs;
-use crate::plugins::store::Txn;
-use crate::plugins::test_support::{created, installed};
 use aruna_core::plugin_runs::EventBatch;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::artifacts::installed;
+use aruna_test_support::plugins::created;
+use aruna_test_support::plugins::flows::matcher::config;
+use aruna_test_support::plugins::rows::Txn;
 use ulid::Ulid;
 
 /// An event decided as waiting because the account's writes are gone; returns the event and

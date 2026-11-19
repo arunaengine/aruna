@@ -5,9 +5,10 @@
 
 use super::*;
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::runs::tests::queued;
+use crate::plugins::test_support::{install_as, install_request};
 use aruna_drivers::driver::drive;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::queued;
 
 fn kind(result: Result<PluginInstall, CallError>) -> Option<ErrorKind> {
     result.err().map(|error| error.0.kind)
@@ -26,9 +27,9 @@ fn covered_paths() {
 async fn checks_each_step() {
     let fixture = Fixture::new().await;
     let (ctx, actor) = (&fixture.ctx, &fixture.actor);
-    let mut request = fixture.request(None);
+    let mut request = install_request(&fixture, None);
     request.grants.insert("write".into(), Vec::new());
-    let installed = fixture.install(&request).await.unwrap();
+    let installed = install_as(&fixture, &request).await.unwrap();
     let mut run = queued(installed.install_id, 1);
     run.digest = installed.digest.clone();
     let scope = RunScope {

@@ -8,15 +8,15 @@ use aruna_core::structs::execution::job::PluginWorkSpec;
 use aruna_drivers::driver::drive;
 
 use super::*;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::values_result;
 use crate::plugins::rows::write_rows;
-use crate::plugins::test_support::ready_copy;
 use crate::plugins::work::tests::edit_work;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_core::calls::IoCall;
 use aruna_drivers::driver::DriverContext;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::ready_copy;
 
 /// The current version of the copy's source object `in/a.txt`.
 async fn source_version(ctx: &DriverContext) -> Ulid {

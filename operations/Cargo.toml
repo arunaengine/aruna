@@ -13,38 +13,13 @@ rust-version.workspace = true
 autotests = false
 
 [features]
-# Test seams and shared test helpers; only dev-dependencies enable it.
-test-hooks = [
-    "dep:async-trait",
-    "dep:tempfile",
-    "dep:aruna-blob",
-    "dep:aruna-graph",
-    "dep:aruna-storage",
-    "dep:aruna-net",
-    "dep:aruna-outbound",
-    "dep:tokio",
-    "dep:tokio-util",
-    "dep:axum",
-    "dep:aruna-drivers",
-    "dep:aruna-tasks",
-    "aruna-drivers/test-hooks",
-    "aruna-net/test-hooks",
-    "aruna-storage/test-hooks",
-]
+# Pure test fixtures for the tests of other crates; only dev-dependencies enable it.
+test-hooks = []
 
 [dependencies]
-axum = { workspace = true, optional = true }
-aruna-blob = { workspace = true, optional = true }
 aruna-core = { workspace = true }
-aruna-drivers = { workspace = true, optional = true }
-aruna-graph = { workspace = true, optional = true }
 aruna-plugin-types = { workspace = true }
-aruna-storage = { workspace = true, optional = true }
-aruna-net = { workspace = true, optional = true }
-aruna-outbound = { workspace = true, optional = true }
-aruna-tasks = { workspace = true, optional = true }
 craqle = { workspace = true }
-async-trait = { workspace = true, optional = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
@@ -65,8 +40,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
 spargebra = { workspace = true }
-tokio = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
@@ -75,14 +48,13 @@ oxrdf = { workspace = true }
 oxttl = { workspace = true }
 percent-encoding = { workspace = true }
 url = { workspace = true }
-tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 aruna-test-support = { workspace = true }
 async-trait = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-graph = { workspace = true }
-aruna-net = { workspace = true }
+aruna-net = { workspace = true, features = ["test-hooks"] }
 aruna-outbound = { workspace = true }
 async_zip = { workspace = true }
 tokio-util = { workspace = true }
