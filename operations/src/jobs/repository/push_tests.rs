@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::OnceLock;
+
 use super::*;
 use crate::jobs::repository::test_support::{
     child, credential_key, job_id, job_scope, link, link_bytes, local_scope, scope,
@@ -44,18 +46,24 @@ fn spec() -> ExportRoCrateSpec {
     }
 }
 
+/// One sealed token per test run: sealing picks a new nonce, so two seals differ.
 fn token() -> RepositoryCredential {
-    let link = link();
-    RepositoryCredential::seal_link(
-        &credential_key(),
-        link.created_by,
-        link.group_id,
-        link.connector_id,
-        Some(link.link_id),
-        link.endpoint,
-        "token",
-    )
-    .unwrap()
+    static SEALED: OnceLock<RepositoryCredential> = OnceLock::new();
+    SEALED
+        .get_or_init(|| {
+            let link = link();
+            RepositoryCredential::seal_link(
+                &credential_key(),
+                link.created_by,
+                link.group_id,
+                link.connector_id,
+                Some(link.link_id),
+                link.endpoint,
+                "token",
+            )
+            .unwrap()
+        })
+        .clone()
 }
 
 fn encoded<T: Serialize>(value: &T) -> aruna_core::types::Value {
