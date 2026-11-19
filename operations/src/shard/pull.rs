@@ -4,7 +4,10 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::document::{DocumentNetEvent, DocumentReconcileResult};
+use aruna_core::document::{
+    AppliedSync, DocumentNetEvent, DocumentReconcileResult, applied_sync_entry,
+    schedule_applied_drain,
+};
 use aruna_core::document_apply::ApplyError;
 use aruna_core::effects::ShardNetEffect;
 use aruna_core::events::ShardNetEvent;
@@ -14,10 +17,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use irokle::TopicId;
 use tracing::warn;
 
-use crate::metadata::after_sync::{AfterSyncOperation, MetadataTimings};
-use crate::node::summary_refresh::{RefreshUsageError, RefreshUsageOperation};
-use crate::notifications::email::RefreshMailOperation;
-use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::shard::{shard_answer, shard_call};
 use crate::sync::reconcile::SyncTopicsOperation;
 
@@ -82,28 +81,17 @@ impl Operation for PullTopicsOperation {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum ApplyStage {
-    Start,
-    Usage,
-    Interest,
-    Mail,
-    Metadata,
-}
-
 type ApplyTurn = Result<Next<bool>, IoError>;
 
-/// Brings usage, watch interest, mail settings and metadata in line with a document reconcile.
-/// Answers false when the reconcile itself failed. A failed follow-up only warns: each has its
-/// own retry, and the applied documents stay applied.
+/// Queues the usage, watch interest, mail settings and metadata follow-ups of a document
+/// reconcile for the node drain. Answers false when the reconcile itself failed. A follow-up
+/// that cannot be queued only warns: each has its own retry, and the applied documents stay.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ApplyPulledOperation {
     node_id: NodeId,
     /// The realm this node serves, when it runs a net transport.
     realm_id: Option<RealmId>,
     sync: Option<DocumentNetEvent>,
-    result: DocumentReconcileResult,
-    stage: ApplyStage,
     now_ms: u64,
     ids: IdMint,
 }
@@ -114,17 +102,9 @@ impl ApplyPulledOperation {
             node_id,
             realm_id,
             sync: Some(sync),
-            result: DocumentReconcileResult::default(),
-            stage: ApplyStage::Start,
             now_ms: 0,
             ids: IdMint::default(),
         }
-    }
-
-    fn mail(&mut self) -> ApplyTurn {
-        self.stage = ApplyStage::Mail;
-        let refresh = RefreshMailOperation::applied(&self.result.targets);
-        Ok(Next::Call(IoCall::child(refresh)))
     }
 }
 
@@ -151,19 +131,29 @@ impl Operation for ApplyPulledOperation {
                 if applied == 0 {
                     return Ok(Next::Done(true));
                 }
-                self.result = DocumentReconcileResult {
-                    targets,
-                    metadata_create_events,
-                    metadata_graph_tombstones,
+                let applied = AppliedSync {
+                    id: self.ids.mint(self.now_ms),
+                    node_id: self.node_id,
+                    realm_id: self.realm_id,
+                    result: DocumentReconcileResult {
+                        targets,
+                        metadata_create_events,
+                        metadata_graph_tombstones,
+                    },
                 };
-                self.stage = ApplyStage::Usage;
-                let refresh = RefreshUsageOperation::new(
-                    self.node_id,
-                    self.realm_id,
-                    &self.result.targets,
-                    self.ids.mint(self.now_ms),
-                );
-                Ok(Next::Call(IoCall::child(refresh)))
+                match applied_sync_entry(&applied) {
+                    Ok(entry) => Ok(Next::Then {
+                        output: true,
+                        calls: vec![
+                            IoCall::Write(vec![entry]),
+                            IoCall::from(schedule_applied_drain()),
+                        ],
+                    }),
+                    Err(error) => {
+                        warn!(%error, "The shard restore follow-ups could not be queued");
+                        Ok(Next::Done(true))
+                    }
+                }
             }
             DocumentNetEvent::Error { error, .. } => {
                 warn!(error = %error, "Failed to sync held shard topics on restart");
@@ -176,42 +166,8 @@ impl Operation for ApplyPulledOperation {
         }
     }
 
-    fn next(&mut self, result: IoResult) -> ApplyTurn {
-        match self.stage {
-            ApplyStage::Start => Err(IoError::Unfinished),
-            ApplyStage::Usage => {
-                if let Err(error) = result.child::<(), RefreshUsageError>()? {
-                    warn!(%error, "Realm usage refresh stopped after the shard restore");
-                }
-                let Some(realm_id) = self.realm_id else {
-                    return self.mail();
-                };
-                self.stage = ApplyStage::Interest;
-                let refresh = RefreshInterestOperation::new(&self.result.targets, realm_id);
-                Ok(Next::Call(IoCall::child(refresh)))
-            }
-            ApplyStage::Interest => {
-                if let Err(error) = result.child::<(), IoError>()? {
-                    warn!(%error, "Watch interest refresh stopped after the shard restore");
-                }
-                self.mail()
-            }
-            ApplyStage::Mail => {
-                if let Err(error) = result.child::<(), IoError>()? {
-                    warn!(%error, "Mail settings refresh stopped after the shard restore");
-                }
-                self.stage = ApplyStage::Metadata;
-                let applied = std::mem::take(&mut self.result);
-                let after = AfterSyncOperation::new(Some(self.node_id), applied, false);
-                Ok(Next::Call(IoCall::child(after)))
-            }
-            ApplyStage::Metadata => {
-                if let Err(error) = result.child::<MetadataTimings, IoError>()? {
-                    warn!(%error, "Metadata follow-up stopped after the shard restore");
-                }
-                Ok(Next::Done(true))
-            }
-        }
+    fn next(&mut self, _result: IoResult) -> ApplyTurn {
+        Err(IoError::Unfinished)
     }
 }
 
@@ -324,41 +280,28 @@ mod tests {
     }
 
     #[test]
-    fn followups_run_ordered() {
+    fn applied_queues_followups() {
         let mut apply = ApplyPulledOperation::new(node(), Some(realm()), reconciled(1));
         apply.stamp(1_000);
         apply.seed(7);
-        let targets = vec![DocumentTarget::RealmConfig { realm_id: realm() }];
-        let generation = ulid::Ulid::from_parts(1_000, 7);
-        let usage = RefreshUsageOperation::new(node(), Some(realm()), &targets, generation);
-        assert_eq!(apply.first(), Ok(Next::Call(IoCall::child(usage))));
-        // A failed refresh does not stop the ones after it.
-        let failed = RefreshUsageError::Io(IoError::Aborted);
-        let interest = RefreshInterestOperation::new(&targets, realm());
-        let turn = apply.next(child::<(), _>(Err(failed)));
-        assert_eq!(turn, Ok(Next::Call(IoCall::child(interest))));
-        let mail = RefreshMailOperation::applied(&targets);
-        let turn = apply.next(child::<(), IoError>(Ok(())));
-        assert_eq!(turn, Ok(Next::Call(IoCall::child(mail))));
-        let result = DocumentReconcileResult {
-            targets,
-            ..DocumentReconcileResult::default()
+        let applied = AppliedSync {
+            id: ulid::Ulid::from_parts(1_000, 7),
+            node_id: node(),
+            realm_id: Some(realm()),
+            result: DocumentReconcileResult {
+                targets: vec![DocumentTarget::RealmConfig { realm_id: realm() }],
+                ..DocumentReconcileResult::default()
+            },
         };
-        let after = AfterSyncOperation::new(Some(node()), result, false);
-        let turn = apply.next(child::<(), IoError>(Ok(())));
-        assert_eq!(turn, Ok(Next::Call(IoCall::child(after))));
-        let timings = MetadataTimings::default();
-        let done = apply.next(child::<_, IoError>(Ok(timings)));
-        assert_eq!(done, Ok(Next::Done(true)));
-    }
-
-    #[test]
-    fn realmless_skips_interest() {
-        let mut apply = ApplyPulledOperation::new(node(), None, reconciled(1));
-        apply.first().unwrap();
-        let targets = vec![DocumentTarget::RealmConfig { realm_id: realm() }];
-        let mail = RefreshMailOperation::applied(&targets);
-        let turn = apply.next(child::<(), RefreshUsageError>(Ok(())));
-        assert_eq!(turn, Ok(Next::Call(IoCall::child(mail))));
+        let entry = applied_sync_entry(&applied).unwrap();
+        let calls = vec![
+            IoCall::Write(vec![entry]),
+            IoCall::from(schedule_applied_drain()),
+        ];
+        let queued = Next::Then {
+            output: true,
+            calls,
+        };
+        assert_eq!(apply.first(), Ok(queued));
     }
 }
