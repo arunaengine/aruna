@@ -29,7 +29,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::held::{HeldElsewhere, admitted};
-use crate::connectors::{ResolveBindingInput, ResolveBindingOperation};
+use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use aruna_core::structs::storage::blob::strong_validator;
 
 /// One reference a read served from its source.

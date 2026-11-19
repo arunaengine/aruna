@@ -37,8 +37,8 @@ use crate::metadata::forward::write::{MetadataWriteError, read_error, write_erro
 use crate::metadata::id_mapping::PersistentIdError;
 use crate::metadata::pid_transition::PidTransition;
 use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::metadata::repository::StorageReadError;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::errors::StorageReadError;
 use aruna_core::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, PersistentIdOutcome, PersistentIdRequest,
     PersistentIdResolution,

@@ -475,7 +475,7 @@ pub(crate) async fn load_document_record(
         Err(ReadError::Conversion(error)) => Err(ServerError::InternalError(error.into())),
     }
 }
-type ReadError = aruna_operations::metadata::repository::StorageReadError;
+type ReadError = aruna_core::errors::StorageReadError;
 
 pub(crate) fn map_export_view(view: &MetadataRoCrateView) -> OperationMetadataRoCrateExportView {
     match view {

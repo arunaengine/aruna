@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod exports;
-mod forwards;
+pub mod forwards;
 mod held;
 mod mirror;
 mod paths;
@@ -437,4 +437,3 @@ impl Operation for ServeRequestOperation {
 #[path = "serve_tests.rs"]
 mod tests;
 
-pub use self::forwards::needs_view;

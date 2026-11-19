@@ -17,7 +17,3 @@ pub mod root_record;
 pub mod secret_config;
 pub mod validation;
 
-pub use resolver::{
-    ResolveBindingInput, ResolveBindingOperation, ResolveConnectorInput, ResolveConnectorOperation,
-    resolve_binding_effect, resolve_connector_effect,
-};

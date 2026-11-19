@@ -16,10 +16,11 @@ use ulid::Ulid;
 use crate::connectors::reference_prune::schedule_prune;
 use crate::connectors::reference_scan::{ReferenceScan, ScanStep};
 use crate::connectors::repository::{
-    StorageReadError, connector_id_key, delete_secret_effect, parse_secret_read,
-    read_secret_effect, source_connector_key,
+    connector_id_key, delete_secret_effect, parse_secret_read, read_secret_effect,
+    source_connector_key,
 };
 use crate::storage_read::decode_row;
+use aruna_core::errors::StorageReadError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteSourceInput {

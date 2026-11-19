@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
-use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
+use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::held::{
     HeldElsewhere, kept_location, kept_reads, kept_source_location, kept_source_reads,
 };

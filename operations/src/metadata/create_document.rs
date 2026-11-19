@@ -45,13 +45,13 @@ use crate::metadata::profile::rules::{
     crate_is_profile, not_profiled_status, profile_path_rule, stamp_unprofiled,
     submission_profile_tag,
 };
-use crate::metadata::repository::create_projection_entries;
 use crate::sync::shard_placement::sort_node_ids;
 use aruna_core::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
 };
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
+use aruna_core::storage_entries::create_projection_entries;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateDocumentConfig {

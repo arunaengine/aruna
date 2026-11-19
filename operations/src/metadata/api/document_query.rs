@@ -22,7 +22,7 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::record_reads::RecordMaterializedOperation;
-use crate::metadata::repository::StorageReadError;
+use aruna_core::errors::StorageReadError;
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, encode_message, peer_call, peer_reply,
 };

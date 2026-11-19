@@ -17,7 +17,6 @@ use ulid::Ulid;
 
 use super::GitError;
 use super::objects::Blob;
-pub(super) use crate::metadata::deletion_guard::metadata_call;
 
 fn store_call(call: GitCall) -> IoCall {
     IoCall::from(Effect::Git(Box::new(call)))

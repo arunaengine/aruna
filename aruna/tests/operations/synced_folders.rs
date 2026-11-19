@@ -43,7 +43,8 @@ use aruna_operations::device::sync::folders::{
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
-use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, needs_view};
+use aruna_operations::metadata::serve::forwards::needs_view;
+use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};

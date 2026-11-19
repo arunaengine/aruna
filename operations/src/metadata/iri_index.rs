@@ -39,7 +39,7 @@ use super::data_links::{
     AssociateVersionsOperation, DataLinkError, DocumentRowsOperation, LinkBudget, LinkRows,
     LinkRowsOperation,
 };
-use super::repository::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 const INDEX_PAGE_SIZE: usize = 128;
 

@@ -21,7 +21,7 @@ use aruna_graph::{GraphHandle, GraphOptions};
 use aruna_net::NetHandle;
 use aruna_net::config::NetConfig;
 use aruna_operations::metadata::projection::{DEFAULT_SKEW_MS, store_clock_skew};
-use aruna_operations::metadata::provenance::ForgetSpoolOperation;
+use aruna_operations::metadata::provenance::export::ForgetSpoolOperation;
 use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;

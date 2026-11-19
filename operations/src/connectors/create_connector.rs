@@ -23,12 +23,13 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::connectors::repository::{
-    LIST_CONNECTOR_SIZE, StorageReadError, connector_id_key, parse_secret_read, read_secret_effect,
+    LIST_CONNECTOR_SIZE, connector_id_key, parse_secret_read, read_secret_effect,
     source_connector_key,
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 use crate::groups::fence::{group_write_result, write_group_new};
 use crate::storage_read::decode_row;
+use aruna_core::errors::StorageReadError;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SourceConnectorInput {

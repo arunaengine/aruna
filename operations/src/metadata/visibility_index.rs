@@ -21,9 +21,9 @@ use ulid::Ulid;
 use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluator, PolicyLoadOperation};
 use crate::auth::error::PolicyEnforcementError;
 use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::metadata::repository::StorageReadError;
 use crate::metadata::updated_page::{UpdatedPageError, UpdatedPageOperation, UpdatedRecordsPage};
 use crate::storage_read::parse_storage_scan;
+use aruna_core::errors::StorageReadError;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Registry rows evaluated per rebuild batch, and index rows per scan batch.

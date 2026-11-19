@@ -13,7 +13,6 @@ use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
 use ulid::Ulid;
 
-pub use crate::connectors::repository::StorageReadError;
 use crate::storage_read::parse_storage_read;
 
 pub const HARVEST_PAGE_SIZE: usize = 128;

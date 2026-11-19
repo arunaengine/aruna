@@ -180,7 +180,7 @@ async fn serve(
         metadata_url: format!("{}/metadata/{id}", api_url(&state).await?),
         push_key: String::new(),
     };
-    let serve = git::transport(&git_node(&state), &auth, request);
+    let serve = git::transport::transport(&git_node(&state), &auth, request);
     let result = drive(serve, &state.get_ctx()).await.map_err(map_error)?;
     let GitEvent::Response {
         status,

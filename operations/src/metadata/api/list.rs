@@ -28,7 +28,7 @@ use crate::groups::list_groups::ListGroupError;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 use crate::metadata::record_reads::RecordMaterializedOperation;
-use crate::metadata::repository::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 type Records = Vec<MetadataRegistryRecord>;
 type PendingRecords = HashMap<GroupId, Records>;

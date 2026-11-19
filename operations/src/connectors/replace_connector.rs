@@ -21,11 +21,12 @@ use ulid::Ulid;
 use crate::connectors::reference_prune::schedule_prune;
 use crate::connectors::reference_scan::{ReferenceScan, ScanStep};
 use crate::connectors::repository::{
-    StorageReadError, delete_secret_effect, parse_secret_read, read_secret_effect,
-    source_connector_key, write_secret_effect,
+    delete_secret_effect, parse_secret_read, read_secret_effect, source_connector_key,
+    write_secret_effect,
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 use crate::storage_read::decode_row;
+use aruna_core::errors::StorageReadError;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReplaceSourceInput {

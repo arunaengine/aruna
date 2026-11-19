@@ -23,10 +23,11 @@ use super::calls::{
 };
 use super::lfs::{PermitObjectOperation, locate};
 use super::objects::{self, Blob};
-use super::{GitError, publish, records, repository};
+use super::{GitError, publish, records};
 use crate::distribution::resolve::{
     GlobalResolution, RESOLVE_BUDGET, ResolvedVersion, resolve_bounded, version_found,
 };
+use crate::git::access::repository;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};

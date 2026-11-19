@@ -39,9 +39,8 @@ use aruna_operations::jobs::records::pages::ServePageOperation;
 use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use aruna_operations::metadata::after_sync::AfterSyncOperation;
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
-use aruna_operations::metadata::serve::{
-    ServeNode, ServeRequestOperation, ServedReply, needs_view,
-};
+use aruna_operations::metadata::serve::forwards::needs_view;
+use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, ServedReply};
 use aruna_operations::node::heartbeat::ReceiveHeartbeatOperation;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 use aruna_operations::notifications::email::RefreshMailOperation;

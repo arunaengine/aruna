@@ -18,12 +18,13 @@ use bytes::Bytes;
 use serde_json::Value;
 use ulid::Ulid;
 
+use super::GitError;
 use super::access::Repository;
 use super::calls::{StoreReadOperation, git_call, git_event, store_read};
 use super::changes::{EntityChange, entity_changes};
 use super::push::record_made;
 use super::snapshot::{read_view, refresh};
-use super::{GitError, repository};
+use crate::git::access::repository;
 use aruna_core::git::GitNode;
 
 type Document = MetadataRegistryRecord;

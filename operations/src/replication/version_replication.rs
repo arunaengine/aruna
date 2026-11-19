@@ -4,9 +4,8 @@
 
 use crate::auth::enforcement::PolicyEvaluator;
 use crate::auth::permission_rules::PermissionRules;
-use crate::connectors::resolver::NATIVE_SET_ID;
+use crate::connectors::resolver::{NATIVE_SET_ID, ResolveBindingInput, resolve_binding_effect};
 use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
-use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::groups::backends::RecordReadError;
 use crate::groups::storage_routing::load_group_inputs;
 use crate::placement::policy::gate::{
