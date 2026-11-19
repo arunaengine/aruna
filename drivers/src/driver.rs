@@ -3447,7 +3447,10 @@ mod test {
         let run = drive_until(parent, &context, deadline);
         let ended = tokio::time::timeout(Duration::from_secs(60), run).await;
         tokio::time::resume();
-        assert_eq!(ended.expect("the child stops waiting at the deadline"), Ok(true));
+        assert_eq!(
+            ended.expect("the child stops waiting at the deadline"),
+            Ok(true)
+        );
         assert_eq!(*log.lock().unwrap(), ["holder"]);
         holder_task.abort();
     }

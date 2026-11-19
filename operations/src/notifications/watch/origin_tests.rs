@@ -94,7 +94,8 @@ fn failed_discovery_unsettled() {
     let mut emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), vec![node_id(2)]);
     emit.first().unwrap();
     let failed = GetConfigError::StorageError(StorageError::Timeout);
-    emit.next(child::<RealmConfigDocument, _>(Err(failed))).unwrap();
+    emit.next(child::<RealmConfigDocument, _>(Err(failed)))
+        .unwrap();
     let acked = NotificationTransportMessage::WatchEventsAck { written: 1 };
     let acked = child::<_, RemoteError>(Ok(acked));
     assert_eq!(emit.next(acked), Ok(Next::Done(vec![node_id(1)])));

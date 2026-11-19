@@ -336,7 +336,9 @@ impl WatchEventsOperation {
             // Nothing was stored: the sender keeps the events and delivers them again.
             Err(error) => {
                 let reason = error.to_string();
-                return Ok(Next::Done(NotificationTransportMessage::Unavailable(reason)));
+                return Ok(Next::Done(NotificationTransportMessage::Unavailable(
+                    reason,
+                )));
             }
         };
         let recipients = outcome.inbox.recipients;

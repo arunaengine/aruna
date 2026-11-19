@@ -599,7 +599,10 @@ fn failed_read_retries() {
     let mut refresh = RefreshMailOperation::new(user().realm_id);
     refresh.first().unwrap();
     let failed = read(GetConfigError::StorageError(StorageError::Timeout));
-    assert_eq!(refresh.next(failed), Err(IoError::Storage(StorageError::Timeout)));
+    assert_eq!(
+        refresh.next(failed),
+        Err(IoError::Storage(StorageError::Timeout))
+    );
     let mut missing = RefreshMailOperation::new(user().realm_id);
     missing.first().unwrap();
     let missing_config = read(GetConfigError::DocumentNotFound);
