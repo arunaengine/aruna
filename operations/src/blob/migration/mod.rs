@@ -55,7 +55,7 @@ use crate::groups::storage_routing::routing_key;
 use crate::s3::object::put::fenced::{Fenced, FencedWrite};
 use crate::s3::object::put::{PlainRecord, intent_rows, owner_call, path_owned, same_name_path};
 use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
-use aruna_core::managed_copy::{ManagedCopyError, check_serveable};
+use aruna_core::managed_copy::{ManagedCopyError, check_old_copy};
 
 /// Steps of one version migration; errors name the step they stopped in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1072,11 +1072,8 @@ impl MigrateVersionOperation {
     /// serve; the placement the gate admitted stays the same, since the backend does not change.
     /// A copy that cannot serve yet fails, so a retry pass moves it after revalidation.
     fn handle_copy(&mut self, value: Option<Value>) -> Turn {
-        let copy = check_serveable(value.as_ref().map(|value| value.as_ref()))?;
-        if !(self.old.as_ref()).is_some_and(|old| copy.location.same_object(old)) {
-            return Err(ManagedCopyError::Mismatched.into());
-        }
-        self.copy = Some(copy);
+        let value = value.as_ref().map(|value| value.as_ref());
+        self.copy = Some(check_old_copy(value, self.old.as_ref())?);
         self.read_target()
     }
 

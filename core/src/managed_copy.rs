@@ -123,6 +123,19 @@ pub fn transition_effect(
     }))
 }
 
+/// The serveable registration in `value`, refused unless it names the same object as `old`. A
+/// governed version moves only while its registration names the old copy and may serve.
+pub fn check_old_copy(
+    value: Option<&[u8]>,
+    old: Option<&BackendLocation>,
+) -> Result<ManagedCopyRecord, ManagedCopyError> {
+    let copy = check_serveable(value)?;
+    if !old.is_some_and(|old| copy.location.same_object(old)) {
+        return Err(ManagedCopyError::Mismatched);
+    }
+    Ok(copy)
+}
+
 /// A governed version is unavailable without a serveable local registration.
 /// An ungoverned version has no refs and never reaches this gate.
 pub fn check_serveable(value: Option<&[u8]>) -> Result<ManagedCopyRecord, ManagedCopyError> {

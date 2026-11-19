@@ -18,7 +18,7 @@ use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, COPY_OWNER_KEYSPACE, MANAGED_COPY_KEYSPACE,
     TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
 };
-use aruna_core::managed_copy::{ManagedCopyError, check_serveable};
+use aruna_core::managed_copy::{ManagedCopyError, check_old_copy};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
@@ -384,11 +384,8 @@ impl RewriteVersionOperation {
 
     /// A governed version moves only while its registration names the old copy and may serve.
     fn handle_copy(&mut self, value: Option<Value>) -> Step {
-        let copy = check_serveable(value.as_ref().map(|value| value.as_ref()))?;
-        if !(self.old.as_ref()).is_some_and(|old| copy.location.same_object(old)) {
-            return Err(ManagedCopyError::Mismatched.into());
-        }
-        self.copy = Some(copy);
+        let value = value.as_ref().map(|value| value.as_ref());
+        self.copy = Some(check_old_copy(value, self.old.as_ref())?);
         self.read_target()
     }
 
