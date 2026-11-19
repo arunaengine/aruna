@@ -93,6 +93,12 @@ impl ExportState {
     pub fn export(&self) -> Ulid {
         self.export
     }
+
+    /// Ends the walk when a step could not keep its rows; the first reason is kept.
+    pub fn lost(&mut self) {
+        let reason = "the export could not keep its working state";
+        self.stopped.get_or_insert_with(|| reason.to_string());
+    }
 }
 
 /// One crate being assembled: the export's state and the rows the current step sees.

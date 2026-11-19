@@ -434,6 +434,39 @@ fn revoked_hop_stops() {
 }
 
 #[test]
+fn silent_crate_incomplete() {
+    // A run whose crate does not answer, or answers too late, leaves the export incomplete.
+    let hop = Hop {
+        target: Target::Run("r1".to_string()),
+        from: "file".to_string(),
+        property: "result",
+        digest: None,
+    };
+    let queued = Hop {
+        target: Target::Version("next".to_string()),
+        from: "file".to_string(),
+        property: "isBasedOn",
+        digest: None,
+    };
+    let status = |read: Option<Read>| {
+        let mut built = built("file", "2026-10-28T00:00:00Z");
+        built.push([queued.clone()]);
+        built.state().awaiting = Some(Awaiting::RunCrate(hop.clone()));
+        let (_, ask) = export::step(&mut built, ExportAnswer::Read(read));
+        let status = node(&root(built), "./")["creativeWorkStatus"].clone();
+        (status.as_str().unwrap().to_string(), ask)
+    };
+    let go_on = ExportAsk::Hop(queued.clone());
+    assert_eq!(status(Some(Read::Hidden)), ("Complete".to_string(), go_on));
+    let (silent, ask) = status(Some(Read::Silent));
+    assert!(silent.starts_with("Incomplete"));
+    assert_eq!(ask, ExportAsk::Hop(queued.clone()));
+    let (late, ask) = status(None);
+    assert!(late.starts_with("Incomplete"));
+    assert_eq!(ask, ExportAsk::Root);
+}
+
+#[test]
 fn root_parts_close() {
     // The root pages its parts one at a time and closes the list after the last.
     use aruna_core::calls::{IoResult, Next};
