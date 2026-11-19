@@ -109,13 +109,6 @@ pub struct Chunk {
     pub bytes: ArtifactBytes,
 }
 
-/// Sends one artifact chunk to the management node `node_id`, which keeps it toward its copy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactStore {
-    pub node_id: crate::NodeId,
-    pub chunk: Chunk,
-}
-
 /// The step of the use check that refused a release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Refusal {

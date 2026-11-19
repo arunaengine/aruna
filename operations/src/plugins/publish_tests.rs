@@ -247,7 +247,15 @@ async fn counts_current_managers() {
 
 /// A finished window member with the answer `stored`.
 fn answered(index: usize, stored: Result<bool, String>) -> IoResult {
-    let event = Event::Net(NetEvent::ArtifactStored(stored));
+    let result = stored.map_err(|_| crate::metadata::protocol::MetadataReadError::Unavailable);
+    let answer = MetadataTransportMessage::ArtifactStored { result };
+    let event = Event::Net(NetEvent::MetadataAnswer(Box::new(
+        aruna_core::events::MetadataAnswer {
+            peer: node(0),
+            elapsed: std::time::Duration::ZERO,
+            result: Ok(encode_message(&answer).unwrap()),
+        },
+    )));
     IoResult::Group(GroupEvent::Member {
         index,
         result: GroupResult::Done(Box::new(event)),
@@ -256,10 +264,9 @@ fn answered(index: usize, stored: Result<bool, String>) -> IoResult {
 
 fn sent(node_id: NodeId, artifact: &[u8], index: u32) -> Effect {
     let chunk = chunk_of("sha256:d", artifact, index);
-    Effect::Net(NetEffect::ArtifactStore(Box::new(ArtifactStore {
-        node_id,
-        chunk,
-    })))
+    Effect::Net(NetEffect::MetadataRequest(Box::new(store_request(
+        node_id, chunk,
+    ))))
 }
 
 #[test]
