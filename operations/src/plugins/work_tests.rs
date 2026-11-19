@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::structs::execution::job::{JobId, PluginWorkAction};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 
@@ -20,9 +20,8 @@ use crate::plugins::store::Txn;
 pub(crate) use crate::plugins::test_support::edit_work;
 use crate::plugins::test_support::installed;
 use aruna_core::structs::execution::job::JobPayload;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_drivers::driver::{DriverContext, drive};
-use aruna_drivers::jobs::context::PayloadHandler;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_drivers::driver::drive;
 
 const SOURCE: &str = "/realm/g/group/data/node/in/a.txt";
 const TARGET: &str = "/realm/g/group/data/node/out/a.txt";
@@ -52,40 +51,6 @@ fn call(ordinal: u32) -> Identity {
 fn job(nonce: u64) -> JobId {
     let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap();
     JobId::from_parts(1_700_000_000_000, handle, BucketId::new(0).unwrap(), nonce).unwrap()
-}
-
-/// The job handlers whose holds the prune asks: the plugin work one.
-fn plugin_handlers() -> [std::sync::Arc<dyn PayloadHandler>; 1] {
-    [std::sync::Arc::new(WorkHolds)]
-}
-
-/// Keeps a job while its work row needs it, as the node's plugin work handler does.
-#[derive(Debug)]
-struct WorkHolds;
-
-impl PayloadHandler for WorkHolds {
-    fn run<'a>(
-        &'a self,
-        _: &'a aruna_drivers::jobs::context::JobContext,
-        _: &'a JobPayload,
-    ) -> Option<futures_util::future::BoxFuture<'a, aruna_core::jobs::JobRunOutcome>> {
-        None
-    }
-
-    fn keeps_job<'a>(
-        &'a self,
-        context: &'a DriverContext,
-        payload: &'a JobPayload,
-    ) -> futures_util::future::BoxFuture<'a, Result<bool, String>> {
-        Box::pin(async move {
-            let JobPayload::PluginWork(spec) = payload else {
-                return Ok(false);
-            };
-            drive(holds_job(spec), context)
-                .await
-                .map_err(|error| error.0)
-        })
-    }
 }
 
 #[tokio::test]
@@ -273,10 +238,66 @@ async fn summary_follows_job() {
     assert_eq!(gone.state, FinalState::Unknown);
 }
 
+/// A due plugin work job of one fixed install.
+fn due_work(seq: u64) -> (JobId, JobPayload) {
+    let spec = PluginWorkSpec {
+        realm_id: RealmId::from_bytes([1u8; 32]),
+        install_id: Ulid::from_parts(1, 1),
+        work_id: Ulid::from_parts(2, seq as u128),
+        group_id: Ulid::from_parts(4, 4),
+        action: PluginWorkAction::Copy {
+            source: "a".into(),
+            source_version: None,
+            target: "b".into(),
+            version_id: Ulid::from_parts(3, seq as u128),
+        },
+    };
+    (job(seq), JobPayload::PluginWork(spec))
+}
+
+#[test]
+fn prune_keeps_held() {
+    let mut prune = PruneKeepingWork::new(10);
+    prune.stamp(50);
+    prune.stamp(60);
+    assert_eq!(prune.now(), 50, "both steps use the start");
+    let is_child = |next: &PruneNext| matches!(next, Ok(Next::Call(IoCall::Child(_))));
+    assert!(is_child(&prune.first()), "the due jobs come first");
+    let due = vec![due_work(1), due_work(2)];
+    let read = IoResult::Child(ChildOutcome::new(Ok::<_, PruneError>(due)));
+    assert!(is_child(&prune.next(read)));
+    assert_eq!(prune.phase, PrunePhase::Holds(job(1)));
+    let held = IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>(true)));
+    assert!(is_child(&prune.next(held)));
+    assert_eq!(prune.phase, PrunePhase::Holds(job(2)));
+    assert_eq!(prune.kept, BTreeSet::from([job(1)]));
+    let settled = IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>(false)));
+    assert!(is_child(&prune.next(settled)));
+    assert_eq!(prune.phase, PrunePhase::Prune);
+    let outcome = JobPruneOutcome {
+        pruned: 1,
+        ..JobPruneOutcome::default()
+    };
+    let done = IoResult::Child(ChildOutcome::new(Ok::<_, PruneError>(outcome)));
+    let pruned = prune.next(done).unwrap();
+    assert!(matches!(pruned, Next::Done(JobPruneOutcome { pruned: 1, .. })));
+}
+
+#[test]
+fn prune_refuses_failure() {
+    let mut prune = PruneKeepingWork::new(10);
+    prune.first().unwrap();
+    let read = IoResult::Child(ChildOutcome::new(Ok::<_, PruneError>(vec![due_work(1)])));
+    prune.next(read).unwrap();
+    let failed = Err::<bool, _>(StoreError("down".into()));
+    let failed = prune.next(IoResult::Child(ChildOutcome::new(failed)));
+    assert_eq!(failed, Err(PruneError("down".into())), "nothing is pruned");
+}
+
 #[tokio::test]
 async fn settles_before_pruning() {
     // A finished job's row keeps its summary; until then the job record is held.
-    use crate::jobs::prune::tests::prune_job_batch;
+    use crate::jobs::JOB_PRUNE_PAGE;
     use crate::jobs::store::test_calls::insert_job;
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
@@ -304,9 +325,8 @@ async fn settles_before_pruning() {
     job_record.state = JobState::Failed;
     job_record.finished_at_ms = Some(1);
     insert_job(&fixture.ctx, &job_record).await.unwrap();
-    let pruned = prune_job_batch(&fixture.ctx, &plugin_handlers())
-        .await
-        .unwrap();
+    let prune = PruneKeepingWork::new(JOB_PRUNE_PAGE);
+    let pruned = drive(prune, &fixture.ctx).await.unwrap();
     assert_eq!(pruned.pruned, 0);
     assert_eq!(settle_work(&fixture.ctx, 5).await, Ok(1));
     let settled = drive(read_work(ids.0, ids.1), &fixture.ctx)
@@ -321,9 +341,8 @@ async fn settles_before_pruning() {
     );
     assert_eq!(drive(holds_job(&spec), &fixture.ctx).await, Ok(false));
     assert_eq!(settle_work(&fixture.ctx, 6).await, Ok(0));
-    let pruned = prune_job_batch(&fixture.ctx, &plugin_handlers())
-        .await
-        .unwrap();
+    let prune = PruneKeepingWork::new(JOB_PRUNE_PAGE);
+    let pruned = drive(prune, &fixture.ctx).await.unwrap();
     assert_eq!(pruned.pruned, 1);
     // The job record is gone; the row still answers the paths, also from its summary.
     let read = drive(read_work(ids.0, ids.1), &fixture.ctx)
@@ -345,7 +364,7 @@ async fn settles_before_pruning() {
 async fn prunes_settled_rows() {
     // A settled row goes once it aged and its run is pruned, since no rerun can ask for it; until
     // then it answers its paths, also after its job record was pruned.
-    use crate::jobs::prune::tests::prune_job_batch;
+    use crate::jobs::JOB_PRUNE_PAGE;
     use crate::jobs::store::test_calls::insert_job;
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
     let fixture = Fixture::new().await;
@@ -383,7 +402,7 @@ async fn prunes_settled_rows() {
         rows.push((run.run_id, row));
     }
     assert_eq!(settle_work(ctx, 1).await, Ok(2));
-    let pruned = prune_job_batch(ctx, &plugin_handlers()).await.unwrap();
+    let pruned = drive(PruneKeepingWork::new(JOB_PRUNE_PAGE), ctx).await.unwrap();
     assert_eq!(pruned.pruned, 2);
     // Delivered as `job_finished`; an undelivered row is never pruned.
     for (_, row) in &rows {

@@ -863,8 +863,8 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn prune_jobs(&self) {
-        let handlers = self.jobs_runtime.handlers();
-        let after = match prune_job_page(&self.context, &handlers).await {
+        let prune = PruneKeepingWork::new(JOB_PRUNE_PAGE);
+        let after = match drive(prune, &self.context).await {
             Ok(outcome) if outcome.has_more => Duration::ZERO,
             Ok(outcome) => outcome
                 .next_due_after
@@ -1047,27 +1047,6 @@ async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle
     {
         warn!(message = %message, "Failed to restore node usage publish timer");
     }
-}
-
-/// One prune pass; the payload handlers decide first which due jobs stay for now.
-async fn prune_job_page(
-    context: &DriverContext,
-    handlers: &[Arc<dyn PayloadHandler>],
-) -> Result<JobPruneOutcome, String> {
-    let now_ms = unix_timestamp_millis();
-    let due = drive(PruneDueOperation::new(now_ms, JOB_PRUNE_PAGE), context)
-        .await
-        .map_err(|error| error.0)?;
-    let mut kept = BTreeSet::new();
-    for (job_id, payload) in due {
-        for handler in handlers {
-            if handler.keeps_job(context, &payload).await? {
-                kept.insert(job_id);
-            }
-        }
-    }
-    let prune = PruneJobsOperation::new(now_ms, JOB_PRUNE_PAGE, kept);
-    drive(prune, context).await.map_err(|error| error.0)
 }
 
 async fn arm_drain_timer(context: &DriverContext) {
