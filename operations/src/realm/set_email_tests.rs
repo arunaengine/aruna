@@ -13,6 +13,7 @@ use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, 
 use aruna_drivers::driver::{DriverContext, drive};
 use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
+use ulid::Ulid;
 
 fn actor(seed: u8) -> Actor {
     let realm_id = RealmId::from_bytes([1u8; 32]);
