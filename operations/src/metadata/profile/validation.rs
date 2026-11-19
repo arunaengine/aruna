@@ -1261,8 +1261,8 @@ fn unavailable_error(code: &str, message: &str, revision: Option<&str>) -> Metad
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::effects::Effect;
     use crate::metadata::profile::rules::crate_is_profile;
+    use aruna_core::effects::Effect;
     use aruna_core::metadata::CRATE_PROFILE_IRI;
     use aruna_core::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
     use craqle::{EncodedTerm, ShaclMessage};

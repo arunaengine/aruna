@@ -3,13 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::calls::IoResult;
-use aruna_core::events::ShardNetEvent;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::shard::recovery::RecoveryError;
 use aruna_operations::shard::recovery::RecoveryStop;
-use irokle::TopicId;
 use aruna_operations::shard::restore_plan::ShardRestoreCursor;
 use aruna_operations::tests::shard::flat_config;
 use std::sync::Arc;
@@ -41,10 +38,6 @@ use tokio_util::sync::CancellationToken;
 const RECOVERY_TEST_GUARD: Duration = Duration::from_secs(5 * 60);
 /// Real-time grace before a pass that published nothing counts as stuck.
 const RECOVERY_PASS_GRACE: Duration = Duration::from_secs(5);
-
-fn node(seed: u8) -> NodeId {
-    iroh::SecretKey::from_bytes(&[seed; 32]).public()
-}
 
 struct RecoveryNode {
     _dir: tempfile::TempDir,
@@ -526,17 +519,4 @@ async fn stall_recovery() {
     finish_driver(cancelled, driver).await;
     stop_node(local).await;
     stop_node(blocked).await;
-}
-
-fn topic(seed: u8) -> TopicId {
-    TopicId::from_bytes([seed; 32])
-}
-
-fn answer(event: ShardNetEvent) -> IoResult {
-    let event = Event::Net(NetEvent::Shard(Box::new(event)));
-    IoResult::Event(Box::new(event))
-}
-
-fn outcome(result: Result<(), &str>) -> IoResult {
-    answer(ShardNetEvent::Outcome(result.map_err(str::to_string)))
 }

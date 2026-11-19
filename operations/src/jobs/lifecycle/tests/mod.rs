@@ -38,10 +38,10 @@ use crate::jobs::lifecycle::launch_admit::{
 };
 use crate::jobs::lifecycle::report::{AuditPaging, AuditRange, FamilyReport};
 use crate::jobs::lifecycle::submit_external::{ExternalSubmission, SubmitExternalOperation};
+use crate::jobs::node_inputs::{ingress_node, launch_node};
 use crate::jobs::records::audit::AuditPage;
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
 use crate::jobs::submit::SubmitJobError;
-use crate::jobs::node_inputs::{ingress_node, launch_node};
 
 pub(super) fn resources() -> EffectiveResources {
     EffectiveResources {
