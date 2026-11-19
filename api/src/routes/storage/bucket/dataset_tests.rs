@@ -12,8 +12,9 @@ use axum::extract::FromRequest;
 
 use super::*;
 use crate::auth::RealmAuth;
-use crate::routes::metadata::tests::{TestState, drain_metadata_background, setup_network_state};
+use crate::routes::metadata::tests::{TestState, setup_network_state};
 use crate::routes::storage::bucket::metadata::get_bucket_metadata;
+use crate::tests::metadata_fixtures::drain_metadata_background;
 
 const BUCKET: &str = "lab-db";
 

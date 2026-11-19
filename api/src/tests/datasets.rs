@@ -6,8 +6,9 @@
 use crate::auth::RealmAuth;
 use crate::metadata::{CreateMetadataRequest, CreateRoCrateRequest};
 use crate::routes::metadata::documents::create_metadata_document;
-use crate::routes::metadata::tests::{TestState, drain_metadata_background};
+use crate::routes::metadata::tests::TestState;
 use crate::tests::distributed::{bucket_info, write};
+use crate::tests::metadata_fixtures::drain_metadata_background;
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use axum::extract::State;
 use axum::{Extension, Json};

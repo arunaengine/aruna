@@ -54,7 +54,6 @@ use aruna_core::structs::storage::blob::{
     VersionKey,
 };
 use aruna_core::task::{PersistedTaskTimer, TaskKey};
-use aruna_graph::GraphHandle;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
@@ -67,7 +66,6 @@ use aruna_operations::testing::{drain_projection_queue, schedule_projection_drai
 use aruna_operations::testing::{process_graph_tombstones, prune_jobs_exist};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
-use ed25519_dalek::SigningKey;
 use serde_json::json;
 use std::collections::HashSet;
 use std::time::SystemTime;
