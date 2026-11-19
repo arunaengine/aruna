@@ -18,7 +18,8 @@ use crate::jobs::repository::test_support::{
     artifact, job_id, job_scope as scoped_job, local_scope, other_node, owner_node, realm,
 };
 use crate::tests::export::{
-    crate_document, job_context, probe_sources, recognized_entities, remote_spec, scope_of,
+    FIXTURE_BYTES, crate_document, job_context, probe_sources, recognized_entities, remote_spec,
+    scope_of,
 };
 use aruna_blob::archive::zip_date;
 use aruna_blob::archive::zip_entry;
@@ -59,7 +60,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::AsyncReadExt;
 
-const FIXTURE_BYTES: &[u8] = b"duplicate fixture payload";
 const ROCRATE_12: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/roundtrip-1.2.json"

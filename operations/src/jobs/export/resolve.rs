@@ -52,6 +52,24 @@ pub struct ExportCandidate {
     pub(super) expected_blake3: Option<[u8; 32]>,
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+impl ExportCandidate {
+    /// A candidate that reads version `target` from `node_id` and expects `hash`.
+    pub fn remote_exact(
+        node_id: NodeId,
+        target: VersionedObjectArn,
+        version: Ulid,
+        hash: [u8; 32],
+    ) -> Self {
+        Self {
+            source: CandidateSource::RemoteExact { node_id, target },
+            report_source: ExportReportSource::Remote,
+            resolved_version: Some(version),
+            expected_blake3: Some(hash),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) enum CandidateSource {
     Local {
