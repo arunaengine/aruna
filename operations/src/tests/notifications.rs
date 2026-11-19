@@ -45,7 +45,7 @@ pub fn record(
     created_at_ms: u64,
 ) -> NotificationRecord {
     NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         recipient,
         class,
         NotificationKind::AddedToGroup {
@@ -93,7 +93,7 @@ pub async fn create_holder_watch(
 > {
     let watch = (path_prefix, event_mask);
     let create = crate::notifications::watch::store::CreateWatchOperation::new(
-        Ulid::new(),
+        Ulid::generate(),
         local_node_id,
         owner,
         watch,
@@ -115,7 +115,7 @@ pub async fn create_local_watch(
     crate::notifications::watch::records::WatchSubscriptionError,
 > {
     let subscription = crate::notifications::watch::records::validated_subscription(
-        Ulid::new(),
+        Ulid::generate(),
         owner,
         path_prefix,
         event_mask,
@@ -153,7 +153,7 @@ pub fn peer_input() -> crate::notifications::deliver::DeliverInput {
 /// A direct notification whose ids and time follow `seed`.
 pub fn seeded_record(recipient: UserId, seed: u8) -> NotificationRecord {
     NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         NotificationKind::AddedToGroup {

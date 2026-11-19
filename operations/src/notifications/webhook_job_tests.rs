@@ -32,7 +32,7 @@ fn spec() -> WebhookDeliverySpec {
         size_bytes: 9,
     };
     let mut notification = NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         user(1, 2),
         NotificationClass::Direct,
         kind,

@@ -81,7 +81,7 @@ fn edge_batches() {
 fn guard_reads_authorization() {
     let mut operation = expanding(None);
     let mut watch = WatchSubscription::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         user(4, 2),
         "data/bucket/".to_string(),
         WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),

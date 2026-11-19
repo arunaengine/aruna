@@ -192,7 +192,7 @@ fn restart_notice_origin() {
         group_id: Ulid::from_bytes([6; 16]),
     };
     let records = vec![NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         kind,
@@ -207,7 +207,7 @@ fn restart_notice_origin() {
         group_id: Ulid::from_bytes([6; 16]),
     };
     let records = vec![NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         deleted,

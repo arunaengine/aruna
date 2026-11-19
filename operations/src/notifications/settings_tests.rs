@@ -83,7 +83,7 @@ fn notice() -> NotificationRecord {
         actor_user_id: owner(),
     };
     NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         owner(),
         NotificationClass::Direct,
         kind,

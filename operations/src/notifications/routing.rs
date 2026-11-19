@@ -519,7 +519,7 @@ mod pure_tests {
     }
 
     fn watch_subscription(owner: UserId, prefix: &str, mask: WatchEventMask) -> WatchSubscription {
-        WatchSubscription::new(ulid::Ulid::new(), owner, prefix.to_string(), mask, 1_000)
+        WatchSubscription::new(ulid::Ulid::generate(), owner, prefix.to_string(), mask, 1_000)
     }
 
     fn upload_event(actor: UserId, path: &str) -> WatchEvent {

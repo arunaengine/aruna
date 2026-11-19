@@ -165,7 +165,7 @@ mod call_tests {
             size_bytes: 9,
         };
         let notification = NotificationRecord::new(
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             user(1, 2),
             NotificationClass::Direct,
             kind,
