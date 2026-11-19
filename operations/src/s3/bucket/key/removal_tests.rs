@@ -12,6 +12,7 @@ use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode, Gra
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::vault_format::key_fingerprint;
 use std::time::SystemTime;
+use ulid::Ulid;
 
 const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
 

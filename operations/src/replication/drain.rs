@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
@@ -28,14 +29,15 @@ use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, sync_relationship_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
-use super::catch_up::{BOOTSTRAP_POLL, BootstrapWaitingOperation, ProcessBootstrapOperation};
+use super::catch_up::{
+    BOOTSTRAP_POLL, BootstrapWaitingOperation, CatchUpCursors, ProcessBootstrapOperation, Waited,
+};
 use super::members::{BoundRecord, BoundRecordOperation, RecordError, member_publication};
 use super::obligations::{LiveRepairResult, ProcessObligationsOperation};
 use super::page::PAGE_RECORDS;
@@ -81,6 +83,8 @@ pub struct BlobDrainResult {
     pub failed: usize,
     pub has_more_due: bool,
     pub next_due_after: Option<Duration>,
+    /// Where the next drain's bootstrap work goes on; the input keeps it for that drain.
+    pub catch_up: CatchUpCursors,
 }
 
 #[derive(Debug, PartialEq)]
@@ -258,6 +262,8 @@ enum BatchStep {
 /// a bounded number of other jobs is delivered one by one.
 #[derive(Debug, PartialEq)]
 pub struct ProcessBatchOperation<T> {
+    catch_up: CatchUpCursors,
+    now_ms: u64,
     transport: T,
     routing: NodeRouting,
     serving: Serving,
@@ -283,6 +289,8 @@ type BatchTurn = Turn<BlobDrainResult>;
 impl<T: PageTransport> ProcessBatchOperation<T> {
     pub fn new(transport: T, routing: NodeRouting, serving: Serving) -> Self {
         Self {
+            catch_up: CatchUpCursors::default(),
+            now_ms: 0,
             transport,
             routing,
             serving,
@@ -304,13 +312,19 @@ impl<T: PageTransport> ProcessBatchOperation<T> {
         }
     }
 
+    /// Goes on with the bootstrap work where the previous drain left it.
+    pub fn with_catch_up(mut self, cursors: CatchUpCursors) -> Self {
+        self.catch_up = cursors;
+        self
+    }
+
     fn call(&mut self, step: BatchStep, call: IoCall) -> BatchTurn {
         self.step = step;
         Ok(Next::Call(call))
     }
 
     fn scanned(&mut self, scan: BlobJobScan) -> BatchTurn {
-        let now_ms = self.started_ms.max(unix_timestamp_millis());
+        let now_ms = self.started_ms.max(self.now_ms);
         self.scan_ms = now_ms.saturating_sub(self.started_ms);
         self.next_due_ms = scan.next_due_ms;
         self.has_more_due = self.repair.has_more || scan.has_more_due;
@@ -376,12 +390,12 @@ impl<T: PageTransport> ProcessBatchOperation<T> {
     }
 
     fn retire(&mut self, (key, job): Job, outcome: &BlobJobOutcome) -> BatchTurn {
-        let retire = RetireJobOperation::new(key, job, outcome, unix_timestamp_millis());
+        let retire = RetireJobOperation::new(key, job, outcome, self.now_ms);
         self.call(BatchStep::Retired, IoCall::child(retire))
     }
 
     fn reschedule(&mut self, (key, job): Job, error: String) -> BatchTurn {
-        let (write, due) = reschedule_call(key, &job, error, unix_timestamp_millis())?;
+        let (write, due) = reschedule_call(key, &job, error, self.now_ms)?;
         self.next_due_ms = min_due_at(self.next_due_ms, due);
         self.failed = self.failed.saturating_add(1);
         self.call(BatchStep::Rescheduled, write)
@@ -411,7 +425,7 @@ impl<T: PageTransport> ProcessBatchOperation<T> {
             }
             // No attempt, no error: the next unlock of a key makes the job due again.
             Ok(BlobJobOutcome::AwaitingKey(keys)) => {
-                let park = ParkJobOperation::new(job.0, job.1, keys, unix_timestamp_millis());
+                let park = ParkJobOperation::new(job.0, job.1, keys, self.now_ms);
                 self.call(BatchStep::Parked, IoCall::child(park))
             }
             Err(error) => self.reschedule(job, error),
@@ -419,7 +433,7 @@ impl<T: PageTransport> ProcessBatchOperation<T> {
     }
 
     fn finish(&mut self) -> BatchTurn {
-        let now_ms = unix_timestamp_millis();
+        let now_ms = self.now_ms;
         if self.job_count > 0 || self.repair.processed > 0 {
             info!(
                 event = "pipeline.blob_replication.summary",
@@ -447,6 +461,7 @@ impl<T: PageTransport> ProcessBatchOperation<T> {
             failed: self.failed,
             has_more_due: self.has_more_due,
             next_due_after: next.filter(|_| !self.has_more_due),
+            catch_up: std::mem::take(&mut self.catch_up),
         }))
     }
 }
@@ -456,7 +471,7 @@ impl<T: PageTransport> Operation for ProcessBatchOperation<T> {
     type Error = BlobQueueError;
 
     fn first(&mut self) -> BatchTurn {
-        self.started_ms = unix_timestamp_millis();
+        self.started_ms = self.now_ms;
         Ok(Next::Call(
             IoCall::child(ProcessObligationsOperation::new()),
         ))
@@ -466,18 +481,22 @@ impl<T: PageTransport> Operation for ProcessBatchOperation<T> {
         match std::mem::replace(&mut self.step, BatchStep::Cursor) {
             BatchStep::Repair => {
                 self.repair = result.child::<LiveRepairResult, BlobQueueError>()??;
-                let bootstrap = ProcessBootstrapOperation::new(self.serving);
+                let cursors = self.catch_up.clone();
+                let bootstrap = ProcessBootstrapOperation::new(self.serving, cursors);
                 self.call(BatchStep::Bootstrap, IoCall::child(bootstrap))
             }
             BatchStep::Bootstrap => {
-                self.bootstrap = match result.child::<bool, BlobQueueError>()? {
-                    Ok(waiting) => waiting,
+                self.bootstrap = match result.child::<Waited, BlobQueueError>()? {
+                    Ok((waiting, cursors)) => {
+                        self.catch_up = cursors;
+                        waiting
+                    }
                     Err(error) => {
                         warn!(%error, "Distributed bucket bootstrap failed; retrying");
                         true
                     }
                 };
-                let scan = ScanJobsOperation::new(unix_timestamp_millis(), PAGE_RECORDS);
+                let scan = ScanJobsOperation::new(self.now_ms, PAGE_RECORDS);
                 self.call(BatchStep::Scan, IoCall::child(scan))
             }
             BatchStep::Scan => {
@@ -519,6 +538,10 @@ impl<T: PageTransport> Operation for ProcessBatchOperation<T> {
                 self.finish()
             }
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
 
@@ -583,8 +606,13 @@ pub(super) fn mark_failure(relationship: &mut SyncRelationship, error: &str) {
         .saturating_add(1);
 }
 
-pub(super) fn mark_progress(relationship: &mut SyncRelationship, replicated: u64, bytes: u64) {
-    relationship.status.last_synced_at = Some(SystemTime::now());
+pub(super) fn mark_progress(
+    relationship: &mut SyncRelationship,
+    (replicated, bytes): (u64, u64),
+    now_ms: u64,
+) {
+    relationship.status.last_synced_at =
+        Some(SystemTime::UNIX_EPOCH + Duration::from_millis(now_ms));
     relationship.status.counters.versions_synced = relationship
         .status
         .counters
@@ -597,8 +625,8 @@ pub(super) fn mark_progress(relationship: &mut SyncRelationship, replicated: u64
         .saturating_add(bytes);
 }
 
-pub(super) fn mark_success(relationship: &mut SyncRelationship, replicated: u64, bytes: u64) {
-    mark_progress(relationship, replicated, bytes);
+pub(super) fn mark_success(relationship: &mut SyncRelationship, synced: (u64, u64), now_ms: u64) {
+    mark_progress(relationship, synced, now_ms);
     relationship.status.last_error = None;
     relationship.status.counters.consecutive_failures = 0;
 }
@@ -660,7 +688,7 @@ fn sync_event(
     group_id: GroupId,
     versions_synced: u64,
     error: Option<&str>,
-    now_ms: u64,
+    (now_ms, event_id): (u64, Ulid),
 ) -> Option<WatchEvent> {
     let bucket = relationship.source.bucket()?;
     let node_id = relationship.source.node_id;
@@ -687,7 +715,7 @@ fn sync_event(
         ),
     };
     Some(WatchEvent {
-        event_id: Ulid::generate(),
+        event_id,
         realm_id: relationship.source.realm_id,
         kind,
         path: watch_resource_path(
@@ -773,6 +801,7 @@ enum JobStep {
 /// Runs one replication job and keeps its relationship's status.
 #[derive(Debug, PartialEq)]
 struct ProcessJobOperation {
+    ids: IdMint,
     job: BlobJobRecord,
     relationship: Option<SyncRelationship>,
     routing: NodeRouting,
@@ -796,6 +825,7 @@ impl ProcessJobOperation {
         serving: Serving,
     ) -> Self {
         Self {
+            ids: IdMint::default(),
             job,
             relationship,
             routing,
@@ -1056,7 +1086,7 @@ impl ProcessJobOperation {
                     group_id,
                     versions,
                     error.as_deref(),
-                    self.now_ms,
+                    (self.now_ms, self.ids.mint(self.now_ms)),
                 )
             },
         );
@@ -1102,13 +1132,21 @@ impl ProcessJobOperation {
             let Some(relationship) = progressed else {
                 return self.finish(outcome);
             };
-            mark_progress(relationship, result.replicated, result.replicated_bytes);
+            mark_progress(
+                relationship,
+                (result.replicated, result.replicated_bytes),
+                self.now_ms,
+            );
             return self.store(None, AfterStore::Finish(outcome));
         }
         if result.failed == 0 {
             let outcome = AfterStore::Finish(Ok(BlobJobOutcome::Completed));
             if let Some(relationship) = self.relationship.as_mut() {
-                mark_success(relationship, result.replicated, result.replicated_bytes);
+                mark_success(
+                    relationship,
+                    (result.replicated, result.replicated_bytes),
+                    self.now_ms,
+                );
             }
             return self.store(Some((result.replicated, None)), outcome);
         }
@@ -1123,7 +1161,11 @@ impl ProcessJobOperation {
         if result.replicated > 0
             && let Some(relationship) = self.relationship.as_mut()
         {
-            mark_progress(relationship, result.replicated, result.replicated_bytes);
+            mark_progress(
+                relationship,
+                (result.replicated, result.replicated_bytes),
+                self.now_ms,
+            );
         }
         let counts = format!(
             "replication completed with {} replicated, {} skipped, {} failed",
@@ -1234,6 +1276,10 @@ impl Operation for ProcessJobOperation {
                 self.after_store(*after)
             }
         }
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

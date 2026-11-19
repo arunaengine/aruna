@@ -61,6 +61,28 @@ pub fn encode_value<T: Serialize + ?Sized>(value: &T) -> Result<String, CursorEr
     Ok(encode(postcard::to_allocvec(value)?))
 }
 
+/// Starts a position this process sealed; no head key encoding starts with it.
+pub const SEALED_POSITION: u8 = 0xFF;
+
+/// Starts the text of a sealed listing position.
+const SEALED_MARK: char = '~';
+
+/// Whether `position` is a sealed one, which only the process that sealed it opens.
+pub fn sealed_position(position: &[u8]) -> bool {
+    position.first() == Some(&SEALED_POSITION)
+}
+
+/// The text a sealed listing position travels as.
+pub fn position_text(sealed: &[u8]) -> String {
+    format!("{SEALED_MARK}{}", encode(sealed))
+}
+
+/// The sealed position a listing text holds; `None` for any other text.
+pub fn position_bytes(text: &str) -> Option<Vec<u8>> {
+    let sealed = decode(text.strip_prefix(SEALED_MARK)?).ok()?;
+    sealed_position(&sealed).then_some(sealed)
+}
+
 /// The value a cursor text holds in postcard form; trailing bytes are ignored.
 pub fn decode_value<T: DeserializeOwned>(text: impl AsRef<[u8]>) -> Result<T, CursorError> {
     Ok(postcard::from_bytes(&decode(text)?)?)

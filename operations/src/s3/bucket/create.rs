@@ -13,6 +13,7 @@ use crate::s3::usage::{
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BUCKET_CREATION_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
@@ -69,6 +70,8 @@ type Turn = Result<Next<BucketInfo>, CreateBucketError>;
 
 #[derive(Debug, PartialEq)]
 pub struct CreateBucketOperation {
+    now_ms: u64,
+    ids: IdMint,
     bucket: String,
     bucket_info: BucketInfo,
     state: CreateBucketState,
@@ -87,6 +90,8 @@ const LINK_PAGE: usize = 256;
 impl CreateBucketOperation {
     pub fn new(bucket: String, bucket_info: BucketInfo) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             bucket,
             bucket_info,
             state: CreateBucketState::CheckExists,
@@ -220,7 +225,7 @@ impl CreateBucketOperation {
 
     fn write_bucket(&mut self) -> Turn {
         // Every creation, a replicated one too, gets a fresh id for its delete trail.
-        let creation = ulid::Ulid::generate().to_bytes();
+        let creation = self.ids.mint(self.now_ms).to_bytes();
         if let Some(binding) = self.bucket_info.distribution.as_mut() {
             // A member binds this exact incarnation, so a later bucket of the name never passes.
             binding.incarnation = u128::from_be_bytes(creation);
@@ -324,6 +329,14 @@ impl Operation for CreateBucketOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

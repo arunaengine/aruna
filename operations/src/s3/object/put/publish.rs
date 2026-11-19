@@ -359,7 +359,7 @@ impl PutObjectOperation {
             (config.realm_id, config.group_id, config.node_id),
             (&config.request.bucket, &config.request.key),
             version_id,
-            unix_timestamp_millis(),
+            self.now_ms,
         );
         rows.extend(journal_entries(&uploaded)?);
         self.call(PutObjectState::CreateVersionRecord, IoCall::Write(rows))

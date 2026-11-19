@@ -855,6 +855,11 @@ pub enum NetEffect {
     /// Signs the signing bytes of a search cursor; only a cursor naming this node as signer.
     /// Answers `NetEvent::CursorSigned`.
     CursorSign(Vec<u8>),
+    /// Seals a search or listing position with this process's key, so it names no key;
+    /// answers `NetEvent::PositionSealed`.
+    SealPosition(Vec<u8>),
+    /// Opens a position this process sealed; answers `NetEvent::PositionOpened`.
+    OpenPosition(Vec<u8>),
     /// Refreshes the last-contact time of a peer whose request was just accepted; answers
     /// `NetEvent::PeerContact`.
     PeerContact(NodeId),

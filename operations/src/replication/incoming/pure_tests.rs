@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    EnqueueClock, IncomingVersionError, IncomingVersionOperation, IncomingVersionResult,
-    IncomingVersionState, QuotaProbe, ReceivedBlob,
+    IncomingVersionError, IncomingVersionOperation, IncomingVersionResult, IncomingVersionState,
+    QuotaProbe, ReceivedBlob,
 };
 use aruna_core::structs::storage::abe::{
     AbeEffect, AbeEvent, AbeParameters, EnvelopePlan, ObjectEnvelope, create_envelope,
@@ -57,7 +57,6 @@ use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::types::{Key, Value};
 use aruna_core::{NodeId, UserId};
-use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;
@@ -400,22 +399,10 @@ fn trace_now() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
 }
 
-fn fixed_trace_clock() -> SystemTime {
-    trace_now()
-}
-
-thread_local! {
-    /// The enqueue-phase clock for the reclaim regression: the test advances
-    /// it while the operation is mid-apply to model a long transfer.
-    static CONTROLLED_CLOCK: Cell<SystemTime> = const { Cell::new(SystemTime::UNIX_EPOCH) };
-}
-
-fn controlled_clock() -> SystemTime {
-    CONTROLLED_CLOCK.with(Cell::get)
-}
-
-fn set_controlled_clock(now: SystemTime) {
-    CONTROLLED_CLOCK.with(|clock| clock.set(now));
+/// `time` on the runner clock.
+fn millis(time: SystemTime) -> u64 {
+    let since = time.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    u64::try_from(since.as_millis()).unwrap()
 }
 
 /// Named fixed identities, one seed per role, so a persisted value in a
@@ -2986,7 +2973,7 @@ fn materialized_trace() {
         manifest,
     )
     .with_publisher_node(iroh::SecretKey::from_bytes(&[0x31; 32]).public());
-    op.clock = EnqueueClock(fixed_trace_clock);
+    op.stamp(millis(trace_now()));
     op.manifest_policy = Some(op.target_authorization_path(group_id));
     op.writer_policy = Some(op.target_authorization_path(group_id));
 
@@ -3338,7 +3325,7 @@ fn delete_marker_trace() {
         test_realm_id(),
         manifest,
     );
-    op.clock = EnqueueClock(fixed_trace_clock);
+    op.stamp(millis(trace_now()));
     op.manifest_policy = Some(op.target_authorization_path(group_id));
     op.writer_policy = Some(op.target_authorization_path(group_id));
 
@@ -3427,7 +3414,7 @@ fn rejected_trace() {
         test_realm_id(),
         make_manifest(ReplicationItemKind::Materialized),
     );
-    op.clock = EnqueueClock(fixed_trace_clock);
+    op.stamp(millis(trace_now()));
     op.manifest_policy = Some(op.target_authorization_path(group_id));
     op.writer_policy = Some("/other/path".to_string());
 
@@ -3460,7 +3447,6 @@ fn rejected_trace() {
 fn reclaim_uses_enqueue() {
     let started_at = trace_now();
     let enqueued_at = started_at + Duration::from_secs(6 * 60 * 60);
-    set_controlled_clock(started_at);
     let manifest = make_manifest(ReplicationItemKind::Materialized);
     let version_id = manifest.version_id;
     let mut op = IncomingVersionOperation::new(
@@ -3469,7 +3455,7 @@ fn reclaim_uses_enqueue() {
         test_realm_id(),
         manifest,
     );
-    op.clock = EnqueueClock(controlled_clock);
+    op.stamp(millis(started_at));
     op.destination_group_id = Some(test_group_id());
     op.replaced_version = Some(BlobVersion::materialized(
         [9u8; 32],
@@ -3486,7 +3472,7 @@ fn reclaim_uses_enqueue() {
         .unwrap();
 
     // The blob transfer and the transactional apply ran for hours.
-    set_controlled_clock(enqueued_at);
+    op.stamp(millis(enqueued_at));
     let effects = op.next(IoResult::Done);
     assert_eq!(op.state, IncomingVersionState::WriteReclaimCandidate);
     let (key_space, _, value) = &written(&effects)[0];

@@ -590,7 +590,7 @@ mod tests {
 
     fn timed_lock() -> LockBucketOperation {
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let mut callback = LockBucketOperation::timed(session_ticket(), node);
+        let mut callback = LockBucketOperation::timed(session_ticket(), node, 1_000);
         callback.first().unwrap();
         callback
     }

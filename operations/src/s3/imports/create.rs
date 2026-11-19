@@ -13,6 +13,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
@@ -77,6 +78,8 @@ type Turn = Result<Next<BackendImport>, ImportRuleError>;
 /// writes to the write backend.
 #[derive(Debug, PartialEq)]
 pub struct CreateImportOperation {
+    now_ms: u64,
+    ids: IdMint,
     input: CreateImportInput,
     state: CreateState,
     /// The bucket record with the added routing rule; `None` keeps the stored one.
@@ -97,6 +100,8 @@ pub struct CreateImportOperation {
 impl CreateImportOperation {
     pub fn new(input: CreateImportInput) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             input,
             state: CreateState::Backends,
             routed: None,
@@ -146,9 +151,9 @@ impl CreateImportOperation {
         Ok(())
     }
 
-    fn record(&self) -> BackendImport {
+    fn record(&self, import_id: Ulid) -> BackendImport {
         BackendImport {
-            import_id: Ulid::generate(),
+            import_id,
             group_id: self.input.group_id,
             backend_id: self.input.backend_id,
             backend_prefix: self.input.backend_prefix.clone(),
@@ -434,7 +439,7 @@ impl CreateImportOperation {
     }
 
     fn write(&mut self) -> Turn {
-        let record = self.record();
+        let record = self.record(self.ids.mint(self.now_ms));
         let mut writes = vec![(
             BACKEND_IMPORT_KEYSPACE.to_string(),
             record.key(),
@@ -595,6 +600,14 @@ impl Operation for CreateImportOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 
@@ -767,7 +780,8 @@ mod tests {
             ),
             "{effects:?}"
         );
-        let mut linked = CreateImportOperation::new(input("lab-new/", "data/new/")).record();
+        let mut linked = CreateImportOperation::new(input("lab-new/", "data/new/"))
+            .record(Ulid::from_bytes([31; 16]));
         (linked.key_prefix, linked.backend_prefix) = ("data/".to_string(), "lab-old/".to_string());
         let effects = scan_page(&mut operation, std::slice::from_ref(&linked));
         assert!(effects.is_empty(), "{effects:?}");
@@ -1088,7 +1102,8 @@ mod tests {
             input("", "imported/x/"),
             bucket(Vec::new(), Compression::Off),
         );
-        let mut other = CreateImportOperation::new(input("", "imported/x/")).record();
+        let mut other =
+            CreateImportOperation::new(input("", "imported/x/")).record(Ulid::from_bytes([32; 16]));
         other.key_prefix = "imported/".to_string();
         scan_page(&mut operation, &[other]);
 
@@ -1177,7 +1192,8 @@ mod tests {
             input("raw/x/", "imported/"),
             bucket(Vec::new(), Compression::Off),
         );
-        let mut other = CreateImportOperation::new(input("raw/x/", "imported/")).record();
+        let mut other = CreateImportOperation::new(input("raw/x/", "imported/"))
+            .record(Ulid::from_bytes([33; 16]));
         other.key_prefix = "elsewhere/".to_string();
         other.backend_prefix = "raw/".to_string();
         let effects = scan_page(&mut operation, std::slice::from_ref(&other));

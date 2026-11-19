@@ -198,6 +198,9 @@ impl ArunaS3Service {
             MergeError::Listing(VisibleError::Cursor) => {
                 s3_error!(InternalError, "The listing cursor was not sealed")
             }
+            MergeError::Listing(VisibleError::Unopened) => {
+                s3_error!(InvalidArgument, "Invalid continuation token")
+            }
             MergeError::Listing(VisibleError::Io(error)) => s3_error!(InternalError, "{error}"),
             MergeError::Failed(reason) => s3_error!(InternalError, "{reason}"),
         }

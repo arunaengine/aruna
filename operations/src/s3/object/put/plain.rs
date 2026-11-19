@@ -372,7 +372,8 @@ impl PutObjectOperation {
                 Ok(rows) => writes.extend(rows),
                 Err(error) => return Some(Err(error.into())),
             }
-            match self.dedup_release().transpose() {
+            let release = self.ids.mint(self.now_ms);
+            match self.dedup_release(release).transpose() {
                 Ok(release) => writes.extend(release),
                 Err(error) => return Some(Err(error.into())),
             }
@@ -1299,7 +1300,10 @@ mod tests {
         operation.next(row(None)).unwrap();
         // The version reads the older file; the written one is released after the commit.
         assert_eq!(operation.output, Some(old.clone()));
-        let (space, _, value) = operation.dedup_release().unwrap().unwrap();
+        let (space, _, value) = operation
+            .dedup_release(Ulid::from_bytes([9; 16]))
+            .unwrap()
+            .unwrap();
         assert_eq!(space, BLOB_CLEANUP_KEYSPACE);
         let work = BlobCleanupWork::from_bytes(&value).unwrap();
         let BlobCleanupWork::ReleaseRenamed {
@@ -1326,7 +1330,7 @@ mod tests {
         let mut operation = rewritten(8);
         let turn = current(&mut operation, &old);
         assert_eq!(operation.state, PutObjectState::CheckHashLookup, "{turn:?}");
-        assert!(operation.dedup_release().is_none());
+        assert!(operation.dedup_release(Ulid::from_bytes([9; 16])).is_none());
         // Without a backend version the written file cannot go, so it is kept as well.
         let mut operation = rewritten(7);
         if let Some(plain) = operation.plain.as_mut() {
@@ -1354,11 +1358,11 @@ mod tests {
         };
         let (operation, old) = reuse(b"v1");
         assert_eq!(operation.output, Some(old));
-        assert!(operation.dedup_release().is_some());
+        assert!(operation.dedup_release(Ulid::from_bytes([9; 16])).is_some());
         // The same backend version is the same file; nothing is released.
         let (operation, _) = reuse(b"v2");
         assert_eq!(operation.state, PutObjectState::CheckHashLookup);
-        assert!(operation.dedup_release().is_none());
+        assert!(operation.dedup_release(Ulid::from_bytes([9; 16])).is_none());
     }
 
     #[test]
@@ -1372,6 +1376,6 @@ mod tests {
         operation.next(row(Some(b"v1".to_vec()))).unwrap();
         operation.next(row(Some(Vec::new()))).unwrap();
         assert_eq!(operation.state, PutObjectState::CheckHashLookup);
-        assert!(operation.dedup_release().is_none());
+        assert!(operation.dedup_release(Ulid::from_bytes([9; 16])).is_none());
     }
 }

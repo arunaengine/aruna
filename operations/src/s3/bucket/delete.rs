@@ -7,6 +7,7 @@ use crate::s3::usage::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_p
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, ABE_REKEY_KEYSPACE, AUTH_KEYSPACE,
     BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
@@ -43,7 +44,6 @@ use thiserror::Error;
 
 use crate::notifications::outbox_record::schedule_drain_effect;
 use crate::sync::mirror_repair::mirror_delete_entry;
-use aruna_core::time::unix_timestamp_millis;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeleteBucketState {
@@ -94,6 +94,8 @@ type Turn = Result<Next<()>, DeleteBucketError>;
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteBucketOperation {
+    now_ms: u64,
+    ids: IdMint,
     bucket: String,
     state: DeleteBucketState,
     group_id: Option<GroupId>,
@@ -120,6 +122,8 @@ impl DeleteBucketOperation {
 
     pub fn new(bucket: String) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             bucket,
             state: DeleteBucketState::ReadBucket,
             group_id: None,
@@ -277,7 +281,7 @@ impl DeleteBucketOperation {
             return self.read_encryption();
         }
         let writes = (self.relationships.iter())
-            .map(|relationship| mirror_delete_entry(relationship, unix_timestamp_millis()))
+            .map(|relationship| mirror_delete_entry(relationship, self.now_ms))
             .collect::<Result<Vec<_>, _>>()?;
         self.call(DeleteBucketState::WriteRepairs, IoCall::Write(writes))
     }
@@ -482,7 +486,7 @@ impl DeleteBucketOperation {
         };
         let row = (
             BLOB_CLEANUP_KEYSPACE.to_string(),
-            ulid::Ulid::generate().to_bytes().to_vec().into(),
+            self.ids.mint(self.now_ms).to_bytes().to_vec().into(),
             work.to_bytes()?.into(),
         );
         self.call(DeleteBucketState::QueueTrail, IoCall::Write(vec![row]))
@@ -511,7 +515,7 @@ impl DeleteBucketOperation {
                 node_id,
                 group_id,
             };
-            let outbox_id = ulid::Ulid::generate();
+            let outbox_id = self.ids.mint(self.now_ms);
             let record = NotificationRecord::new(
                 member,
                 NotificationClass::Direct,
@@ -619,6 +623,14 @@ impl Operation for DeleteBucketOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

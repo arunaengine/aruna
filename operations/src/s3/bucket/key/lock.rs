@@ -157,8 +157,8 @@ impl LockBucketOperation {
         }
     }
 
-    /// The node's own lock of one timed session, after its deadline passed.
-    pub fn timed(session: KeyTicket, node_id: NodeId) -> Self {
+    /// The node's own lock of one timed session at `now_ms`, after its deadline passed.
+    pub fn timed(session: KeyTicket, node_id: NodeId, now_ms: u64) -> Self {
         let mut operation = Self::new(LockInput {
             bucket: String::new(),
             group_id: Ulid::nil(),
@@ -166,7 +166,7 @@ impl LockBucketOperation {
             node_id,
             caller: None,
             session: Some(session),
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms,
         });
         operation.bucket_id = Some(session.key.bucket_id);
         operation
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn locks_named_session() {
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let mut operation = LockBucketOperation::timed(ticket(2), node);
+        let mut operation = LockBucketOperation::timed(ticket(2), node, 1_000);
         // The node locks by session alone, without reading the bucket.
         let turn = operation.first();
         let lock = BlobEffect::LockKey {

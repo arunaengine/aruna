@@ -26,6 +26,7 @@ use aruna_core::errors::StorageReadError;
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE,
@@ -1047,6 +1048,8 @@ enum ReplicateObjectState {
 
 #[derive(Debug, PartialEq)]
 pub struct ReplicateObjectOperation {
+    now_ms: u64,
+    ids: IdMint,
     request: VersionReplicationRequest,
     state: ReplicateObjectState,
     pending_materialized_version: Option<PendingMaterializedVersion>,
@@ -1110,6 +1113,8 @@ struct ManifestVersionParts {
 impl ReplicateObjectOperation {
     pub fn new(request: VersionReplicationRequest) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             request,
             state: ReplicateObjectState::Init,
             pending_materialized_version: None,
@@ -2214,6 +2219,14 @@ impl Operation for ReplicateObjectOperation {
         }
         calls
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 }
 
 impl ReplicateObjectOperation {
@@ -2574,7 +2587,7 @@ impl ReplicateObjectOperation {
                 };
                 let blob_size = blob.size;
                 self.negotiated = Some(result.clone());
-                let replication_id = Ulid::generate();
+                let replication_id = self.ids.mint(self.now_ms);
                 self.blob_replication_id = Some(replication_id);
                 debug!(
                     bucket = %self.request.bucket,

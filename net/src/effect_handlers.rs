@@ -260,6 +260,9 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         }
         // The avoided holders are read through the handle the runner holds.
         NetEffect::AvoidHolder { .. } => NetEvent::HolderAvoided,
+        // Positions are sealed with the key the runner holds for this process.
+        NetEffect::SealPosition(_) => NetEvent::PositionSealed(None),
+        NetEffect::OpenPosition(_) => NetEvent::PositionOpened(None),
         NetEffect::CursorSign(bytes) => {
             let signer = ctx.secret_key.public();
             let signed = aruna_core::cursor::names_signer(&bytes, signer.as_bytes());
@@ -658,6 +661,8 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::DelegationSign(_) => "delegation_sign",
         NetEffect::AvoidHolder { .. } => "avoid_holder",
         NetEffect::CursorSign(_) => "cursor_sign",
+        NetEffect::SealPosition(_) => "seal_position",
+        NetEffect::OpenPosition(_) => "open_position",
         NetEffect::Shard(_) => "shard",
         NetEffect::EnsureTopics { .. } => "ensure_topics",
         NetEffect::AllowTopicPeers { .. } => "allow_topic_peers",

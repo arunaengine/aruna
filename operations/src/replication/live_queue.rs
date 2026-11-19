@@ -6,13 +6,13 @@ use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use tracing::warn;
 use ulid::Ulid;
@@ -44,6 +44,8 @@ enum PutStep {
 /// failure only warns, since the durable obligation remains for repair.
 #[derive(Debug, PartialEq)]
 pub struct CompletePutOperation {
+    now_ms: u64,
+    ids: IdMint,
     input: CompletePutInput,
     step: PutStep,
 }
@@ -51,6 +53,8 @@ pub struct CompletePutOperation {
 impl CompletePutOperation {
     pub fn new(input: CompletePutInput) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             input,
             step: PutStep::Queue,
         }
@@ -84,14 +88,15 @@ impl CompletePutOperation {
         let Some((local, holders)) = route else {
             return Ok(Next::Done(()));
         };
+        let event_id = self.ids.mint(self.now_ms);
         let input = &self.input;
         let event = WatchEvent {
-            event_id: Ulid::generate(),
+            event_id,
             realm_id: input.realm_id,
             kind: WatchEventKind::DataUploaded,
             path: self.path(),
             actor: input.auth.user_id,
-            occurred_at_ms: unix_timestamp_millis(),
+            occurred_at_ms: self.now_ms,
             detail: WatchEventDetail::DataUploaded {
                 group_id: input.group_id,
                 node_id: input.node_id,
@@ -137,6 +142,14 @@ impl Operation for CompletePutOperation {
                 Ok(Next::Done(()))
             }
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

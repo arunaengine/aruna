@@ -17,7 +17,6 @@ use aruna_core::structs::storage::replication_queue::{
     ReplicateScopeInput, blob_job_entry, blob_job_key, blob_job_preferred, live_obligation_entry,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_core::{NodeId, UserId};
 use thiserror::Error;
@@ -89,6 +88,7 @@ enum QueueBlobState {
 
 #[derive(Debug, PartialEq)]
 pub struct QueueBlobOperation {
+    now_ms: u64,
     job: BlobJobRecord,
     state: QueueBlobState,
     /// The plaintext request this queueing records: `Some(None)` withdraws an earlier one.
@@ -98,7 +98,8 @@ pub struct QueueBlobOperation {
 impl QueueBlobOperation {
     pub fn new(input: ReplicateScopeInput, source_delete_marker: Option<bool>) -> Self {
         Self {
-            job: BlobJobRecord::new(input, source_delete_marker, unix_timestamp_millis()),
+            now_ms: 0,
+            job: BlobJobRecord::new(input, source_delete_marker, 0),
             state: QueueBlobState::ReadExisting,
             consent: None,
         }
@@ -118,12 +119,8 @@ impl QueueBlobOperation {
         relationship_id: Ulid,
     ) -> Self {
         Self {
-            job: BlobJobRecord::new_relationship(
-                input,
-                source_delete_marker,
-                relationship_id,
-                unix_timestamp_millis(),
-            ),
+            now_ms: 0,
+            job: BlobJobRecord::new_relationship(input, source_delete_marker, relationship_id, 0),
             state: QueueBlobState::ReadExisting,
             consent: None,
         }
@@ -187,6 +184,9 @@ impl Operation for QueueBlobOperation {
     type Error = BlobQueueError;
 
     fn first(&mut self) -> QueueTurn {
+        // The job is due and enqueued when the run starts.
+        self.job.due_at_ms = self.now_ms;
+        self.job.enqueued_at_ms = self.now_ms;
         match self.consent {
             Some(None) => self.clear_consent(),
             _ => self.read_existing(),
@@ -209,6 +209,10 @@ impl Operation for QueueBlobOperation {
                 scheduled: drain_scheduled(result),
             })),
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
 
@@ -417,6 +421,7 @@ mod tests {
     };
     use aruna_core::plugin_runs::{SourceEvent, SourceKind};
     use aruna_core::structs::{SyncMode, SyncRelationship, SyncState};
+    use aruna_core::time::unix_timestamp_millis;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::StorageHandle;
 
@@ -1853,7 +1858,7 @@ mod tests {
     fn success_counts_bytes() {
         let mut relationship = relationship(81, 2, None, true);
 
-        mark_success(&mut relationship, 2, 42);
+        mark_success(&mut relationship, (2, 42), 5_000);
 
         assert_eq!(relationship.status.counters.versions_synced, 2);
         assert_eq!(relationship.status.counters.bytes_synced, 42);
@@ -1863,10 +1868,11 @@ mod tests {
     fn partial_counts_progress() {
         let mut relationship = relationship(82, 2, None, true);
 
-        mark_progress(&mut relationship, 2, 42);
+        mark_progress(&mut relationship, (2, 42), 5_000);
         mark_failure(&mut relationship, "one version failed");
 
-        assert!(relationship.status.last_synced_at.is_some());
+        let synced = SystemTime::UNIX_EPOCH + Duration::from_millis(5_000);
+        assert_eq!(relationship.status.last_synced_at, Some(synced));
         assert_eq!(relationship.status.counters.versions_synced, 2);
         assert_eq!(relationship.status.counters.bytes_synced, 42);
         assert_eq!(relationship.status.counters.failures, 1);

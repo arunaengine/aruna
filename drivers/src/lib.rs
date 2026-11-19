@@ -12,6 +12,7 @@ pub mod clock;
 pub mod driver;
 pub mod effect_adapters;
 pub mod jobs;
+pub mod position;
 pub mod recorder;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod testing;

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::ops::Range;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -390,6 +391,7 @@ enum CreateLinkStep {
 /// version now. A source on another node must name its version.
 #[derive(Debug, PartialEq)]
 pub struct CreateLinkOperation {
+    ids: IdMint,
     caller: LinkCaller,
     bucket: String,
     key: String,
@@ -415,8 +417,9 @@ impl CreateLinkOperation {
             group_id,
             node,
             source,
-            fresh: Ulid::generate(),
+            fresh: Ulid::nil(),
             now_ms: 0,
+            ids: IdMint::default(),
             step: CreateLinkStep::Access,
         }
     }
@@ -475,6 +478,7 @@ impl Operation for CreateLinkOperation {
     }
 
     fn first(&mut self) -> LinkTurn<Ulid> {
+        self.fresh = self.ids.mint(self.now_ms);
         let source = &self.source;
         if source.node_id != self.node.local {
             return self.ask_remote();
@@ -549,6 +553,10 @@ impl Operation for CreateLinkOperation {
                 Ok(Next::Done(written.map_err(unavailable)?.0))
             }
         }
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

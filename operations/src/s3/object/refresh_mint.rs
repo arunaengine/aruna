@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -77,6 +77,7 @@ enum MintState {
 /// head, and outputs whether it did. A caller folds these calls into its own transaction.
 #[derive(Debug, PartialEq)]
 pub(crate) struct MintSuccessorOperation {
+    now_ms: u64,
     refresh: ReferenceRefresh,
     observation: SourceMetadata,
     predecessor: BlobVersion,
@@ -93,6 +94,7 @@ impl MintSuccessorOperation {
         predecessor: BlobVersion,
     ) -> Self {
         Self {
+            now_ms: 0,
             refresh,
             observation,
             predecessor,
@@ -168,7 +170,7 @@ impl MintSuccessorOperation {
             return Ok(None);
         }
         let refresh = &self.refresh;
-        let now = SystemTime::now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         let hint = bucket.distribution.as_ref().map(DistributionBinding::hint);
         let version_id = mint_version(hint);
         let successor = BlobVersion::reference(
@@ -306,6 +308,10 @@ impl Operation for MintSuccessorOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
 

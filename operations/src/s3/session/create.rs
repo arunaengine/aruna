@@ -9,6 +9,7 @@ use super::{
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::PathRestriction;
@@ -17,7 +18,6 @@ use aruna_core::structs::identity::s3_session::{S3Session, SESSION_MAX_TTL};
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::BTreeSet;
 use std::time::SystemTime;
-use ulid::Ulid;
 
 use crate::groups::fence::group_fence_key;
 
@@ -41,6 +41,10 @@ enum CreatePhase {
 
 #[derive(Debug, PartialEq)]
 pub struct CreateS3Operation {
+    /// The key id is minted when the run starts.
+    mint_key: bool,
+    now_ms: u64,
+    ids: IdMint,
     config: CreateS3Config,
     key_id: String,
     encryption_key: CredentialEncryptionKey,
@@ -52,7 +56,10 @@ pub struct CreateS3Operation {
 
 impl CreateS3Operation {
     pub fn new(config: CreateS3Config, encryption_key: CredentialEncryptionKey) -> Self {
-        Self::with_key(config, Ulid::generate().to_string(), encryption_key)
+        Self {
+            mint_key: true,
+            ..Self::with_key(config, String::new(), encryption_key)
+        }
     }
 
     pub fn with_key(
@@ -63,6 +70,9 @@ impl CreateS3Operation {
         Self {
             config,
             key_id,
+            mint_key: false,
+            now_ms: 0,
+            ids: IdMint::default(),
             encryption_key,
             pending: None,
             index: BTreeSet::new(),
@@ -189,6 +199,10 @@ impl Operation for CreateS3Operation {
     type Error = S3SessionError;
 
     fn first(&mut self) -> Result<Next<S3SessionCredentials>, S3SessionError> {
+        // Minted once, so a rerun after a conflict keeps the key id.
+        if std::mem::take(&mut self.mint_key) {
+            self.key_id = self.ids.mint(self.now_ms).to_string();
+        }
         let ttl = (self.config.expiry.duration_since(self.config.now))
             .map_err(|_| S3SessionError::InvalidExpiry)?;
         if ttl.is_zero() || ttl > SESSION_MAX_TTL {
@@ -234,6 +248,14 @@ impl Operation for CreateS3Operation {
     fn expected_error(error: &Self::Error) -> bool {
         error.expected()
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +263,7 @@ mod tests {
     use super::*;
     use aruna_core::structs::identity::realm::RealmId;
     use std::time::Duration;
+    use ulid::Ulid;
 
     fn operation() -> CreateS3Operation {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);

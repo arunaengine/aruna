@@ -15,6 +15,7 @@ use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
     GROUP_ENCRYPTED_KEYSPACE, TRANSITION_KEYSPACE, UPLOAD_KEYSPACE,
@@ -40,7 +41,6 @@ use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
-use ulid::Ulid;
 
 /// Versions read per page while checking copy sizes before encryption is enabled.
 const SIZE_PAGE: usize = 256;
@@ -140,6 +140,7 @@ pub struct EnableResult {
 
 #[derive(Debug, PartialEq)]
 pub struct EnableEncryptionOperation {
+    ids: IdMint,
     input: EnableInput,
     state: EnableState,
     abe: Option<PrepareAbe>,
@@ -160,6 +161,7 @@ pub struct EnableEncryptionOperation {
 impl EnableEncryptionOperation {
     pub fn new(input: EnableInput) -> Self {
         Self {
+            ids: IdMint::default(),
             input,
             state: EnableState::ReadBucket,
             abe: None,
@@ -337,10 +339,10 @@ impl EnableEncryptionOperation {
     /// opens it.
     fn seal(&mut self, public_key: [u8; 32], private_key: SharedSecret) -> EnableTurn {
         if self.settings.bucket_id.is_none() {
-            self.settings.bucket_id = Some(Ulid::generate());
+            self.settings.bucket_id = Some(self.ids.mint(self.input.now_ms));
         }
         let key = self.key_ref();
-        let record_id = Ulid::generate();
+        let record_id = self.ids.mint(self.input.now_ms);
         let mut record = BucketKeyRecord::new(key, record_id, public_key, self.input.now_ms);
         if self.input.mode == EncryptionMode::NodeManaged {
             record.vault_entry = Some(record_id);
@@ -427,7 +429,7 @@ impl EnableEncryptionOperation {
         }
         // The mode change and its audit record commit together.
         let audit = BucketAuditRecord {
-            event_id: Ulid::generate(),
+            event_id: self.ids.mint(self.input.now_ms),
             bucket_id: key.bucket_id,
             at_ms: now_ms,
             action: AuditAction::ModeChange,
@@ -555,6 +557,10 @@ impl Operation for EnableEncryptionOperation {
     fn abort(&mut self) -> Vec<IoCall> {
         self.private_key = None;
         Vec::new()
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 
