@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aruna_core::document::DocumentTarget;
-use aruna_core::keys::generate_signing_key;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingPhase,
     OnboardingSecret, OnboardingTicket, issuer_proof_message, node_proof_message,
@@ -126,12 +125,12 @@ pub(crate) async fn bootstrap_node_state(
     timeout: Duration,
 ) -> Result<BootstrappedNodeState, IdentityError> {
     let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
-    let node_signing_key = generate_signing_key();
+    let node_signing_key = crate::identity::fresh_signing_key();
     let net_secret_key = node_signing_key.to_bytes();
     let node_id = iroh::SecretKey::from_bytes(&net_secret_key).public();
 
     let issuer_signing_key = if matches!(decoded_secret.mode, OnboardingMode::Server) {
-        Some(generate_signing_key())
+        Some(crate::identity::fresh_signing_key())
     } else {
         None
     };
