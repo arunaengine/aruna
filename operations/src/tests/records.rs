@@ -9,10 +9,11 @@ use aruna_core::UserId;
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::structs::execution::job::{
     CancelAuthority, CollisionPolicy, ComputeResources, EffectiveResources, ExecutionOutputRecord,
-    ExecutionReceipt, ExecutionSpec, ExecutionUpdate, JobAdmissionRecord, JobCancelRecord,
-    JobFamilyId, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope, JobRetryPolicy,
-    LaunchIntent, LogicalJobSpec, OutputObject, OutputSet, PhysicalExecutionResult,
-    PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+    ExecutionReceipt, ExecutionSpec, ExecutionStop, ExecutionUpdate, JobAdmissionRecord,
+    JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope,
+    JobRetryPolicy, LaunchIntent, LogicalJobSpec, OutputObject, OutputSet, PhysicalExecutionResult,
+    PhysicalExecutionState, ResultMessage, StopEvidence, SubmissionClaim, SubmissionId,
+    WitnessBudgetRecord,
 };
 use aruna_core::structs::execution::job::{CapturedInput, InputContent, InputSelection};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -285,6 +286,30 @@ impl Family {
             authority: CancelAuthority::Submitter,
             requested_at_ms: 1_020,
         }
+    }
+
+    /// A successful run of execution 1 with its stop record, as the target signed it.
+    pub fn stopped_run(&self) -> Vec<JobRecordEnvelope> {
+        let mut records = self.run(1, 0, PhysicalExecutionState::Succeeded);
+        let (JobFamilyRecord::Receipt(receipt), JobFamilyRecord::Update(update)) =
+            (&records[4].record, &records[7].record)
+        else {
+            panic!("the run fixture keeps its order");
+        };
+        let stop = ExecutionStop {
+            execution_id: receipt.execution_id,
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+            executor_node_id: self.target.public(),
+            receipt_digest: receipt.digest().expect("receipt digest"),
+            update_sequence: update.sequence,
+            update_digest: update.digest().expect("update digest"),
+            output_digest: (update.result.as_ref()).and_then(|result| result.output_digest),
+            evidence: StopEvidence::Tombstoned,
+            stopped_at_ms: 1_100,
+        };
+        records.push(self.sign(&self.target, JobFamilyRecord::Stop(Box::new(stop))));
+        records
     }
 
     pub fn sign(&self, key: &iroh::SecretKey, record: JobFamilyRecord) -> JobRecordEnvelope {
