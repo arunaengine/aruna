@@ -22,7 +22,7 @@ use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 use crate::document_repository::GetConfigError;
-use crate::session::{
+use crate::session::create::{
     CreateSessionConfig, CreateSessionError, CreateSessionOperation, CreatedSession,
 };
 use crate::users::read_document::ReadUserError;

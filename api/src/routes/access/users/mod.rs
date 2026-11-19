@@ -41,7 +41,8 @@ use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
 use aruna_operations::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
 };
-use aruna_operations::session::{CreateSessionConfig, CreateSessionError, MakeRoomOperation};
+use aruna_operations::session::create::{CreateSessionConfig, CreateSessionError};
+use aruna_operations::session::limit::MakeRoomOperation;
 use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
 use aruna_operations::users::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::users::list_users::{ListUsersInput, ListUsersOperation};
@@ -822,7 +823,7 @@ async fn get_token(
 
     ensure_active(&state, user_id).await?;
     let now = now_timestamp();
-    let expiry = aruna_operations::session::bound_session_expiry(
+    let expiry = aruna_operations::session::create::bound_session_expiry(
         now,
         query.expires_in_seconds,
         now.saturating_add(TOKEN_EXPIRY_SECONDS),

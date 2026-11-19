@@ -24,7 +24,8 @@ use super::{config_read, parse_config};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::revoke_token::{RevokeTokenError, RevokeTokenOperation, owner_cutoff};
 use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
-use crate::s3::session::{RevokeS3Config, RevokeS3Operation, S3SessionError};
+use crate::s3::session::S3SessionError;
+use crate::s3::session::revoke::{RevokeS3Config, RevokeS3Operation};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RevokeTarget {

@@ -41,9 +41,9 @@ use aruna_operations::jobs::workflow::input_view::view_job;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
-use aruna_operations::s3::session::{
-    GetS3Operation, S3SessionError, TouchS3Config, TouchS3Operation,
-};
+use aruna_operations::s3::session::S3SessionError;
+use aruna_operations::s3::session::get::GetS3Operation;
+use aruna_operations::s3::session::touch::{TouchS3Config, TouchS3Operation};
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, Uri};

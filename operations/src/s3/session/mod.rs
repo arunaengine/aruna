@@ -3,21 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod create;
-mod get;
-mod list;
-mod purge;
-mod refresh;
-mod revoke;
-mod touch;
-
-pub use create::{CreateS3Config, CreateS3Operation};
-pub use get::GetS3Operation;
-pub use list::ListSessionsOperation;
-pub use purge::{PurgeSessionsOperation, PurgeSessionsResult};
-pub use refresh::{RefreshS3Config, RefreshS3Operation};
-pub use revoke::{RevokeS3Config, RevokeS3Operation};
-pub use touch::{TouchS3Config, TouchS3Operation};
+pub mod create;
+pub mod get;
+pub mod list;
+pub mod purge;
+pub mod refresh;
+pub mod revoke;
+pub mod touch;
 
 use aruna_core::calls::IoError;
 use aruna_core::compute::Secret;
@@ -246,6 +238,11 @@ fn build_session(
 
 #[cfg(test)]
 mod tests {
+    use super::create::{CreateS3Config, CreateS3Operation};
+    use super::get::GetS3Operation;
+    use super::purge::PurgeSessionsOperation;
+    use super::refresh::{RefreshS3Config, RefreshS3Operation};
+    use super::touch::{TouchS3Config, TouchS3Operation};
     use super::*;
     use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
     use crate::s3::access::list::{ListUserInput, ListUserOperation};

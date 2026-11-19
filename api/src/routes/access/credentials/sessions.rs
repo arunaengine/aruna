@@ -15,10 +15,12 @@ use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
-use aruna_operations::s3::session::{
-    CreateS3Config, CreateS3Operation, GetS3Operation, ListSessionsOperation, RefreshS3Config,
-    RefreshS3Operation, RevokeS3Config, RevokeS3Operation, S3SessionCredentials, S3SessionError,
-};
+use aruna_operations::s3::session::create::{CreateS3Config, CreateS3Operation};
+use aruna_operations::s3::session::get::GetS3Operation;
+use aruna_operations::s3::session::list::ListSessionsOperation;
+use aruna_operations::s3::session::refresh::{RefreshS3Config, RefreshS3Operation};
+use aruna_operations::s3::session::revoke::{RevokeS3Config, RevokeS3Operation};
+use aruna_operations::s3::session::{S3SessionCredentials, S3SessionError};
 use aruna_wire::session::{
     S3SessionRequest, S3SessionsResponse, SessionGroupResponse, SessionIssuerResponse,
     SessionRestrictionResponse, SessionSummaryResponse, SessionTokenResponse,

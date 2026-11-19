@@ -22,7 +22,7 @@ use aruna_drivers::driver::drive;
 use aruna_operations::s3::access::create::{
     CreateUserConfig, CreateUserError, CreateUserOperation,
 };
-use aruna_operations::session::{
+use aruna_operations::session::create::{
     CreateSessionConfig, CreateSessionOperation, MAX_SESSION_TTL, bound_session_expiry,
 };
 use aruna_operations::users::service_account::check::{
