@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_PRUNE_KEYSPACE,
@@ -23,6 +23,8 @@ use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
 
 use crate::jobs::lifecycle::family_reads::FamilyProjectionOperation;
+use crate::jobs::records::admit::Admission;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::pages::{page_key, page_rows};
 use crate::jobs::records::prune::{FamilyPruneOutcome, PruneFamiliesOperation};
 use crate::jobs::route::JobRouteError;
@@ -131,7 +133,7 @@ async fn projected(
 #[tokio::test]
 async fn prunes_in_steps() {
     // The entry step leaves a tombstone and an index row due at once; each later pass deletes a
-    // page, and the index row goes only with the last page, so an interrupted prune resumes.
+    // page, and the index row moves to the tombstone's expiry only with the last page.
     let family = Family::new([90u8; 32]);
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     seed(&ctx, &family, &family.stopped_run(), 2_000).await;
@@ -163,16 +165,58 @@ async fn prunes_in_steps() {
 
     let last = pass(&ctx).await;
     assert_eq!(last.pruned, 1);
-    assert_eq!(index_rows(&ctx).await, 0);
-    assert!(
-        tombstone(&ctx, &family)
-            .await
-            .is_some_and(|tombstone| tombstone.finished)
-    );
+    let kept = tombstone(&ctx, &family).await.expect("tombstone kept");
+    assert!(kept.finished);
+    assert_eq!(kept.aliases, vec![family.job_id]);
+    assert_eq!(index_rows(&ctx).await, 2);
+    assert_eq!(slot(&ctx, &family).await, Some(kept.expires_at_ms()));
     assert_eq!(
         projected(&ctx, &family, user()).await,
         Err(JobRouteError::Pruned)
     );
+}
+
+#[tokio::test]
+async fn expires_tombstone() {
+    // A finished tombstone past its expiry goes with its aliases, and the old spec replayed after
+    // that is refused as stale without it.
+    let family = Family::new([99u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    seed(&ctx, &family, &[], 2_000).await;
+    let finished = FamilyTombstone {
+        pruned_at_ms: 1_000,
+        last_record_ms: 900,
+        finished: true,
+        created_by: None,
+        aliases: vec![family.job_id],
+    };
+    let value = Value::from(to_bytes(&finished).expect("tombstone encodes").as_slice());
+    let prefix = family_prefix(&family.family());
+    write(
+        &ctx,
+        vec![(FAMILY_TOMBSTONE_KEYSPACE.to_string(), prefix, value)],
+    )
+    .await;
+
+    assert_eq!(pass(&ctx).await.pruned, 1);
+    assert_eq!(tombstone(&ctx, &family).await, None);
+    assert_eq!(index_rows(&ctx).await, 0);
+    let alias = alias_key(family.job_id, &family.family()).to_vec();
+    let alias = read_row(&ctx, FAMILY_ALIAS_KEYSPACE, alias).await;
+    assert_eq!(alias.expect("alias read"), None);
+
+    let spec = family.stopped_run()[0].clone();
+    let replay = AppendRecordOperation::new(AppendRecordConfig {
+        realm_id: REALM,
+        local_node_id: family.holder.public(),
+        record: JobRecordFrame::new(spec).expect("record frame"),
+        local: None,
+        origin: RecordOrigin::Local,
+        now_ms: aruna_core::time::unix_timestamp_millis(),
+    });
+    let outcome = drive(replay, &ctx).await.expect("replay judged");
+    assert_eq!(outcome.admission, Admission::Stale);
+    assert_eq!(rows(&ctx, FAMILY_RECORD_KEYSPACE, &family).await, 0);
 }
 
 #[tokio::test]

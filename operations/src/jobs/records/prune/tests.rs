@@ -4,10 +4,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::ChildOutcome;
-use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
-use aruna_core::structs::execution::job::record_keys::prune_rows_at;
+use aruna_core::keyspaces::{
+    FAMILY_ALIAS_KEYSPACE, FAMILY_RECORD_KEYSPACE, FAMILY_TOMBSTONE_KEYSPACE,
+};
+use aruna_core::structs::execution::job::record_keys::{alias_key, family_prefix, prune_rows_at};
 use aruna_core::structs::execution::job::record_rows::to_bytes;
-use aruna_core::structs::execution::job::{FamilyTombstone, JobRecordEnvelope, SubmissionId};
+use aruna_core::structs::execution::job::{
+    FamilyTombstone, JobId, JobRecordEnvelope, SubmissionId,
+};
 use aruna_core::types::Key;
 
 use super::*;
@@ -95,6 +99,7 @@ fn tombstone_pages_bodies() {
         last_record_ms: 1,
         finished: false,
         created_by: None,
+        aliases: Vec::new(),
     };
     let stored = Some(Value::from(to_bytes(&tombstone).unwrap().as_slice()));
     let mut prune = PruneFamilyOperation::new(family(), 7, None);
@@ -144,6 +149,54 @@ fn empty_family_goes() {
         prune.next(child(Ok::<_, IoError>(true))),
         Ok(Next::Done(PruneStep::Pruned))
     );
+}
+
+/// The decision on an empty family at `now_ms` behind the finished `tombstone`.
+fn after_tombstone(
+    tombstone: &FamilyTombstone,
+    now_ms: u64,
+) -> Result<Next<PruneStep>, PruneError> {
+    let stored = Some(Value::from(to_bytes(tombstone).unwrap().as_slice()));
+    let mut prune = PruneFamilyOperation::new(family(), 7, None);
+    prune.stamp(now_ms);
+    prune.first().unwrap();
+    prune.next(IoResult::Values(vec![slot(7), stored])).unwrap();
+    let records = Vec::<JobRecordEnvelope>::new();
+    prune
+        .next(child(Ok::<_, FamilyReadError>(records)))
+        .unwrap();
+    prune.next(empty_page())
+}
+
+// A finished tombstone waits for its expiry, then goes with its index rows and its aliases.
+#[test]
+fn tombstone_expires_late() {
+    let job_id = JobId::from_bytes([4; 16]);
+    let tombstone = FamilyTombstone {
+        pruned_at_ms: 1_000,
+        last_record_ms: 900,
+        finished: true,
+        created_by: None,
+        aliases: vec![job_id],
+    };
+    let expiry = tombstone.expires_at_ms();
+    let due = vec![(
+        FAMILY_PRUNE_KEYSPACE.to_string(),
+        prune_due_key(7, &family()),
+    )];
+    let waits = commit_call(true, due, prune_rows_at(&family(), expiry).to_vec());
+    assert_eq!(after_tombstone(&tombstone, expiry - 1), waits);
+    let mut gone = index_rows(&family(), 7);
+    gone.push((
+        FAMILY_ALIAS_KEYSPACE.to_string(),
+        alias_key(job_id, &family()),
+    ));
+    gone.push((
+        FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+        family_prefix(&family()),
+    ));
+    let expired = commit_call(true, gone, Vec::new());
+    assert_eq!(after_tombstone(&tombstone, expiry), expired);
 }
 
 // The pass stops at the first row that is not due yet and reports when it is.

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::family::{CLOCK_MARGIN_MS, JobFamilyRecord, JobRecordEnvelope, LogicalJobState};
-use super::identity::RETENTION_MS;
+use super::identity::{JobId, RETENTION_MS};
 use super::membership::NotRun;
 use crate::{NodeId, UserId};
 
@@ -16,7 +16,7 @@ use crate::{NodeId, UserId};
 pub const TOMBSTONE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// What stays of a pruned family on one node until it expires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FamilyTombstone {
     /// When this node pruned the family.
     pub pruned_at_ms: u64,
@@ -26,6 +26,17 @@ pub struct FamilyTombstone {
     pub finished: bool,
     /// The submitter of the pruned spec: only they learn that the job was pruned.
     pub created_by: Option<UserId>,
+    /// The job ids of the family's claims, whose alias rows go when the tombstone expires.
+    pub aliases: Vec<JobId>,
+}
+
+impl FamilyTombstone {
+    /// When a finished tombstone expires: a replayed spec is stale by then without it.
+    pub fn expires_at_ms(&self) -> u64 {
+        (self.pruned_at_ms.max(self.last_record_ms))
+            .saturating_add(TOMBSTONE_RETENTION_MS)
+            .saturating_add(CLOCK_MARGIN_MS)
+    }
 }
 
 /// What one node knows about one family when it decides.

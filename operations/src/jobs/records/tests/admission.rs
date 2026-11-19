@@ -344,6 +344,7 @@ fn tombstone(last_record_ms: u64, finished: bool) -> FamilyTombstone {
         last_record_ms,
         finished,
         created_by: None,
+        aliases: Vec::new(),
     }
 }
 

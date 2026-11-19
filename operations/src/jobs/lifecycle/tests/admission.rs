@@ -470,6 +470,7 @@ async fn waits_for_pruning() {
             last_record_ms: 500,
             finished,
             created_by: None,
+            aliases: Vec::new(),
         };
         StorageEffect::Write {
             key_space: FAMILY_TOMBSTONE_KEYSPACE.to_string(),

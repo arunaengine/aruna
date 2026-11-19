@@ -8,13 +8,13 @@ use std::collections::BTreeSet;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{
-    DEADLINE_INDEX_KEYSPACE, FAMILY_OUTBOX_KEYSPACE, FAMILY_PENDING_KEYSPACE,
-    FAMILY_PROJECTION_KEYSPACE, FAMILY_PRUNE_KEYSPACE, FAMILY_TOMBSTONE_KEYSPACE, JOB_KEYSPACE,
-    JOB_RESERVATION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
+    DEADLINE_INDEX_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
+    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_PRUNE_KEYSPACE,
+    FAMILY_TOMBSTONE_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::record_keys::{
-    family_prefix, prune_due_key, prune_rows_at, prune_slot_key,
+    alias_key, family_prefix, prune_due_key, prune_rows_at, prune_slot_key,
 };
 use aruna_core::structs::execution::job::record_rows::{PendingRecord, from_bytes, to_bytes};
 use aruna_core::structs::execution::job::{
@@ -120,8 +120,8 @@ impl PruneFamilyOperation {
         }))
     }
 
-    /// Step 3: one page of body rows; the last page also deletes the index rows and marks the
-    /// tombstone finished.
+    /// Step 3: one page of body rows; the last page marks the tombstone finished and moves the
+    /// index row to the tombstone's expiry.
     fn body_page(&mut self, space: usize) -> FamilyNext {
         let room = FAMILY_PRUNE_PAGE - self.body.len();
         if let Some(name) = BODY_SPACES.get(space).filter(|_| room > 0) {
@@ -131,18 +131,22 @@ impl PruneFamilyOperation {
         if !body.is_empty() {
             return self.commit(PruneStep::Paged, true, (body, Vec::new()));
         }
-        let tombstone = self.tombstone.ok_or(IoError::Unfinished)?;
+        let tombstone = self.tombstone.take().ok_or(IoError::Unfinished)?;
         let finished = FamilyTombstone {
             finished: true,
             ..tombstone
         };
         let value = Value::from(to_bytes(&finished)?.as_slice());
-        let writes = vec![(
+        let mut writes = prune_rows_at(&self.family, finished.expires_at_ms()).to_vec();
+        writes.push((
             FAMILY_TOMBSTONE_KEYSPACE.to_string(),
             family_prefix(&self.family),
             value,
+        ));
+        let deletes = vec![(
+            FAMILY_PRUNE_KEYSPACE.to_string(),
+            prune_due_key(self.due_ms, &self.family),
         )];
-        let deletes = index_rows(&self.family, self.due_ms);
         self.commit(PruneStep::Pruned, true, (deletes, writes))
     }
 
@@ -167,17 +171,24 @@ impl PruneFamilyOperation {
             self.step = FamilyStep::Closures;
             return Ok(Next::Call(IoCall::child(close)));
         }
+        // A finished tombstone expires with the last pending row; then nothing is left here.
         let expired = std::mem::take(&mut self.expired);
-        match self.earliest_ms {
+        let expiry = (self.tombstone.as_ref()).map(FamilyTombstone::expires_at_ms);
+        let waits = (self.earliest_ms)
+            .map(|first_seen_ms| first_seen_ms.saturating_add(TOMBSTONE_RETENTION_MS))
+            .into_iter()
+            .chain(expiry.filter(|expiry| *expiry > self.now_ms))
+            .min();
+        match waits {
             None => {
                 let mut deletes = expired;
                 deletes.extend(index_rows(&self.family, self.due_ms));
+                if let Some(tombstone) = self.tombstone.take() {
+                    deletes.extend(tombstone_rows(&self.family, &tombstone));
+                }
                 self.commit(PruneStep::Pruned, true, (deletes, Vec::new()))
             }
-            Some(first_seen_ms) => self.moved(
-                first_seen_ms.saturating_add(TOMBSTONE_RETENTION_MS),
-                expired,
-            ),
+            Some(recheck) => self.moved(recheck, expired),
         }
     }
 
@@ -278,11 +289,18 @@ impl PruneFamilyOperation {
             JobFamilyRecord::Spec(spec) => Some(spec.created_by),
             _ => None,
         });
+        let aliases: BTreeSet<_> = (self.records.iter())
+            .filter_map(|envelope| match &envelope.record {
+                JobFamilyRecord::Claim(claim) => Some(claim.job_id),
+                _ => None,
+            })
+            .collect();
         let tombstone = FamilyTombstone {
             pruned_at_ms: self.now_ms,
             last_record_ms: last_record_ms(&self.records),
             finished: false,
             created_by,
+            aliases: aliases.into_iter().collect(),
         };
         let prefix = family_prefix(&self.family);
         let mut deletes = std::mem::take(&mut self.expired);
@@ -306,6 +324,18 @@ impl PruneFamilyOperation {
         writes.push((FAMILY_TOMBSTONE_KEYSPACE.to_string(), prefix, value));
         self.commit(PruneStep::Paged, true, (deletes, writes))
     }
+}
+
+/// The rows an expired tombstone leaves: the tombstone and the aliases it kept answering.
+fn tombstone_rows(family: &JobFamilyId, tombstone: &FamilyTombstone) -> JobDeletes {
+    let aliases = (tombstone.aliases.iter()).map(|job_id| {
+        (
+            FAMILY_ALIAS_KEYSPACE.to_string(),
+            alias_key(*job_id, family),
+        )
+    });
+    let row = (FAMILY_TOMBSTONE_KEYSPACE.to_string(), family_prefix(family));
+    aliases.chain([row]).collect()
 }
 
 fn page_rows(result: IoResult) -> Result<Vec<(Key, Value)>, PruneError> {
@@ -356,7 +386,7 @@ impl Operation for PruneFamilyOperation {
                 self.tombstone = tombstone
                     .map(|value| from_bytes::<FamilyTombstone>(&value))
                     .transpose()?;
-                if self.tombstone.is_some_and(|tombstone| !tombstone.finished) {
+                if (self.tombstone.as_ref()).is_some_and(|tombstone| !tombstone.finished) {
                     self.step = FamilyStep::Pages;
                     let pages = PrunePagesOperation::new(self.family);
                     return Ok(Next::Call(IoCall::child(pages)));

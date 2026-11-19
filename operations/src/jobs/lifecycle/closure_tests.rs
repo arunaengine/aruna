@@ -80,6 +80,7 @@ fn target_answers_rows() {
         last_record_ms: start + 1,
         finished: true,
         created_by: None,
+        aliases: Vec::new(),
     };
     let answer = answered(&family, frame, start + 1, (Vec::new(), Some(pruned)));
     assert_eq!(answer, Ok(Next::Done(LaunchClosureAnswer::Pruned)));
