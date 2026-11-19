@@ -16,7 +16,6 @@ use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::structs::storage::backend_import::BackendImportSpec;
 use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
 use aruna_core::{NodeId, UserId};
-use ulid::Ulid;
 
 use super::JOB_RETENTION_MS;
 use super::records::pages::ServingNode;
@@ -40,7 +39,9 @@ fn unavailable(reason: &str) -> SubmitJobError {
 pub struct MintJobOperation {
     realm_id: RealmId,
     owner_node_id: NodeId,
+    /// The dedup key, or the run entropy for a fresh id.
     subject: Vec<u8>,
+    fresh: bool,
     serving: ServingNode,
 }
 
@@ -51,14 +52,11 @@ impl MintJobOperation {
         dedup_key: Option<&[u8]>,
         serving: ServingNode,
     ) -> Self {
-        let subject = match dedup_key {
-            Some(key) => key.to_vec(),
-            None => Ulid::generate().to_bytes().to_vec(),
-        };
         Self {
             realm_id,
             owner_node_id,
-            subject,
+            subject: dedup_key.map(<[u8]>::to_vec).unwrap_or_default(),
+            fresh: dedup_key.is_none(),
             serving,
         }
     }
@@ -67,6 +65,12 @@ impl MintJobOperation {
 impl Operation for MintJobOperation {
     type Output = JobId;
     type Error = SubmitJobError;
+
+    fn seed(&mut self, entropy: u128) {
+        if self.fresh {
+            self.subject = entropy.to_be_bytes().to_vec();
+        }
+    }
 
     fn first(&mut self) -> Result<Next<JobId>, SubmitJobError> {
         let Some((local, serving_realm)) = self.serving else {

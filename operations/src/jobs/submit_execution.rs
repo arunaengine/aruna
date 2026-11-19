@@ -157,7 +157,7 @@ impl SubmitExecutionOperation {
         Self {
             submission,
             dedup_key,
-            entropy: ulid::Ulid::generate().to_bytes(),
+            entropy: [0; 16],
             minted: false,
         }
     }
@@ -189,6 +189,10 @@ impl SubmitExecutionOperation {
 impl Operation for SubmitExecutionOperation {
     type Output = SubmitJobResult;
     type Error = SubmitJobError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.entropy = entropy.to_be_bytes();
+    }
 
     fn first(&mut self) -> Result<Next<SubmitJobResult>, SubmitJobError> {
         let submission = &mut self.submission;
