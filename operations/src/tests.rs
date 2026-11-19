@@ -4,6 +4,7 @@
 
 pub(crate) mod access;
 pub(crate) mod calls;
+pub(crate) mod connectors;
 pub(crate) mod device;
 pub(crate) mod import;
 pub(crate) mod incoming;

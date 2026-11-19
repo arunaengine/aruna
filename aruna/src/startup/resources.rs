@@ -701,21 +701,9 @@ mod tests {
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{UsageCounters, global_shard_keys};
     use aruna_operations::node::counter_check::CounterCheckError;
+    use aruna_operations::testing::test_context;
     use aruna_storage::StorageHandle;
     use tempfile::tempdir;
-
-    fn test_driver_ctx(storage_handle: StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
-    }
 
     fn open_storage(dir: &tempfile::TempDir) -> StorageHandle {
         aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
@@ -753,7 +741,7 @@ mod tests {
         use aruna_core::structs::storage::usage::USAGE_REBUILD_KEY;
         let temp = tempdir().expect("temp dir");
         let storage_handle = open_storage(&temp);
-        let driver_ctx = test_driver_ctx(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         assert!(
             ensure_usage_counters(&driver_ctx).await.unwrap(),
@@ -809,7 +797,7 @@ mod tests {
 
         let temp = tempdir().expect("temp dir");
         let storage_handle = open_storage(&temp);
-        let driver_ctx = test_driver_ctx(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
         assert!(ensure_usage_counters(&driver_ctx).await.unwrap());
         rebuild(&driver_ctx).await;
         // A bucket from before bucket rows existed has shards but no row of its own.

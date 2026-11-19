@@ -5,6 +5,7 @@
 use super::*;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::extract;
+use crate::tests::routes::write_fixture;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -155,23 +156,6 @@ async fn install_holder_policies(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => {}
         other => panic!("unexpected realm config write event: {other:?}"),
-    }
-}
-
-async fn write_fixture(state: &ServerState, key_space: &str, key: ByteView, value: ByteView) {
-    match state
-        .get_ctx()
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key,
-            value,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => panic!("unexpected fixture write event: {other:?}"),
     }
 }
 

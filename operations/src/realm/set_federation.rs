@@ -491,6 +491,7 @@ mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
     use crate::driver::{DriverContext, drive};
+    use crate::testing::path_context;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentDot;
     use aruna_core::document::DocumentOutboxRecord;
@@ -504,19 +505,6 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
-
-    fn context(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
-    }
 
     fn realm_key() -> SigningKey {
         SigningKey::from_bytes(&[9u8; 32])
@@ -612,7 +600,7 @@ mod tests {
     async fn stores_signed_descriptor() {
         // The stored descriptor verifies for the realm and its issue time only grows.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let actor = actor();
         seed(&ctx, &actor, RealmNodeKind::Management, true).await;
 
@@ -636,7 +624,7 @@ mod tests {
     async fn renames_resign_descriptor() {
         // A rename re-signs the descriptor with the realm key and keeps the other public facts.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let actor = actor();
         seed(&ctx, &actor, RealmNodeKind::Management, true).await;
         let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
@@ -836,7 +824,7 @@ mod tests {
     async fn refuses_changed_settings() {
         // A write based on an older read, or a first setup over stored settings, changes nothing.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let actor = actor();
         seed(&ctx, &actor, RealmNodeKind::Management, true).await;
         let mut config = request(&actor, "https://api.example.org");
@@ -868,7 +856,7 @@ mod tests {
     async fn node_creates_once() {
         // The node needs no token, and stored settings stay, also a cleared URL and a disabled mode.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let actor = actor();
         seed(&ctx, &actor, RealmNodeKind::Management, false).await;
         let mut config = request(&actor, "https://api.example.org");
@@ -892,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_non_admin() {
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let actor = actor();
         seed(&ctx, &actor, RealmNodeKind::Management, false).await;
 
@@ -910,7 +898,7 @@ mod tests {
     async fn refuses_server_node() {
         // Peers reject realm-config events from a server node, so it never writes them.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let actor = actor();
         seed(&ctx, &actor, RealmNodeKind::Server, true).await;
 
@@ -926,7 +914,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_plain_http() {
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let actor = actor();
         seed(&ctx, &actor, RealmNodeKind::Management, true).await;
 

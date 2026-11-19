@@ -5,6 +5,7 @@
 use super::*;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
+use crate::testing::path_context;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
@@ -12,19 +13,6 @@ use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
 use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
-
-fn context(root: &str) -> DriverContext {
-    DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    }
-}
 
 fn actor(seed: u8) -> Actor {
     let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -121,7 +109,7 @@ fn opened(config: &RealmConfigDocument) -> Vec<Vec<u8>> {
 async fn stores_profile_entry() {
     // Profile and sealed password land together; a replace without password keeps the entry.
     let dir = tempdir().unwrap();
-    let ctx = context(dir.path().to_str().unwrap());
+    let ctx = path_context(dir.path().to_str().unwrap());
     let actor = actor(1);
     seed(&ctx, &actor, RealmNodeKind::Management).await;
 
@@ -173,7 +161,7 @@ async fn stores_profile_entry() {
 #[tokio::test]
 async fn refuses_server_node() {
     let dir = tempdir().unwrap();
-    let ctx = context(dir.path().to_str().unwrap());
+    let ctx = path_context(dir.path().to_str().unwrap());
     let actor = actor(1);
     seed(&ctx, &actor, RealmNodeKind::Server).await;
     let refused = set(&ctx, &actor, Some(input(None, None))).await;

@@ -11,8 +11,8 @@ use crate::jobs::{
     JobRequestError, MAX_OUTPUT_PREFIXES, mount_permission_path, native_input, native_outputs,
     output_buckets, validate_output_prefixes, workspace_request,
 };
+use crate::tests::execution::{auth_for, build_state, management_state, node_id, realm};
 use aruna_core::UserId;
-use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{
     ArtifactRef, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
@@ -24,26 +24,21 @@ use aruna_core::structs::execution::job::{
     CollisionPolicy, ComputeResources, ExecutionSpec, OutputDestination, WorkspaceMode,
 };
 use aruna_core::structs::execution::job::{JobRecord, JobState};
-use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction, Permission};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::command::{
     ExecutionInput, ExecutionOutput, InputMode, WorkspaceMode as CommandWorkspaceMode,
     WorkspaceSpec,
 };
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
-use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
-use aruna_storage::FjallStorage;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::collections::HashMap;
 use std::time::SystemTime;
-use tempfile::TempDir;
 use ulid::Ulid;
 
 /// One reduced family with a duplicate success and a locally exhausted view.
@@ -225,14 +220,6 @@ fn reads_without_endpoint() {
     assert!(response.outputs[0].endpoint_url.is_none());
 }
 
-fn realm() -> RealmId {
-    RealmId([1u8; 32])
-}
-
-fn node_id() -> NodeId {
-    iroh::SecretKey::from_bytes(&[7u8; 32]).public()
-}
-
 fn user(byte: u8) -> UserId {
     UserId::new(Ulid::from_bytes([byte; 16]), realm())
 }
@@ -247,15 +234,6 @@ fn job_id(timestamp_ms: u64) -> JobId {
     .unwrap()
 }
 
-fn auth_for(user_id: UserId) -> Option<AuthContext> {
-    Some(AuthContext {
-        user_id,
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    })
-}
-
 fn restricted_auth_for(user_id: UserId) -> Option<AuthContext> {
     Some(AuthContext {
         user_id,
@@ -266,32 +244,6 @@ fn restricted_auth_for(user_id: UserId) -> Option<AuthContext> {
         }]),
         session: None,
     })
-}
-
-async fn build_state() -> (TempDir, Arc<ServerState>) {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let ctx = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    });
-    let state = ServerState::new(
-        ctx,
-        realm(),
-        node_id(),
-        NodeCapabilities::user_node(realm()).unwrap(),
-        false,
-        None,
-        JobsRuntime::new(),
-    )
-    .await;
-    (dir, Arc::new(state))
 }
 
 fn job_for(job_id: JobId, owner: UserId, created_at_ms: u64) -> JobRecord {
@@ -1144,34 +1096,6 @@ fn local_request() -> SubmitExecutionRequest {
         workspace: None,
         target: Some(super::ExecutionTarget::Local),
     }
-}
-
-async fn management_state() -> (TempDir, Arc<ServerState>) {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let ctx = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    });
-    let capabilities =
-        NodeCapabilities::management_node(aruna_core::keys::generate_signing_key()).unwrap();
-    let state = ServerState::new(
-        ctx,
-        realm(),
-        node_id(),
-        capabilities,
-        false,
-        None,
-        JobsRuntime::new(),
-    )
-    .await;
-    (dir, Arc::new(state))
 }
 
 async fn enroll_device(state: &ServerState, owner: UserId) {

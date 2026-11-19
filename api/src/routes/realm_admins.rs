@@ -158,52 +158,8 @@ fn map_admin_error(error: SetAdminError) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::routes::{test_state, test_storage};
-    use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::identity::auth::NodeCapabilities;
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::testing::test_context;
-    use tempfile::TempDir;
+    use crate::tests::realms::admin_state;
     use ulid::Ulid;
-
-    /// A management node with one realm admin; returns the admin.
-    async fn setup_state() -> (TempDir, Arc<ServerState>, UserId) {
-        let (dir, storage) = test_storage();
-        let context = Arc::new(test_context(storage));
-        let signing_key = generate_signing_key();
-        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
-        let actor = Actor {
-            node_id: iroh::SecretKey::generate().public(),
-            user_id: UserId::local(Ulid::generate(), realm_id),
-            realm_id,
-        };
-        drive(
-            CreateRealmOperation::new(CreateRealmConfig {
-                actor: actor.clone(),
-                realm_description: "Realm".to_string(),
-                oidc_providers: Vec::new(),
-                node_location: None,
-                node_weight: None,
-                node_labels: Default::default(),
-            }),
-            &context,
-        )
-        .await
-        .unwrap();
-        drive(
-            ClaimInitialOperation::new(ClaimInitialInput {
-                actor: actor.clone(),
-            }),
-            &context,
-        )
-        .await
-        .unwrap();
-        let capabilities = NodeCapabilities::management_node(signing_key).unwrap();
-        let state = Arc::new(test_state(context, realm_id, actor.node_id, capabilities).await);
-        (dir, state, actor.user_id)
-    }
 
     async fn change(
         state: &Arc<ServerState>,
@@ -229,7 +185,7 @@ mod tests {
     #[tokio::test]
     async fn admin_grants_role() {
         // The new admin can remove the first one, and the last admin stays.
-        let (_dir, state, admin) = setup_state().await;
+        let (_dir, state, admin) = admin_state().await;
         let other = UserId::local(Ulid::generate(), state.get_realm_id());
         let ids = change(&state, admin, other, true).await.unwrap();
         assert_eq!(ids, sorted_ids(HashSet::from([admin, other])));
@@ -242,7 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn member_is_forbidden() {
-        let (_dir, state, admin) = setup_state().await;
+        let (_dir, state, admin) = admin_state().await;
         let member = UserId::local(Ulid::generate(), state.get_realm_id());
         let grant = change(&state, member, member, true).await;
         assert!(matches!(grant, Err(ServerError::Forbidden)));

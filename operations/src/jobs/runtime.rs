@@ -466,6 +466,7 @@ mod tests {
     };
     use crate::tasks::job_context::JobContext;
     use crate::tasks::job_runner::{handle_panic, run_job};
+    use crate::testing::task_context;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::Event;
@@ -480,7 +481,6 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::time::unix_timestamp_millis;
     use aruna_storage::{FjallStorage, StorageHandle};
-    use aruna_tasks::TaskHandle;
     use byteview::ByteView;
     use futures_util::future::FutureExt;
     use std::time::Duration;
@@ -491,19 +491,6 @@ mod tests {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[0] = seed;
         iroh::SecretKey::from_bytes(&seed_bytes).public()
-    }
-
-    fn context(storage: StorageHandle) -> Arc<DriverContext> {
-        Arc::new(DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: Some(TaskHandle::new()),
-            compute_handle: None,
-            outbound_handle: None,
-        })
     }
 
     fn probe_record(job_id: JobId, steps: u32, sleep_ms: u64, marker: Option<String>) -> JobRecord {
@@ -612,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn probe_reaches_success() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([1u8; 16]);
         let claimed = claim(&ctx, probe_record(job_id, 3, 0, None)).await;
@@ -634,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_running_cleanup() {
         let (dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([2u8; 16]);
         let marker = dir.path().join("probe-marker");
@@ -672,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_before_run() {
         let (dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([3u8; 16]);
         let marker = dir.path().join("marker");
@@ -695,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_runs_import() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let job_id = JobId::from_bytes([0x3B; 16]);
         let mut record = import_record(job_id);
         record.cancel_requested = true;
@@ -730,7 +717,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_after_claim() {
         let (dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let job_id = JobId::from_bytes([0x3A; 16]);
         let marker = dir.path().join("late-cancel-marker");
         std::fs::write(&marker, b"partial").unwrap();
@@ -763,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn zombie_skips_cleanup() {
         let (dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let job_id = JobId::from_bytes([0x2A; 16]);
         let marker = dir.path().join("zombie-marker");
         let marker_str = marker.to_str().unwrap().to_string();
@@ -881,7 +868,7 @@ mod tests {
     #[tokio::test]
     async fn finished_at_fresh() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([8u8; 16]);
         let claimed = claim(&ctx, probe_record(job_id, 30, 10, None)).await;
@@ -905,7 +892,7 @@ mod tests {
     #[tokio::test]
     async fn progress_writes_throttled() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([7u8; 16]);
         let claimed = claim(&ctx, probe_record(job_id, 10_000, 0, None)).await;
@@ -932,7 +919,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_releases_lease() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let job_id = JobId::from_bytes([0x11; 16]);
         let claimed = claim(&ctx, probe_record(job_id, 100, 20, None)).await;
 
@@ -969,7 +956,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_awaits_producer() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let job_id = JobId::from_bytes([0x15; 16]);
         let claimed = claim(&ctx, probe_record(job_id, 1, 0, None)).await;
         let runtime = JobsRuntime::new();
@@ -1079,7 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn restarts_keep_attempts() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let job_id = JobId::from_bytes([0x12; 16]);
         insert_job(&ctx, &probe_record(job_id, 10_000, 5, None))
             .await
@@ -1102,7 +1089,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_skips_cleanup() {
         let (dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let job_id = JobId::from_bytes([0x13; 16]);
         let marker = dir.path().join("probe-marker");
         let marker_str = marker.to_str().unwrap().to_string();
@@ -1132,7 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_spares_takeover() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let job_id = JobId::from_bytes([0x14; 16]);
         let claimed = claim(&ctx, probe_record(job_id, 10_000, 5, None)).await;
 
@@ -1162,7 +1149,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_beats_capacity() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let runtime = JobsRuntime::with_capacity(0);
         let job_id = JobId::from_bytes([0x6C; 16]);
         let record = probe_record(job_id, 5, 0, None);
@@ -1205,7 +1192,7 @@ mod tests {
     #[tokio::test]
     async fn panic_frees_slot() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let runtime = JobsRuntime::with_capacity(1);
         let boom = JobId::from_bytes([0xEE; 16]);
         let mut record = probe_record(boom, 5, 0, None);
@@ -1384,7 +1371,7 @@ mod tests {
     #[tokio::test]
     async fn zombie_keeps_survivor() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([0x5A; 16]);
 
@@ -1408,7 +1395,7 @@ mod tests {
         };
         use aruna_core::structs::execution::webhook::WebhookDeliverySpec;
         let (_dir, storage) = temp_storage();
-        let driver = context(storage.clone());
+        let driver = task_context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([0x6D; 16]);
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
@@ -1430,7 +1417,7 @@ mod tests {
         let claimed = claim(&driver, record).await;
         let attempts = claimed.attempts;
 
-        runtime.spawn(context(storage.clone()), claimed);
+        runtime.spawn(task_context(storage.clone()), claimed);
         let mut finished = runtime.state().running[&job_id].completion.subscribe();
         tokio::time::timeout(Duration::from_secs(60), finished.wait_for(|done| *done))
             .await
@@ -1456,7 +1443,7 @@ mod tests {
     #[tokio::test]
     async fn counts_running_jobs() {
         let (_dir, storage) = temp_storage();
-        let ctx = context(storage.clone());
+        let ctx = task_context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([0x6B; 16]);
         let claimed = claim(&ctx, probe_record(job_id, 2, 0, None)).await;
@@ -1491,7 +1478,7 @@ mod tests {
                 }
             );
         }
-        runtime.finish(&context(storage), job_id, nonce).await;
+        runtime.finish(&task_context(storage), job_id, nonce).await;
         assert_eq!(runtime.running_jobs(), RunningJobs::default());
     }
 

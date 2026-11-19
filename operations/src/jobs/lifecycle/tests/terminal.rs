@@ -6,14 +6,14 @@ use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
 use aruna_core::structs::execution::job::{
-    AttemptIntent, EffectiveResources, ExecutionReceipt, JobClaim, JobFamilyRecord, JobId,
-    JobPayload, JobRecord, JobResultPayload, JobState, LogicalJobState, OutputObject,
-    PhysicalExecutionState,
+    AttemptIntent, ExecutionReceipt, JobClaim, JobFamilyRecord, JobId, JobPayload, JobRecord,
+    JobResultPayload, JobState, LogicalJobState, OutputObject, PhysicalExecutionState,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use tempfile::TempDir;
 use ulid::Ulid;
 
+use super::resources;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
 use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
@@ -33,16 +33,6 @@ const TOKEN: Ulid = Ulid(0x7E12);
 /// the logical job id the family records are keyed by.
 pub(super) fn physical() -> JobId {
     JobId::from_bytes([31u8; 16])
-}
-
-fn resources() -> EffectiveResources {
-    EffectiveResources {
-        cpu_cores: 1,
-        ram_bytes: 1024,
-        disk_bytes: 2048,
-        max_walltime_ms: 60_000,
-        preemptible: false,
-    }
 }
 
 /// One node of the family with a live net handle, so it can sign the records

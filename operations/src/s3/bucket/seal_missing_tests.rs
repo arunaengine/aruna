@@ -3,13 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::bucket::key::test_rows::authority_rows;
-use aruna_core::structs::identity::user::vault::UserKeyRecord;
-use aruna_core::structs::placement::record::PlacementRef;
+use crate::s3::bucket::key::test_rows::{authority_rows, keys, rows};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode, HolderOrigin};
 use aruna_core::structs::storage::format::Compression;
-use aruna_core::vault_format::key_fingerprint;
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -17,22 +14,6 @@ const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
 
 fn user(seed: u8) -> UserId {
     UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([1; 32]))
-}
-
-fn keys(user_id: UserId) -> KeyLookup {
-    KeyLookup::Keys(vec![UserKeyRecord {
-        realm_id: user_id.realm_id,
-        user_id,
-        record_id: Ulid::from_bytes([user_id.user_ulid.to_bytes()[0]; 16]),
-        key_id: "slot".to_string(),
-        public_key: [7; 32],
-        fingerprint: key_fingerprint(&[7; 32]),
-        has_recovery: false,
-        node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
-        placement: PlacementRef::NIL,
-        created_at_ms: 1,
-        signature: None,
-    }])
 }
 
 fn copy(user_id: UserId) -> SealedCopy {
@@ -44,16 +25,6 @@ fn copy(user_id: UserId) -> SealedCopy {
         enc: [0; 32],
         ciphertext: vec![0; 48],
         created_at_ms: 1,
-    }
-}
-
-fn rows(values: Vec<Vec<u8>>) -> IoResult {
-    IoResult::Page {
-        rows: values
-            .into_iter()
-            .map(|value| (Key::from(Vec::new()), value.into()))
-            .collect(),
-        next: None,
     }
 }
 

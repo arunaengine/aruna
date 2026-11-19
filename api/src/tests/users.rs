@@ -38,3 +38,8 @@ pub(crate) fn realm_auth(realm_id: RealmId) -> AuthContext {
         session: None,
     }
 }
+
+/// The auth of a fresh user in a realm no test state belongs to.
+pub(crate) fn foreign_auth() -> AuthContext {
+    realm_auth(RealmId::from_bytes([7u8; 32]))
+}

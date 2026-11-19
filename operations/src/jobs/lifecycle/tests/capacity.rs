@@ -8,12 +8,13 @@ use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::execution::job::{
-    CapturedInput, EffectiveResources, JobFamilyRecord, JobPayload, JobRecord, JobRecordBody,
-    LaunchIntent, LogicalJobSpec, PhysicalExecutionState,
+    CapturedInput, JobFamilyRecord, JobPayload, JobRecord, JobRecordBody, LaunchIntent,
+    LogicalJobSpec, PhysicalExecutionState,
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use ulid::Ulid;
 
+use super::resources;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
@@ -36,16 +37,6 @@ fn envelope(max_concurrent: u32) -> ResourceEnvelope {
         max_ram_bytes: Some(8_192),
         max_disk_bytes: Some(16_384),
         max_concurrent: Some(max_concurrent),
-    }
-}
-
-fn resources() -> EffectiveResources {
-    EffectiveResources {
-        cpu_cores: 1,
-        ram_bytes: 1024,
-        disk_bytes: 2048,
-        max_walltime_ms: 60_000,
-        preemptible: false,
     }
 }
 

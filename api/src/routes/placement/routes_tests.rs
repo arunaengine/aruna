@@ -343,14 +343,12 @@ mod mint {
     use crate::lookup::bucket_info;
     use crate::mcp::data::{WriteObjectInput, store_text};
     use crate::tests::distributed::{
-        BUCKET, LOCAL, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api, write,
+        BUCKET, Node, PEER, advertise, distribute, mock_peer, node_id, node_state, publish_api,
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, NODE_SUBJECT_KEYSPACE};
+    use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
     use aruna_core::structs::identity::auth::AuthContext;
-    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-    use aruna_core::structs::placement::policy::PlacementSubject;
     use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
     use axum::Extension;
     use axum::Json;
@@ -383,21 +381,6 @@ mod mint {
         )
         .await?;
         Ok(minted.0)
-    }
-
-    /// Advertises this node's placement subject, so it admits governed data.
-    async fn advertise(node: &Node) {
-        let record = NodeSubjectRecord::seed(PlacementSubject {
-            node_id: node_id(LOCAL),
-            generation: 1,
-            location: "eu-west".to_string(),
-            labels: Default::default(),
-            executor_kind: None,
-            local_to_controller: true,
-        })
-        .unwrap();
-        let (key, value) = (NODE_SUBJECT_KEY.to_vec(), record.to_bytes().unwrap());
-        write(&node.state, NODE_SUBJECT_KEYSPACE, key, value).await;
     }
 
     #[tokio::test]
@@ -488,12 +471,9 @@ mod runs {
     use crate::auth::{RealmAuth, ValidatedBearer};
     use crate::error::ServerError;
     use crate::tests::distributed::{
-        BUCKET, CLOSED_API, LOCAL, Node, PEER, distribute, mock_peer, node_id, node_state,
-        publish_api, replicate, write,
+        BUCKET, CLOSED_API, Node, PEER, advertise, distribute, mock_peer, node_id, node_state,
+        publish_api, replicate,
     };
-    use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
-    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-    use aruna_core::structs::placement::policy::PlacementSubject;
     use axum::Extension;
     use axum::Json;
     use axum::extract::{Path, State};
@@ -519,20 +499,6 @@ mod runs {
         )
         .await?;
         Ok(answer.0)
-    }
-
-    async fn advertise(node: &Node) {
-        let record = NodeSubjectRecord::seed(PlacementSubject {
-            node_id: node_id(LOCAL),
-            generation: 1,
-            location: "eu-west".to_string(),
-            labels: Default::default(),
-            executor_kind: None,
-            local_to_controller: true,
-        })
-        .unwrap();
-        let (key, value) = (NODE_SUBJECT_KEY.to_vec(), record.to_bytes().unwrap());
-        write(&node.state, NODE_SUBJECT_KEYSPACE, key, value).await;
     }
 
     #[tokio::test]
