@@ -12,6 +12,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keys::realm_presence_key;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_drivers::driver::DriverContext;
+use aruna_drivers::testing::poll_until;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_tasks::TaskHandle;
 use reqwest::StatusCode;
@@ -81,17 +82,13 @@ async fn handled(
     before: &aruna_net::PoolCounts,
     wait: Duration,
 ) -> TestResult<Option<aruna_net::PoolCounts>> {
-    let cap = tokio::time::Instant::now() + wait;
-    loop {
+    let found = poll_until(wait, async || {
         let counts = metadata_counts(seed, peer);
-        if counts.dials > before.dials || counts.cooldown_hits > before.cooldown_hits {
-            return Ok(Some(counts));
-        }
-        if tokio::time::Instant::now() >= cap {
-            return Ok(None);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        let moved = counts.dials > before.dials || counts.cooldown_hits > before.cooldown_hits;
+        moved.then_some(counts)
+    })
+    .await;
+    Ok(found)
 }
 
 /// Queries the stopped peer until the pool handles a query. A query can fail on the

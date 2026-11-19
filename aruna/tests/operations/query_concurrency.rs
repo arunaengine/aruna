@@ -27,6 +27,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, Value};
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::poll_until;
 use aruna_operations::metadata::local_query::LocalQueryOperation;
 use aruna_operations::metadata::text_search::LocalSearchOperation;
 use aruna_storage::FjallStorage;
@@ -246,16 +247,12 @@ async fn wait_for(
     deadline: Duration,
     mut condition: impl AsyncFnMut() -> Result<bool, BoxError>,
 ) -> Result<bool, BoxError> {
-    let started = Instant::now();
-    loop {
-        if condition().await? {
-            return Ok(true);
-        }
-        if started.elapsed() > deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let held = poll_until(deadline, async || match condition().await {
+        Ok(false) => None,
+        answer => Some(answer),
+    })
+    .await;
+    held.unwrap_or(Ok(false))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

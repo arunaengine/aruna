@@ -373,11 +373,10 @@ const POLL_MOST: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Asks `check` until it answers `Some`, waiting twice as long after each miss up to half a
 /// second. Answers `None` once `cap` has passed: a hang cap for tests, never a speed bound.
-pub async fn poll_until<T, F, Fut>(cap: std::time::Duration, mut check: F) -> Option<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Option<T>>,
-{
+pub async fn poll_until<T>(
+    cap: std::time::Duration,
+    mut check: impl AsyncFnMut() -> Option<T>,
+) -> Option<T> {
     let deadline = tokio::time::Instant::now() + cap;
     let mut wait = POLL_FIRST;
     loop {

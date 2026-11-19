@@ -21,6 +21,7 @@ use aruna_core::structs::storage::format::{
 };
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_drivers::testing::poll_until;
 use aruna_operations::blob::cleanup::{CleanupNode, ProcessCleanupOperation};
 use aruna_operations::s3::bucket::compression::PutCompressionOperation;
 use std::sync::Arc;
@@ -150,14 +151,9 @@ async fn restart_resumes_migration() {
     start_task_queues(restarted, task_handle, JobsRuntime::new(), &shutdown).await;
 
     // A generous cap only detects lost progress; the run itself needs a few seconds.
-    let finished = tokio::time::timeout(std::time::Duration::from_secs(300), async {
-        loop {
-            let record = progress(&context).await;
-            if record.finished_at_ms.is_some() {
-                return record;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+    let finished = poll_until(std::time::Duration::from_secs(300), async || {
+        let record = progress(&context).await;
+        record.finished_at_ms.is_some().then_some(record)
     })
     .await
     .expect("the restart re-arms the migration");
