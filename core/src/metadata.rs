@@ -1486,6 +1486,23 @@ pub enum MetadataEffect {
     CachedGroup {
         group_id: GroupId,
     },
+    /// The registry cache's snapshot, an expired one included, with its generation.
+    RegistrySnapshot,
+    /// Stores a registry fill and the deletion state of its graphs, unless the registry cache
+    /// changed since `generation`.
+    StoreRegistry {
+        records: Vec<MetadataRegistryRecord>,
+        lifecycle: Vec<(String, bool)>,
+        generation: u64,
+    },
+    /// Re-stamps the deletion states a read resolved, unless the registry cache changed since
+    /// `generation`.
+    RefreshLifecycle {
+        lifecycle: Vec<(String, bool)>,
+        generation: u64,
+    },
+    /// The query cache's current stamp, taken before a read whose result it may keep.
+    QueryCacheStamp,
 }
 
 impl MetadataEffect {
@@ -1530,6 +1547,10 @@ impl MetadataEffect {
             MetadataEffect::CacheRecords { .. } => "cache_records",
             MetadataEffect::UncacheRecord { .. } => "uncache_record",
             MetadataEffect::CachedGroup { .. } => "cached_group",
+            MetadataEffect::RegistrySnapshot => "registry_snapshot",
+            MetadataEffect::StoreRegistry { .. } => "store_registry",
+            MetadataEffect::RefreshLifecycle { .. } => "refresh_lifecycle",
+            MetadataEffect::QueryCacheStamp => "query_cache_stamp",
             MetadataEffect::QueryCacheGet { .. } => "query_cache_get",
             MetadataEffect::QueryCachePut { .. } => "query_cache_put",
         }
@@ -1581,7 +1602,11 @@ impl MetadataEffect {
             | MetadataEffect::UncacheRecord { .. }
             | MetadataEffect::CachedGroup { .. }
             | MetadataEffect::QueryCacheGet { .. }
-            | MetadataEffect::QueryCachePut { .. } => None,
+            | MetadataEffect::QueryCachePut { .. }
+            | MetadataEffect::RegistrySnapshot
+            | MetadataEffect::StoreRegistry { .. }
+            | MetadataEffect::RefreshLifecycle { .. }
+            | MetadataEffect::QueryCacheStamp => None,
         }
     }
 
@@ -1720,6 +1745,16 @@ pub enum MetadataEvent {
     /// The cached registry rows of one group, or `None` without a fresh copy.
     CachedGroup {
         records: Option<Vec<MetadataRegistryRecord>>,
+    },
+    /// The registry cache's snapshot, whether it is still fresh, and the cache generation.
+    RegistrySnapshot {
+        records: Option<std::sync::Arc<Vec<MetadataRegistryRecord>>>,
+        fresh: bool,
+        generation: u64,
+    },
+    /// Whether a registry fill or deletion refresh was kept.
+    RegistryStored {
+        accepted: bool,
     },
     /// The kept shape sources of one Profile revision, if any; a store answers with `None`.
     ProfileShapes {

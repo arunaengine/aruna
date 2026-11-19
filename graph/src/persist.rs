@@ -116,7 +116,11 @@ pub(crate) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::UncacheRecord { .. }
         | MetadataEffect::CachedGroup { .. }
         | MetadataEffect::QueryCacheGet { .. }
-        | MetadataEffect::QueryCachePut { .. } => false,
+        | MetadataEffect::QueryCachePut { .. }
+        | MetadataEffect::QueryCacheStamp
+        | MetadataEffect::RegistrySnapshot
+        | MetadataEffect::StoreRegistry { .. }
+        | MetadataEffect::RefreshLifecycle { .. } => false,
     }
 }
 
