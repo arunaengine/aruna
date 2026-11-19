@@ -15,22 +15,7 @@ use aruna_core::metadata::MetadataRequestDurability;
 use aruna_drivers::driver::drive;
 use byteview::ByteView;
 pub(super) fn registry_record(document_path: &str) -> MetadataRegistryRecord {
-    let document_id = Ulid::generate();
-    MetadataRegistryRecord {
-        realm_id: RealmId([7u8; 32]),
-        group_id: Ulid::generate(),
-        document_id,
-        document_path: document_path.to_string(),
-        graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
-        public: true,
-        permission_path: format!("/metadata/{document_path}"),
-        placement: PlacementRef::NIL,
-        holder_node_ids: Vec::new(),
-        created_at_ms: 0,
-        updated_at_ms: 0,
-        establishing_event_id: Ulid::nil(),
-        last_event_id: Ulid::nil(),
-    }
+    aruna_core::testing::registry_record(document_path)
 }
 
 #[tokio::test]

@@ -25,15 +25,12 @@ use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::job::{
-    ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportDetail, ImportReportRow,
-    ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
-    LEASE_INDEX_PREFIX, ReasonCode, RoCrateLimits, encode_dedup_value, job_schedule_key,
-    parse_schedule_key, pid_dedup_key,
+    ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportRow, ImportRoCrateResult,
+    ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, LEASE_INDEX_PREFIX,
+    RoCrateLimits, encode_dedup_value, job_schedule_key, parse_schedule_key, pid_dedup_key,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::TxnId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
@@ -83,13 +80,7 @@ fn node_id(seed: u8) -> NodeId {
 }
 
 fn job_id(timestamp_ms: u64) -> JobId {
-    JobId::from_parts(
-        timestamp_ms,
-        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
-        BucketId::new(0).unwrap(),
-        0,
-    )
-    .unwrap()
+    aruna_core::testing::job_at(timestamp_ms, 0)
 }
 
 fn queued_record(job_id: JobId) -> JobRecord {
@@ -145,21 +136,7 @@ fn rocrate_record(job_id: JobId) -> JobRecord {
 }
 
 fn report_row(entry_key: &str) -> ImportReportRow {
-    ImportReportRow {
-        entry_key: entry_key.to_string(),
-        code: ReasonCode::Imported,
-        message: None,
-        detail: ImportReportDetail {
-            archive_path: entry_key.to_string(),
-            target_key: Some(entry_key.to_string()),
-            version_id: None,
-            blake3: None,
-            size: None,
-            arn: None,
-            w3id: None,
-            validation: None,
-        },
-    }
+    aruna_core::testing::report_row(entry_key)
 }
 
 fn digest_values(values: &[Vec<u8>]) -> [u8; 32] {

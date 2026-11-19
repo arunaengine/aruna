@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::record::PlacementRef;
 
 const TTL: Duration = Duration::from_secs(30);
 
@@ -108,22 +106,7 @@ fn ttl_expires_entry() {
 }
 
 fn record(document_path: &str) -> MetadataRegistryRecord {
-    let document_id = Ulid::generate();
-    MetadataRegistryRecord {
-        realm_id: RealmId([7u8; 32]),
-        group_id: Ulid::generate(),
-        document_id,
-        document_path: document_path.to_string(),
-        graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
-        public: true,
-        permission_path: format!("/metadata/{document_path}"),
-        placement: PlacementRef::NIL,
-        holder_node_ids: Vec::new(),
-        created_at_ms: 0,
-        updated_at_ms: 0,
-        establishing_event_id: Ulid::nil(),
-        last_event_id: Ulid::nil(),
-    }
+    aruna_core::testing::registry_record(document_path)
 }
 
 fn filled(records: Vec<MetadataRegistryRecord>) -> VisibilityCache {

@@ -46,6 +46,7 @@ tokio-util = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
+aruna-core = { workspace = true, features = ["test-hooks"] }
 aruna-api = { workspace = true }
 axum = { workspace = true }
 flate2 = { workspace = true }
