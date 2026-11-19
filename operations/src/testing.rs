@@ -9,6 +9,7 @@ use aruna_core::document_apply::ApplyError;
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
@@ -22,6 +23,7 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
 use crate::driver::{DriverContext, drive};
+use crate::metadata::deletion_guard::DeletionGuardOperation;
 use crate::sync::document_outbox::{
     OutboxPagePlan, OutboxReadBatch, OutboxTailsOperation, OutboxTimerOperation, ReadOutboxPlan,
 };
@@ -33,7 +35,6 @@ pub fn test_context(storage: StorageHandle) -> DriverContext {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: None,
         compute_handle: None,
@@ -346,4 +347,34 @@ pub fn installed_graph_handle(context: &DriverContext) -> &aruna_graph::GraphHan
         .graph_handle
         .as_ref()
         .expect("graph handle installed")
+}
+
+/// Runs one metadata effect on this node's graph store and answers with its event; an effect
+/// that names a graph skips the deletion guard here.
+pub async fn send_metadata_effect(context: &DriverContext, effect: MetadataEffect) -> Event {
+    match &context.graph_handle {
+        Some(graph) => Event::Metadata(graph.run(effect).await),
+        None => Event::Metadata(MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::HandleMissing,
+        }),
+    }
+}
+
+/// The RO-Crate JSON-LD of one graph.
+pub async fn export_rocrate_jsonld(
+    context: &DriverContext,
+    graph_iri: String,
+) -> Result<String, MetadataError> {
+    let export = MetadataEffect::ExportRoCrate {
+        graph_iri: graph_iri.clone(),
+    };
+    match drive(DeletionGuardOperation::new(graph_iri, export), context).await? {
+        MetadataEvent::RoCrateExportResult { jsonld, .. } => Ok(jsonld),
+        MetadataEvent::Error { error, .. } => Err(error),
+        other => Err(MetadataError::Backend(format!(
+            "unexpected metadata export event: {}",
+            other.label()
+        ))),
+    }
 }
