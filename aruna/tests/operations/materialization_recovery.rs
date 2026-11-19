@@ -614,7 +614,7 @@ async fn build_context(with_metadata: bool) -> Result<TestContext, Box<dyn std::
     };
     let graph_handle = match metadata_dir.as_ref() {
         Some(dir) => {
-            aruna_operations::metadata::install_indexes(&storage_handle, dir.path());
+            storage_handle.install_metadata_indexes(dir.path());
             Some(GraphHandle::open(
                 dir.path(),
                 node_id,

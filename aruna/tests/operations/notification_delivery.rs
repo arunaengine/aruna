@@ -533,7 +533,7 @@ async fn build_node(
                 aruna_graph::GraphOptions::default(),
             )?;
             let path = dir.path().join("metadata");
-            aruna_operations::metadata::install_indexes(&storage, path);
+            storage.install_metadata_indexes(path);
             (Some(dir), Some(graph))
         }
         false => (None, None),

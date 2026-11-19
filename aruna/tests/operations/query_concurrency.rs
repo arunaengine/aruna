@@ -56,7 +56,7 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
         options = options.with_pool_size(pool_size);
     }
     let graph = aruna_graph::GraphHandle::open(metadata_dir.path(), node_id, None, None, options)?;
-    aruna_operations::metadata::install_indexes(&storage, metadata_dir.path());
+    storage.install_metadata_indexes(metadata_dir.path());
     // Policy loading fails closed without realm config and group documents.
     let group_id = Ulid::generate();
     let owner = aruna_core::UserId::nil(REALM);

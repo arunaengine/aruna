@@ -451,10 +451,9 @@ async fn fill(
             .with_sync_all(config.fjall_persist_policy == FjallPersistPolicy::SyncAll),
     )?;
     acquired.graph_handle = Some(graph_handle.clone());
-    aruna_operations::metadata::install_indexes(
-        &acquired.storage_handle,
-        &config.metadata_storage_path,
-    );
+    acquired
+        .storage_handle
+        .install_metadata_indexes(&config.metadata_storage_path);
     checkpoint(StartupStage::Metadata)?;
     stopped(stop)?;
 

@@ -65,10 +65,10 @@ async fn broker() -> (Fixture, RunBroker, Ulid, tempfile::TempDir) {
         None,
         aruna_graph::GraphOptions::default(),
     );
-    aruna_operations::metadata::install_indexes(
-        &fixture.ctx.storage_handle,
-        dir.path().join("meta"),
-    );
+    fixture
+        .ctx
+        .storage_handle
+        .install_metadata_indexes(dir.path().join("meta"));
     ctx.graph_handle = Some(graph.unwrap());
     let ctx = Arc::new(ctx);
     let create = CreateDocumentOperation::new(CreateDocumentConfig {

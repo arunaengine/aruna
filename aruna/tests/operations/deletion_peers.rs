@@ -39,10 +39,10 @@ async fn connect_fixture(fixture: &mut Fixture, seed: u8) -> NetHandle {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    aruna_operations::metadata::install_indexes(
-        &fixture.context.storage_handle,
-        fixture.dir.path().join("metadata"),
-    );
+    fixture
+        .context
+        .storage_handle
+        .install_metadata_indexes(fixture.dir.path().join("metadata"));
     fixture.context.net_handle = Some(net.clone());
     fixture.context.graph_handle = Some(graph);
     net.reload_realm_peers().await.unwrap();

@@ -51,7 +51,7 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
         None,
         aruna_graph::GraphOptions::default(),
     )?;
-    aruna_operations::metadata::install_indexes(&storage, temp_dir.path().join("metadata"));
+    storage.install_metadata_indexes(temp_dir.path().join("metadata"));
     let context = Arc::new(DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,

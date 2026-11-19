@@ -1635,7 +1635,7 @@ mod tests {
             aruna_graph::GraphOptions::default(),
         )
         .unwrap();
-        crate::metadata::install_indexes(&metadata_storage, temp.join("meta"));
+        metadata_storage.install_metadata_indexes(temp.join("meta"));
         Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,

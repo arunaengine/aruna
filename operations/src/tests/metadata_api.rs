@@ -36,7 +36,7 @@ pub(crate) fn metadata_test() -> MetadataTest {
         aruna_graph::GraphOptions::default(),
     )
     .expect("metadata handle");
-    crate::metadata::install_indexes(&storage_handle, metadata_dir.path());
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     MetadataTest {
         context: DriverContext {
             storage_handle,

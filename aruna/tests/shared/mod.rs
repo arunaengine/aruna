@@ -1112,7 +1112,7 @@ async fn initialize_context(
             Some(net.document_sync_database()),
             Default::default(),
         )?;
-        aruna_operations::metadata::install_indexes(&storage_handle, &config.metadata_storage_path);
+        storage_handle.install_metadata_indexes(&config.metadata_storage_path);
         Some(graph)
     } else {
         None

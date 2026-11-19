@@ -1706,7 +1706,7 @@ async fn build_context(
         None,
         aruna_graph::GraphOptions::default().with_validation_disabled(validator_disabled),
     )?;
-    aruna_operations::metadata::install_indexes(&storage, metadata_dir.path());
+    storage.install_metadata_indexes(metadata_dir.path());
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),

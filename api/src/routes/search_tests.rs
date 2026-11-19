@@ -197,7 +197,7 @@ async fn setup() -> Fixture {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,

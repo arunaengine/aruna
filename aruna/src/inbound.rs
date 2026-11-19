@@ -1275,7 +1275,7 @@ mod tests {
                 aruna_graph::GraphOptions::default(),
             )
             .unwrap();
-            aruna_operations::metadata::install_indexes(&storage, dir.path().join("metadata"));
+            storage.install_metadata_indexes(dir.path().join("metadata"));
             let context = Arc::new(DriverContext {
                 storage_handle: storage,
                 net_handle: Some(net.clone()),
