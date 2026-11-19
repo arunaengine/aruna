@@ -25,8 +25,8 @@ use aruna_operations::abe::{
     KeyAction, KeyError, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
 };
 use aruna_operations::s3::abe_copies::CompleteCopiesOperation;
-use aruna_operations::s3::abe_rekey::{RekeyOperation, RekeyProgress};
 use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
+use aruna_operations::transfer::abe_rekey::{RekeyOperation, RekeyProgress};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::StatusCode;

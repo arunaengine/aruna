@@ -27,7 +27,7 @@ use aruna_operations::metadata::provenance::{
     CrateFile, ExportAnswer, ExportAsk, ExportState, ExportStepOperation, ForgetSpoolOperation,
     Hop, Read, RootCursor, RootPageOperation, Target,
 };
-use aruna_operations::s3::bucket::release::holder::{
+use aruna_operations::transfer::release::holder::{
     AskHolderError, AskHolderOperation, ReadCrateOperation,
 };
 use async_zip::tokio::write::ZipFileWriter;

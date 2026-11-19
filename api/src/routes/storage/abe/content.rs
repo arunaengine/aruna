@@ -10,7 +10,7 @@ use crate::rate_limit::LocalKey;
 use crate::routes::execution::jobs::range_request;
 use crate::routes::storage::relay::{RestRead, holder_stream, missed_stream};
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use aruna_operations::s3::object::read::ReadObjectOperation;
+use aruna_operations::transfer::read::ReadObjectOperation;
 use axum::response::Response;
 use http::{HeaderMap, header};
 

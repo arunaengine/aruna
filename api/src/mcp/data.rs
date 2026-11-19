@@ -34,8 +34,8 @@ use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_operations::s3::object::read::GetRoutedOperation;
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
+use aruna_operations::transfer::read::GetRoutedOperation;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use rmcp::Json;

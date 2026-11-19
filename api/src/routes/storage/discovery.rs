@@ -12,7 +12,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::discovery::DiscoveryRule;
 use aruna_drivers::driver::drive;
 use aruna_operations::s3::imports::ReadImportOperation;
-use aruna_operations::s3::imports::discovery::{
+use aruna_operations::transfer::discovery::{
     AuthorizedPreviewOperation, FileOutcome, ReadDiscoveryOperation, RuleAccessOperation,
     SetDiscoveryOperation,
 };

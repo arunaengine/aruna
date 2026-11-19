@@ -20,10 +20,10 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::s3::object::copy::{
+use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_operations::transfer::copy::{
     CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };
-use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};

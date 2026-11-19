@@ -54,11 +54,11 @@ use aruna_operations::connectors::create_connector::{
 };
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use aruna_operations::testing::fresh_job_id;
+use aruna_operations::transfer::origin::ReadOriginOperation;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use aruna_test_support::metadata::process_materialization_batch;

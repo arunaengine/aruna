@@ -13,7 +13,7 @@ use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key};
 use aruna_drivers::driver::drive;
-use aruna_operations::s3::object::origin::ReadOriginOperation;
+use aruna_operations::transfer::origin::ReadOriginOperation;
 
 use super::*;
 use crate::auth::RealmAuth;
@@ -359,11 +359,11 @@ async fn purge_keeps_pinned() {
     use crate::routes::storage::deletion::{PurgeScopeRequest, SubmitPurgeRequest, submit_purge};
     use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
     use aruna_drivers::driver::drive;
-    use aruna_operations::s3::object::delete::pinned::{
-        PinnedError, RefusePinnedOperation, RefuseScopeOperation,
-    };
     use aruna_operations::s3::object::delete::{
         DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
+    };
+    use aruna_operations::transfer::pinned::{
+        PinnedError, RefusePinnedOperation, RefuseScopeOperation,
     };
 
     let node = node_state().await;

@@ -38,7 +38,7 @@ use aruna_operations::s3::bucket::key::removal::{
 use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockError, UnlockInput};
 use aruna_operations::s3::bucket::rotate::KeyChange;
 use aruna_operations::s3::bucket::seal_missing::{SealMissingInput, SealMissingOperation};
-use aruna_operations::s3::key_status::{AuditPageOperation, KeySnapshot};
+use aruna_operations::transfer::key_status::{AuditPageOperation, KeySnapshot};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};

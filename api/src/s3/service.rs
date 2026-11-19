@@ -114,17 +114,11 @@ use aruna_operations::s3::multipart::complete::{
 use aruna_operations::s3::multipart::create::{
     CreateMultipartInput as CMPI, CreateMultipartOperation,
 };
-use aruna_operations::s3::multipart::part_copy::{
-    KeepPoliciesOperation, PartCopyInput as UploadPartCopyData, PartCopyOperation,
-};
 use aruna_operations::s3::multipart::part_upload::{UploadPartInput as UPI, UploadPartOperation};
 use aruna_operations::s3::multipart::parts::{ListPartsInput as LPI, ListPartsOperation};
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput as LMUI, ListUploadsOperation};
 use aruna_operations::s3::object::attributes::{
     GetAttributesInput as GOAI, GetAttributesOperation,
-};
-use aruna_operations::s3::object::copy::{
-    CopyObjectInput as CopyObjectData, CopyObjectOperation, CopyReferences,
 };
 use aruna_operations::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput as DOSI, BulkDeleteOperation,
@@ -135,11 +129,17 @@ use aruna_operations::s3::object::head::{HeadObjectInput as HOI, HeadObjectOpera
 use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListBucketOperation};
 use aruna_operations::s3::object::member_read::MemberRead;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectOperation};
-use aruna_operations::s3::object::read::{
-    GetRoutedOperation, KeyedReadOperation, ObjectInfoOperation, TokenRead,
-};
 use aruna_operations::s3::object::versions::{ListVersionsInput as LOVI, ListVersionsOperation};
 use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed};
+use aruna_operations::transfer::copy::{
+    CopyObjectInput as CopyObjectData, CopyObjectOperation, CopyReferences,
+};
+use aruna_operations::transfer::part_copy::{
+    KeepPoliciesOperation, PartCopyInput as UploadPartCopyData, PartCopyOperation,
+};
+use aruna_operations::transfer::read::{
+    GetRoutedOperation, KeyedReadOperation, ObjectInfoOperation, TokenRead,
+};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,

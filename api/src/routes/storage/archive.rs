@@ -11,7 +11,7 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_operations::auth::error::token_grant;
-use aruna_operations::s3::object::archive::{
+use aruna_operations::transfer::archive::{
     OpenArchiveOperation, SelectionEntry, WriteSelectionOperation, validate_selection,
 };
 use axum::extract::{Query, State};

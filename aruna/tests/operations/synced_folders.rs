@@ -44,13 +44,13 @@ use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::staging::offer::list::ListOffersOperation;
 use aruna_operations::staging::offered_directory::{
     OfferDirectoryInput, OfferedDirectoryError, offer_directory,
 };
+use aruna_operations::transfer::origin::ReadOriginOperation;
 use futures_util::StreamExt;
 use topology::{TestResult, Topology, wait_for_convergence, wait_until};
 use ulid::Ulid;

@@ -26,7 +26,7 @@ use aruna_operations::distribution::resolve::{
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
 use aruna_operations::s3::bucket::sources::{BucketSourcesOperation, FileSource};
-use aruna_operations::s3::object::origin::{
+use aruna_operations::transfer::origin::{
     BucketRunsOperation, OriginError, OriginView, ReadOriginOperation,
 };
 use axum::extract::{Path, Query, State};
@@ -57,8 +57,8 @@ use crate::server::state::ServerState;
 use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
 use aruna_core::structs::storage::release::MembershipQuery;
 use aruna_operations::auth::request_authorization::BucketAccessOperation;
-use aruna_operations::s3::bucket::release::access::MembersCheckOperation;
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
+use aruna_operations::transfer::release::access::MembersCheckOperation;
+use aruna_operations::transfer::release::{BucketScope, MembershipCaller};
 
 /// How long an origin read directed at another node may take, body included.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
