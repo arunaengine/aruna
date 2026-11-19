@@ -11,8 +11,8 @@ use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
 use aruna_core::structs::execution::job::record_rows::PendingNeed;
 use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
-    PhysicalExecutionState, SubmissionId,
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind, LaunchIntent,
+    Membership, PhysicalExecutionState, SubmissionId, membership,
 };
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -31,10 +31,12 @@ use crate::jobs::lifecycle::cancel::CancelLocalRunsOperation;
 use crate::jobs::lifecycle::launch_admit::{
     AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided,
 };
+use crate::jobs::lifecycle::membership::MembershipViewOperation;
 use crate::jobs::lifecycle::witness_arm::ArmFamilyOperation;
 use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
 use crate::realm::load_config::config_unavailable;
+use crate::secrets::owner::WriterView;
 
 #[derive(Debug, PartialEq)]
 struct PageRequest {
@@ -64,6 +66,8 @@ enum ServeError {
 #[derive(Debug, PartialEq)]
 enum ServeStep {
     Config,
+    /// The membership view, for the schedulers of the launches sent along with a receipt.
+    Members,
     Append,
     Dashboard,
     Armed,
@@ -269,7 +273,16 @@ impl ServeRecordOperation {
                 if let Err(error) = self.authorized(&config, family.submission_id) {
                     return self.fail(error);
                 }
-                self.append(*record, attached)
+                if !attached.iter().any(|frame| launch_of(frame).is_some()) {
+                    return self.append(*record, attached);
+                }
+                let Some((_, realm_id)) = self.serving else {
+                    return self.fail(ServeError::Unavailable);
+                };
+                self.request = Some(RecordRequest::Publish(record, attached));
+                self.step = ServeStep::Members;
+                let view = MembershipViewOperation::new(realm_id);
+                Ok(Next::Call(IoCall::child(view)))
             }
             RecordRequest::Page(request) => {
                 if let Err(error) = self.authorized(&config, request.submission_id) {
@@ -381,6 +394,29 @@ impl ServeRecordOperation {
     }
 }
 
+fn launch_of(frame: &JobRecordFrame) -> Option<&LaunchIntent> {
+    match &frame.envelope().record {
+        JobFamilyRecord::Launch(launch) => Some(launch),
+        _ => None,
+    }
+}
+
+/// A launch sent along with its receipt names a scheduler that had an open membership interval
+/// at the launch's clock; it may have left since.
+fn scheduler_member(view: &WriterView, launch: &LaunchIntent) -> Result<(), ServeError> {
+    let cited = &launch.config_clock;
+    match membership(
+        launch.scheduler_node_id,
+        cited,
+        &view.intervals,
+        &view.clock,
+    ) {
+        Membership::Open | Membership::Left => Ok(()),
+        Membership::Unknown => Err(ServeError::Unavailable),
+        Membership::Absent => Err(ServeError::Refused(JobRecordRejection::Unauthorized)),
+    }
+}
+
 impl Operation for ServeRecordOperation {
     type Output = MetadataTransportMessage;
     type Error = IoError;
@@ -406,6 +442,22 @@ impl Operation for ServeRecordOperation {
                     self.fail(ServeError::Unavailable)
                 }
             },
+            ServeStep::Members => {
+                let Some(RecordRequest::Publish(record, attached)) = self.request.take() else {
+                    return Err(IoError::Unfinished);
+                };
+                let Ok(Some(view)) = result.child::<Option<WriterView>, IoError>()? else {
+                    return self.fail(ServeError::Unavailable);
+                };
+                let launches = attached.iter().filter_map(launch_of);
+                let checked: Result<(), ServeError> = launches
+                    .map(|launch| scheduler_member(&view, launch))
+                    .collect();
+                match checked {
+                    Ok(()) => self.append(*record, attached),
+                    Err(error) => self.fail(error),
+                }
+            }
             ServeStep::Append => match result.child::<AppendOutcome, RecordStoreError>()? {
                 Ok(outcome) => self.appended(outcome),
                 Err(error) => self.fail(append_failure(error)),
@@ -656,6 +708,36 @@ mod pure_tests {
             serve.next(stopped).unwrap(),
             Next::Done(MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) })
         );
+    }
+
+    // A launch sent along with its receipt needs a scheduler that was a member at its clock; an
+    // unreadable membership view decides nothing.
+    #[test]
+    fn checks_launch_scheduler() {
+        let family = Family::new([19u8; 32]);
+        let launch = family.launch(&family.spec(), family.holder.public(), 0);
+        let receipt = family.receipt(&launch, 1);
+        let frame = |key: &iroh::SecretKey, record| {
+            JobRecordFrame::new(family.sign(key, record)).expect("bounded record")
+        };
+        let receipt = frame(&family.target, JobFamilyRecord::Receipt(Box::new(receipt)));
+        let launch = frame(&family.holder, JobFamilyRecord::Launch(Box::new(launch)));
+        let waiting = || {
+            let mut serve =
+                ServeRecordOperation::new(node(2), record_request(&family), serving(), 5);
+            let publish = RecordRequest::Publish(Box::new(receipt.clone()), vec![launch.clone()]);
+            serve.request = Some(publish);
+            serve.step = ServeStep::Members;
+            serve
+        };
+        let absent = child(Ok::<_, IoError>(Some(WriterView::default())));
+        let unauthorized = MetadataTransportMessage::ForwardedJobRecord {
+            result: Err(JobRecordRejection::Unauthorized),
+        };
+        assert_eq!(waiting().next(absent), Ok(Next::Done(unauthorized)));
+        let unread = child(Ok::<Option<WriterView>, IoError>(None));
+        let unavailable = MetadataTransportMessage::ForwardedWriteUnavailable;
+        assert_eq!(waiting().next(unread), Ok(Next::Done(unavailable)));
     }
 
     fn launch_offer(family: &Family) -> LaunchFrame {

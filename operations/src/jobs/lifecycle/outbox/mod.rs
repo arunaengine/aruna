@@ -18,7 +18,7 @@ use aruna_core::events::{
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::FAMILY_OUTBOX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobRecordKey;
+use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordKey};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskKey};
 use tracing::{debug, warn};
@@ -101,6 +101,11 @@ impl PublishRecordOperation {
             clearing: false,
             spec_needed: false,
         }
+    }
+
+    fn spec_attached(&self) -> bool {
+        (self.config.attached.iter())
+            .any(|frame| matches!(frame.envelope().record, JobFamilyRecord::Spec(_)))
     }
 
     fn outcome(&self) -> PublishOutcome {
@@ -271,7 +276,7 @@ impl PublishRecordOperation {
                 debug!(peer = %holder, "Family holder refused a record of an old family");
                 return Ok(self.clear());
             }
-            JobRecordRejection::SpecNeeded if self.config.attached.is_empty() => {
+            JobRecordRejection::SpecNeeded if !self.spec_attached() => {
                 self.spec_needed = true;
                 return self.store();
             }

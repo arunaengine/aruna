@@ -146,6 +146,44 @@ async fn separates_peer_authority() {
     net.shutdown().await;
 }
 
+// A receipt offered with its launch is refused when the launch's scheduler had no open
+// membership interval at the launch's clock, although the receipt binds that launch.
+#[tokio::test]
+async fn refuses_absent_scheduler() {
+    let (_dir, context, net, family) = fixture().await;
+    let spec = fresh_spec(&family);
+    let frame = |key: &iroh::SecretKey, record| {
+        JobRecordFrame::new(family.sign(key, record)).expect("bounded record")
+    };
+    let offer = |record, attached| MetadataTransportMessage::ForwardJobRecord {
+        placement: family.placement,
+        record: Box::new(record),
+        attached,
+    };
+    let held = frame(
+        &family.holder,
+        JobFamilyRecord::Spec(Box::new(spec.clone())),
+    );
+    let peer = crate::tests::records::node(2);
+    let stored = serve_job_record(&context, peer, offer(held, Vec::new())).await;
+    let accepted = MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) };
+    assert_eq!(stored, accepted);
+    let budget = family.budget(&spec, secret(9).public());
+    let launch = family.launch(&spec, secret(9).public(), 0);
+    let receipt = family.receipt(&launch, 1);
+    let attached = vec![
+        frame(&secret(9), JobFamilyRecord::Launch(Box::new(launch))),
+        frame(&secret(9), JobFamilyRecord::Budget(budget)),
+    ];
+    let receipt = frame(&family.target, JobFamilyRecord::Receipt(Box::new(receipt)));
+    let refused = serve_job_record(&context, peer, offer(receipt, attached)).await;
+    let unauthorized = MetadataTransportMessage::ForwardedJobRecord {
+        result: Err(JobRecordRejection::Unauthorized),
+    };
+    assert_eq!(refused, unauthorized);
+    net.shutdown().await;
+}
+
 #[tokio::test]
 async fn holds_bound_pages() {
     // A holder acknowledges a spec that binds input pages only once it keeps those pages, so

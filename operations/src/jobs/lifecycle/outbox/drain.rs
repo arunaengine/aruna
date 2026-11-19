@@ -12,6 +12,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
+use aruna_core::structs::execution::job::record_keys::{budget_key, id_key, record_key};
 use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::execution::job::{
     JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind,
@@ -47,6 +48,9 @@ enum Phase {
     Record(Key),
     Clear,
     Publish(Box<PublishRecordOperation>),
+    /// The launch a queued receipt binds, then its scheduler's budget, are read to go with it.
+    Launch(Box<PublishRecordConfig>),
+    Budget(Box<PublishRecordConfig>),
     /// The family's specs are read, to offer the record again with the one it binds.
     Spec(Box<PublishRecordConfig>),
     WriteCursor,
@@ -128,13 +132,25 @@ impl DrainOutboxOperation {
                 key,
             )])));
         }
-        self.publish(PublishRecordConfig {
+        let launch = launch_key(frame.envelope());
+        let config = PublishRecordConfig {
             placement,
             holders,
             record: Box::new(frame),
             key: record_key,
             attached: Vec::new(),
-        })
+        };
+        match launch {
+            Some(key) => self.read_bundled(Phase::Launch(Box::new(config)), key),
+            None => self.publish(config),
+        }
+    }
+
+    /// Reads one record that goes with the queued one.
+    fn read_bundled(&mut self, phase: Phase, key: JobRecordKey) -> Step {
+        self.phase = phase;
+        let row = (FAMILY_RECORD_KEYSPACE.to_string(), record_key(&key));
+        Ok(Next::Call(IoCall::Read(vec![row])))
     }
 
     fn publish(&mut self, config: PublishRecordConfig) -> Step {
@@ -162,6 +178,16 @@ impl DrainOutboxOperation {
             }
         }
     }
+}
+
+/// The key of the launch a receipt binds: a holder admits both, and the scheduler's budget, even
+/// after the scheduler lost holder authority before its launch reached that holder.
+fn launch_key(envelope: &JobRecordEnvelope) -> Option<JobRecordKey> {
+    let JobFamilyRecord::Receipt(receipt) = &envelope.record else {
+        return None;
+    };
+    let id = receipt.launch_id.to_bytes();
+    Some(id_key(&envelope.family(), JobRecordKind::Launch, id, 0))
 }
 
 /// The stored spec `envelope` names by digest; an update or a stop names none, so it takes the
@@ -269,6 +295,23 @@ impl Operation for DrainOutboxOperation {
                 self.phase = Phase::Publish(publish);
                 self.after_publish(step)
             }
+            Phase::Launch(mut config) => {
+                let Some(launch) = stored_frame(single(result)?.as_deref()) else {
+                    return self.publish(*config);
+                };
+                let JobFamilyRecord::Launch(intent) = &launch.envelope().record else {
+                    return self.publish(*config);
+                };
+                let budget = budget_key(&config.key.family, intent.scheduler_node_id);
+                config.attached.push(launch);
+                self.read_bundled(Phase::Budget(config), budget)
+            }
+            Phase::Budget(mut config) => {
+                config
+                    .attached
+                    .extend(stored_frame(single(result)?.as_deref()));
+                self.publish(*config)
+            }
             Phase::Spec(mut config) => {
                 let specs = result.child::<Vec<JobRecordEnvelope>, FamilyReadError>();
                 let specs = match specs {
@@ -281,7 +324,7 @@ impl Operation for DrainOutboxOperation {
                 };
                 match bound_spec(config.record.envelope(), specs) {
                     Some(spec) => {
-                        config.attached = vec![spec];
+                        config.attached.push(spec);
                         self.publish(*config)
                     }
                     None => self.next_entry(),

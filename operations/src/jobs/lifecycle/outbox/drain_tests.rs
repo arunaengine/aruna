@@ -313,3 +313,48 @@ fn picks_bound_spec() {
     assert_eq!(bound, Some(other));
     assert_eq!(bound_spec(&signed, vec![signed.clone()]), None);
 }
+
+fn row_of(envelope: &JobRecordEnvelope) -> IoResult {
+    let bytes = to_bytes(envelope).expect("record encodes");
+    IoResult::Values(vec![Some(Value::from(bytes.as_slice()))])
+}
+
+// A queued receipt goes with the launch it binds and that scheduler's budget.
+#[test]
+fn bundles_receipt_records() {
+    let family = Family::new([8u8; 32]);
+    let run = family.run(
+        1,
+        0,
+        aruna_core::structs::execution::job::PhysicalExecutionState::Failed,
+    );
+    let (budget, launch, receipt) = (&run[2], &run[3], &run[4]);
+    let key = record_key(&receipt.key());
+    let mut drain = scanning(&family, None);
+    drain.next(page(vec![key], None)).expect("record read");
+    assert_eq!(
+        drain.next(row_of(receipt)),
+        record_read(&record_key(&launch.key()))
+    );
+    assert_eq!(
+        drain.next(row_of(launch)),
+        record_read(&record_key(&budget.key()))
+    );
+    let outbox = drain.next(row_of(budget));
+    assert!(matches!(outbox, Ok(Next::Call(IoCall::Read(_)))));
+    let Ok(Next::Call(IoCall::Group(group))) = drain.next(stored_entry()) else {
+        panic!("the receipt is offered");
+    };
+    let Effect::Net(NetEffect::MetadataRequest(request)) = &group.members[0] else {
+        panic!("a record publish");
+    };
+    let message = decode_message(&request.frame).expect("publish decodes");
+    let MetadataTransportMessage::ForwardJobRecord { attached, .. } = message else {
+        panic!("a record publish");
+    };
+    let attached: Vec<JobRecordEnvelope> = attached
+        .into_iter()
+        .map(|frame| frame.into_inner())
+        .collect();
+    assert_eq!(attached, vec![launch.clone(), budget.clone()]);
+}
