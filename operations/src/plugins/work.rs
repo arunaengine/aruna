@@ -662,7 +662,7 @@ pub(crate) fn summary_of(record: Option<&JobRecord>) -> Option<Summary> {
 }
 
 impl Summary {
-    fn of(state: FinalState) -> Self {
+    pub(crate) fn of(state: FinalState) -> Self {
         Self {
             state,
             source: None,

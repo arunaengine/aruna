@@ -51,6 +51,7 @@ pub mod settings;
 pub mod state;
 pub mod submit;
 pub mod sweep;
+pub mod task_change;
 pub mod task_row;
 pub mod tasks;
 pub mod transfer_steps;
