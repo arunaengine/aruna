@@ -566,6 +566,7 @@ pub enum NetEvent {
     /// The asked peers a topic lacks, `None` without the topic's state here, or why it is
     /// unreadable.
     MissingTopicPeers(Result<Option<Vec<crate::NodeId>>, String>),
+    ConfigCatchUp(CatchUpEvent),
     /// This node's signature over a group deletion plan.
     DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
     /// A local signal or change was taken; nothing is read back.
@@ -610,6 +611,19 @@ pub enum ShardNetEvent {
     Root(Result<[u8; 32], String>),
     Proof(crate::structs::placement::transition::CompletionProof),
     Manifest(Result<Box<crate::document::ShardManifest>, String>),
+}
+
+/// The answer to one realm config catch-up step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatchUpEvent {
+    /// The round ran to its end; the topic's stored clock after it is the round target.
+    Counted { target: irokle::ActorClock },
+    /// The round stopped at its page budget (`WouldBlock`), so it counts for nothing.
+    Partial,
+    /// The management node did not answer, or the round failed.
+    Failed(String),
+    /// Whether the applied cursor covers every round target.
+    Applied { covered: bool },
 }
 
 /// Why sync topics did not take the requested peers.
@@ -1114,6 +1128,7 @@ impl Event {
                     Shard,
                     TopicPeers,
                     MissingTopicPeers,
+                    ConfigCatchUp,
                     DeletePlanSigned,
                     Notification,
                     InboxWoken,

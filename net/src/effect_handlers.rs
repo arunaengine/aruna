@@ -10,8 +10,8 @@ use std::time::Duration;
 use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
-    DhtEntry, DhtEvent, ExecutionSignEvent, JobControlEvent, MetadataAnswer, NetEvent,
-    PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
+    CatchUpEvent, DhtEntry, DhtEvent, ExecutionSignEvent, JobControlEvent, MetadataAnswer,
+    NetEvent, PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
 };
 use aruna_core::id::{DhtKeyId, hex_prefix};
 use aruna_core::metadata::MetadataError;
@@ -306,6 +306,9 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         }
         NetEffect::MissingTopicPeers { .. } => NetEvent::MissingTopicPeers(Err(
             "topic members must be read by the operations runner".to_string(),
+        )),
+        NetEffect::ConfigCatchUp(_) => NetEvent::ConfigCatchUp(CatchUpEvent::Failed(
+            "the realm config catch-up must be run by the operations runner".to_string(),
         )),
         NetEffect::Notification(_) => NetEvent::Notification(Err(
             "notification requests must be dispatched by the operations runner".to_string(),
@@ -671,6 +674,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::AllowTopicPeers { .. } => "allow_topic_peers",
         NetEffect::SyncTopic { .. } => "sync_topic",
         NetEffect::MissingTopicPeers { .. } => "missing_topic_peers",
+        NetEffect::ConfigCatchUp(_) => "config_catch_up",
         NetEffect::Notification(_) => "notification",
         NetEffect::WakeInbox(_) => "wake_inbox",
         NetEffect::Heartbeat(_) => "heartbeat",

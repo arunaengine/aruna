@@ -93,6 +93,8 @@ pub enum TaskKey {
     MaintainRanges,
     /// Prunes the job families whose prune index row is due, page by page.
     PruneFamilies,
+    /// Catches up with the realm config after a start, then refreshes the last contact.
+    ConfigCatchUp,
 }
 
 impl TaskKey {

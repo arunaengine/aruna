@@ -12,10 +12,10 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentSyncPublish;
-use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::effects::{CatchUpEffect, Effect, NetEffect};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{
-    Event, ExecutionSignEvent, JobControlEvent, NetError, NetEvent, PolicySignEvent,
+    CatchUpEvent, Event, ExecutionSignEvent, JobControlEvent, NetError, NetEvent, PolicySignEvent,
     SnapshotSignEvent, StatementSignEvent, VaultSignEvent,
 };
 use aruna_core::handle::Handle;
@@ -232,6 +232,26 @@ async fn set_topic_peers(effect: NetEffect, context: &DriverContext) -> Result<E
     Ok(Event::Net(NetEvent::TopicPeers(result)))
 }
 
+/// Runs one step of the realm config catch-up; the operation decides from the answers.
+async fn catch_up(step: CatchUpEffect, context: &DriverContext) -> CatchUpEvent {
+    let Some(net) = &context.net_handle else {
+        return CatchUpEvent::Failed("no network".to_string());
+    };
+    match step {
+        CatchUpEffect::Round { topic, peer } => match net.catch_up_round(topic, peer).await {
+            Ok(Some(target)) => CatchUpEvent::Counted { target },
+            Ok(None) => CatchUpEvent::Partial,
+            Err(error) => CatchUpEvent::Failed(error.to_string()),
+        },
+        CatchUpEffect::Applied { topic, targets } => {
+            match net.applied_covers(topic, &targets).await {
+                Ok(covered) => CatchUpEvent::Applied { covered },
+                Err(error) => CatchUpEvent::Failed(error.to_string()),
+            }
+        }
+    }
+}
+
 /// The peers of `peers` that are not members of `topic`, or `None` without its state here.
 fn missing_peers(
     net: &NetHandle,
@@ -334,6 +354,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
         Ok(answered) => return answered,
         Err(effect) => effect,
     };
+    if let NetEffect::ConfigCatchUp(step) = effect {
+        return Event::Net(NetEvent::ConfigCatchUp(catch_up(*step, context).await));
+    }
     if let NetEffect::GrantedRead(read) = effect {
         return Event::Net(NetEvent::GrantedRead(granted_read(*read, context).await));
     }
