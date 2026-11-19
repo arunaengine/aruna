@@ -31,8 +31,10 @@ use aruna_operations::jobs::lifecycle::ids::SubmissionScope;
 use aruna_operations::jobs::lifecycle::submit_external::{
     ExternalSubmission, SubmitExternalOperation,
 };
-use aruna_operations::jobs::local_run::{LocalExecutionConfig, LocalExecutionError};
-use aruna_operations::jobs::node_inputs::{ingress_node, local_run};
+use aruna_operations::jobs::local_run::{
+    LocalExecutionConfig, LocalExecutionError, LocalRunOperation,
+};
+use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::jobs::submit::SubmitJobError;
@@ -159,6 +161,7 @@ impl JobRequestError {
                 Self::Conflict(error.to_string())
             }
             LocalExecutionError::Unsupported(_)
+            | LocalExecutionError::Refused(_)
             | LocalExecutionError::InputNotLocal { .. }
             | LocalExecutionError::InputRefused { .. } => {
                 Self::BadRequestMessage(error.to_string())
@@ -295,6 +298,7 @@ pub(crate) async fn admit_execution(
             preemptible: false,
         },
         executor_constraint: command.executor_constraint,
+        backend: command.backend,
         inputs,
         file_outputs,
         workspace_outputs,
@@ -365,7 +369,7 @@ async fn local_submit(
         retention_ms: state.rocrate_limits().artifact_retention_ms,
     };
     let result = drive(
-        local_run(config, &context.compute_limits(), context.node_and_realm()),
+        LocalRunOperation::new(config, context.node_and_realm()),
         context.as_ref(),
     )
     .await
@@ -779,6 +783,9 @@ pub struct JobInputResponse {
 #[schema(as = JobPlacementCandidateResponse)]
 pub struct JobCandidateResponse {
     pub node_id: String,
+    /// The compute backend's node-local name. Absent where the report names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_kind: Option<String>,
     /// `selected`, `ranked` or `rejected`.
@@ -796,6 +803,9 @@ pub struct JobCandidateResponse {
 /// Only a local planning round supplies `alternatives`, `rejected`, and `omitted` counts.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JobPlacementResponse {
+    /// The compute backend's node-local name on the target node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_kind: Option<String>,
     /// The node the execution was planned to run on.
@@ -1064,6 +1074,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
         locally_exhausted: report.locally_exhausted,
         cancel_requested: report.cancel_requested,
         placement: report.plan.as_ref().map(|plan| JobPlacementResponse {
+            backend: plan.target.as_ref().map(|target| target.backend.clone()),
             executor_kind: plan
                 .target
                 .as_ref()
@@ -1094,6 +1105,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
                 .iter()
                 .map(|candidate| JobCandidateResponse {
                     node_id: candidate.node_id.to_string(),
+                    backend: candidate.backend.clone(),
                     executor_kind: candidate.executor_kind.clone(),
                     verdict: candidate.verdict.name().to_string(),
                     rank: candidate.rank,

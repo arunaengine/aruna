@@ -58,6 +58,8 @@ const TES_VERSION: &str = "1.1.0";
 const GROUP_TAG_KEY: &str = "aruna-engine.org/group";
 /// Optional tag pinning a backend executor kind.
 const EXECUTOR_TAG_KEY: &str = "aruna-engine.org/executor";
+/// Names the compute backend a task runs on, next to the executor kind.
+const BACKEND_TAG_KEY: &str = "aruna-engine.org/compute-backend";
 /// Optional tag carrying the submission idempotency key.
 const IDEMPOTENCY_TAG_KEY: &str = "aruna-engine.org/idempotency-key";
 /// Optional tag choosing where the task runs: `realm` or `local`.
@@ -712,9 +714,8 @@ pub async fn create_task(
         };
         let context = state.get_ctx();
         return match drive(
-            aruna_operations::jobs::node_inputs::local_run(
+            aruna_operations::jobs::local_run::LocalRunOperation::new(
                 config,
-                &context.compute_limits(),
                 context.node_and_realm(),
             ),
             context.as_ref(),
@@ -1297,6 +1298,7 @@ fn map_execution_spec(
         env: executor.env.clone(),
         resources,
         executor_constraint: task.tags.get(EXECUTOR_TAG_KEY).cloned(),
+        backend: task.tags.get(BACKEND_TAG_KEY).cloned(),
         inputs,
         file_outputs,
         workspace_outputs: Vec::new(),
@@ -1989,6 +1991,10 @@ fn project_tags(spec: &ExecutionSpec) -> BTreeMap<String, String> {
     if let Some(constraint) = &spec.executor_constraint {
         tags.entry(EXECUTOR_TAG_KEY.to_string())
             .or_insert_with(|| constraint.clone());
+    }
+    if let Some(backend) = &spec.backend {
+        tags.entry(BACKEND_TAG_KEY.to_string())
+            .or_insert_with(|| backend.clone());
     }
     tags
 }

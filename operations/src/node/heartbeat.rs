@@ -244,7 +244,8 @@ mod tests {
             executor_kind: None,
             local_to_controller: true,
         };
-        let mut executor = ExecutorCapability::new("docker".to_string(), subject).unwrap();
+        let mut executor =
+            ExecutorCapability::new("docker".to_string(), "docker".to_string(), subject).unwrap();
         executor.availability = Some(availability(9));
         NodeInfoDocument {
             node_id,

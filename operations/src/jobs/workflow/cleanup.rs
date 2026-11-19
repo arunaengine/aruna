@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::compute::effect::{ComputeAnswer, ComputeRequest};
-use aruna_core::compute::{BackendError, ExecutorKind, FenceContext, TombstoneSpec};
+use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect, ComputeRequest};
+use aruna_core::compute::{BackendError, FenceContext, TombstoneSpec};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     AttemptControl, AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload, JobWrites,
@@ -20,7 +20,7 @@ use ulid::Ulid;
 use super::super::lifecycle::outbox::schedule_outbox_drain;
 use super::super::store::job_calls::{authorize_cleanup, record_stop_tombstone};
 use super::super::store::mutation_error::JobMutationError;
-use super::compute::{attempt_call, compute_answer};
+use super::compute::{attempt_call, compute_answer, compute_call};
 use super::stop_record::StopRecordOperation;
 use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use aruna_core::jobs::JobRunOutcome;
@@ -30,6 +30,7 @@ enum CleanupStep {
     Stop,
     StopWrite,
     Authorize,
+    Home(FenceContext),
     Fence(FenceContext),
     Cleanup(FenceContext),
     Tombstone(FenceContext),
@@ -104,20 +105,17 @@ impl TerminalCleanupOperation {
         self.revoke()
     }
 
+    fn backend_name(&self) -> &str {
+        self.intent.as_ref().map_or("", |intent| &intent.backend)
+    }
+
     fn backend_call(&self, fence: &FenceContext, request: ComputeRequest) -> Next<()> {
-        let kind = self.intent.as_ref().map_or_else(
-            || ExecutorKind::from_wire(""),
-            |intent| ExecutorKind::from_wire(&intent.executor_kind),
-        );
-        Next::Call(attempt_call(&kind, fence, request))
+        Next::Call(attempt_call(self.backend_name(), fence, request))
     }
 
     /// The error of an answer that names no usable backend.
     fn no_backend(&self, answer: &ComputeAnswer) -> Option<JobError> {
-        let kind = self
-            .intent
-            .as_ref()
-            .map_or("", |intent| &intent.executor_kind);
+        let kind = self.backend_name();
         match answer {
             ComputeAnswer::NoCompute => {
                 Some(JobError::retryable("cleanup needs a compute backend"))
@@ -147,9 +145,29 @@ impl TerminalCleanupOperation {
         if expected != Some(fence.attempt.external_name().as_str()) {
             return self.failed(JobError::permanent("cleanup attempt identity mismatch"));
         }
-        let call = self.backend_call(&fence, ComputeRequest::Fence);
-        self.step = CleanupStep::Fence(fence);
-        call
+        let backend = self.backend_name().to_string();
+        self.step = CleanupStep::Home(fence);
+        Next::Call(compute_call(ComputeEffect::Facts { backend }))
+    }
+
+    /// The attempt lives where the backend kept its home; one that moved cannot remove it.
+    fn homed(&mut self, fence: FenceContext, answer: ComputeAnswer) -> Next<()> {
+        if let Some(error) = self.no_backend(&answer) {
+            return self.failed(error);
+        }
+        let home = self.intent.as_ref().map(|intent| intent.home_digest);
+        match answer {
+            ComputeAnswer::Facts(facts) if Some(facts.home_digest) == home => {
+                let call = self.backend_call(&fence, ComputeRequest::Fence);
+                self.step = CleanupStep::Fence(fence);
+                call
+            }
+            ComputeAnswer::Facts(_) => self.failed(JobError::retryable(format!(
+                "cleanup backend {} moved to another home since the attempt",
+                self.backend_name()
+            ))),
+            _ => self.failed(unexpected_answer()),
+        }
     }
 
     fn fenced(&mut self, fence: FenceContext, answer: ComputeAnswer) -> Next<()> {
@@ -251,6 +269,10 @@ impl Operation for TerminalCleanupOperation {
                 let fence = result.child::<FenceContext, JobMutationError>()?;
                 Ok(self.authorized(fence))
             }
+            CleanupStep::Home(fence) => {
+                let answer = compute_answer(result)?;
+                Ok(self.homed(fence, answer))
+            }
             CleanupStep::Fence(fence) => {
                 let answer = compute_answer(result)?;
                 Ok(self.fenced(fence, answer))
@@ -342,9 +364,10 @@ mod tests {
     use aruna_compute::ExecutorBackend;
     use aruna_compute::ExecutorRegistry;
     use aruna_core::UserId;
+    use aruna_core::compute::identity::home_digest;
     use aruna_core::compute::{
-        AttemptRef, AttemptStatus, CancelEvidence, FenceContext, LogLimits, LogTails, NOBODY,
-        ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, UserSpec,
+        AttemptRef, AttemptStatus, CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails,
+        NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, UserSpec,
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USER_ACCESS_KEYSPACE};
@@ -479,9 +502,20 @@ mod tests {
     }
 
     fn job_context(storage: StorageHandle, backends: &[Arc<StubBackend>]) -> JobContext {
+        let names: Vec<String> = (backends.iter())
+            .map(|backend| backend.kind.as_wire())
+            .collect();
+        let named: Vec<(&str, &Arc<StubBackend>)> =
+            names.iter().map(String::as_str).zip(backends).collect();
+        named_context(storage, &named)
+    }
+
+    fn named_context(storage: StorageHandle, backends: &[(&str, &Arc<StubBackend>)]) -> JobContext {
         let mut registry = ExecutorRegistry::new();
-        for backend in backends {
-            registry.register(backend.clone());
+        for (name, backend) in backends {
+            let backend = Arc::clone(*backend) as Arc<dyn ExecutorBackend>;
+            let workspace = aruna_compute::registry::WorkspaceEndpoint::default();
+            registry.register(*name, backend, workspace);
         }
         JobContext {
             driver: Arc::new(DriverContext {
@@ -505,16 +539,19 @@ mod tests {
         }
     }
 
-    fn intent(job_id: JobId, kind: &str) -> AttemptIntent {
+    fn intent(job_id: JobId, name: &str) -> AttemptIntent {
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), 1);
         AttemptIntent {
             attempt_no: 1,
             external_name: attempt.external_name(),
-            executor_kind: kind.to_string(),
+            executor_kind: "docker".to_string(),
             pinned_image:
                 "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                     .to_string(),
             attempt_epoch: 1,
+            backend: name.to_string(),
+            config_generation: 0,
+            home_digest: home_digest("docker", None),
         }
     }
 
@@ -539,6 +576,7 @@ mod tests {
                 env: Default::default(),
                 resources: ComputeResources::default(),
                 executor_constraint: None,
+                backend: None,
                 inputs: Vec::new(),
                 file_outputs: Vec::new(),
                 workspace_outputs: Vec::new(),
@@ -591,6 +629,7 @@ mod tests {
                 env: Default::default(),
                 resources: ComputeResources::default(),
                 executor_constraint: None,
+                backend: None,
                 inputs: Vec::new(),
                 file_outputs: Vec::new(),
                 workspace_outputs: Vec::new(),
@@ -781,15 +820,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_uses_kind() {
+    async fn cleanup_uses_name() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = aruna_drivers::testing::test_context(storage.clone());
-        let docker = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
-        let slurm = StubBackend::new(ExecutorKind::Slurm, vec![Ok(())]);
-        let ctx = job_context(storage.clone(), &[docker.clone(), slurm.clone()]);
+        let first = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
+        let second = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
+        let ctx = named_context(storage.clone(), &[("docker", &first), ("lab", &second)]);
         let job_id = JobId::from_bytes([8; 16]);
-        let intent = seed_attempt(&context, job_id, "slurm", ctx.claim_token).await;
+        let intent = seed_attempt(&context, job_id, "lab", ctx.claim_token).await;
 
         let outcome = run_terminal_cleanup(&ctx, job_id, Some(&intent), "missing-access").await;
 
@@ -797,8 +836,33 @@ mod tests {
             outcome,
             JobRunOutcome::Succeeded(JobResultPayload::Cleanup)
         ));
-        assert_eq!(docker.calls.load(Ordering::Relaxed), 0);
-        assert_eq!(slurm.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(first.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(second.calls.load(Ordering::Relaxed), 1);
+
+        // A backend that moved to another home, or one that is gone, is retried later.
+        let moved = JobId::from_bytes([11; 16]);
+        let mut intent = seed_attempt(&context, moved, "lab", ctx.claim_token).await;
+        intent.home_digest = [9u8; 32];
+        let outcome = run_terminal_cleanup(&ctx, moved, Some(&intent), "missing-access").await;
+        assert!(matches!(
+            outcome,
+            JobRunOutcome::Failed(JobError {
+                kind: JobErrorKind::Retryable,
+                ..
+            })
+        ));
+        assert_eq!(second.calls.load(Ordering::Relaxed), 1);
+        let gone = JobId::from_bytes([10; 16]);
+        let intent = seed_attempt(&context, gone, "gone", ctx.claim_token).await;
+        let outcome = run_terminal_cleanup(&ctx, gone, Some(&intent), "missing-access").await;
+        assert!(matches!(
+            outcome,
+            JobRunOutcome::Failed(JobError {
+                kind: JobErrorKind::Retryable,
+                ..
+            })
+        ));
+        assert_eq!(first.calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

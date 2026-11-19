@@ -846,6 +846,7 @@ fn maps_states() {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1042,6 +1043,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::report::FamilyReport {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1256,6 +1258,7 @@ fn derives_family_tags() {
     report.plan = Some(PlanEstimate {
         target: Some(ExecutionTargetId {
             node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+            backend: "docker".to_string(),
             executor_kind: "docker".to_string(),
         }),
         scheduler_node_id: None,
@@ -1452,6 +1455,7 @@ fn projects_full_command() {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1922,6 +1926,7 @@ fn projects_input_identity() {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1991,4 +1996,20 @@ fn projects_input_identity() {
             version_id: Some(version.to_string()),
         }
     );
+}
+
+#[test]
+fn maps_backend_tag() {
+    // The compute backend tag names the backend a task runs on and is reported back.
+    let group = Ulid::from_bytes([5u8; 16]);
+    let mut task = sample_task(group);
+    task.tags.insert(
+        "aruna-engine.org/compute-backend".to_string(),
+        "lab".to_string(),
+    );
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
+    assert_eq!(spec.backend.as_deref(), Some("lab"));
+    let projected = project_tags(&spec);
+    let tag = projected.get("aruna-engine.org/compute-backend");
+    assert_eq!(tag.map(String::as_str), Some("lab"));
 }

@@ -6,11 +6,14 @@
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ResourceEnvelope;
+use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect};
 use aruna_core::id::NodeId;
 use aruna_core::node_state::{DrainState, DrainStateError, DrainStateOperation};
 use aruna_core::operation::Operation;
+use aruna_core::scheduling::RejectionVerdict;
 use aruna_core::structs::execution::job::{
-    ExecutionSpec, InputMode, InputSource, JobPayload, JobRecord, JobState, WorkspaceMode,
+    ExecutionSpec, InputMode, InputSource, JobPayload, JobRecord, JobState, LocalAdmission,
+    WorkspaceMode,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use thiserror::Error;
@@ -18,9 +21,11 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::jobs::device_admission::{BackendAdmission, select_offer};
 use crate::jobs::store::list_jobs::{ListJobsError, ListJobsOperation};
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
+use crate::jobs::workflow::compute::{compute_answer, compute_call};
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -56,6 +61,9 @@ pub enum LocalExecutionError {
     NoExecutor,
     #[error("this device does not run the request: {0}")]
     Unsupported(&'static str),
+    /// Every backend of the right kind excludes the request; the first reason is kept.
+    #[error("no compute backend on this device takes the request: {}", .0.reason())]
+    Refused(RejectionVerdict),
     #[error("input {bucket}/{key} is not on this device")]
     InputNotLocal { bucket: String, key: String },
     /// The request itself asks for a copy this device may never make.
@@ -85,6 +93,8 @@ fn unavailable(error: impl std::fmt::Display) -> LocalExecutionError {
 enum RunStep {
     Config,
     Drain,
+    Offers,
+    Admission,
     /// The head of the input at `index`, requested at `version` when the run named one.
     Input {
         index: usize,
@@ -96,30 +106,48 @@ enum RunStep {
 type RunTurn = Result<Next<SubmitJobResult>, LocalExecutionError>;
 
 /// Accepts one local run. Refusals are decided before the job exists; the admitting transaction
-/// bounds concurrent submissions. `limits` are the ceilings of the backend the request would run
-/// on: a device without one refuses the run instead of queueing work nothing will claim.
+/// bounds concurrent submissions. The run goes to the first backend that takes it by the rules
+/// planning applies, and the job stores that backend with the values it was admitted under.
 #[derive(Debug, PartialEq)]
 pub struct LocalRunOperation {
     config: LocalExecutionConfig,
-    limits: Option<ResourceEnvelope>,
     serving: Option<(NodeId, RealmId)>,
+    /// The chosen backend's concurrency ceiling, which bounds this owner's active runs.
+    active_cap: Option<u32>,
+    admission: Option<LocalAdmission>,
     now_ms: u64,
     step: RunStep,
 }
 
 impl LocalRunOperation {
-    pub fn new(
-        config: LocalExecutionConfig,
-        limits: Option<ResourceEnvelope>,
-        serving: Option<(NodeId, RealmId)>,
-    ) -> Self {
+    pub fn new(config: LocalExecutionConfig, serving: Option<(NodeId, RealmId)>) -> Self {
         Self {
             config,
-            limits,
             serving,
+            active_cap: None,
+            admission: None,
             now_ms: 0,
             step: RunStep::Config,
         }
+    }
+
+    /// Chooses the backend; with none, the first backend's reason refuses the run.
+    fn select(&mut self, answer: ComputeAnswer) -> RunTurn {
+        let ComputeAnswer::Offers(offers) = answer else {
+            return Err(LocalExecutionError::NoExecutor);
+        };
+        let offer = select_offer(&offers, &self.config.spec).map_err(|refusal| {
+            refusal.map_or(
+                LocalExecutionError::NoExecutor,
+                LocalExecutionError::Refused,
+            )
+        })?;
+        self.config.spec.backend = Some(offer.name().to_string());
+        self.active_cap = offer.caps().limits.max_concurrent;
+        self.step = RunStep::Admission;
+        Ok(Next::Call(IoCall::child(BackendAdmission::new(
+            offer.clone(),
+        ))))
     }
 
     fn check_owner(&mut self, realm: &RealmConfigDocument) -> RunTurn {
@@ -199,10 +227,6 @@ impl LocalRunOperation {
     }
 
     fn submit(&mut self) -> RunTurn {
-        let limits = self
-            .limits
-            .as_ref()
-            .ok_or(LocalExecutionError::NoExecutor)?;
         let config = &self.config;
         let mut spec = config.spec.clone();
         pin_outputs(&mut spec, config.node_id);
@@ -214,9 +238,10 @@ impl LocalRunOperation {
             workspace_mode: config.workspace_mode,
             workspace_bucket: None,
             retention_ms: config.retention_ms,
-            active_cap: limits.max_concurrent,
+            active_cap: self.active_cap,
             serving: self.serving,
             now_ms: self.now_ms,
+            local_admission: self.admission.clone(),
         });
         self.step = RunStep::Submit;
         Ok(Next::Call(IoCall::child(submit)))
@@ -247,9 +272,13 @@ impl Operation for LocalRunOperation {
                     return Err(LocalExecutionError::Paused);
                 }
                 local_staging(&self.config.spec, self.config.workspace_mode)?;
-                if self.limits.is_none() {
-                    return Err(LocalExecutionError::NoExecutor);
-                }
+                self.step = RunStep::Offers;
+                Ok(Next::Call(compute_call(ComputeEffect::Offers)))
+            }
+            RunStep::Offers => self.select(compute_answer(result)?),
+            RunStep::Admission => {
+                let admission = result.child::<LocalAdmission, LocalExecutionError>()??;
+                self.admission = Some(admission);
                 self.next_input(0)
             }
             RunStep::Input { index, version } => self.pin_input(index, version, result),
@@ -421,9 +450,11 @@ fn missing_input(bucket: &str, key: &str) -> LocalExecutionError {
 mod tests {
     use super::*;
     use crate::jobs::submit::SubmitJobError;
+    use crate::jobs::workflow::fixtures::compute;
     use crate::tests::records::payload;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::compute::ExecutorKind;
+    use aruna_core::compute::offer::{BackendCaps, ExecutorOffer};
     use aruna_core::compute::{AttemptStatus, BackendError, FenceContext};
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
@@ -457,9 +488,7 @@ mod tests {
         ctx: &DriverContext,
         config: LocalExecutionConfig,
     ) -> Result<SubmitJobResult, LocalExecutionError> {
-        let limits = ctx.compute_limits();
-        let run = crate::jobs::node_inputs::local_run(config, &limits, ctx.node_and_realm());
-        drive(run, ctx).await
+        drive(LocalRunOperation::new(config, ctx.node_and_realm()), ctx).await
     }
 
     const REALM: RealmId = RealmId([3u8; 32]);
@@ -527,7 +556,28 @@ mod tests {
     }
 
     fn local_run(config: LocalExecutionConfig) -> LocalRunOperation {
-        LocalRunOperation::new(config, Some(ResourceEnvelope::default()), None)
+        LocalRunOperation::new(config, None)
+    }
+
+    /// A Docker backend named `default` with one slot, changed by `adjust`.
+    fn offer(adjust: impl FnOnce(&mut BackendCaps)) -> ExecutorOffer {
+        let mut caps = BackendCaps {
+            limits: ResourceEnvelope {
+                max_concurrent: Some(1),
+                ..ResourceEnvelope::default()
+            },
+            ..BackendCaps::default()
+        };
+        adjust(&mut caps);
+        ExecutorOffer::new(("default".to_string(), "docker".to_string()), [1; 32], caps)
+    }
+
+    /// `run` past its drain read, answered with `offers`.
+    fn offered(run: &mut LocalRunOperation, offers: Vec<ExecutorOffer>) -> RunTurn {
+        run.step = RunStep::Drain;
+        let read = Ok(Next::Call(compute_call(ComputeEffect::Offers)));
+        assert_eq!(run.next(drain(false)), read);
+        run.next(compute(ComputeAnswer::Offers(offers)))
     }
 
     fn outcome<T, E>(result: Result<T, E>) -> IoResult
@@ -578,17 +628,17 @@ mod tests {
 
     #[test]
     fn run_stops_early() {
-        let drained = |limits| {
-            let config = run_config(node(1), owner(2));
-            let mut run = LocalRunOperation::new(config, limits, None);
-            run.step = RunStep::Drain;
-            run
-        };
-        let limits = Some(ResourceEnvelope::default());
-        let answer = drained(limits).next(drain(true));
-        assert_eq!(answer, Err(LocalExecutionError::Paused));
-        let answer = drained(None).next(drain(false));
+        let mut paused = local_run(run_config(node(1), owner(2)));
+        paused.step = RunStep::Drain;
+        assert_eq!(paused.next(drain(true)), Err(LocalExecutionError::Paused));
+        // No backend refuses with no reason; backends that all exclude the run give the first.
+        let mut bare = local_run(run_config(node(1), owner(2)));
+        let answer = offered(&mut bare, Vec::new());
         assert_eq!(answer, Err(LocalExecutionError::NoExecutor));
+        let short = offer(|caps| caps.max_walltime_ms = Some(1));
+        let mut refused = local_run(run_config(node(1), owner(2)));
+        let walltime = LocalExecutionError::Refused(RejectionVerdict::WalltimeLimit);
+        assert_eq!(offered(&mut refused, vec![short]), Err(walltime));
     }
 
     #[test]
@@ -598,9 +648,24 @@ mod tests {
         config.spec.inputs.push(input("project", None, None));
         let mut run = local_run(config);
         run.stamp(7);
-        run.step = RunStep::Drain;
+        let chosen = offer(|_| {});
+        let admit = IoCall::child(BackendAdmission::new(chosen.clone()));
+        assert_eq!(offered(&mut run, vec![chosen]), Ok(Next::Call(admit)));
+        assert_eq!(run.config.spec.backend.as_deref(), Some("default"));
+        let admission = LocalAdmission {
+            backend: "default".to_string(),
+            config_generation: 1,
+            config_digest: [2; 32],
+            home_digest: [1; 32],
+            subject: None,
+        };
+        let admitted = outcome::<_, LocalExecutionError>(Ok(admission.clone()));
         let call = IoCall::child(HeadObjectOperation::new(head(None)));
-        assert_eq!(run.next(drain(false)), Ok(Next::Call(call)));
+        assert_eq!(run.next(admitted), Ok(Next::Call(call)));
+        assert_eq!(
+            (run.admission.clone(), run.active_cap),
+            (Some(admission), Some(1))
+        );
         let found = HeadObjectResult {
             resolved_version_id: Some(version),
             ..head_result()
@@ -874,7 +939,7 @@ mod tests {
         DriverContext {
             compute_handle: Some(std::sync::Arc::new(
                 aruna_compute::ExecutorRegistry::new()
-                    .with_backend(std::sync::Arc::new(StubBackend)),
+                    .with_backend("docker", std::sync::Arc::new(StubBackend)),
             )),
             ..test_ctx(root)
         }

@@ -19,7 +19,8 @@ use aruna_core::rows::values;
 use aruna_core::structs::execution::harvest::HarvestSource;
 use aruna_core::structs::execution::job::{
     ActiveJobKind, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
-    RoCrateUploadRecord, WorkspaceMode, job_active_prefix, job_record_key, parse_dedup_value,
+    LocalAdmission, RoCrateUploadRecord, WorkspaceMode, job_active_prefix, job_record_key,
+    parse_dedup_value,
 };
 use aruna_core::structs::placement::record::shard_for_subject;
 use aruna_core::structs::storage::backend_import::{BackendImport, import_key};
@@ -245,6 +246,12 @@ pub struct SubmitJobOperation {
 }
 
 impl SubmitJobOperation {
+    /// Stores the backend values a device admitted the job under in the same transaction.
+    pub fn with_admission(mut self, admission: Option<LocalAdmission>) -> Self {
+        self.record.local_admission = admission;
+        self
+    }
+
     pub fn new(spec: SubmitJobSpec, job_id: JobId) -> Self {
         let active_cap = spec.active_cap.or_else(|| {
             spec.payload
@@ -787,6 +794,7 @@ mod tests {
             env: Default::default(),
             resources: ComputeResources::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),

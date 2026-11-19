@@ -32,7 +32,9 @@ use super::admission_race::{
     commit_receipt, commit_with, config, envelope, minted, receipts, rows, seed,
 };
 use crate::jobs::lifecycle::LifecycleError;
-use crate::jobs::lifecycle::launch_admit::{CommitVerdict, RESERVE_ATTEMPTS, classify};
+use crate::jobs::lifecycle::launch_admit::{
+    CommitVerdict, RESERVE_ATTEMPTS, classify, hosts_offer, suits_offer,
+};
 use crate::jobs::lifecycle::reservation::{ReserveExecutionOperation, reservation_key};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::node::info::flows::OperatorDrainOperation;
@@ -128,7 +130,8 @@ fn advertised(local: NodeId, draining: bool) -> NodeInfoDocument {
     NodeInfoDocument {
         node_id: local,
         executors: vec![
-            ExecutorCapability::new("docker".to_string(), subject).expect("capability is valid"),
+            ExecutorCapability::new("docker".to_string(), "docker".to_string(), subject)
+                .expect("capability is valid"),
         ],
         labels: BTreeMap::new(),
         urls: NodeUrls {
@@ -381,27 +384,85 @@ async fn session_support_rechecked() {
     );
     let launch = family.launch(&spec, family.holder.public(), 0);
 
-    assert!(matches!(
-        local_capability(&ctx, &family.config, local, &launch, &spec).await,
-        Err(LaunchDecline::Unauthorized)
-    ));
+    // Session support is runtime state, so its absence is never a refusal that would exclude
+    // this target for good.
+    let capability = local_capability(&ctx, &family.config, local, &launch, &spec)
+        .await
+        .expect("missing session support is no refusal");
+    assert!(!hosts_offer(&spec, &capability));
     document.executors[0].session = true;
     advertise(&ctx, &document).await;
-    assert!(
-        local_capability(&ctx, &family.config, local, &launch, &spec)
-            .await
-            .is_ok()
-    );
+    let capability = local_capability(&ctx, &family.config, local, &launch, &spec)
+        .await
+        .expect("session support admits the offer");
+    assert!(hosts_offer(&spec, &capability));
+    // A Docker backend without the channel runs on a remote daemon, which has no session
+    // bridge; restoring the local daemon must make the same offer admissible again.
     document.executors[0].session = false;
     advertise(&ctx, &document).await;
     spec.payload
         .tags
         .insert("aruna-engine.org/network".to_string(), "open".to_string());
+    let capability = local_capability(&ctx, &family.config, local, &launch, &spec)
+        .await
+        .expect("missing session support is no refusal");
+    assert!(!hosts_offer(&spec, &capability));
+}
+
+#[tokio::test]
+async fn backend_limits_rechecked() {
+    // At admission a walltime above the maximum, a refused workload kind or a group outside the
+    // allow-list leaves the offer undecided: all are node config a restart can change.
+    use aruna_core::compute::backend::Suitability;
+    let family = Family::new([20u8; 32]);
+    let local = family.target.public();
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let mut document = advertised(local, false);
+    document.executors[0].file_staging = true;
+    advertise(&ctx, &document).await;
+    let spec = family.spec();
+    let launch = family.launch(&spec, family.holder.public(), 0);
+    let capability = local_capability(&ctx, &family.config, local, &launch, &spec)
+        .await
+        .expect("the backend is advertised");
+    assert!(suits_offer(&spec, &capability));
+
+    let walltime = spec.resources.max_walltime_ms;
+    let mut bounded = capability.clone();
+    bounded.max_walltime_ms = Some(walltime - 1);
+    assert!(!suits_offer(&spec, &bounded));
+    let mut refusing = capability.clone();
+    refusing.suitability.batch = Suitability::Refused;
+    assert!(!suits_offer(&spec, &refusing));
+    let mut limited = capability;
+    limited.groups = vec![Ulid::from_bytes([9u8; 16])];
+    assert!(!suits_offer(&spec, &limited));
+    limited.groups.push(spec.payload.group_id);
+    assert!(suits_offer(&spec, &limited));
+}
+
+#[tokio::test]
+async fn backend_name_checked() {
+    // A launch whose request names another backend than the offered one is refused.
+    let family = Family::new([21u8; 32]);
+    let local = family.target.public();
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let mut document = advertised(local, false);
+    document.executors[0].file_staging = true;
+    advertise(&ctx, &document).await;
+    let mut spec = family.spec();
+    let launch = family.launch(&spec, family.holder.public(), 0);
+    spec.payload.backend = Some("docker".to_string());
     assert!(
         local_capability(&ctx, &family.config, local, &launch, &spec)
             .await
             .is_ok()
     );
+    spec.payload.backend = Some("lab".to_string());
+    assert!(matches!(
+        local_capability(&ctx, &family.config, local, &launch, &spec).await,
+        Err(LaunchDecline::Unauthorized)
+    ));
 }
 
 #[tokio::test]

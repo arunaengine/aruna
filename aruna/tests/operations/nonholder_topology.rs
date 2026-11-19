@@ -82,6 +82,7 @@ fn execution_spec(seed: u8) -> ExecutionSpec {
         env: Default::default(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),

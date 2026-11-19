@@ -112,12 +112,12 @@ impl NodeInfoDocument {
         if self.executors.len() > MAX_ADVERTISED_EXECUTORS {
             return Err(AdvertisementError::ExecutorCount);
         }
-        let mut kinds = BTreeSet::new();
+        let mut names = BTreeSet::new();
         for executor in &self.executors {
             executor.validate(self.node_id)?;
-            if !kinds.insert(executor.kind.trim()) {
-                return Err(AdvertisementError::DuplicateKind {
-                    kind: executor.kind.clone(),
+            if !names.insert(executor.backend.as_str()) {
+                return Err(AdvertisementError::DuplicateBackend {
+                    backend: executor.backend.clone(),
                 });
             }
         }
@@ -225,8 +225,12 @@ mod tests {
         NodeInfoDocument {
             node_id,
             executors: vec![
-                ExecutorCapability::new("docker".to_string(), subject(node_id, 3))
-                    .expect("subject is valid"),
+                ExecutorCapability::new(
+                    "docker".to_string(),
+                    "docker".to_string(),
+                    subject(node_id, 3),
+                )
+                .expect("subject is valid"),
             ],
             labels: BTreeMap::from([(KIND_LABEL_KEY.to_string(), "server".to_string())]),
             urls: NodeUrls {
@@ -294,11 +298,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_kind() {
+    fn names_backends_apart() {
         let mut document = document(node(1), epoch(1, 1));
-        let duplicate = document.executors[0].clone();
-        document.executors.push(duplicate);
-        assert!(document.validate().is_err());
+        let mut second = document.executors[0].clone();
+        document.executors.push(second.clone());
+        assert_eq!(
+            document.validate(),
+            Err(crate::compute::AdvertisementError::DuplicateBackend {
+                backend: "docker".to_string()
+            })
+        );
+        // A second backend of the same kind under its own name is valid.
+        second.backend = "lab-docker".to_string();
+        document.executors[1] = second.clone();
+        assert_eq!(document.validate(), Ok(()));
+        second.backend = " lab".to_string();
+        document.executors[1] = second;
+        assert_eq!(
+            document.validate(),
+            Err(crate::compute::AdvertisementError::InvalidBackend)
+        );
     }
 
     #[test]

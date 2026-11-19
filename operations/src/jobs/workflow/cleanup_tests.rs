@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::ChildOutcome;
-use aruna_core::compute::{AttemptRef, TombstoneEvidence};
+use aruna_core::compute::effect::BackendFacts;
+use aruna_core::compute::identity::home_digest;
+use aruna_core::compute::{AttemptRef, ExecutorKind, NOBODY, TombstoneEvidence};
 use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
 
@@ -24,7 +26,25 @@ fn intent() -> AttemptIntent {
         executor_kind: "docker".to_string(),
         pinned_image: "alpine".to_string(),
         attempt_epoch: 3,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: home_digest("docker", None),
     }
+}
+
+/// The facts of the attempt's backend, now living at `home`.
+fn facts(home: [u8; 32]) -> IoResult {
+    answer(ComputeAnswer::Facts(BackendFacts {
+        name: "docker".to_string(),
+        kind: ExecutorKind::Docker,
+        home_digest: home,
+        config_digest: [0; 32],
+        s3_mount: false,
+        session: false,
+        local_site: false,
+        worker_location: None,
+        run_as: NOBODY,
+    }))
 }
 
 fn fence() -> FenceContext {
@@ -48,7 +68,7 @@ fn authorized() -> IoResult {
 }
 
 fn compute_call(request: ComputeRequest) -> Next<()> {
-    Next::Call(attempt_call(&ExecutorKind::Docker, &fence(), request))
+    Next::Call(attempt_call("docker", &fence(), request))
 }
 
 fn tombstone_spec() -> ComputeRequest {
@@ -86,11 +106,28 @@ fn is_child(next: &Result<Next<()>, JobError>) -> bool {
 fn fenced() -> TerminalCleanupOperation {
     let mut cleanup = operation(Some(intent()));
     assert!(is_child(&cleanup.first()));
+    let backend = "docker".to_string();
+    let read = super::compute_call(ComputeEffect::Facts { backend });
+    assert_eq!(cleanup.next(authorized()), Ok(Next::Call(read)));
     assert_eq!(
-        cleanup.next(authorized()),
+        cleanup.next(facts(home_digest("docker", None))),
         Ok(compute_call(ComputeRequest::Fence))
     );
     cleanup
+}
+
+// A backend that moved to another home never removes an attempt it no longer holds.
+#[test]
+fn moved_home_retries() {
+    let mut cleanup = operation(Some(intent()));
+    cleanup.first().unwrap();
+    cleanup.next(authorized()).unwrap();
+    assert!(is_child(&cleanup.next(facts([9; 32]))));
+    let message = "cleanup backend docker moved to another home since the attempt";
+    assert_eq!(
+        cleanup.next(missing_key()),
+        Err(JobError::retryable(message))
+    );
 }
 
 // The whole path: fence, cleanup, tombstone, its record, and the revoke.
@@ -167,6 +204,7 @@ fn drained() -> Result<Next<()>, JobError> {
 fn stop_with_tombstone() {
     let mut cleanup = stop_built(Some(intent()), stop_rows());
     cleanup.next(authorized()).unwrap();
+    cleanup.next(facts(home_digest("docker", None))).unwrap();
     cleanup.next(answer(ComputeAnswer::Done(Ok(())))).unwrap();
     cleanup.next(answer(ComputeAnswer::Done(Ok(())))).unwrap();
     let tombstone = TombstoneEvidence {

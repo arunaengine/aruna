@@ -8,6 +8,8 @@ use std::sync::Arc;
 use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::compute::effect::{BackendFacts, ComputeAnswer};
+use aruna_core::compute::identity::home_digest;
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::compute::{
     ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, ExecutorKind, FenceContext, NOBODY,
     ReconcileEvidence, StagingMode,
@@ -16,7 +18,8 @@ use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobEvent, JobStops};
 use aruna_core::structs::execution::job::{
-    AttemptControl, AttemptIntent, ExecutionSpec, JobClaim, JobId, JobPayload, JobRecord,
+    AttemptControl, AttemptIntent, EffectiveResources, ExecutionSpec, JobClaim, JobId, JobPayload,
+    JobRecord,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::routing::NodeRouting;
@@ -33,7 +36,7 @@ pub(super) fn job() -> JobId {
     JobId::from_bytes([1; 16])
 }
 
-pub(super) fn token() -> Ulid {
+pub(crate) fn token() -> Ulid {
     Ulid::from_bytes([2; 16])
 }
 
@@ -49,7 +52,7 @@ pub(super) fn group_spec(group_id: Ulid) -> ExecutionSpec {
     ExecutionSpec { group_id, ..spec() }
 }
 
-pub(super) fn spec() -> ExecutionSpec {
+pub(crate) fn spec() -> ExecutionSpec {
     ExecutionSpec {
         group_id: Ulid::from_bytes([3; 16]),
         name: None,
@@ -62,6 +65,7 @@ pub(super) fn spec() -> ExecutionSpec {
         env: Default::default(),
         resources: Default::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -76,7 +80,7 @@ pub(super) fn record() -> JobRecord {
     JobRecord::new(job(), payload, user, node(), 1, 1, None)
 }
 
-pub(super) fn claimed() -> JobRecord {
+pub(crate) fn claimed() -> JobRecord {
     let mut job = record();
     job.claim = Some(JobClaim {
         holder_node_id: node(),
@@ -115,12 +119,18 @@ pub(super) fn intent() -> AttemptIntent {
         executor_kind: "docker".to_string(),
         pinned_image: PINNED.to_string(),
         attempt_epoch: EPOCH,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: home_digest("docker", None),
     }
 }
 
 pub(super) fn facts() -> BackendFacts {
     BackendFacts {
+        name: "docker".to_string(),
         kind: ExecutorKind::Docker,
+        home_digest: home_digest("docker", None),
+        config_digest: [0; 32],
         s3_mount: false,
         session: false,
         local_site: false,
@@ -141,7 +151,7 @@ pub(super) fn scope_of(spec: ExecutionSpec) -> Arc<AttemptScope> {
     Arc::new(AttemptScope {
         job_id: job(),
         token: token(),
-        kind: ExecutorKind::Docker,
+        backend: "docker".to_string(),
         fence: fence(),
         spec: Arc::new(spec),
         bucket: BUCKET.to_string(),
@@ -152,6 +162,29 @@ pub(super) fn scope_of(spec: ExecutionSpec) -> Arc<AttemptScope> {
             encryption_key: None,
         },
     })
+}
+
+/// The reservation of the test job's receipted execution at `subject_generation`.
+pub(super) fn reservation(subject_generation: u64) -> JobReservationRecord {
+    JobReservationRecord {
+        execution_id: control().execution_id,
+        job_id: job(),
+        logical_job_id: job(),
+        resources: EffectiveResources {
+            cpu_cores: 1,
+            ram_bytes: 1,
+            disk_bytes: 0,
+            max_walltime_ms: 1,
+            preemptible: false,
+        },
+        created_at_ms: 1,
+        subject_generation,
+        subject_digest: [4; 32],
+        backend: "docker".to_string(),
+        config_generation: 1,
+        config_digest: [0; 32],
+        config_clock: Default::default(),
+    }
 }
 
 pub(super) fn scope() -> Arc<AttemptScope> {
@@ -180,7 +213,7 @@ pub(super) fn control() -> AttemptControl {
     }
 }
 
-pub(super) fn child<T, E>(result: Result<T, E>) -> IoResult
+pub(crate) fn child<T, E>(result: Result<T, E>) -> IoResult
 where
     T: Send + std::fmt::Debug + PartialEq + 'static,
     E: Send + std::fmt::Debug + PartialEq + 'static,
@@ -188,7 +221,7 @@ where
     IoResult::Child(ChildOutcome::new(result))
 }
 
-pub(super) fn compute(answer: ComputeAnswer) -> IoResult {
+pub(crate) fn compute(answer: ComputeAnswer) -> IoResult {
     IoResult::Event(Box::new(Event::Compute(Box::new(answer))))
 }
 

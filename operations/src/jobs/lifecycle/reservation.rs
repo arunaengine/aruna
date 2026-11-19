@@ -44,13 +44,17 @@ pub fn reservation_key(execution_id: Ulid) -> Key {
     Key::from(execution_id.to_bytes().as_slice())
 }
 
-/// Whether one more execution fits the backend's static ceilings. An unmeasured
-/// ceiling never filters, and a zero concurrency ceiling admits nothing.
+/// Whether one more execution fits the static ceilings of backend `backend`, counting only its
+/// own reservations. An unmeasured ceiling never filters, and a zero concurrency ceiling admits
+/// nothing.
 pub fn fits(
     held: &[JobReservationRecord],
+    backend: &str,
     request: &EffectiveResources,
     envelope: &ResourceEnvelope,
 ) -> bool {
+    let held: Vec<&JobReservationRecord> =
+        (held.iter()).filter(|row| row.backend == backend).collect();
     let cpu: u64 = held
         .iter()
         .map(|row| u64::from(row.resources.cpu_cores))
@@ -93,6 +97,9 @@ pub struct ReserveExecutionConfig {
     /// itself against a subject this node no longer advertises.
     pub subject_generation: u64,
     pub subject_digest: [u8; 32],
+    /// Backend config the receipt was accepted under, fenced again at the start.
+    pub config_generation: u64,
+    pub config_digest: [u8; 32],
     pub record: Box<JobRecord>,
     pub now_ms: u64,
     /// A plugin task's install and work on this node, read in the transaction with its task
@@ -157,7 +164,9 @@ impl ReserveExecutionOperation {
             .held
             .iter()
             .any(|row| row.execution_id == self.config.execution_id);
-        if !replay && !fits(&self.held, &self.config.resources, &self.config.envelope) {
+        let backend = &self.config.launch.target.backend;
+        let config = &self.config;
+        if !replay && !fits(&self.held, backend, &config.resources, &config.envelope) {
             return Err(LifecycleError::Capacity);
         }
         if let Some((install_id, work_id)) = self.config.fence {
@@ -243,6 +252,9 @@ impl ReserveExecutionOperation {
                         subject_generation: self.config.subject_generation,
                         subject_digest: self.config.subject_digest,
                         config_clock: signed.config_clock.clone(),
+                        backend: self.config.launch.target.backend.clone(),
+                        config_generation: self.config.config_generation,
+                        config_digest: self.config.config_digest,
                     })?
                     .as_slice(),
                 ),

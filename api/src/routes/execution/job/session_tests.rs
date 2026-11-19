@@ -24,6 +24,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, PLACEMENT_POLICY_KEYSPACE};
 use aruna_core::structs::execution::job::{
     CollisionPolicy, ComputeResources, ExecutionSpec, JobId, SessionReportDetail, SessionReportRow,
 };
@@ -34,8 +35,16 @@ use aruna_core::structs::execution::staging::{
 };
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+};
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::policy::document::{
+    PlacementPolicyDocument, PolicyPublicationClaim, placement_policy_key,
+};
+use aruna_core::structs::placement::policy::{
+    PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, VerifiedPolicy,
 };
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
@@ -43,7 +52,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::job_calls::ClaimOutcome;
+use aruna_operations::jobs::store::JobMutation;
+use aruna_operations::jobs::store::job_calls::{ClaimOutcome, change_job};
 use aruna_storage::{FjallStorage, StorageHandle};
 use async_trait::async_trait;
 use byteview::ByteView;
@@ -184,6 +194,7 @@ fn session_spec() -> ExecutionSpec {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -201,7 +212,7 @@ async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexS
     let backend = Arc::new(FakeBackend {
         helper: AsyncMutex::new(Some(node_side)),
     });
-    let registry = Arc::new(ExecutorRegistry::new().with_backend(backend.clone()));
+    let registry = Arc::new(ExecutorRegistry::new().with_backend("docker", backend.clone()));
     let ctx = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,
@@ -694,10 +705,16 @@ async fn seed_bucket(state: &Arc<ServerState>, bucket: &str, group_id: Ulid, own
     .await;
 }
 
-/// Puts `input.txt` into `bucket` as a reference bound to a connector.
-async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
+/// Puts `input.txt` into `bucket` as a reference bound to a connector, governed by `policies`,
+/// and returns its version id.
+async fn seed_reference(
+    state: &Arc<ServerState>,
+    bucket: &str,
+    owner: UserId,
+    policies: Vec<PlacementPolicyRef>,
+) -> Ulid {
     let version_id = Ulid::generate();
-    let version = BlobVersion::reference(
+    let mut version = BlobVersion::reference(
         VersionSourceBinding {
             strategy: StagingStrategy::Reference,
             descriptor: PortableSourceDescriptor {
@@ -725,6 +742,7 @@ async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
         owner,
         UNIX_EPOCH,
     );
+    version.placement_policies = policies;
     let storage = &state.get_ctx().storage_handle;
     write_row(
         storage,
@@ -746,6 +764,7 @@ async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
         version.to_bytes().unwrap(),
     )
     .await;
+    version_id
 }
 
 async fn inputs_body(response: Response) -> SessionInputsResponse {
@@ -793,7 +812,7 @@ async fn queues_reference_copy() {
     let group_id = seed_group(&state, owner, true).await;
     seed_bucket(&state, "source", group_id, owner).await;
     seed_bucket(&state, "lab-data", group_id, owner).await;
-    seed_reference(&state, "source", owner).await;
+    let version_id = seed_reference(&state, "source", owner, Vec::new()).await;
 
     let response = stage_inputs(
         State(state.clone()),
@@ -825,6 +844,8 @@ async fn queues_reference_copy() {
         ("source", "lab-data")
     );
     assert_eq!(spec.dest_key, "data/genomes/ref.fna");
+    // No version was asked for: the copy takes exactly the version that was checked.
+    assert_eq!(spec.source_version_id, Some(version_id));
     assert_eq!(spec.auth_context.user_id, owner);
     assert_eq!(record.progress.unit, "bytes");
 
@@ -850,7 +871,7 @@ async fn link_crosses_groups() {
     let shared_group = seed_group(&state, owner, true).await;
     seed_bucket(&state, "lab-data", own_group, owner).await;
     seed_bucket(&state, "shared", shared_group, owner).await;
-    seed_reference(&state, "shared", owner).await;
+    seed_reference(&state, "shared", owner, Vec::new()).await;
 
     let mut item = input("shared", "data/genomes/ref.fna");
     item.strategy = SessionInputStrategy::Reference;
@@ -899,7 +920,7 @@ async fn refuses_unreadable_source() {
     let foreign_group = seed_group(&state, owner, false).await;
     seed_bucket(&state, "lab-data", own_group, owner).await;
     seed_bucket(&state, "foreign", foreign_group, user(3)).await;
-    seed_reference(&state, "foreign", user(3)).await;
+    seed_reference(&state, "foreign", user(3), Vec::new()).await;
 
     let response = stage_inputs(
         State(state.clone()),
@@ -997,4 +1018,220 @@ async fn session_body(state: &Arc<ServerState>, owner: UserId, job_id: JobId) ->
         .await
         .expect("the body reads");
     serde_json::from_slice(&bytes).expect("the body parses")
+}
+
+#[tokio::test]
+async fn refuses_governed_source() {
+    // A governed source is staged only where its policy admits the session's execution site;
+    // a site this node cannot name admits nothing, and nothing is copied or queued.
+    let owner = user(2);
+    let (_dir, state, job_id, _helper) = build_node(owner).await;
+    let group_id = seed_group(&state, owner, true).await;
+    seed_bucket(&state, "source", group_id, owner).await;
+    seed_bucket(&state, "lab-data", group_id, owner).await;
+    let policy = PlacementPolicyRef {
+        policy_id: Ulid::from_bytes([4u8; 16]),
+        digest: [4u8; 32],
+    };
+    seed_reference(&state, "source", owner, vec![policy]).await;
+
+    let response = stage_inputs(
+        State(state.clone()),
+        Extension(auth_for(owner)),
+        Path(job_id.to_string()),
+        Json(SessionInputsRequest {
+            items: vec![input("source", "data/ref.fna")],
+        }),
+    )
+    .await;
+    assert!(matches!(response, Err(ServerError::Forbidden)));
+    let session = registry_session(&state, job_id).expect("session is live");
+    assert!(session.pending().is_empty() && session.inventory().is_empty());
+}
+
+/// Publishes a placement rule with `selector` the way a realm admin's node would, and gives this
+/// node its placement subject, so the staging gate resolves the rule locally.
+async fn seed_policy(
+    state: &Arc<ServerState>,
+    owner: UserId,
+    selector: PlacementSelector,
+) -> PlacementPolicyRef {
+    let realm_id = realm();
+    let actor = Actor {
+        node_id: node(),
+        user_id: owner,
+        realm_id,
+    };
+    let publisher = iroh::SecretKey::from_bytes(&[3u8; 32]);
+    let mut auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+    for role in auth.roles.values_mut() {
+        role.assigned_users.insert(owner);
+    }
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.ensure_node(publisher.public(), RealmNodeKind::Server);
+    let target = DocumentTarget::RealmConfig { realm_id };
+    let storage = &state.get_ctx().storage_handle;
+    let auth = auth.to_bytes(&actor).unwrap();
+    write_row(storage, AUTH_KEYSPACE, (*realm_id.as_bytes()).into(), auth).await;
+    let config = config.to_bytes(&actor).unwrap();
+    write_row(
+        storage,
+        target.storage_keyspace(),
+        target.storage_key(),
+        config,
+    )
+    .await;
+    let rule = PlacementPolicy::new(Ulid::generate(), "lab-rule".to_string(), vec![selector]);
+    let policy = VerifiedPolicy::verify(rule.unwrap()).unwrap();
+    let event_id = Ulid::from_bytes([5u8; 16]);
+    let publication = PolicyPublicationClaim::new(
+        realm_id,
+        &policy,
+        publisher.public(),
+        owner,
+        event_id,
+        7,
+        [0u8; 32],
+    )
+    .sign(&publisher);
+    let document = PlacementPolicyDocument::new(realm_id, &policy, publication);
+    let key = placement_policy_key(policy.policy().policy_id).into();
+    write_row(
+        storage,
+        PLACEMENT_POLICY_KEYSPACE,
+        key,
+        document.to_bytes().unwrap(),
+    )
+    .await;
+    let subject = NodeSubjectRecord::seed(PlacementSubject {
+        node_id: node(),
+        generation: 1,
+        location: "eu-west".to_string(),
+        labels: BTreeMap::new(),
+        executor_kind: None,
+        local_to_controller: true,
+    })
+    .unwrap();
+    let key = NODE_SUBJECT_KEY.to_vec().into();
+    write_row(
+        storage,
+        NODE_SUBJECT_KEYSPACE,
+        key,
+        subject.to_bytes().unwrap(),
+    )
+    .await;
+    policy.policy_ref()
+}
+
+/// Stages one reference governed by a rule with `selector`, or by a rule this node cannot
+/// resolve when `None`, and returns the handler's answer.
+async fn stage_governed(
+    selector: Option<PlacementSelector>,
+) -> (Arc<ServerState>, JobId, TempDir, ServerResult<Response>) {
+    let owner = user(2);
+    let (dir, state, job_id, _helper) = build_node(owner).await;
+    let group_id = seed_group(&state, owner, true).await;
+    seed_bucket(&state, "source", group_id, owner).await;
+    seed_bucket(&state, "lab-data", group_id, owner).await;
+    let policy = match selector {
+        Some(selector) => seed_policy(&state, owner, selector).await,
+        None => {
+            seed_policy(&state, owner, node_selector()).await;
+            PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([6u8; 16]),
+                digest: [6u8; 32],
+            }
+        }
+    };
+    seed_reference(&state, "source", owner, vec![policy]).await;
+    let response = stage_inputs(
+        State(state.clone()),
+        Extension(auth_for(owner)),
+        Path(job_id.to_string()),
+        Json(SessionInputsRequest {
+            items: vec![input("source", "data/ref.fna")],
+        }),
+    )
+    .await;
+    (state, job_id, dir, response)
+}
+
+/// A rule that admits this node whatever site its backends run at.
+fn node_selector() -> PlacementSelector {
+    PlacementSelector {
+        node_id: Some(node()),
+        location: None,
+        labels: Vec::new(),
+        executor_kind: None,
+    }
+}
+
+#[tokio::test]
+async fn stages_allowed_source() {
+    // A rule that admits the session backend's site lets the governed source through.
+    let (_state, _job_id, _dir, response) = stage_governed(Some(node_selector())).await;
+    let response = response.expect("an admitted source is staged");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(inputs_body(response).await.pending.len(), 1);
+}
+
+#[tokio::test]
+async fn refuses_denied_site() {
+    // The node is in eu-west, but the session's backend proves no location, so a rule that
+    // admits only eu-west refuses the item with 403 and nothing moves.
+    let selector = PlacementSelector {
+        node_id: None,
+        location: Some("eu-west".to_string()),
+        labels: Vec::new(),
+        executor_kind: None,
+    };
+    let (state, job_id, _dir, response) = stage_governed(Some(selector)).await;
+    assert!(matches!(response, Err(ServerError::Forbidden)));
+    let session = registry_session(&state, job_id).expect("session is live");
+    assert!(session.pending().is_empty() && session.inventory().is_empty());
+}
+
+#[tokio::test]
+async fn unresolved_policy_unavailable() {
+    // A rule this node cannot resolve is never treated as allowed: 503, nothing moves.
+    let (state, job_id, _dir, response) = stage_governed(None).await;
+    let reason = match response {
+        Err(ServerError::ServiceUnavailableReason(reason)) => reason,
+        other => panic!("an unresolved rule must not stage: {:?}", other.err()),
+    };
+    assert_eq!(reason, "placement_policy_unavailable");
+    let session = registry_session(&state, job_id).expect("session is live");
+    assert!(session.pending().is_empty() && session.inventory().is_empty());
+}
+
+#[tokio::test]
+async fn uses_physical_backend() {
+    // A logical session id answers with the request's spec, which names no backend; the gate
+    // must use the backend the physical execution was placed on.
+    let owner = user(2);
+    let (_dir, state, job_id, _helper) = build_node(owner).await;
+    let placed = change_job(job_id, |record| {
+        if let JobPayload::Execution(spec) = &mut record.payload {
+            spec.backend = Some("b".to_string());
+        }
+        Ok(JobMutation::Persist)
+    });
+    drive(placed, &state.get_ctx())
+        .await
+        .expect("the physical record is updated");
+    let logical = JobRecord::new(
+        JobId::from_bytes([8u8; 16]),
+        JobPayload::Execution(session_spec()),
+        owner,
+        node(),
+        1_000,
+        1_000,
+        None,
+    );
+
+    let spec = running_spec(&state, &logical, Some(job_id))
+        .await
+        .expect("the spec resolves")
+        .expect("a session runs an execution");
+    assert_eq!(spec.backend.as_deref(), Some("b"));
 }

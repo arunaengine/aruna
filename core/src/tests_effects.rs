@@ -62,6 +62,7 @@ pub(crate) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
         holder_generation: 3,
         target: ExecutionTargetId {
             node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+            backend: "default".to_string(),
             executor_kind: "d".repeat(kind_bytes),
         },
         inputs: Vec::new(),
@@ -91,6 +92,7 @@ pub(crate) fn sized_receipt(kind_bytes: usize) -> JobRecordEnvelope {
         executor_node_id: secret.public(),
         target: ExecutionTargetId {
             node_id: secret.public(),
+            backend: "default".to_string(),
             executor_kind: "d".repeat(kind_bytes),
         },
         spec_digest: [7u8; 32],
@@ -99,6 +101,8 @@ pub(crate) fn sized_receipt(kind_bytes: usize) -> JobRecordEnvelope {
         subject_digest: [8u8; 32],
         accepted_at_ms: 1,
         config_clock: Default::default(),
+        config_generation: 0,
+        config_digest: [0u8; 32],
     }));
     JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
 }

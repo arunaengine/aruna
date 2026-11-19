@@ -70,6 +70,9 @@ type InputJob = LegacyJob<ExportRoCrateSpec, ExportRoCrateResult, LegacyProgress
 
 /// The current record of an older row; every byte of the row must be used.
 fn upgraded(value: &[u8]) -> Option<JobRecord> {
+    if let Some(record) = super::compute::old_job(value) {
+        return Some(record);
+    }
     // The round trip keeps a row of another shape from reading as one of alpha.134.
     if let Ok(old) = postcard::from_bytes::<InputJob>(value)
         && postcard::to_allocvec(&old).is_ok_and(|bytes| bytes == value)
@@ -595,6 +598,7 @@ where
             report_digest: legacy.report_digest,
             retention_ms: legacy.retention_ms,
             locally_exhausted: legacy.locally_exhausted,
+            local_admission: None,
         }
     }
 }
@@ -891,6 +895,7 @@ mod tests {
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
+            backend: None,
         }
     }
 

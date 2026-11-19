@@ -178,7 +178,7 @@ impl SeedInfoOperation {
             config,
             self.node_id,
             self.facts.clone(),
-            inputs.reservation.reserved,
+            inputs.held.clone(),
             self.clock.started(),
         ))))
     }
@@ -361,7 +361,7 @@ impl RefreshInfoOperation {
     fn send(&mut self, stored: NodeInfoDocument) -> Result<Next<()>, InfoFlowError> {
         let parts = self.parts.take().ok_or_else(unfinished)?;
         let mut availability: Vec<_> = (parts.executors.iter())
-            .filter_map(|executor| Some((executor.kind.clone(), executor.availability?)))
+            .filter_map(|executor| Some((executor.backend.clone(), executor.availability?)))
             .collect();
         availability.sort_by(|left, right| left.0.cmp(&right.0));
         let epoch = AdvertisementEpoch {
@@ -424,7 +424,7 @@ impl Operation for RefreshInfoOperation {
                     config,
                     self.node_id,
                     self.facts.clone(),
-                    inputs.reservation.reserved,
+                    inputs.held.clone(),
                     self.clock.started(),
                 );
                 self.inputs = Some(inputs);
@@ -923,7 +923,7 @@ mod tests {
             config(),
             node(),
             facts(),
-            ResourceTotals::default(),
+            Vec::new(),
             NOW,
         ))
     }
@@ -1182,6 +1182,9 @@ mod tests {
             subject_generation: 1,
             subject_digest: [0; 32],
             config_clock: Default::default(),
+            backend: "default".to_string(),
+            config_generation: 0,
+            config_digest: [0; 32],
         }
     }
 

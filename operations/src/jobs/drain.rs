@@ -938,6 +938,9 @@ mod tests {
             executor_kind: "docker".to_string(),
             pinned_image: "alpine@sha256:digest".to_string(),
             attempt_epoch: 1,
+            backend: "docker".to_string(),
+            config_generation: 0,
+            home_digest: aruna_core::compute::identity::home_digest("docker", None),
         });
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),

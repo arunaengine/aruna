@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::compute::ResourceEnvelope;
+use aruna_core::compute::offer::BackendLimits;
 use aruna_core::effects::LaunchFrame;
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::structs::execution::job::JobFamilyRecord;
@@ -16,7 +16,6 @@ use ulid::Ulid;
 use crate::jobs::lifecycle::launch_admit::LaunchNode;
 use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::lifecycle::witness::WitnessNode;
-use crate::jobs::local_run::{LocalExecutionConfig, LocalRunOperation};
 
 /// This node as the submission operations see it at `now_ms`; `None` without a network.
 pub fn ingress_node(
@@ -34,18 +33,18 @@ pub fn ingress_node(
 }
 
 /// This node as an offered launch sees it; `None` without a network, which leaves the offer
-/// undecided. `limits` holds each local backend's limits by its wire kind; the caller mints
-/// `execution_id` for the execution the launch would start here.
+/// undecided. `limits` holds each local backend's wire kind and limits by its name; the caller
+/// mints `execution_id` for the execution the launch would start here.
 pub fn launch_node(
     serving: Option<(NodeId, RealmId)>,
-    limits: &BTreeMap<String, ResourceEnvelope>,
+    limits: &BackendLimits,
     launch: &LaunchFrame,
     now_ms: u64,
     execution_id: Ulid,
 ) -> Option<LaunchNode> {
     let (local, realm_id) = serving?;
-    let limits = match &launch.envelope().record {
-        JobFamilyRecord::Launch(intent) => limits.get(&intent.target.executor_kind).copied(),
+    let limit = match &launch.envelope().record {
+        JobFamilyRecord::Launch(intent) => limits.get(&intent.target.backend),
         _ => None,
     };
     Some(LaunchNode {
@@ -53,7 +52,8 @@ pub fn launch_node(
         realm_id,
         now_ms,
         execution_id,
-        limits,
+        limits: limit.map(|limit| limit.limits),
+        config_digest: limit.map(|limit| limit.config_digest),
     })
 }
 
@@ -61,7 +61,7 @@ pub fn launch_node(
 pub fn witness_node(
     serving: Option<(NodeId, RealmId)>,
     fresh: BTreeMap<NodeId, HeldHeartbeat>,
-    limits: BTreeMap<String, ResourceEnvelope>,
+    limits: BackendLimits,
 ) -> Option<WitnessNode> {
     let (local, realm_id) = serving?;
     Some(WitnessNode {
@@ -70,18 +70,4 @@ pub fn witness_node(
         fresh,
         limits,
     })
-}
-
-/// A run on this node: the limits of the backend it would select (the constrained kind, or the
-/// first one), and the realm it serves.
-pub fn local_run(
-    config: LocalExecutionConfig,
-    limits: &BTreeMap<String, ResourceEnvelope>,
-    serving: Option<(NodeId, RealmId)>,
-) -> LocalRunOperation {
-    let selected = match config.spec.executor_constraint.as_deref() {
-        Some(kind) => limits.get(kind).copied(),
-        None => limits.values().next().copied(),
-    };
-    LocalRunOperation::new(config, selected, serving)
 }

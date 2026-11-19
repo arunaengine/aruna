@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::effect::{ComputeAnswer, ComputeRequest, OutputBody, OutputFailure};
-use aruna_core::compute::{ExecutorKind, FenceContext, has_wildcard};
+use aruna_core::compute::{FenceContext, has_wildcard};
 use aruna_core::effects::Effect;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::Event;
@@ -69,7 +69,7 @@ use crate::s3::object::put::{
 /// What an output capture works with.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptureScope {
-    pub kind: ExecutorKind,
+    pub backend: String,
     pub fence: FenceContext,
     pub spec: Arc<ExecutionSpec>,
     pub record: Arc<JobRecord>,
@@ -189,7 +189,7 @@ impl PutOutputOperation {
             path: self.output.container_path.clone(),
             until_stop: scope.until_stop,
         };
-        let call = attempt_call(&scope.kind, &scope.fence, request);
+        let call = attempt_call(&scope.backend, &scope.fence, request);
         self.call(PutStep::Fetch, call)
     }
 
@@ -595,7 +595,7 @@ impl CaptureOutputsOperation {
                 pattern: output.container_path.clone(),
                 until_stop: scope.until_stop,
             };
-            let call = attempt_call(&scope.kind, &scope.fence, request);
+            let call = attempt_call(&scope.backend, &scope.fence, request);
             return self.call(CaptureStep::Resolve(output), call);
         }
         self.plan()

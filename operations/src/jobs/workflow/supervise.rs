@@ -93,8 +93,8 @@ impl SuperviseOperation {
         if session_of(&scope.spec).is_none() || scope.wiring.serving.is_none() {
             return self.wait(started_at_ms);
         }
-        let kind = scope.kind.clone();
-        let call = compute_call(ComputeEffect::Facts { kind });
+        let backend = scope.backend.clone();
+        let call = compute_call(ComputeEffect::Facts { backend });
         self.call(SuperviseStep::Facts(started_at_ms), call)
     }
 

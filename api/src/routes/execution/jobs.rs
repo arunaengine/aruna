@@ -265,6 +265,10 @@ pub struct SubmitExecutionRequest {
     /// Optional executor selector. Leave unset unless the realm documents one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_constraint: Option<String>,
+    /// Optional compute backend name, for example `default`. Names are node-local, so a name
+    /// matches that backend on every node; a node label pins one node as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     /// Objects staged into or mounted for the run.
     #[serde(default)]
     pub inputs: Vec<ExecutionInputRequest>,
@@ -315,6 +319,7 @@ impl From<SubmitExecutionRequest> for SubmitExecutionCommand {
             ram_bytes: request.ram_bytes,
             max_walltime_ms: request.max_walltime_ms,
             executor_constraint: request.executor_constraint,
+            backend: request.backend,
             inputs: request.inputs.into_iter().map(Into::into).collect(),
             outputs: request.outputs.into_iter().map(Into::into).collect(),
             output_prefixes: request.output_prefixes,
@@ -857,6 +862,7 @@ pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
             ServerError::Conflict(error.to_string())
         }
         LocalExecutionError::Unsupported(_)
+        | LocalExecutionError::Refused(_)
         | LocalExecutionError::InputNotLocal { .. }
         | LocalExecutionError::InputRefused { .. } => {
             ServerError::BadRequestMessage(error.to_string())
@@ -995,6 +1001,7 @@ the link's group, who may manage the link.
                     "locally_exhausted": false,
                     "cancel_requested": false,
                     "placement": {
+                        "backend": "default",
                         "executor_kind": "docker",
                         "target_node_id": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c",
                         "scheduler_node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
@@ -1015,17 +1022,20 @@ the link's group, who may manage the link.
                         "candidates": [
                             {
                                 "node_id": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c",
+                                "backend": "default",
                                 "executor_kind": "docker",
                                 "verdict": "selected"
                             },
                             {
                                 "node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+                                "backend": "default",
                                 "executor_kind": "docker",
                                 "verdict": "ranked",
                                 "rank": 1
                             },
                             {
                                 "node_id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f8",
+                                "backend": "hpc",
                                 "executor_kind": "apptainer",
                                 "verdict": "rejected",
                                 "reason": "no executor of that kind"

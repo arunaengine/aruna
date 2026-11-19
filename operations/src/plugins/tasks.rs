@@ -107,6 +107,7 @@ pub fn task_spec(
             preemptible: false,
         },
         executor_constraint: None,
+        backend: None,
         inputs: objects.chain(files).collect(),
         file_outputs: outputs.collect(),
         workspace_outputs: Vec::new(),

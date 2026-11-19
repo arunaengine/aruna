@@ -337,6 +337,7 @@ fn resolves_workspace_outputs() {
         }],
         output_prefixes: vec!["outputs/".to_string()],
         collision_policy: Default::default(),
+        backend: None,
     };
 
     spec.resolve_outputs("ws-job", node_id);
@@ -505,6 +506,7 @@ fn submission() -> SubmissionId {
 fn target() -> ExecutionTargetId {
     ExecutionTargetId {
         node_id: node_id(9),
+        backend: "docker".to_string(),
         executor_kind: "docker".to_string(),
     }
 }
@@ -625,6 +627,7 @@ fn sample_spec() -> LogicalJobSpec {
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
+            backend: None,
         },
         request_digest: [1u8; 32],
         spec_digest: [0u8; 32],
@@ -705,6 +708,8 @@ fn sample_receipt() -> ExecutionReceipt {
         subject_digest: [15u8; 32],
         accepted_at_ms: 1_700_000_000_000,
         config_clock: Default::default(),
+        config_generation: 0,
+        config_digest: [0u8; 32],
     }
 }
 
@@ -841,7 +846,7 @@ fn canonical_encodings() {
         digests,
         [
             "2e3adfb3440145e2f0acf7dcac006c00cdbccb0fa8df37b935fc0ba4055993d2",
-            "867bcdf4ee17d3181c9b89ad4d3e3d5d0e08fa45de30818a29a76ff66cf93f34",
+            "240e97a3ad85964661055de2abcda8424c44612245aa3d2c7d46132973e13383",
             "1c4dc854b3931565ff75fafec7a24673cc03c1989516f9b46dc93a093ec2bfeb",
             "08c19deca0ed44b4647bba5d11f0d2729b0d2949d347ede46ca9acb80bfc4b45",
             "957b71361481ffdfdca3ec746bb904a90dad09faf61012c35b69634e21c50614",
@@ -1475,6 +1480,7 @@ fn rejects_wrong_target() {
     elsewhere.executor_node_id = node_id(2);
     elsewhere.target = ExecutionTargetId {
         node_id: node_id(2),
+        backend: "docker".to_string(),
         executor_kind: "docker".to_string(),
     };
     assert_eq!(

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aruna_core::calls::IoCall;
 use aruna_core::compute::effect::ComputeRequest;
-use aruna_core::compute::{ExecutorKind, FenceContext, UserSpec};
+use aruna_core::compute::{FenceContext, UserSpec};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::Effect;
 use aruna_core::jobs::JobEffect;
@@ -33,7 +33,8 @@ pub struct RunWiring {
 pub struct AttemptScope {
     pub job_id: JobId,
     pub token: Ulid,
-    pub kind: ExecutorKind,
+    /// Node-local name of the backend the attempt runs on.
+    pub backend: String,
     pub fence: FenceContext,
     pub spec: Arc<ExecutionSpec>,
     pub bucket: String,
@@ -44,7 +45,7 @@ pub struct AttemptScope {
 
 impl AttemptScope {
     pub(super) fn backend(&self, request: ComputeRequest) -> IoCall {
-        attempt_call(&self.kind, &self.fence, request)
+        attempt_call(&self.backend, &self.fence, request)
     }
 
     pub(super) fn settle(&self, now_ms: u64) -> SettleScope {
@@ -66,7 +67,7 @@ impl AttemptScope {
         until_stop: bool,
     ) -> Option<CaptureScope> {
         Some(CaptureScope {
-            kind: self.kind.clone(),
+            backend: self.backend.clone(),
             fence: self.fence.clone(),
             spec: self.spec.clone(),
             record: record.clone(),

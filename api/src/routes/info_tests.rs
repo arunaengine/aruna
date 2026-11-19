@@ -1655,6 +1655,7 @@ async fn realm_node_details() {
     // the default location/weight. Publish a node info document for it too.
     let mut docker = aruna_core::compute::ExecutorCapability::new(
         "docker".to_string(),
+        "docker".to_string(),
         aruna_core::structs::placement::policy::PlacementSubject {
             node_id,
             generation: 1,
@@ -1667,6 +1668,10 @@ async fn realm_node_details() {
     .expect("subject is valid");
     docker.file_staging = true;
     docker.direct_s3 = true;
+    let group = ulid::Ulid::from_bytes([7u8; 16]);
+    docker.groups = vec![group];
+    docker.max_walltime_ms = Some(3_600_000);
+    docker.config_generation = 4;
     let document = NodeInfoDocument {
         node_id,
         executors: vec![docker],
@@ -1729,6 +1734,16 @@ async fn realm_node_details() {
     let node_info = node.info.as_ref().expect("node info document present");
     assert_eq!(node_info.executors.len(), 1);
     assert_eq!(node_info.executors[0].kind, "docker");
+    let executor = &node_info.executors[0];
+    assert_eq!(executor.backend, "docker");
+    assert_eq!(executor.location, "eu-west");
+    assert_eq!(executor.max_walltime_ms, Some(3_600_000));
+    assert_eq!(executor.config_generation, 4);
+    assert_eq!(executor.suitability.sessions, "good");
+    // An allow-list shows as a count; the group ids stay on the node.
+    assert_eq!(executor.group_count, 1);
+    let shown = serde_json::to_string(executor).unwrap();
+    assert!(!shown.contains(&group.to_string()), "{shown}");
     assert_eq!(node_info.labels.get("tier"), Some(&"hot".to_string()));
     assert_eq!(node_info.urls.s3.as_deref(), Some("s3.example"));
     assert_eq!(node_info.utilization.storage_bytes_used, 4_096);

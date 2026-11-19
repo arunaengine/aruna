@@ -9,6 +9,7 @@ pub(crate) mod blob_request;
 pub mod command;
 pub mod copy;
 pub mod demand;
+pub mod device_admission;
 pub mod drain;
 pub mod export;
 pub mod handed_imports;

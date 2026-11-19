@@ -360,7 +360,9 @@ fn plan_request(
         spec_digest: spec.spec_digest,
         admitted: true,
         resources: spec.resources,
+        group_id: spec.group_id,
         executor_constraint: spec.payload.executor_constraint.clone(),
+        backend: spec.payload.backend.clone(),
         required_labels: ids::required_labels(&spec.payload)?,
         staging: REALM_STAGING,
         network: network_access(spec),
@@ -416,7 +418,7 @@ fn candidates(
     };
     let mut page = Vec::new();
     // Members come out of the map in node id byte order and every document's
-    // backends are walked by kind: the canonical order pages must continue in.
+    // backends are walked by name: the canonical order pages must continue in.
     for (node_id, document) in documents {
         if ids::workspace_of(&spec.payload).0 == WorkspaceMode::Existing
             && *node_id != spec.ingress_node_id
@@ -433,7 +435,7 @@ fn candidates(
         let entry = config.placement_entry(*node_id);
         let group_allowed = allowed.get(node_id).copied().unwrap_or(false);
         let mut executors: Vec<&ExecutorCapability> = document.executors.iter().collect();
-        executors.sort_unstable_by(|left, right| left.kind.as_str().cmp(right.kind.as_str()));
+        executors.sort_unstable_by(|left, right| left.backend.cmp(&right.backend));
         for capability in executors {
             if excluded.contains(&capability.target(*node_id)) {
                 continue;
@@ -644,7 +646,8 @@ mod tests {
                     executor_kind: None,
                     local_to_controller: true,
                 };
-                ExecutorCapability::new(format!("k{index}"), subject).expect("subject is valid")
+                ExecutorCapability::new(format!("k{index}"), format!("k{index}"), subject)
+                    .expect("subject is valid")
             })
             .collect();
         NodeInfoDocument {
@@ -856,7 +859,8 @@ mod tests {
             local_to_controller: true,
         };
         let mut capability =
-            ExecutorCapability::new("docker".to_string(), subject).expect("subject is valid");
+            ExecutorCapability::new("docker".to_string(), "docker".to_string(), subject)
+                .expect("subject is valid");
         capability.file_staging = true;
         capability
     }
@@ -947,6 +951,7 @@ mod tests {
             plan.selected.map(|selection| selection.target),
             Some(ExecutionTargetId {
                 node_id: node(1),
+                backend: "docker".to_string(),
                 executor_kind: "docker".to_string(),
             })
         );

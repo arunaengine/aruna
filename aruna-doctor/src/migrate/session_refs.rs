@@ -189,8 +189,21 @@ impl<'de, E: serde::de::Error> Deserializer<'de> for Zero<E> {
         visitor.visit_u64(0)
     }
 
+    fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_str("")
+    }
+
+    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_str("")
+    }
+
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
         visitor.visit_seq(SeqDeserializer::new(std::iter::empty::<()>()))
+    }
+
+    /// A fixed array, such as a digest, of zero bytes.
+    fn deserialize_tuple<V: Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_seq(SeqDeserializer::new(std::iter::repeat_n(0u8, len)))
     }
 
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
@@ -206,8 +219,8 @@ impl<'de, E: serde::de::Error> Deserializer<'de> for Zero<E> {
     }
 
     serde::forward_to_deserialize_any! {
-        i8 i16 i32 i64 i128 u8 u16 u32 u128 f32 f64 char str string bytes byte_buf unit
-        unit_struct tuple tuple_struct struct enum identifier ignored_any
+        i8 i16 i32 i64 i128 u8 u16 u32 u128 f32 f64 char bytes byte_buf unit
+        unit_struct tuple_struct struct enum identifier ignored_any
     }
 }
 

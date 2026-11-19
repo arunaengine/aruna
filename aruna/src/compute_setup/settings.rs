@@ -89,6 +89,7 @@ fn collect_docker(
         )?,
         keep_failed: parse_bool(env.var("ARUNA_COMPUTE_KEEP_FAILED").as_deref()),
         state_root: parse_path(env.var("ARUNA_COMPUTE_STATE_ROOT").as_deref()),
+        docker_host: parse_nonempty(env.var("DOCKER_HOST").as_deref()),
     })
 }
 
@@ -596,6 +597,17 @@ mod pure_tests {
         let unknown =
             BTreeMap::from([("ARUNA_COMPUTE_EXECUTOR".to_string(), "podman".to_string())]);
         assert!(collect(&unknown).is_err());
+
+        // The environment backend reads its daemon address here, never at connect time.
+        let docker = BTreeMap::from([
+            ("ARUNA_COMPUTE_EXECUTOR".to_string(), "docker".to_string()),
+            ("DOCKER_HOST".to_string(), "tcp://10.0.0.5:2376".to_string()),
+        ]);
+        let BackendSettings::Docker(docker) = collect(&docker).expect("docker collects").backend
+        else {
+            panic!("docker was selected");
+        };
+        assert_eq!(docker.docker_host.as_deref(), Some("tcp://10.0.0.5:2376"));
     }
 
     #[test]

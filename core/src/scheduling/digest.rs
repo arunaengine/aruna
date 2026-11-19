@@ -8,7 +8,7 @@ use crate::scheduling::inputs::{PlanRequest, TargetCandidate, TargetScore};
 use crate::structs::execution::job::InputContent;
 use crate::structs::execution::source_access::write_fingerprint_field;
 
-pub const PLAN_DIGEST_DOMAIN: &[u8] = b"aruna-execution-plan-v1";
+pub const PLAN_DIGEST_DOMAIN: &[u8] = b"aruna-execution-plan-v2";
 
 /// Digest over the request identity, the pinned inputs and their chosen
 /// sources, the target's eligibility values and stored subject, and the score.
@@ -31,7 +31,9 @@ pub fn plan_digest(
     hasher.update(&resources.disk_bytes.to_le_bytes());
     hasher.update(&resources.max_walltime_ms.to_le_bytes());
     flag(&mut hasher, resources.preemptible);
+    hasher.update(&request.group_id.to_bytes());
     write_fingerprint_field(&mut hasher, request.executor_constraint.as_deref());
+    write_fingerprint_field(&mut hasher, request.backend.as_deref());
     count(&mut hasher, request.required_labels.len());
     for label in &request.required_labels {
         write_fingerprint_field(&mut hasher, Some(&label.key));
@@ -72,10 +74,26 @@ pub fn plan_digest(
 
     let capability = &candidate.capability;
     hasher.update(candidate.node_id.as_bytes());
+    write_fingerprint_field(&mut hasher, Some(&capability.backend));
     write_fingerprint_field(&mut hasher, Some(&capability.kind));
     write_fingerprint_field(&mut hasher, Some(candidate.node_kind.label()));
     hasher.update(&capability.subject_digest);
     hasher.update(&capability.subject.generation.to_le_bytes());
+    hasher.update(&capability.config_digest);
+    hasher.update(&capability.config_generation.to_le_bytes());
+    ceiling(&mut hasher, capability.max_walltime_ms);
+    count(&mut hasher, capability.groups.len());
+    for group_id in &capability.groups {
+        hasher.update(&group_id.to_bytes());
+    }
+    let suitability = &capability.suitability;
+    for value in [
+        suitability.batch,
+        suitability.sessions,
+        suitability.services,
+    ] {
+        hasher.update(&[value as u8]);
+    }
     for value in [
         candidate.active,
         candidate.compute_draining,

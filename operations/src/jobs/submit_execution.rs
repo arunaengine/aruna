@@ -10,8 +10,8 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    ExecutionSpec, InputSource, JobId, JobPayload, MAX_EXECUTION_OUTPUTS, MAX_INLINE_BYTES,
-    OutputDestination, WorkspaceMode, plugin_tag, user_dedup_key,
+    ExecutionSpec, InputSource, JobId, JobPayload, LocalAdmission, MAX_EXECUTION_OUTPUTS,
+    MAX_INLINE_BYTES, OutputDestination, WorkspaceMode, plugin_tag, user_dedup_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::{
@@ -151,6 +151,8 @@ pub struct ExecutionSubmission {
     /// This node and the realm it serves; `None` on a node without a net transport.
     pub serving: Option<(NodeId, RealmId)>,
     pub now_ms: u64,
+    /// The backend values a device admitted the run under; `None` on any other node.
+    pub local_admission: Option<LocalAdmission>,
 }
 
 /// Validates an execution request, mints its job id from the serving node's placement, and
@@ -198,9 +200,9 @@ impl SubmitExecutionOperation {
             workspace_bucket: submission.workspace_bucket.clone(),
             active_cap: submission.active_cap,
         };
-        Ok(Next::Call(IoCall::child(SubmitJobOperation::new(
-            spec, job_id,
-        ))))
+        let admission = submission.local_admission.clone();
+        let submit = SubmitJobOperation::new(spec, job_id).with_admission(admission);
+        Ok(Next::Call(IoCall::child(submit)))
     }
 }
 

@@ -113,9 +113,12 @@ async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
 
     // Compute-enabled context sharing the node's storage/net/blob/metadata.
     let container_endpoint = endpoint.endpoint_url.replace("localhost", "127.0.0.1");
-    let registry = ExecutorRegistry::new()
-        .with_backend(Arc::new(backend))
-        .with_workspace_endpoint(Some(container_endpoint), "eu-central-1".to_string());
+    let workspace = aruna_compute::registry::WorkspaceEndpoint {
+        endpoint: Some(container_endpoint),
+        region: "eu-central-1".to_string(),
+        session_endpoint: None,
+    };
+    let registry = ExecutorRegistry::new().with_workspace("docker", Arc::new(backend), workspace);
     let mut ctx = (*seed.context).clone();
     ctx.compute_handle = Some(Arc::new(registry));
     let compute_ctx = Arc::new(ctx);
@@ -159,6 +162,7 @@ fn execution_spec(
             preemptible: false,
         },
         executor_constraint: Some("docker".to_string()),
+        backend: None,
         inputs: vec![InputSelection {
             source: InputSource::S3 {
                 bucket: fixture.source_bucket.clone(),
@@ -789,7 +793,7 @@ async fn runs_nextflow_task() -> TestResult<()> {
 }
 
 async fn check_nextflow_task(backend: DockerBackend) -> TestResult<()> {
-    let registry = Arc::new(ExecutorRegistry::new().with_backend(Arc::new(backend)));
+    let registry = Arc::new(ExecutorRegistry::new().with_backend("docker", Arc::new(backend)));
     let seed = spawn_compute_seed(registry).await?;
     let endpoint = seed.s3.clone().expect("full node exposes S3");
     let bearer = create_bearer_token(

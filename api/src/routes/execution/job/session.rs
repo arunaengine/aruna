@@ -7,19 +7,25 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use crate::job_service::read_session_reason;
-use crate::job_service::submit_copy_job;
+use crate::job_service::{read_job_record, submit_copy_job};
+use aruna_clock::unix_timestamp_millis;
+use aruna_core::compute::ExecutorKind;
 use aruna_core::compute::session::{
     EndReason, EventKind, MAX_SCRATCH_BYTES, PendingInput, SessionAnswer, SessionError,
     SessionEvent, SessionRequest, SessionSnapshot, StagedInput,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{CopyJobSpec, JobId, JobPayload, JobRecord, JobState};
+use aruna_core::structs::execution::job::{
+    CopyJobSpec, ExecutionSpec, JobId, JobPayload, JobRecord, JobState,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::jobs::lifecycle::ids::session_of;
+use aruna_operations::placement::policy::gate::{gate_decision, write_gate};
+use aruna_operations::placement::policy::{GateContext, GateOperation, PolicyGateError};
 use aruna_operations::s3::object::copy::{
     CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };
@@ -790,7 +796,11 @@ like cancel, and each source additionally needs the caller's read permission on 
 
 **Limits** (refused with 400)
 - At most 64 items per call, and a `dest_key` that is relative and traversal-free.
-- A source on another node: import it into a bucket of this node first."#,
+- A source on another node: import it into a bucket of this node first.
+- A source with placement policies is staged only where every policy allows the execution site
+  of the backend the session runs on. The copy takes exactly the version that was checked, also
+  when no `version_id` was given. A refused item fails with 403; a policy this node cannot
+  resolve right now fails with 503 and is never treated as allowed."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
     request_body(content = SessionInputsRequest, example = json!({
         "items": [{"bucket": "source-data", "key": "input.txt", "dest_key": "data/input.txt"}]
@@ -803,9 +813,10 @@ like cancel, and each source additionally needs the caller's read permission on 
             "failed": []
         })),
         (status = 400, description = "An invalid destination key, too many items, or a source on another node", body = ErrorResponse),
-        (status = 403, description = "The token is path-restricted, or the caller may not read a source", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted, the caller may not read a source, or a source's placement policy does not allow the session's execution site", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
-        (status = 409, description = "The session has ended", body = ErrorResponse)
+        (status = 409, description = "The session has ended", body = ErrorResponse),
+        (status = 503, description = "A source's placement policy cannot be resolved on this node right now", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -837,12 +848,16 @@ pub async fn stage_inputs(
         let dest_key = check_item(&item, &node_id)?;
         items.push((item, dest_key));
     }
+    let gate = match running_spec(&state, &record, physical_job_id).await? {
+        Some(spec) => session_gate(&state, &spec).await?,
+        None => None,
+    };
     let mut staged = Vec::with_capacity(items.len());
     let mut pending = Vec::new();
     let mut failed = Vec::new();
     let mut refusal = None;
     for (item, dest_key) in items {
-        match stage_one(&state, &auth, &bucket, item, &dest_key).await {
+        match stage_one(&state, &auth, (&bucket, gate.as_ref()), item, &dest_key).await {
             Ok(InputOutcome::Staged(entry)) => {
                 let input = StagedInput {
                     dest_key: entry.dest_key.clone(),
@@ -938,12 +953,79 @@ enum InputOutcome {
     Pending(PendingInputResponse),
 }
 
+/// The spec of the execution that runs the session. A logical id answers with the request,
+/// while the backend the run was placed on is stored only in its physical execution.
+async fn running_spec(
+    state: &ServerState,
+    record: &JobRecord,
+    physical_job_id: Option<JobId>,
+) -> ServerResult<Option<ExecutionSpec>> {
+    let physical = match physical_job_id {
+        Some(job_id) if job_id != record.job_id => read_job_record(&state.get_ctx(), job_id)
+            .await
+            .map_err(|error| ServerError::InternalError(error.into()))?,
+        _ => Some(record.clone()),
+    };
+    Ok(physical.and_then(|record| match record.payload {
+        JobPayload::Execution(spec) => Some(spec),
+        _ => None,
+    }))
+}
+
+/// The gate context of the backend a session runs on, carrying the subject that backend
+/// advertises: data staged into the session is checked against where its workers really run.
+/// `None` when this node or the backend has no subject, which leaves governed data refused.
+async fn session_gate(
+    state: &ServerState,
+    spec: &ExecutionSpec,
+) -> ServerResult<Option<GateContext>> {
+    let context = state.get_ctx();
+    let read = GateOperation::new(state.get_realm_id(), unix_timestamp_millis());
+    let gate = drive(read, &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
+    let (Some(mut gate), Some(registry)) = (gate, context.compute_handle.as_ref()) else {
+        return Ok(None);
+    };
+    let kind = (spec.executor_constraint.as_deref()).map(ExecutorKind::from_wire);
+    let Some((name, _)) = registry.placed(spec.backend.as_deref(), kind.as_ref()) else {
+        return Ok(None);
+    };
+    let advertised = registry.capabilities(&gate.subject, false).ok();
+    let found = (advertised.into_iter().flatten()).find(|capability| capability.backend == name);
+    let Some(capability) = found else {
+        return Ok(None);
+    };
+    gate.subject = capability.subject;
+    Ok(Some(gate))
+}
+
+/// A placement refusal of one staged item: a policy that does not admit the session's site is
+/// forbidden, one this node cannot resolve right now is unavailable; neither grants.
+fn gate_refusal(error: PolicyGateError) -> ServerError {
+    match error {
+        PolicyGateError::Denied { .. }
+        | PolicyGateError::NoSubject
+        | PolicyGateError::ForeignPolicy { .. }
+        | PolicyGateError::Invalid
+        | PolicyGateError::Policy(_) => ServerError::Forbidden,
+        PolicyGateError::Unavailable { .. }
+        | PolicyGateError::Required { .. }
+        | PolicyGateError::Drift
+        | PolicyGateError::AdmissionStopped
+        | PolicyGateError::Read(_) => {
+            ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
+        }
+        other => ServerError::InternalError(other.to_string().into()),
+    }
+}
+
 /// Brings one object into the workspace bucket. A source stored here is
 /// deduplicated inline; one behind a connector is pulled by a job or linked.
 async fn stage_one(
     state: &ServerState,
     auth: &AuthContext,
-    bucket: &str,
+    (bucket, gate): (&str, Option<&GateContext>),
     item: SessionInputRequest,
     dest_key: &str,
 ) -> ServerResult<InputOutcome> {
@@ -974,6 +1056,15 @@ async fn stage_one(
     )
     .await
     .map_err(map_head_error)?;
+    // The version's own refs must admit where the session's workers run, and the copy takes
+    // exactly that version, so a write after the check cannot bring in other refs.
+    if let Some(operation) = write_gate(gate, &head.source_policies, None).map_err(gate_refusal)? {
+        let outcome = drive(operation, &context)
+            .await
+            .map_err(|error| ServerError::InternalError(error.into()))?;
+        gate_decision(outcome).map_err(gate_refusal)?;
+    }
+    let version_id = head.resolved_version_id.or(version_id);
     // A stored source deduplicates inline whatever was asked. A reference is
     // either queued for its pull or kept as a reference, which moves no byte.
     if head.location.is_none() && item.strategy == SessionInputStrategy::Snapshot {

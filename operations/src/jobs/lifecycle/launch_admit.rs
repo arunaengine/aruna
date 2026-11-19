@@ -19,7 +19,7 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::scheduling::PlannedInput;
+use aruna_core::scheduling::{PlannedInput, backend_verdict, hosts_session};
 use aruna_core::structs::execution::job::{
     ExecutionClaim, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobId, JobPayload,
     JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
@@ -35,10 +35,11 @@ use ulid::Ulid;
 use super::LifecycleError;
 use super::cancel::FlagLocalRunOperation;
 use super::fetch::{FetchFamilyOperation, FetchedFamily};
-use super::ids::workspace_of;
+use super::ids::{session_of, workspace_of};
 use super::launch_checks::{CheckError, LaunchCheck, LaunchChecksOperation, Verdict};
 use super::membership::MembershipViewOperation;
 use super::outbox::schedule_outbox_drain;
+use super::plan::network_access;
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::RecordStoreError;
@@ -481,6 +482,8 @@ pub struct LaunchNode {
     pub(crate) now_ms: u64,
     pub(crate) execution_id: Ulid,
     pub(crate) limits: Option<ResourceEnvelope>,
+    /// The offered backend's config digest now; `None` without that backend.
+    pub(crate) config_digest: Option<[u8; 32]>,
 }
 
 impl LaunchNode {
@@ -522,6 +525,8 @@ struct PreparedReceipt {
     job_id: JobId,
     subject_generation: u64,
     subject_digest: [u8; 32],
+    config_generation: u64,
+    config_digest: [u8; 32],
     record: JobRecord,
 }
 
@@ -686,6 +691,14 @@ impl AdmitLaunchOperation {
         if !limits.fits(&spec.resources) {
             return Ok(Next::Done(Err(LaunchDecline::Capacity)));
         }
+        // An advertisement that lags the config, as after a restart, is undecided: the holder
+        // retries once it is refreshed, where a refusal would exclude this target for good.
+        if self.node.config_digest != Some(capability.config_digest) {
+            return Err(LaunchUndecided);
+        }
+        if !hosts_offer(spec, &capability) || !suits_offer(spec, &capability) {
+            return Err(LaunchUndecided);
+        }
         let read = ReadInfoOperation::new(vec![self.node.local]);
         self.call(
             AdmitStep::Membership(Box::new(capability)),
@@ -731,6 +744,8 @@ impl AdmitLaunchOperation {
             subject_digest: capability.subject_digest,
             accepted_at_ms: node.now_ms,
             config_clock: self.clock.clone(),
+            config_generation: capability.config_generation,
+            config_digest: capability.config_digest,
         };
         let claim = ExecutionClaim {
             realm_id: node.realm_id,
@@ -741,6 +756,8 @@ impl AdmitLaunchOperation {
             job_id,
             subject_generation: capability.subject.generation,
             subject_digest: capability.subject_digest,
+            config_generation: capability.config_generation,
+            config_digest: capability.config_digest,
             record,
         };
         self.ids = ids;
@@ -785,6 +802,8 @@ impl AdmitLaunchOperation {
             resources: spec.resources,
             subject_generation: prepared.subject_generation,
             subject_digest: prepared.subject_digest,
+            config_generation: prepared.config_generation,
+            config_digest: prepared.config_digest,
             record: Box::new(prepared.record),
             now_ms: node.now_ms,
             fence: tagged(&spec.payload)
@@ -944,6 +963,7 @@ fn materialize_local(
     payload.resources.max_walltime_ms = Some(spec.resources.max_walltime_ms);
     payload.resources.preemptible = spec.resources.preemptible;
     payload.executor_constraint = Some(intent.target.executor_kind.clone());
+    payload.backend = Some(intent.target.backend.clone());
     let (mode, bucket) = workspace_of(&spec.payload);
     let (physical_mode, physical_bucket) = match mode {
         WorkspaceMode::Existing if local != spec.ingress_node_id => {
@@ -1025,6 +1045,24 @@ fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
     })
 }
 
+/// Whether the backend can host the offered session now. Session support is runtime state, such
+/// as a Docker daemon that moved, so a miss leaves the offer undecided instead of refused.
+pub(crate) fn hosts_offer(spec: &LogicalJobSpec, capability: &ExecutorCapability) -> bool {
+    session_of(&spec.payload).is_none()
+        || hosts_session(&capability.kind, capability.session, network_access(spec))
+}
+
+/// Whether the backend's allow-list, walltime maximum and suitability admit the offered run.
+/// They are node config a restart can change, so a miss leaves the offer undecided.
+pub(crate) fn suits_offer(spec: &LogicalJobSpec, capability: &ExecutorCapability) -> bool {
+    let session = session_of(&spec.payload).is_some();
+    let walltime_ms = spec.resources.max_walltime_ms;
+    let (groups, suitability) = (&capability.groups, &capability.suitability);
+    let group_id = spec.payload.group_id;
+    let maximum = capability.max_walltime_ms;
+    backend_verdict(groups, maximum, suitability, group_id, session, walltime_ms).is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::jobs::lifecycle::ids;
@@ -1056,6 +1094,7 @@ mod tests {
             now_ms: 4_000,
             execution_id: Ulid::from_parts(9, 9),
             limits,
+            config_digest: Some([0; 32]),
         };
         let mut config = family.config.clone();
         config.seed_job_control(family.target.public(), 0);
@@ -1076,7 +1115,12 @@ mod tests {
             executor_kind: None,
             local_to_controller: true,
         };
-        ExecutorCapability::new(family.target_id().executor_kind, subject).expect("subject")
+        ExecutorCapability::new(
+            family.target_id().backend,
+            family.target_id().executor_kind,
+            subject,
+        )
+        .expect("subject")
     }
 
     fn declined(reason: LaunchDecline) -> AdmitNext {

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::WorkspaceEndpoint;
 use tracing::info;
 
 use super::settings::{
@@ -15,7 +15,7 @@ pub(super) async fn build(
     settings: &ComputeSettings,
     kubernetes: &KubernetesSettings,
     config: &Config,
-) -> Result<ExecutorRegistry, ComputeBuildError> {
+) -> Result<super::BuiltBackend, ComputeBuildError> {
     let workspace = kubernetes_workspace(
         settings.local_only,
         compute_s3_endpoint(settings, config).as_deref(),
@@ -80,10 +80,12 @@ pub(super) async fn build(
     );
     // Pods use the in-cluster endpoint when one is set; KubeDAL keeps the public one.
     let session = workspace.as_ref().and(kubernetes.session_endpoint.clone());
-    Ok(ExecutorRegistry::new()
-        .with_backend(std::sync::Arc::new(backend))
-        .with_workspace_endpoint(workspace, "eu-central-1".to_string())
-        .with_session_endpoint(session))
+    let workspace = WorkspaceEndpoint {
+        endpoint: workspace,
+        region: "eu-central-1".to_string(),
+        session_endpoint: session,
+    };
+    Ok((std::sync::Arc::new(backend), workspace))
 }
 
 #[cfg(test)]

@@ -129,10 +129,20 @@ fn holds_static_ceilings() {
         subject_generation: 1,
         subject_digest: [0u8; 32],
         config_clock: Default::default(),
+        backend: "default".to_string(),
+        config_generation: 0,
+        config_digest: [0; 32],
     }];
-    assert!(fits(&held, &resources(), &envelope(2)));
-    assert!(!fits(&held, &resources(), &envelope(1)));
-    assert!(fits(&held, &resources(), &ResourceEnvelope::default()));
+    assert!(fits(&held, "default", &resources(), &envelope(2)));
+    assert!(!fits(&held, "default", &resources(), &envelope(1)));
+    assert!(fits(
+        &held,
+        "default",
+        &resources(),
+        &ResourceEnvelope::default()
+    ));
+    // Another backend's reservations take nothing from this one's ceilings.
+    assert!(fits(&held, "lab", &resources(), &envelope(1)));
     assert!(!fits(
         &[],
         &resources(),
@@ -160,6 +170,9 @@ async fn pages_reservations() {
                 subject_generation: 1,
                 subject_digest: [0u8; 32],
                 config_clock: Default::default(),
+                backend: "default".to_string(),
+                config_generation: 0,
+                config_digest: [0; 32],
             };
             (
                 JOB_RESERVATION_KEYSPACE.to_string(),

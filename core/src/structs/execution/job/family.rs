@@ -340,6 +340,9 @@ pub struct ExecutionReceipt {
     pub accepted_at_ms: u64,
     /// The executor's realm config clock when it accepted, which names its membership interval.
     pub config_clock: crate::admin_documents::AdminDocumentClock,
+    /// Config of the backend the launch was accepted on; a change fences the start.
+    pub config_generation: u64,
+    pub config_digest: [u8; 32],
 }
 
 /// State of one physical execution. Terminal here means terminal for this

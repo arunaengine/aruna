@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use aruna_core::admin_documents::AdminDocumentClock;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::compute::{ExecutionTargetId, ExecutorKind, ResourceEnvelope};
+use aruna_core::compute::ExecutionTargetId;
+use aruna_core::compute::offer::BackendLimits;
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, NetEffect};
 use aruna_core::events::{Event, ExecutionSignEvent, LaunchDecline, NetEvent};
 use aruna_core::heartbeat::HeldHeartbeat;
@@ -63,18 +64,15 @@ pub struct WitnessNode {
     pub realm_id: RealmId,
     /// The fresh heartbeats whose telemetry overrides the advertised one.
     pub fresh: BTreeMap<NodeId, HeldHeartbeat>,
-    /// What each local executor backend advertises, by its wire kind.
-    pub limits: BTreeMap<String, ResourceEnvelope>,
+    /// Each local executor backend's wire kind and limits, by its name.
+    pub limits: BackendLimits,
 }
 
 impl WitnessNode {
     /// This node as a launch planned onto it sees it.
     fn launch_node(&self, launch: &LaunchFrame, execution_id: Ulid, now_ms: u64) -> LaunchNode {
-        let limits = match &launch.envelope().record {
-            JobFamilyRecord::Launch(intent) => {
-                let kind = ExecutorKind::from_wire(&intent.target.executor_kind);
-                self.limits.get(&kind.as_wire()).cloned()
-            }
+        let limit = match &launch.envelope().record {
+            JobFamilyRecord::Launch(intent) => self.limits.get(&intent.target.backend),
             _ => None,
         };
         LaunchNode {
@@ -82,7 +80,8 @@ impl WitnessNode {
             realm_id: self.realm_id,
             now_ms,
             execution_id,
-            limits,
+            limits: limit.map(|limit| limit.limits),
+            config_digest: limit.map(|limit| limit.config_digest),
         }
     }
 }

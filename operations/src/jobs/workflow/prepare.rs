@@ -187,18 +187,24 @@ impl PrepareAttemptOperation {
         self.call(PrepareStep::TaskAdmit, IoCall::child(admit))
     }
 
-    /// The capabilities of the backend this run is placed on.
+    /// The backend this run is placed on: by its stored name, else by kind, else the first.
     fn read_facts(&mut self) -> PrepareNext {
-        let Some(kind) = self.spec.executor_constraint.as_deref() else {
-            return self.read_endpoint();
-        };
-        let kind = ExecutorKind::from_wire(kind);
-        let call = compute_call(ComputeEffect::Facts { kind });
+        let backend = self.spec.backend.clone();
+        let constraint = (self.spec.executor_constraint.as_deref()).map(ExecutorKind::from_wire);
+        let call = compute_call(ComputeEffect::Select {
+            backend,
+            constraint,
+        });
         self.call(PrepareStep::Facts, call)
     }
 
-    fn read_endpoint(&mut self) -> PrepareNext {
-        self.call(PrepareStep::Endpoint, compute_call(ComputeEffect::Endpoint))
+    /// The S3 endpoints the containers of `backend` reach.
+    fn read_endpoint(&mut self, backend: Option<String>) -> PrepareNext {
+        let Some(backend) = backend else {
+            return self.load_inputs();
+        };
+        let call = compute_call(ComputeEffect::Endpoint { backend });
+        self.call(PrepareStep::Endpoint, call)
     }
 
     fn load_inputs(&mut self) -> PrepareNext {
@@ -379,10 +385,15 @@ impl Operation for PrepareAttemptOperation {
                 Err(error) => Err(JobError::permanent(error.to_string())),
             },
             PrepareStep::Facts => {
-                if let ComputeAnswer::Facts(facts) = compute_answer(result)? {
+                let ComputeAnswer::Selected(Some(facts)) = compute_answer(result)? else {
+                    return self.read_endpoint(None);
+                };
+                let name = facts.name.clone();
+                // Mounts and sessions follow a backend the run is pinned to.
+                if self.spec.backend.is_some() || self.spec.executor_constraint.is_some() {
                     self.facts = Some(facts);
                 }
-                self.read_endpoint()
+                self.read_endpoint(Some(name))
             }
             PrepareStep::Endpoint => {
                 if let ComputeAnswer::Endpoint(address) = compute_answer(result)? {

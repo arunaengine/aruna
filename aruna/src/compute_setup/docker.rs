@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::WorkspaceEndpoint;
 use tracing::info;
 
 use super::settings::{compute_s3_endpoint, docker_workspace, session_s3_address};
@@ -13,7 +13,7 @@ pub(super) async fn build(
     settings: &ComputeSettings,
     docker: &DockerSettings,
     config: &Config,
-) -> Result<ExecutorRegistry, ComputeBuildError> {
+) -> Result<super::BuiltBackend, ComputeBuildError> {
     let workspace = docker_workspace(
         settings.local_only,
         compute_s3_endpoint(settings, config).as_deref(),
@@ -27,6 +27,7 @@ pub(super) async fn build(
             .envelope
             .expect("a selected docker backend has an envelope"),
         keep_failed: docker.keep_failed,
+        docker_host: docker.docker_host.clone(),
         ..aruna_compute::DockerConfig::default()
     };
     if let Some(state_root) = &docker.state_root {
@@ -47,8 +48,10 @@ pub(super) async fn build(
         local_only = workspace.is_none(),
         "Docker executor backend enabled"
     );
-    Ok(ExecutorRegistry::new()
-        .with_backend(std::sync::Arc::new(backend))
-        .with_workspace_endpoint(workspace, "eu-central-1".to_string())
-        .with_session_endpoint(session_s3.map(|address| format!("http://{address}"))))
+    let workspace = WorkspaceEndpoint {
+        endpoint: workspace,
+        region: "eu-central-1".to_string(),
+        session_endpoint: session_s3.map(|address| format!("http://{address}")),
+    };
+    Ok((std::sync::Arc::new(backend), workspace))
 }

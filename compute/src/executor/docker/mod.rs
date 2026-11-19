@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::compute::backend::{DOCKER_DEFAULT_HOST, RuntimeDestination, local_daemon};
 use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
@@ -71,6 +72,8 @@ pub struct DockerBackend {
     docker: Docker,
     config: DockerConfig,
     daemon_lock: Arc<DaemonLock>,
+    /// The daemon runs on this node; a remote daemon is no local site and hosts no sessions.
+    local: bool,
 }
 
 enum RemoveOutcome {
@@ -86,16 +89,28 @@ impl DockerBackend {
     }
 
     pub fn with_config(config: DockerConfig) -> Result<Self, BackendError> {
-        let docker = Docker::connect_with_defaults().map_err(|e| classify(&e))?;
+        let host = config
+            .docker_host
+            .clone()
+            .or_else(|| std::env::var("DOCKER_HOST").ok())
+            .unwrap_or_else(|| DOCKER_DEFAULT_HOST.to_string());
+        let docker = Docker::connect_with_host(&host).map_err(|e| classify(&e))?;
+        let config = DockerConfig {
+            docker_host: Some(host),
+            ..config
+        };
         Self::from_parts(docker, config)
     }
 
+    /// A client without an address in `config` counts as the local daemon.
     pub fn from_parts(docker: Docker, config: DockerConfig) -> Result<Self, BackendError> {
         let daemon_lock = Arc::new(DaemonLock::acquire(&config.state_root)?);
+        let local = config.docker_host.as_deref().is_none_or(local_daemon);
         Ok(Self {
             docker,
             config,
             daemon_lock,
+            local,
         })
     }
 
@@ -703,8 +718,20 @@ impl ExecutorBackend for DockerBackend {
         ExecutorKind::Docker
     }
 
+    fn destination(&self) -> Option<RuntimeDestination> {
+        Some(RuntimeDestination::Docker {
+            host: (self.config.docker_host.clone()).unwrap_or_else(|| DOCKER_DEFAULT_HOST.into()),
+            state_root: self.config.state_root.display().to_string(),
+        })
+    }
+
     fn capabilities(&self) -> BackendCaps {
-        host_capabilities(self.config.envelope)
+        // A remote daemon runs elsewhere, so it holds no session and no local site.
+        BackendCaps {
+            local_site: self.local,
+            session: self.local,
+            ..host_capabilities(self.config.envelope)
+        }
     }
 
     fn granted(&self, spec: &TaskSpec) -> Result<GrantedResources, BackendError> {
@@ -1598,6 +1625,61 @@ mod tests {
             attempt_epoch: 1,
             controller_generation: 1,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_daemon_unproven() {
+        // A daemon reached over the network is not this node: no local site, no sessions.
+        let dir = tempfile::tempdir().unwrap();
+        let backend = |host: &str, root: &str| {
+            DockerBackend::with_config(DockerConfig {
+                docker_host: Some(host.to_string()),
+                state_root: dir.path().join(root),
+                ..DockerConfig::default()
+            })
+            .unwrap()
+            .capabilities()
+        };
+
+        let remote = backend("tcp://10.0.0.5:2376", "remote");
+        assert!(!remote.local_site && !remote.session);
+        let local = backend("unix:///var/run/docker.sock", "local");
+        assert!(local.local_site && local.session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn digests_follow_config() {
+        // A new daemon address moves the home and the config; a new envelope only the config.
+        let dir = tempfile::tempdir().unwrap();
+        let digests = |host: &str, cores: Option<u32>| {
+            let config = DockerConfig {
+                docker_host: Some(host.to_string()),
+                state_root: dir.path().join("state"),
+                envelope: aruna_core::compute::ResourceEnvelope {
+                    max_cpu_cores: cores,
+                    ..Default::default()
+                },
+                ..DockerConfig::default()
+            };
+            let backend = Arc::new(DockerBackend::with_config(config).unwrap());
+            let registry = crate::ExecutorRegistry::new().with_backend("lab", backend);
+            let home = registry.home_digest("lab").unwrap();
+            (home, registry.config_digest("lab").unwrap())
+        };
+        let local = "unix:///var/run/docker.sock";
+
+        let base = digests(local, Some(4));
+        assert_eq!(
+            digests(local, Some(4)),
+            base,
+            "an unchanged config keeps its digests"
+        );
+        let moved = digests("tcp://10.0.0.5:2376", Some(4));
+        assert!(moved.0 != base.0 && moved.1 != base.1);
+        let grown = digests(local, Some(8));
+        assert!(grown.0 == base.0 && grown.1 != base.1);
     }
 
     #[test]

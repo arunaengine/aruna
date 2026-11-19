@@ -62,6 +62,7 @@ fn execution() -> JobPayload {
         env: BTreeMap::new(),
         resources: Default::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),

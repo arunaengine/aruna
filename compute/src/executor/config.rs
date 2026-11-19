@@ -41,6 +41,8 @@ pub struct DockerConfig {
     /// Static ceilings this host offers. Hard eligibility plus the basis of the
     /// advertised ranking availability.
     pub envelope: ResourceEnvelope,
+    /// Daemon address; `None` takes `DOCKER_HOST`, else the platform's default socket.
+    pub docker_host: Option<String>,
 }
 
 impl Default for DockerConfig {
@@ -57,6 +59,7 @@ impl Default for DockerConfig {
             session_subnet: DEFAULT_SESSION_SUBNET.to_string(),
             pull_deadline: Duration::from_secs(300),
             envelope: ResourceEnvelope::default(),
+            docker_host: None,
         }
     }
 }
@@ -167,6 +170,9 @@ pub struct KubernetesConfig {
     /// Configured namespace envelope: Kubernetes exposes no immutable ceiling
     /// this backend could read instead.
     pub envelope: ResourceEnvelope,
+    /// Kubeconfig file and context of the cluster; neither set infers the client as before.
+    pub kubeconfig: Option<PathBuf>,
+    pub context: Option<String>,
 }
 
 impl Default for KubernetesConfig {
@@ -189,6 +195,8 @@ impl Default for KubernetesConfig {
             default_cpu_cores: Some(2),
             default_disk_bytes: None,
             envelope: ResourceEnvelope::default(),
+            kubeconfig: None,
+            context: None,
         }
     }
 }
