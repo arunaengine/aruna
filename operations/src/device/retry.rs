@@ -2,8 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::time::unix_timestamp_millis;
-
 use super::publish_queue::{PublishEntry, PublishState};
 use super::sync::repository::{SyncUpload, UploadState};
 use crate::queue_backoff::retry_delay_ms;
@@ -75,11 +73,6 @@ impl RetryView for SyncUpload {
     fn attempts(&self) -> u32 {
         self.state.attempts()
     }
-}
-
-/// Due time for the next attempt after `attempts` failures.
-pub(crate) fn retry_due_ms(attempts: u32) -> u64 {
-    retry_due_at(unix_timestamp_millis(), attempts)
 }
 
 /// Due time for the next attempt after `attempts` failures, counted from `now_ms`.

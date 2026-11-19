@@ -250,7 +250,7 @@ async fn retry_redoes_undone() {
 /// A settled work row of a fixed install, and its two lookup answers.
 fn settled_work() -> (WorkRow, [IoResult; 2]) {
     let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
-    let mut row = WorkRow::reserved(&install, WorkKind::Copy, Ulid::nil(), 1);
+    let mut row = WorkRow::reserved(&install, WorkKind::Copy, (Ulid::nil(), Ulid::generate()), 1);
     row.state = WorkState::Settled;
     let answers = [
         values_result(vec![Some(b"key".to_vec())]),

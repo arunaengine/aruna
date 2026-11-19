@@ -1364,7 +1364,12 @@ mod tests {
         let key = (*realm_id.as_bytes()).into();
         write_doc(&ctx, REALM_CONFIG_KEYSPACE, key, row.into()).await;
         let kind = aruna_operations::plugins::work::WorkKind::Copy;
-        let mut work = WorkRow::reserved(&install, kind, Ulid::from_parts(5, 5), 1);
+        let mut work = WorkRow::reserved(
+            &install,
+            kind,
+            (Ulid::from_parts(5, 5), Ulid::generate()),
+            1,
+        );
         work.target = Some("/realm/g/group/data/node/out/a.txt".into());
         let identity = Identity::Call {
             run_id: work.run_id,

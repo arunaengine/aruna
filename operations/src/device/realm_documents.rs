@@ -30,7 +30,6 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{Key, KeySpace, Value};
 use rand::seq::SliceRandom;
 use serde::de::DeserializeOwned;
@@ -674,6 +673,7 @@ struct InstallDocumentsOperation {
     stored: StoredCopies,
     groups: Vec<DeviceGroupDocuments>,
     config: Option<RealmConfigDocument>,
+    now_ms: u64,
 }
 
 type Installing = Result<Next<bool>, IoError>;
@@ -681,6 +681,7 @@ type Installing = Result<Next<bool>, IoError>;
 impl InstallDocumentsOperation {
     fn new(plan: FetchPlan, accepted: Accepted, behind: u32) -> Self {
         Self {
+            now_ms: 0,
             plan,
             accepted,
             behind,
@@ -755,7 +756,7 @@ impl InstallDocumentsOperation {
         let installed = (self.stored.config.as_deref())
             .and_then(|bytes| RealmConfigDocument::from_bytes(bytes).ok());
         if let Some(installed) = installed {
-            keep_revocations(&mut config, &installed, unix_timestamp_secs());
+            keep_revocations(&mut config, &installed, self.now_ms / 1000);
         }
         let Ok(bytes) = config.to_bytes(&self.actor()) else {
             warn!("A fetched realm configuration could not be stored");
@@ -848,6 +849,10 @@ impl InstallDocumentsOperation {
 impl Operation for InstallDocumentsOperation {
     type Output = bool;
     type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Installing {
         Ok(Next::Call(self.stored_read()))

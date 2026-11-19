@@ -6,14 +6,16 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{ByCalls, Operation};
 use aruna_core::rows::{done, read_row, value};
 use aruna_core::types::{Key, KeySpace, Value};
+use ulid::Ulid;
 
 use super::mutation_error::JobMutationError;
 use crate::jobs::MUTATE_MAX_ATTEMPTS;
 
-type StartCall = Box<dyn FnMut() -> IoCall + Send>;
+type StartCall = Box<dyn FnMut(Ulid) -> IoCall + Send>;
 type FinishCall<T> =
     Box<dyn FnMut(IoResult) -> Result<Result<T, JobMutationError>, IoError> + Send>;
 
@@ -26,6 +28,9 @@ pub struct StoreCall<T> {
     exhausted: &'static str,
     attempt: u32,
     waiting: bool,
+    ids: IdMint,
+    now_ms: u64,
+    id: Ulid,
 }
 
 impl<T> std::fmt::Debug for StoreCall<T> {
@@ -50,15 +55,31 @@ impl<T> PartialEq for StoreCall<T> {
 
 impl<T: 'static> StoreCall<T> {
     /// Each attempt runs a fresh `build()`, and `map` turns its output into the answer.
-    pub(crate) fn of<O, B, M>(mut build: B, mut map: M, exhausted: &'static str) -> Self
+    pub(crate) fn of<O, B, M>(mut build: B, map: M, exhausted: &'static str) -> Self
     where
         O: Operation<Error = JobMutationError> + 'static,
         O::Output: PartialEq + 'static,
         B: FnMut() -> O + Send + 'static,
         M: FnMut(O::Output) -> Result<T, JobMutationError> + Send + 'static,
     {
+        Self::minted(0, move |_| build(), map, exhausted)
+    }
+
+    /// [`Self::of`], where every attempt builds with one id minted at `now_ms` for this call.
+    pub(crate) fn minted<O, B, M>(
+        now_ms: u64,
+        mut build: B,
+        mut map: M,
+        exhausted: &'static str,
+    ) -> Self
+    where
+        O: Operation<Error = JobMutationError> + 'static,
+        O::Output: PartialEq + 'static,
+        B: FnMut(Ulid) -> O + Send + 'static,
+        M: FnMut(O::Output) -> Result<T, JobMutationError> + Send + 'static,
+    {
         Self {
-            start: Box::new(move || IoCall::child::<O, ByCalls>(build())),
+            start: Box::new(move |id| IoCall::child::<O, ByCalls>(build(id))),
             finish: Box::new(move |result| {
                 let output = result.child::<O::Output, JobMutationError>()?;
                 Ok(output.and_then(&mut map))
@@ -67,18 +88,24 @@ impl<T: 'static> StoreCall<T> {
             exhausted,
             attempt: 0,
             waiting: false,
+            ids: IdMint::default(),
+            now_ms,
+            id: Ulid::nil(),
         }
     }
 
     /// A call that was refused before it could start.
     pub(crate) fn refused(error: JobMutationError) -> Self {
         Self {
-            start: Box::new(|| IoCall::Read(Vec::new())),
+            start: Box::new(|_| IoCall::Read(Vec::new())),
             finish: Box::new(|_| Err(IoError::Unfinished)),
             refused: Some(error),
             exhausted: "",
             attempt: 0,
             waiting: false,
+            ids: IdMint::default(),
+            now_ms: 0,
+            id: Ulid::nil(),
         }
     }
 }
@@ -87,17 +114,22 @@ impl<T: Send + std::fmt::Debug> Operation for StoreCall<T> {
     type Output = T;
     type Error = JobMutationError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<T>, JobMutationError> {
         if let Some(error) = self.refused.take() {
             return Err(error);
         }
-        Ok(Next::Call((self.start)()))
+        self.id = self.ids.mint(self.now_ms);
+        Ok(Next::Call((self.start)(self.id)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<T>, JobMutationError> {
         if self.waiting {
             self.waiting = false;
-            return Ok(Next::Call((self.start)()));
+            return Ok(Next::Call((self.start)(self.id)));
         }
         match (self.finish)(result)? {
             Err(JobMutationError::Conflict) if self.attempt + 1 < MUTATE_MAX_ATTEMPTS => {

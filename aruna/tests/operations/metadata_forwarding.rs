@@ -139,6 +139,7 @@ async fn device_drain_publishes() -> Result<(), Box<dyn std::error::Error>> {
         "datasets/forwarded".to_string(),
         true,
         draft_crate(),
+        aruna_core::time::unix_timestamp_millis(),
     );
     drive(
         EnqueueDraftOperation::new(EnqueueDraftInput {
@@ -194,6 +195,7 @@ async fn drains_past_terminal() -> Result<(), Box<dyn std::error::Error>> {
             format!("datasets/queued-{index}"),
             true,
             draft_crate(),
+            aruna_core::time::unix_timestamp_millis(),
         );
         if index <= PUBLISH_PAGE_SIZE {
             entry.state = PublishState::Published {

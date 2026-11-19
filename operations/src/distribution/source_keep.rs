@@ -7,13 +7,12 @@
 // published like any kept copy; else nothing is kept.
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::on_use::{
     CACHE_CAPACITY_BYTES, FillClaim, PullPlan, claim_key,
 };
-use aruna_core::time::unix_timestamp_millis;
 use tracing::warn;
-use ulid::Ulid;
 
 use super::keep::{ClaimFillOperation, Claimed, KeepError, KeptCopy};
 use super::pull::{KeepCopyOperation, ReleaseClaimOperation};
@@ -96,12 +95,16 @@ pub struct KeepSourceOperation {
     plan: Plan,
     claim: Vec<u8>,
     step: SourceStep,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 impl KeepSourceOperation {
     fn new(keep: SourceKeep, plan: Plan) -> Self {
         let claim = claim_key(plan.kind, plan.set_id, keep.version_id, plan.identity);
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             keep,
             plan,
             claim,
@@ -125,7 +128,7 @@ impl KeepSourceOperation {
             location,
             claim_key: self.claim.clone(),
             capacity: CACHE_CAPACITY_BYTES,
-            order: Ulid::generate(),
+            order: self.mint.mint(self.now_ms),
             member_id: self.plan.member_id,
         };
         self.step = SourceStep::Publish;
@@ -137,10 +140,18 @@ impl Operation for KeepSourceOperation {
     type Output = bool;
     type Error = IoError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<bool>, IoError> {
         let claimed = FillClaim {
-            claim_id: Ulid::generate(),
-            claimed_at_ms: unix_timestamp_millis(),
+            claim_id: self.mint.mint(self.now_ms),
+            claimed_at_ms: self.now_ms,
         };
         let claim = ClaimFillOperation::new(self.claim.clone(), claimed);
         Ok(Next::Call(IoCall::child(claim)))
@@ -189,6 +200,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
 
     use super::*;
 

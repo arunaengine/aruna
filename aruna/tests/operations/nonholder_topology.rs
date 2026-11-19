@@ -42,7 +42,7 @@ use aruna_operations::jobs::lifecycle::submit_external::{
 };
 use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::jobs::route::JobRouteError;
-use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
+use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::export_types::{
@@ -58,6 +58,7 @@ use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOper
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
+use aruna_operations::testing::fresh_job_id;
 use std::cell::RefCell;
 use ulid::Ulid;
 
@@ -701,7 +702,7 @@ async fn owner_answers_absence() -> TestResult<()> {
         .config
         .job_control_handle(&ingress.node_id())
         .expect("fixture binds every node");
-    let missing = mint_job_id(handle, BucketId::new(0)?)?;
+    let missing = fresh_job_id(handle, BucketId::new(0)?)?;
 
     let routed = read_job_routed(
         bystander.context.as_ref(),
@@ -716,7 +717,7 @@ async fn owner_answers_absence() -> TestResult<()> {
     );
 
     let unbound = PlacementHandle::new(band_start(500))?;
-    let unresolved = mint_job_id(unbound, BucketId::new(0)?)?;
+    let unresolved = fresh_job_id(unbound, BucketId::new(0)?)?;
     let routed = read_job_routed(
         bystander.context.as_ref(),
         &realm.auth_context(),

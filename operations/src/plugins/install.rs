@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugin_installs::{
     BoundScope, InstallState, PluginInstall, Prerequisite, SecretBinding,
@@ -251,6 +252,8 @@ pub struct PrepareInstall {
     realm_id: RealmId,
     local: Option<NodeId>,
     request: InstallRequest,
+    now_ms: u64,
+    ids: IdMint,
     phase: PreparePhase,
 }
 
@@ -265,6 +268,8 @@ impl PrepareInstall {
             realm_id,
             local,
             request: request.clone(),
+            now_ms: 0,
+            ids: IdMint::default(),
             phase: PreparePhase::Admin,
         }
     }
@@ -273,7 +278,12 @@ impl PrepareInstall {
         (self.request.install_id).and_then(|id| find_install(config, id))
     }
 
-    fn checked(&self, config: RealmConfigDocument) -> Result<CheckedRequest, InstallError> {
+    /// The checked request; a new install takes `fresh` as its id.
+    fn checked(
+        &self,
+        config: RealmConfigDocument,
+        fresh: Ulid,
+    ) -> Result<CheckedRequest, InstallError> {
         let request = &self.request;
         let existing = self.existing(&config);
         let pinned = existing.map(|install| install.digest.as_str());
@@ -288,7 +298,7 @@ impl PrepareInstall {
         let scope = InstallScope {
             realm_id: self.realm_id,
             group_id: request.group_id,
-            install_id: request.install_id.unwrap_or_else(Ulid::generate),
+            install_id: request.install_id.unwrap_or(fresh),
         };
         let grants = narrow_grants(&manifest, &scope, &request.grants)?;
         Ok(CheckedRequest {
@@ -345,6 +355,14 @@ impl Operation for PrepareInstall {
     type Output = Prepared;
     type Error = InstallError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<Prepared>, InstallError> {
         Ok(Next::Call(admin_call(&self.auth, self.request.group_id)))
     }
@@ -356,7 +374,8 @@ impl Operation for PrepareInstall {
                 Ok(Next::Call(config_call(self.realm_id)))
             }
             PreparePhase::Config => {
-                let checked = self.checked(config_answer(result)?)?;
+                let fresh = self.ids.mint(self.now_ms);
+                let checked = self.checked(config_answer(result)?, fresh)?;
                 let what = (&checked.scope, &checked.grants);
                 let holder = CheckHolder::new(&self.auth, what, &checked.config);
                 self.phase = PreparePhase::Holder(Box::new(checked));
@@ -390,6 +409,7 @@ enum InstallPhase {
 pub struct InstallPrepared {
     caller: InstallCaller,
     prepared: Box<Prepared>,
+    ids: IdMint,
     phase: InstallPhase,
 }
 
@@ -398,6 +418,7 @@ impl InstallPrepared {
         Self {
             caller,
             prepared: Box::new(prepared),
+            ids: IdMint::default(),
             phase: InstallPhase::Config,
         }
     }
@@ -431,7 +452,9 @@ impl InstallPrepared {
                     let why = "no eligible server or management node holds the group's metadata";
                     InstallError::Unavailable(why.into())
                 })?;
-                let record = new_record(&self.caller.actor, &self.prepared, receiver);
+                let now_ms = self.caller.now_ms;
+                let ids = (self.ids.mint(now_ms), self.ids.mint(now_ms));
+                let record = new_record(&self.caller.actor, &self.prepared, (receiver, ids));
                 let write = self.caller.write(None, &record, None);
                 self.phase = InstallPhase::Written(Box::new(record));
                 Ok(Next::Call(write))
@@ -443,6 +466,10 @@ impl InstallPrepared {
 impl Operation for InstallPrepared {
     type Output = PluginInstall;
     type Error = InstallError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn hold_scope(&self) -> Option<HoldScope> {
         Some(HoldScope::PluginInstall(self.prepared.scope.install_id))
@@ -851,7 +878,12 @@ impl Operation for CheckHolder {
 
 /// The record of a new install. The account and role ids are fresh, never taken from the
 /// caller, so no existing user or role can be adopted or replaced.
-pub(crate) fn new_record(actor: &Actor, prepared: &Prepared, receiver: NodeId) -> PluginInstall {
+/// A new install record on `receiver`, with fresh ids for its account and role.
+pub(crate) fn new_record(
+    actor: &Actor,
+    prepared: &Prepared,
+    (receiver, (account, role_id)): (NodeId, (Ulid, Ulid)),
+) -> PluginInstall {
     let scope = &prepared.scope;
     PluginInstall {
         install_id: scope.install_id,
@@ -863,8 +895,8 @@ pub(crate) fn new_record(actor: &Actor, prepared: &Prepared, receiver: NodeId) -
         paused: false,
         settings: prepared.settings.clone(),
         grants: stored_grants(&prepared.grants),
-        account: UserId::local(Ulid::generate(), scope.realm_id),
-        role_id: Ulid::generate(),
+        account: UserId::local(account, scope.realm_id),
+        role_id,
         receiver,
         granted_by: actor.user_id,
         request: prepared.request.clone(),

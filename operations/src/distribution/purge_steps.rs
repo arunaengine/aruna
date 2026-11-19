@@ -10,6 +10,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::key_index::{IndexEffect, IndexError, IndexEvent};
 use aruna_core::keyspaces::{
     ATTACHMENT_KEYSPACE, BOOTSTRAP_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE,
@@ -33,7 +34,6 @@ use aruna_core::structs::storage::distribution::inventory::{
 use aruna_core::structs::storage::distribution::on_use::{
     Attachment, CACHE_TOTALS_KEY, CacheEntry, CacheTotals, attachment_key,
 };
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use tracing::warn;
@@ -483,6 +483,8 @@ struct DebitRowsOperation {
     left: Vec<Vec<u8>>,
     deltas: Vec<(Key, RangeCounters)>,
     state: DebitState,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -496,6 +498,8 @@ enum DebitState {
 impl DebitRowsOperation {
     fn new(target: &PurgeTarget, deletes: Vec<(String, Key)>, left: Vec<Vec<u8>>) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             set_id: target.binding.set_id,
             range_id: target.range_id,
             group_id: target.group_id,
@@ -545,6 +549,14 @@ impl Operation for DebitRowsOperation {
     type Output = ();
     type Error = PurgeError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<()>, PurgeError> {
         let account = account_key(self.set_id, self.range_id).into();
         let mut reads = vec![(RANGE_ACCOUNT_KEYSPACE.to_string(), account)];
@@ -571,7 +583,7 @@ impl Operation for DebitRowsOperation {
                 done(result)?;
                 self.state = DebitState::Mark;
                 // The share moves without the group counters, so the group is published again.
-                let writes = dirty_rows([self.group_id], Ulid::generate());
+                let writes = dirty_rows([self.group_id], self.mint.mint(self.now_ms));
                 Ok(Next::Call(IoCall::Write(writes)))
             }
             DebitState::Mark => {
@@ -706,11 +718,13 @@ struct AbortUploadsOperation {
     bucket: String,
     rows: Vec<Vec<u8>>,
     uploads: VecDeque<(String, Ulid)>,
+    now_ms: u64,
 }
 
 impl AbortUploadsOperation {
     fn new(bucket: String, rows: Vec<Vec<u8>>) -> Self {
         Self {
+            now_ms: 0,
             bucket,
             rows,
             uploads: VecDeque::new(),
@@ -725,7 +739,7 @@ impl AbortUploadsOperation {
             bucket: self.bucket.clone(),
             key,
             upload_id,
-            now_ms: unix_timestamp_millis(),
+            now_ms: self.now_ms,
         };
         Next::Call(IoCall::child(
             AbortUploadOperation::new(input).including_in_progress(),
@@ -736,6 +750,10 @@ impl AbortUploadsOperation {
 impl Operation for AbortUploadsOperation {
     type Output = ();
     type Error = PurgeError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<()>, PurgeError> {
         for row in std::mem::take(&mut self.rows) {
@@ -881,12 +899,16 @@ pub(super) struct PurgeRangeOperation {
     cursor: PurgeCursor,
     state: RangeState,
     last: Option<Vec<u8>>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 impl PurgeRangeOperation {
     pub(super) fn new(target: PurgeTarget, pages: usize) -> Self {
         let key = PurgeCursor::key(target.binding.set_id, target.range_id);
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             target,
             pages,
             key,
@@ -956,6 +978,14 @@ impl Operation for PurgeRangeOperation {
     type Output = (Purged, usize);
     type Error = PurgeError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> RangeNext {
         Ok(Next::Call(read_row(
             DISTRIBUTION_PURGE_KEYSPACE,
@@ -994,7 +1024,8 @@ impl Operation for PurgeRangeOperation {
             RangeState::Cleared => {
                 step_done(result)?;
                 // The range leaves this node's replica share with its counter rows.
-                let mark = MarkDirtyOperation::new([self.target.group_id], Ulid::generate());
+                let mark =
+                    MarkDirtyOperation::new([self.target.group_id], self.mint.mint(self.now_ms));
                 self.call(RangeState::Marked, IoCall::child(mark))
             }
             RangeState::Marked => {

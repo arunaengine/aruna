@@ -213,6 +213,13 @@ pub enum BlobEvent {
         blob: BackendStream<Result<Bytes, BackendStreamError>>,
     },
     HiddenDeleted,
+    /// The stream of a `BlobEffect::PinRead`, which holds the copy until it ends or drops.
+    PinnedRead {
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
+    ReadHeld {
+        held: bool,
+    },
     HiddenListed {
         entries: Vec<HiddenBlobEntry>,
         next_cursor: Option<Vec<u8>>,
@@ -962,6 +969,8 @@ impl Event {
                     HiddenRead,
                     LocalSpooled,
                     HiddenDeleted,
+                    PinnedRead,
+                    ReadHeld,
                     HiddenListed,
                     ConnectionEstablished,
                     ConnectionClosed,

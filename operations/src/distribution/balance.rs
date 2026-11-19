@@ -11,6 +11,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::HeldHeartbeat;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::{
@@ -117,6 +118,8 @@ pub(super) struct BalanceOperation {
     snapshot: DistributionSnapshot,
     inputs: BalanceInputs,
     proposal: Option<Proposal>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 impl BalanceOperation {
@@ -126,6 +129,8 @@ impl BalanceOperation {
         inputs: BalanceInputs,
     ) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             ids,
             snapshot,
             inputs,
@@ -147,7 +152,7 @@ impl BalanceOperation {
         let Some(member) = (snapshot.config.members.iter()).find(|m| m.node_id == local) else {
             return Ok(Next::Done(false));
         };
-        let transfer_id = Ulid::generate();
+        let transfer_id = self.mint.mint(self.now_ms);
         let kind = StatementKind::TransferPrepare {
             basis: snapshot.number,
             transfer_id,
@@ -173,6 +178,14 @@ impl BalanceOperation {
 impl Operation for BalanceOperation {
     type Output = bool;
     type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<bool>, IoError> {
         let global = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());

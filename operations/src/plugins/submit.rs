@@ -7,6 +7,7 @@ use std::collections::{BTreeSet, VecDeque};
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
@@ -107,6 +108,7 @@ pub(crate) struct PrepareWork {
     now_ms: u64,
     /// The version id a new row of a writing work takes.
     minted: Ulid,
+    ids: IdMint,
     steps: VecDeque<Step>,
     current: Step,
     install: Option<PluginInstall>,
@@ -144,6 +146,7 @@ impl PrepareWork {
             request,
             now_ms,
             minted,
+            ids: IdMint::default(),
             steps: steps.iter().copied().collect(),
             current: Check,
             install: None,
@@ -200,7 +203,7 @@ impl PrepareWork {
         )))
     }
 
-    fn call(&self, step: Step) -> Result<IoCall, CallError> {
+    fn call(&mut self, step: Step) -> Result<IoCall, CallError> {
         match step {
             Step::Check => Ok(IoCall::child(CheckCall::new(&self.scope, None))),
             Step::CopyGrants => {
@@ -257,10 +260,10 @@ impl PrepareWork {
     }
 
     /// The row this request proposes, with what names its arguments.
-    fn proposed(&self, install: &PluginInstall) -> Result<WorkRow, CallError> {
-        let run_id = self.scope.run.run_id;
+    fn proposed(&self, install: &PluginInstall, work_id: Ulid) -> Result<WorkRow, CallError> {
+        let ids = (self.scope.run.run_id, work_id);
         let stored = |error: super::rows::StoreError| CallError(unavailable(error.0));
-        let reserved = |kind| WorkRow::reserved(install, kind, run_id, self.now_ms);
+        let reserved = |kind| WorkRow::reserved(install, kind, ids, self.now_ms);
         Ok(match &self.request {
             WorkRequest::Copy(copy) => {
                 let version = copy.source_version.map(|version| version.to_bytes());
@@ -309,13 +312,14 @@ impl PrepareWork {
         })
     }
 
-    fn reservation(&self) -> Result<ReserveWork, CallError> {
+    fn reservation(&mut self) -> Result<ReserveWork, CallError> {
+        let work_id = self.ids.mint(self.now_ms);
         let install = self.install()?;
         let identity = Identity::Call {
             run_id: self.scope.run.run_id,
             ordinal: self.ordinal(),
         };
-        let proposed = self.proposed(install)?;
+        let proposed = self.proposed(install, work_id)?;
         let marked = match &self.request {
             WorkRequest::Download(download) if download.secret => {
                 (self.place.as_ref()).map(|(bucket, key)| (bucket.as_str(), key.as_str()))
@@ -382,6 +386,10 @@ impl PrepareWork {
 impl Operation for PrepareWork {
     type Output = PreparedWork;
     type Error = CallError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<PreparedWork>, CallError> {
         Ok(Next::Call(self.call(Step::Check)?))

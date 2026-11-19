@@ -11,6 +11,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE};
 use aruna_core::metadata::{
     MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload,
@@ -349,6 +350,7 @@ impl CreateDocumentOperation {
             pending: None,
             created: None,
             now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 }
@@ -429,6 +431,7 @@ pub struct CreateCommitOperation {
     pending: Option<Resolved>,
     created: Option<CreateDocumentResult>,
     now_ms: u64,
+    ids: IdMint,
 }
 
 impl CreateCommitOperation {
@@ -668,7 +671,7 @@ impl CreateCommitOperation {
 
     /// The persistent id mint job and the requested mapping of the new document.
     fn pid_entries(
-        &self,
+        &mut self,
         realm_config: &RealmConfigDocument,
         create_event: &MetadataEventRecord,
     ) -> Result<Vec<(String, Key, Value)>, aruna_core::errors::ConversionError> {
@@ -687,6 +690,8 @@ impl CreateCommitOperation {
             realm_config,
             create_event.node_id,
             &dedup_key,
+            &mut self.ids,
+            self.now_ms,
         )
         .map_err(|error| aruna_core::errors::ConversionError::FromStrError(error.to_string()))?;
         let mut job = JobRecord::new(
@@ -734,6 +739,10 @@ impl Operation for CreateCommitOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn transaction(&self) -> TransactionMode {

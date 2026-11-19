@@ -44,7 +44,6 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::jobs::workflow::credential::RunIdentity;
 use aruna_operations::jobs::workflow::inputs::LoadInputsOperation;
 use aruna_operations::jobs::workflow::outputs::{CaptureOutputsOperation, CaptureScope};
@@ -57,6 +56,7 @@ use aruna_operations::s3::object::put::{
 use aruna_operations::s3::object::versions::{
     ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
+use aruna_operations::testing::fresh_job_id;
 use aruna_storage::storage;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use futures_util::StreamExt;
@@ -182,7 +182,7 @@ fn execution_spec(group_id: GroupId) -> ExecutionSpec {
 /// One claimed job whose attempt intent and control row are already write-ahead,
 /// which is the state every output capture starts from.
 async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, AttemptControl) {
-    let job_id = mint_job_id(
+    let job_id = fresh_job_id(
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
         BucketId::new(0).unwrap(),
     )

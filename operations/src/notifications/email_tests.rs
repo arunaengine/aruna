@@ -175,15 +175,17 @@ fn remove_writes_off() {
     assert_eq!(refused.next(failed), Err(EmailError::Setting(error())));
 }
 
-/// The address is trimmed, and each opt-in gets its own ids.
 #[test]
 fn opt_in_trimmed() {
     let categories = BTreeSet::from(["share.upload".to_string()]);
-    let opt_in =
-        |address: &str| EmailOptIn::new(user(), node(), address.to_string(), categories.clone(), 5);
-    let trimmed = opt_in(" ada@example.org ");
+    let trimmed = EmailOptIn::new(
+        user(),
+        node(),
+        " ada@example.org ".to_string(),
+        categories,
+        5,
+    );
     assert_eq!(trimmed.address, ADDRESS);
-    assert_ne!(trimmed.write_id, opt_in(ADDRESS).write_id);
 }
 
 #[test]

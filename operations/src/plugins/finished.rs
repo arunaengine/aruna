@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
 use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
@@ -321,6 +322,7 @@ pub struct DueCompletions {
     rows: VecDeque<(Vec<u8>, Vec<u8>)>,
     current: Option<Box<Candidate>>,
     due: Vec<NotifyWork>,
+    ids: IdMint,
 }
 
 impl DueCompletions {
@@ -333,6 +335,7 @@ impl DueCompletions {
             rows: VecDeque::new(),
             current: None,
             due: Vec::new(),
+            ids: IdMint::default(),
         }
     }
 
@@ -375,6 +378,10 @@ impl Operation for DueCompletions {
     type Output = Vec<NotifyWork>;
     type Error = StoreError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
         Ok(Next::Call(self.scan.ask()))
     }
@@ -395,7 +402,8 @@ impl Operation for DueCompletions {
         if state.is_none_or(|state| state == RunState::Succeeded) {
             let Candidate { install, row } = *candidate;
             let event = finished_event(&install, &row, self.now_ms);
-            let run = event_run(&self.config, &install, &event, self.now_ms);
+            let run_id = self.ids.mint(self.now_ms);
+            let run = event_run(&self.config, &install, &event, (run_id, self.now_ms));
             self.due
                 .push(NotifyWork::new(install.install_id, row.work_id, run));
         }

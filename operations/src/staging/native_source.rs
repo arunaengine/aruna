@@ -9,6 +9,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::native_reference::{
     DelegatedBody, DelegatedReadEffect, NativeAuthority, NativeRange, NativeReferenceReject,
     NativeReferenceRequest,
@@ -25,7 +26,6 @@ use aruna_core::structs::storage::read_grant::{
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{SyncRelationship, SyncState};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use bytes::Bytes;
 use tracing::warn;
@@ -80,6 +80,8 @@ pub(crate) fn delegated_read(
     head: bool,
 ) -> DelegatedReadOperation {
     DelegatedReadOperation {
+        now_ms: 0,
+        mint: IdMint::default(),
         ids,
         caller: Some(caller),
         arn: arn.clone(),
@@ -95,11 +97,21 @@ pub(crate) struct DelegatedReadOperation {
     arn: VersionedObjectArn,
     range: Option<Range<u64>>,
     head: bool,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 impl Operation for DelegatedReadOperation {
     type Output = DelegatedBody;
     type Error = StagingSourceError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<DelegatedBody>, StagingSourceError> {
         let range = NativeRange::checked(self.range.clone())?;
@@ -125,9 +137,10 @@ impl Operation for DelegatedReadOperation {
             request_digest: digest,
             ..caller
         };
-        let now = unix_timestamp_millis() / 1000;
+        let now = self.now_ms / 1000;
+        let nonce = self.mint.mint(self.now_ms).to_bytes();
         let read = DelegatedReadEffect {
-            delegation: unsigned_delegation(ids, input, now),
+            delegation: unsigned_delegation(ids, input, (now, nonce)),
             version_id: arn.version,
             head: self.head,
             range,
@@ -261,6 +274,7 @@ pub struct PrepareReferenceOperation {
     step: PrepareStep,
     vouched: Option<VouchedRead>,
     relationship: Option<SyncRelationship>,
+    now_ms: u64,
 }
 
 type PrepareTurn = Result<Next<PreparedReference>, Reject>;
@@ -268,6 +282,7 @@ type PrepareTurn = Result<Next<PreparedReference>, Reject>;
 impl PrepareReferenceOperation {
     pub fn new(ids: Option<Ids>, peer: NodeId, request: NativeReferenceRequest) -> Self {
         Self {
+            now_ms: 0,
             ids,
             peer,
             request,
@@ -323,9 +338,13 @@ impl Operation for PrepareReferenceOperation {
     type Output = PreparedReference;
     type Error = Reject;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> PrepareTurn {
         let ids = self.ids()?;
-        let now = unix_timestamp_millis() / 1000;
+        let now = self.now_ms / 1000;
         match &self.request.authority {
             NativeAuthority::Relationship(relationship_id) => {
                 let direction = SyncRelationshipDirection::Outgoing;

@@ -275,7 +275,7 @@ fn plain_row(source: &str) -> ForwardRow {
 fn verdict_decisions() {
     let row = plain_row("s1");
     // An unavailable check is busy and needs no storage.
-    let mut busy = decide_event(Verdict::Unavailable, &row, 9).unwrap();
+    let mut busy = decide_event(Verdict::Unavailable, &row, (Ulid::from_parts(9, 1), 9)).unwrap();
     assert_eq!(busy.first(), Ok(Next::Done(Outcome::Busy)));
     // A denial records its outcome at once.
     let mut plan = DecideEvent {
@@ -296,7 +296,7 @@ fn verdict_decisions() {
     let mut hold = DecideEvent {
         row: Box::new(row.clone()),
         now_ms: 9,
-        phase: DecidePhase::Holding(Hold::new(&row, 9).unwrap()),
+        phase: DecidePhase::Holding(Hold::new(&row, (Ulid::from_parts(9, 1), 9)).unwrap()),
     };
     hold.first().unwrap();
     let full = (0..RUNS_QUEUED)
@@ -309,7 +309,7 @@ fn verdict_decisions() {
     let mut slot = DecideEvent {
         row: Box::new(row.clone()),
         now_ms: 9,
-        phase: DecidePhase::Holding(Hold::new(&row, 9).unwrap()),
+        phase: DecidePhase::Holding(Hold::new(&row, (Ulid::from_parts(9, 1), 9)).unwrap()),
     };
     slot.first().unwrap();
     let Next::Call(IoCall::Write(rows)) = slot.next(page_result(Vec::new(), None)).unwrap() else {

@@ -12,6 +12,7 @@ use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision,
 };
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::realm_vault::seal_setting;
 use aruna_core::register::{RegisterError, RegisterStamp};
@@ -168,20 +169,15 @@ impl SettingValue {
 pub struct SettingWrite {
     pub owner: UserId,
     pub local: NodeId,
-    pub write_id: Ulid,
-    pub event_id: Ulid,
     pub now_ms: u64,
     pub value: SettingValue,
 }
 
 impl SettingWrite {
-    /// A write of `value` with new ids.
     pub fn new(owner: UserId, local: NodeId, now_ms: u64, value: SettingValue) -> Self {
         Self {
             owner,
             local,
-            write_id: Ulid::generate(),
-            event_id: Ulid::generate(),
             now_ms,
             value,
         }
@@ -228,14 +224,14 @@ impl SettingWrite {
     }
 
     /// The document row, its revision and the sync outbox upsert, written in one batch.
-    fn rows(&self, write_id: Ulid, bytes: &[u8]) -> Result<IoCall, SettingError> {
+    fn rows(&self, write_id: Ulid, event_id: Ulid, bytes: &[u8]) -> Result<IoCall, SettingError> {
         let storage = |error: String| SettingError::Storage(error);
         let target = self.value.channel().target(self.owner, write_id);
         let change = DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
-                event_id: self.event_id,
+                event_id,
                 actor: self.local,
                 updated_at_ms: self.now_ms,
             },
@@ -280,6 +276,8 @@ pub struct WriteSettingOperation {
     write: SettingWrite,
     scan: SettingScan,
     state: WriteState,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl WriteSettingOperation {
@@ -288,6 +286,8 @@ impl WriteSettingOperation {
             write,
             scan: SettingScan::default(),
             state: WriteState::Scan,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -298,9 +298,11 @@ impl WriteSettingOperation {
             .iter()
             .map(|(head, _)| head.stamp.counter)
             .max();
-        let stamp = RegisterStamp::next(held, self.write.local, self.write.write_id)?;
+        let write_id = self.ids.mint(self.now_ms);
+        let event_id = self.ids.mint(self.now_ms);
+        let stamp = RegisterStamp::next(held, self.write.local, write_id)?;
         let bytes = self.write.bytes(stamp)?;
-        let rows = self.write.rows(stamp.write_id, &bytes)?;
+        let rows = self.write.rows(stamp.write_id, event_id, &bytes)?;
         self.state = WriteState::Store(bytes);
         Ok(Next::Call(rows))
     }
@@ -309,6 +311,14 @@ impl WriteSettingOperation {
 impl Operation for WriteSettingOperation {
     type Output = Vec<u8>;
     type Error = SettingError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         let channel = self.write.value.channel();

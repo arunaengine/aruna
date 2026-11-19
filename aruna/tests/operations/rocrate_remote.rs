@@ -48,10 +48,10 @@ use aruna_drivers::jobs::context::JobContext;
 use aruna_graph::GraphHandle;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
-use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
+use aruna_operations::testing::fresh_job_id;
 use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::replay_event_log;
 use aruna_storage::FjallStorage;
@@ -75,7 +75,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 /// A fixed job id (handle 1, bucket 0); the RF-3 realm over two nodes makes
 /// every node hold every bucket, so bucket 0 is always held.
 fn job_id() -> JobId {
-    mint_job_id(
+    fresh_job_id(
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
         BucketId::new(0).unwrap(),
     )

@@ -167,3 +167,26 @@ impl From<calls::JobStatus> for jobs::Status {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_digest_text() {
+        // An upload's intent digests the WIT method's text; the node's copy writes the same.
+        use services::Method;
+        let methods = [
+            (Method::Get, "Method::Get"),
+            (Method::Head, "Method::Head"),
+            (Method::Post, "Method::Post"),
+            (Method::Put, "Method::Put"),
+            (Method::Patch, "Method::Patch"),
+            (Method::Delete, "Method::Delete"),
+        ];
+        for (method, text) in methods {
+            assert_eq!(format!("{method:?}"), text);
+            assert_eq!(format!("{:?}", calls::Method::from(method)), text);
+        }
+    }
+}
