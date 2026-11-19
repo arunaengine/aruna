@@ -221,11 +221,11 @@ pub enum Reserve {
     Earlier,
 }
 
-pub(crate) fn row_key(install_id: Ulid, identity: &Identity) -> Result<Vec<u8>, StoreError> {
+pub fn row_key(install_id: Ulid, identity: &Identity) -> Result<Vec<u8>, StoreError> {
     Ok([&[WORK_ROW][..], &install_id.to_bytes(), &encode(identity)?].concat())
 }
 
-pub(crate) fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
+pub fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
     [
         &[WORK_INDEX][..],
         &install_id.to_bytes(),
