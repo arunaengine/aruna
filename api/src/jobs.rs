@@ -178,7 +178,8 @@ impl JobRequestError {
         match error {
             JobRouteError::Unauthorized => Self::Unauthorized,
             JobRouteError::Forbidden => Self::Forbidden,
-            JobRouteError::NotFound => Self::NotFound,
+            // A session whose family was pruned is gone for good, like an unknown one.
+            JobRouteError::NotFound | JobRouteError::Pruned => Self::NotFound,
             JobRouteError::Unavailable(_) => {
                 Self::ServiceUnavailableReason("job_read_unavailable".to_string())
             }
@@ -1181,5 +1182,8 @@ pub(crate) fn map_job_route(error: JobRouteError) -> ServerError {
             ServerError::ServiceUnavailableReason("job_read_unavailable".to_string())
         }
         JobRouteError::Internal(error) => ServerError::InternalError(error.into()),
+        JobRouteError::Pruned => {
+            ServerError::Gone("the job was pruned after its retention".to_string())
+        }
     }
 }

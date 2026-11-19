@@ -7,11 +7,13 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::keyspaces::FAMILY_PRUNE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::JobFamilyId;
 use aruna_core::structs::execution::job::record_keys::{PRUNE_DUE_PREFIX, parse_prune_due};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 
 use super::prune::{
@@ -106,5 +108,53 @@ impl Operation for PruneFamiliesOperation {
             PruneStep::Moved => {}
         }
         self.next_row()
+    }
+}
+
+/// Moves the family prune timer up to the earliest due row of the index. An unreadable index
+/// leaves the timer as it is.
+#[derive(Debug, Default, PartialEq)]
+pub struct FamilyTimerOperation {
+    now_ms: u64,
+}
+
+impl FamilyTimerOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Operation for FamilyTimerOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(IoCall::Page {
+            space: FAMILY_PRUNE_KEYSPACE.to_string(),
+            prefix: Key::from([PRUNE_DUE_PREFIX].as_slice()),
+            after: None,
+            limit: 1,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        let IoResult::Page { rows, .. } = result else {
+            return Ok(Next::Done(()));
+        };
+        let Some((due_ms, _)) = rows.first().and_then(|(key, _)| parse_prune_due(key)) else {
+            return Ok(Next::Done(()));
+        };
+        let timer = Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PruneFamilies,
+            after: Duration::from_millis(due_ms.saturating_sub(self.now_ms)),
+        });
+        Ok(Next::Then {
+            output: (),
+            calls: vec![IoCall::Effect(Box::new(timer))],
+        })
     }
 }

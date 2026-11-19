@@ -91,6 +91,8 @@ pub enum TaskKey {
     PruneConnectorReferences,
     /// Accounts recorded splits, rebuilds split children and splits ranges above thresholds.
     MaintainRanges,
+    /// Prunes the job families whose prune index row is due, page by page.
+    PruneFamilies,
 }
 
 impl TaskKey {

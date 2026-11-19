@@ -37,18 +37,24 @@ fn created(frame: &LaunchFrame) -> u64 {
     intent.created_at_ms
 }
 
-/// The target's answer to `frame` at `now_ms`, with `receipts` stored.
+/// The target's answer to `frame` at `now_ms`, with `receipts` stored; without a receipt the
+/// family's `tombstone` row is read too.
 fn answered(
     family: &Family,
     frame: LaunchFrame,
     now_ms: u64,
-    receipts: Vec<JobRecordEnvelope>,
+    (receipts, tombstone): (Vec<JobRecordEnvelope>, Option<FamilyTombstone>),
 ) -> Result<Next<LaunchClosureAnswer>, ClosureError> {
     let serving = Some((family.target.public(), REALM));
     let mut answer = AnswerClosureOperation::new(frame, serving, None);
     answer.stamp(now_ms);
     assert!(matches!(answer.first(), Ok(Next::Call(IoCall::Child(_)))));
-    answer.next(child(Ok::<_, FamilyReadError>(receipts)))
+    let read = answer.next(child(Ok::<_, FamilyReadError>(receipts)));
+    let Ok(Next::Call(IoCall::Read(_))) = read else {
+        return read;
+    };
+    let row = tombstone.map(|tombstone| Value::from(to_bytes(&tombstone).unwrap().as_slice()));
+    answer.next(IoResult::Values(vec![row]))
 }
 
 // The target answers from its rows: its receipt, too early inside the window, never after it.
@@ -58,15 +64,24 @@ fn target_answers_rows() {
     let (frame, run) = launch(&family);
     let start = created(&frame);
     let receipt = run[4].clone();
-    let answer = answered(&family, frame.clone(), start, vec![receipt]);
+    let answer = answered(&family, frame.clone(), start, (vec![receipt], None));
     assert!(matches!(
         answer,
         Ok(Next::Done(LaunchClosureAnswer::Receipt(_)))
     ));
-    let early = answered(&family, frame.clone(), start + 1, Vec::new());
+    let early = answered(&family, frame.clone(), start + 1, (Vec::new(), None));
     assert_eq!(early, Ok(Next::Done(LaunchClosureAnswer::TooEarly)));
-    let late = answered(&family, frame, start + LAUNCH_WINDOW_MS + 1, Vec::new());
+    let after = start + LAUNCH_WINDOW_MS + 1;
+    let late = answered(&family, frame.clone(), after, (Vec::new(), None));
     assert_eq!(late, Ok(Next::Done(LaunchClosureAnswer::NeverAccepted)));
+    // A family pruned after the launch was made answers pruned, even inside the window.
+    let pruned = FamilyTombstone {
+        pruned_at_ms: start + 5,
+        last_record_ms: start + 1,
+        finished: true,
+    };
+    let answer = answered(&family, frame, start + 1, (Vec::new(), Some(pruned)));
+    assert_eq!(answer, Ok(Next::Done(LaunchClosureAnswer::Pruned)));
 }
 
 // Another node answers nothing for a launch it is not the target of; an outsider is refused.

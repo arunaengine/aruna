@@ -935,6 +935,9 @@ impl OperationsTaskHandler {
             TaskKey::PruneJobs => Box::pin(async move {
                 self.prune_jobs().await;
             }),
+            TaskKey::PruneFamilies => Box::pin(async move {
+                self.prune_families().await;
+            }),
             TaskKey::DrainMirrorRepair => Box::pin(async move {
                 self.drain_mirror_repair().await;
             }),

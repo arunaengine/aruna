@@ -1048,6 +1048,7 @@ the link's group, who may manage the link.
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such job, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
+        (status = 410, description = "The distributed job's family was pruned on this node after its retention", body = ErrorResponse),
         (status = 503, description = "The node owning this job could not be reached or is not yet known here; retryable, the caller may repeat the read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

@@ -12,14 +12,15 @@ use aruna_core::events::{Event, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{ClosureAnswer, LaunchClosureAnswer};
 use aruna_core::keyspaces::{
-    FAMILY_RECORD_KEYSPACE, LAUNCH_CLOSURE_KEYSPACE, SUBMISSION_CLOSURE_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, FAMILY_TOMBSTONE_KEYSPACE, LAUNCH_CLOSURE_KEYSPACE,
+    SUBMISSION_CLOSURE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::job::record_keys::{family_prefix, submission_prefix};
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 use aruna_core::structs::execution::job::{
-    CLOCK_MARGIN_MS, JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent,
-    SubmissionId,
+    CLOCK_MARGIN_MS, FamilyTombstone, JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
+    JobRecordKind, LaunchIntent, SubmissionId,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, Value};
@@ -364,6 +365,7 @@ impl From<IoError> for ClosureError {
 enum AnswerStep {
     Config,
     Receipts,
+    Tombstone,
 }
 
 /// The answer this target gives for one signed launch, from its stored rows only: no fetch, no
@@ -421,13 +423,38 @@ impl AnswerClosureOperation {
         Ok(Next::Call(IoCall::child(read)))
     }
 
-    fn answer(&self, receipts: &[JobRecordEnvelope]) -> Result<LaunchClosureAnswer, ClosureError> {
+    /// The receipt of the launch, else the tombstone read that tells a pruned family.
+    fn answer(
+        &mut self,
+        receipts: &[JobRecordEnvelope],
+    ) -> Result<Next<LaunchClosureAnswer>, ClosureError> {
         let intent = self.intent()?;
         match existing_receipt(receipts, intent) {
-            Some(Ok(receipt)) => return Ok(LaunchClosureAnswer::Receipt(Box::new(receipt))),
+            Some(Ok(receipt)) => {
+                return Ok(Next::Done(LaunchClosureAnswer::Receipt(Box::new(receipt))));
+            }
             // Another launch holds this launch id here, so this one stays open.
             Some(Err(_)) => return Err(Self::undecided("another launch holds this launch id")),
             None => {}
+        }
+        let family = self.launch.envelope().family();
+        self.step = AnswerStep::Tombstone;
+        let row = (
+            FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+            family_prefix(&family),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn unreceipted(&self, tombstone: Option<Value>) -> Result<LaunchClosureAnswer, ClosureError> {
+        let intent = self.intent()?;
+        let tombstone = tombstone
+            .map(|value| from_bytes::<FamilyTombstone>(&value))
+            .transpose();
+        let tombstone = tombstone.map_err(|error| ClosureError::Undecided(error.to_string()))?;
+        // This node pruned the family only after every execution it ran there had stopped.
+        if tombstone.is_some_and(|tombstone| tombstone.last_record_ms >= intent.created_at_ms) {
+            return Ok(LaunchClosureAnswer::Pruned);
         }
         Ok(match intent.expired(self.now_ms) {
             true => LaunchClosureAnswer::NeverAccepted,
@@ -466,8 +493,9 @@ impl Operation for AnswerClosureOperation {
                     warn!(error = %error, "Receipt read failed; closure undecided");
                     ClosureError::Undecided(error.to_string())
                 })?;
-                Ok(Next::Done(self.answer(&receipts)?))
+                self.answer(&receipts)
             }
+            AnswerStep::Tombstone => Ok(Next::Done(self.unreceipted(result.value()?)?)),
         }
     }
 }

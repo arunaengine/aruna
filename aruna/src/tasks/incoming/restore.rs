@@ -6,6 +6,7 @@ use super::*;
 use crate::tasks::runner::{claim_producer, spawn_job};
 use aruna_drivers::driver::node_routing;
 use aruna_operations::federation::registration::PublishRegistrationOperation;
+use aruna_operations::jobs::records::prune::{FamilyTimerOperation, PruneFamiliesOperation};
 use std::time::SystemTime;
 
 const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -878,6 +879,22 @@ impl OperationsTaskHandler {
         self.reschedule_timer(TaskKey::PruneJobs, after).await;
     }
 
+    pub(super) async fn prune_families(&self) {
+        let serving = self.context.node_and_realm();
+        let pass = PruneFamiliesOperation::new(serving);
+        let after = match drive(pass, &self.context).await {
+            Ok(outcome) if outcome.has_more => Duration::ZERO,
+            Ok(outcome) => (outcome.next_due_after)
+                .unwrap_or(PRUNE_POLL_AFTER)
+                .min(PRUNE_POLL_AFTER),
+            Err(error) => {
+                warn!(task_id = ?TaskKey::PruneFamilies, error = %error, "Failed to prune job families");
+                PRUNE_RETRY_AFTER
+            }
+        };
+        self.reschedule_timer(TaskKey::PruneFamilies, after).await;
+    }
+
     pub(super) async fn drain_blob_cleanup(&self) {
         let node = CleanupNode {
             routing: node_routing(&self.context),
@@ -1186,5 +1203,8 @@ async fn arm_prune_timer(context: &DriverContext) {
     let timer = PruneTimerOperation::new(unix_timestamp_millis());
     if let Err(error) = drive(timer, context).await {
         warn!(error = %error, "Failed to restore job prune timer");
+    }
+    if let Err(error) = drive(FamilyTimerOperation::new(), context).await {
+        warn!(error = %error, "Failed to restore the family prune timer");
     }
 }

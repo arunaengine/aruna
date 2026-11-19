@@ -2332,6 +2332,11 @@ impl TesError {
                 code: None,
             },
             JobRouteError::Internal(message) => Self::internal(message),
+            JobRouteError::Pruned => Self {
+                status: StatusCode::GONE,
+                message: "TES task was pruned after its retention".to_string(),
+                code: None,
+            },
         }
     }
 }

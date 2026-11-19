@@ -17,7 +17,7 @@ use aruna_core::types::Value;
 use thiserror::Error;
 
 pub use super::prune_family::PruneFamilyOperation;
-pub use super::prune_pass::PruneFamiliesOperation;
+pub use super::prune_pass::{FamilyTimerOperation, PruneFamiliesOperation};
 
 /// Due index rows one pass reads, and body rows one page transaction deletes.
 pub const FAMILY_PRUNE_PAGE: usize = 256;
