@@ -17,6 +17,8 @@ pub struct LaunchRecord {
     pub env: BTreeMap<String, String>,
     /// Set once the backend accepted this attempt; `None` means planned only.
     pub started_at_ms: Option<u64>,
+    /// Node-local name of the backend the attempt was launched on.
+    pub backend: String,
 }
 
 impl LaunchRecord {

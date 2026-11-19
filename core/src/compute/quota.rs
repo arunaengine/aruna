@@ -139,7 +139,7 @@ pub struct ComputeReservationSnapshot {
 
 /// One durable local reservation of exact capacity, keyed by ExecutionId. This
 /// node writes it before starting work and releases it on a terminal state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobReservationRecord {
     pub execution_id: Ulid,
     /// Mutable row of this exact physical execution.
@@ -152,6 +152,11 @@ pub struct JobReservationRecord {
     /// when this node no longer advertises exactly this subject.
     pub subject_generation: u64,
     pub subject_digest: [u8; 32],
+    /// Node-local name of the backend whose envelope this reservation uses.
+    pub backend: String,
+    /// Backend config the receipt stored; the start refuses when it no longer holds.
+    pub config_generation: u64,
+    pub config_digest: [u8; 32],
 }
 
 /// What a departing node could not resolve before leaving. Recorded durably so
@@ -228,6 +233,16 @@ fn fair_shares(counts: &[usize], budget: usize) -> Vec<usize> {
         }
     }
     shares
+}
+
+/// Reserved capacity of the rows that use backend `backend`, so each backend's
+/// availability subtracts only its own reservations.
+pub fn backend_reserved(rows: &[JobReservationRecord], backend: &str) -> ResourceTotals {
+    let mut reserved = ResourceTotals::default();
+    for row in rows.iter().filter(|row| row.backend == backend) {
+        reserved.add(&row.resources);
+    }
+    reserved
 }
 
 /// Ranking-only availability of one backend: its static ceilings minus what this
@@ -713,6 +728,35 @@ mod tests {
         assert_eq!(groups.validate(), Err(SnapshotError::GroupOrder));
         groups.groups.swap(0, 1);
         assert_eq!(groups.validate(), Ok(()));
+    }
+
+    #[test]
+    fn reserved_per_backend() {
+        // Each backend's availability subtracts only its own reservations.
+        let row = |backend: &str, cpu_cores: u32| JobReservationRecord {
+            execution_id: Ulid::from_bytes([cpu_cores as u8; 16]),
+            job_id: JobId::from_bytes([1u8; 16]),
+            logical_job_id: JobId::from_bytes([1u8; 16]),
+            resources: EffectiveResources {
+                cpu_cores,
+                ram_bytes: 1,
+                disk_bytes: 0,
+                max_walltime_ms: 1,
+                preemptible: false,
+            },
+            created_at_ms: 1,
+            subject_generation: 1,
+            subject_digest: [0u8; 32],
+            backend: backend.to_string(),
+            config_generation: 0,
+            config_digest: [0u8; 32],
+        };
+        let rows = [row("lab", 2), row("lab", 3), row("edge", 4)];
+
+        assert_eq!(backend_reserved(&rows, "lab").cpu_cores, 5);
+        assert_eq!(backend_reserved(&rows, "lab").count, 2);
+        assert_eq!(backend_reserved(&rows, "edge").cpu_cores, 4);
+        assert_eq!(backend_reserved(&rows, "gone"), ResourceTotals::default());
     }
 
     #[test]

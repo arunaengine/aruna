@@ -311,6 +311,7 @@ fn resolves_workspace_outputs() {
         }],
         output_prefixes: vec!["outputs/".to_string()],
         collision_policy: Default::default(),
+        backend: None,
     };
 
     spec.resolve_outputs("ws-job", node_id);
@@ -479,6 +480,7 @@ fn submission() -> SubmissionId {
 fn target() -> ExecutionTargetId {
     ExecutionTargetId {
         node_id: node_id(9),
+        backend: "docker".to_string(),
         executor_kind: "docker".to_string(),
     }
 }
@@ -599,6 +601,7 @@ fn sample_spec() -> LogicalJobSpec {
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
+            backend: None,
         },
         request_digest: [1u8; 32],
         spec_digest: [0u8; 32],
@@ -677,6 +680,8 @@ fn sample_receipt() -> ExecutionReceipt {
         subject_generation: 2,
         subject_digest: [15u8; 32],
         accepted_at_ms: 1_700_000_000_000,
+        config_generation: 0,
+        config_digest: [0u8; 32],
     }
 }
 
@@ -813,15 +818,15 @@ fn canonical_encodings() {
         digests,
         [
             "2e3adfb3440145e2f0acf7dcac006c00cdbccb0fa8df37b935fc0ba4055993d2",
-            "867bcdf4ee17d3181c9b89ad4d3e3d5d0e08fa45de30818a29a76ff66cf93f34",
+            "240e97a3ad85964661055de2abcda8424c44612245aa3d2c7d46132973e13383",
             "1c4dc854b3931565ff75fafec7a24673cc03c1989516f9b46dc93a093ec2bfeb",
-            "08c19deca0ed44b4647bba5d11f0d2729b0d2949d347ede46ca9acb80bfc4b45",
-            "957b71361481ffdfdca3ec746bb904a90dad09faf61012c35b69634e21c50614",
-            "ea5f320399ec50f6cf373d1569adae7cafcd459e47e68b2112c109ee883562b3",
-            "d411a8c29cf623f809a3b64ebc90afb265f2aeab9004b5f9e6d97bc4bc08c868",
-            "8b6fe57497102547e048acb401f95467697a9ea8cc6e619a56eb030510938265",
-            "f558c0cf6296de333a89a2848d71293cfc0763dc83ba63e2a6bd923ea10760cc",
-            "da845a6ec08937f98ab8cd3df645b29f3ac9e25ea36e2ecb21c79b47dca1018b",
+            "3bc380ef38b8aea7a61f277e383118ad35a7b5ed4130d3d52debb38a7e0cef42",
+            "67f5b55b2fb8a390fdc60fdaaba482585584f7a3413eec06415a0ce55f3c34b9",
+            "1db2170c898ddd6c063b025c18df732f1da7b29619b9918c26321cfceee43757",
+            "de351c2e89722274b7eb61322bfa589955395ab2c4e182ac45f4b741dc32c606",
+            "c6eded0fefa3e4725715c8974d9f037ff8715e73ddaa13fe47002530c4800f6e",
+            "491f72542ba7f982ad0d8be4314092242f1506688c3360e2c1a5659d8531589b",
+            "ee8318c302baf68aab8c51c3dd55d7966a1516206a92dc9582930d30a82aee97",
             "bb342189b2c25f4c3c70813b14199b2e1c0fc2b54e8869e05fff02957ffc5d79",
         ]
     );
@@ -1447,6 +1452,7 @@ fn rejects_wrong_target() {
     elsewhere.executor_node_id = node_id(2);
     elsewhere.target = ExecutionTargetId {
         node_id: node_id(2),
+        backend: "docker".to_string(),
         executor_kind: "docker".to_string(),
     };
     assert_eq!(

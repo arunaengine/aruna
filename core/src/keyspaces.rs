@@ -287,6 +287,8 @@ pub const NODE_INFO_KEYSPACE: &str = "node_info";
 /// Single-row local placement subject and its generation. Governed writes and
 /// internal serves are evaluated against it; a rejoin blocks serving here.
 pub const NODE_SUBJECT_KEYSPACE: &str = "node_subject";
+/// One `BackendConfigRecord` per compute backend name: its digests and config generation.
+pub const COMPUTE_BACKEND_KEYSPACE: &str = "compute_backends";
 pub const NOTIFICATION_INBOX_KEYSPACE: &str = "notification_inbox";
 pub const PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_prune_index";
 pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
@@ -739,6 +741,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NODE_STATS_KEYSPACE,
     NODE_INFO_KEYSPACE,
     NODE_SUBJECT_KEYSPACE,
+    COMPUTE_BACKEND_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE,
     PRUNE_INDEX_KEYSPACE,
     NOTIFICATION_OUTBOX_KEYSPACE,
