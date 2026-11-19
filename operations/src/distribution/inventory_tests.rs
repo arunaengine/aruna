@@ -8,6 +8,7 @@ use crate::distribution::test_store::{
     apply, begin, commit, counters, get, has_row, install, open, range, stage, stage_usage,
 };
 use aruna_core::structs::storage::distribution::accounting::{Cursor, Rebuild};
+use aruna_core::types::TxnId;
 use aruna_storage::storage::StorageHandle;
 
 fn change_of(update: &InventoryUpdate) -> &InventoryChange {
