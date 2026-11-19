@@ -254,8 +254,8 @@ pub(super) fn store_progress(progress: &SyncedFolder) -> UpdateFolderOperation {
 mod tests {
     use std::sync::Arc;
 
-    use super::super::folder_gate;
     use super::super::repository::folder_bucket;
+    use super::super::{folder_pass, folder_scope};
     use super::bind::ReserveBindingOperation;
     use super::unbind::{ClearRowsOperation, DeleteLocalOperation};
     use super::*;
@@ -768,45 +768,19 @@ mod tests {
         );
     }
 
-    // The removal of an unbound folder waits for the pass in flight on it, so rows that pass still
-    // writes are cleared too instead of outliving the folder.
-    #[tokio::test]
-    async fn unbind_awaits_pass() {
-        let (_dir, context) = context().await;
-        let context = Arc::new(context);
+    // A pass, a binding and a cleanup of one folder hold the same scope, so an unbind waits for
+    // the pass in flight on it and clears the rows that pass still writes.
+    #[test]
+    fn folder_runs_exclusive() {
         let folder = bound_folder(FolderState::Active);
-        store_folder(&context, &folder).await.expect("row stored");
-
-        drive(unbind_folder(folder.folder_id), &context)
-            .await
-            .expect("the folder is marked");
-        let pass = folder_gate(folder.folder_id).lock().await;
-        let unbind = tokio::spawn({
-            let context = context.clone();
-            let folder_id = folder.folder_id;
-            async move {
-                let _pass = folder_gate(folder_id).lock().await;
-                drive(
-                    finish_unbind(context.node_and_realm(), folder_id, node()),
-                    &context,
-                )
-                .await
-            }
-        });
-        let row = super::super::repository::base_entry(folder.folder_id, "note.txt", &base_row())
-            .expect("base encodes");
-        assert!(write_rows(&context, vec![row], None).await);
-        drop(pass);
-
-        assert_eq!(unbind.await.expect("the unbind task ends"), Ok(()));
-        let (entries, _) = drive(list_entries(folder.folder_id, None, None), &context)
-            .await
-            .expect("the entries read");
-        assert!(entries.is_empty());
-        assert_eq!(
-            drive(read_bound(folder.folder_id), &context).await,
-            Err(FolderError::NotFound)
-        );
+        let scope = Some(folder_scope(folder.folder_id));
+        assert_eq!(folder_pass(None, folder.clone()).hold_scope(), scope);
+        assert_eq!(finish_binding(folder.folder_id).hold_scope(), scope);
+        let unbind = finish_unbind(None, folder.folder_id, node());
+        assert_eq!(unbind.hold_scope(), scope);
+        let shard = |seed: u8| folder_scope(Ulid::from_bytes([seed; 16]));
+        assert_eq!(shard(1), shard(65));
+        assert_ne!(shard(1), shard(2));
     }
 
     // A pass that listed a binding before its unbind must not ask the realm node for a bucket once

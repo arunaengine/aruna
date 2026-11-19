@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_LOG_KEYSPACE, SYNC_UPLOAD_KEYSPACE,
     SYNCED_FOLDER_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::rows::{done, read_row, value};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -88,8 +88,8 @@ impl Operation for UnbindFolderOperation {
     }
 }
 
-/// Removes a `Deleting` folder. Its caller holds the folder's gate, so a pass in flight ends
-/// first and the rows it wrote are cleared too.
+/// Removes a `Deleting` folder under the folder's pass scope, so a pass in flight ends first and
+/// the rows it wrote are cleared too.
 pub fn finish_unbind(
     origin: Option<(NodeId, RealmId)>,
     folder_id: Ulid,
@@ -162,6 +162,10 @@ impl FinishUnbindOperation {
 impl Operation for FinishUnbindOperation {
     type Output = ();
     type Error = FolderError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(super::super::folder_scope(self.folder_id))
+    }
 
     fn first(&mut self) -> UnbindTurn {
         Ok(Next::Call(IoCall::child(read_bound(self.folder_id))))

@@ -5,6 +5,12 @@
 
 use crate::structs::identity::realm::RealmNodeKind;
 
+/// Reason a node closes an open connection once its realm configuration stops admitting the peer.
+pub const MEMBERSHIP_CLOSE: &str = "realm membership";
+
+/// Reason a node refuses a new connection from a peer its realm configuration does not admit.
+pub const ADMISSION_CLOSE: &str = "realm admission";
+
 /// Which side of a connection is being judged. The same table answers all
 /// three, so a protocol that is one-directional for a node kind says so in one
 /// place instead of in three checks that can drift apart.

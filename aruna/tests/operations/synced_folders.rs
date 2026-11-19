@@ -26,7 +26,6 @@ use aruna_core::structs::{
 use aruna_core::types::GroupId;
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
-use aruna_operations::device::sync::folder_gate;
 use aruna_operations::device::sync::folders::{
     BindFolderInput, FolderError, RealmBucketInput, bind_folder as reserve_folder,
     create_realm_bucket, finish_binding, list_entries, list_folders, list_transfers, read_bound,
@@ -60,13 +59,12 @@ const REPLICATION_FACTOR: u32 = 1;
 const REMOTE_BUCKET: &str = "lab-data";
 
 /// Binds a folder as the device API does: reserves it, then confirms its realm bucket under the
-/// folder's gate.
+/// folder's pass scope.
 async fn bind_folder(
     context: &std::sync::Arc<DriverContext>,
     input: BindFolderInput,
 ) -> Result<aruna_core::structs::SyncedFolder, FolderError> {
     let folder_id = drive(reserve_folder(input), context).await?.folder_id;
-    let _pass = folder_gate(folder_id).lock().await;
     drive(finish_binding(folder_id), context).await
 }
 
