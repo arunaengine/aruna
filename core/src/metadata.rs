@@ -1498,6 +1498,19 @@ pub enum MetadataEffect {
     },
     /// The query cache's current stamp, taken before a read whose result it may keep.
     QueryCacheStamp,
+    /// Whether the deletion cache marks `graph_iri` deleted, an expired mark included.
+    DeletionMark {
+        graph_iri: String,
+    },
+    /// Caches whether `graph_iri` is deleted, as its lifecycle row says.
+    MarkDeletion {
+        graph_iri: String,
+        deleted: bool,
+    },
+    /// Drops a deleted graph's cached registry rows and marks it deleted.
+    ForgetGraph {
+        graph_iri: String,
+    },
     // Reads within a scope an operation decided.
     /// One SPARQL query over exactly `graph_iris`, failing on a missing one, or, when not
     /// `exact`, over those of them the store holds.
@@ -1564,6 +1577,9 @@ impl MetadataEffect {
             MetadataEffect::StoreRegistry { .. } => "store_registry",
             MetadataEffect::RefreshLifecycle { .. } => "refresh_lifecycle",
             MetadataEffect::QueryCacheStamp => "query_cache_stamp",
+            MetadataEffect::DeletionMark { .. } => "deletion_mark",
+            MetadataEffect::MarkDeletion { .. } => "mark_deletion",
+            MetadataEffect::ForgetGraph { .. } => "forget_graph",
             MetadataEffect::QueryScope { .. } => "query_scope",
             MetadataEffect::SearchScope { .. } => "search_scope",
             MetadataEffect::DescribeHits { .. } => "describe_hits",
@@ -1617,6 +1633,9 @@ impl MetadataEffect {
             | MetadataEffect::StoreRegistry { .. }
             | MetadataEffect::RefreshLifecycle { .. }
             | MetadataEffect::QueryCacheStamp
+            | MetadataEffect::DeletionMark { .. }
+            | MetadataEffect::MarkDeletion { .. }
+            | MetadataEffect::ForgetGraph { .. }
             | MetadataEffect::QueryScope { .. }
             | MetadataEffect::SearchScope { .. }
             | MetadataEffect::DescribeHits { .. } => None,
@@ -1771,6 +1790,12 @@ pub enum MetadataEvent {
     RegistryStored {
         accepted: bool,
     },
+    /// Whether the deletion cache marks the graph deleted.
+    DeletionMark {
+        deleted: bool,
+    },
+    /// The deletion cache took a mark.
+    DeletionMarked,
     /// The kept shape sources of one Profile revision, if any; a store answers with `None`.
     ProfileShapes {
         shapes: Option<Vec<String>>,

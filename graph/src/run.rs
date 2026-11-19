@@ -1000,6 +1000,9 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::QueryCacheGet { .. }
         | MetadataEffect::QueryCachePut { .. }
         | MetadataEffect::QueryCacheStamp
+        | MetadataEffect::DeletionMark { .. }
+        | MetadataEffect::MarkDeletion { .. }
+        | MetadataEffect::ForgetGraph { .. }
         | MetadataEffect::RegistrySnapshot
         | MetadataEffect::StoreRegistry { .. }
         | MetadataEffect::RefreshLifecycle { .. }

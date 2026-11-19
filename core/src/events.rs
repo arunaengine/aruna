@@ -935,6 +935,8 @@ impl MetadataEvent {
                 RegistrySnapshot,
                 RegistryStored,
                 QueryCacheStored,
+                DeletionMark,
+                DeletionMarked,
                 Error,
             }
         )
