@@ -340,10 +340,8 @@ pub struct IncomingVersionOperation {
     publisher_node_id: NodeId,
     local_realm_id: RealmId,
     manifest: VersionReplicationManifest,
-    /// The clock the enqueue phase samples. A reclaim candidate is stamped when
-    /// it is enqueued, so a long apply still gets its full grace window instead
-    /// of inheriting an operation-start time that may already be stale.
-    /// The runner clock of the current step.
+    /// The runner clock of the current step. A reclaim candidate is stamped when it is
+    /// enqueued, so a long apply still gets its full grace window.
     now_ms: u64,
     ids: IdMint,
     /// This instance is the apply: one write transaction over the rows of the version.
