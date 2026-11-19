@@ -8,7 +8,6 @@ pub mod deliver;
 pub mod dispatch;
 pub mod email;
 pub mod email_job;
-pub mod emit;
 pub mod enqueue;
 pub mod holder;
 pub mod inbox;

@@ -32,7 +32,7 @@ use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::epoch_due::DueMarks;
-use crate::notifications::emit::emit_notifications_effect;
+use crate::sync::notification_outbox::emit_notifications_effect;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };

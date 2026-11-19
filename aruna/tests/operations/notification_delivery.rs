@@ -30,12 +30,14 @@ use aruna_operations::notifications::client::{
     HolderRequestOperation, marked_read, unread_counted,
 };
 use aruna_operations::notifications::dispatch::NotificationDispatchError;
-use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::settings::{Delivery, DeliveryOperation};
 use aruna_operations::notifications::webhook::{
     ReadWebhookOperation, RemoveWebhookOperation, SetWebhookOperation, WebhookOutcome,
+};
+use aruna_operations::sync::notification_outbox::{
+    EmitNotificationsInput, EmitNotificationsOperation,
 };
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
