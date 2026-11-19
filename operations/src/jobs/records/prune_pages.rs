@@ -181,7 +181,7 @@ mod tests {
 
     // An own chain goes tail first; a page another family names stays.
     #[test]
-    fn own_chain_tail_first() {
+    fn chain_tail_first() {
         let (tail, tail_digest) = page(1, None);
         let (head, head_digest) = page(0, Some(tail_digest));
         let mut pages = PrunePagesOperation::new(family(1));
