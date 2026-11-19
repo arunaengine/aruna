@@ -243,7 +243,6 @@ impl ReplicationHarness {
         let waited = wait_until(
             "sync relationship creation",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || async {
                 let response = reqwest::Client::new()
                     .post(format!("{base_url}/api/v1/data/sync/relationships"))
@@ -334,7 +333,6 @@ impl ReplicationHarness {
         wait_until(
             "sync creator membership convergence",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let base_url = self.joiner.base_url.clone();
                 let group_id = self.group_id.clone();
@@ -424,7 +422,6 @@ impl ReplicationHarness {
         wait_until(
             "replicated object availability",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let joiner_client = self.joiner_client.clone();
                 let bucket = bucket.to_string();
@@ -485,6 +482,7 @@ impl ReplicationHarness {
                 Some(404),
                 "the object must be absent on the joiner, not merely forbidden"
             );
+            // Real time: the object must stay absent over the whole window, not at one look.
             tokio::time::sleep(interval).await;
         }
         Ok(())
@@ -506,7 +504,6 @@ async fn wait_for_body(
     wait_until(
         description,
         shared::WAIT_CAP,
-        Duration::from_millis(200),
         || {
             let client = client.clone();
             let bucket = bucket.to_string();
@@ -651,7 +648,6 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
         wait_until(
             "remapped delete marker visibility",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let joiner_client = harness.joiner_client.clone();
                 async move {
@@ -957,7 +953,6 @@ async fn reference_syncs_lazily() -> TestResult<()> {
         wait_until(
             "reference delete marker",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let context = harness.joiner.context.clone();
                 async move {
@@ -1034,7 +1029,6 @@ async fn reference_syncs_lazily() -> TestResult<()> {
         wait_until(
             "incoming mirror removal",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let context = harness.joiner.context.clone();
                 async move {
@@ -1122,7 +1116,6 @@ async fn quota_surfaces_failure() -> TestResult<()> {
         wait_until(
             "quota configuration convergence",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || async {
                 let Ok(response) = reqwest::Client::new()
                     .get(format!("{}/api/v1/system/realm", harness.joiner.base_url))
@@ -1165,7 +1158,6 @@ async fn quota_surfaces_failure() -> TestResult<()> {
         wait_until(
             "quota failure relationship status",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let harness = &harness;
                 let relationship_id = relationship.id.clone();
@@ -1266,7 +1258,6 @@ async fn permission_rechecks_creator() -> TestResult<()> {
         wait_until(
             "creator permission failure status",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let harness = &harness;
                 let relationship_id = relationship.id.clone();
@@ -1423,7 +1414,6 @@ async fn orphan_mirror_rollback() -> TestResult<()> {
         wait_until(
             "joiner refuses the creator WRITE",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || async {
                 matches!(
                     drive(
@@ -1462,7 +1452,6 @@ async fn orphan_mirror_rollback() -> TestResult<()> {
         wait_until(
             "orphan sync mirror rollback",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || async {
                 let mirror = row_exists(
                     &harness.joiner.context,
@@ -1601,7 +1590,6 @@ async fn chain_blocks_cycle() -> TestResult<()> {
         wait_until(
             "chained replication queue drain",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || async {
                 keyspace_empty(
                     harness.seed.context.as_ref(),
@@ -1729,7 +1717,6 @@ async fn delete_marker_replicates() -> TestResult<()> {
         wait_until(
             "replicated delete marker visibility",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let joiner_client = harness.joiner_client.clone();
                 async move {
@@ -1910,7 +1897,6 @@ async fn repair_honors_restrictions() -> TestResult<()> {
         wait_until(
             "replication obligation repair",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || async {
                 keyspace_empty(
                     harness.seed.context.as_ref(),
@@ -2223,7 +2209,7 @@ async fn encrypted_sync_regrants() -> TestResult<()> {
         let query = [("bucket", target), ("key", key), ("version_id", version)];
         let envelope_route = format!("{base}/api/v1/data/blobs/envelope");
         let url = reqwest::Url::parse_with_params(&envelope_route, query)?;
-        wait_until("target envelope", shared::WAIT_CAP, Duration::from_millis(200), || {
+        wait_until("target envelope", shared::WAIT_CAP, || {
             let request = http.get(url.clone()).bearer_auth(token);
             async move { request.send().await.is_ok_and(|r| r.status() == StatusCode::OK) }
         })

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::topology::init_logging;
+use aruna_clock::testing::poll_until;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -246,16 +247,12 @@ async fn wait_for(
     deadline: Duration,
     mut condition: impl AsyncFnMut() -> Result<bool, BoxError>,
 ) -> Result<bool, BoxError> {
-    let started = Instant::now();
-    loop {
-        if condition().await? {
-            return Ok(true);
-        }
-        if started.elapsed() > deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let held = poll_until(deadline, async || match condition().await {
+        Ok(false) => None,
+        answer => Some(answer),
+    })
+    .await;
+    held.unwrap_or(Ok(false))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

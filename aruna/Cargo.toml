@@ -79,6 +79,7 @@ rand = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+aruna-clock = { workspace = true, features = ["test-hooks"] }
 aruna-api = { workspace = true, features = ["test-hooks"] }
 aruna-test-support = { workspace = true }
 aruna-cli = { workspace = true }

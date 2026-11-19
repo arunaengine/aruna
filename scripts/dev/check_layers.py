@@ -170,6 +170,8 @@ CLOCK_RE = re.compile(
 )
 EFFECT_OP_RE = re.compile(r"\bimpl(?:\s*<[^{;]*?>)?\s+(?:[\w:]+::)?EffectOperation\s+for\b")
 PAUSE_RE = re.compile(r"\bstart_paused\b|\bpause\s*\(\s*\)")
+# The shared bounded poll helper; the one real sleep in tests the guard does not count.
+POLL_HELPER = ("clock/src/testing.rs", "poll_until")
 SKIP_RE = re.compile(r"\be?println!\s*\([^;]*\)\s*;\s*(?:return\b|None\s*[},])")
 SPACE_RE = re.compile(r"\s+")
 COMMA_RE = re.compile(r"\s*,")
@@ -594,31 +596,48 @@ def function_bodies(masked):
 
 
 def test_habits(sources):
-    """Real sleeps outside paused tests, and tests that print and return early."""
+    """Real sleeps outside paused tests and test-hooks helpers, and tests that print and return
+    early."""
     sleeps, skips = [], []
+    hooked = hook_modules(sources)
     for source in sources:
         text = source.test_masked
         if "sleep" in text:
             sleeps.extend(real_sleeps(source.rel, text))
+        hooks = hook_text(source, hooked)
+        if "sleep" in hooks:
+            sleeps.extend(real_sleeps(source.rel, hooks))
         if "println!" in text:
             for found in SKIP_RE.finditer(text):
                 skips.append(f"{source.rel}:{text.count(chr(10), 0, found.start()) + 1}")
     return sleeps, skips
 
 
+def hook_text(source, hooked):
+    """The production text that only the test-hooks feature compiles: a gated module file whole,
+    else its gated items."""
+    if any(source.rel == f"{prefix}.rs" or source.rel.startswith(f"{prefix}/") for prefix in hooked):
+        return source.masked
+    spans = hook_spans(source)
+    return blank(source.masked, outside(spans, len(source.masked))) if spans else ""
+
+
 def real_sleeps(rel, text):
-    """Sleep calls whose outermost enclosing fn neither starts paused nor pauses time."""
+    """Sleep calls whose outermost enclosing fn neither starts paused nor pauses time, outside
+    the one shared bounded poll helper."""
     outer, found_sleeps = [], []
-    for _, keyword, start, end in function_bodies(text):
+    for name, keyword, start, end in function_bodies(text):
         if outer and start < outer[-1][2]:
             continue
         head = max(text.rfind("}", 0, keyword), text.rfind(";", 0, keyword), 0)
-        outer.append((head, start, end))
+        outer.append((head, start, end, name))
     for found in SLEEP_RE.finditer(text):
         if text[: found.start()].rstrip().endswith("fn"):
             continue
         owner = next((item for item in outer if item[0] <= found.start() < item[2]), None)
         if owner and PAUSE_RE.search(text, owner[0], owner[2]):
+            continue
+        if owner and (rel, owner[3]) == POLL_HELPER:
             continue
         found_sleeps.append(f"{rel}:{text.count(chr(10), 0, found.start()) + 1}")
     return found_sleeps

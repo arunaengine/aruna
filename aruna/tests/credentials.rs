@@ -408,7 +408,6 @@ async fn credential_outlives_session() -> TestResult<()> {
     wait_until(
         "the issuing token to expire",
         WAIT_CAP,
-        Duration::from_millis(500),
         || async move {
             let response = reqwest::Client::new()
                 .get(group_path)

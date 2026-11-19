@@ -33,4 +33,5 @@ tantivy = { workspace = true }
 test-hooks = []
 
 [dev-dependencies]
+aruna-clock = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }

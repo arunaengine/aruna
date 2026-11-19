@@ -10,7 +10,6 @@ use aws_sdk_s3::primitives::ByteStream;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Once;
-use std::time::Duration;
 
 static MOCK_KEYRING: Once = Once::new();
 
@@ -294,7 +293,6 @@ async fn metadata_round_trip() -> TestResult<()> {
         shared::wait_until(
             "the new crate in search",
             shared::WAIT_CAP,
-            Duration::from_millis(100),
             || async {
                 cli_json(&config, &["meta", "search", "zyxwquokka"])
                     .await

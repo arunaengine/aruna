@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use aruna::inbound::{initialize_incoming_fixture, initialize_net_holder};
 use aruna::tasks::incoming::start_task_queues;
 use aruna_blob::blob::BlobHandler;
+use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::REALMS_LIST_KEY;
@@ -1612,8 +1613,8 @@ pub async fn respawn_with_retry(
     dir: &Path,
     hold_shutdown: bool,
 ) -> Result<TestNode, BoxError> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
+    let mut last = String::new();
+    let spawned = poll_until(Duration::from_secs(20), async || {
         let spawned = spawn_node_with(
             realm_id,
             Some(secret_key.clone()),
@@ -1621,15 +1622,15 @@ pub async fn respawn_with_retry(
             hold_shutdown,
         );
         match spawned.await {
-            Ok(node) => return Ok(node),
+            Ok(node) => Some(node),
             Err(error) => {
-                if Instant::now() >= deadline {
-                    return Err(format!("respawn failed after retries: {error}").into());
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                last = error.to_string();
+                None
             }
         }
-    }
+    })
+    .await;
+    spawned.ok_or_else(|| format!("respawn failed after retries: {last}").into())
 }
 
 /// Installs the default realm config with every node as a management node, then repeats

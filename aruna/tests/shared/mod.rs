@@ -23,6 +23,7 @@ use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_blob::blob::{BackendRegistry, BlobHandler};
+use aruna_clock::testing::poll_until;
 use aruna_compute::ExecutorRegistry;
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
@@ -66,14 +67,13 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep, timeout as time_limit};
+use tokio::time::timeout as time_limit;
 use ulid::Ulid;
 
 pub(crate) type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(crate) const AWS_REGION: &str = "eu-central-1";
 pub(crate) const WAIT_CAP: Duration = Duration::from_secs(300);
 const CONDITION_CAP: Duration = Duration::from_secs(30);
-const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Deadlock cap for one shutdown phase: far above any honest shutdown, so a
 /// stuck child is reported by name instead of hanging until the job timeout.
 const SHUTDOWN_CAP: Duration = Duration::from_secs(120);
@@ -244,33 +244,26 @@ pub(crate) async fn shutdown_pair(joiner: JoinerNode, seed: SeedNode) {
     tokio::join!(joiner.shutdown(), seed.shutdown());
 }
 
+/// Asks `condition` until it holds, each ask capped at `CONDITION_CAP`, through the shared
+/// bounded poll; fails once `timeout` has passed.
 pub(crate) async fn wait_until<F, Fut>(
     description: &str,
     timeout: Duration,
-    mut interval: Duration,
     mut condition: F,
 ) -> TestResult<()>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if time_limit(timeout.min(CONDITION_CAP), condition())
-            .await
-            .is_ok_and(|ready| ready)
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(
-                std::io::Error::other(format!("timed out waiting for {description}")).into(),
-            );
-        }
-        sleep(interval).await;
-        // Heavy predicates (HTTP plus S3 round trips) must not busy-poll a
-        // loaded node for the whole cap.
-        interval = interval.saturating_mul(2).min(MAX_POLL_INTERVAL);
+    let cap = timeout.min(CONDITION_CAP);
+    let held = poll_until(timeout, || {
+        let ask = condition();
+        async move { time_limit(cap, ask).await.is_ok_and(|ready| ready).then_some(()) }
+    })
+    .await;
+    match held {
+        Some(()) => Ok(()),
+        None => Err(std::io::Error::other(format!("timed out waiting for {description}")).into()),
     }
 }
 
@@ -282,7 +275,6 @@ pub(crate) async fn wait_realm_nodes(
     wait_until(
         "realm node convergence",
         WAIT_CAP,
-        Duration::from_millis(100),
         || async {
             for context in contexts {
                 match drive(GetNodesOperation::new(*realm_id), context).await {
@@ -457,7 +449,6 @@ pub(crate) async fn wait_group_http(
     wait_until(
         "group visibility over REST",
         WAIT_CAP,
-        Duration::from_millis(100),
         || async {
             get_group_http(base_url, bearer_token, group_id)
                 .await
@@ -478,7 +469,6 @@ pub(crate) async fn wait_group_member(
     wait_until(
         "group membership over REST",
         WAIT_CAP,
-        Duration::from_millis(100),
         || async {
             get_group_http(base_url, bearer_token, group_id)
                 .await
@@ -513,11 +503,9 @@ pub(crate) async fn request_credentials(
     group_id: &str,
     path_restrictions: Option<Vec<CreatePathRestriction>>,
 ) -> TestResult<S3Credentials> {
-    let client = reqwest::Client::new();
-    let deadline = Instant::now() + WAIT_CAP;
-    let mut interval = Duration::from_millis(100);
-    loop {
-        let response = client
+    let (client, path_restrictions) = (&reqwest::Client::new(), &path_restrictions);
+    let answered = poll_until(WAIT_CAP, move || async move {
+        let sent = client
             .post(format!("{base_url}/api/v1/access/credentials"))
             .bearer_auth(bearer_token)
             .json(&CreateS3Request {
@@ -528,26 +516,31 @@ pub(crate) async fn request_credentials(
                 token_public_key: None,
             })
             .send()
-            .await?;
-        if response.status() == StatusCode::CREATED {
-            let response: CreateS3Response = response.json().await?;
-            return Ok(S3Credentials {
-                access_key_id: response.access_key_id,
-                access_secret: response.access_secret,
-            });
+            .await;
+        match sent {
+            Ok(response) if response.status() == StatusCode::SERVICE_UNAVAILABLE => None,
+            sent => Some(sent),
         }
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if status != StatusCode::SERVICE_UNAVAILABLE || Instant::now() >= deadline {
-            return Err(std::io::Error::other(format!(
-                "unexpected create credentials status: {} body={}",
-                status, body
-            ))
-            .into());
-        }
-        sleep(interval).await;
-        interval = interval.saturating_mul(2).min(Duration::from_secs(1));
+    })
+    .await;
+    let Some(response) = answered else {
+        return Err(std::io::Error::other("create credentials stayed unavailable").into());
+    };
+    let response = response?;
+    if response.status() == StatusCode::CREATED {
+        let response: CreateS3Response = response.json().await?;
+        return Ok(S3Credentials {
+            access_key_id: response.access_key_id,
+            access_secret: response.access_secret,
+        });
     }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(std::io::Error::other(format!(
+        "unexpected create credentials status: {} body={}",
+        status, body
+    ))
+    .into())
 }
 
 #[allow(dead_code)]

@@ -5,6 +5,7 @@
 
 use super::tests::{commit_transaction, start_write_transaction, worker};
 use super::{FjallStorage, StorageHandle};
+use aruna_clock::testing::poll_until;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, USAGE_PREIMAGE_KEYSPACE};
@@ -16,7 +17,7 @@ use aruna_core::types::TxnId;
 use byteview::ByteView;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, PersistMode};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::tempdir;
 
 const SPACE: &str = "usage_stats";
@@ -422,11 +423,9 @@ pub(super) fn seal_journal(db: &OptimisticTxDatabase) {
 
 /// Waits until Fjall deletes the first journal in `dir`.
 pub(super) async fn first_dropped(dir: &Path) {
-    let cap = Instant::now() + Duration::from_secs(120);
-    while dir.join("0.jnl").exists() {
-        assert!(Instant::now() < cap, "the first journal is never deleted");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let gone = async || (!dir.join("0.jnl").exists()).then_some(());
+    let dropped = poll_until(Duration::from_secs(120), gone).await;
+    assert!(dropped.is_some(), "the first journal is never deleted");
 }
 
 /// Clearing kept values that a sealed journal holds lets Fjall delete that journal.

@@ -8,9 +8,10 @@
 use crate::shared;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aruna::tasks::runner::{ComputeReconciler, run_execution_job};
+use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::docker::DockerBackend;
@@ -243,28 +244,36 @@ async fn wait_state(
     want: JobState,
     idle: Duration,
 ) -> JobState {
-    let mut progress = None;
-    let mut deadline = Instant::now() + idle;
+    // Each window of `idle` ends early on a changed record, so only a stalled job fails.
+    let progress = &std::sync::Mutex::new(None);
     loop {
-        let record = drive(row_calls::read_job_record(job_id), ctx)
-            .await
-            .ok()
-            .flatten();
-        if let Some(record) = &record
-            && (record.state == want || (record.state.is_terminal() && want.is_terminal()))
-        {
-            return record.state;
+        let seen = poll_until(idle, move || async move {
+            let record = drive(row_calls::read_job_record(job_id), ctx)
+                .await
+                .ok()
+                .flatten();
+            if let Some(record) = &record
+                && (record.state == want || (record.state.is_terminal() && want.is_terminal()))
+            {
+                return Some(Some(record.state));
+            }
+            let observed = record.map(|record| (record.state, record.updated_at_ms));
+            let mut progress = progress.lock().unwrap();
+            if observed == *progress {
+                return None;
+            }
+            *progress = observed;
+            Some(None)
+        })
+        .await;
+        match seen {
+            Some(Some(state)) => return state,
+            Some(None) => {}
+            None => {
+                let state = progress.lock().unwrap().map(|(state, _)| state);
+                panic!("timed out waiting for {want:?}, last state {state:?}");
+            }
         }
-        let observed = record.map(|record| (record.state, record.updated_at_ms));
-        if observed != progress {
-            progress = observed;
-            deadline = Instant::now() + idle;
-        }
-        if Instant::now() >= deadline {
-            let state = progress.map(|(state, _)| state);
-            panic!("timed out waiting for {want:?}, last state {state:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -291,21 +300,14 @@ async fn wait_run_crate(
     job_id: JobId,
     timeout: Duration,
 ) -> Option<RunCrateStatus> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(Some(status)) = drive(row_calls::read_crate_status(job_id), ctx).await
-            && !matches!(
-                status,
-                RunCrateStatus::Pending | RunCrateStatus::Minted { .. }
-            )
-        {
-            return Some(status);
+    poll_until(timeout, move || async move {
+        match drive(row_calls::read_crate_status(job_id), ctx).await {
+            Ok(Some(RunCrateStatus::Pending | RunCrateStatus::Minted { .. })) => None,
+            Ok(status) => status,
+            Err(_) => None,
         }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    })
+    .await
 }
 
 /// Runs a container that upper-cases the source into `outputs/result.txt`; it must succeed.
@@ -471,18 +473,12 @@ async fn follows_provenance() -> TestResult<()> {
         .expect("run");
     let document = run["run_crate"].as_str().expect("the run names its crate");
     // The crate graph is read once it is materialized.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let run_crate = loop {
-        let path = format!("/metadata/{document}/rocrate");
-        if let Some(answer) = api_get(&fixture, &path, &[]).await {
-            break answer["rocrate"].clone();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the run crate never materialized"
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    };
+    let (fixture_ref, path) = (&fixture, &format!("/metadata/{document}/rocrate"));
+    let answer = poll_until(Duration::from_secs(60), move || async move {
+        api_get(fixture_ref, path, &[]).await
+    })
+    .await;
+    let run_crate = answer.expect("the run crate never materialized")["rocrate"].clone();
 
     let input_id = exact_version(&run_crate, &format!("s3://{bucket}/data.txt"));
     let input = api_get(&fixture, "/data/origin", &[("version", &input_id)])
@@ -716,9 +712,9 @@ fn nextflow_task(bucket: &str) -> Value {
     })
 }
 
-/// Polls one TES task until its state is terminal; the caller bounds the wait.
+/// Polls one TES task until its state is terminal, up to a generous hang cap.
 async fn wait_task(client: &reqwest::Client, url: &str, creds: &S3Credentials) -> Value {
-    loop {
+    let ended = poll_until(Duration::from_secs(600), move || async move {
         let task: Value = client
             .get(format!("{url}?view=FULL"))
             .basic_auth(&creds.access_key_id, Some(&creds.access_secret))
@@ -729,14 +725,14 @@ async fn wait_task(client: &reqwest::Client, url: &str, creds: &S3Credentials) -
             .await
             .unwrap_or_default();
         let state = task["state"].as_str().map(str::to_string);
-        if matches!(
+        let terminal = matches!(
             state.as_deref(),
             Some("COMPLETE" | "EXECUTOR_ERROR" | "SYSTEM_ERROR" | "CANCELED")
-        ) {
-            return task;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+        );
+        terminal.then_some(task)
+    })
+    .await;
+    ended.expect("the task never ended")
 }
 
 async fn read_object(s3: &aws_sdk_s3::Client, bucket: &str, key: String) -> Option<Vec<u8>> {

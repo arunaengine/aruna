@@ -4,14 +4,16 @@
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aruna_clock::testing::poll_until;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_test_support::metadata::materialization_jobs_exist;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::timeout;
 use ulid::Ulid;
 
 pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -24,37 +26,43 @@ pub const HANG_CAP: Duration = Duration::from_secs(300);
 /// forward, so a slow run is never failed for slowness, only for being stuck.
 pub const NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
 
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Polls until no work remains, resetting the deadline after each observed decrease.
+/// Polls until no work remains. Each lost-progress window ends early on an observed decrease,
+/// so only a whole window without one fails.
 pub async fn wait_for_convergence<F, Fut, E>(context: &str, check: F) -> Result<(), E>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<usize, E>>,
     E: From<String>,
 {
-    let mut best = usize::MAX;
-    let mut deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
-    let mut poll_interval = POLL_INTERVAL;
+    let (best, last) = (AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX));
+    let (check, best, last) = (&check, &best, &last);
     loop {
-        let pending = match timeout(HANG_CAP, check()).await {
-            Ok(result) => result?,
-            Err(_) => panic!("hang cap fired: `{context}` poll exceeded {HANG_CAP:?}"),
-        };
-        if pending == 0 {
-            return Ok(());
+        let seen = poll_until(NO_PROGRESS_TIMEOUT, move || async move {
+            let pending = match timeout(HANG_CAP, check()).await {
+                Ok(Ok(pending)) => pending,
+                Ok(Err(error)) => return Some(Err(error)),
+                Err(_) => panic!("hang cap fired: `{context}` poll exceeded {HANG_CAP:?}"),
+            };
+            last.store(pending, Relaxed);
+            match pending {
+                0 => Some(Ok(true)),
+                fewer if fewer < best.load(Relaxed) => {
+                    best.store(fewer, Relaxed);
+                    Some(Ok(false))
+                }
+                _ => None,
+            }
+        })
+        .await;
+        match seen {
+            Some(Ok(true)) => return Ok(()),
+            Some(Ok(false)) => {}
+            Some(Err(error)) => return Err(error),
+            None => {
+                let pending = last.load(Relaxed);
+                return Err(format!("{context} (still pending: {pending})").into());
+            }
         }
-        if pending < best {
-            best = pending;
-            deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
-            poll_interval = POLL_INTERVAL;
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("{context} (still pending: {pending})").into());
-        }
-        sleep(poll_interval).await;
-        poll_interval = poll_interval.saturating_mul(2).min(MAX_POLL_INTERVAL);
     }
 }
 
@@ -63,43 +71,32 @@ where
 pub async fn wait_for_visibility(
     contexts: &[Arc<DriverContext>],
     pairs: &[(GroupId, Ulid)],
-    poll_interval: Duration,
 ) -> Result<(), String> {
-    let mut remaining: Vec<Vec<(GroupId, Ulid)>> =
-        contexts.iter().map(|_| pairs.to_vec()).collect();
-    let mut best = usize::MAX;
-    let mut deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
-
-    loop {
-        for (context, missing) in contexts.iter().zip(remaining.iter_mut()) {
+    let remaining: Mutex<Vec<Vec<(GroupId, Ulid)>>> =
+        Mutex::new(contexts.iter().map(|_| pairs.to_vec()).collect());
+    let remaining = &remaining;
+    let waited = wait_for_convergence("visibility stalled", move || async move {
+        let missing_before = remaining.lock().unwrap().clone();
+        let mut missing_now = Vec::with_capacity(contexts.len());
+        for (context, missing) in contexts.iter().zip(missing_before) {
             let mut still_missing = Vec::new();
-            for &(group_id, document_id) in missing.iter() {
-                if drive(
-                    GetDocumentOperation::new(group_id, document_id),
-                    context.as_ref(),
-                )
-                .await
-                .is_err()
-                {
+            for (group_id, document_id) in missing {
+                let read = GetDocumentOperation::new(group_id, document_id);
+                if drive(read, context.as_ref()).await.is_err() {
                     still_missing.push((group_id, document_id));
                 }
             }
-            *missing = still_missing;
+            missing_now.push(still_missing);
         }
-        let pending: usize = remaining.iter().map(Vec::len).sum();
-        if pending == 0 {
-            return Ok(());
-        }
-        if pending < best {
-            best = pending;
-            deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
-        }
-        if Instant::now() >= deadline {
-            let counts: Vec<usize> = remaining.iter().map(Vec::len).collect();
-            return Err(format!("visibility stalled; missing per node: {counts:?}"));
-        }
-        sleep(poll_interval).await;
-    }
+        let pending = missing_now.iter().map(Vec::len).sum();
+        *remaining.lock().unwrap() = missing_now;
+        Ok::<usize, String>(pending)
+    })
+    .await;
+    waited.map_err(|_| {
+        let counts: Vec<usize> = remaining.lock().unwrap().iter().map(Vec::len).collect();
+        format!("visibility stalled; missing per node: {counts:?}")
+    })
 }
 
 /// Waits until no node has a metadata materialization job left.

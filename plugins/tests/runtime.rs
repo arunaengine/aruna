@@ -38,6 +38,8 @@ struct Recorder {
     abandoned: Mutex<Vec<u32>>,
     /// Signals that a call to the `block` resource is waiting.
     blocked: tokio::sync::Notify,
+    /// Lets a write to the `slow` resource finish.
+    released: tokio::sync::Notify,
 }
 
 impl Recorder {
@@ -71,6 +73,7 @@ impl Broker for Recorder {
                     json: format!(r#"{{"name":"{}"}}"#, "x".repeat(8192)),
                 });
             }
+            // Real time: a host call that takes wall time while the guest waits on it.
             "slow" => tokio::time::sleep(Duration::from_millis(50)).await,
             "block" => {
                 self.blocked.notify_one();
@@ -106,7 +109,7 @@ impl Broker for Recorder {
         self.intents.lock().unwrap().push(patch.intent);
         match patch.resource.as_str() {
             "stall" => std::future::pending::<()>().await,
-            "slow" => tokio::time::sleep(Duration::from_millis(1500)).await,
+            "slow" => self.released.notified().await,
             _ => {}
         }
         self.note("metadata_patch_done");
@@ -686,7 +689,12 @@ async fn write_outlives_timeout() {
     );
     patch.limits.wall = Duration::from_secs(1);
     patch.limits.write = Duration::from_secs(5);
-    let ended = invoke(patch, broker.clone()).await;
+    // The write ends after the wall limit and inside the write limit, on paused time.
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        broker.released.notify_one();
+    };
+    let (ended, ()) = tokio::join!(invoke(patch, broker.clone()), release);
     assert!(matches!(ended, Err(InvokeError::Timeout)), "{ended:?}");
     assert_eq!(
         broker.calls(),

@@ -558,6 +558,7 @@ version = "3.0.0-alpha.207"
 dependencies = [
  "aruna-core",
  "nix",
+ "tokio",
  "ulid 3.0.0",
 ]
 

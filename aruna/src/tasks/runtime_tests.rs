@@ -6,6 +6,7 @@ use crate::tasks::runner::{
     claim_producer, finish_job, recover_stale_jobs, recover_until_stopped, run_job, shutdown_jobs,
     spawn_job, wait_for_terminal,
 };
+use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -43,6 +44,9 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
+
+/// A hang cap for the waits on the job runtime, never a speed bound.
+const WAIT_CAP: Duration = Duration::from_secs(60);
 
 fn node_id(seed: u8) -> NodeId {
     let mut seed_bytes = [0u8; 32];
@@ -90,15 +94,12 @@ async fn reclaim(context: &DriverContext, job_id: JobId) -> JobRecord {
 }
 
 async fn wait_running(context: &DriverContext, job_id: JobId) {
-    for _ in 0..400 {
-        if let Ok(Some(record)) = read_job_record(context, job_id, None).await
-            && record.state == JobState::Running
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("job never reached Running");
+    let running = poll_until(WAIT_CAP, move || async move {
+        let record = read_job_record(context, job_id, None).await;
+        matches!(record, Ok(Some(record)) if record.state == JobState::Running).then_some(())
+    })
+    .await;
+    assert!(running.is_some(), "job never reached Running");
 }
 
 fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
@@ -151,12 +152,7 @@ async fn cancel_running_cleanup() {
     let claimed = claim(&ctx, probe_record(job_id, 10_000, 5, Some(marker_str))).await;
 
     spawn_job(&runtime, ctx.clone(), claimed);
-    for _ in 0..100 {
-        if marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    poll_until(WAIT_CAP, || std::future::ready(marker.exists().then_some(()))).await;
     assert!(
         marker.exists(),
         "probe should create its marker while running"
@@ -168,12 +164,7 @@ async fn cancel_running_cleanup() {
         .unwrap();
     assert_eq!(state, JobState::Cancelled);
     // Cleanup follows the stored terminal state, so it may still be running here.
-    for _ in 0..1000 {
-        if !marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    poll_until(WAIT_CAP, || std::future::ready((!marker.exists()).then_some(()))).await;
     assert!(!marker.exists(), "cleanup hook must remove the marker");
 }
 
@@ -284,12 +275,7 @@ async fn zombie_skips_cleanup() {
         (cancel.clone(), None),
         (CancellationToken::new(), RangeTurns::default(), Vec::new()),
     ));
-    for _ in 0..100 {
-        if marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    poll_until(WAIT_CAP, || std::future::ready(marker.exists().then_some(()))).await;
     assert!(marker.exists(), "probe must reach its cleanup side effect");
 
     requeue_job(
@@ -615,12 +601,7 @@ async fn shutdown_skips_cleanup() {
     let runtime = JobsRuntime::new();
     spawn_job(&runtime, ctx.clone(), claimed);
     wait_running(&ctx, job_id).await;
-    for _ in 0..100 {
-        if marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    poll_until(WAIT_CAP, || std::future::ready(marker.exists().then_some(()))).await;
     assert!(marker.exists(), "probe should create its marker");
 
     let report = shutdown_jobs(&runtime, &ctx, Duration::from_secs(10)).await;
@@ -717,15 +698,9 @@ async fn panic_frees_slot() {
     let claimed = claim(&ctx, record).await;
 
     spawn_job(&runtime, ctx.clone(), claimed);
-    let mut freed = false;
-    for _ in 0..400 {
-        if runtime.available_slots() == 1 {
-            freed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert!(freed, "panic must release the concurrency slot");
+    let one_free = || std::future::ready((runtime.available_slots() == 1).then_some(()));
+    let freed = poll_until(WAIT_CAP, one_free).await;
+    assert!(freed.is_some(), "panic must release the concurrency slot");
 
     let ok = JobId::from_bytes([0xAB; 16]);
     let claimed = claim(&ctx, probe_record(ok, 2, 0, None)).await;
