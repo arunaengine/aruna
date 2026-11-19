@@ -29,6 +29,10 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+/// The unverified data link posting the next pass continues after; a restart begins again at
+/// the start.
+static UNVERIFIED_CURSOR: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
 #[cfg(debug_assertions)]
 struct OutboxBarrier {
     marker: std::path::PathBuf,
@@ -74,6 +78,7 @@ use crate::jobs::prune::{
 use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::job_calls;
 use crate::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
+use crate::metadata::data_links::RetryUnverifiedOperation;
 use crate::metadata::materialization_queue::{
     MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER, MetadataDrainResult, NEXT_BATCH_AFTER,
     materialization_jobs_exist, process_materialization_batch, requeue_dead_letters,
@@ -1074,9 +1079,17 @@ impl OperationsTaskHandler {
                     }
                 };
                 // Version links metadata could not verify in a set are retried a page per pass.
-                match crate::metadata::data_links::retry_unverified(context).await {
-                    Ok(true) => after = std::time::Duration::ZERO,
-                    Ok(false) => {}
+                let resume = (UNVERIFIED_CURSOR.lock().ok()).and_then(|cursor| cursor.clone());
+                let retry = RetryUnverifiedOperation::new(context.node_and_realm(), resume);
+                match crate::driver::drive(retry, context).await {
+                    Ok(next) => {
+                        if next.is_some() {
+                            after = std::time::Duration::ZERO;
+                        }
+                        if let Ok(mut cursor) = UNVERIFIED_CURSOR.lock() {
+                            *cursor = next;
+                        }
+                    }
                     Err(error) => warn!(%error, "Unverified data links could not be retried"),
                 }
                 self.reschedule_timer(TaskKey::MaintainRanges, after).await;
