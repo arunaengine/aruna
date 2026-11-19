@@ -34,8 +34,9 @@ use aruna_operations::device::sync::folders::{
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::{accept_pull, pull_status};
+use aruna_operations::driver::{DriverContext, drive, node_routing};
+use aruna_operations::metadata::protocol::MetadataTransportMessage;
+use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, needs_view};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -385,6 +386,53 @@ async fn wakes_replication_drain() -> TestResult<()> {
         "the local delete reached the realm"
     );
     await_drained(&server.context).await
+}
+
+/// What a realm node answers a device's forwarded pull request or poll, served as its inbound
+/// shell serves it.
+async fn served_pull(
+    context: &std::sync::Arc<DriverContext>,
+    peer: aruna_core::NodeId,
+    request: MetadataTransportMessage,
+) -> SyncPullStatus {
+    let view = needs_view(&request);
+    let serving = ServeNode {
+        local: context.node_and_realm(),
+        graph: context.graph_handle.is_some(),
+        indexed: context.storage_handle.range_indexes().is_some(),
+        metadata_bytes: u64::MAX,
+        here: view.then(|| context.here()),
+        routing: view.then(|| node_routing(context)),
+    };
+    let serve = ServeRequestOperation::new(peer, serving, request);
+    match drive(serve, context.as_ref()).await {
+        Ok((MetadataTransportMessage::ForwardedSyncPull { status }, _)) => status,
+        other => panic!("unexpected pull answer: {other:?}"),
+    }
+}
+
+/// Starts pulling one device version of `peer` and answers at once.
+async fn accept_pull(
+    context: &std::sync::Arc<DriverContext>,
+    peer: aruna_core::NodeId,
+    auth_token: AuthToken,
+    pull: SyncPull,
+) -> SyncPullStatus {
+    let pull = Box::new(pull);
+    let request = MetadataTransportMessage::ForwardSyncPull { auth_token, pull };
+    served_pull(context, peer, request).await
+}
+
+/// Where the pull of one device version of `peer` stands on this node.
+async fn pull_status(
+    context: &std::sync::Arc<DriverContext>,
+    peer: aruna_core::NodeId,
+    auth_token: AuthToken,
+    pull: &SyncPull,
+) -> SyncPullStatus {
+    let pull = Box::new(pull.clone());
+    let request = MetadataTransportMessage::ForwardPullStatus { auth_token, pull };
+    served_pull(context, peer, request).await
 }
 
 /// Polls an accepted pull until the realm node answers for good.
