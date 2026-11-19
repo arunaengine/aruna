@@ -22,7 +22,6 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::ExportOperation;
 use crate::metadata::api::export_types::{ENTRY_ROOM, ExportMetadataRequest, PAGE_DEFAULT, PAGE_MAX};
 use crate::metadata::api::readable::RecordReadableOperation;
-use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::device::selection::keep_read;
@@ -199,7 +198,7 @@ impl Operation for DeviceExportOperation {
             return self.graph_view();
         }
         let record = self.record()?;
-        match effect_event(result)? {
+        match result.event()? {
             Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => {
                 Ok(Next::Done(self.raw(record, Some(jsonld))))
             }
@@ -313,7 +312,7 @@ impl RoutedExportOperation {
 
     /// Like a read, an unselected replica answers only while the realm is out of reach.
     fn replica_read(&mut self, result: IoResult) -> ExportTurn {
-        let replica = read_answer(&effect_event(result)?).filter(ReplicaRecord::serves_reads);
+        let replica = read_answer(&result.event()?).filter(ReplicaRecord::serves_reads);
         let pinned = replica
             .as_ref()
             .is_some_and(|replica| replica.selected || replica.pending_edits > 0);

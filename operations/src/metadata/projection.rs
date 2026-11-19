@@ -42,7 +42,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::call_results::{effect_event, page_rows};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::record_reads::DocumentRecordOperation;
@@ -664,7 +663,7 @@ impl ProjectEventsOperation {
                     counter: batch.counter,
                 })));
             };
-            if !dot_answer(effect_event(result)?)? {
+            if !dot_answer(result.event()?)? {
                 let job = MetadataMaterializationRecord::new(&current.event, self.now_ms);
                 self.writes.push(materialization_job_entry(&job)?);
                 self.writes.push(document_job_entry(&job)?);
@@ -984,12 +983,12 @@ impl ProjectEventsOperation {
             Answer::Done => Ok(done(result)?),
             Answer::Child => Ok(result.child::<(), MetadataProjectionError>()??),
             Answer::Ignored => {
-                let _ = effect_event(result);
+                let _ = result.event();
                 Ok(())
             }
             Answer::Wake => {
                 if let Ok(Event::Task(aruna_core::task::TaskEvent::Error { message, .. })) =
-                    effect_event(result)
+                    result.event()
                 {
                     warn!(%message, "Failed to wake a metadata drain after projection");
                 }
@@ -1056,7 +1055,7 @@ impl Operation for ProjectEventsOperation {
         if !self.generation_read {
             // The answer to the cache generation read; a node without the cache has none.
             if let Ok(Event::Metadata(MetadataEvent::CacheGeneration { generation })) =
-                effect_event(result)
+                result.event()
             {
                 self.cache_generation = Some(generation);
             }
@@ -1320,7 +1319,7 @@ impl Operation for DrainProjectionOperation {
     fn next(&mut self, result: IoResult) -> DrainTurn {
         match std::mem::replace(&mut self.stage, DrainStage::Project) {
             DrainStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.has_more = next.is_some();
                 let mut targets = Vec::with_capacity(rows.len());
                 let mut malformed = Vec::new();
@@ -1394,7 +1393,7 @@ impl Operation for ReplayPageOperation {
             let projected = result.child::<usize, MetadataProjectionError>()??;
             return Ok(Next::Done((projected, self.next.take())));
         }
-        let (rows, next) = page_rows(result)?;
+        let (rows, next) = result.page()?;
         self.next = next;
         let events = (rows.iter())
             .map(|(_, value)| decode::<MetadataEventRecord>(value))
@@ -1437,7 +1436,7 @@ impl Operation for DotAppliedOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, MetadataProjectionError> {
-        Ok(Next::Done(dot_answer(effect_event(result)?)?))
+        Ok(Next::Done(dot_answer(result.event()?)?))
     }
 }
 
@@ -1462,7 +1461,7 @@ impl Operation for ProjectionWakeOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataProjectionError> {
-        match effect_event(result)? {
+        match result.event()? {
             Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) => {
                 Err(MetadataProjectionError::UnexpectedEvent(message))
             }
@@ -1505,13 +1504,13 @@ impl Operation for ProjectionTimerOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataProjectionError> {
         if self.waking {
             if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) =
-                effect_event(result)?
+                result.event()?
             {
                 warn!(message = %message, "Failed to restore metadata projection timer");
             }
             return Ok(Next::Done(()));
         }
-        let (rows, _) = page_rows(result)?;
+        let (rows, _) = result.page()?;
         if rows.is_empty() {
             return Ok(Next::Done(()));
         }

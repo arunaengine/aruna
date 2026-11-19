@@ -41,7 +41,6 @@ use crate::git::snapshot::capture;
 use crate::git::{GitError, GitNode};
 use crate::jobs::repository::link_queue::{LinkTimerOperation, QueueRowsOperation};
 use crate::jobs::repository::links::LinkError;
-use crate::metadata::call_results::page_rows;
 use crate::metadata::checkpoint::{CheckpointError, CheckpointOperation};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
@@ -1051,7 +1050,7 @@ impl Operation for RequeueParkedOperation {
     fn next(&mut self, result: IoResult) -> MaterializationTurn<usize> {
         match std::mem::replace(&mut self.stage, RequeueStage::Page) {
             RequeueStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.rows = rows.into();
                 self.next = next;
             }
@@ -1413,7 +1412,7 @@ impl Operation for DueJobsOperation {
     fn next(&mut self, result: IoResult) -> MaterializationTurn<DueJobs> {
         match std::mem::replace(&mut self.stage, ScanStage::Page) {
             ScanStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.next = next;
                 self.scanned(rows)
             }
@@ -1693,7 +1692,7 @@ impl Operation for GroupJobsOperation {
                 self.page(None)
             }
             LoadStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 for (key, value) in rows {
                     match postcard::from_bytes::<MetadataMaterializationRecord>(&value) {
                         Ok(job) if job.document_id == self.document_id => {
@@ -2462,7 +2461,7 @@ impl Operation for JobsExistOperation {
     fn next(&mut self, result: IoResult) -> MaterializationTurn<bool> {
         match std::mem::replace(&mut self.stage, ExistStage::Removed) {
             ExistStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.next = next;
                 let Some((key, _value)) = rows.into_iter().next() else {
                     return Ok(Next::Done(false));

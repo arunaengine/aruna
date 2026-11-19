@@ -20,8 +20,6 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::page_rows;
-
 /// Page transactions one run retries after conflicts before it pauses.
 const MAX_CONFLICTS: usize = 16;
 /// Entries concurrent writers may add beyond the sample size before a refill trims them.
@@ -283,7 +281,7 @@ impl Operation for RefillPageOperation {
                 self.call(PageStep::Rows, read)
             }
             PageStep::Rows => {
-                let (rows, truncated) = page_rows(result)?;
+                let (rows, truncated) = result.page()?;
                 self.collect(rows, truncated)
             }
             PageStep::Sample => {
@@ -432,7 +430,7 @@ impl Operation for RefillOperation {
                 self.probe()
             }
             State::Probe => {
-                let (rows, more) = page_rows(result)?;
+                let (rows, more) = result.page()?;
                 let probe_end = rows.last().map(|(key, _)| key.to_vec());
                 let Some(span) = self.span(probe_end, more.is_none()) else {
                     return Ok(Next::Done(RefillOutcome::Done));

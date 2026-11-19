@@ -11,7 +11,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use super::export_types::{ExportMetadataRequest, GetVisibleRequest, PAGE_DEFAULT, PAGE_MAX};
 use super::readable::RecordReadableOperation;
 use super::{MetadataApiError, RealmId, Ulid, map_event_error};
-use crate::metadata::call_results::effect_event;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::raw_events::RawReadError;
@@ -37,7 +36,7 @@ fn graph_effect(effect: MetadataEffect) -> IoCall {
 
 /// The answer of a graph export, or why there is none.
 fn exported(result: IoResult) -> Result<MetadataEvent, MetadataApiError> {
-    match effect_event(result)? {
+    match result.event()? {
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(map_event_error(error)),
         Event::Metadata(event) => Ok(event),
         other => Err(MetadataApiError::Internal(format!(

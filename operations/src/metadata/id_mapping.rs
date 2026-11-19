@@ -22,7 +22,6 @@ use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::read_value;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry};
 use aruna_core::placement::fence::{admits, fence_read};
@@ -92,7 +91,7 @@ pub(crate) fn mapping_call(document_id: Ulid) -> IoCall {
 pub(crate) fn mapping_answer(
     result: IoResult,
 ) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
-    read_value(result)?
+    result.value()?
         .map(|value| PersistentIdMapping::from_bytes(value.as_ref()))
         .transpose()
         .map_err(PersistentIdError::Conversion)
@@ -113,7 +112,7 @@ pub(crate) fn fence_answer(
     result: IoResult,
 ) -> Result<(), PersistentIdError> {
     let generation = route.as_ref().map_or(0, |route| route.generation);
-    match admits(read_value(result)?.as_ref(), generation) {
+    match admits(result.value()?.as_ref(), generation) {
         true => Ok(()),
         false => Err(PersistentIdError::PlacementFenced),
     }

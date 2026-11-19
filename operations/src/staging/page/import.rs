@@ -5,7 +5,6 @@
 use crate::connectors::repository::{parse_secret_read, read_secret_effect};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::distribution::guard::{authority_reads, write_epochs};
-use crate::metadata::call_results::page_rows as range_rows;
 use crate::replication::queue::schedule_blob_drain;
 use crate::s3::usage::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 use crate::staging::page::rows::{
@@ -239,7 +238,7 @@ impl Operation for PageImportOperation {
                     None => self.take_heads(Vec::new()),
                 }
             }
-            PageStep::Heads => match range_rows(result)? {
+            PageStep::Heads => match result.page()? {
                 (_, Some(_)) => {
                     let reads = head_reads(&self.input)?;
                     self.call(PageStep::HeadKeys, IoCall::Read(reads))

@@ -16,8 +16,6 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::{page_rows, read_values};
-
 /// Storage rows read per index page.
 pub(crate) const INDEX_SCAN_BATCH: usize = 256;
 /// Index keys validated by one default sweep pass.
@@ -267,10 +265,10 @@ impl Operation for TimestampSweepOperation {
     fn next(&mut self, result: IoResult) -> SweepTurn {
         match self.state {
             SweepState::Scan => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.scanned_page(rows, next)
             }
-            SweepState::Records => self.read_records(read_values(result)?),
+            SweepState::Records => self.read_records(result.values()?),
             SweepState::Delete => {
                 done(result)?;
                 self.deleted_batch()

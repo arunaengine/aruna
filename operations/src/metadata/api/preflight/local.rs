@@ -27,7 +27,6 @@ use super::{
     MAX_TARGET_VERSIONS, PREFLIGHT_BUDGET, add_location_iris, index_state, visible_prefix,
 };
 use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
-use crate::metadata::call_results::page_rows;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::iri_index::{
     BacklinkError, BacklinkPage, BacklinksOperation, IriFreshness, iri_freshness, status_rows,
@@ -410,12 +409,12 @@ impl Operation for LocalPreflightOperation {
                 Ok(Next::Call(any_row(MATERIALIZATION_JOB_KEYSPACE)))
             }
             LocalStage::Queued(freshness, pending) => {
-                let (queued, _) = page_rows(result).map_err(unavailable)?;
+                let (queued, _) = result.page().map_err(unavailable)?;
                 self.stage = LocalStage::Dead(freshness, pending || !queued.is_empty());
                 Ok(Next::Call(any_row(DEAD_LETTER_KEYSPACE)))
             }
             LocalStage::Dead(freshness, pending) => {
-                let (dead, _) = page_rows(result).map_err(unavailable)?;
+                let (dead, _) = result.page().map_err(unavailable)?;
                 // A queued or failed materialization has no postings yet, so its references
                 // are missing.
                 let freshness = (freshness, pending, !dead.is_empty());

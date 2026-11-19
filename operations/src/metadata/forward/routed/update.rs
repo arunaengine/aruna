@@ -19,7 +19,6 @@ use crate::device::publish_queue::token_issued_at;
 use crate::device::replica::{ReplicaRecord, read_answer, replica_read};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::routing::{ForwardHoldersOperation, HolderWriteError, holder_intersection};
-use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::device::edit::{DeviceEditError, accepts_edits, apply_local_edit};
 use crate::metadata::forward::replay::routed_record_matches;
@@ -273,7 +272,7 @@ impl Operation for RouteUpdateOperation {
                 self.configured(config)
             }
             UpdateStage::Replica => {
-                let replica = read_answer(&effect_event(result)?);
+                let replica = read_answer(&result.event()?);
                 self.replica(replica.filter(ReplicaRecord::serves_reads))
             }
             UpdateStage::Device => {

@@ -32,7 +32,6 @@ use super::rules::{
     objects, profile_tags, stale_status, submission_profile_tag,
 };
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
-use crate::metadata::call_results::effect_event;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::forward::profile_export::ProfileExportOperation;
 use crate::metadata::raw_events::{RawReadError, RawRevisionState};
@@ -592,7 +591,7 @@ impl ProfileAssessOperation {
         // A node without the graph store keeps no shapes and fetches every time.
         if let Event::Metadata(MetadataEvent::ProfileShapes {
             shapes: Some(shapes),
-        }) = effect_event(result)?
+        }) = result.event()?
         {
             let profile = self.registered_profile(shapes)?;
             return self.evaluate(profile);
@@ -685,7 +684,7 @@ impl ProfileAssessOperation {
             .profile
             .take()
             .ok_or_else(|| MetadataError::Backend("the Profile is missing".to_string()))?;
-        let assessment = match checked(effect_event(result)?, Some(&profile.revision))? {
+        let assessment = match checked(result.event()?, Some(&profile.revision))? {
             Ok(report) => shacl_assessment(report, &profile.revision),
             Err(ProfileShaclError::Unsupported { rule, message }) => ProfileAssessment {
                 findings: vec![unsupported_finding(&rule, message, Some(&profile.revision))],
@@ -705,7 +704,7 @@ impl ProfileAssessOperation {
 
     fn structure_checked(&mut self, result: IoResult) -> AssessTurn {
         let report =
-            checked(effect_event(result)?, None)?.map_err(|error| shacl_failure(error, None))?;
+            checked(result.event()?, None)?.map_err(|error| shacl_failure(error, None))?;
         Ok(Next::Done(MetadataProfilePreview {
             status: ProfileValidationStatus {
                 validated_at_ms: Some(self.now_ms),
@@ -777,7 +776,7 @@ impl Operation for ProfileAssessOperation {
             AssessStage::Cached => self.cached_read(result),
             AssessStage::Export => self.export_read(result),
             AssessStage::Store => {
-                effect_event(result)?;
+                result.event()?;
                 let profile = self
                     .profile
                     .take()

@@ -26,7 +26,6 @@ use super::types::LINKS_MAX_LIMIT;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::api::title::DocumentTitleOperation;
-use crate::metadata::call_results::page_rows;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use aruna_core::metadata::api::{
@@ -418,7 +417,7 @@ impl LinksLocalOperation {
             .asked
             .take()
             .ok_or(MetadataApiError::ServiceUnavailable)?;
-        let (rows, next) = page_rows(result).map_err(internal)?;
+        let (rows, next) = result.page().map_err(internal)?;
         self.budget.rows = self.budget.rows.saturating_sub(rows.len());
         let link_key = link.key();
         let mut last = None;
@@ -482,7 +481,7 @@ impl Operation for LinksLocalOperation {
         match std::mem::replace(&mut self.stage, LinkStage::Status) {
             LinkStage::Prefixes => {
                 self.stage = LinkStage::Prefixes;
-                let (rows, _) = page_rows(result).map_err(internal)?;
+                let (rows, _) = result.page().map_err(internal)?;
                 self.length_found(rows)
             }
             LinkStage::Postings => {
@@ -607,7 +606,7 @@ impl SetPreviewOperation {
     }
 
     fn range_read(&mut self, result: IoResult) -> Result<Next<SetPreviewPage>, MetadataApiError> {
-        let (rows, next) = page_rows(result).map_err(internal)?;
+        let (rows, next) = result.page().map_err(internal)?;
         for (key, value) in rows {
             self.last = Some(key.to_vec());
             if let Some(document_id) = posting_document(&key) {

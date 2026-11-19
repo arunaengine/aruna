@@ -218,20 +218,28 @@ impl IoResult {
         }
     }
 
-    /// The values of a read, or the error naming the result that came instead.
+    /// The values of a read, one per requested key. A batch read effect, used inside a caller's
+    /// transaction, answers the same way.
     pub fn values(self) -> Result<Vec<Option<Value>>, IoError> {
         match self {
             Self::Values(values) => Ok(values),
+            Self::Event(event) => match *event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    Ok(values.into_iter().map(|(_, value)| value).collect())
+                }
+                other => Err(failure("IoResult::Values", other)),
+            },
             other => Err(other.other("IoResult::Values")),
         }
     }
 
     /// The value of a read of exactly one row.
     pub fn value(self) -> Result<Option<Value>, IoError> {
-        match self {
-            Self::Values(values) if values.len() == 1 => Ok(values.into_iter().next().flatten()),
-            other => Err(other.other("IoResult::Values with one value")),
-        }
+        let [value] = <[_; 1]>::try_from(self.values()?).map_err(|_| IoError::Unexpected {
+            expected: "IoResult::Values with one value",
+            got: "IoResult::Values",
+        })?;
+        Ok(value)
     }
 
     /// The end of a write, a delete or a sync.
@@ -242,10 +250,18 @@ impl IoResult {
         }
     }
 
-    /// The rows of a page and the key to continue after.
+    /// The rows of a page and the key to continue after. An iteration effect, used to start at a
+    /// key or inside a caller's transaction, answers the same way.
     pub fn page(self) -> Result<crate::types::PageRows, IoError> {
         match self {
             Self::Page { rows, next } => Ok((rows, next)),
+            Self::Event(event) => match *event {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => Ok((values, next_start_after)),
+                other => Err(failure("IoResult::Page", other)),
+            },
             other => Err(other.other("IoResult::Page")),
         }
     }

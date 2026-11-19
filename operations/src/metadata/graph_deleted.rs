@@ -10,8 +10,6 @@ use aruna_core::operation::Operation;
 use aruna_core::storage_entries::graph_lifecycle_key;
 use thiserror::Error;
 
-use crate::metadata::call_results::read_value;
-
 #[derive(Debug, Error, PartialEq)]
 pub enum GraphDeletedError {
     #[error(transparent)]
@@ -77,7 +75,7 @@ impl Operation for GraphDeletedOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, GraphDeletedError> {
-        let deleted = read_value(result)?
+        let deleted = result.value()?
             .map(|bytes| postcard::from_bytes::<GraphLifecycleRecord>(&bytes))
             .transpose()
             .map_err(ConversionError::from)?

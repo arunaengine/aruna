@@ -15,7 +15,6 @@ use aruna_core::structs::{PersistentIdFailure, PersistentIdMapping, secondary_in
 use aruna_core::types::{Key, KeySpace};
 use ulid::Ulid;
 
-use crate::metadata::call_results::read_value;
 use crate::metadata::id_mapping::{
     MappingRoute, PersistentIdError, TransitionEntry, fence_answer, fence_call, mapping_answer,
     mapping_call, mapping_revision, transition_actor, transition_entries,
@@ -133,7 +132,7 @@ impl PidTransitionOperation {
     }
 
     fn registry_read(&mut self, result: IoResult) -> PidTurn {
-        let value = read_value(result)?;
+        let value = result.value()?;
         if let PidTransition::Withdraw { .. } = self.transition {
             let value = value.ok_or(PersistentIdError::DocumentMissing)?;
             self.registry = Some(decode(&value)?);

@@ -24,7 +24,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::Key;
 use ulid::Ulid;
 
-use crate::metadata::call_results::{effect_event, page_rows};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::profile::rules::stale_status;
 use crate::metadata::profile::validation::{
@@ -93,7 +92,7 @@ impl ReadyBaseOperation {
     }
 
     fn newest_read(&mut self, result: IoResult) -> BaseTurn {
-        let (rows, _) = page_rows(result)?;
+        let (rows, _) = result.page()?;
         let current = (rows.first())
             .and_then(|(key, _)| <[u8; 16]>::try_from(key.get(16..32)?).ok())
             .map_or(Ulid::nil(), Ulid::from_bytes);
@@ -133,7 +132,7 @@ impl ReadyBaseOperation {
     }
 
     fn markers_read(&mut self, result: IoResult) -> BaseTurn {
-        let (rows, next) = page_rows(result)?;
+        let (rows, next) = result.page()?;
         let keys = rows.into_iter().map(|(key, _)| key).collect();
         self.next_marker(keys, next)
     }
@@ -169,7 +168,7 @@ impl ReadyBaseOperation {
     }
 
     fn dot_read(&mut self, result: IoResult, keys: Vec<Key>, next: Option<Key>) -> BaseTurn {
-        match effect_event(result)? {
+        match result.event()? {
             Event::Metadata(MetadataEvent::ContainsDotResult { contains: true, .. })
             // A node without the graph store has nothing to wait for.
             | Event::Metadata(MetadataEvent::Error {
@@ -223,7 +222,7 @@ impl Operation for ReadyBaseOperation {
             BaseStage::Marker(keys, next) => self.marker_read(result, keys, next),
             BaseStage::Dot(keys, next) => self.dot_read(result, keys, next),
             BaseStage::Jobs => {
-                let (queued, _) = page_rows(result)?;
+                let (queued, _) = result.page()?;
                 match queued.is_empty() {
                     true => Ok(Next::Done(())),
                     false => Err(self.pending()),
@@ -323,7 +322,7 @@ impl UpdateEntryOperation {
     fn generation_read(&mut self, result: IoResult) -> EntryTurn {
         // A node without the metadata handle keeps no cache.
         if let Event::Metadata(MetadataEvent::CacheGeneration { generation }) =
-            effect_event(result)?
+            result.event()?
         {
             self.generation = Some(generation);
         }
@@ -381,7 +380,7 @@ impl Operation for UpdateEntryOperation {
             EntryStage::Update => self.updated(result),
             EntryStage::Cache => {
                 // The row is committed; a cache that missed it refills from storage.
-                let _ = effect_event(result);
+                let _ = result.event();
                 let updated = self
                     .updated
                     .take()

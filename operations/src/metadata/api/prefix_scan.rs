@@ -9,8 +9,6 @@ use aruna_core::operation::Operation;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
-use crate::metadata::call_results::page_rows;
-
 /// Storage rows read per scan page.
 pub(super) const PREFLIGHT_PAGE_SIZE: usize = 128;
 
@@ -92,7 +90,7 @@ impl Operation for PrefixScanOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<ScannedRows>, PrefixScanError> {
-        let (values, next) = page_rows(result)?;
+        let (values, next) = result.page()?;
         self.rows.extend(values);
         if self.rows.len() > self.limit {
             let mut rows = std::mem::take(&mut self.rows);

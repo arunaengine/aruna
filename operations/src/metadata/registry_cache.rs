@@ -19,7 +19,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, Value};
 use tracing::{debug_span, field};
 
-use crate::metadata::call_results::page_rows;
 use crate::metadata::span_timing::ReadTiming;
 use crate::metadata::visible_scope::{DeletedGraphs, DeletedGraphsOperation};
 
@@ -177,7 +176,7 @@ impl Operation for RegistryFillOperation {
                 other => Err(unexpected(&other)),
             },
             Some(FillStage::Registry) => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.registry_read(rows, next)
             }
             Some(FillStage::Lifecycle) => {
