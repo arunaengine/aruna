@@ -152,6 +152,7 @@ async fn run<O: Runnable<K>, K>(
     race: Race,
 ) -> Result<O::Output, O::Error> {
     let mut operation = operation.into_machine();
+    operation.seed(7);
     let mut effects: Vec<Effect> = operation.start().into_iter().collect();
     while !operation.is_complete() {
         let effect = effects.remove(0);

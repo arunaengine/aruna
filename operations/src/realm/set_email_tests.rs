@@ -220,6 +220,8 @@ fn concurrent_firsts() -> (AdminDocumentState, BTreeSet<RealmVaultEntry>) {
             &actor(seed),
             Some(input(Some("mailer"), Some("first"))),
         )));
+        // Each node's run has its own entropy, so the two firsts mint different ids.
+        operation.seed(u128::from(seed) << 32);
         let (operations, profile) = operation.email_writes(&state).unwrap();
         entries.insert(profile.unwrap().password.unwrap().entry);
         for operation in operations {
@@ -243,6 +245,7 @@ fn apply_change(
     profile: Option<EmailInput>,
 ) -> Option<RealmEmailProfile> {
     let mut operation = EmailWrite::new(Arc::new(email_config(&actor(1), profile)));
+    operation.seed((state.applied_event_ids.len() as u128 + 10) << 32);
     let (operations, profile) = operation.email_writes(state).unwrap();
     for operation in operations {
         state

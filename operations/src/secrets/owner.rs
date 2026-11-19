@@ -15,7 +15,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, OWNER_SECRETS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::realm_vault::{RealmVaultError, seal_named};
+use aruna_core::realm_vault::{RealmVaultError, SEAL_DRAW_LEN, seal_named, seal_seed};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::register::{RegisterError, RegisterStamp};
 use aruna_core::rows;
@@ -36,6 +36,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::{ChangeError, Managers, SecretChange, drains, widening_notices};
+use crate::s3::session::{draw_secret, drawn_secret};
 use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
 
 /// Register documents read per page.
@@ -201,6 +202,7 @@ impl EntryReader {
 /// The call an owner secret change waits for.
 #[derive(Debug, PartialEq)]
 enum Stage {
+    Drawing,
     Reading,
     Managers,
     Write,
@@ -215,6 +217,8 @@ pub struct OwnerSecretOperation {
     notices: bool,
     result: Option<Option<SecretEntry>>,
     ids: IdMint,
+    /// The seed of the realm seal, drawn first when the change carries a value.
+    seal_seed: Option<[u8; 32]>,
 }
 
 impl OwnerSecretOperation {
@@ -227,6 +231,7 @@ impl OwnerSecretOperation {
             notices: false,
             result: None,
             ids: IdMint::default(),
+            seal_seed: None,
         }
     }
 
@@ -261,13 +266,17 @@ impl OwnerSecretOperation {
         fields: &aruna_core::secrets::SecretFields,
     ) -> Result<SecretDocument, OwnerSecretError> {
         let name = self.input.change.name();
+        let seed = self
+            .seal_seed
+            .as_ref()
+            .ok_or(OwnerSecretError::NotFinished)?;
         let sealed = seal_named(
             &self.input.realm_id,
             &self.input.owner,
             name,
             incarnation,
             id,
-            &fields.encode()?,
+            (&fields.encode()?, seed),
         )?;
         let body = SecretBody::Value(SecretValue {
             fields: fields.names().map(str::to_string).collect(),
@@ -486,6 +495,14 @@ impl Operation for OwnerSecretOperation {
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, OwnerSecretError> {
+        // A new or rotated value is sealed with a seed drawn from the OS random source.
+        if matches!(
+            self.input.change,
+            SecretChange::Create { .. } | SecretChange::Rotate { .. }
+        ) {
+            self.stage = Stage::Drawing;
+            return Ok(Next::Call(draw_secret(SEAL_DRAW_LEN)));
+        }
         Ok(Next::Call(IoCall::Effect(Box::new(
             self.reader.start(None),
         ))))
@@ -493,6 +510,13 @@ impl Operation for OwnerSecretOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, OwnerSecretError> {
         match self.stage {
+            Stage::Drawing => {
+                self.seal_seed = Some(seal_seed(drawn_secret(result)?.expose()));
+                self.stage = Stage::Reading;
+                Ok(Next::Call(IoCall::Effect(Box::new(
+                    self.reader.start(None),
+                ))))
+            }
             Stage::Reading => match self.reader.step(rows::event(result)?, None)? {
                 Some(effect) => Ok(Next::Call(IoCall::Effect(Box::new(effect)))),
                 None => self.read_managers(),

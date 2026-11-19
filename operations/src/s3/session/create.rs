@@ -263,14 +263,6 @@ impl Operation for CreateS3Operation {
     fn expected_error(error: &Self::Error) -> bool {
         error.expected()
     }
-
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
-
-    fn seed(&mut self, entropy: u128) {
-        self.ids = IdMint::new(entropy);
-    }
 }
 
 #[cfg(test)]
