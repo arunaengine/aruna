@@ -54,8 +54,6 @@ fn webhook_off(writer: NodeId) -> WriteSettingOperation {
     WriteSettingOperation::new(SettingWrite {
         owner: owner(),
         local: writer,
-        write_id: Ulid::generate(),
-        event_id: Ulid::generate(),
         now_ms: NOW_MS,
         value: SettingValue::Webhook { target: None },
     })

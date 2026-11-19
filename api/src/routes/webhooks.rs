@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use aruna_core::compute::SecretBytes;
 use aruna_core::structs::execution::webhook::{WEBHOOK_EVENT, WebhookSubscription};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
@@ -144,10 +145,12 @@ pub async fn set_webhook(
     Json(request): Json<WebhookRequest>,
 ) -> ServerResult<Json<WebhookResponse>> {
     settings_node(&state, &auth).await?;
+    let secret = SecretBytes::new(rand::random::<[u8; 32]>().to_vec());
     let set = SetWebhookOperation::new(
         auth.user_id,
         state.get_node_id(),
         request.url,
+        secret,
         unix_timestamp_millis(),
     );
     let outcome = drive(set, &state.get_ctx()).await.map_err(map_error)?;
