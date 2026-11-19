@@ -307,12 +307,13 @@ impl PruneFamilyOperation {
             JobFamilyRecord::Spec(spec) => Some(spec.created_by),
             _ => None,
         });
-        let aliases: BTreeSet<_> = (self.records.iter())
-            .filter_map(|envelope| match &envelope.record {
-                JobFamilyRecord::Claim(claim) => Some(claim.job_id),
-                _ => None,
-            })
-            .collect();
+        // The replaced tombstone's aliases stay, so expiry deletes every incarnation's alias rows.
+        let claimed = (self.records.iter()).filter_map(|envelope| match &envelope.record {
+            JobFamilyRecord::Claim(claim) => Some(claim.job_id),
+            _ => None,
+        });
+        let old = (self.tombstone.iter()).flat_map(|tombstone| tombstone.aliases.iter().copied());
+        let aliases: BTreeSet<_> = claimed.chain(old).collect();
         let tombstone = FamilyTombstone {
             pruned_at_ms: self.now_ms,
             last_record_ms: last_record_ms(&self.records),

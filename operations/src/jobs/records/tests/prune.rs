@@ -219,6 +219,36 @@ async fn expires_tombstone() {
     assert_eq!(rows(&ctx, FAMILY_RECORD_KEYSPACE, &family).await, 0);
 }
 
+// Pruning a new incarnation keeps the aliases of the tombstone it replaces, so its expiry
+// deletes the alias rows of every incarnation.
+#[tokio::test]
+async fn keeps_old_aliases() {
+    let family = Family::new([96u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let old_job = aruna_core::structs::execution::job::JobId::from_bytes([77u8; 16]);
+    let previous = FamilyTombstone {
+        pruned_at_ms: 500,
+        last_record_ms: 400,
+        finished: true,
+        created_by: None,
+        aliases: vec![old_job],
+    };
+    let encoded = Value::from(to_bytes(&previous).expect("tombstone encodes").as_slice());
+    let prefix = family_prefix(&family.family());
+    write(
+        &ctx,
+        vec![(FAMILY_TOMBSTONE_KEYSPACE.to_string(), prefix, encoded)],
+    )
+    .await;
+    seed(&ctx, &family, &family.stopped_run(), 2_000).await;
+    for _ in 0..3 {
+        pass(&ctx).await;
+    }
+    let kept = tombstone(&ctx, &family).await.expect("tombstone kept");
+    assert!(kept.finished);
+    assert_eq!(kept.aliases, vec![family.job_id, old_job]);
+}
+
 #[tokio::test]
 async fn moves_held_family() {
     // An execution without a stop record holds the family, and its index row moves a retention
