@@ -48,8 +48,9 @@ use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::realm::load_config::config_unavailable;
 use aruna_core::NodeId;
+use aruna_core::events::Event;
 use aruna_core::metadata::MetadataError;
-use aruna_core::metadata::MetadataQueryResults;
+use aruna_core::metadata::{MetadataEffect, MetadataEvent, MetadataQueryResults};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use std::sync::Arc;
@@ -581,7 +582,13 @@ pub(crate) async fn apply_document_query(
     )
     .await
     .map_err(read_error)?;
-    crate::metadata::query_authorized_local(context, auth, Some(vec![record.graph_iri]), sparql)
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)
+    let query = MetadataEffect::QueryGraphs {
+        auth_context: auth,
+        graph_iris: Some(vec![record.graph_iri]),
+        sparql,
+    };
+    match super::send_metadata_effect(context, query).await {
+        Event::Metadata(MetadataEvent::QueryResult { results }) => Ok(results),
+        _ => Err(MetadataReadError::Unavailable),
+    }
 }
