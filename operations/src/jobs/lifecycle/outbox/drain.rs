@@ -15,7 +15,7 @@ use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::execution::job::record_keys::{budget_key, id_key, record_key};
 use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind,
+    ExpiryReason, JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobSpec,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
@@ -23,7 +23,9 @@ use tracing::warn;
 
 use super::{OUTBOX_DRAIN_BATCH, PublishOutcome, PublishRecordConfig, PublishRecordOperation};
 use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::cancel::PublishCancelOperation;
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
+use crate::jobs::route::JobRouteError;
 
 const OUTBOX_CURSOR_KEY: &[u8] = b"job_family_outbox_cursor";
 
@@ -33,6 +35,7 @@ const OUTBOX_CURSOR_KEY: &[u8] = b"job_family_outbox_cursor";
 pub struct DrainOutboxOperation {
     realm_id: RealmId,
     local: NodeId,
+    now_ms: u64,
     realm: Option<Box<RealmConfigDocument>>,
     entries: VecDeque<Key>,
     next_cursor: Option<Key>,
@@ -53,6 +56,10 @@ enum Phase {
     Budget(Box<PublishRecordConfig>),
     /// The family's specs are read, to offer the record again with the one it binds.
     Spec(Box<PublishRecordConfig>),
+    /// The specs of a family whose claim was refused as stale, to cancel an own spec.
+    StaleSpec(Box<JobRecordEnvelope>),
+    /// The expiry cancel of a family this node started with a stale spec.
+    Expiring,
     WriteCursor,
     Rescan,
 }
@@ -75,6 +82,7 @@ impl DrainOutboxOperation {
         Self {
             realm_id,
             local,
+            now_ms: 0,
             realm: None,
             entries: VecDeque::new(),
             next_cursor: None,
@@ -167,6 +175,34 @@ impl DrainOutboxOperation {
         Ok(Next::Call(IoCall::child(specs)))
     }
 
+    /// This node's own spec or claim was refused as stale, so its family never runs: the origin
+    /// ends it with an expiry cancel, which also keeps its own witness from launching.
+    fn expire_stale(&mut self, envelope: JobRecordEnvelope) -> Step {
+        match &envelope.record {
+            JobFamilyRecord::Spec(spec) => {
+                let spec = spec.as_ref().clone();
+                self.expire(spec)
+            }
+            JobFamilyRecord::Claim(_) => {
+                let specs = LoadFamilyOperation::kind(envelope.family(), JobRecordKind::Spec);
+                self.phase = Phase::StaleSpec(Box::new(envelope));
+                Ok(Next::Call(IoCall::child(specs)))
+            }
+            _ => self.next_entry(),
+        }
+    }
+
+    fn expire(&mut self, spec: LogicalJobSpec) -> Step {
+        if spec.origin_node_id != self.local {
+            return self.next_entry();
+        }
+        let serving = Some((self.local, self.realm_id));
+        let reason = ExpiryReason::StaleSpec;
+        let cancel = PublishCancelOperation::expiry(spec, reason, serving, self.now_ms);
+        self.phase = Phase::Expiring;
+        Ok(Next::Call(IoCall::child(cancel)))
+    }
+
     /// Hands the publish's calls on, or moves to the next entry once it ended.
     fn after_publish(&mut self, step: Result<Next<PublishOutcome>, LifecycleError>) -> Step {
         match step {
@@ -235,6 +271,10 @@ impl Operation for DrainOutboxOperation {
     type Output = bool;
     type Error = LifecycleError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Step {
         let config = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
@@ -289,8 +329,15 @@ impl Operation for DrainOutboxOperation {
             },
             Phase::Publish(mut publish) => {
                 let step = publish.next(result);
-                if matches!(step, Ok(Next::Done(PublishOutcome::SpecNeeded))) {
-                    return self.load_spec(publish.config);
+                match step {
+                    Ok(Next::Done(PublishOutcome::SpecNeeded)) => {
+                        return self.load_spec(publish.config);
+                    }
+                    Ok(Next::Done(PublishOutcome::Stale)) => {
+                        let envelope = publish.config.record.into_inner();
+                        return self.expire_stale(envelope);
+                    }
+                    _ => {}
                 }
                 self.phase = Phase::Publish(publish);
                 self.after_publish(step)
@@ -329,6 +376,24 @@ impl Operation for DrainOutboxOperation {
                     }
                     None => self.next_entry(),
                 }
+            }
+            Phase::StaleSpec(claim) => {
+                let specs = result.child::<Vec<JobRecordEnvelope>, FamilyReadError>();
+                let Ok(Ok(specs)) = specs else {
+                    warn!("The spec of a stale claim is unreadable");
+                    return self.next_entry();
+                };
+                let spec = bound_spec(&claim, specs).map(JobRecordFrame::into_inner);
+                match spec.map(|envelope| envelope.record) {
+                    Some(JobFamilyRecord::Spec(spec)) => self.expire(*spec),
+                    _ => self.next_entry(),
+                }
+            }
+            Phase::Expiring => {
+                if let Err(error) = result.child::<(), JobRouteError>()? {
+                    warn!(error = %error, "Expiry cancel of a stale spec was not published");
+                }
+                self.next_entry()
             }
             Phase::WriteCursor => match result {
                 IoResult::Done => {

@@ -65,6 +65,8 @@ pub enum PublishOutcome {
     Queued,
     /// A holder holds no spec of the family; the record goes again together with its spec.
     SpecNeeded,
+    /// A holder refused the family as older than the horizon; the entry is gone.
+    Stale,
 }
 
 /// One queued record offered to the family holders at once. The entry is cleared only
@@ -78,6 +80,7 @@ pub struct PublishRecordOperation {
     /// Whether the last call clears the entry instead of storing it.
     clearing: bool,
     spec_needed: bool,
+    stale: bool,
 }
 
 /// What the asked holders answered together.
@@ -100,6 +103,7 @@ impl PublishRecordOperation {
             asked: Vec::new(),
             clearing: false,
             spec_needed: false,
+            stale: false,
         }
     }
 
@@ -110,6 +114,7 @@ impl PublishRecordOperation {
 
     fn outcome(&self) -> PublishOutcome {
         match (self.clearing, self.spec_needed) {
+            (true, _) if self.stale => PublishOutcome::Stale,
             (true, _) => PublishOutcome::Cleared,
             (false, true) => PublishOutcome::SpecNeeded,
             (false, false) => PublishOutcome::Queued,
@@ -274,6 +279,7 @@ impl PublishRecordOperation {
             // The family is too old or pruned there, so no holder ever takes it again.
             JobRecordRejection::StaleFamily | JobRecordRejection::FamilyPruned => {
                 debug!(peer = %holder, "Family holder refused a record of an old family");
+                self.stale = reason == JobRecordRejection::StaleFamily;
                 return Ok(self.clear());
             }
             JobRecordRejection::SpecNeeded if !self.spec_attached() => {
@@ -440,12 +446,13 @@ mod tests {
             let answer = operation.next(IoResult::Group(GroupEvent::Finished { results }));
             (operation, answer)
         };
-        for reason in [
-            JobRecordRejection::StaleFamily,
-            JobRecordRejection::FamilyPruned,
+        for (reason, outcome) in [
+            (JobRecordRejection::StaleFamily, PublishOutcome::Stale),
+            (JobRecordRejection::FamilyPruned, PublishOutcome::Cleared),
         ] {
-            let (_, answer) = refused(reason);
+            let (mut operation, answer) = refused(reason);
             assert!(matches!(answer, Ok(Next::Call(IoCall::Delete(_)))));
+            assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(outcome)));
         }
         let (mut operation, answer) = refused(JobRecordRejection::SpecNeeded);
         let Ok(Next::Call(IoCall::Write(rows))) = answer else {

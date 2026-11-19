@@ -21,8 +21,8 @@ use aruna_core::rows::event;
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 use aruna_core::structs::execution::job::{
-    ExecutionClaim, JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionState, WitnessBudgetRecord,
+    ExecutionClaim, ExpiryReason, JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LaunchIntent,
+    LogicalJobSpec, NotRun, PhysicalExecutionState, WitnessBudgetRecord, work_settled,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::PlacementDecision;
@@ -31,6 +31,8 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
+use super::cancel::PublishCancelOperation;
+use super::closure::CloseLaunchesOperation;
 use super::launch_admit::{AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided};
 use super::membership::{MembershipViewOperation, family_not_run};
 use super::offer::{OfferLaunchOperation, OfferOutcome};
@@ -46,6 +48,7 @@ use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::pages::{PageReadError, SpecInputsOperation, StoreEntriesOperation};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
+use crate::jobs::route::JobRouteError;
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::store_call::{RowBatch, RowRead};
 use crate::realm::load_config::config_unavailable;
@@ -113,6 +116,9 @@ enum RoundStep {
     BudgetSigned,
     BudgetStored,
     Explain,
+    /// The launch closures of a family whose budget is used up, then its expiry cancel.
+    Closures,
+    Expired,
     Inputs,
     Planned,
     ExplainStored,
@@ -143,6 +149,7 @@ struct RoundFacts {
     records: Vec<JobRecordEnvelope>,
     /// This node's applied realm config clock, which a new launch cites.
     clock: AdminDocumentClock,
+    not_run: NotRun,
     spec: Option<LogicalJobSpec>,
     max_launches: u32,
     sequence: u32,
@@ -267,6 +274,7 @@ impl WitnessRoundOperation {
             window_ms,
             records: Vec::new(),
             clock: AdminDocumentClock::default(),
+            not_run: NotRun::default(),
             spec: None,
             max_launches: 0,
             sequence: 0,
@@ -304,9 +312,11 @@ impl WitnessRoundOperation {
         };
         let family = self.family;
         let facts = self.facts()?;
-        if family_not_run(&facts.records, &view).family {
+        let not_run = family_not_run(&facts.records, &view);
+        if not_run.family {
             return finished();
         }
+        facts.not_run = not_run;
         facts.clock = view.clock;
         let running = running_nodes(family, &facts.records);
         if running.is_empty() {
@@ -452,7 +462,9 @@ impl WitnessRoundOperation {
         }
         if sequence >= facts.max_launches {
             debug!(sequence, "Witness budget is exhausted for this request");
-            return finished();
+            let records = facts.records.clone();
+            let close = CloseLaunchesOperation::new(self.family, records, serving);
+            return self.call(RoundStep::Closures, IoCall::child(close));
         }
         facts.sequence = sequence;
         facts.overlapping = overlapping;
@@ -460,6 +472,28 @@ impl WitnessRoundOperation {
         let spec = facts.spec.as_ref().ok_or(IoError::Unfinished)?;
         let fill = SpecInputsOperation::new(spec, serving);
         self.call(RoundStep::Inputs, IoCall::child(fill))
+    }
+
+    /// A used-up budget ends the family with an expiry cancel, but only once every known launch
+    /// is received or closed and every execution stopped, so the cancel never stops a running one.
+    fn budget_used(&mut self, result: IoResult) -> RoundNext {
+        let (now_ms, serving) = (self.now_ms, self.serving()?);
+        let facts = self.facts()?;
+        let window_ms = facts.window_ms;
+        let closed = match result.child::<BTreeSet<Ulid>, LifecycleError>()? {
+            Ok(closed) => closed,
+            Err(error) => {
+                warn!(error = %error, "Launch closures could not be read");
+                return retry(window_ms);
+            }
+        };
+        if !work_settled(&facts.records, &closed, &facts.not_run) {
+            return retry(window_ms);
+        }
+        let spec = facts.spec.clone().ok_or(IoError::Unfinished)?;
+        let reason = ExpiryReason::BudgetUsed;
+        let cancel = PublishCancelOperation::expiry(spec, reason, serving, now_ms);
+        self.call(RoundStep::Expired, IoCall::child(cancel))
     }
 
     fn serving(&self) -> Result<Option<(NodeId, RealmId)>, IoError> {
@@ -735,6 +769,14 @@ impl Operation for WitnessRoundOperation {
                 let stored = explain_row(result)?;
                 self.explained(stored)
             }
+            RoundStep::Closures => self.budget_used(result),
+            RoundStep::Expired => match result.child::<(), JobRouteError>()? {
+                Ok(()) => finished(),
+                Err(error) => {
+                    warn!(error = %error, "Expiry cancel of a used-up budget was not published");
+                    retry(self.facts()?.window_ms)
+                }
+            },
             RoundStep::Inputs => self.inputs_read(result),
             RoundStep::Planned => self.planned(result),
             RoundStep::ExplainStored => self.explain_stored(result),

@@ -14,14 +14,18 @@ use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::record_keys::record_key;
 use aruna_core::structs::execution::job::record_rows::{OutboxEntry, to_bytes};
-use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordEnvelope, JobRecordKind};
+use aruna_core::structs::execution::job::{
+    ExpiryReason, JobFamilyRecord, JobRecordEnvelope, JobRecordKind,
+};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::{Key, Value};
 
 use super::{DrainOutboxOperation, bound_spec, scan};
 use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::cancel::PublishCancelOperation;
 use crate::jobs::lifecycle::outbox::OUTBOX_DRAIN_BATCH;
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
+use crate::jobs::route::JobRouteError;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use crate::tests::records::{Family, REALM, actor, node};
 
@@ -217,8 +221,13 @@ fn stored_entry() -> IoResult {
 
 /// The holders' answer that they hold no spec of the family.
 fn spec_needed(holders: usize) -> IoResult {
+    refusal(JobRecordRejection::SpecNeeded, holders)
+}
+
+/// The same refusal from each of `holders`.
+fn refusal(reason: JobRecordRejection, holders: usize) -> IoResult {
     let reply = MetadataTransportMessage::ForwardedJobRecord {
-        result: Err(JobRecordRejection::SpecNeeded),
+        result: Err(reason),
     };
     let answer = || MetadataAnswer {
         peer: node(2),
@@ -357,4 +366,36 @@ fn bundles_receipt_records() {
         .map(|frame| frame.into_inner())
         .collect();
     assert_eq!(attached, vec![launch.clone(), budget.clone()]);
+}
+
+// An own spec refused as stale is cancelled with an expiry, then the pass goes on.
+#[test]
+fn expires_stale_spec() {
+    let family = Family::new([9u8; 32]);
+    let mut spec = family.spec();
+    spec.origin_node_id = node(1);
+    let envelope = family.sign(
+        &family.holder,
+        JobFamilyRecord::Spec(Box::new(spec.clone())),
+    );
+    let key = record_key(&envelope.key());
+    let mut drain = scanning(&family, None);
+    drain.next(page(vec![key], None)).expect("record read");
+    drain.next(row_of(&envelope)).expect("outbox read");
+    let Ok(Next::Call(IoCall::Group(group))) = drain.next(stored_entry()) else {
+        panic!("the spec is offered");
+    };
+    let stale = refusal(JobRecordRejection::StaleFamily, group.members.len());
+    assert!(matches!(
+        drain.next(stale),
+        Ok(Next::Call(IoCall::Delete(_)))
+    ));
+    let reason = ExpiryReason::StaleSpec;
+    let cancel = PublishCancelOperation::expiry(spec, reason, Some((node(1), REALM)), 0);
+    assert_eq!(
+        drain.next(IoResult::Done),
+        Ok(Next::Call(IoCall::child(cancel)))
+    );
+    let published = IoResult::Child(ChildOutcome::new(Ok::<_, JobRouteError>(())));
+    assert_eq!(drain.next(published), cursor_write(None));
 }

@@ -368,3 +368,49 @@ fn lost_target_expires() {
     assert_eq!(lost_retry_ms(10, 10, base, window), base);
     assert_eq!(lost_retry_ms(10, 9 + window, base, window), 1);
 }
+
+// A used-up budget cancels the family with an expiry once its work settled; a running
+// execution keeps the round waiting a window.
+#[test]
+fn used_budget_expires() {
+    let fixture = Family::new([26u8; 32]);
+    let spec = fixture.spec();
+    let claim = JobFamilyRecord::Claim(fixture.claim(&spec));
+    let records = vec![
+        fixture.sign(
+            &fixture.holder,
+            JobFamilyRecord::Spec(Box::new(spec.clone())),
+        ),
+        fixture.sign(&fixture.holder, claim),
+    ];
+    let serving = Some((fixture.holder.public(), REALM));
+    let used = |records: &[JobRecordEnvelope]| {
+        let mut operation = configured(&fixture);
+        let facts = operation.facts().unwrap();
+        facts.records = records.to_vec();
+        facts.spec = Some(spec.clone());
+        let close = CloseLaunchesOperation::new(fixture.family(), records.to_vec(), serving);
+        assert_eq!(
+            operation.explained(None),
+            Ok(Next::Call(IoCall::child(close)))
+        );
+        operation
+    };
+    let mut settled = used(&records);
+    let closed = child(Ok::<_, LifecycleError>(BTreeSet::<Ulid>::new()));
+    let reason = ExpiryReason::BudgetUsed;
+    let cancel = PublishCancelOperation::expiry(spec.clone(), reason, serving, 5_000);
+    assert_eq!(settled.next(closed), Ok(Next::Call(IoCall::child(cancel))));
+    let published = child(Ok::<_, JobRouteError>(()));
+    assert_eq!(outcome(settled.next(published)), RoundOutcome::Done);
+
+    let launch = fixture.launch(&spec, node(2), 0);
+    let receipt = JobFamilyRecord::Receipt(Box::new(fixture.receipt(&launch, 1)));
+    let mut running = records.clone();
+    running.push(fixture.sign(&fixture.target, receipt));
+    let mut waiting = used(&running);
+    let window = fixture.config.compute.catch_up_ms;
+    let closed = child(Ok::<_, LifecycleError>(BTreeSet::<Ulid>::new()));
+    let after = RoundOutcome::Retry { after_ms: window };
+    assert_eq!(outcome(waiting.next(closed)), after);
+}
