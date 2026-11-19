@@ -21,7 +21,7 @@ use aruna_core::types::{Key, KeySpace, Value};
 use ulid::Ulid;
 
 use crate::connectors::resolver::NATIVE_SET_ID;
-use crate::s3::object::get::{ObjectInfo, ObjectRangeRequest};
+use aruna_core::structs::storage::object_read::{ObjectInfo, ObjectRangeRequest};
 
 /// A distributed version whose record this member holds without its bytes.
 #[derive(Clone, Debug, PartialEq)]

@@ -6,8 +6,7 @@ use crate::connectors::repository::source_connector_key;
 use crate::replication::bao_read::BaoReadError;
 use crate::s3::object::get::{
     AdvanceEnd, AdvanceReference, AdvanceStep, GetObjectError, GetObjectInput, GetObjectOperation,
-    GetObjectResult, GetObjectState, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
-    Turn,
+    GetObjectResult, GetObjectState, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, Turn,
 };
 use crate::s3::object::read::{
     GetRoutedOperation, HolderFailures, PromoteLeasedOperation, RoutedRead, routed_info,
@@ -48,6 +47,7 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, MAX_AUTO_ADVANCES};
 use aruna_core::structs::storage::usage::{UsageDelta, usage_group_key};
@@ -384,53 +384,6 @@ fn pending_content_refused() {
             BucketKeyError::Unsupported
         )))
     ));
-}
-
-#[test]
-fn explicit_range_resolves() {
-    let resolved = ObjectRangeRequest::StartEnd { start: 2, end: 5 }
-        .resolve(10)
-        .unwrap();
-
-    assert_eq!(resolved.range, 2..6);
-    assert_eq!(resolved.content_length, 4);
-    assert_eq!(resolved.content_range, "bytes 2-5/10");
-}
-
-#[test]
-fn suffix_range_resolves() {
-    let resolved = ObjectRangeRequest::Suffix { length: 3 }
-        .resolve(10)
-        .unwrap();
-
-    assert_eq!(resolved.range, 7..10);
-    assert_eq!(resolved.content_length, 3);
-    assert_eq!(resolved.content_range, "bytes 7-9/10");
-}
-
-#[test]
-fn open_range_resolves() {
-    let resolved = ObjectRangeRequest::Start { start: 4 }.resolve(10).unwrap();
-
-    assert_eq!(resolved.range, 4..10);
-    assert_eq!(resolved.content_length, 6);
-    assert_eq!(resolved.content_range, "bytes 4-9/10");
-}
-
-#[test]
-fn invalid_ranges_rejected() {
-    assert_eq!(
-        ObjectRangeRequest::Suffix { length: 1 }.resolve(0),
-        Err(GetObjectError::InvalidRange)
-    );
-    assert_eq!(
-        ObjectRangeRequest::Start { start: 10 }.resolve(10),
-        Err(GetObjectError::InvalidRange)
-    );
-    assert_eq!(
-        ObjectRangeRequest::StartEnd { start: 6, end: 5 }.resolve(10),
-        Err(GetObjectError::InvalidRange)
-    );
 }
 
 #[test]

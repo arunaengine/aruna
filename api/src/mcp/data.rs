@@ -19,6 +19,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
@@ -27,7 +28,7 @@ use aruna_operations::metadata::api::search_types::BucketSearchRequest;
 use aruna_operations::placement::policy::GateOperation;
 use aruna_operations::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
-use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
+use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::s3::object::put::{

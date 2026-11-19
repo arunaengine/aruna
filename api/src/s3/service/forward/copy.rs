@@ -16,9 +16,10 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::delegation::{COPY_CONTEXT_HEADER, CopyContext};
 use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_operations::s3::object::copy::{CopySourceConditions, ReadCopyOperation, source_origin};
-use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult, ObjectRangeRequest};
+use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult};
 pub(in crate::s3::service) use aruna_operations::s3::object::member_write::CopyPath;
 use aruna_operations::s3::object::member_write::{
     CopyPathError, CopyPathOperation, answered_metadata, answered_policies, copy_headers,

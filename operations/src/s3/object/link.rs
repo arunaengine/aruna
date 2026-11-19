@@ -30,9 +30,7 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::distribution::delegate::{DelegationInput, unsigned_delegation};
-use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
-};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
@@ -41,6 +39,7 @@ use crate::s3::object::reference::{
     MaterializeReferenceError, ReferenceWrite, WriteReferenceOperation,
 };
 use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::read_grant::{
     self, GrantScope, HEAD_OPERATION, READ_OPERATION,
 };

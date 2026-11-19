@@ -21,6 +21,7 @@ use aruna_core::structs::execution::job::{
     CompositionError, ExportReportRow, ImportReportRow, JobId, SYSTEM_ENTRY_PREFIX,
 };
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::REPORT_MAX_ROWS;
 use aruna_operations::jobs::command::{
@@ -31,7 +32,6 @@ use aruna_operations::jobs::command::{
 use aruna_operations::jobs::export::grant::AdmitGrantOperation;
 use aruna_operations::jobs::local_run::LocalExecutionError;
 use aruna_operations::jobs::store::RunDelete;
-use aruna_operations::s3::object::get::ObjectRangeRequest;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
