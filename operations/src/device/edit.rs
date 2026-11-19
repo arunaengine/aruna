@@ -612,29 +612,25 @@ mod tests {
         });
         let record = record();
         assert!(matches!(
-            context
-                .metadata_handle
-                .as_ref()
-                .unwrap()
-                .run_effect(
-                    &context,
-                    MetadataEffect::CreateCrate {
-                        request: MetadataCrateRequest {
-                            graph_iri: record.graph_iri.clone(),
-                            name: "Notes".to_string(),
-                            description: "Offline notes".to_string(),
-                            date_published: "2026-08-29".to_string(),
-                            license: None,
-                            policy: MetadataGraphPolicy {
-                                public: false,
-                                permission_paths: vec![record.permission_path.clone()],
-                            },
-                            durability: MetadataRequestDurability::Durable,
-                            deterministic_actor: Some([1u8; 32]),
+            crate::metadata::send_metadata_effect(
+                &context,
+                MetadataEffect::CreateCrate {
+                    request: MetadataCrateRequest {
+                        graph_iri: record.graph_iri.clone(),
+                        name: "Notes".to_string(),
+                        description: "Offline notes".to_string(),
+                        date_published: "2026-08-29".to_string(),
+                        license: None,
+                        policy: MetadataGraphPolicy {
+                            public: false,
+                            permission_paths: vec![record.permission_path.clone()],
                         },
-                    }
-                )
-                .await,
+                        durability: MetadataRequestDurability::Durable,
+                        deterministic_actor: Some([1u8; 32]),
+                    },
+                }
+            )
+            .await,
             Event::Metadata(MetadataEvent::CreateCrateResult { .. })
         ));
         (dir, context, record)

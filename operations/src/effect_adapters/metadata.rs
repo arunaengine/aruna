@@ -8,7 +8,7 @@ use aruna_core::effects::{MetadataRequestEffect, WritePeerRequest};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerAuthRefusal, PeerRequestError};
 use aruna_core::metadata::{AuthToken, MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::structs::storage::dataset_description::DatasetSummaryRequest;
-use std::future::{Future, ready};
+use std::future::Future;
 use std::pin::Pin;
 use tokio::time::{Instant, timeout};
 
@@ -16,19 +16,18 @@ use crate::driver::DriverContext;
 use crate::metadata::forward::read::{summary_answer, summary_export};
 use crate::metadata::message_kind::MetadataRequestDelivery;
 
-// A boxed future: the metadata effect path reads authorization through the runner again,
-// so its type must not contain the runner's own future.
-pub(super) fn dispatch_metadata(
-    effect: MetadataEffect,
-    context: &DriverContext,
-) -> Pin<Box<dyn Future<Output = Event> + Send + '_>> {
-    match &context.metadata_handle {
-        Some(metadata) => Box::pin(metadata.run_effect(context, effect)),
-        None => Box::pin(ready(Event::Metadata(MetadataEvent::Error {
+/// Runs one metadata effect on the graph store, or answers that the store is missing.
+pub(super) async fn dispatch_metadata(effect: MetadataEffect, context: &DriverContext) -> Event {
+    let Some(graph) = &context.graph_handle else {
+        return Event::Metadata(MetadataEvent::Error {
             graph_iri: None,
             error: MetadataError::HandleMissing,
-        }))),
-    }
+        });
+    };
+    let started = std::time::Instant::now();
+    let event = graph.run(effect).await;
+    aruna_core::telemetry::record_stage("craqle", started.elapsed());
+    Event::Metadata(event)
 }
 
 // A boxed future for the same reason: the routed export drives operations again.
