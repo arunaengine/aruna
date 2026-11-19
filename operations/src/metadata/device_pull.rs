@@ -27,9 +27,10 @@ use aruna_core::structs::storage::distribution::{
 };
 use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
+use aruna_core::structs::synced_folder::refusal_kind;
 use aruna_core::structs::{
     ORIGIN_DEVICE_TAG, RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull,
-    SyncPullAck, SyncRefusal, SyncVersionPage, refusal_kind,
+    SyncPullAck, SyncRefusal, SyncVersionPage,
 };
 use aruna_core::types::{GroupId, Key, Value};
 use futures_util::StreamExt;
@@ -1458,9 +1459,8 @@ mod tests {
             OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
         };
         use crate::tests::device::store_folder;
-        use aruna_core::structs::{
-            FolderMode, FolderState, RemoteBinding, SyncedFolder, folder_bucket,
-        };
+        use aruna_core::structs::synced_folder::folder_bucket;
+        use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
 
         let fixture = crate::tests::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);

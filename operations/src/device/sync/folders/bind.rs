@@ -28,7 +28,7 @@ use super::super::ReconcileFolderError;
 use super::super::repository::{MAX_SYNCED_FOLDERS, folder_entry, folder_key};
 use super::reads::read_bound;
 use super::{BindFolderInput, FolderChange, FolderError, RealmBucketInput, UpdateFolderOperation};
-use aruna_core::structs::folder_bucket;
+use aruna_core::structs::synced_folder::folder_bucket;
 
 type RemoteError = ReconcileFolderError;
 
