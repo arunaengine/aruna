@@ -10,13 +10,12 @@ use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::encryption::{
     BucketKeyRef, KeyTicket, UnlockStatus, deadline_after,
 };
-use aruna_core::structs::storage::key_audit::{
-    AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
-};
+use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::task::TaskEffect;
 use aruna_core::{NodeId, UserId};
 use std::time::Duration;
@@ -113,6 +112,7 @@ pub struct InstallKeyOperation {
     /// The event id of the stored intent, which the outcome names.
     intent_id: Option<Ulid>,
     outcome: Option<BucketAuditRecord>,
+    ids: IdMint,
 }
 
 impl InstallKeyOperation {
@@ -132,6 +132,7 @@ impl InstallKeyOperation {
             intent_synced: false,
             intent_id: None,
             outcome: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -172,10 +173,10 @@ impl InstallKeyOperation {
         self.call(InstallState::DiscardKey, discard.into())
     }
 
-    fn record(&self, audit: InstallAudit, outcome: AuditOutcome) -> BucketAuditRecord {
+    fn record(&mut self, audit: InstallAudit, outcome: AuditOutcome) -> BucketAuditRecord {
         let (duration, max) = self.bounds;
         BucketAuditRecord {
-            event_id: next_event_id(audit.now_ms),
+            event_id: self.ids.mint(audit.now_ms),
             bucket_id: self.key.bucket_id,
             at_ms: audit.now_ms,
             action: AuditAction::Unlock,
@@ -323,6 +324,10 @@ impl InstallKeyOperation {
 impl Operation for InstallKeyOperation {
     type Output = UnlockStatus;
     type Error = InstallError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     /// The operation hands its only key handle to the adapter and keeps none.
     fn first(&mut self) -> InstallTurn {
