@@ -16,6 +16,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, SnapshotSignEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     CATCH_UP_KEYSPACE, DISTRIBUTION_ACCEPT_KEYSPACE, DISTRIBUTION_KEYSPACE,
     DISTRIBUTION_LIFECYCLE_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
@@ -126,6 +127,8 @@ pub struct PublishOperation {
     check: Option<CheckPermissionsConfig>,
     /// The revision the commit publishes.
     revision: Option<DistributionRevision>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 /// What the publisher keeps per accepted request, so a retry replays only the same request.
@@ -158,6 +161,8 @@ fn revision_event(set_id: Ulid, number: u64) -> Ulid {
 impl PublishOperation {
     pub fn new(config: PublishConfig) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             config,
             state: PublishState::ReadState,
             stored: Stored::default(),
@@ -415,7 +420,7 @@ impl PublishOperation {
         }
         // This node's replica share may shrink with the record: its quota gate stops deducting it.
         let share = dirty_share_key(view.snapshot().config.owner_group).into();
-        let generation = Ulid::generate().to_bytes().to_vec().into();
+        let generation = self.mint.mint(self.now_ms).to_bytes().to_vec().into();
         writes.push((NODE_STATS_KEYSPACE.to_string(), share, generation));
         self.revision = Some(revision);
         self.call(PublishState::Write, IoCall::Write(writes))
@@ -425,6 +430,14 @@ impl PublishOperation {
 impl Operation for PublishOperation {
     type Output = DistributionRevision;
     type Error = PublishError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> PublishNext {
         Ok(Next::Call(self.read_state()))

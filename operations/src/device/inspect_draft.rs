@@ -93,6 +93,7 @@ mod tests {
             "/notes".to_string(),
             true,
             "{}".to_string(),
+            aruna_core::time::unix_timestamp_millis(),
         );
         let draft_id = entry.draft_id;
         drive(

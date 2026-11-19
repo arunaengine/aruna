@@ -22,6 +22,7 @@ use aruna_core::structs::storage::format::{Compression, StoredFormat};
 use aruna_core::types::Key;
 use aruna_core::types::Value;
 use aruna_drivers::driver::drive;
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 fn held(size: u64) -> HeldElsewhere {
@@ -329,4 +330,50 @@ fn release_tolerates_failure() {
     assert!(matches!(release.first(), Ok(Next::Call(IoCall::Child(_)))));
     let failed = child(Err::<IoResult, _>(IoError::Unfinished));
     assert_eq!(release.next(failed), Ok(Next::Done(())));
+}
+
+// A kept copy's stream is handed to the blob backend, which holds it while it is read.
+#[test]
+fn kept_read_pinned() {
+    let call = pin_call(
+        "copy",
+        BackendStream(Box::pin(futures_util::stream::empty())),
+    );
+    let IoCall::Effect(effect) = call else {
+        panic!("expected the pin effect");
+    };
+    assert!(matches!(*effect, Effect::Blob(BlobEffect::PinRead { .. })));
+    let held = IoResult::Event(Box::new(Event::Blob(BlobEvent::ReadHeld { held: true })));
+    assert_eq!(held_answer(held), Ok(true));
+    let missing = Event::Blob(BlobEvent::Error(BlobError::HandleMissing));
+    assert_eq!(held_answer(IoResult::Event(Box::new(missing))), Ok(false));
+}
+
+// An evicted copy a read holds is left to the sweep; a free one is deleted.
+#[test]
+fn held_copy_spared() {
+    let location = location(9);
+    let mut keep = KeepCopyOperation {
+        copy: None,
+        location: location.clone(),
+        claim: Vec::new(),
+        step: KeepStep::Publish,
+        evicted: VecDeque::from([location.clone(), location.clone()]),
+        asked: None,
+        error: None,
+    };
+    assert!(matches!(
+        keep.next_evicted(),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
+    let held = |held| IoResult::Event(Box::new(Event::Blob(BlobEvent::ReadHeld { held })));
+    assert!(matches!(
+        keep.next(held(true)),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
+    assert!(matches!(
+        keep.next(held(false)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(keep.step, KeepStep::Evicted);
 }

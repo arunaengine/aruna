@@ -944,7 +944,11 @@ async fn serve_download(
 /// Signs a ticket for one redirect with this node's key; `now` is Unix seconds.
 fn issue_ticket(context: &DriverContext, input: TicketInput, now: u64) -> Option<SignedTicket> {
     let net = context.net_handle.as_ref()?;
-    let ticket = unsigned_ticket((net.node_id(), *net.realm_id()), input, now);
+    let ticket = unsigned_ticket(
+        (net.node_id(), *net.realm_id()),
+        input,
+        (now, rand::random()),
+    );
     let bytes = ticket.signing_bytes().ok()?;
     Some(SignedTicket {
         signature: net.sign(&bytes),

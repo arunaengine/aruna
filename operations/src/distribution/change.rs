@@ -10,6 +10,7 @@ use std::marker::PhantomData;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -204,6 +205,8 @@ pub struct ChangeOperation<T> {
     snapshot: Option<DistributionSnapshot>,
     plan: Option<SplitPlan>,
     answer: PhantomData<T>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 type Changing<T> = Result<Next<T>, CreateError>;
@@ -215,6 +218,8 @@ fn change<T>(
     change: Change,
 ) -> ChangeOperation<T> {
     ChangeOperation {
+        now_ms: 0,
+        mint: IdMint::default(),
         here,
         auth: auth.clone(),
         bearer,
@@ -360,7 +365,7 @@ impl<T: ChangeAnswer> ChangeOperation<T> {
                 eligible_target(snapshot, range_id, to)?;
                 needs_coordinator(heard, snapshot, range_id, "the transfer")?;
                 self.send(DistributionRequest::TransferPrepare {
-                    transfer_id: Ulid::generate(),
+                    transfer_id: self.mint.mint(self.now_ms),
                     range_id,
                     to,
                     // The publisher raises it above every epoch its head names.
@@ -372,7 +377,7 @@ impl<T: ChangeAnswer> ChangeOperation<T> {
                 copy_target(snapshot, range_id, member_id)?;
                 needs_coordinator(heard, snapshot, range_id, "the new copy")?;
                 let fill = RangeFill {
-                    fill_id: Ulid::generate(),
+                    fill_id: self.mint.mint(self.now_ms),
                     range_id,
                     member_id,
                     admitted: false,
@@ -408,7 +413,7 @@ impl<T: ChangeAnswer> ChangeOperation<T> {
             )));
         }
         let member = DistributionMember {
-            member_id: Ulid::generate(),
+            member_id: self.mint.mint(self.now_ms),
             node_id: input.node_id,
             incarnation: None,
             state: MemberState::Created,
@@ -485,6 +490,14 @@ impl<T: ChangeAnswer> ChangeOperation<T> {
 impl<T: ChangeAnswer> Operation for ChangeOperation<T> {
     type Output = T;
     type Error = CreateError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Changing<T> {
         if self.here.ids.is_none() {

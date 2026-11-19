@@ -3,16 +3,20 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::keyspaces::DEVICE_REPLICA_KEYSPACE;
+use aruna_core::keyspaces::{DEVICE_REPLICA_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::read_row;
+use aruna_core::rows::{done, read_row, value};
 use aruna_core::rows::{outside_answer, outside_call};
 use tracing::warn;
 use ulid::Ulid;
 
 use super::replica::{
-    CacheUsageOperation, ListReplicasOperation, ReplicaRecord, replica_entry, replica_key,
+    CacheUsageOperation, DEFAULT_CACHE_BYTES, ListReplicasOperation, ReplicaRecord, replica_entry,
+    replica_key,
 };
+
+/// The row of `NODE_STATE_KEYSPACE` that holds the owner's cache budget in bytes.
+const CACHE_BUDGET_KEY: &[u8] = b"device_cache_budget";
 
 /// One replica, or `None` for both an absent row and an unreadable one: every caller treats an
 /// unreadable row as a document this device does not hold.
@@ -113,6 +117,60 @@ pub fn cache_usage() -> CacheUsageOperation {
     CacheUsageOperation::new()
 }
 
+/// The owner's cache budget; a node that never stored one keeps the default.
+pub fn cache_budget() -> CacheBudgetOperation {
+    CacheBudgetOperation
+}
+
+#[derive(Debug, PartialEq)]
+pub struct CacheBudgetOperation;
+
+impl Operation for CacheBudgetOperation {
+    type Output = u64;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<u64>, IoError> {
+        Ok(Next::Call(read_row(
+            NODE_STATE_KEYSPACE,
+            CACHE_BUDGET_KEY.to_vec(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<u64>, IoError> {
+        let stored = value(result)?.and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
+        Ok(Next::Done(
+            stored.map_or(DEFAULT_CACHE_BYTES, u64::from_be_bytes),
+        ))
+    }
+}
+
+/// Stores the owner's cache budget; startup writes it each time a device starts.
+pub fn store_cache_budget(bytes: u64) -> StoreBudgetOperation {
+    StoreBudgetOperation(bytes)
+}
+
+#[derive(Debug, PartialEq)]
+pub struct StoreBudgetOperation(u64);
+
+impl Operation for StoreBudgetOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let row = (
+            NODE_STATE_KEYSPACE.to_string(),
+            CACHE_BUDGET_KEY.to_vec().into(),
+            self.0.to_be_bytes().to_vec().into(),
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        done(result)?;
+        Ok(Next::Done(()))
+    }
+}
+
 /// Every replica this device holds, in document order.
 pub fn list_replicas() -> ListReplicasOperation {
     ListReplicasOperation::new()
@@ -200,5 +258,36 @@ mod tests {
         );
         assert_eq!(delete.first(), Ok(Next::Call(IoCall::Delete(vec![row]))));
         assert_eq!(delete.next(IoResult::Done), Ok(Next::Done(())));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    // A device that never stored a budget keeps the default.
+    #[test]
+    fn missing_budget_default() {
+        let mut read = cache_budget();
+        assert!(matches!(read.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let answer = read.next(IoResult::Values(vec![None]));
+        assert_eq!(answer, Ok(Next::Done(DEFAULT_CACHE_BYTES)));
+    }
+
+    // A stored budget is read back as written.
+    #[test]
+    fn stored_budget_read() {
+        let mut store = store_cache_budget(7);
+        let Ok(Next::Call(IoCall::Write(rows))) = store.first() else {
+            panic!("expected the write");
+        };
+        let mut read = cache_budget();
+        read.first().unwrap();
+        let written = rows.into_iter().next().map(|(_, _, value)| value);
+        assert_eq!(
+            read.next(IoResult::Values(vec![written])),
+            Ok(Next::Done(7))
+        );
+        assert_eq!(store.next(IoResult::Done), Ok(Next::Done(())));
     }
 }

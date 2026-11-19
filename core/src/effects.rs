@@ -493,6 +493,16 @@ pub enum BlobEffect {
         backend: BackendRef,
         bucket: String,
     },
+    /// Holds the kept copy at `backend_path` while `blob` streams, so eviction leaves its bytes
+    /// to the hidden sweep; answered by `BlobEvent::PinnedRead`.
+    PinRead {
+        backend_path: String,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    /// Whether a read holds the kept copy at `backend_path`; answered by `BlobEvent::ReadHeld`.
+    ReadHeld {
+        backend_path: String,
+    },
     /// One repository, provider or stored artifact call of a job or link; answers
     /// `BlobEvent::Remote`.
     Remote(Box<crate::repository::remote::RemoteRequest>),
