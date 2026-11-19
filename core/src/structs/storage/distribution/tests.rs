@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::presets::{add_edges, replica_layout, shard_layout};
-use super::validate::validate_config;
+use super::validate::{DistributionError, validate_config};
 use super::*;
 use crate::id::NodeId;
 use ulid::Ulid;
