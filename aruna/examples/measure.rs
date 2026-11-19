@@ -758,7 +758,7 @@ impl EffectOperation for ReadRows {
             }),
             false => runner_read(0),
         };
-        smallvec::smallvec![effect]
+        Effects::from_iter([effect])
     }
 
     fn step(&mut self, event: Event) -> Effects {
@@ -777,7 +777,7 @@ impl EffectOperation for ReadRows {
         }
         match self.is_complete() {
             true => Effects::new(),
-            false => smallvec::smallvec![runner_read(self.answered)],
+            false => Effects::from_iter([runner_read(self.answered)]),
         }
     }
 

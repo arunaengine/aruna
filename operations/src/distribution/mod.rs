@@ -42,8 +42,8 @@ pub mod split;
 pub mod status;
 mod status_view;
 pub mod submit;
-#[cfg(test)]
-pub(crate) mod test_record;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_record;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod test_store;
 pub mod ticket;

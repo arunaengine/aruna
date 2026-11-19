@@ -15,7 +15,7 @@ use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;
 
-pub(crate) const MAX_FUTURE_SKEW: u64 = 5 * 60 * 1000;
+pub const MAX_FUTURE_SKEW: u64 = 5 * 60 * 1000;
 
 /// A restart or recovery notice speaks for the node that holds the bucket, so only that node
 /// may deliver it.

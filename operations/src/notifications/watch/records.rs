@@ -24,7 +24,7 @@ pub(crate) const WATCH_CAP_REACHED: &str = "notification watch subscription cap 
 
 /// Stable reject reason for an unauthorized create; matched verbatim by the
 /// holder proxy to surface a 403 to the API layer.
-pub(crate) const WATCH_SUBSCRIPTION_UNAUTHORIZED: &str =
+pub const WATCH_SUBSCRIPTION_UNAUTHORIZED: &str =
     "watch subscription owner lacks READ on the watched path";
 pub(crate) const WATCH_SUBSCRIPTION_UNAVAILABLE: &str =
     "watch subscription authorization is temporarily unavailable";

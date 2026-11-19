@@ -380,8 +380,8 @@ impl ValidatedBearer {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_for_test(token: impl Into<String>) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn new_for_test(token: impl Into<String>) -> Self {
         Self::new(token, u64::MAX)
     }
 

@@ -91,6 +91,7 @@ zip = { workspace = true }
 aruna-operations = { workspace = true, features = ["test-hooks"] }
 keyring-core = { workspace = true }
 aruna-kpabe = { workspace = true }
+md5 = { workspace = true }
 axum = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-smithy-http-client = { workspace = true }
