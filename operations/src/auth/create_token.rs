@@ -6,6 +6,7 @@ use aruna_core::UserId;
 use aruna_core::auth::valid_token_lifetime;
 use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::compute::Secret;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::validate_restriction_limits;
 use aruna_core::structs::identity::auth::{
@@ -33,6 +34,8 @@ pub struct CreateTokenConfig {
 #[derive(Debug, PartialEq)]
 pub struct CreateTokenOperation {
     config: CreateTokenConfig,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -57,14 +60,16 @@ impl From<IoError> for CreateTokenError {
     }
 }
 
-pub fn mint_token(config: &CreateTokenConfig) -> Result<String, CreateTokenError> {
-    mint_login_token(config, None)
+/// Mints a token with the token id `jti`.
+pub fn mint_token(config: &CreateTokenConfig, jti: Ulid) -> Result<String, CreateTokenError> {
+    mint_login_token(config, None, jti)
 }
 
 /// Mints a token that carries the time of the primary login it descends from.
 pub fn mint_login_token(
     config: &CreateTokenConfig,
     auth_time: Option<u64>,
+    jti: Ulid,
 ) -> Result<String, CreateTokenError> {
     let iat = config.time;
     let exp = match config.expiry {
@@ -91,7 +96,7 @@ pub fn mint_login_token(
         iss: config.realm_id.to_string(),
         iat,
         exp,
-        jti: Ulid::generate().to_string(),
+        jti: jti.to_string(),
         sid: config.session.as_ref().map(|session| session.sid.clone()),
         session_kind: config.session.as_ref().map(|session| session.kind),
         restrictions: config.restrictions.clone(),
@@ -142,7 +147,11 @@ impl CreateTokenOperation {
         if matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
             return Err(CreateTokenError::NotEnoughCapabilities);
         }
-        Ok(CreateTokenOperation { config })
+        Ok(CreateTokenOperation {
+            config,
+            now_ms: 0,
+            ids: IdMint::default(),
+        })
     }
 }
 
@@ -150,8 +159,19 @@ impl Operation for CreateTokenOperation {
     type Output = Secret;
     type Error = CreateTokenError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<Secret>, CreateTokenError> {
-        mint_token(&self.config).map(Secret::new).map(Next::Done)
+        let jti = self.ids.mint(self.now_ms);
+        mint_token(&self.config, jti)
+            .map(Secret::new)
+            .map(Next::Done)
     }
 
     fn next(&mut self, _result: IoResult) -> Result<Next<Secret>, CreateTokenError> {
@@ -258,20 +278,23 @@ mod test {
         let signing_key: SigningKey = generate_signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
         let sid = Ulid::from_bytes([7; 16]).to_string();
-        let token = mint_token(&CreateTokenConfig {
-            time: 1_800_000_000,
-            expiry: Some(1_800_000_600),
-            user_id: UserId::local(Ulid::from_bytes([8; 16]), realm_id),
-            realm_id,
-            node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
-            session: Some(SessionRef {
-                sid: sid.clone(),
-                kind: SessionKind::Assistant,
-                name: None,
-                via: None,
-            }),
-            restrictions: None,
-        })
+        let token = mint_token(
+            &CreateTokenConfig {
+                time: 1_800_000_000,
+                expiry: Some(1_800_000_600),
+                user_id: UserId::local(Ulid::from_bytes([8; 16]), realm_id),
+                realm_id,
+                node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
+                session: Some(SessionRef {
+                    sid: sid.clone(),
+                    kind: SessionKind::Assistant,
+                    name: None,
+                    via: None,
+                }),
+                restrictions: None,
+            },
+            Ulid::from_parts(1_800_000_000_000, 9),
+        )
         .unwrap();
         let claims = jsonwebtoken::dangerous::insecure_decode::<TokenClaims>(&token)
             .unwrap()

@@ -170,6 +170,7 @@ struct RevocationWrite {
     revocation: Revocation,
     marks: Option<DueMarks>,
     revoked: Option<Revoked>,
+    now_ms: u64,
 }
 
 impl RevocationWrite {
@@ -178,6 +179,7 @@ impl RevocationWrite {
             revocation: Revocation::new(config),
             marks: None,
             revoked: None,
+            now_ms: 0,
         }
     }
 
@@ -195,6 +197,10 @@ impl RevocationWrite {
 impl Operation for RevocationWrite {
     type Output = Revoked;
     type Error = RevokeTokenError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -218,7 +224,7 @@ impl Operation for RevocationWrite {
         let revoked = self.revocation.outcome()?;
         // A new or later user cutoff ends READ for the account, so its buckets need new epochs.
         if revoked.outbox && revoked.cutoff_raised {
-            let marks = DueMarks::new(None, aruna_core::time::unix_timestamp_millis());
+            let marks = DueMarks::new(None, self.now_ms);
             let first = marks.first();
             self.marks = Some(marks);
             self.revoked = Some(revoked);

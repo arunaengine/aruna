@@ -181,6 +181,7 @@ impl CreateSessionOperation {
             name: self.config.name.clone(),
             via: self.config.via,
         };
+        let jti = self.ids.mint(self.now_ms);
         let token = mint_login_token(
             &CreateTokenConfig {
                 time: self.config.time,
@@ -192,6 +193,7 @@ impl CreateSessionOperation {
                 restrictions: self.config.restrictions.clone(),
             },
             self.config.auth_time,
+            jti,
         )?;
         self.session = Some(UserSession {
             sid: self.sid.clone(),
