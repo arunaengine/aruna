@@ -262,7 +262,6 @@ impl Operation for JobStatsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{

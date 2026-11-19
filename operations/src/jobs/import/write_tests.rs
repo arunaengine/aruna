@@ -117,9 +117,7 @@ fn final_report_counts() {
 #[test]
 fn queue_failure_continues() {
     let mut write = writing(Step::FinalQueue);
-    let failed = child(Err::<QueueBlobResult, _>(BlobQueueError::Conversion(
-        aruna_core::errors::ConversionError::InvalidLength("broken".to_string()),
-    )));
+    let failed = child(Err::<bool, _>(IoError::Codec("broken".to_string())));
     let Ok(Next::Done(done)) = write.next(failed) else {
         panic!("expected the advanced checkpoint");
     };
@@ -130,9 +128,7 @@ fn queue_failure_continues() {
 #[test]
 fn reference_queue_retries() {
     let mut write = writing(Step::ReferenceQueue);
-    let failed = child(Err::<QueueBlobResult, _>(BlobQueueError::Conversion(
-        aruna_core::errors::ConversionError::InvalidLength("broken".to_string()),
-    )));
+    let failed = child(Err::<bool, _>(IoError::Codec("broken".to_string())));
     assert!(matches!(
         write.next(failed),
         Err(ImportFailure::Retryable(_))
