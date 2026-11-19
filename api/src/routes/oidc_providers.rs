@@ -194,9 +194,9 @@ fn map_provider_error(error: SetProviderError) -> ServerError {
         }
         SetProviderError::InvalidProvider { reason } => ServerError::BadRequestReason(reason),
         SetProviderError::LastProvider => ServerError::Conflict(error.to_string()),
-        SetProviderError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
-            "concurrent realm configuration update conflict; retry".to_string(),
-        ),
+        SetProviderError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::config_conflict()
+        }
         SetProviderError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }

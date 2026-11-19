@@ -85,9 +85,9 @@ fn realm_error(error: RealmSecretError) -> ServerError {
         RealmSecretError::Change(error) => change_error(error),
         RealmSecretError::ConfigMissing => ServerError::NotFound,
         RealmSecretError::NotManagementNode => ServerError::Forbidden,
-        RealmSecretError::Storage(StorageError::TransactionConflict) => ServerError::Conflict(
-            "concurrent realm configuration update conflict; retry".to_string(),
-        ),
+        RealmSecretError::Storage(StorageError::TransactionConflict) => {
+            ServerError::config_conflict()
+        }
         other => ServerError::InternalError(other.into()),
     }
 }

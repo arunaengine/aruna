@@ -496,9 +496,9 @@ fn map_compute_error(error: SetComputeError) -> ServerError {
             ServerError::Forbidden
         }
         SetComputeError::InvalidCompute { reason } => ServerError::BadRequestReason(reason),
-        SetComputeError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
-            "concurrent realm configuration update conflict; retry".to_string(),
-        ),
+        SetComputeError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::config_conflict()
+        }
         SetComputeError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }

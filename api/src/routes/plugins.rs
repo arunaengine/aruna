@@ -251,7 +251,7 @@ fn map_publish_error(error: PublishError) -> ServerError {
             ServerError::Conflict(error.to_string())
         }
         PublishError::Entry(EntryError::StorageError(StorageError::TransactionConflict)) => {
-            ServerError::Conflict("concurrent realm configuration update conflict; retry".into())
+            ServerError::config_conflict()
         }
         PublishError::Entry(EntryError::Unauthorized | EntryError::NotManagementNode) => {
             ServerError::Forbidden
