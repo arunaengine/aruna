@@ -13,8 +13,6 @@ use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::HashIndex;
-use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::driver::drive;
