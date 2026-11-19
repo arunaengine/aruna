@@ -4,6 +4,7 @@
 
 use super::tests::{create_event, node};
 use super::*;
+use aruna_core::keyspaces::RAW_REVISION_KEYSPACE;
 use aruna_core::storage_entries::create_event_entry;
 use aruna_core::task::TaskKey;
 
@@ -384,6 +385,39 @@ fn commit_writes_first() {
     assert_eq!(commit.next(IoResult::Done), Ok(Next::Done(())));
     let conflict = Error::from(IoError::Conflict);
     assert!(CommitFinishOperation::is_conflict(&conflict));
+}
+
+// The capture mark holds the revision the job displays, so the drain snapshots that graph.
+#[test]
+fn mark_holds_revision() {
+    let job_ids = (job_key(), job(1));
+    let cache = RawStateCache::default();
+    let mut operation = MaterializationJobOperation::new(job_ids, None, cache, GitNode::default());
+    let revision = MetadataRawRevision {
+        jsonld: "{}".to_string(),
+        winning_event_id: ids().1,
+        context_digest: [1; 32],
+        dataset_digest: None,
+        merged: None,
+    };
+    let state_write = (
+        RAW_REVISION_KEYSPACE.to_string(),
+        Key::from(vec![1]),
+        Value::from(vec![2]),
+    );
+    let materialized = MaterializedCreateEvent {
+        raw_revision: Some(revision.clone()),
+        raw_state_write: state_write,
+        validation_write: None,
+    };
+    let value = Value::from(postcard::to_allocvec(&Some(revision)).unwrap());
+    let mark = (
+        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+        Key::from(sidecar_key()),
+        value,
+    );
+    let written = operation.mark(materialized);
+    assert_eq!(written, Ok(Next::Call(IoCall::Write(vec![mark]))));
 }
 
 fn drain_result(turn: MaterializationTurn<MetadataDrainResult>) -> MetadataDrainResult {

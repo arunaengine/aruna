@@ -2065,16 +2065,19 @@ impl MaterializationJobOperation {
     }
 
     // Refreshes keep off the raw view from here until the Git capture drain, after the finish
-    // batch stored this graph, takes its snapshot.
+    // batch stored this graph, takes its snapshot. The mark holds the revision this job
+    // displays, so a newer edit stored before the drain never takes its place.
     fn mark(
         &mut self,
         materialized: MaterializedCreateEvent,
     ) -> MaterializationTurn<ProcessedMaterializationJob> {
         self.craqle_elapsed = elapsed(self.apply_started_ms, self.now_ms);
+        let revision =
+            postcard::to_allocvec(&materialized.raw_revision).map_err(ConversionError::from)?;
         let mark = (
             MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
             document_job_key(self.job.document_id, self.job.event_id),
-            ByteView::from(Vec::new()),
+            ByteView::from(revision),
         );
         self.stage = JobStage::Mark(Box::new(materialized));
         Ok(Next::Call(IoCall::Write(vec![mark])))

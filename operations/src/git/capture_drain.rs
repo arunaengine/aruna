@@ -1,5 +1,5 @@
-//! Takes the Git snapshot of each document whose capture mark remains once its materialization
-//! finished, and deletes the mark only after the snapshot, so a crash never loses one.
+//! Snapshots the revision each capture mark holds once its materialization finished, and
+//! deletes the mark only after the snapshot, so a crash never loses one.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,12 +10,12 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageReadError;
 use aruna_core::git::GitNode;
 use aruna_core::keyspaces::{MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE};
-use aruna_core::metadata::{MaterializationState, MaterializationStatusRecord};
+use aruna_core::metadata::{MaterializationState, MaterializationStatusRecord, MetadataRawRevision};
 use aruna_core::operation::Operation;
 use aruna_core::rows::PrefixPages;
 use aruna_core::storage_entries::materialization_status_key;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::Key;
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
@@ -47,8 +47,9 @@ enum CaptureStep {
 pub struct CaptureDrainOperation {
     node: GitNode,
     pages: PrefixPages,
-    marks: VecDeque<Key>,
+    marks: VecDeque<(Key, Value)>,
     current: Option<(Key, Ulid, Ulid)>,
+    revision: Option<MetadataRawRevision>,
     failed: bool,
     step: CaptureStep,
 }
@@ -71,13 +72,14 @@ impl CaptureDrainOperation {
             ),
             marks: VecDeque::new(),
             current: None,
+            revision: None,
             failed: false,
             step: CaptureStep::Page,
         }
     }
 
     fn next_mark(&mut self) -> Turn {
-        let Some(key) = self.marks.pop_front() else {
+        let Some((key, value)) = self.marks.pop_front() else {
             if !self.pages.done() {
                 self.step = CaptureStep::Page;
                 return Ok(Next::Call(self.pages.call()));
@@ -88,6 +90,11 @@ impl CaptureDrainOperation {
             self.current = Some((key, Ulid::nil(), Ulid::nil()));
             return self.delete();
         };
+        // A mark that does not decode still gets a snapshot, of the graph the document shows.
+        self.revision = postcard::from_bytes(&value).unwrap_or_else(|error| {
+            warn!(%document_id, %error, "A Git capture mark holds no readable revision");
+            None
+        });
         self.current = Some((key, document_id, event_id));
         self.step = CaptureStep::Status;
         let row = (
@@ -148,7 +155,7 @@ impl Operation for CaptureDrainOperation {
         match std::mem::replace(&mut self.step, CaptureStep::Page) {
             CaptureStep::Page => {
                 let rows = self.pages.take(result)?;
-                self.marks = rows.into_iter().map(|(key, _)| key).collect();
+                self.marks = rows.into_iter().collect();
                 self.next_mark()
             }
             CaptureStep::Status => {
@@ -163,7 +170,7 @@ impl Operation for CaptureDrainOperation {
                 match result.child::<Option<MetadataRegistryRecord>, StorageReadError>()? {
                     Ok(Some(record)) => {
                         self.step = CaptureStep::Capture;
-                        let snapshot = capture(&self.node, &record, None);
+                        let snapshot = capture(&self.node, &record, self.revision.as_ref());
                         Ok(Next::Call(IoCall::child(snapshot)))
                     }
                     // A deleted document has no snapshot to take.
@@ -194,13 +201,26 @@ mod tests {
 
     const DOCUMENT: Ulid = Ulid::from_parts(1, 1);
     const EVENT: Ulid = Ulid::from_parts(2, 2);
+    const LATER: Ulid = Ulid::from_parts(2, 9);
+
+    fn revision(jsonld: &str, event_id: Ulid) -> MetadataRawRevision {
+        MetadataRawRevision {
+            jsonld: jsonld.to_string(),
+            winning_event_id: event_id,
+            context_digest: [0; 32],
+            dataset_digest: None,
+            merged: None,
+        }
+    }
+
+    fn mark_row(event_id: Ulid, revision: &MetadataRawRevision) -> (Key, Value) {
+        let value = postcard::to_allocvec(&Some(revision.clone())).unwrap();
+        (document_job_key(DOCUMENT, event_id), Value::from(value))
+    }
 
     fn marks() -> IoResult {
-        let key = document_job_key(DOCUMENT, EVENT);
-        IoResult::Page {
-            rows: vec![(key, Value::from(Vec::new()))],
-            next: None,
-        }
+        let rows = vec![mark_row(EVENT, &revision("first", EVENT))];
+        IoResult::Page { rows, next: None }
     }
 
     fn status(event_id: Ulid, state: MaterializationState) -> IoResult {
@@ -270,7 +290,8 @@ mod tests {
         let record_read = IoCall::child(DocumentRecordOperation::new(DOCUMENT));
         assert_eq!(read, Ok(Next::Call(record_read)));
         let found = child(Ok::<_, StorageReadError>(Some(record())));
-        let snapshot = IoCall::child(capture(&GitNode::default(), &record(), None));
+        let first = revision("first", EVENT);
+        let snapshot = IoCall::child(capture(&GitNode::default(), &record(), Some(&first)));
         assert_eq!(drain.next(found), Ok(Next::Call(snapshot)));
         drain
     }
@@ -294,6 +315,30 @@ mod tests {
         );
         let mut rerun = snapshotting();
         assert_eq!(rerun.next(child(Ok::<(), GitError>(()))), delete_mark());
+    }
+
+    // Two quick edits each get the snapshot of the revision their own job displayed, even
+    // when the newer one finished before the drain ran.
+    #[test]
+    fn marks_keep_revisions() {
+        let (first, second) = (revision("first", EVENT), revision("second", LATER));
+        let mut drain = CaptureDrainOperation::new(GitNode::default());
+        drain.first().unwrap();
+        let rows = vec![mark_row(EVENT, &first), mark_row(LATER, &second)];
+        drain.next(IoResult::Page { rows, next: None }).unwrap();
+        for (event_id, displayed) in [(EVENT, first), (LATER, second)] {
+            drain.next(status(LATER, MaterializationState::Materialized)).unwrap();
+            let found = child(Ok::<_, StorageReadError>(Some(record())));
+            let snapshot = capture(&GitNode::default(), &record(), Some(&displayed));
+            assert_eq!(drain.next(found), Ok(Next::Call(IoCall::child(snapshot))));
+            let row = (
+                MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+                document_job_key(DOCUMENT, event_id),
+            );
+            let deleted = Ok(Next::Call(IoCall::Delete(vec![row])));
+            assert_eq!(drain.next(child(Ok::<(), GitError>(()))), deleted);
+            drain.next(IoResult::Done).unwrap();
+        }
     }
 
     fn reading() -> CaptureDrainOperation {
