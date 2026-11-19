@@ -700,6 +700,7 @@ dependencies = [
  "aruna-graph",
  "aruna-net",
  "aruna-outbound",
+ "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
  "bytes",
