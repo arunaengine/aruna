@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::document::BATCH_TOPIC_LIMIT;
 
 impl DocumentSyncService {
     pub async fn sync_with_peers(

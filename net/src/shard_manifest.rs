@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{ShardManifest, ShardManifestEntry};
+use aruna_core::document::{
+    ShardManifest, ShardManifestEntry, ShardTransportMessage, manifest_entry_digest,
+};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use irokle::Storage as _;
@@ -20,8 +22,6 @@ use tracing::debug;
 
 use crate::NetHandle;
 use crate::streams::BiStream;
-
-pub use aruna_core::document::{ShardTransportMessage, manifest_entry_digest};
 
 /// How long one read or write of a shard manifest exchange may take.
 pub const SHARD_IO_TIMEOUT: Duration = Duration::from_secs(10);

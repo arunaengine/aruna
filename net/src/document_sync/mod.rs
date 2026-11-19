@@ -56,7 +56,6 @@ mod topics;
 use self::cursor::*;
 
 const PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
-pub use aruna_core::document::BATCH_TOPIC_LIMIT;
 const OUTBOUND_PEER_LIMIT: usize = 8;
 const SYNC_FANOUT_DOMAIN: &[u8] = b"aruna-document-sync-fanout-v1";
 const SYNC_FANOUT_KEYSPACE: &str = "document-sync-fanout";
