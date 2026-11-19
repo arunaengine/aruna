@@ -4,14 +4,10 @@
 
 use crate::shared;
 
-use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, MetadataDirective};
-use shared::{
-    SeedNode, TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
-    spawn_complete_seed,
-};
+use shared::{TestResult, s3_setup};
 
 fn service_error_code<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<String>
 where
@@ -22,25 +18,6 @@ where
         .err()
         .and_then(|err| err.as_service_error().and_then(|inner| inner.code()))
         .map(ToOwned::to_owned)
-}
-
-async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client)> {
-    let seed = spawn_complete_seed().await?;
-    let admin_token = create_bearer_token(
-        seed.context.as_ref(),
-        seed.user_id,
-        seed.realm_id,
-        seed.capabilities.clone(),
-    )
-    .await?;
-    let group = create_group_http(&seed.base_url, &admin_token, group_name).await?;
-    let credentials = create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
-    let endpoint = seed
-        .s3
-        .as_ref()
-        .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-    let client = s3_client(endpoint, &credentials);
-    Ok((seed, client))
 }
 
 #[tokio::test]

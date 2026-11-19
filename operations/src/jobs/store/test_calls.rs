@@ -12,7 +12,6 @@ use super::job_calls::ReleaseOutcome;
 use super::job_calls::RenewOutcome;
 use super::job_calls::RequeueOutcome;
 use super::job_calls::RunSuccess;
-use super::list_jobs::ListJobsOperation;
 use super::mutation::{MutateJobOperation, NoGuard};
 use super::park_wake::AwaitOutcome;
 use super::*;
@@ -231,21 +230,6 @@ pub async fn list_job_entries(
 ) -> Result<(Vec<(Vec<u8>, Value)>, Option<Vec<u8>>), String> {
     drive(
         row_calls::list_job_entries(job_id, last_key, limit),
-        context,
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
-pub async fn list_user_jobs(
-    context: &DriverContext,
-    user_id: UserId,
-    cursor: Option<Vec<u8>>,
-    limit: usize,
-    filter: impl Fn(&JobRecord) -> bool + Send,
-) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
-    drive(
-        ListJobsOperation::new(user_id, cursor, limit, filter),
         context,
     )
     .await
@@ -539,11 +523,10 @@ pub async fn reserve_output_commits(
     destinations: &[(NodeId, String, String)],
     hints: &BTreeMap<(NodeId, String), SetHint>,
 ) -> Result<AttemptControl, JobMutationError> {
-    drive(
-        job_calls::reserve_output_commits(job_id, destinations.to_vec(), hints.clone()),
-        context,
-    )
-    .await
+    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let destinations = destinations.to_vec();
+    let call = job_calls::reserve_output_commits(job_id, destinations, hints.clone(), now_ms);
+    drive(call, context).await
 }
 
 pub async fn set_cancel_requested(
@@ -625,4 +608,33 @@ pub async fn settle_attempt<T>(
         }
         other => Some(other),
     }
+}
+
+/// Submits an execution job served by this context's node, at the current time.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_execution_job(
+    context: &DriverContext,
+    spec: aruna_core::structs::execution::job::ExecutionSpec,
+    created_by: aruna_core::UserId,
+    owner_node_id: aruna_core::id::NodeId,
+    idempotency_key: Option<String>,
+    workspace_mode: aruna_core::structs::execution::job::WorkspaceMode,
+    workspace_bucket: Option<String>,
+    retention_ms: u64,
+    active_cap: Option<u32>,
+) -> Result<crate::jobs::submit::SubmitJobResult, crate::jobs::submit::SubmitJobError> {
+    use crate::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
+    let submission = ExecutionSubmission {
+        spec,
+        created_by,
+        owner_node_id,
+        idempotency_key,
+        workspace_mode,
+        workspace_bucket,
+        retention_ms,
+        active_cap,
+        serving: context.node_and_realm(),
+        now_ms: aruna_core::time::unix_timestamp_millis(),
+    };
+    drive(SubmitExecutionOperation::new(submission), context).await
 }

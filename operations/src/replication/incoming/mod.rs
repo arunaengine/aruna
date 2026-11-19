@@ -29,6 +29,7 @@ use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, SubOperationEvent};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
@@ -82,9 +83,8 @@ use aruna_core::structs::storage::routing::{
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::structs::tagged_receipt;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, Value};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tracing::{debug, warn};
 use ulid::Ulid;
@@ -292,26 +292,6 @@ pub struct IncomingVersionResult {
     pub group_id: Option<GroupId>,
 }
 
-/// The enqueue-phase clock. A function pointer compares by address with the
-/// default lint noise, so equality is explicit; two operations that share the
-/// production clock or the same test clock are equal.
-#[derive(Clone, Copy, Debug)]
-struct EnqueueClock(fn() -> SystemTime);
-
-impl PartialEq for EnqueueClock {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::fn_addr_eq(self.0, other.0)
-    }
-}
-
-impl Eq for EnqueueClock {}
-
-impl EnqueueClock {
-    fn now(self) -> SystemTime {
-        (self.0)()
-    }
-}
-
 /// The bytes accepted from the sender, with the reservation cleanup this node
 /// still owes while the apply transaction is unresolved.
 #[derive(Clone, Debug, PartialEq)]
@@ -360,10 +340,10 @@ pub struct IncomingVersionOperation {
     publisher_node_id: NodeId,
     local_realm_id: RealmId,
     manifest: VersionReplicationManifest,
-    /// The clock the enqueue phase samples. A reclaim candidate is stamped when
-    /// it is enqueued, so a long apply still gets its full grace window instead
-    /// of inheriting an operation-start time that may already be stale.
-    clock: EnqueueClock,
+    /// The runner clock of the current step. A reclaim candidate is stamped when it is
+    /// enqueued, so a long apply still gets its full grace window.
+    now_ms: u64,
+    ids: IdMint,
     /// This instance is the apply: one write transaction over the rows of the version.
     applying: bool,
     destination_group_id: Option<GroupId>,
@@ -454,7 +434,8 @@ impl IncomingVersionOperation {
             publisher_node_id: local_node_id,
             local_realm_id,
             manifest,
-            clock: EnqueueClock(SystemTime::now),
+            now_ms: 0,
+            ids: IdMint::default(),
             applying: false,
             destination_group_id: None,
             destination_rules: Vec::new(),
@@ -763,6 +744,14 @@ impl Operation for IncomingVersionOperation {
         }
         calls.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }).into());
         calls
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 
@@ -1357,7 +1346,7 @@ impl IncomingVersionOperation {
         let envelope = AbeEffect::Envelope(EnvelopePlan {
             parameters,
             epoch,
-            write_id: Ulid::generate(),
+            write_id: self.ids.mint(self.now_ms),
             object_key: self.manifest.key.clone(),
             bucket_public: plan.public_key,
         });
@@ -1496,7 +1485,7 @@ impl IncomingVersionOperation {
         Self {
             applying: true,
             publisher_node_id: self.publisher_node_id,
-            clock: self.clock,
+            now_ms: self.now_ms,
             destination_group_id: self.destination_group_id,
             destination_compression: self.destination_compression,
             destination_bound: self.destination_bound,
@@ -1699,7 +1688,7 @@ impl IncomingVersionOperation {
 
     fn write_replaced_candidate(&mut self, key: ReclaimCandidateKey) -> Turn {
         let candidate = ReclaimCandidate {
-            enqueued_at: self.clock.now(),
+            enqueued_at: SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
         };
         let value = match candidate.to_bytes() {
             Ok(value) => value,
@@ -2213,7 +2202,7 @@ impl IncomingVersionOperation {
                 (self.local_realm_id, group_id, self.local_node_id),
                 (&self.manifest.bucket, &self.manifest.key),
                 self.manifest.version_id,
-                unix_timestamp_millis(),
+                self.now_ms,
             );
             rows.extend(journal_entries(&uploaded)?);
         }
@@ -2477,7 +2466,7 @@ impl IncomingVersionOperation {
     fn start_usage_update(&mut self) -> Turn {
         match self.usage_update.as_mut() {
             Some(update) => {
-                let call = update.start_calls().into_call();
+                let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
                 self.call(IncomingVersionState::UpdateUsage, call)
             }
             None => self.fail(ReplicationError::ReplicationFailed.into()),

@@ -34,7 +34,7 @@ fn used(install: &PluginInstall, at_ms: u64) -> AdminAuditRecord {
         run_id: None,
         refused: None,
     };
-    let mut record = AdminAuditRecord::for_use(install, secret, used);
+    let mut record = AdminAuditRecord::for_use(ulid::Ulid::from_parts(1, 3), install, secret, used);
     record.audit_id = Ulid::from_parts(at_ms, 1);
     record
 }
@@ -64,6 +64,7 @@ async fn prunes_old_uses() {
     let fixture = Fixture::new().await;
     let install = fixture.install(&fixture.request(None)).await.unwrap();
     let mut kept = AdminAuditRecord::for_install(
+        ulid::Ulid::from_parts(1, 3),
         AdminAuditAction::PluginInstalled,
         fixture.actor.user_id,
         &install,

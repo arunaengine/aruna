@@ -6,13 +6,13 @@
 use std::time::Duration;
 
 use aruna_api::portal::api_base_url;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::federation::{
     AcceptedRealms, MAX_NAME_LEN, RegistrationMode, valid_federation_url,
 };
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::time::unix_timestamp_secs;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::federation::publish::is_reporting;

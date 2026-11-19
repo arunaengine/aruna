@@ -345,7 +345,7 @@ impl Operation for ResumeAuditOperation {
 mod tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, next_event_id};
+    use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome};
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use tempfile::tempdir;
@@ -365,7 +365,7 @@ mod tests {
             outbound_handle: None,
         };
         let record = BucketAuditRecord {
-            event_id: next_event_id(5),
+            event_id: ulid::Ulid::from_parts(5, 1),
             bucket_id: Ulid::from_bytes([4; 16]),
             at_ms: 5,
             action: AuditAction::Lock,
@@ -441,7 +441,7 @@ mod tests {
         // and the last run completes.
         for steps in 0..=16 {
             let record = BucketAuditRecord {
-                event_id: next_event_id(5),
+                event_id: ulid::Ulid::from_parts(5, 2),
                 bucket_id: Ulid::from_bytes([4; 16]),
                 at_ms: 5,
                 action: AuditAction::TimedLock,
@@ -625,3 +625,25 @@ mod tests {
         );
     }
 }
+
+/// Converts audit retry failures into an operation error that names the state `$state`.
+macro_rules! audit_failure {
+    ($error:ty, $state:literal) => {
+        impl From<$crate::s3::bucket::audit_retry::AuditError> for $error {
+            fn from(error: $crate::s3::bucket::audit_retry::AuditError) -> Self {
+                use $crate::s3::bucket::audit_retry::AuditError;
+                match error {
+                    AuditError::Conversion(error) => Self::Conversion(error),
+                    AuditError::Storage(error) => Self::Storage(error),
+                    AuditError::NotAuditTimer => Self::NotFinished,
+                    AuditError::Unexpected(received) => Self::InvalidStateEvent {
+                        state: $state.to_string(),
+                        expected: "the audit retry timer's answer",
+                        received,
+                    },
+                }
+            }
+        }
+    };
+}
+pub(crate) use audit_failure;

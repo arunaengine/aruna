@@ -69,7 +69,7 @@ impl SignedCursor<ObjectCursorPayload> {
             if !nodes.insert(partition.node_id)
                 || partition.start_after.as_ref().is_some_and(|key| {
                     // A sealed position is checked by the node that sealed it.
-                    let plain = !crate::s3::object::search_scan::sealed_position(key);
+                    let plain = !aruna_core::cursor::sealed_position(key);
                     key.len() > SEARCH_MAX_BYTES || plain && BlobHeadKey::from_bytes(key).is_err()
                 })
             {

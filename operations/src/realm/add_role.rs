@@ -8,12 +8,13 @@ use aruna_core::admin_documents::{
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
+use aruna_core::id_mint::IdMint;
+use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::done;
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
@@ -246,6 +247,8 @@ struct RoleWrite {
     written: Option<WrittenRole>,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl RoleWrite {
@@ -256,7 +259,9 @@ impl RoleWrite {
             narrowed: false,
             written: None,
             deletes: Vec::new(),
-            marks: DueMarks::new(None, aruna_core::time::unix_timestamp_millis()),
+            marks: DueMarks::new(None, 0),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -288,7 +293,8 @@ impl RoleWrite {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
+        let admin_events =
+            apply_reducer_updates(&mut reducer_state, &self.input, &mut self.ids, self.now_ms)?;
         let roles_before = auth_doc.roles.clone();
         materialize_realm_role(&mut auth_doc, &self.input.role, &reducer_state);
         self.narrowed = aruna_core::admin_documents::roles_narrowed(&roles_before, &auth_doc.roles);
@@ -349,22 +355,23 @@ impl Operation for RoleWrite {
     type Output = WrittenRole;
     type Error = RealmRoleError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.marks.stamp(now_ms);
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<WrittenRole>, RealmRoleError> {
-        let target = AdminDocumentTarget::Realm {
-            realm_id: self.input.realm_id,
-        };
-        let auth_key = (*self.input.realm_id.as_bytes()).into();
-        Ok(Next::Call(IoCall::Read(vec![
-            (AUTH_KEYSPACE.to_string(), auth_key),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        Ok(Next::Call(crate::realm::authorization_reads(
+            self.input.realm_id,
+        )))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<WrittenRole>, RealmRoleError> {
@@ -396,6 +403,8 @@ impl Operation for RoleWrite {
 fn apply_reducer_updates(
     state: &mut AdminDocumentState,
     input: &RealmRoleConfig,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut admin_events = Vec::new();
     let event = state.apply_operation(
@@ -403,6 +412,7 @@ fn apply_reducer_updates(
         AdminDocumentOperation::RealmRoleCreated {
             role: AdminRoleDefinition::from(&input.role),
         },
+        ids.mint(now_ms),
     )?;
     admin_events.push(event);
 
@@ -413,6 +423,7 @@ fn apply_reducer_updates(
                 role_id: input.role.role_id,
                 user_id,
             },
+            ids.mint(now_ms),
         )?;
         admin_events.push(event);
     }

@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use aruna_core::UserId;
@@ -10,6 +9,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, BACKEND_IMPORT_KEYSPACE, DEDUP_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE,
     HARVEST_SOURCE_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -26,7 +26,7 @@ use aruna_core::structs::storage::backend_import::{BackendImport, import_key};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structured_id::{
-    BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredIdGenerator,
+    BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredId,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
@@ -48,23 +48,34 @@ pub fn schedule_drain_effect() -> Effect {
     })
 }
 
-pub fn mint_job_id(handle: PlacementHandle, bucket: BucketId) -> Result<JobId, ClockHealthError> {
-    let mut generator = job_id_generator()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    generator
-        .mint::<RoutableJobId>(handle, bucket)
+/// The largest time and the largest nonce of a structured id, both 48 bits wide.
+const FIELD_MAX: u64 = (1 << 48) - 1;
+
+/// A job id for `(handle, bucket)` at `now_ms`, with its time and nonce from the run's `ids`. The
+/// ids of one run strictly increase; ids of separate runs differ by their random nonce.
+pub fn mint_job_id(
+    handle: PlacementHandle,
+    bucket: BucketId,
+    ids: &mut IdMint,
+    now_ms: u64,
+) -> Result<JobId, ClockHealthError> {
+    let overflow = |timestamp_ms| ClockHealthError::TimestampOverflow { timestamp_ms };
+    if now_ms > FIELD_MAX {
+        return Err(overflow(now_ms));
+    }
+    let minted = ids.mint(now_ms);
+    let nonce = minted.random() as u64 & FIELD_MAX;
+    RoutableJobId::from_parts(minted.timestamp_ms(), handle, bucket, nonce)
         .map(JobId::from_routable)
+        .map_err(|_| overflow(minted.timestamp_ms()))
 }
 
-/// Synchronous form used by producer transactions that already fenced and read
-/// the realm config. The resulting job id and dedup shard can therefore be
-/// written atomically with the producer's own records.
-pub(crate) fn mint_configured_job(
+/// The owner's job-control handle and the bucket of `subject` in its strategy.
+pub(crate) fn job_placement(
     config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     owner_node_id: NodeId,
     subject: &[u8],
-) -> Result<JobId, SubmitJobError> {
+) -> Result<(PlacementHandle, BucketId), SubmitJobError> {
     let handle = config.job_control_handle(&owner_node_id).ok_or_else(|| {
         SubmitJobError::PlacementUnavailable(
             "serving node has no job-control binding yet".to_string(),
@@ -84,12 +95,21 @@ pub(crate) fn mint_configured_job(
         .ok_or_else(|| {
             SubmitJobError::PlacementUnavailable("job bucket is out of range".to_string())
         })?;
-    Ok(mint_job_id(handle, bucket)?)
+    Ok((handle, bucket))
 }
 
-fn job_id_generator() -> &'static Mutex<StructuredIdGenerator> {
-    static GENERATOR: OnceLock<Mutex<StructuredIdGenerator>> = OnceLock::new();
-    GENERATOR.get_or_init(|| Mutex::new(StructuredIdGenerator::new()))
+/// Synchronous form used by producer transactions that already fenced and read
+/// the realm config. The resulting job id and dedup shard can therefore be
+/// written atomically with the producer's own records.
+pub(crate) fn mint_configured_job(
+    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
+    owner_node_id: NodeId,
+    subject: &[u8],
+    ids: &mut IdMint,
+    now_ms: u64,
+) -> Result<JobId, SubmitJobError> {
+    let (handle, bucket) = job_placement(config, owner_node_id, subject)?;
+    Ok(mint_job_id(handle, bucket, ids, now_ms)?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -692,7 +712,7 @@ mod tests {
     }
 
     fn operation(spec: SubmitJobSpec) -> SubmitJobOperation {
-        let job_id = mint_job_id(
+        let job_id = crate::testing::fresh_job_id(
             PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
             BucketId::new(0).unwrap(),
         )

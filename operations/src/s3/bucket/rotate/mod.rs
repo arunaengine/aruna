@@ -14,6 +14,7 @@ use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, TRANSITION_KEYSPACE,
     TRANSITION_QUEUE_KEYSPACE, UPLOAD_KEYSPACE,
@@ -140,6 +141,7 @@ pub struct ChangeResult {
 
 #[derive(Debug, PartialEq)]
 pub struct ChangeEncryptionOperation {
+    ids: IdMint,
     input: ChangeInput,
     state: ChangeState,
     abe: Option<PrepareAbe>,
@@ -157,6 +159,7 @@ pub struct ChangeEncryptionOperation {
 impl ChangeEncryptionOperation {
     pub fn new(input: ChangeInput) -> Self {
         Self {
+            ids: IdMint::default(),
             input,
             state: ChangeState::ReadBucket,
             abe: None,
@@ -323,7 +326,7 @@ impl ChangeEncryptionOperation {
             return Err(ChangeError::NotFinished);
         };
         let key = BucketKeyRef::new(active.key.bucket_id, active.key.generation + 1);
-        let record_id = Ulid::generate();
+        let record_id = self.ids.mint(self.input.now_ms);
         let mut record = BucketKeyRecord::new(key, record_id, public_key, self.input.now_ms);
         let (mode, ..) = self.wanted();
         // A new `vault_locked` generation never enters the node vault.
@@ -496,6 +499,10 @@ impl Operation for ChangeEncryptionOperation {
         self.new_key = None;
         self.vault = None;
         Vec::new()
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

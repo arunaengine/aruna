@@ -5,7 +5,7 @@
 
 use aruna_core::UserId;
 use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::federation::{FederationError, Signed};
@@ -66,16 +66,7 @@ pub enum LinkLoginError {
     UnexpectedEvent,
 }
 
-impl From<IoError> for LinkLoginError {
-    fn from(error: IoError) -> Self {
-        match error {
-            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
-            IoError::Storage(error) => Self::Storage(error),
-            IoError::Unexpected { .. } | IoError::Codec(_) => Self::UnexpectedEvent,
-            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
-        }
-    }
-}
+super::io_failure!(LinkLoginError);
 
 fn user_read(user_id: &UserId) -> (String, ByteView) {
     (
@@ -427,7 +418,6 @@ mod tests {
     use super::*;
     use crate::users::update_user::{UserWrite, UserWritten};
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-    use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{
         AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode,
     };
@@ -499,6 +489,7 @@ mod tests {
             nonce,
             None,
             now,
+            ulid::Ulid::from_bytes([7; 16]),
         );
         let home = NodeCapabilities::management_node(home_key()).unwrap();
         Signed::sign(payload.unwrap(), &home).unwrap()
@@ -527,13 +518,7 @@ mod tests {
     }
 
     async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        let effect = StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        };
-        context.storage_handle.send_storage_effect(effect).await;
+        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     /// Two active local accounts and a realm that admits logins of every realm.

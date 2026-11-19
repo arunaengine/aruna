@@ -248,7 +248,8 @@ mod tests {
             object_key: "foo/a".into(),
             bucket_public: [3; 32],
         };
-        let (envelope, _) = create_envelope(plan).unwrap();
+        let (envelope, _) =
+            create_envelope(plan, &mut aruna_core::key_seal::SeedRng::new(&[7; 32])).unwrap();
         let values = vec![Some(envelope.to_bytes().unwrap().into())];
         operation.next(IoResult::Values(values)).unwrap();
         // One scope of the write's own epoch waits for the recipient's keys.

@@ -456,7 +456,15 @@ pub async fn serve_launch_offer(
     peer: NodeId,
     launch: LaunchFrame,
 ) -> MetadataTransportMessage {
-    let node = launch_node(context.node_and_realm(), &context.compute_limits(), &launch);
+    let (now_ms, execution_id) = (aruna_core::time::unix_timestamp_millis(), Ulid::generate());
+    let limits = context.compute_limits();
+    let node = launch_node(
+        context.node_and_realm(),
+        &limits,
+        &launch,
+        now_ms,
+        execution_id,
+    );
     let serve = ServeLaunchOperation::new(peer, launch, node);
     drive(serve, context)
         .await

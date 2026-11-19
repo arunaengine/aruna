@@ -13,6 +13,7 @@ use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, NetEffect};
 use aruna_core::events::{Event, ExecutionSignEvent, LaunchDecline, NetEvent};
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::PLAN_EXPLAIN_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::event;
@@ -216,8 +217,8 @@ impl WitnessRoundOperation {
             family,
             node,
             now_ms,
-            launch_id: Ulid::generate(),
-            execution_id: Ulid::generate(),
+            launch_id: Ulid::nil(),
+            execution_id: Ulid::nil(),
             step: RoundStep::Config,
             facts: None,
         }
@@ -668,6 +669,13 @@ impl WitnessRoundOperation {
 impl Operation for WitnessRoundOperation {
     type Output = RoundOutcome;
     type Error = IoError;
+
+    /// Both ids stay fixed for the whole run.
+    fn seed(&mut self, entropy: u128) {
+        let mut ids = IdMint::new(entropy);
+        self.launch_id = ids.mint(self.now_ms);
+        self.execution_id = ids.mint(self.now_ms);
+    }
 
     fn first(&mut self) -> RoundNext {
         let Some(node) = self.node.as_ref() else {

@@ -789,7 +789,7 @@ fn seal_rows(
             skipped.push(row_note(name, &key, "neither sealed nor a plain secret"));
             continue;
         }
-        let sealed = seal_bytes(secret_key, &value, &aad)
+        let sealed = seal_bytes(secret_key, &value, &aad, rand::random::<[u8; 24]>())
             .map_err(|error| decode_error(name, &key, error))?;
         rows.push((key.to_vec(), sealed));
     }
@@ -1503,7 +1503,13 @@ mod tests {
         let backend_key = backend_id.to_bytes();
         let aad = aruna_storage::row_aad(BACKEND_SECRET_KEYSPACE, &backend_key);
         let credential = CredentialEncryptionKey::derive(&[11u8; 32]);
-        let sealed = seal_bytes(&credential, &backend.to_bytes().unwrap(), &aad).unwrap();
+        let sealed = seal_bytes(
+            &credential,
+            &backend.to_bytes().unwrap(),
+            &aad,
+            rand::random::<[u8; 24]>(),
+        )
+        .unwrap();
         let source_key = source_id.to_bytes();
         let source_rows = vec![
             (source_key.as_slice(), source.to_bytes().unwrap()),

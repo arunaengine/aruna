@@ -365,12 +365,14 @@ pub struct WatchSubscription {
 
 impl WatchSubscription {
     pub fn new(
+        watch_id: Ulid,
         owner: UserId,
         path_prefix: String,
         event_mask: WatchEventMask,
         created_at_ms: u64,
     ) -> Self {
         Self::new_with_authorization(
+            watch_id,
             owner,
             path_prefix,
             event_mask,
@@ -380,6 +382,7 @@ impl WatchSubscription {
     }
 
     pub fn new_with_authorization(
+        watch_id: Ulid,
         owner: UserId,
         path_prefix: String,
         event_mask: WatchEventMask,
@@ -388,7 +391,7 @@ impl WatchSubscription {
     ) -> Self {
         authorization.watch_path_prefix = path_prefix.clone();
         Self {
-            watch_id: Ulid::generate(),
+            watch_id,
             owner,
             path_prefix,
             event_mask,
@@ -694,6 +697,7 @@ mod tests {
 
     fn subscription(owner: UserId) -> WatchSubscription {
         WatchSubscription::new(
+            ulid::Ulid::generate(),
             owner,
             "/bucket/prefix".to_string(),
             WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
@@ -713,7 +717,13 @@ mod tests {
             ]),
             WatchEventMask::from_kinds([WatchEventKind::SyncCompleted, WatchEventKind::SyncFailed]),
         ] {
-            let record = WatchSubscription::new(owner, "/data".to_string(), mask, 42);
+            let record = WatchSubscription::new(
+                ulid::Ulid::generate(),
+                owner,
+                "/data".to_string(),
+                mask,
+                42,
+            );
             let bytes = record.to_bytes().unwrap();
             assert_eq!(WatchSubscription::from_bytes(&bytes).unwrap(), record);
         }

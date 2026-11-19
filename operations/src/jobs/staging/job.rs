@@ -275,7 +275,7 @@ fn stopped_outcome(stops: JobStops, outcome: JobRunOutcome) -> Result<JobRunOutc
     })
 }
 
-fn stops_of(result: IoResult) -> Result<JobStops, IoError> {
+pub(super) fn stops_of(result: IoResult) -> Result<JobStops, IoError> {
     let event = result.event()?;
     match event {
         Event::Job(JobEvent::Stops(stops)) => Ok(stops),
@@ -286,7 +286,7 @@ fn stops_of(result: IoResult) -> Result<JobStops, IoError> {
     }
 }
 
-fn reported(result: IoResult) -> Result<(), IoError> {
+pub(super) fn reported(result: IoResult) -> Result<(), IoError> {
     let event = result.event()?;
     match event {
         Event::Job(JobEvent::Reported) => Ok(()),

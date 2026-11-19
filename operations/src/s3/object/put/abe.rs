@@ -40,7 +40,7 @@ impl PutObjectOperation {
         self.envelope_plan = Some(EnvelopePlan {
             parameters,
             epoch,
-            write_id: Ulid::generate(),
+            write_id: self.ids.mint(self.now_ms),
             object_key: self.config.request.key.clone(),
             bucket_public: plan.public_key,
         });

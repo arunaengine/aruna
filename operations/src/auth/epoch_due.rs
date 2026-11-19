@@ -44,6 +44,16 @@ impl DueMarks {
         }
     }
 
+    /// Takes the run's time; a run stamps it before every step.
+    pub fn stamp(&mut self, now_ms: u64) {
+        self.now = now_ms;
+    }
+
+    /// The run's time the marks write.
+    pub fn now(&self) -> u64 {
+        self.now
+    }
+
     /// The scan of the encrypted bucket index.
     pub fn first(&self) -> IoCall {
         let prefix = self.group_id.map(|group| group.to_bytes().to_vec());

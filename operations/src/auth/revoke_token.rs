@@ -11,6 +11,7 @@ use aruna_core::auth::{
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{
@@ -25,6 +26,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{Key, KeySpace, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::auth::epoch_due::DueMarks;
 use crate::sync::outbox_record::{admin_outbox_prefix, revocation_index_entry};
@@ -170,6 +172,8 @@ struct RevocationWrite {
     revocation: Revocation,
     marks: Option<DueMarks>,
     revoked: Option<Revoked>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl RevocationWrite {
@@ -178,6 +182,8 @@ impl RevocationWrite {
             revocation: Revocation::new(config),
             marks: None,
             revoked: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -196,11 +202,20 @@ impl Operation for RevocationWrite {
     type Output = Revoked;
     type Error = RevokeTokenError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Revoked>, RevokeTokenError> {
+        self.revocation.set_event(self.ids.mint(self.now_ms));
         Ok(Next::Call(self.revocation.first()))
     }
 
@@ -218,7 +233,7 @@ impl Operation for RevocationWrite {
         let revoked = self.revocation.outcome()?;
         // A new or later user cutoff ends READ for the account, so its buckets need new epochs.
         if revoked.outbox && revoked.cutoff_raised {
-            let marks = DueMarks::new(None, aruna_core::time::unix_timestamp_millis());
+            let marks = DueMarks::new(None, self.now_ms);
             let first = marks.first();
             self.marks = Some(marks);
             self.revoked = Some(revoked);
@@ -261,6 +276,8 @@ pub(crate) struct Revocation {
     outbox: bool,
     cutoff_raised: bool,
     refused: bool,
+    /// The id of the revocation event, which the run that folds this in mints.
+    event_id: Ulid,
 }
 
 impl Revocation {
@@ -282,7 +299,13 @@ impl Revocation {
             outbox: false,
             cutoff_raised: false,
             refused: false,
+            event_id: Ulid::nil(),
         }
+    }
+
+    /// Takes the id of the revocation event from the run that folds this in.
+    pub(crate) fn set_event(&mut self, event_id: Ulid) {
+        self.event_id = event_id;
     }
 
     fn document_ref(&self) -> DocumentTarget {
@@ -590,6 +613,7 @@ impl Revocation {
                     token_owner: self.config.token_owner,
                 },
                 &mut revocation_index,
+                self.event_id,
             )
         });
         let admin_event = admin_event.transpose()?;
@@ -746,6 +770,7 @@ mod tests {
                         expires_at: 2_000,
                         token_owner,
                     },
+                    ulid::Ulid::generate(),
                 )
                 .unwrap();
         }
@@ -904,10 +929,9 @@ mod tests {
         for commit in [false, true] {
             let token_hash = bearer_token_hash(&format!("joined-{commit}"));
             let config = revocation(&actor, &token_hash, 2_000, 1_000);
-            let folded = Folded {
-                revocation: Revocation::new(config),
-                commit,
-            };
+            let mut revocation = Revocation::new(config);
+            revocation.set_event(Ulid::from_parts(1_000, 1));
+            let folded = Folded { revocation, commit };
             assert_eq!(drive(folded, &context).await.is_ok(), commit);
             let read = drive(GetConfigOperation::new(actor.realm_id), &context)
                 .await
@@ -1139,6 +1163,7 @@ mod tests {
                     expires_at: 2_000,
                     token_owner: actor.user_id,
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         write_state(&context, &state).await;

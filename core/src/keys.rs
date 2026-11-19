@@ -7,9 +7,10 @@ use ed25519_dalek::SigningKey;
 use crate::id::{DhtKeyId, NodeId};
 use crate::structs::identity::realm::RealmId;
 
-/// Fresh Ed25519 signing key from operating-system randomness. `SigningKey::generate` needs an
-/// infallible `rand_core` generator, and no `OsRng` implements that trait, so the entropy is drawn
-/// directly. A failing system generator is not recoverable.
+/// Fresh Ed25519 signing key from operating-system randomness, for tests only: core takes keys
+/// as input. `SigningKey::generate` needs an infallible `rand_core` generator, which no `OsRng`
+/// implements, so the entropy is drawn directly.
+#[cfg(any(test, feature = "test-hooks"))]
 #[must_use]
 pub fn generate_signing_key() -> SigningKey {
     let mut bytes = [0u8; 32];

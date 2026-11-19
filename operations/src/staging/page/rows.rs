@@ -17,6 +17,7 @@ use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::StorageReadError;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, JOB_CLAIM_KEYSPACE, PURGE_FENCE_KEYSPACE,
     S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
@@ -436,6 +437,7 @@ pub(crate) fn page_rows(
     input: &PageImportInput,
     guards: &PageGuards,
     versions: Vec<Option<BlobVersion>>,
+    (mint, now_ms): (&mut IdMint, u64),
 ) -> Result<PageRows, PageImportError> {
     let mut versions = versions.into_iter();
     let mut writes = Vec::new();
@@ -471,8 +473,13 @@ pub(crate) fn page_rows(
             }
             EntryPlan::Register => {
                 let epoch = guards.epochs.get(index).copied().unwrap_or_default();
-                let (rows, change, root) =
-                    register_rows(input, guards, (entry, epoch), head.as_ref())?;
+                let (rows, change, root) = register_rows(
+                    input,
+                    guards,
+                    (entry, epoch),
+                    head.as_ref(),
+                    mint.mint(now_ms),
+                )?;
                 writes.extend(rows);
                 roots.extend(root);
                 inventory.extend(change);
@@ -534,6 +541,7 @@ fn register_rows(
     guards: &PageGuards,
     (entry, epoch): (&PageEntry, OriginalEpoch),
     head: Option<&CurrentVersionPointer>,
+    fresh: Ulid,
 ) -> Result<EntryRows, PageImportError> {
     let connector = &input.connector;
     let mut binding = build_source_binding(
@@ -545,7 +553,7 @@ fn register_rows(
         Some(connector.connector_id),
     );
     binding.mirrors = entry.mirrors.clone();
-    let version_id = mint_version(guards.set_hint);
+    let version_id = mint_version(fresh, guards.set_hint);
     let version = BlobVersion::reference(
         binding,
         entry.observation.clone(),

@@ -735,12 +735,7 @@ mod tests {
     }
 
     fn owner_auth(record: &JobRecord, realm_id: RealmId) -> AuthContext {
-        AuthContext {
-            user_id: record.created_by,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(record.created_by, realm_id)
     }
 
     #[tokio::test]

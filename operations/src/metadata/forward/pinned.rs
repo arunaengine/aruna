@@ -5,6 +5,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::identity::auth::Actor;
@@ -48,6 +49,8 @@ pub struct PinnedMintOperation {
     path: String,
     payload: Option<CreateDocumentPayload>,
     message: Option<String>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl PinnedMintOperation {
@@ -62,21 +65,27 @@ impl PinnedMintOperation {
             path: MetadataRegistryRecord::normalize_document_path(path),
             payload: Some(payload),
             message,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
     fn pin(&mut self, config: &RealmConfigDocument) -> Result<PinnedCreate, CreateAuthorizedError> {
-        let actor = &self.actor;
+        let (actor, ids) = (&self.actor, &mut self.ids);
         let user_origin =
             is_user_origin(config, actor.node_id).ok_or(MetadataApiError::ServiceUnavailable)?;
         let local = match user_origin {
             true => Err(CreateDocumentError::HoldsNoBucket),
-            false => mint_local_document(config, actor, self.group_id, &self.path),
+            false => {
+                mint_local_document(config, actor, self.group_id, &self.path, ids, self.now_ms)
+            }
         };
         let (document_id, target) = match local {
             Ok(id) => (id.as_ulid(), actor.node_id),
             Err(CreateDocumentError::HoldsNoBucket) => {
-                let id = mint_forward_document(config, actor, self.group_id, &self.path)?.as_ulid();
+                let (group_id, now_ms) = (self.group_id, self.now_ms);
+                let id = mint_forward_document(config, actor, group_id, &self.path, ids, now_ms)?;
+                let id = id.as_ulid();
                 let placement =
                     resolve_metadata_id(config, actor.realm_id, Some(self.group_id), id)?;
                 let holders = resolve_shard_holders(config, &placement);
@@ -121,6 +130,14 @@ impl Operation for PinnedMintOperation {
             .child::<RealmConfigDocument, GetConfigError>()?
             .map_err(|_| MetadataApiError::ServiceUnavailable)?;
         Ok(Next::Done(self.pin(&config)?))
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

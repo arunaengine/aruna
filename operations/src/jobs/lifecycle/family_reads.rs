@@ -677,12 +677,7 @@ mod tests {
     }
 
     fn auth(user_id: UserId) -> AuthContext {
-        AuthContext {
-            user_id,
-            realm_id: REALM,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(user_id, REALM)
     }
 
     fn stranger() -> UserId {

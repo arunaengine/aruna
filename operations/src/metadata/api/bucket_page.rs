@@ -71,7 +71,7 @@ pub(super) fn encode_cursor(cursor: &BucketCursor) -> Option<String> {
 fn may_reach(position: &NodePosition, bucket: &str) -> bool {
     !position.done
         && position.after.as_deref().is_none_or(|after| {
-            crate::s3::object::search_scan::sealed_position(after) || after < bucket.as_bytes()
+            aruna_core::cursor::sealed_position(after) || after < bucket.as_bytes()
         })
 }
 
@@ -357,7 +357,7 @@ mod tests {
             set_id: Some(set_id),
             ..hit("refseq", node_id)
         };
-        let sealed = crate::s3::object::search_scan::seal_position(b"bucket-key").unwrap();
+        let sealed = aruna_drivers::position::seal_position(b"bucket-key").unwrap();
         let first = vec![
             (
                 node(1),

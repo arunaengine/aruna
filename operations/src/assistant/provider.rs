@@ -6,6 +6,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{ASSISTANT_PROVIDER_KEYSPACE, PROVIDER_OWNER_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows;
@@ -94,6 +95,8 @@ pub struct CreateProviderOperation {
     pending_headers: AssistantHeaders,
     encryption_key: CredentialEncryptionKey,
     stage: CreateStage,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl CreateProviderOperation {
@@ -109,14 +112,22 @@ impl CreateProviderOperation {
             pending_headers: headers,
             encryption_key,
             stage: CreateStage::Index,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
     fn write(&mut self, index: &BTreeSet<String>) -> Result<IoCall, ProviderStoreError> {
-        self.provider
-            .encrypt_secret(&self.encryption_key, &self.pending_secret)?;
-        self.provider
-            .encrypt_headers(&self.encryption_key, &self.pending_headers)?;
+        self.provider.encrypt_secret(
+            &self.encryption_key,
+            &self.pending_secret,
+            aruna_core::id_mint::id_nonce(self.ids.mint(self.now_ms)),
+        )?;
+        self.provider.encrypt_headers(
+            &self.encryption_key,
+            &self.pending_headers,
+            aruna_core::id_mint::id_nonce(self.ids.mint(self.now_ms)),
+        )?;
         let (provider_space, provider_key) = provider_row(&self.provider.provider_id);
         let (owner_space, owner_key) = owner_row(self.provider.user_id);
         Ok(IoCall::Write(vec![
@@ -133,6 +144,14 @@ impl CreateProviderOperation {
 impl Operation for CreateProviderOperation {
     type Output = AssistantProvider;
     type Error = ProviderStoreError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<AssistantProvider>, ProviderStoreError> {
         Ulid::from_string(&self.provider.provider_id).map_err(ConversionError::from)?;

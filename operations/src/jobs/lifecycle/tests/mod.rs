@@ -95,33 +95,29 @@ pub(super) async fn family_audit(
     drive(read, context).await.transpose()
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Submits `spec` for the test user under the idempotency key `key`, without a workspace.
 pub(super) async fn submit_external_job(
     context: &DriverContext,
     spec: ExecutionSpec,
-    created_by: UserId,
-    idempotency_key: Option<String>,
-    workspace_mode: WorkspaceMode,
-    workspace_bucket: Option<String>,
-    retention_ms: u64,
+    key: &str,
     auth_token: Option<AuthToken>,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
-    let scope = match idempotency_key {
-        Some(key) => SubmissionScope::Keyed(key),
-        None => SubmissionScope::Unkeyed(Ulid::generate()),
-    };
     let submission = ExternalSubmission {
         spec,
-        created_by,
-        scope,
-        workspace_mode,
-        workspace_bucket,
-        retention_ms,
+        created_by: crate::tests::records::user(),
+        scope: SubmissionScope::Keyed(key.to_string()),
+        workspace_mode: WorkspaceMode::None,
+        workspace_bucket: None,
+        retention_ms: 60_000,
         auth_token,
     };
     let submit = SubmitExternalOperation::new(
         submission,
-        ingress_node(context.node_and_realm(), context.fresh_heartbeats()),
+        ingress_node(
+            context.node_and_realm(),
+            context.fresh_heartbeats(),
+            unix_timestamp_millis(),
+        ),
     );
     drive(submit, context).await.map_err(placement_failure)
 }
@@ -151,7 +147,15 @@ pub(super) async fn admit_launch(
     context: &DriverContext,
     launch: LaunchFrame,
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {
-    let node = launch_node(context.node_and_realm(), &context.compute_limits(), &launch)?;
+    let (now_ms, execution_id) = (unix_timestamp_millis(), Ulid::generate());
+    let limits = context.compute_limits();
+    let node = launch_node(
+        context.node_and_realm(),
+        &limits,
+        &launch,
+        now_ms,
+        execution_id,
+    )?;
     drive(AdmitLaunchOperation::new(launch, node), context)
         .await
         .ok()

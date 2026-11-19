@@ -176,16 +176,7 @@ fn starts_child(turn: &Turn) -> bool {
 
 /// The cleanup rows among `calls`, in order.
 fn cleanup_works(calls: &[IoCall]) -> Vec<BlobCleanupWork> {
-    let rows = calls.iter().filter_map(|call| match call {
-        IoCall::Write(rows) => Some(rows),
-        _ => None,
-    });
-    rows.flatten()
-        .map(|(space, _, value)| {
-            assert_eq!(space, BLOB_CLEANUP_KEYSPACE);
-            BlobCleanupWork::from_bytes(value.as_ref()).unwrap()
-        })
-        .collect()
+    crate::tests::s3::cleanup_works(calls)
 }
 
 fn released(calls: &[IoCall]) -> Option<Ulid> {
@@ -1306,13 +1297,16 @@ fn fence_values(
     let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
     let key = sealed_plan().key;
     let parameters = create_parameters(&secret, input.realm_id, input.node_id, key).unwrap();
-    let (envelope, _) = create_envelope(EnvelopePlan {
-        parameters: parameters.clone(),
-        epoch: 1,
-        write_id: Ulid::from_parts(6, 6),
-        object_key: input.key.clone(),
-        bucket_public: [3; 32],
-    })
+    let (envelope, _) = create_envelope(
+        EnvelopePlan {
+            parameters: parameters.clone(),
+            epoch: 1,
+            write_id: Ulid::from_parts(6, 6),
+            object_key: input.key.clone(),
+            bucket_public: [3; 32],
+        },
+        &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+    )
     .unwrap();
     let row = pending.then(|| envelope.to_bytes().unwrap().into());
     let values = vec![
@@ -1718,7 +1712,7 @@ mod decisions {
     use super::*;
     use crate::placement::policy::PolicyCacheStats;
     use aruna_core::structs::placement::policy::{
-        PlacementDecision, PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
+        PlacementDecision, PlacementSubject, VerifiedPolicy,
     };
     use std::collections::BTreeMap;
 
@@ -1727,18 +1721,7 @@ mod decisions {
     }
 
     fn policy(location: &str) -> VerifiedPolicy {
-        let policy = PlacementPolicy::new(
-            Ulid::from_bytes([1u8; 16]),
-            "residency".to_string(),
-            vec![PlacementSelector {
-                node_id: None,
-                location: Some(location.to_string()),
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
-        )
-        .expect("policy is valid");
-        VerifiedPolicy::verify(policy).expect("policy verifies")
+        crate::tests::policy::residency(1, location)
     }
 
     fn gate(location: &str) -> GateContext {

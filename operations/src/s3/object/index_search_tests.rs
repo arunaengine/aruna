@@ -107,12 +107,7 @@ async fn distributed_with(
 }
 
 fn owner(fixture: &Fixture) -> AuthContext {
-    AuthContext {
-        user_id: fixture.owner,
-        realm_id: fixture.realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(fixture.owner, fixture.realm_id)
 }
 
 impl Distributed {
@@ -228,7 +223,7 @@ async fn denied_pages_bounded() {
     let hidden = b"b/needle-2";
     assert!(!cursor.windows(hidden.len()).any(|part| part == hidden));
     assert_eq!(
-        open_position(&cursor).unwrap(),
+        aruna_drivers::position::open_position(&cursor).unwrap(),
         BlobHeadKey::new("spire", "b/needle-2").to_bytes().unwrap()
     );
 
@@ -468,7 +463,10 @@ async fn metadata_hits_authorized() {
         .expect("the budget ends the page early");
     assert!(sealed_position(&cursor));
     let last = BlobHeadKey::new("spire", "a/").to_bytes().unwrap();
-    assert_eq!(open_position(&cursor).unwrap(), last);
+    assert_eq!(
+        aruna_drivers::position::open_position(&cursor).unwrap(),
+        last
+    );
 }
 
 // Metadata words of at least three characters match by their start, through the index query

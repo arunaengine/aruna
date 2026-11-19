@@ -70,6 +70,7 @@ use crate::s3::util::{
     parse_completed_part, parse_copy_source, parse_part_number, parse_source_range,
     parse_version_id, reject_sse, sse_header, stored_encrypted, validate_object_key,
 };
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::compute::session::{SessionRequest, TouchedObject};
 use aruna_core::stream::BackendStream;
@@ -83,8 +84,8 @@ use aruna_core::structs::storage::multipart::COMPLETION_DEADLINE_MS;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive, drive_retry, drive_until, node_routing};
+use aruna_drivers::position::open_cursor;
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
@@ -133,7 +134,7 @@ use aruna_operations::s3::object::read::{
     GetRoutedOperation, KeyedReadOperation, ObjectInfoOperation, TokenRead,
 };
 use aruna_operations::s3::object::versions::{ListVersionsInput as LOVI, ListVersionsOperation};
-use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed, open_cursor};
+use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed};
 use aruna_operations::sync::mirror_repair::{
     KickRepairOperation, MirrorRecordOperation, SyncMirrorIntent,
 };

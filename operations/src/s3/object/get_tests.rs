@@ -1438,14 +1438,7 @@ async fn drift_creates_successor() {
 }
 
 fn observation(content_length: u64) -> SourceMetadata {
-    SourceMetadata {
-        content_length,
-        content_type: None,
-        etag: Some(format!("etag-{content_length}")),
-        last_modified: None,
-        source_version: None,
-        digests: Default::default(),
-    }
+    crate::tests::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
 }
 
 fn reference_source() -> VersionSourceBinding {
@@ -1658,6 +1651,7 @@ fn advance_writes_obligation() {
         permission: Permission::READ,
     }];
     let mut operation = drifted_operation().with_restrictions(Some(restrictions));
+    operation.stamp(millis(SystemTime::UNIX_EPOCH + MIN_ADVANCE_INTERVAL));
     let creator = operation.reference_creator.unwrap();
     let reader_auth = operation.auth_context();
     let headed = Ulid::generate();
@@ -1705,7 +1699,7 @@ fn advance_writes_obligation() {
 fn advance_at_boundary() {
     let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
     let mut operation = drifted_operation();
-    operation.now_override = Some(created_at + MIN_ADVANCE_INTERVAL);
+    operation.stamp(millis(created_at + MIN_ADVANCE_INTERVAL));
     let mut advance = advance_to_reread(&mut operation, Ulid::generate());
 
     let turn = step(&mut advance, current_version(created_at, 7));
@@ -1720,7 +1714,9 @@ fn advance_at_boundary() {
 fn advance_rejects_early() {
     let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
     let mut operation = drifted_operation();
-    operation.now_override = Some(created_at + MIN_ADVANCE_INTERVAL - Duration::from_secs(1));
+    operation.stamp(millis(
+        created_at + MIN_ADVANCE_INTERVAL - Duration::from_secs(1),
+    ));
     let mut advance = advance_to_reread(&mut operation, Ulid::generate());
 
     let turn = step(&mut advance, current_version(created_at, 0));
@@ -1731,9 +1727,9 @@ fn advance_rejects_early() {
 // A backwards clock must not grant an unbounded advance budget.
 #[test]
 fn advance_rejects_rollback() {
-    let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
     let mut operation = drifted_operation();
-    operation.now_override = Some(created_at - Duration::from_secs(3_600));
+    operation.stamp(millis(created_at - Duration::from_secs(3_600)));
     let mut advance = advance_to_reread(&mut operation, Ulid::generate());
 
     let turn = step(&mut advance, current_version(created_at, 0));
@@ -1746,7 +1742,7 @@ fn advance_rejects_rollback() {
 fn advance_at_cap() {
     let created_at = SystemTime::UNIX_EPOCH;
     let mut operation = drifted_operation();
-    operation.now_override = Some(created_at + MIN_ADVANCE_INTERVAL);
+    operation.stamp(millis(created_at + MIN_ADVANCE_INTERVAL));
     let mut advance = advance_to_reread(&mut operation, Ulid::generate());
 
     let turn = step(
@@ -1766,7 +1762,7 @@ fn advance_at_cap() {
 fn advance_rejects_exhausted() {
     let created_at = SystemTime::UNIX_EPOCH;
     let mut operation = drifted_operation();
-    operation.now_override = Some(created_at + Duration::from_secs(86_400));
+    operation.stamp(millis(created_at + Duration::from_secs(86_400)));
     let mut advance = advance_to_reread(&mut operation, Ulid::generate());
     let attempts = operation.drift_attempts;
 
@@ -1850,7 +1846,8 @@ fn successor_charges_size() {
         },
     )
     .in_bucket(&operation.input.bucket, RowChange::AddedVersion);
-    let _ = expected.start_calls();
+    // The successor id is given here, so the advance's first mint is the markers' generation.
+    let _ = expected.start_calls(aruna_core::id_mint::IdMint::default().mint(0));
     assert_eq!(advance.usage, Some(expected));
 }
 
@@ -2220,7 +2217,7 @@ async fn offered_drift_replaces() {
         .unwrap();
     std::fs::write(&file, b"one-changed").unwrap();
 
-    let mut operation = GetObjectOperation::new(GetObjectInput {
+    let operation = GetObjectOperation::new(GetObjectInput {
         bucket: offer.bucket.clone(),
         key: "data.bin".to_string(),
         version_id: None,
@@ -2230,8 +2227,9 @@ async fn offered_drift_replaces() {
         realm_id,
         node_id: offer.node_id,
     });
-    operation.now_override = Some(SystemTime::now() + 2 * MIN_ADVANCE_INTERVAL);
-    let mut stream = drive(operation, context).await.unwrap().blob;
+    // The run's clock is two cooldowns ahead, so the changed file may advance at once.
+    let ahead = 2 * MIN_ADVANCE_INTERVAL.as_millis() as u64;
+    let mut stream = drive(Ahead(operation, ahead), context).await.unwrap().blob;
     while let Some(Ok(_)) = stream.next().await {}
 
     let usage = || async {
@@ -3588,4 +3586,35 @@ fn missing_validator_advances() {
         turn.err(),
         Some(GetObjectError::HistoricalReferenceUnavailable)
     );
+}
+
+/// `time` on the runner clock.
+fn millis(time: SystemTime) -> u64 {
+    let since = time.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    u64::try_from(since.as_millis()).unwrap()
+}
+
+/// Runs a read on a clock `.1` milliseconds ahead of the runner's.
+#[derive(Debug, PartialEq)]
+struct Ahead(GetObjectOperation, u64);
+
+impl Operation for Ahead {
+    type Output = GetObjectResult;
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Result<Next<GetObjectResult>, GetObjectError> {
+        self.0.first()
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<GetObjectResult>, GetObjectError> {
+        self.0.next(result)
+    }
+
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        self.0.transaction()
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.0.stamp(now_ms + self.1);
+    }
 }

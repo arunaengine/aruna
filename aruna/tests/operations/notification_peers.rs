@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna::inbound::initialize_incoming_fixture;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -26,7 +27,6 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenRevocation,
 };
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::document_repository::GetConfigOperation;
@@ -112,7 +112,7 @@ async fn revoke_watch_token(
             .expect("watch binding")
             .token_hash
             .clone(),
-        expires_at: aruna_core::time::unix_timestamp_secs() + 600,
+        expires_at: aruna_clock::unix_timestamp_secs() + 600,
     });
     write_config(node, config.realm_id, &config).await;
 }
@@ -257,6 +257,7 @@ async fn read_inbox(node: &Node) -> Vec<NotificationRecord> {
 fn watch_record(recipient: UserId, seed: u8) -> NotificationRecord {
     let key = format!("object-{seed}");
     let mut record = NotificationRecord::new(
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Transient,
         NotificationKind::DataUploaded {
@@ -323,7 +324,13 @@ fn share_upload(from: &Node, recipient: UserId, bucket: &str, at: u64) -> Notifi
         key: "a.csv".to_string(),
         size_bytes: 1,
     };
-    NotificationRecord::new(recipient, NotificationClass::Direct, kind, at)
+    NotificationRecord::new(
+        ulid::Ulid::generate(),
+        recipient,
+        NotificationClass::Direct,
+        kind,
+        at,
+    )
 }
 
 async fn webhook_queued(node: &Node, record: &NotificationRecord) -> bool {
@@ -472,7 +479,13 @@ async fn dropped_upload_unqueued() {
         node_id: a.net.node_id(),
         group_id: data_group_id(),
     };
-    let deletion = NotificationRecord::new(recipient, NotificationClass::Direct, deleted, at);
+    let deletion = NotificationRecord::new(
+        ulid::Ulid::generate(),
+        recipient,
+        NotificationClass::Direct,
+        deleted,
+        at,
+    );
     deliver_remote(&a.context, b.net.node_id(), vec![deletion])
         .await
         .expect("deletion delivered");

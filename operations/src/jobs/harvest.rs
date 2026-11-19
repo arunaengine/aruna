@@ -8,6 +8,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
@@ -577,6 +578,7 @@ pub(crate) struct ApplyRecordOperation {
     now_ms: u64,
     access_started_ms: u64,
     step: ApplyStep,
+    ids: IdMint,
 }
 
 type ApplyTurn = Turn<RecordApplied>;
@@ -599,6 +601,7 @@ impl ApplyRecordOperation {
             now_ms: 0,
             access_started_ms: 0,
             step: ApplyStep::Provenance,
+            ids: IdMint::default(),
         }
     }
 
@@ -833,6 +836,10 @@ impl Operation for ApplyRecordOperation {
         self.now_ms = now_ms;
     }
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> ApplyTurn {
         let identifier = &self.record.header.identifier;
         if identifier.is_empty() {
@@ -862,8 +869,10 @@ impl Operation for ApplyRecordOperation {
                     .child::<RealmConfigDocument, GetConfigError>()?
                     .map_err(|error| retryable(format!("harvest mint document id: {error}")))?;
                 let path = self.path()?;
+                let (ids, now_ms) = (&mut self.ids, self.now_ms);
+                let group_id = self.source.group_id;
                 let document_id =
-                    mint_document_for(&config, &self.actor, self.source.group_id, &path, true)
+                    mint_document_for(&config, &self.actor, group_id, &path, true, ids, now_ms)
                         .map_err(|error| retryable(format!("harvest mint document id: {error}")))?
                         .as_ulid();
                 let row = self.row()?;

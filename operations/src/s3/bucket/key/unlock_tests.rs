@@ -11,7 +11,6 @@ use aruna_core::handle::Handle;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode, public_key_of};
-use aruna_core::structs::storage::format::Compression;
 use aruna_core::task::TaskEvent;
 use std::time::SystemTime;
 
@@ -39,17 +38,7 @@ fn input(caller: UserId) -> UnlockInput {
 }
 
 fn info() -> BucketInfo {
-    BucketInfo {
-        group_id: Ulid::from_bytes([3; 16]),
-        created_at: SystemTime::UNIX_EPOCH,
-        created_by: user(1),
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Off,
-        distribution: None,
-    }
+    crate::tests::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
 }
 
 fn event(event: Event) -> IoResult {
@@ -87,6 +76,7 @@ fn checked(caller: UserId, admins: &[UserId]) -> (UnlockIntent, IntentTurn) {
         record: None,
         ticket: None,
         intent: None,
+        ids: aruna_core::id_mint::IdMint::default(),
     };
     assert_eq!(operation.transaction(), TransactionMode::Write);
     operation.first().unwrap();

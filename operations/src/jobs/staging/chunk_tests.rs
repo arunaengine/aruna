@@ -26,14 +26,7 @@ fn table_run() -> StagingRun {
 }
 
 fn observation(length: u64) -> SourceMetadata {
-    SourceMetadata {
-        content_length: length,
-        content_type: None,
-        etag: None,
-        last_modified: None,
-        source_version: None,
-        digests: Default::default(),
-    }
+    crate::tests::staging::sized_source(length, None)
 }
 
 fn reader(read: TableRead) -> ChunkReadOperation {

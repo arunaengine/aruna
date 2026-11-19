@@ -14,6 +14,7 @@ use aruna_core::effects::{
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, ExecutionSignEvent, LaunchDecline, NetEvent};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
@@ -530,6 +531,7 @@ pub(crate) struct AdmitLaunchOperation {
     intent: Option<LaunchIntent>,
     spec: Option<LogicalJobSpec>,
     planned: Option<LaunchIntent>,
+    ids: IdMint,
     step: AdmitStep,
 }
 
@@ -544,6 +546,7 @@ impl AdmitLaunchOperation {
             intent: None,
             spec: None,
             planned: None,
+            ids: IdMint::default(),
             step: AdmitStep::Config,
         }
     }
@@ -687,7 +690,10 @@ impl AdmitLaunchOperation {
         let planned = self.planned.as_ref().ok_or(LaunchUndecided)?;
         let declined = |reason| Ok(Next::Done(Err(reason)));
         let subject = node.execution_id.to_bytes();
-        let Ok(job_id) = mint_configured_job(self.config()?, node.local, &subject) else {
+        let mut ids = self.ids;
+        let minted =
+            mint_configured_job(self.config()?, node.local, &subject, &mut ids, node.now_ms);
+        let Ok(job_id) = minted else {
             return declined(LaunchDecline::Draining);
         };
         let record = match materialize_local(spec, planned, job_id, node.local, node.now_ms) {
@@ -728,6 +734,7 @@ impl AdmitLaunchOperation {
             config_digest: capability.config_digest,
             record,
         };
+        self.ids = ids;
         let effect = Effect::Net(NetEffect::ExecutionSign(Box::new(claim)));
         self.call(
             AdmitStep::Sign(Box::new(prepared)),
@@ -782,6 +789,10 @@ impl AdmitLaunchOperation {
 impl Operation for AdmitLaunchOperation {
     type Output = LaunchDecision;
     type Error = LaunchUndecided;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> AdmitNext {
         let read = GetConfigOperation::new(self.node.realm_id);

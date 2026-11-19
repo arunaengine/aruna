@@ -23,7 +23,7 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::{MetaResourceId, StructuredId};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
-use crate::metadata::provenance::{RELEASE_INCOMPLETE, RELEASE_MEMBERSHIP};
+use aruna_core::structs::storage::release::{RELEASE_INCOMPLETE, RELEASE_MEMBERSHIP};
 use serde_json::json;
 use ulid::Ulid;
 

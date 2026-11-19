@@ -66,7 +66,8 @@ impl NodeVaultKey {
         Self(blake3::derive_key(KEY_CONTEXT, node_secret))
     }
 
-    /// Key with no node secret behind it, for stores that never restart.
+    /// Key with no node secret behind it, for tests whose stores never restart.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn random() -> Self {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).expect("operating system random number generator failed");
@@ -77,10 +78,13 @@ impl NodeVaultKey {
         Aes256Gcm::new((&self.0).into())
     }
 
-    /// Seals `secret` for `entry` as `nonce || ciphertext`.
-    pub fn seal(&self, entry: VaultEntry, secret: &SecretBytes) -> Result<Vec<u8>, VaultError> {
-        let mut nonce = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce).map_err(|_| VaultError::Seal)?;
+    /// Seals `secret` for `entry` as `nonce || ciphertext`; `nonce` must never repeat under this key.
+    pub fn seal(
+        &self,
+        entry: VaultEntry,
+        secret: &SecretBytes,
+        nonce: [u8; NONCE_LEN],
+    ) -> Result<Vec<u8>, VaultError> {
         let payload = Payload {
             msg: secret.expose(),
             aad: &entry.key(),
@@ -138,7 +142,9 @@ mod tests {
     fn opens_only_bound() {
         let key = NodeVaultKey::derive(&[7u8; 32]);
         let entry = VaultEntry::new(VaultPurpose::SourceConnector, Ulid::from_bytes([1u8; 16]));
-        let sealed = key.seal(entry, &SecretBytes::new(CANARY.to_vec())).unwrap();
+        let sealed = key
+            .seal(entry, &SecretBytes::new(CANARY.to_vec()), [3; 12])
+            .unwrap();
         assert!(!sealed.windows(CANARY.len()).any(|window| window == CANARY));
 
         // A restart derives the same key from the same node secret.

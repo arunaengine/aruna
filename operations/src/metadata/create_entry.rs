@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::identity::auth::Actor;
@@ -35,6 +36,8 @@ pub struct DocumentMintOperation {
     group_id: GroupId,
     document_path: String,
     forward_blind: bool,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl DocumentMintOperation {
@@ -44,6 +47,8 @@ impl DocumentMintOperation {
             group_id,
             document_path,
             forward_blind: false,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -54,6 +59,8 @@ impl DocumentMintOperation {
             group_id,
             document_path,
             forward_blind: true,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 }
@@ -78,8 +85,18 @@ impl Operation for DocumentMintOperation {
             self.group_id,
             &self.document_path,
             self.forward_blind,
+            &mut self.ids,
+            self.now_ms,
         )?;
         Ok(Next::Done(minted))
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

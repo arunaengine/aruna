@@ -11,7 +11,6 @@ use aruna_core::effects::LaunchFrame;
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::structs::execution::job::JobFamilyRecord;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
 use crate::jobs::lifecycle::launch_admit::LaunchNode;
@@ -19,26 +18,30 @@ use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::lifecycle::witness::WitnessNode;
 use crate::jobs::local_run::{LocalExecutionConfig, LocalRunOperation};
 
-/// This node as the submission operations see it; `None` without a network.
+/// This node as the submission operations see it at `now_ms`; `None` without a network.
 pub fn ingress_node(
     serving: Option<(NodeId, RealmId)>,
     fresh: BTreeMap<NodeId, HeldHeartbeat>,
+    now_ms: u64,
 ) -> Option<IngressNode> {
     let (local, realm_id) = serving?;
     Some(IngressNode {
         local,
         realm_id,
-        now_ms: unix_timestamp_millis(),
+        now_ms,
         fresh,
     })
 }
 
 /// This node as an offered launch sees it; `None` without a network, which leaves the offer
-/// undecided. `limits` holds each local backend's wire kind and limits by its name.
+/// undecided. `limits` holds each local backend's wire kind and limits by its name; the caller
+/// mints `execution_id` for the execution the launch would start here.
 pub fn launch_node(
     serving: Option<(NodeId, RealmId)>,
     limits: &BackendLimits,
     launch: &LaunchFrame,
+    now_ms: u64,
+    execution_id: Ulid,
 ) -> Option<LaunchNode> {
     let (local, realm_id) = serving?;
     let limit = match &launch.envelope().record {
@@ -48,8 +51,8 @@ pub fn launch_node(
     Some(LaunchNode {
         local,
         realm_id,
-        now_ms: unix_timestamp_millis(),
-        execution_id: Ulid::generate(),
+        now_ms,
+        execution_id,
         limits: limit.map(|limit| limit.limits),
         config_digest: limit.map(|limit| limit.config_digest),
     })

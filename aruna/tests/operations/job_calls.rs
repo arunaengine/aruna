@@ -3,16 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::execution::job::AttemptControl;
-use aruna_core::structs::execution::job::AttemptIntent;
 use aruna_core::structs::execution::job::JobError;
 use aruna_core::structs::execution::job::JobProgress;
 use aruna_core::structs::execution::job::JobResultPayload;
-use aruna_core::structs::execution::job::LaunchRecord;
 use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
 use aruna_core::types::TxnId;
-use aruna_core::types::Value;
-use aruna_operations::jobs::store::attempt_intent::AttemptCommit;
 use aruna_operations::jobs::store::job_calls;
 use aruna_operations::jobs::store::job_calls::CancelRequestOutcome;
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
@@ -24,15 +20,12 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use ulid::Ulid;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::execution::job::{
-    ArtifactRef, ExecutionSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId, JobRecord,
-    WorkspaceMode,
-};
+use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, JobId, JobRecord};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::JOB_PRUNE_PAGE;
@@ -47,8 +40,10 @@ use aruna_operations::jobs::job_reports::{ReportQuery, ReportRouteOperation};
 use aruna_operations::jobs::job_routes::{RecordRouteOperation, StatusRouteOperation};
 use aruna_operations::jobs::prune::{JobPruneOutcome, PruneJobsOperation};
 use aruna_operations::jobs::route::{JobRouteError, RoutedJobStatus};
+pub use aruna_operations::jobs::store::test_calls::{
+    list_job_entries, record_attempt_intent, submit_execution_job,
+};
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
-use aruna_operations::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
 use aruna_operations::jobs::submit_local::SubmitLocalOperation;
 
 pub async fn read_owned_job(
@@ -152,60 +147,18 @@ pub async fn prune_job_batch(context: &DriverContext) -> Result<JobPruneOutcome,
     drive(prune, context).await.map_err(|error| error.0)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn submit_execution_job(
-    context: &DriverContext,
-    spec: ExecutionSpec,
-    created_by: UserId,
-    owner_node_id: NodeId,
-    idempotency_key: Option<String>,
-    workspace_mode: WorkspaceMode,
-    workspace_bucket: Option<String>,
-    retention_ms: u64,
-    active_cap: Option<u32>,
-) -> Result<SubmitJobResult, SubmitJobError> {
-    let submission = ExecutionSubmission {
-        spec,
-        created_by,
-        owner_node_id,
-        idempotency_key,
-        workspace_mode,
-        workspace_bucket,
-        retention_ms,
-        active_cap,
-        serving: context.node_and_realm(),
-        now_ms: unix_timestamp_millis(),
-    };
-    drive(SubmitExecutionOperation::new(submission), context).await
-}
-
+/// Submits an import of `spec` without an idempotency key, served by this context's node.
 pub async fn submit_rocrate_import(
     context: &DriverContext,
     spec: ImportRoCrateSpec,
     owner_node_id: NodeId,
-    idempotency_key: Option<String>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
+    let serving = context.node_and_realm();
     let submit = SubmitLocalOperation::rocrate_import(
         spec,
         owner_node_id,
-        idempotency_key,
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    drive(submit, context).await
-}
-
-pub async fn submit_export_job(
-    context: &DriverContext,
-    spec: ExportRoCrateSpec,
-    owner_node_id: NodeId,
-    idempotency_key: Option<String>,
-) -> Result<SubmitJobResult, SubmitJobError> {
-    let submit = SubmitLocalOperation::rocrate_export(
-        spec,
-        owner_node_id,
-        idempotency_key,
-        context.node_and_realm(),
+        None,
+        serving,
         unix_timestamp_millis(),
     );
     drive(submit, context).await
@@ -287,20 +240,6 @@ pub async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(
         .map_err(|error| error.to_string())
 }
 
-pub async fn list_job_entries(
-    context: &DriverContext,
-    job_id: JobId,
-    last_key: Option<Vec<u8>>,
-    limit: usize,
-) -> Result<(Vec<(Vec<u8>, Value)>, Option<Vec<u8>>), String> {
-    drive(
-        row_calls::list_job_entries(job_id, last_key, limit),
-        context,
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
 pub async fn put_crate_status(
     context: &DriverContext,
     job_id: JobId,
@@ -352,29 +291,6 @@ pub async fn read_run_link(
         .map_err(|error| error.to_string())
 }
 
-pub async fn record_attempt_intent(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    draft: AttemptIntent,
-    execution_id: Option<Ulid>,
-    launch: Option<&LaunchRecord>,
-    now_ms: u64,
-) -> Result<AttemptCommit, JobMutationError> {
-    drive(
-        job_calls::record_attempt_intent(
-            job_id,
-            token,
-            draft,
-            execution_id,
-            launch.cloned(),
-            now_ms,
-        ),
-        context,
-    )
-    .await
-}
-
 pub async fn release_job(
     context: &DriverContext,
     job_id: JobId,
@@ -390,11 +306,10 @@ pub async fn reserve_output_commits(
     destinations: &[(NodeId, String, String)],
     hints: &BTreeMap<(NodeId, String), SetHint>,
 ) -> Result<AttemptControl, JobMutationError> {
-    drive(
-        job_calls::reserve_output_commits(job_id, destinations.to_vec(), hints.clone()),
-        context,
-    )
-    .await
+    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let destinations = destinations.to_vec();
+    let call = job_calls::reserve_output_commits(job_id, destinations, hints.clone(), now_ms);
+    drive(call, context).await
 }
 
 pub async fn set_cancel_requested(

@@ -35,6 +35,7 @@ fn deletion_survives_replay() {
                     proofs: vec![proof],
                 }),
             },
+            ulid::Ulid::generate(),
         )
         .unwrap();
     assert!(state.group_deleted());
@@ -67,6 +68,7 @@ fn group_policies_materialize() {
             AdminDocumentOperation::GroupPoliciesSet {
                 policies: policies.clone(),
             },
+            ulid::Ulid::generate(),
         )
         .unwrap();
     assert_eq!(state.materialized_group_policies(), Some(policies));
@@ -249,6 +251,7 @@ fn group_location_materializes() {
         state.apply_operation(
             &actor(node(1)),
             AdminDocumentOperation::GroupLocationSet { location },
+            ulid::Ulid::generate(),
         )
     };
     set(&mut state, Some(location.clone())).unwrap();

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use aruna_core::structs::storage::distribution::{MemberState, MetadataCoverage};
 
 use super::*;
@@ -25,7 +26,12 @@ fn input(layout: LayoutKind, edges: Vec<(NodeId, DataStrategy)>) -> CreateInput 
 fn replica_plan_edge() {
     let set_id = Ulid::from_bytes([3; 16]);
     let edges = vec![(node(3), DataStrategy::Stream)];
-    let layout = plan_layout(set_id, &input(LayoutKind::Replica, edges)).unwrap();
+    let layout = plan_layout(
+        set_id,
+        &input(LayoutKind::Replica, edges),
+        (&mut IdMint::new(1), 1),
+    )
+    .unwrap();
     assert_eq!(layout.members.len(), 3);
     assert!(
         layout
@@ -63,7 +69,12 @@ fn shard_plan_alternates() {
         boundaries: vec!["m".to_string()],
         replicas: 1,
     };
-    let planned = plan_layout(Ulid::from_bytes([3; 16]), &input(layout, Vec::new())).unwrap();
+    let planned = plan_layout(
+        Ulid::from_bytes([3; 16]),
+        &input(layout, Vec::new()),
+        (&mut IdMint::new(1), 1),
+    )
+    .unwrap();
     let [lower, upper] = planned.ranges.as_slice() else {
         panic!("one boundary gives two ranges");
     };
@@ -79,7 +90,11 @@ fn shard_needs_boundaries() {
         boundaries: Vec::new(),
         replicas: 1,
     };
-    let refused = plan_layout(Ulid::from_bytes([3; 16]), &input(layout, Vec::new()));
+    let refused = plan_layout(
+        Ulid::from_bytes([3; 16]),
+        &input(layout, Vec::new()),
+        (&mut IdMint::new(1), 1),
+    );
     let Err(DistributionError::Malformed(reason)) = refused else {
         panic!("a sharding layout without boundaries is refused: {refused:?}");
     };
@@ -90,7 +105,14 @@ fn shard_needs_boundaries() {
 fn copy_edges_refused() {
     let edges = vec![(node(3), DataStrategy::Copy)];
     let set_id = Ulid::from_bytes([3; 16]);
-    assert!(plan_layout(set_id, &input(LayoutKind::Replica, edges)).is_err());
+    assert!(
+        plan_layout(
+            set_id,
+            &input(LayoutKind::Replica, edges),
+            (&mut IdMint::new(1), 1)
+        )
+        .is_err()
+    );
 }
 
 #[test]

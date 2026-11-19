@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -111,6 +111,7 @@ pub struct ReplaceSourceOperation {
     stage: Stage,
     replacement: Option<SourceConnector>,
     replacement_secret: Option<SourceConnectorSecret>,
+    now_ms: u64,
 }
 
 type Replaced = Result<Next<Option<ReplaceSourceResult>>, ReplaceSourceError>;
@@ -122,11 +123,12 @@ impl ReplaceSourceOperation {
             stage: Stage::Current,
             replacement: None,
             replacement_secret: None,
+            now_ms: 0,
         }
     }
 
     fn prepare_replacement(&mut self, existing: SourceConnector) {
-        let now = SystemTime::now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         self.replacement = Some(
             SourceConnector::new(
                 existing.connector_id,
@@ -205,6 +207,10 @@ fn secret_config_changed(
 impl Operation for ReplaceSourceOperation {
     type Output = Option<ReplaceSourceResult>;
     type Error = ReplaceSourceError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Replaced {
         validate_connector_input(

@@ -1665,7 +1665,15 @@ async fn create_crate(
 }
 
 fn mint(test: &TestContext, group_id: Ulid, path: &str) -> Result<Ulid, CreateDocumentError> {
-    Ok(mint_local_document(&test.config, &test.actor, group_id, path)?.as_ulid())
+    Ok(mint_local_document(
+        &test.config,
+        &test.actor,
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid())
 }
 
 async fn event_count(

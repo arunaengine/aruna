@@ -9,12 +9,12 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::federation::valid_federation_url;
-use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, config_oidc_path};
 use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument};
@@ -213,6 +213,8 @@ struct ProviderWrite {
     stage: Stage,
     document: Option<RealmConfigDocument>,
     deletes: Vec<(KeySpace, Key)>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl ProviderWrite {
@@ -222,6 +224,8 @@ impl ProviderWrite {
             stage: Stage::Read,
             document: None,
             deletes: Vec::new(),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -291,7 +295,11 @@ impl ProviderWrite {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_event = reducer_state.apply_operation(&self.config.actor, operation)?;
+        let admin_event = reducer_state.apply_operation(
+            &self.config.actor,
+            operation,
+            self.ids.mint(self.now_ms),
+        )?;
         // Materialized reducer state keeps local and replicated conflict outcomes equal.
         apply_reducer_provider(&mut document, &reducer_state, self.provider_id());
 
@@ -337,6 +345,14 @@ impl Operation for ProviderWrite {
     type Output = RealmConfigDocument;
     type Error = SetProviderError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -346,18 +362,8 @@ impl Operation for ProviderWrite {
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, SetProviderError> {
-        let document = self.document_ref();
-        let target = self.admin_target();
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                document.storage_keyspace().to_string(),
-                document.storage_key(),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        let reads = crate::realm::document_reads(self.document_ref(), &self.admin_target());
+        Ok(Next::Call(reads))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetProviderError> {

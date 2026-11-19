@@ -7,6 +7,7 @@ use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, StatementSignEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::CATCH_UP_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_retry};
@@ -205,6 +206,8 @@ pub(crate) struct SendAdminOperation {
     bearer: Option<AuthToken>,
     request: Option<DistributionRequest>,
     sent: bool,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 impl SendAdminOperation {
@@ -215,6 +218,8 @@ impl SendAdminOperation {
         request: DistributionRequest,
     ) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             ids,
             publisher,
             set_id,
@@ -230,9 +235,17 @@ impl Operation for SendAdminOperation {
     type Output = DistributionRevision;
     type Error = PublishRefusal;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<DistributionRevision>, PublishRefusal> {
         let request = self.request.take().ok_or(IoError::Unfinished)?;
-        let request_id = Ulid::generate();
+        let request_id = self.mint.mint(self.now_ms);
         if self.ids.is_some_and(|(local, _)| local == self.publisher) {
             let ids = (self.set_id, request_id);
             let auth = Some(self.auth.clone());

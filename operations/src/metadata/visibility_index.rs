@@ -1030,7 +1030,6 @@ mod tests {
     use aruna_core::time::unix_timestamp_millis;
     use aruna_core::{NodeId, UserId};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage;
     use std::collections::{HashMap, HashSet};
 
     const REALM: RealmId = RealmId([1; 32]);
@@ -1143,16 +1142,7 @@ mod tests {
     }
 
     fn context() -> (DriverContext, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let context = DriverContext {
-            storage_handle: storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
+        let (dir, context) = crate::testing::temp_context();
         (context, dir)
     }
 

@@ -3,10 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::structs::storage::distribution::delegation::{
     DELEGATION_HEADER, Delegation, Payload,
 };
-use aruna_core::time::unix_timestamp_secs;
 use http::{HeaderMap, Method};
 use s3s::dto::StreamingBlob;
 

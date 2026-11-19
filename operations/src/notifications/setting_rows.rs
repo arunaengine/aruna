@@ -12,8 +12,9 @@ use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision,
 };
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
-use aruna_core::realm_vault::seal_setting;
+use aruna_core::realm_vault::{SEAL_DRAW_LEN, seal_seed, seal_setting};
 use aruna_core::register::{RegisterError, RegisterStamp};
 use aruna_core::storage_entries::sync_revision_entry;
 use aruna_core::structs::execution::email::EmailPreference;
@@ -26,6 +27,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::notifications::unexpected;
+use crate::s3::session::{draw_secret, drawn_secret};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -155,6 +157,14 @@ impl std::fmt::Debug for SettingValue {
 }
 
 impl SettingValue {
+    /// Whether the write carries a secret to seal.
+    fn sealed(&self) -> bool {
+        match self {
+            SettingValue::Email { address, .. } => address.is_some(),
+            SettingValue::Webhook { target } => target.is_some(),
+        }
+    }
+
     fn channel(&self) -> SettingChannel {
         match self {
             SettingValue::Email { .. } => SettingChannel::Email,
@@ -168,32 +178,40 @@ impl SettingValue {
 pub struct SettingWrite {
     pub owner: UserId,
     pub local: NodeId,
-    pub write_id: Ulid,
-    pub event_id: Ulid,
     pub now_ms: u64,
     pub value: SettingValue,
 }
 
 impl SettingWrite {
-    /// A write of `value` with new ids.
     pub fn new(owner: UserId, local: NodeId, now_ms: u64, value: SettingValue) -> Self {
         Self {
             owner,
             local,
-            write_id: Ulid::generate(),
-            event_id: Ulid::generate(),
             now_ms,
             value,
         }
     }
 
-    /// The stored bytes of this write with `stamp`; a secret is sealed to the realm key.
-    fn bytes(&self, stamp: RegisterStamp) -> Result<Vec<u8>, SettingError> {
+    /// The stored bytes of this write with `stamp`; a secret is sealed to the realm key with
+    /// the drawn `seed`.
+    fn bytes(
+        &self,
+        stamp: RegisterStamp,
+        seed: Option<&[u8; 32]>,
+    ) -> Result<Vec<u8>, SettingError> {
         let owner = self.owner;
         let seal = |secret: &SecretBytes| {
             let channel = self.value.channel();
-            seal_setting(&owner.realm_id, channel, &owner, stamp.write_id, secret)
-                .map_err(|error| SettingError::Build(error.to_string()))
+            let seed = seed.ok_or_else(|| SettingError::Build("no seal seed was drawn".into()))?;
+            seal_setting(
+                &owner.realm_id,
+                channel,
+                &owner,
+                stamp.write_id,
+                secret,
+                seed,
+            )
+            .map_err(|error| SettingError::Build(error.to_string()))
         };
         let encoded = match &self.value {
             SettingValue::Email {
@@ -228,14 +246,14 @@ impl SettingWrite {
     }
 
     /// The document row, its revision and the sync outbox upsert, written in one batch.
-    fn rows(&self, write_id: Ulid, bytes: &[u8]) -> Result<IoCall, SettingError> {
+    fn rows(&self, write_id: Ulid, event_id: Ulid, bytes: &[u8]) -> Result<IoCall, SettingError> {
         let storage = |error: String| SettingError::Storage(error);
         let target = self.value.channel().target(self.owner, write_id);
         let change = DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
-                event_id: self.event_id,
+                event_id,
                 actor: self.local,
                 updated_at_ms: self.now_ms,
             },
@@ -269,6 +287,7 @@ impl SettingWrite {
 enum WriteState {
     #[default]
     Scan,
+    Draw,
     Store(Vec<u8>),
     Schedule(Vec<u8>),
 }
@@ -280,6 +299,10 @@ pub struct WriteSettingOperation {
     write: SettingWrite,
     scan: SettingScan,
     state: WriteState,
+    now_ms: u64,
+    ids: IdMint,
+    /// The seed of the realm seal, drawn before a write that carries a secret.
+    seal_seed: Option<[u8; 32]>,
 }
 
 impl WriteSettingOperation {
@@ -288,7 +311,19 @@ impl WriteSettingOperation {
             write,
             scan: SettingScan::default(),
             state: WriteState::Scan,
+            now_ms: 0,
+            ids: IdMint::default(),
+            seal_seed: None,
         }
+    }
+
+    /// Draws the seal seed first when the write carries a secret.
+    fn draw_or_store(&mut self) -> Result<Next<Vec<u8>>, SettingError> {
+        if !self.write.value.sealed() {
+            return self.store();
+        }
+        self.state = WriteState::Draw;
+        Ok(Next::Call(draw_secret(SEAL_DRAW_LEN)))
     }
 
     fn store(&mut self) -> Result<Next<Vec<u8>>, SettingError> {
@@ -298,9 +333,11 @@ impl WriteSettingOperation {
             .iter()
             .map(|(head, _)| head.stamp.counter)
             .max();
-        let stamp = RegisterStamp::next(held, self.write.local, self.write.write_id)?;
-        let bytes = self.write.bytes(stamp)?;
-        let rows = self.write.rows(stamp.write_id, &bytes)?;
+        let write_id = self.ids.mint(self.now_ms);
+        let event_id = self.ids.mint(self.now_ms);
+        let stamp = RegisterStamp::next(held, self.write.local, write_id)?;
+        let bytes = self.write.bytes(stamp, self.seal_seed.as_ref())?;
+        let rows = self.write.rows(stamp.write_id, event_id, &bytes)?;
         self.state = WriteState::Store(bytes);
         Ok(Next::Call(rows))
     }
@@ -309,6 +346,14 @@ impl WriteSettingOperation {
 impl Operation for WriteSettingOperation {
     type Output = Vec<u8>;
     type Error = SettingError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         let channel = self.write.value.channel();
@@ -330,8 +375,12 @@ impl Operation for WriteSettingOperation {
                         self.write.owner,
                         next,
                     ))),
-                    None => self.store(),
+                    None => self.draw_or_store(),
                 }
+            }
+            (WriteState::Draw, result) => {
+                self.seal_seed = Some(seal_seed(drawn_secret(result)?.expose()));
+                self.store()
             }
             (WriteState::Store(bytes), IoResult::Done) => {
                 self.state = WriteState::Schedule(bytes);

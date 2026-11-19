@@ -11,11 +11,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::compute::Secret;
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
 use aruna_core::secrets::{SecretFields, SecretKind, SecretName, SecretRecord, UseRule};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
 use aruna_operations::secrets::owner::{
     OwnerChange, OwnerSecretError, OwnerSecretOperation, OwnerSecretsOperation,
@@ -214,6 +214,33 @@ pub(crate) fn rotate_change(
         fields: secret_fields(request.fields),
         expected,
     }
+}
+
+/// The delete of the secret `name` at the revision the request names.
+pub(crate) fn delete_change(name: &str, headers: &HeaderMap) -> ServerResult<SecretChange> {
+    Ok(SecretChange::Delete {
+        name: parse_name(name)?,
+        expected: expected(headers)?,
+    })
+}
+
+/// Refuses a caller that may not manage the realm's secrets.
+pub(crate) async fn manager(
+    state: &Arc<ServerState>,
+    auth: AuthContext,
+) -> ServerResult<AuthContext> {
+    use aruna_core::structs::identity::auth::Permission;
+    use aruna_core::structs::placement::policy::document::policy_admin_path;
+    let path = policy_admin_path(state.get_realm_id());
+    crate::auth::ensure_permission(state, &auth, path, Permission::WRITE).await?;
+    Ok(auth)
+}
+
+/// The view of a changed secret, or not found when the change found none.
+pub(crate) fn stored_view(stored: Option<SecretRecord>) -> ServerResult<axum::Json<SecretView>> {
+    stored
+        .map(|info| axum::Json(view(info)))
+        .ok_or(ServerError::NotFound)
 }
 
 pub(crate) fn view(info: SecretRecord) -> SecretView {

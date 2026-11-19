@@ -10,6 +10,7 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{AuthorizationError, ConversionError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::decode_reducer_state;
@@ -17,7 +18,6 @@ use aruna_core::rows::done;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Value;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -93,6 +93,8 @@ pub(super) struct HandoffWrite {
     config: HandoffConfig,
     stage: Stage,
     batch: Batch,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl HandoffWrite {
@@ -101,6 +103,8 @@ impl HandoffWrite {
             config,
             stage: Stage::Read,
             batch: Batch::default(),
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -145,8 +149,9 @@ impl HandoffWrite {
             AdminDocumentOperation::MergeCoordinatorSet {
                 node_id: self.config.node_id,
             },
+            self.ids.mint(self.now_ms),
         )?;
-        overlay_reducer_state(&mut config, &change.state, unix_timestamp_millis());
+        overlay_reducer_state(&mut config, &change.state, self.now_ms);
         let document = DocumentTarget::RealmConfig { realm_id };
         let placement = target_placement_ref(&config, &document, Default::default());
         self.batch.writes.push((
@@ -172,6 +177,14 @@ impl HandoffWrite {
 impl Operation for HandoffWrite {
     type Output = ();
     type Error = MergeError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

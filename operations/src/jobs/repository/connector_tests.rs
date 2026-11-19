@@ -126,7 +126,7 @@ fn public_connector_opens() {
 fn credential_gives_token() {
     let link = link();
     let credential = RepositoryCredential::seal_link(
-        &credential_key(),
+        (&credential_key(), [3; 24]),
         link.created_by,
         link.group_id,
         link.connector_id,
@@ -147,7 +147,7 @@ fn credential_gives_token() {
 fn credential_needs_key() {
     let mut connect = request(Some(
         RepositoryCredential::seal_link(
-            &credential_key(),
+            (&credential_key(), [3; 24]),
             link().created_by,
             link().group_id,
             link().connector_id,

@@ -17,7 +17,6 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW};
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase, OnboardingSecretError};
 use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -30,6 +29,7 @@ use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
+use rand::Rng;
 use std::array::TryFromSliceError;
 use std::string::FromUtf8Error;
 use thiserror::Error;
@@ -230,9 +230,16 @@ pub(crate) fn node_capabilities(
     }
 }
 
+/// A fresh Ed25519 signing key from operating-system randomness.
+pub(crate) fn fresh_signing_key() -> SigningKey {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    SigningKey::from_bytes(&bytes)
+}
+
 pub(crate) fn generate_node_state() -> Result<PersistedNodeState, IdentityError> {
-    let realm_signing_key = generate_signing_key();
-    let node_signing_key = generate_signing_key();
+    let realm_signing_key = fresh_signing_key();
+    let node_signing_key = fresh_signing_key();
 
     Ok(PersistedNodeState {
         boot_origin: BootOrigin::InitializedRealm,
@@ -322,6 +329,7 @@ pub async fn mark_onboarding_phase(
 mod tests {
     use super::*;
     use aruna_core::UserId;
+    use aruna_core::keys::generate_signing_key;
 
     /// The persisted record keeps its byte layout across the ownership move:
     /// the stored encoding is part of the deployed compatibility surface.

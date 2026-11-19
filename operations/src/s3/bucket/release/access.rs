@@ -17,8 +17,8 @@ use super::{
     Access, BucketScope, MembersConfig, MembersOutput, MembershipCaller, ReleaseError,
     ReleaseMembersOperation,
 };
-use crate::auth::enforcement::{policy_reads, read_policies};
-use crate::auth::permission_rules::{read_rules, rule_reads};
+use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
+use crate::auth::permission_rules::{PermissionRules, read_rules, rule_reads};
 use crate::auth::request_authorization::BucketAccess;
 
 fn unavailable(error: impl std::fmt::Display) -> ReleaseError {
@@ -33,6 +33,8 @@ pub struct LoadAccessOperation {
     group_id: GroupId,
     bucket_path: String,
     rule_rows: usize,
+    /// The caller's rules while the policy sets compile.
+    rules: Option<PermissionRules>,
 }
 
 impl LoadAccessOperation {
@@ -49,6 +51,7 @@ impl LoadAccessOperation {
                 scope.bucket,
             ),
             rule_rows: 0,
+            rules: None,
         }
     }
 }
@@ -65,6 +68,19 @@ impl Operation for LoadAccessOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Access>, ReleaseError> {
+        let Some(rules) = self.rules.take() else {
+            return self.read_rows(result);
+        };
+        let policies = compiled_policies(result).map_err(unavailable)?;
+        let path = std::mem::take(&mut self.bucket_path);
+        let access = BucketAccess::from_parts(self.auth.clone(), path, rules, policies);
+        Ok(Next::Done(Access(Arc::new(access))))
+    }
+}
+
+impl LoadAccessOperation {
+    /// Reads the caller's rules, then compiles the policy sets of the rows.
+    fn read_rows(&mut self, result: IoResult) -> Result<Next<Access>, ReleaseError> {
         let IoResult::Values(mut rows) = result else {
             let got = result.label();
             let expected = "IoResult::Values";
@@ -72,11 +88,10 @@ impl Operation for LoadAccessOperation {
         };
         let policies = rows.split_off(self.rule_rows.min(rows.len()));
         let rules = read_rules(&self.auth, rows).map_err(unavailable)?;
-        let policies =
+        let sets =
             read_policies(self.realm_id, Some(self.group_id), policies).map_err(unavailable)?;
-        let path = std::mem::take(&mut self.bucket_path);
-        let access = BucketAccess::from_parts(self.auth.clone(), path, rules, policies);
-        Ok(Next::Done(Access(Arc::new(access))))
+        self.rules = Some(rules);
+        Ok(Next::Call(sets.compile()))
     }
 }
 
@@ -155,30 +170,20 @@ impl Operation for MembersCheckOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::calls::compiled;
     use crate::tests::records::{REALM, actor, node, user};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::structs::identity::auth::Permission;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
-    use aruna_core::structs::storage::format::Compression;
     use aruna_core::types::{Key, Value};
     use ulid::Ulid;
 
     const GROUP: Ulid = Ulid::from_parts(2, 2);
 
     fn info() -> BucketInfo {
-        BucketInfo {
-            group_id: GROUP,
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: user(),
-            cors_configuration: None,
-            storage_routing: Vec::new(),
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-            compression: Compression::Off,
-            distribution: None,
-        }
+        crate::tests::s3::bucket_info(GROUP, user())
     }
 
     fn auth() -> AuthContext {
@@ -249,8 +254,11 @@ mod tests {
             .iter()
             .map(|(space, key)| Some(stored(space, key)))
             .collect();
-        let Ok(Next::Done(access)) = operation.next(IoResult::Values(rows)) else {
+        let Ok(Next::Call(compile)) = operation.next(IoResult::Values(rows)) else {
             panic!("every row is present");
+        };
+        let Ok(Next::Done(access)) = operation.next(compiled(compile)) else {
+            panic!("the policy sets compile");
         };
         assert!(!access.0.allows(Some("k"), &Permission::WRITE));
     }

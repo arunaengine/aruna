@@ -278,11 +278,9 @@ fn request_owner(document: &RealmConfigDocument) -> Option<NodeId> {
 mod tests {
     use super::*;
     use crate::metadata::protocol::decode_message;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::{Effect, NetEffect};
     use aruna_core::events::{Event, MetadataAnswer, NetEvent};
-    use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::realm::RealmId;
 
     /// Node ids in ascending order of `rank`, so a test knows which one owns database requests.
@@ -295,14 +293,7 @@ mod tests {
     }
 
     fn realm() -> (SigningKey, RealmId, RealmConfigDocument) {
-        let key = generate_signing_key();
-        let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
-        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        document.ensure_node(node(1), RealmNodeKind::Management);
-        document.ensure_node(node(2), RealmNodeKind::Server);
-        let owner = UserId::nil(realm_id);
-        document.ensure_node(node(3), RealmNodeKind::User { owner });
-        (key, realm_id, document)
+        crate::tests::realm::promotion_realm([node(1), node(2), node(3)])
     }
 
     fn pem(key: &SigningKey) -> RealmKeyPem {

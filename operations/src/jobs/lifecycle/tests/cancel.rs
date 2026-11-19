@@ -26,12 +26,7 @@ use crate::tests::records::{Family, REALM, serve_job_record, user};
 use aruna_drivers::driver::{DriverContext, drive};
 
 fn auth(user_id: UserId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id: REALM,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, REALM)
 }
 
 /// Whether the local physical row of the seeded execution is flagged.

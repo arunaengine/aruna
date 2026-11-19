@@ -144,7 +144,7 @@ async fn notifies_without_trigger() {
 
 fn audit(fixture: &Fixture, action: AdminAuditAction) -> AdminAuditRecord {
     let actor = fixture.actor.user_id;
-    AdminAuditRecord::new(action, actor, actor)
+    AdminAuditRecord::new(Ulid::from_parts(1, 1), action, actor, actor)
 }
 
 #[tokio::test]

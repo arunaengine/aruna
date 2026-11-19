@@ -55,12 +55,15 @@ impl Change {
         })
     }
 
+    /// Applies `op` as a new event with the id `event_id`, minted by the merge run.
     pub(super) fn apply(
         &mut self,
         actor: &Actor,
         op: AdminDocumentOperation,
+        event_id: ulid::Ulid,
     ) -> Result<(), MergeError> {
-        self.events.push(self.state.apply_operation(actor, op)?);
+        self.events
+            .push(self.state.apply_operation(actor, op, event_id)?);
         Ok(())
     }
 
@@ -72,6 +75,7 @@ impl Change {
         roles: &mut HashMap<RoleId, Role>,
         (handed, held): (&[RoleId], &[RoleId]),
         (survivor, merged): (UserId, UserId),
+        (ids, now_ms): (&mut aruna_core::id_mint::IdMint, u64),
     ) -> Result<(), MergeError> {
         let group = matches!(self.state.target, AdminDocumentTarget::Group { .. });
         for (role_id, user_id, added) in handed
@@ -80,9 +84,14 @@ impl Change {
             .chain(held.iter().map(|role_id| (*role_id, merged, false)))
         {
             if self.unseeded(role_id, group) {
-                self.apply(actor, seed_op(role_id, group))?;
+                self.apply(actor, seed_op(role_id, group), ids.mint(now_ms))?;
             }
-            self.apply(actor, assignment_op(role_id, user_id, added, group))?;
+            let event_id = ids.mint(now_ms);
+            self.apply(
+                actor,
+                assignment_op(role_id, user_id, added, group),
+                event_id,
+            )?;
         }
         let assignments = if group {
             self.state.materialized_group_assignments()

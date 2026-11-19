@@ -13,6 +13,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::join_request::{
     JoinDecision, JoinDecisionKind, JoinRequest, JoinRequestState, valid_message,
 };
@@ -189,6 +190,7 @@ struct JoinWrite {
     deny: bool,
     result: Option<JoinRequestState>,
     marks: DueMarks,
+    ids: IdMint,
 }
 
 impl JoinWrite {
@@ -203,6 +205,7 @@ impl JoinWrite {
             deny: false,
             result: None,
             marks,
+            ids: IdMint::default(),
         }
     }
 
@@ -256,7 +259,7 @@ impl JoinWrite {
                 }
                 AdminDocumentOperation::GroupJoinRequested {
                     request: JoinRequest {
-                        request_id: Ulid::generate(),
+                        request_id: self.ids.mint(self.input.now_ms),
                         group_id: self.input.group_id,
                         user_id: self.input.actor.user_id,
                         message,
@@ -378,11 +381,13 @@ impl JoinWrite {
                     realm_id: self.input.actor.realm_id,
                 },
                 self.input.now_ms,
+                &mut self.ids,
             )
         } else {
             Vec::new()
         };
-        let event = state.apply_operation(&self.input.actor, op)?;
+        let event =
+            state.apply_operation(&self.input.actor, op, self.ids.mint(self.input.now_ms))?;
         let config =
             RealmConfigDocument::from_bytes(config.as_deref().ok_or(GroupJoinError::NotFound)?)?;
         if config.realm_id != group.realm_id {
@@ -473,6 +478,10 @@ fn normalized(value: &Option<String>) -> Option<String> {
 impl Operation for JoinWrite {
     type Output = JoinRequestState;
     type Error = GroupJoinError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -614,6 +623,7 @@ mod pure_tests {
                     display_name: "Group".into(),
                     owner: actor.user_id,
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         for role in auth_doc.roles.values() {
@@ -623,6 +633,7 @@ mod pure_tests {
                     AdminDocumentOperation::GroupRoleCreated {
                         role: AdminRoleDefinition::from(role),
                     },
+                    ulid::Ulid::generate(),
                 )
                 .unwrap();
         }
@@ -639,6 +650,7 @@ mod pure_tests {
                         created_at: 1,
                     },
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         let config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -784,7 +796,9 @@ mod pure_tests {
         for role in auth_doc.roles.values() {
             let role = AdminRoleDefinition::from(role);
             let op = AdminDocumentOperation::GroupRoleCreated { role };
-            reducer.apply_operation(&actor, op).unwrap();
+            reducer
+                .apply_operation(&actor, op, ulid::Ulid::generate())
+                .unwrap();
         }
         let request_id = Ulid::from_bytes([15; 16]);
         let request = JoinRequest {
@@ -795,7 +809,9 @@ mod pure_tests {
             created_at: 1,
         };
         let op = AdminDocumentOperation::GroupJoinRequested { request };
-        reducer.apply_operation(&member, op).unwrap();
+        reducer
+            .apply_operation(&member, op, ulid::Ulid::generate())
+            .unwrap();
         let config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         let input = GroupJoinInput {
             actor: actor.clone(),

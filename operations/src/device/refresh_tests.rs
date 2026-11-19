@@ -7,7 +7,6 @@ use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 
 use super::*;
-use crate::device::replica::ReplicaOrigin;
 use crate::metadata::protocol::encode_message;
 
 fn node(seed: u8) -> NodeId {
@@ -23,13 +22,7 @@ fn owner() -> UserId {
 }
 
 fn replica() -> ReplicaRecord {
-    let (document_id, group_id) = (Ulid::from_bytes([2; 16]), Ulid::from_bytes([1; 16]));
-    ReplicaRecord::new(
-        document_id,
-        group_id,
-        "notes".to_string(),
-        ReplicaOrigin::Realm,
-    )
+    crate::tests::device::replica()
 }
 
 fn config() -> RealmConfigDocument {

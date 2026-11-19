@@ -204,18 +204,9 @@ async fn refuses_undeliverable_submit() {
     let family = Family::new([1u8; 32]);
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
 
-    let error = submit_external_job(
-        &ctx,
-        payload(),
-        user(),
-        Some("idempotency".to_string()),
-        WorkspaceMode::None,
-        None,
-        60_000,
-        None,
-    )
-    .await
-    .expect_err("no holder is reachable");
+    let error = submit_external_job(&ctx, payload(), "idempotency", None)
+        .await
+        .expect_err("no holder is reachable");
 
     assert!(matches!(
         error,
@@ -399,11 +390,7 @@ async fn device_skips_materialization() {
     let error = submit_external_job(
         &device,
         spec.clone(),
-        user(),
-        Some("device".to_string()),
-        WorkspaceMode::None,
-        None,
-        60_000,
+        "device",
         Some(AuthToken::bearer("token").expect("bearer fits")),
     )
     .await
@@ -426,11 +413,7 @@ async fn device_skips_materialization() {
     let refused = submit_external_job(
         &server,
         spec,
-        user(),
-        Some("server".to_string()),
-        WorkspaceMode::None,
-        None,
-        60_000,
+        "server",
         Some(AuthToken::bearer("token").expect("bearer fits")),
     )
     .await
@@ -453,18 +436,9 @@ async fn device_needs_bearer() {
     // cannot back with the caller's own bearer token is refused, not forwarded.
     let (_dir, device) = kind_context(7, RealmNodeKind::User { owner: user() }).await;
 
-    let error = submit_external_job(
-        &device,
-        payload(),
-        user(),
-        Some("device".to_string()),
-        WorkspaceMode::None,
-        None,
-        60_000,
-        None,
-    )
-    .await
-    .expect_err("an asserted context is not forwardable");
+    let error = submit_external_job(&device, payload(), "device", None)
+        .await
+        .expect_err("an asserted context is not forwardable");
 
     assert!(matches!(error, SubmitJobError::AuthorityDenied));
 }

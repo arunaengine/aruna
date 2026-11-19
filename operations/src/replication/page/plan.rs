@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
-use aruna_core::time::unix_timestamp_millis;
 use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::NodeId;
@@ -346,7 +345,7 @@ pub(super) fn page_rows(
     items: &[PageItem],
     plans: &[Plan],
     (guards, previous): (&PageGuards, Vec<Option<BlobVersion>>),
-    (realm_id, local): (RealmId, NodeId),
+    (realm_id, local, now_ms): (RealmId, NodeId, u64),
 ) -> Result<PageRows, PageError> {
     let mut previous = previous.into_iter();
     let mut rows = PageRows {
@@ -398,7 +397,7 @@ pub(super) fn page_rows(
             (realm_id, guards.group_id, local),
             (&page.bucket, key),
             manifest.version_id,
-            unix_timestamp_millis(),
+            now_ms,
         );
         rows.writes.extend(journal_entries(&uploaded)?);
         if let Some(root) = &item.root {

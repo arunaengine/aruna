@@ -12,9 +12,10 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, OWNER_SECRETS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::realm_vault::{RealmVaultError, seal_named};
+use aruna_core::realm_vault::{RealmVaultError, SEAL_DRAW_LEN, seal_named, seal_seed};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::register::{RegisterError, RegisterStamp};
 use aruna_core::rows;
@@ -35,6 +36,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::{ChangeError, Managers, SecretChange, drains, widening_notices};
+use crate::s3::session::{draw_secret, drawn_secret};
 use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
 
 /// Register documents read per page.
@@ -200,6 +202,7 @@ impl EntryReader {
 /// The call an owner secret change waits for.
 #[derive(Debug, PartialEq)]
 enum Stage {
+    Drawing,
     Reading,
     Managers,
     Write,
@@ -213,6 +216,9 @@ pub struct OwnerSecretOperation {
     stage: Stage,
     notices: bool,
     result: Option<Option<SecretEntry>>,
+    ids: IdMint,
+    /// The seed of the realm seal, drawn first when the change carries a value.
+    seal_seed: Option<[u8; 32]>,
 }
 
 impl OwnerSecretOperation {
@@ -224,6 +230,8 @@ impl OwnerSecretOperation {
             stage: Stage::Reading,
             notices: false,
             result: None,
+            ids: IdMint::default(),
+            seal_seed: None,
         }
     }
 
@@ -258,13 +266,17 @@ impl OwnerSecretOperation {
         fields: &aruna_core::secrets::SecretFields,
     ) -> Result<SecretDocument, OwnerSecretError> {
         let name = self.input.change.name();
+        let seed = self
+            .seal_seed
+            .as_ref()
+            .ok_or(OwnerSecretError::NotFinished)?;
         let sealed = seal_named(
             &self.input.realm_id,
             &self.input.owner,
             name,
             incarnation,
             id,
-            &fields.encode()?,
+            (&fields.encode()?, seed),
         )?;
         let body = SecretBody::Value(SecretValue {
             fields: fields.names().map(str::to_string).collect(),
@@ -400,6 +412,7 @@ impl OwnerSecretOperation {
                 None,
                 self.input.actor,
                 self.input.now_ms,
+                &mut self.ids,
             )?;
             self.notices = !notices.is_empty();
             writes.extend(notices);
@@ -446,6 +459,7 @@ impl OwnerSecretOperation {
         }
         let incarnation = documents.first().map(|document| document.incarnation);
         let audit = AdminAuditRecord::for_secret(
+            self.ids.mint(self.input.now_ms),
             action,
             self.input.actor,
             SecretAudit {
@@ -476,7 +490,19 @@ impl Operation for OwnerSecretOperation {
     type Output = Option<SecretEntry>;
     type Error = OwnerSecretError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<Self::Output>, OwnerSecretError> {
+        // A new or rotated value is sealed with a seed drawn from the OS random source.
+        if matches!(
+            self.input.change,
+            SecretChange::Create { .. } | SecretChange::Rotate { .. }
+        ) {
+            self.stage = Stage::Drawing;
+            return Ok(Next::Call(draw_secret(SEAL_DRAW_LEN)));
+        }
         Ok(Next::Call(IoCall::Effect(Box::new(
             self.reader.start(None),
         ))))
@@ -484,6 +510,13 @@ impl Operation for OwnerSecretOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, OwnerSecretError> {
         match self.stage {
+            Stage::Drawing => {
+                self.seal_seed = Some(seal_seed(drawn_secret(result)?.expose()));
+                self.stage = Stage::Reading;
+                Ok(Next::Call(IoCall::Effect(Box::new(
+                    self.reader.start(None),
+                ))))
+            }
             Stage::Reading => match self.reader.step(rows::event(result)?, None)? {
                 Some(effect) => Ok(Next::Call(IoCall::Effect(Box::new(effect)))),
                 None => self.read_managers(),
@@ -631,6 +664,8 @@ pub struct ReadbackOperation {
     owner: SecretOwner,
     actor: UserId,
     entry: Option<SecretEntry>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl ReadbackOperation {
@@ -640,6 +675,8 @@ impl ReadbackOperation {
             owner,
             actor,
             entry: None,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -651,6 +688,7 @@ impl ReadbackOperation {
             return Err(OwnerSecretError::NotReadable);
         }
         let audit = AdminAuditRecord::for_secret(
+            self.ids.mint(self.now_ms),
             AdminAuditAction::SecretRead,
             self.actor,
             SecretAudit {
@@ -668,6 +706,14 @@ impl ReadbackOperation {
 impl Operation for ReadbackOperation {
     type Output = SecretEntry;
     type Error = OwnerSecretError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, OwnerSecretError> {
         Ok(Next::Call(IoCall::Effect(Box::new(

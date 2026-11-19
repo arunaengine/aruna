@@ -6,13 +6,12 @@ use super::*;
 use crate::document_repository::GetConfigOperation;
 use crate::testing::path_context;
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
 use aruna_drivers::driver::{DriverContext, drive};
 use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
+use ulid::Ulid;
 
 fn actor(seed: u8) -> Actor {
     let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -53,19 +52,7 @@ fn email_config(actor: &Actor, profile: Option<EmailInput>) -> SetEmailConfig {
 }
 
 async fn write(ctx: &DriverContext, key_space: &str, key: Key, value: Vec<u8>) {
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key,
-            value: value.into(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => panic!("unexpected event: {other:?}"),
-    }
+    crate::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
 }
 
 /// Seeds a config where `kind` describes the actor's node and makes the actor a realm admin.
@@ -229,14 +216,20 @@ fn concurrent_firsts() -> (AdminDocumentState, BTreeSet<RealmVaultEntry>) {
     let mut rivals = Vec::new();
     for seed in [1u8, 2] {
         let mut state = base.clone();
-        let operation = EmailWrite::new(Arc::new(email_config(
+        let mut operation = EmailWrite::new(Arc::new(email_config(
             &actor(seed),
             Some(input(Some("mailer"), Some("first"))),
         )));
+        // Each node's run has its own entropy, so the two firsts mint different ids.
+        operation.seed(u128::from(seed) << 32);
         let (operations, profile) = operation.email_writes(&state).unwrap();
         entries.insert(profile.unwrap().password.unwrap().entry);
         for operation in operations {
-            rivals.push(state.apply_operation(&actor(seed), operation).unwrap());
+            rivals.push(
+                state
+                    .apply_operation(&actor(seed), operation, ulid::Ulid::generate())
+                    .unwrap(),
+            );
         }
     }
     for event in &rivals {
@@ -251,10 +244,13 @@ fn apply_change(
     state: &mut AdminDocumentState,
     profile: Option<EmailInput>,
 ) -> Option<RealmEmailProfile> {
-    let operation = EmailWrite::new(Arc::new(email_config(&actor(1), profile)));
+    let mut operation = EmailWrite::new(Arc::new(email_config(&actor(1), profile)));
+    operation.seed((state.applied_event_ids.len() as u128 + 10) << 32);
     let (operations, profile) = operation.email_writes(state).unwrap();
     for operation in operations {
-        state.apply_operation(&actor(1), operation).unwrap();
+        state
+            .apply_operation(&actor(1), operation, ulid::Ulid::generate())
+            .unwrap();
     }
     profile
 }

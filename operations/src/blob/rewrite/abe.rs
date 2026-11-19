@@ -110,10 +110,14 @@ impl RewriteVersionOperation {
         let (parameters, epoch) = parse_abe(anchors, target.key).map_err(abe_error)?;
         // A complete envelope keeps its write id; a pending copy gets its first one.
         let id = id.as_deref().and_then(|id| <[u8; 16]>::try_from(id).ok());
+        let write_id = match id {
+            Some(id) => Ulid::from_bytes(id),
+            None => self.ids.mint(self.now_ms),
+        };
         let plan = EnvelopePlan {
             parameters,
             epoch,
-            write_id: id.map_or_else(Ulid::generate, Ulid::from_bytes),
+            write_id,
             object_key: self.version_key.key.clone(),
             bucket_public: target.public_key,
         };

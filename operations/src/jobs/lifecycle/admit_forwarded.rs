@@ -7,6 +7,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::PeerAuthRefusal;
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
@@ -25,7 +26,7 @@ use super::submission_rules::{
 };
 use super::submit_external::IngressNode;
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::pages::{LoadChainOperation, PageReadError, StoreEntriesOperation};
@@ -39,6 +40,7 @@ use crate::realm::peer_trust::peer_acts_for;
 pub(super) struct GroupWriteOperation {
     check: CheckPermissionsConfig,
     group_id: GroupId,
+    compiling: bool,
 }
 
 impl GroupWriteOperation {
@@ -48,7 +50,11 @@ impl GroupWriteOperation {
             path: group_permission_path(auth.realm_id, group_id, local),
             required_permission: Permission::WRITE,
         };
-        Self { check, group_id }
+        Self {
+            check,
+            group_id,
+            compiling: false,
+        }
     }
 }
 
@@ -66,6 +72,9 @@ impl Operation for GroupWriteOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        if self.compiling {
+            return Ok(Next::Done(self.policies_allow(result)));
+        }
         let IoResult::Values(mut rows) = result else {
             let got = result.label();
             let expected = "IoResult::Values";
@@ -78,17 +87,28 @@ impl Operation for GroupWriteOperation {
         if !self.check.allowed(rows).unwrap_or(false) {
             return Ok(Next::Done(false));
         }
-        let auth = &self.check.auth_context;
-        let Ok(evaluator) = read_policies(auth.realm_id, Some(self.group_id), policies) else {
+        let realm_id = self.check.auth_context.realm_id;
+        let Ok(sets) = read_policies(realm_id, Some(self.group_id), policies) else {
             return Ok(Next::Done(false));
+        };
+        self.compiling = true;
+        Ok(Next::Call(sets.compile()))
+    }
+}
+
+impl GroupWriteOperation {
+    /// Whether the compiled request policies allow the write.
+    fn policies_allow(&self, result: IoResult) -> bool {
+        let Ok(evaluator) = compiled_policies(result) else {
+            return false;
         };
         let request = policy_request_with(
             &self.check.path,
             &Permission::WRITE,
-            Some(auth),
+            Some(&self.check.auth_context),
             PolicyRequestExtras::rest(),
         );
-        Ok(Next::Done(evaluator.evaluate(&request).is_ok()))
+        evaluator.evaluate(&request).is_ok()
     }
 }
 
@@ -111,6 +131,7 @@ pub struct AdmitForwardedOperation {
     submission_id: SubmissionId,
     request: SubmissionRequest,
     node: Option<IngressNode>,
+    ids: IdMint,
     step: ForwardedStep,
 }
 
@@ -130,6 +151,7 @@ impl AdmitForwardedOperation {
             submission_id,
             request,
             node,
+            ids: IdMint::default(),
             step: ForwardedStep::Token,
         }
     }
@@ -255,7 +277,11 @@ impl AdmitForwardedOperation {
             self.request.captured_inputs.clear();
         }
         self.request.input_pages = manifest;
-        let admit = self.node()?.admission(&self.request, identity, config);
+        let mut mint = self.ids;
+        let admit = self
+            .node()?
+            .admission(&self.request, identity, config, &mut mint);
+        self.ids = mint;
         let admit = admit.map_err(admission_refusal)?;
         self.step = ForwardedStep::Admit;
         Ok(Next::Call(IoCall::child(admit)))
@@ -277,6 +303,10 @@ fn admission_refusal(error: SubmitJobError) -> SubmissionRefusal {
 impl Operation for AdmitForwardedOperation {
     type Output = SubmissionAck;
     type Error = SubmissionRefusal;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> ForwardedNext {
         let check = WritePeerOperation::new(self.peer, self.token.clone());
@@ -352,12 +382,7 @@ mod tests {
     }
 
     fn auth(user_id: UserId) -> AuthContext {
-        AuthContext {
-            user_id,
-            realm_id: REALM,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(user_id, REALM)
     }
 
     fn operation(node_view: Option<IngressNode>) -> AdmitForwardedOperation {

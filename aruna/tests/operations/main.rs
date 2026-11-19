@@ -71,3 +71,8 @@ mod usage_deltas;
 mod usage_replication;
 mod user_calls;
 mod watch_delivery;
+
+/// A document id mint as a create run gets one, with fresh entropy.
+fn fresh_ids() -> aruna_core::id_mint::IdMint {
+    aruna_core::id_mint::IdMint::new(rand::random())
+}

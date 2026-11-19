@@ -54,8 +54,6 @@ fn webhook_off(writer: NodeId) -> WriteSettingOperation {
     WriteSettingOperation::new(SettingWrite {
         owner: owner(),
         local: writer,
-        write_id: Ulid::generate(),
-        event_id: Ulid::generate(),
         now_ms: NOW_MS,
         value: SettingValue::Webhook { target: None },
     })
@@ -84,7 +82,13 @@ fn notice() -> NotificationRecord {
         group_id: Ulid::from_bytes([2u8; 16]),
         actor_user_id: owner(),
     };
-    NotificationRecord::new(owner(), NotificationClass::Direct, kind, 1)
+    NotificationRecord::new(
+        ulid::Ulid::generate(),
+        owner(),
+        NotificationClass::Direct,
+        kind,
+        1,
+    )
 }
 
 /// The bytes of an on webhook setting written on another node.

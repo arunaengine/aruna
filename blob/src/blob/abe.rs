@@ -5,6 +5,7 @@
 use super::BlobHandler;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
+use aruna_core::key_seal::SeedRng;
 use aruna_core::structs::storage::abe::{
     AbeEffect, AbeError, AbeEvent, EnvelopePlan, check_copy, check_object, copy_envelope,
     create_envelope, create_parameters,
@@ -24,16 +25,12 @@ impl BlobHandler {
                     Err(error) => return BlobEvent::Error(error.into()),
                 };
                 let result = (|| {
+                    let mut rng = fresh_rng().ok_or(AbeError::Crypto)?;
                     let r = &context.request;
                     let parameters = r.parameters.public()?;
                     let master = r.parameters.recompute(secret.bytes())?;
                     let policy = r.scope.policy(&r.parameters, &r.epochs)?;
-                    let key = aruna_kpabe::issue(
-                        &parameters,
-                        &master,
-                        &policy,
-                        &mut aruna_core::structs::storage::abe::SysRng,
-                    )?;
+                    let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut rng)?;
                     let aad = context.bytes()?;
                     let recipient = r
                         .recipient_public
@@ -44,6 +41,7 @@ impl BlobHandler {
                             aruna_core::structs::storage::abe::GRANT_PURPOSE,
                             &aad,
                             plain,
+                            &mut rng,
                         )
                         .map_err(|_| aruna_kpabe::Error)
                     })?;
@@ -78,7 +76,10 @@ impl BlobHandler {
                 blob,
                 size,
             } => {
-                let (envelope, private) = match create_envelope(plan) {
+                let created = fresh_rng()
+                    .ok_or(AbeError::Crypto)
+                    .and_then(|mut rng| create_envelope(plan, &mut rng));
+                let (envelope, private) = match created {
                     Ok(value) => value,
                     Err(error) => return BlobEvent::Error(error.into()),
                 };
@@ -101,7 +102,9 @@ impl BlobHandler {
                     event => event,
                 }
             }
-            AbeEffect::Envelope(plan) => match create_envelope(plan) {
+            AbeEffect::Envelope(plan) => match (fresh_rng().ok_or(AbeError::Crypto))
+                .and_then(|mut rng| create_envelope(plan, &mut rng))
+            {
                 Ok((envelope, _)) => BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope))),
                 Err(error) => BlobEvent::Error(error.into()),
             },
@@ -130,7 +133,10 @@ impl BlobHandler {
                     object_key,
                     bucket_public,
                 };
-                match copy_envelope(&source, secret.bytes(), plan) {
+                let copied = fresh_rng()
+                    .ok_or(AbeError::Crypto)
+                    .and_then(|mut rng| copy_envelope(&source, secret.bytes(), plan, &mut rng));
+                match copied {
                     Ok(envelope) => BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope))),
                     Err(error) => BlobEvent::Error(error.into()),
                 }
@@ -166,4 +172,11 @@ impl BlobHandler {
             }
         }
     }
+}
+
+/// A secret random stream seeded from the operating system, or none when it gives no bytes.
+pub(super) fn fresh_rng() -> Option<SeedRng> {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).ok()?;
+    Some(SeedRng::new(&seed))
 }

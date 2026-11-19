@@ -8,12 +8,12 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
-use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_PORTAL_PATH};
 use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, validate_portal_features};
@@ -166,6 +166,8 @@ struct PortalWrite {
     stage: Stage,
     document: Option<RealmConfigDocument>,
     deletes: Vec<(KeySpace, Key)>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl PortalWrite {
@@ -175,6 +177,8 @@ impl PortalWrite {
             stage: Stage::Read,
             document: None,
             deletes: Vec::new(),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -232,6 +236,7 @@ impl PortalWrite {
             AdminDocumentOperation::ConfigPortalSet {
                 features: self.config.features.clone(),
             },
+            self.ids.mint(self.now_ms),
         )?;
         // Materialized reducer state keeps local and replicated conflict outcomes equal.
         apply_reducer_portal(&mut document, &reducer_state);
@@ -278,6 +283,14 @@ impl Operation for PortalWrite {
     type Output = RealmConfigDocument;
     type Error = SetPortalError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -287,18 +300,8 @@ impl Operation for PortalWrite {
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, SetPortalError> {
-        let document = self.document_ref();
-        let target = self.admin_target();
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                document.storage_keyspace().to_string(),
-                document.storage_key(),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        let reads = crate::realm::document_reads(self.document_ref(), &self.admin_target());
+        Ok(Next::Call(reads))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetPortalError> {
@@ -339,8 +342,6 @@ mod tests {
     use crate::testing::path_context;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmId, RealmNodeKind,
@@ -371,19 +372,7 @@ mod tests {
     }
 
     async fn write(ctx: &DriverContext, key_space: &str, key: Key, value: Vec<u8>) {
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key,
-                value: value.into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
     }
 
     /// Seeds a management node config and makes the actor a realm admin.

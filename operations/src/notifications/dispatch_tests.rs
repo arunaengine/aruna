@@ -46,6 +46,7 @@ fn holder_from_config() {
 #[test]
 fn answers_unpack() {
     let watch = WatchSubscription::new(
+        ulid::Ulid::generate(),
         user(1, 2),
         "meta/".to_string(),
         WatchEventMask::default(),

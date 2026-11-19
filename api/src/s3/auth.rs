@@ -724,7 +724,7 @@ impl AuthProvider {
             .ok()
             .and_then(|value| SignedDelegation::decode(value).ok())
             .ok_or_else(|| denied("malformed delegation"))?;
-        let now = aruna_core::time::unix_timestamp_secs();
+        let now = aruna_clock::unix_timestamp_secs();
         let accepted = match accept_delegation(self.driver_ctx.node_and_realm(), &signed, now) {
             Ok(accept) => drive(accept, &self.driver_ctx).await,
             Err(error) => Err(error),
@@ -1296,6 +1296,7 @@ mod tests {
             .encrypt_secret(
                 &CredentialEncryptionKey::derive(&[7u8; 32]),
                 "plaintext-secret",
+                [3; 24],
             )
             .unwrap();
         access
@@ -1323,6 +1324,7 @@ mod tests {
             .encrypt_secret(
                 &CredentialEncryptionKey::derive(&[7u8; 32]),
                 "temporary-secret",
+                [3; 24],
             )
             .unwrap();
         session
@@ -1339,7 +1341,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = provider(dir.path().to_str().unwrap());
         let user = UserId::local(Ulid::generate(), provider.realm_id);
-        let cutoff = aruna_core::time::unix_timestamp_secs() + 60;
+        let cutoff = aruna_clock::unix_timestamp_secs() + 60;
         let mut config = RealmConfigDocument::new(provider.realm_id, Vec::new(), 3);
         config.revoked_tokens.push(TokenRevocation {
             token_hash: user_cutoff_hash(&user),
@@ -1526,7 +1528,7 @@ mod tests {
             S3Session::build_access_key(&ulid::Ulid::generate().to_string()).unwrap();
         long_lived.secret = EncryptedS3Secret::empty();
         long_lived
-            .encrypt_secret(&provider.encryption_key, "long-lived-secret")
+            .encrypt_secret(&provider.encryption_key, "long-lived-secret", [3; 24])
             .unwrap();
         store_access(&provider, &long_lived).await;
 
@@ -1564,6 +1566,7 @@ mod tests {
         old.encrypt_secret(
             &CredentialEncryptionKey::derive(&[7u8; 32]),
             "previous-secret",
+            [3; 24],
         )
         .unwrap();
         let mut session = S3Session {
@@ -1575,6 +1578,7 @@ mod tests {
             .encrypt_secret(
                 &CredentialEncryptionKey::derive(&[7u8; 32]),
                 "temporary-secret",
+                [3; 24],
             )
             .unwrap();
         session.previous = Some(PreviousCredential {

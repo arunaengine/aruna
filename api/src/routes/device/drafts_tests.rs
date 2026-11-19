@@ -146,6 +146,7 @@ fn entry() -> PublishEntry {
         "/notes".to_string(),
         true,
         "{}".to_string(),
+        aruna_clock::unix_timestamp_millis(),
     )
 }
 

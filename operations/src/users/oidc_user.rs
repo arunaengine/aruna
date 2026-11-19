@@ -11,6 +11,7 @@ use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -20,7 +21,6 @@ use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::user::validation::EMAIL_HASH_ATTRIBUTE;
 use aruna_core::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
@@ -60,6 +60,8 @@ pub struct ResolveOidcOperation {
     stage: Stage,
     user: Option<User>,
     announce: bool,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 #[derive(Debug, PartialEq)]
@@ -120,6 +122,8 @@ impl ResolveOidcOperation {
             stage: Stage::Subject,
             user: None,
             announce: false,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -195,9 +199,17 @@ impl ResolveOidcOperation {
             self.fence.add(realm_id, config, [placement]);
         }
         let generation = self.fence.generation(&realm_id, &placement);
-        let document_revision = initial_sync_change(&self.input.actor, placement);
+        let event_id = self.ids.mint(self.now_ms);
+        let document_revision =
+            initial_sync_change(&self.input.actor, placement, self.now_ms, event_id);
         let mut reducer_state = AdminDocumentState::new(admin_target);
-        let admin_events = seed_admin_events(&mut reducer_state, &self.input, subject_id)?;
+        let admin_events = seed_admin_events(
+            &mut reducer_state,
+            &self.input,
+            subject_id,
+            &mut self.ids,
+            self.now_ms,
+        )?;
         let mut writes = vec![
             (
                 USER_KEYSPACE.to_string(),
@@ -261,6 +273,14 @@ impl Operation for ResolveOidcOperation {
     type Output = User;
     type Error = ResolveOidcError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
@@ -323,6 +343,8 @@ fn seed_admin_events(
     state: &mut AdminDocumentState,
     input: &ResolveOidcInput,
     subject_id: String,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut events = Vec::with_capacity(3);
     let email = input
@@ -341,20 +363,24 @@ fn seed_admin_events(
     .into_iter()
     .chain(email)
     {
-        let event = state.apply_operation(&input.actor, operation)?;
+        let event = state.apply_operation(&input.actor, operation, ids.mint(now_ms))?;
         events.push(event);
     }
 
     Ok(events)
 }
 
-pub(crate) fn initial_sync_change(actor: &Actor, placement: PlacementRef) -> DocumentChange {
-    let updated_at_ms = current_timestamp_ms();
+pub(crate) fn initial_sync_change(
+    actor: &Actor,
+    placement: PlacementRef,
+    updated_at_ms: u64,
+    event_id: Ulid,
+) -> DocumentChange {
     DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: updated_at_ms,
-            event_id: Ulid::generate(),
+            event_id,
             actor: actor.node_id,
             updated_at_ms,
         },
@@ -562,6 +588,8 @@ mod tests {
             create_new: false,
         });
         let document_target = DocumentTarget::User { user_id };
+        // The run's stamp is the first revision's time and generation.
+        operation.stamp(5_000);
 
         let writes = write_call(answer_subject(&mut operation, None));
         assert_eq!(writes.len(), 7);
@@ -584,8 +612,8 @@ mod tests {
         assert_eq!(revision_key, &sync_revision_key(&document_target));
         assert_eq!(revision.base, None);
         assert_eq!(revision.current.actor, actor.node_id);
-        assert!(revision.current.generation > 0);
-        assert!(revision.current.updated_at_ms > 0);
+        assert_eq!(revision.current.generation, 5_000);
+        assert_eq!(revision.current.updated_at_ms, 5_000);
         assert_eq!(revision.kind, DocumentChangeKind::Upsert);
     }
 

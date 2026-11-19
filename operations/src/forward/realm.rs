@@ -275,7 +275,6 @@ mod tests {
     use aruna_core::placement::resolve_shard_holders;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmNodeKind;
-    use aruna_core::structs::placement::record::PlacementStrategy;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
@@ -283,27 +282,7 @@ mod tests {
     }
 
     fn config_and_placement() -> (RealmConfigDocument, PlacementRef) {
-        let mut config = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
-        let strategy = PlacementStrategy {
-            strategy_id: Ulid::from_bytes([4u8; 16]),
-            name: "default".to_string(),
-            replica_count: Some(2),
-            distinct_locations: false,
-            affinity: Vec::new(),
-            shard_count: 64,
-        };
-        config.default_strategy_id = Some(strategy.strategy_id);
-        config.strategies = vec![strategy.clone()];
-        for seed in 1..=4u8 {
-            config.ensure_node(node(seed), RealmNodeKind::Server);
-        }
-        (
-            config,
-            PlacementRef {
-                strategy_id: strategy.strategy_id,
-                shard: 9,
-            },
-        )
+        crate::tests::calls::placed_config()
     }
 
     fn relay_fixture() -> (RealmConfigDocument, PlacementRef, NodeId) {
@@ -435,16 +414,7 @@ mod tests {
     }
 
     fn asked(turn: Result<Next<()>, ForwardError>) -> (NodeId, Duration) {
-        let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
-            panic!("expected a peer request");
-        };
-        let aruna_core::effects::Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(
-            request,
-        )) = *effect
-        else {
-            panic!("expected a metadata request");
-        };
-        (request.peer, request.timeout)
+        crate::tests::calls::asked(turn)
     }
 
     #[test]

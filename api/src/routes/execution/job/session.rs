@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::job_service::read_session_reason;
 use crate::job_service::{read_job_record, submit_copy_job};
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::compute::ExecutorKind;
 use aruna_core::compute::session::{
     EndReason, EventKind, MAX_SCRATCH_BYTES, PendingInput, SessionAnswer, SessionError,
@@ -20,7 +21,6 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::key_content_type;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::jobs::lifecycle::ids::session_of;

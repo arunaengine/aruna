@@ -75,7 +75,7 @@ fn share_of(view: &PlacementView, strategy: &PlacementStrategy, seed: u8) -> f64
     hits as f64 / SUBJECTS as f64
 }
 
-fn multiply_rule(key: &str, value: &str, permille: u32) -> AffinityRule {
+pub(super) fn multiply_rule(key: &str, value: &str, permille: u32) -> AffinityRule {
     AffinityRule {
         matcher: LabelMatch {
             key: key.to_string(),

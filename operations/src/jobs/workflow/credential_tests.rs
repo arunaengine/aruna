@@ -8,7 +8,6 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::execution::job::{
     AttemptIntent, JobErrorKind, JobPayload, workspace_credential_id,
 };
-use aruna_core::structs::storage::format::Compression;
 use ulid::Ulid;
 
 use super::*;
@@ -72,17 +71,7 @@ fn is_child<T>(next: &Result<Next<T>, JobError>) -> bool {
 }
 
 fn bucket(group_id: GroupId) -> BucketInfo {
-    BucketInfo {
-        group_id,
-        created_at: SystemTime::UNIX_EPOCH,
-        created_by: Default::default(),
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Off,
-        distribution: None,
-    }
+    crate::tests::s3::bucket_info(group_id, Default::default())
 }
 
 /// The stored credential the mint of `spec` and `record` would accept.
@@ -99,7 +88,9 @@ fn stored(spec: &ExecutionSpec, record: &JobRecord, expiry: SystemTime) -> UserA
         issued_by: *node().as_bytes(),
         revoked_at: None,
     };
-    access.encrypt_secret(&key(), "stored secret").unwrap();
+    access
+        .encrypt_secret(&key(), "stored secret", [3; 24])
+        .unwrap();
     access
 }
 

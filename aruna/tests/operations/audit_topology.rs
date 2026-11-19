@@ -36,8 +36,15 @@ async fn nonholder_audit_trail() -> TestResult<()> {
     for index in 0..DOCUMENTS {
         let path = format!("datasets/audit-{index}");
         let origin = realm.leading_node(group_id, &path);
-        let document_id =
-            mint_local_document(&realm.config, &realm.actor(origin), group_id, &path)?.as_ulid();
+        let document_id = mint_local_document(
+            &realm.config,
+            &realm.actor(origin),
+            group_id,
+            &path,
+            &mut crate::fresh_ids(),
+            aruna_core::time::unix_timestamp_millis(),
+        )?
+        .as_ulid();
         let placement = create_document(
             &realm,
             origin,

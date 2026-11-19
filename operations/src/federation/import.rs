@@ -808,7 +808,7 @@ pub(crate) mod tests {
     use aruna_drivers::driver::{DriverContext, drive};
     use ed25519_dalek::SigningKey;
     use std::time::SystemTime;
-    use tempfile::{TempDir, tempdir};
+    use tempfile::TempDir;
     use url::Url;
 
     async fn write_import(
@@ -1150,18 +1150,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn context() -> (TempDir, DriverContext) {
-        let dir = tempdir().unwrap();
-        let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
-        (dir, context)
+        crate::testing::temp_context()
     }
 
     pub(crate) fn realm(seed: u8) -> RealmId {

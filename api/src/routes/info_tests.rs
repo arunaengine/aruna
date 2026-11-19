@@ -638,12 +638,7 @@ async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir
 }
 
 fn admin_auth(realm_id: RealmId, user_id: UserId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, realm_id)
 }
 
 /// Installs a realm deny policy for one permission path.

@@ -9,7 +9,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 
 use super::*;
-use crate::jobs::job_cancel::{CancelJobOutcome, CancelOwnedOperation};
 use crate::jobs::job_delete::DeleteOwnedOperation;
 use crate::jobs::job_reports::{
     JobReportLookup, JobReportOperation, ReportQuery, ReportRouteOperation,
@@ -17,7 +16,6 @@ use crate::jobs::job_reports::{
 use crate::jobs::store::RunDelete;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_drivers::jobs::runtime::JobsRuntime;
 
 pub(crate) fn realm() -> RealmId {
     RealmId([1u8; 32])
@@ -119,20 +117,6 @@ pub(crate) async fn delete_owned_run(
     let serving = context.node_and_realm();
     let delete = DeleteOwnedOperation::new(auth, job_id, serving, unix_timestamp_millis());
     drive(delete, context).await
-}
-
-pub(crate) async fn cancel_owned_job(
-    context: &DriverContext,
-    runtime: &JobsRuntime,
-    user_id: UserId,
-    job_id: JobId,
-) -> Result<CancelJobOutcome, String> {
-    let cancel = CancelOwnedOperation::new(user_id, job_id, unix_timestamp_millis());
-    let report = drive(cancel, context).await.map_err(|error| error.0)?;
-    for running in report.running {
-        runtime.request_cancel(running);
-    }
-    Ok(report.outcome)
 }
 
 fn mint_record() -> JobRecord {

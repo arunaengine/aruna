@@ -15,7 +15,6 @@ use aruna_core::storage_entries::{subject_index_key, subject_index_value, sync_r
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, RoleId, Value};
 use aruna_core::user::validation::{
     DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, counted_attributes,
@@ -201,7 +200,7 @@ impl MergeUsersOperation {
         let user_id = user.user_id;
         let mut change = Change::new(state.as_ref(), AdminDocumentTarget::User { user_id })?;
         for op in ops {
-            change.apply(&actor, op)?;
+            change.apply(&actor, op, self.ids.mint(self.now_ms))?;
         }
         let document = DocumentTarget::User { user_id };
         let placement = self.placement(config, &document);
@@ -210,7 +209,9 @@ impl MergeUsersOperation {
             .map(|bytes| postcard::from_bytes::<DocumentChange>(bytes.as_ref()))
             .transpose()
             .map_err(ConversionError::from)?;
-        let revision = local_sync_change(previous.as_ref(), &actor, placement);
+        let event_id = self.ids.mint(self.now_ms);
+        let revision =
+            local_sync_change(previous.as_ref(), &actor, placement, self.now_ms, event_id);
         self.batch.writes.push((
             document.storage_keyspace().to_string(),
             document.storage_key(),
@@ -288,6 +289,7 @@ impl MergeUsersOperation {
             &mut realm_auth.roles,
             (&handed, &held),
             (survivor, merged),
+            (&mut self.ids, self.now_ms),
         )?;
         let document = DocumentTarget::RealmAuthorization { realm_id };
         self.batch.writes.push((
@@ -317,7 +319,14 @@ impl MergeUsersOperation {
         for ((group, state), (handed, held)) in groups.iter_mut().zip(states).zip(plans) {
             let group_id: GroupId = group.group_id;
             let mut change = Change::new(state.as_ref(), AdminDocumentTarget::Group { group_id })?;
-            change.move_roles(&actor, &mut group.roles, (handed, held), (survivor, merged))?;
+            let mint = (&mut self.ids, self.now_ms);
+            change.move_roles(
+                &actor,
+                &mut group.roles,
+                (handed, held),
+                (survivor, merged),
+                mint,
+            )?;
             let document = DocumentTarget::GroupAuthorization { group_id };
             let placement = self.placement(config, &document);
             self.batch.writes.push((
@@ -368,13 +377,10 @@ impl MergeUsersOperation {
                     node_id,
                     kind: RealmNodeKind::User { owner: survivor },
                 },
+                self.ids.mint(self.now_ms),
             )?;
         }
-        overlay_reducer_state(
-            &mut documents.config,
-            &change.state,
-            unix_timestamp_millis(),
-        );
+        overlay_reducer_state(&mut documents.config, &change.state, self.now_ms);
         let document = DocumentTarget::RealmConfig { realm_id };
         let placement = target_placement_ref(&documents.config, &document, Default::default());
         self.batch.writes.push((

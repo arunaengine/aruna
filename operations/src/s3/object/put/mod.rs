@@ -27,6 +27,7 @@ use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE, MANAGED_COPY_KEYSPACE,
@@ -73,7 +74,6 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
 
-use aruna_core::time::unix_timestamp_millis;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -311,6 +311,8 @@ pub struct PutObjectResult {
 /// conflict.
 #[derive(Debug, PartialEq)]
 pub struct PutObjectOperation {
+    now_ms: u64,
+    ids: IdMint,
     state: PutObjectState,
     config: PutObjectConfig,
     /// This instance is the version transaction.
@@ -407,6 +409,8 @@ impl PutObjectOperation {
     pub fn new(config: PutObjectConfig) -> Self {
         let version_id = config.preassigned_version_id;
         PutObjectOperation {
+            now_ms: 0,
+            ids: IdMint::default(),
             state: PutObjectState::Init,
             config,
             publishing: false,
@@ -922,7 +926,7 @@ impl PutObjectOperation {
         let set_hint = self.set_hint;
         let version_id = *self
             .version_id
-            .get_or_insert_with(|| mint_version(set_hint));
+            .get_or_insert_with(|| mint_version(self.ids.mint(self.now_ms), set_hint));
         let mut child = Self::new(self.config.without_body());
         child.publishing = true;
         child.state = PutObjectState::CheckPurgeFence;
@@ -1021,12 +1025,12 @@ impl PutObjectOperation {
     }
 
     /// A cleanup row written outside any transaction.
-    fn cleanup_row(work: &BlobCleanupWork) -> Option<IoCall> {
+    fn cleanup_row(work: &BlobCleanupWork, fresh: Ulid) -> Option<IoCall> {
         let key = match work {
             BlobCleanupWork::ReconcileWrite { location, .. } => {
                 location.ulid.to_bytes().to_vec().into()
             }
-            _ => Ulid::generate().to_bytes().to_vec().into(),
+            _ => fresh.to_bytes().to_vec().into(),
         };
         match work.to_bytes() {
             Ok(value) => Some(IoCall::Write(vec![(
@@ -1186,7 +1190,12 @@ impl Operation for PutObjectOperation {
         let mut calls = Vec::new();
         if let Some(location) = self.reconcile_location.take() {
             let work = self.reconcile_work(location);
-            calls.extend(work.ok().as_ref().and_then(Self::cleanup_row));
+            let fresh = self.ids.mint(self.now_ms);
+            calls.extend(
+                work.ok()
+                    .as_ref()
+                    .and_then(|work| Self::cleanup_row(work, fresh)),
+            );
         }
         if let Some(location) = self.written_location.take()
             && !self.adopted
@@ -1197,6 +1206,14 @@ impl Operation for PutObjectOperation {
             calls.push(Effect::Blob(BlobEffect::ReleaseReservation { id }).into());
         }
         calls
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

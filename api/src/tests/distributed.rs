@@ -481,7 +481,7 @@ pub(crate) const CLOSED_API: &str = "http://127.0.0.1:0";
 pub(crate) async fn peer_heartbeat(state: &ServerState) {
     let net = state.get_ctx().net_handle.clone().unwrap();
     net.reload_realm_peers().await.unwrap();
-    let now = aruna_core::time::unix_timestamp_millis();
+    let now = aruna_clock::unix_timestamp_millis();
     let heartbeat = NodeHeartbeat {
         realm_id: state.get_realm_id(),
         epoch: AdvertisementEpoch {
@@ -514,7 +514,7 @@ pub(crate) async fn peer_heartbeat(state: &ServerState) {
 /// signature.
 pub(crate) fn unsigned_token(auth: &AuthContext) -> String {
     use base64::Engine;
-    let now = aruna_core::time::unix_timestamp_secs();
+    let now = aruna_clock::unix_timestamp_secs();
     let claims = TokenClaims {
         sub: auth.user_id.to_string(),
         iss: auth.realm_id.to_base64(),

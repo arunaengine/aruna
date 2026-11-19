@@ -53,8 +53,15 @@ async fn policy_converges_inventory() -> Result<(), Box<dyn std::error::Error>> 
     let initial_config =
         drive(GetConfigOperation::new(realm_id), nodes[0].context.as_ref()).await?;
     assert_distinct_resolution(&nodes, &initial_config);
-    let document_id =
-        mint_local_document(&initial_config, &actor, group_id, "datasets/issue-261")?.as_ulid();
+    let document_id = mint_local_document(
+        &initial_config,
+        &actor,
+        group_id,
+        "datasets/issue-261",
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
 
     // The create-receiving node chooses the document's bucket out of the ones
     // it holds; every record of the document rides that bucket.
@@ -532,6 +539,7 @@ async fn seed_config_topic(
                 .ok_or("realm config has no placement entry")?
                 .clone(),
         },
+        ulid::Ulid::generate(),
     )?;
 
     match nodes[1]

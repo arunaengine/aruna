@@ -12,6 +12,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ABE_COPY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
@@ -66,6 +67,8 @@ type Step = Result<Next<CopyOutcome>, AbeError>;
 /// transaction.
 #[derive(Debug, PartialEq)]
 pub struct CopyEnvelopeOperation {
+    now_ms: u64,
+    ids: IdMint,
     version: VersionKey,
     row: Vec<u8>,
     pending: PendingCopy,
@@ -84,6 +87,8 @@ pub struct CopyEnvelopeOperation {
 impl CopyEnvelopeOperation {
     pub fn new(version: VersionKey, row: Vec<u8>, pending: PendingCopy) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             version,
             row,
             pending,
@@ -115,7 +120,7 @@ impl CopyEnvelopeOperation {
         let copy = Effect::Blob(BlobEffect::Abe(Box::new(AbeEffect::Copy {
             source: self.pending.source.clone(),
             epoch,
-            write_id: Ulid::generate(),
+            write_id: self.ids.mint(self.now_ms),
             object_key: self.version.key.clone(),
         })));
         Ok(Next::Call(IoCall::Effect(Box::new(copy))))
@@ -298,7 +303,9 @@ impl Operation for CopyEnvelopeOperation {
                 result.done()?;
                 let usage = self.usage.as_mut().ok_or(AbeError::Context)?;
                 self.state = State::Usage;
-                Ok(Next::Call(usage.start_calls().into_call()))
+                Ok(Next::Call(
+                    usage.start_calls(self.ids.mint(self.now_ms)).into_call(),
+                ))
             }
             State::Usage => self.usage_step(result),
         }
@@ -306,6 +313,14 @@ impl Operation for CopyEnvelopeOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 
