@@ -5,9 +5,11 @@
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+use aruna_core::compute::backend::RuntimeDestination;
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
     ExecutorKind, FenceContext, GrantedResources, LogLimits, LogTails, MAX_OUTPUT_MATCHES, NOBODY,
@@ -82,19 +84,80 @@ const RANGE_TRIES: u32 = 5;
 /// Bounds the termination evidence kept on a terminal status.
 const MAX_TERMINATION_DETAIL: usize = 2048;
 
+/// The API server a kubeconfig context names, or the in-cluster one without a
+/// kubeconfig. Without a context the kubeconfig's current context applies.
+pub fn api_server(kubeconfig: Option<&Path>, context: Option<&str>) -> Result<String, String> {
+    let Some(path) = kubeconfig else {
+        if context.is_some() {
+            return Err("a Kubernetes context needs a kubeconfig".to_string());
+        }
+        let config = kube::Config::incluster().map_err(|error| error.to_string())?;
+        return Ok(config.cluster_url.to_string());
+    };
+    let file = kube::config::Kubeconfig::read_from(path).map_err(|error| error.to_string())?;
+    let name = context
+        .map(str::to_string)
+        .or(file.current_context.clone())
+        .ok_or_else(|| "the kubeconfig sets no current context".to_string())?;
+    let cluster = file
+        .contexts
+        .iter()
+        .find(|named| named.name == name)
+        .and_then(|named| named.context.as_ref())
+        .map(|context| context.cluster.clone())
+        .ok_or_else(|| format!("the kubeconfig has no context `{name}`"))?;
+    file.clusters
+        .iter()
+        .find(|named| named.name == cluster)
+        .and_then(|named| named.cluster.as_ref())
+        .and_then(|cluster| cluster.server.clone())
+        .ok_or_else(|| format!("the kubeconfig names no server for cluster `{cluster}`"))
+}
+
+/// The client settings of one context of a kubeconfig file, else its current context.
+async fn client_config(path: &Path, context: Option<&str>) -> Result<kube::Config, BackendError> {
+    let invalid =
+        |error: kube::config::KubeconfigError| BackendError::InvalidSpec(error.to_string());
+    let file = kube::config::Kubeconfig::read_from(path).map_err(invalid)?;
+    let options = kube::config::KubeConfigOptions {
+        context: context.map(str::to_string),
+        ..Default::default()
+    };
+    kube::Config::from_custom_kubeconfig(file, &options)
+        .await
+        .map_err(invalid)
+}
+
 #[derive(Clone)]
 pub struct KubernetesBackend {
     client: Client,
     config: KubernetesConfig,
     policies: Vec<PolicyManifest>,
+    /// The API server the client talks to, part of where this backend's attempts live.
+    server: String,
 }
 
 impl KubernetesBackend {
     pub async fn with_config(config: KubernetesConfig) -> Result<Self, BackendError> {
-        let client = Client::try_default().await.map_err(kube_error)?;
-        Self::from_client(client, config)
+        let settings = match &config.kubeconfig {
+            Some(path) => client_config(path, config.context.as_deref()).await?,
+            None if config.context.is_some() => {
+                return Err(BackendError::InvalidSpec(
+                    "a Kubernetes context needs a kubeconfig".to_string(),
+                ));
+            }
+            None => kube::Config::infer()
+                .await
+                .map_err(|error| kube_error(kube::Error::InferConfig(error)))?,
+        };
+        let server = settings.cluster_url.to_string();
+        let client = Client::try_from(settings).map_err(kube_error)?;
+        let mut backend = Self::from_client(client, config)?;
+        backend.server = server;
+        Ok(backend)
     }
 
+    /// A backend on `client`, whose API server address it cannot name.
     pub fn from_client(client: Client, config: KubernetesConfig) -> Result<Self, BackendError> {
         validate_config(&config)?;
         let policies = policy_manifests(&config)?;
@@ -102,6 +165,7 @@ impl KubernetesBackend {
             client,
             config,
             policies,
+            server: String::new(),
         })
     }
 
@@ -1043,6 +1107,13 @@ impl ExecutorBackend for KubernetesBackend {
     /// Workers do not run on the controller: the advertised site is the
     /// configured worker placement, and network isolation only counts as proven
     /// when those pods are actually pinned to it.
+    fn destination(&self) -> Option<RuntimeDestination> {
+        Some(RuntimeDestination::Kubernetes {
+            server: self.server.clone(),
+            namespace: self.config.namespace.clone(),
+        })
+    }
+
     fn capabilities(&self) -> BackendCaps {
         let worker_site = self.config.worker_site();
         BackendCaps {
@@ -1054,6 +1125,7 @@ impl ExecutorBackend for KubernetesBackend {
             worker_site,
             limits: self.config.envelope,
             session: !self.config.s3_cidrs.is_empty(),
+            ..BackendCaps::default()
         }
     }
 
@@ -2257,6 +2329,61 @@ mod tests {
     use super::status::pull_refused;
     use super::*;
 
+    fn two_contexts(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("kubeconfig");
+        std::fs::write(
+            &path,
+            "apiVersion: v1\nkind: Config\ncurrent-context: dev\n\
+             clusters:\n\
+             - name: a\n  cluster:\n    server: https://a.example:6443\n\
+             - name: b\n  cluster:\n    server: https://b.example:6443\n\
+             contexts:\n\
+             - name: dev\n  context:\n    cluster: a\n\
+             - name: prod\n  context:\n    cluster: b\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn client_per_context() {
+        // Each backend's kubeconfig context gives that backend its own API server.
+        let dir = tempfile::tempdir().unwrap();
+        let path = two_contexts(dir.path());
+
+        let prod = client_config(&path, Some("prod")).await.unwrap();
+        let current = client_config(&path, None).await.unwrap();
+
+        assert_eq!(prod.cluster_url.host(), Some("b.example"));
+        assert_eq!(current.cluster_url.host(), Some("a.example"));
+        assert!(client_config(&path, Some("missing")).await.is_err());
+        let config = KubernetesConfig {
+            context: Some("prod".to_string()),
+            ..test_config()
+        };
+        assert!(matches!(
+            KubernetesBackend::with_config(config).await,
+            Err(BackendError::InvalidSpec(_))
+        ));
+    }
+
+    #[test]
+    fn server_from_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = two_contexts(dir.path());
+
+        assert_eq!(
+            api_server(Some(&path), None).unwrap(),
+            "https://a.example:6443"
+        );
+        assert_eq!(
+            api_server(Some(&path), Some("prod")).unwrap(),
+            "https://b.example:6443"
+        );
+        assert!(api_server(Some(&path), Some("missing")).is_err());
+        assert!(api_server(None, Some("prod")).is_err());
+    }
+
     fn context() -> FenceContext {
         FenceContext {
             attempt: AttemptRef::new("job", 1),
@@ -2469,6 +2596,7 @@ mod tests {
             client: fake_client(|_, _| (404, status_json(404))),
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
 
         let evidence = backend
@@ -2527,6 +2655,7 @@ mod tests {
             client,
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
 
         backend.cleanup(&context()).await.unwrap();
@@ -2590,6 +2719,7 @@ mod tests {
             client,
             config,
             policies: Vec::new(),
+            server: String::new(),
         };
 
         let result = backend.cleanup(&context()).await;
@@ -2634,6 +2764,7 @@ mod tests {
             client,
             config,
             policies: Vec::new(),
+            server: String::new(),
         };
         let mut spec = TaskSpec::new(context().attempt, "session:latest");
         spec.session = true;
@@ -2696,6 +2827,7 @@ mod tests {
             client,
             config,
             policies: Vec::new(),
+            server: String::new(),
         };
         let mut spec = TaskSpec::new(context().attempt, "session:latest");
         spec.session = true;
@@ -2780,6 +2912,7 @@ mod tests {
             client,
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
 
         backend.cleanup(&context()).await.unwrap();
@@ -2815,6 +2948,7 @@ mod tests {
             client,
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
 
         let evidence = backend.cancel(&context()).await.unwrap();
@@ -2839,6 +2973,7 @@ mod tests {
             }),
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
         let context = context();
         let spec = TaskSpec::new(context.attempt.clone(), "registry.example/task:latest");
@@ -2931,6 +3066,7 @@ mod tests {
             client,
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
         let context = context();
         let spec = TaskSpec::new(context.attempt.clone(), "registry.example/task:latest");
@@ -2994,6 +3130,7 @@ mod tests {
             client,
             config,
             policies: Vec::new(),
+            server: String::new(),
         };
         let context = context();
         let mut spec = TaskSpec::new(context.attempt.clone(), "registry.example/task:latest");
@@ -3078,6 +3215,7 @@ mod tests {
             client: fake_client(|_, _| (404, status_json(404))),
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
         let cancel = CancellationToken::new();
 
@@ -3171,6 +3309,7 @@ mod tests {
             client: probe_client(disabled.clone()),
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
         backend.health().await.unwrap();
         assert!(
@@ -3188,6 +3327,7 @@ mod tests {
             client: probe_client(enabled.clone()),
             config,
             policies: Vec::new(),
+            server: String::new(),
         };
         backend.health().await.unwrap();
         assert!(
@@ -3207,6 +3347,7 @@ mod tests {
             client: fake_client(|_, _| (200, json!({}))),
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
         assert!(!backend.capabilities().session);
 
@@ -3216,6 +3357,7 @@ mod tests {
             client: fake_client(|_, _| (200, json!({}))),
             config,
             policies: Vec::new(),
+            server: String::new(),
         };
         assert!(backend.capabilities().session);
     }
@@ -3245,6 +3387,7 @@ mod tests {
             client,
             config,
             policies: Vec::new(),
+            server: String::new(),
         };
 
         backend.apply_network().await.expect("the policies apply");
@@ -3309,6 +3452,7 @@ mod tests {
                 source: std::path::PathBuf::from("policies.yaml"),
                 object,
             }],
+            server: String::new(),
         };
 
         backend
@@ -3539,6 +3683,7 @@ mod tests {
             client,
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
 
         let status = backend.status(&context()).await.unwrap();
@@ -3575,6 +3720,7 @@ mod tests {
             client: stuck_client(),
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
 
         let status = backend.status(&context()).await.unwrap();
@@ -3595,6 +3741,7 @@ mod tests {
             client: stuck_client(),
             config: test_config(),
             policies: Vec::new(),
+            server: String::new(),
         };
 
         let tails = backend
