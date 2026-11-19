@@ -709,7 +709,7 @@ impl Operation for AwaitingJobsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::key_locks::KeyUnlockedOperation;
+    use crate::blob::unlocked::KeyUnlockedOperation;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::test_context;
     use aruna_storage::StorageHandle;

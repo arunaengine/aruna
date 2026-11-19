@@ -28,9 +28,10 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::blob::unlocked::KeyUnlockedOperation;
 use crate::jobs::key_locks::{
-    AliasPage, AliasPageOperation, FindAliasOperation, KeyCheckError, KeyUnlockedOperation,
-    MAX_AWAITED, VersionWaitOperation,
+    AliasPage, AliasPageOperation, FindAliasOperation, KeyCheckError, MAX_AWAITED,
+    VersionWaitOperation,
 };
 use crate::jobs::records::pages::ServingNode;
 use crate::jobs::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};

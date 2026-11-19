@@ -36,8 +36,8 @@ use aruna_core::types::{Key, Value};
 use super::shared::MigrationError;
 use crate::blob::migration::drain::MIGRATION_CONTINUE;
 use crate::blob::migration::rewrite::{RewriteError, RewriteOutcome, RewriteVersionOperation};
+use crate::blob::unlocked::KeyUnlockedOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::jobs::key_locks::KeyUnlockedOperation;
 use crate::replication::parking::WakeParkedOperation;
 use crate::replication::queue::{BlobQueueError, schedule_blob_drain};
 
