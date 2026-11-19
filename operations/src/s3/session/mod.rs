@@ -230,6 +230,7 @@ fn build_session(
     issued_by: [u8; 32],
     encryption_key: &CredentialEncryptionKey,
     drawn: Secret,
+    nonce: [u8; 24],
 ) -> Result<S3SessionCredentials, S3SessionError> {
     if let Some(restrictions) = path_restrictions.as_deref() {
         validate_restriction_limits(restrictions)?;
@@ -252,7 +253,7 @@ fn build_session(
         last_used_at: None,
         previous: None,
     };
-    session.encrypt_secret(encryption_key, secret_access_key.expose())?;
+    session.encrypt_secret(encryption_key, secret_access_key.expose(), nonce)?;
     Ok(S3SessionCredentials {
         access_key_id: access_key,
         secret_access_key,

@@ -15,6 +15,7 @@ fn apply_operation_event() {
             AdminDocumentOperation::UserNameSet {
                 name: "Alice".to_string(),
             },
+            ulid::Ulid::generate(),
         )
         .unwrap();
     let second = state
@@ -24,6 +25,7 @@ fn apply_operation_event() {
                 key: "department".to_string(),
                 value: "biology".to_string(),
             },
+            ulid::Ulid::generate(),
         )
         .unwrap();
 
@@ -547,14 +549,22 @@ fn links_foreign_only() {
     let realm = crate::structs::identity::realm::RealmId::from_bytes([77; 32]);
     let foreign = UserId::new(Ulid::from_bytes([5; 16]), realm);
     let added = AdminDocumentOperation::UserAliasAdded { alias: foreign };
-    state.apply_operation(&actor, added).unwrap();
+    state
+        .apply_operation(&actor, added, ulid::Ulid::generate())
+        .unwrap();
     assert!(state.materialized_alias(&foreign));
     assert!(state.materialized_subject_ids().is_empty());
     let removed = AdminDocumentOperation::UserAliasRemoved { alias: foreign };
-    state.apply_operation(&actor, removed).unwrap();
+    state
+        .apply_operation(&actor, removed, ulid::Ulid::generate())
+        .unwrap();
     assert!(!state.materialized_alias(&foreign));
     let local = AdminDocumentOperation::UserAliasAdded {
         alias: user_id_seed(9),
     };
-    assert!(state.apply_operation(&actor, local).is_err());
+    assert!(
+        state
+            .apply_operation(&actor, local, ulid::Ulid::generate())
+            .is_err()
+    );
 }

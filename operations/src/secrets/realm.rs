@@ -7,6 +7,7 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::realm_vault::{RealmSecretRef, RealmVaultError, RealmVaultKey, RealmVaultRecord};
@@ -86,6 +87,7 @@ pub struct RealmSecretOperation {
     result: Option<Option<SecretRecord>>,
     /// The run's random value; it varies the nonce of each sealed value.
     entropy: u128,
+    ids: IdMint,
 }
 
 impl RealmSecretOperation {
@@ -96,6 +98,7 @@ impl RealmSecretOperation {
             notices: false,
             result: None,
             entropy: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -130,7 +133,7 @@ impl RealmSecretOperation {
             self.input.change.clone(),
             self.input.actor.user_id,
             self.input.now_ms,
-            self.input.write_id,
+            (self.input.write_id, self.ids.mint(self.input.now_ms)),
         )?;
         let mut operations = Vec::new();
         if let (Some(info), Some(fields)) = (&applied.info, &applied.value) {
@@ -193,7 +196,11 @@ impl RealmSecretOperation {
         let actor = self.input.actor.clone();
         let mut events = Vec::new();
         for operation in operations {
-            events.push(state.apply_operation(&actor, operation)?);
+            events.push(state.apply_operation(
+                &actor,
+                operation,
+                self.ids.mint(self.input.now_ms),
+            )?);
         }
         // Only values this write supersedes retire: the name's old value and those of its lost
         // conflicts. A value whose record has not arrived yet stays hidden, never retired.
@@ -206,7 +213,11 @@ impl RealmSecretOperation {
                     entry,
                     record: None,
                 };
-                events.push(state.apply_operation(&actor, retire)?);
+                events.push(state.apply_operation(
+                    &actor,
+                    retire,
+                    self.ids.mint(self.input.now_ms),
+                )?);
             }
         }
         config.vault = state.materialized_realm_vault();
@@ -260,6 +271,7 @@ impl Operation for RealmSecretOperation {
     type Error = RealmSecretError;
 
     fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
         self.entropy = entropy;
     }
 

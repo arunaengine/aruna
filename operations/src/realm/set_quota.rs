@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::BTreeSet;
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
@@ -169,6 +170,8 @@ struct QuotaWrite {
     stage: Stage,
     document: Option<RealmConfigDocument>,
     deletes: Vec<(KeySpace, Key)>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl QuotaWrite {
@@ -178,6 +181,8 @@ impl QuotaWrite {
             stage: Stage::Read,
             document: None,
             deletes: Vec::new(),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -231,12 +236,14 @@ impl QuotaWrite {
             AdminDocumentOperation::ConfigQuotaSet {
                 quota: self.config.quota.clone(),
             },
+            self.ids.mint(self.now_ms),
         )?;
         let replicas_event = reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::ConfigReplicasSet {
                 replicas: self.config.replicas.clone(),
             },
+            self.ids.mint(self.now_ms),
         )?;
         // Materialized reducer state keeps local and replicated quota conflict outcomes equal.
         apply_reducer_quota(&mut document, &reducer_state);
@@ -284,6 +291,14 @@ impl QuotaWrite {
 impl Operation for QuotaWrite {
     type Output = RealmConfigDocument;
     type Error = SetQuotaError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -663,6 +678,7 @@ mod tests {
                 AdminDocumentOperation::ConfigDescriptionSet {
                     description: "changed elsewhere".to_string(),
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         let (_, _, reducer_value) = reducer_state_entry(&reducer).unwrap();

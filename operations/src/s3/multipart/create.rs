@@ -1130,7 +1130,11 @@ mod pure_tests {
             panic!("expected an envelope plan, got {effect:?}")
         };
         assert_eq!(plan.bucket_public, [5; 32]);
-        let (envelope, _) = create_envelope(plan.clone()).unwrap();
+        let (envelope, _) = create_envelope(
+            plan.clone(),
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )
+        .unwrap();
         let created = AbeEvent::Envelope(envelope);
         operation.next(event(Event::Blob(BlobEvent::Abe(Box::new(created)))))
     }

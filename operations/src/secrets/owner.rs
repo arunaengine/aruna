@@ -12,6 +12,7 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, OWNER_SECRETS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::realm_vault::{RealmVaultError, seal_named};
@@ -213,6 +214,7 @@ pub struct OwnerSecretOperation {
     stage: Stage,
     notices: bool,
     result: Option<Option<SecretEntry>>,
+    ids: IdMint,
 }
 
 impl OwnerSecretOperation {
@@ -224,6 +226,7 @@ impl OwnerSecretOperation {
             stage: Stage::Reading,
             notices: false,
             result: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -446,6 +449,7 @@ impl OwnerSecretOperation {
         }
         let incarnation = documents.first().map(|document| document.incarnation);
         let audit = AdminAuditRecord::for_secret(
+            self.ids.mint(self.input.now_ms),
             action,
             self.input.actor,
             SecretAudit {
@@ -475,6 +479,10 @@ fn expected(change: &SecretChange) -> Option<&str> {
 impl Operation for OwnerSecretOperation {
     type Output = Option<SecretEntry>;
     type Error = OwnerSecretError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, OwnerSecretError> {
         Ok(Next::Call(IoCall::Effect(Box::new(
@@ -631,6 +639,8 @@ pub struct ReadbackOperation {
     owner: SecretOwner,
     actor: UserId,
     entry: Option<SecretEntry>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl ReadbackOperation {
@@ -640,6 +650,8 @@ impl ReadbackOperation {
             owner,
             actor,
             entry: None,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -651,6 +663,7 @@ impl ReadbackOperation {
             return Err(OwnerSecretError::NotReadable);
         }
         let audit = AdminAuditRecord::for_secret(
+            self.ids.mint(self.now_ms),
             AdminAuditAction::SecretRead,
             self.actor,
             SecretAudit {
@@ -668,6 +681,14 @@ impl ReadbackOperation {
 impl Operation for ReadbackOperation {
     type Output = SecretEntry;
     type Error = OwnerSecretError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, OwnerSecretError> {
         Ok(Next::Call(IoCall::Effect(Box::new(

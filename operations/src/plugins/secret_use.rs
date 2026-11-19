@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -322,6 +323,8 @@ pub(crate) struct ReleaseSecret {
     peer: NodeId,
     request: ReleaseRequest,
     phase: ReleasePhase,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl ReleaseSecret {
@@ -336,6 +339,8 @@ impl ReleaseSecret {
             peer,
             request,
             phase: ReleasePhase::Selecting,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -350,10 +355,11 @@ impl ReleaseSecret {
     }
 
     fn audit_rows(
-        &self,
+        &mut self,
         refusal: Option<Refusal>,
         selected: Option<&Selected>,
     ) -> Result<Option<Vec<Row>>, ReleaseFailure> {
+        let audit_id = self.ids.mint(self.now_ms);
         let install = self.install()?;
         let Some(binding) = self.binding()? else {
             return Ok(None);
@@ -369,7 +375,7 @@ impl ReleaseSecret {
             run_id: self.request.run_id,
             refused: refusal.map(|refusal| refusal.as_str().to_string()),
         };
-        let record = AdminAuditRecord::for_use(install, secret, used);
+        let record = AdminAuditRecord::for_use(audit_id, install, secret, used);
         let rows = record.entries();
         Ok(Some(rows.map_err(|error| unavailable(error.to_string()))?))
     }
@@ -528,6 +534,14 @@ impl ReleaseSecret {
 impl Operation for ReleaseSecret {
     type Output = Released;
     type Error = ReleaseFailure;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<Released>, ReleaseFailure> {
         let install = self.install()?;

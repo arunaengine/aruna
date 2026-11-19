@@ -97,6 +97,7 @@ impl CreateS3Operation {
             self.config.issued_by,
             &self.encryption_key,
             drawn,
+            aruna_core::id_mint::id_nonce(self.ids.mint(self.now_ms)),
         )?);
         let owner = owner_key(self.config.user_identity, self.config.group_id);
         self.phase = CreatePhase::Index;

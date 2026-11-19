@@ -191,6 +191,7 @@ struct MemberRemoval {
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
     ids: IdMint,
+    now_ms: u64,
 }
 
 impl MemberRemoval {
@@ -206,6 +207,7 @@ impl MemberRemoval {
             deletes: Vec::new(),
             marks,
             ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -246,6 +248,8 @@ impl MemberRemoval {
             &self.input.actor,
             self.input.user_id,
             &role_ids,
+            &mut self.ids,
+            self.now_ms,
         )?;
 
         let materialized_assignments = reducer_state.materialized_group_assignments();
@@ -389,7 +393,12 @@ impl Operation for MemberRemoval {
     type Output = GroupAuthorizationDocument;
     type Error = RemoveFromError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
         self.marks.stamp(now_ms);
     }
 
@@ -498,6 +507,8 @@ fn apply_reducer_updates(
     actor: &Actor,
     user_id: UserId,
     role_ids: &[RoleId],
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut admin_events = Vec::new();
     for role_id in role_ids {
@@ -505,6 +516,7 @@ fn apply_reducer_updates(
             let event = state.apply_operation(
                 actor,
                 AdminDocumentOperation::GroupRoleAdded { role_id: *role_id },
+                ids.mint(now_ms),
             )?;
             admin_events.push(event);
         }
@@ -514,6 +526,7 @@ fn apply_reducer_updates(
                 role_id: *role_id,
                 user_id,
             },
+            ids.mint(now_ms),
         )?;
         admin_events.push(event);
     }

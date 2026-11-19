@@ -57,7 +57,6 @@ futures-util = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
-lru = { workspace = true }
 postcard = { workspace = true }
 quick-xml = { workspace = true }
 rand = { workspace = true }

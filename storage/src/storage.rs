@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod handle;
+#[cfg(debug_assertions)]
+mod ledger;
 mod lifecycle;
 mod metrics;
 mod owner;

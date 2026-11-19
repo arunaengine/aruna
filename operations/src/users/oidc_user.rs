@@ -203,7 +203,13 @@ impl ResolveOidcOperation {
         let document_revision =
             initial_sync_change(&self.input.actor, placement, self.now_ms, event_id);
         let mut reducer_state = AdminDocumentState::new(admin_target);
-        let admin_events = seed_admin_events(&mut reducer_state, &self.input, subject_id)?;
+        let admin_events = seed_admin_events(
+            &mut reducer_state,
+            &self.input,
+            subject_id,
+            &mut self.ids,
+            self.now_ms,
+        )?;
         let mut writes = vec![
             (
                 USER_KEYSPACE.to_string(),
@@ -337,6 +343,8 @@ fn seed_admin_events(
     state: &mut AdminDocumentState,
     input: &ResolveOidcInput,
     subject_id: String,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut events = Vec::with_capacity(3);
     let email = input
@@ -355,7 +363,7 @@ fn seed_admin_events(
     .into_iter()
     .chain(email)
     {
-        let event = state.apply_operation(&input.actor, operation)?;
+        let event = state.apply_operation(&input.actor, operation, ids.mint(now_ms))?;
         events.push(event);
     }
 

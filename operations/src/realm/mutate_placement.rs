@@ -7,6 +7,7 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
@@ -824,6 +825,7 @@ impl MutatePlacementOperation {
             document: None,
             deletes: Vec::new(),
             now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -915,6 +917,7 @@ struct PlacementWrite {
     document: Option<RealmConfigDocument>,
     deletes: Vec<(KeySpace, Key)>,
     now_ms: u64,
+    ids: IdMint,
 }
 
 impl PlacementWrite {
@@ -968,8 +971,11 @@ impl PlacementWrite {
         for mutation in &self.mutations {
             mutation.authorize(&document, &self.actor)?;
             mutation.validate(&document)?;
-            let admin_event =
-                reducer_state.apply_operation(&self.actor, mutation.admin_operation(&document)?)?;
+            let admin_event = reducer_state.apply_operation(
+                &self.actor,
+                mutation.admin_operation(&document)?,
+                self.ids.mint(self.now_ms),
+            )?;
             overlay_placement(&mut document, &reducer_state, self.now_ms);
             admin_events.push(admin_event);
         }
@@ -1183,6 +1189,10 @@ impl PlacementWrite {
 impl Operation for PlacementWrite {
     type Output = RealmConfigDocument;
     type Error = MutatePlacementError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;

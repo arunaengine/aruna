@@ -370,6 +370,8 @@ struct RoleAddition {
     written: Option<AddedRole>,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl RoleAddition {
@@ -385,6 +387,8 @@ impl RoleAddition {
             written: None,
             deletes: Vec::new(),
             marks,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -439,7 +443,8 @@ impl RoleAddition {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
+        let admin_events =
+            apply_reducer_updates(&mut reducer_state, &self.input, &mut self.ids, self.now_ms)?;
         let members_before = group_members(&auth_doc);
         let roles_before = auth_doc.roles.clone();
         materialize_group_role(&mut group, &mut auth_doc, &self.input.role, &reducer_state);
@@ -533,7 +538,12 @@ impl Operation for RoleAddition {
     type Output = AddedRole;
     type Error = AddRoleError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
         self.marks.stamp(now_ms);
     }
 
@@ -592,6 +602,8 @@ impl Operation for RoleAddition {
 fn apply_reducer_updates(
     state: &mut AdminDocumentState,
     input: &AddRoleConfig,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut admin_events = Vec::new();
     let event = state.apply_operation(
@@ -599,6 +611,7 @@ fn apply_reducer_updates(
         AdminDocumentOperation::GroupRoleCreated {
             role: AdminRoleDefinition::from(&input.role),
         },
+        ids.mint(now_ms),
     )?;
     admin_events.push(event);
 
@@ -609,6 +622,7 @@ fn apply_reducer_updates(
                 role_id: input.role.role_id,
                 user_id,
             },
+            ids.mint(now_ms),
         )?;
         admin_events.push(event);
     }

@@ -19,6 +19,7 @@ aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
 ulid = { workspace = true }
 byteview = { workspace = true }
+getrandom = { workspace = true }
 hex = { workspace = true }
 lru = { workspace = true }
 postcard = { workspace = true }

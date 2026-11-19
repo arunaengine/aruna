@@ -55,12 +55,15 @@ impl Change {
         })
     }
 
+    /// Applies `op` as a new event with the id `event_id`, minted by the merge run.
     pub(super) fn apply(
         &mut self,
         actor: &Actor,
         op: AdminDocumentOperation,
+        event_id: ulid::Ulid,
     ) -> Result<(), MergeError> {
-        self.events.push(self.state.apply_operation(actor, op)?);
+        self.events
+            .push(self.state.apply_operation(actor, op, event_id)?);
         Ok(())
     }
 

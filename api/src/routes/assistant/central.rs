@@ -211,8 +211,14 @@ fn build_central(
     let secret = central_secret(state, request.api_key, current)?;
     let key = state.credential_encryption_key();
     provider
-        .encrypt_secret(key, &secret)
-        .and_then(|_| provider.encrypt_headers(key, &AssistantHeaders(Default::default())))
+        .encrypt_secret(key, &secret, rand::random::<[u8; 24]>())
+        .and_then(|_| {
+            provider.encrypt_headers(
+                key,
+                &AssistantHeaders(Default::default()),
+                rand::random::<[u8; 24]>(),
+            )
+        })
         .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     Ok(CentralAssistant {
         provider,

@@ -1606,6 +1606,7 @@ mod test {
                     expires_at: 1_000,
                     token_owner: owner,
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
 
@@ -1661,6 +1662,7 @@ mod test {
                     expires_at: 2_000,
                     token_owner: owner_a,
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         reducer
@@ -1671,6 +1673,7 @@ mod test {
                     expires_at: 2_000,
                     token_owner: owner_b,
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
 

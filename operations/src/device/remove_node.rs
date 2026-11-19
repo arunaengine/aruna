@@ -8,6 +8,7 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -53,6 +54,7 @@ pub struct RemoveNodeOperation {
     state: RemoveNodeState,
     document: Option<RealmConfigDocument>,
     now_ms: u64,
+    ids: IdMint,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +108,7 @@ impl RemoveNodeOperation {
             config,
             state: RemoveNodeState::ReadCurrent,
             document: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -214,6 +217,7 @@ impl RemoveNodeOperation {
                 // A publisher is never removed here, so no set needs a cutoff yet.
                 cutoffs: Vec::new(),
             },
+            self.ids.mint(self.now_ms),
         )?;
         // The stored document is derived from the reducer, exactly as the
         // replicated overlay derives it on every other node.
@@ -263,6 +267,10 @@ impl RemoveNodeOperation {
 impl Operation for RemoveNodeOperation {
     type Output = RealmConfigDocument;
     type Error = RemoveNodeError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;

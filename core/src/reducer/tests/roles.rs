@@ -79,6 +79,7 @@ fn observed_group_assignments() {
         .apply_operation(
             &actor(node(3)),
             AdminDocumentOperation::GroupRoleRemoved { role_id },
+            ulid::Ulid::generate(),
         )
         .unwrap();
 

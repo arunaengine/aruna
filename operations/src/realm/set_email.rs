@@ -352,7 +352,11 @@ impl EmailWrite {
                 let revision = record.as_ref().map(|record| record.revision);
                 info!(?entry, ?revision, user = %self.config.actor.user_id, "Vault entry set");
             }
-            events.push(reducer_state.apply_operation(&self.config.actor, operation)?);
+            events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                operation,
+                self.ids.mint(self.now_ms),
+            )?);
         }
         document.email = reducer_state.materialized_realm_email();
         document.vault = reducer_state.materialized_realm_vault();

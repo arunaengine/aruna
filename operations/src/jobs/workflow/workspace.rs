@@ -1012,6 +1012,7 @@ mod tests {
             .encrypt_secret(
                 &aruna_core::credential_encryption::CredentialEncryptionKey::random(),
                 "foreign",
+                [3; 24],
             )
             .unwrap();
         let _ = context

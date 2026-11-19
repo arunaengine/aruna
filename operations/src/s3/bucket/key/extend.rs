@@ -11,6 +11,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::BUCKET_HOLDER_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
@@ -19,9 +20,7 @@ use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRef, HolderOrigin, KeyTicket, UnlockStatus,
     deadline_after,
 };
-use aruna_core::structs::storage::key_audit::{
-    AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
-};
+use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::task::TaskEffect;
 use aruna_core::types::{GroupId, Value};
 use aruna_core::{NodeId, UserId};
@@ -99,6 +98,7 @@ pub struct ExtendBucketOperation {
     failure: Option<ExtendError>,
     /// The event id of the stored intent, which the outcome names.
     intent_id: Option<Ulid>,
+    ids: IdMint,
 }
 
 impl ExtendBucketOperation {
@@ -111,6 +111,7 @@ impl ExtendBucketOperation {
             outcome: None,
             failure: None,
             intent_id: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -196,13 +197,13 @@ impl ExtendBucketOperation {
     }
 
     fn record(
-        &self,
+        &mut self,
         key: BucketKeyRef,
         outcome: AuditOutcome,
         deadline_ms: Option<u64>,
     ) -> BucketAuditRecord {
         BucketAuditRecord {
-            event_id: next_event_id(self.input.now_ms),
+            event_id: self.ids.mint(self.input.now_ms),
             bucket_id: key.bucket_id,
             at_ms: self.input.now_ms,
             action: AuditAction::Extend,
@@ -316,6 +317,10 @@ impl ExtendBucketOperation {
 impl Operation for ExtendBucketOperation {
     type Output = UnlockStatus;
     type Error = ExtendError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> ExtendTurn {
         let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);

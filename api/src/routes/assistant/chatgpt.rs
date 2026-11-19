@@ -449,7 +449,11 @@ pub async fn poll_login(
     provider.login_expires_at = None;
     provider.login_interval_seconds = None;
     provider
-        .encrypt_secret(state.credential_encryption_key(), &secret)
+        .encrypt_secret(
+            state.credential_encryption_key(),
+            &secret,
+            rand::random::<[u8; 24]>(),
+        )
         .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     save_provider(&state, auth.user_id, expected, provider).await?;
     Ok((
@@ -524,7 +528,11 @@ pub(super) async fn refresh_provider(
     }
     provider.token_obtained_at = Some(unix_timestamp_secs());
     provider
-        .encrypt_secret(state.credential_encryption_key(), &secret)
+        .encrypt_secret(
+            state.credential_encryption_key(),
+            &secret,
+            rand::random::<[u8; 24]>(),
+        )
         .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     save_provider(state, provider.user_id, expected, provider).await
 }

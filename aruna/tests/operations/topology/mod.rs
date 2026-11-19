@@ -1260,6 +1260,7 @@ async fn seed_config_topic(
                 .ok_or("realm config has no placement entry")?
                 .clone(),
         },
+        ulid::Ulid::generate(),
     )?;
     // Persist the state the seed event advanced, or the seeder's next mutation
     // would reuse origin sequence one and fork its own actor log.

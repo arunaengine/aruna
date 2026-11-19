@@ -9,6 +9,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
@@ -189,6 +190,8 @@ struct RoleRemoval {
     outbox: bool,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl RoleRemoval {
@@ -207,6 +210,8 @@ impl RoleRemoval {
             outbox: false,
             deletes: Vec::new(),
             marks,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -269,7 +274,8 @@ impl RoleRemoval {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
+        let admin_events =
+            apply_reducer_updates(&mut reducer_state, &self.input, &mut self.ids, self.now_ms)?;
         materialize_role_removal(
             &mut group,
             &mut auth_doc,
@@ -364,7 +370,12 @@ impl Operation for RoleRemoval {
     type Output = RemovedRole;
     type Error = RemoveGroupError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
         self.marks.stamp(now_ms);
     }
 
@@ -423,12 +434,15 @@ impl Operation for RoleRemoval {
 fn apply_reducer_updates(
     state: &mut AdminDocumentState,
     input: &RemoveGroupConfig,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let event = state.apply_operation(
         &input.actor,
         AdminDocumentOperation::GroupRoleRemoved {
             role_id: input.role_id,
         },
+        ids.mint(now_ms),
     )?;
     Ok(vec![event])
 }

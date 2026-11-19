@@ -117,7 +117,7 @@ pub fn apply_change(
     change: SecretChange,
     actor: UserId,
     now_ms: u64,
-    write_id: Ulid,
+    (write_id, audit_id): (Ulid, Ulid),
 ) -> Result<Applied, ChangeError> {
     if let (Some(current), Some(expected)) = (current, change.expected())
         && current.revision_token() != expected
@@ -204,6 +204,7 @@ pub fn apply_change(
         info.check(scope)?;
     }
     let audit = AdminAuditRecord::for_secret(
+        audit_id,
         action,
         actor,
         SecretAudit {

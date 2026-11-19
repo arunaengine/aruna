@@ -12,6 +12,7 @@ use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
 };
@@ -22,9 +23,7 @@ use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRecord, BucketKeyRef, HolderOrigin, KeyState, KeyTicket,
     SealedCopy, UnlockStatus, deadline_after,
 };
-use aruna_core::structs::storage::key_audit::{
-    AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
-};
+use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::task::TaskEffect;
 use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
@@ -86,11 +85,11 @@ fn audit_record(
     input: &UnlockInput,
     max: Option<Duration>,
     session: Option<Ulid>,
-    outcome: AuditOutcome,
+    (outcome, event_id): (AuditOutcome, Ulid),
 ) -> BucketAuditRecord {
     let deadline = input.duration.or(max);
     BucketAuditRecord {
-        event_id: next_event_id(input.now_ms),
+        event_id,
         bucket_id: input.key.bucket_id,
         at_ms: input.now_ms,
         action: AuditAction::Unlock,
@@ -137,6 +136,7 @@ struct UnlockIntent {
     record: Option<BucketKeyRecord>,
     ticket: Option<KeyTicket>,
     intent: Option<BucketAuditRecord>,
+    ids: IdMint,
 }
 
 impl UnlockIntent {
@@ -229,7 +229,13 @@ impl UnlockIntent {
         };
         self.ticket = Some(ticket);
         let session = Some(ticket.session_id);
-        let intent = audit_record(&self.input, self.max, session, AuditOutcome::Intent);
+        let event_id = self.ids.mint(self.input.now_ms);
+        let intent = audit_record(
+            &self.input,
+            self.max,
+            session,
+            (AuditOutcome::Intent, event_id),
+        );
         let row = (
             BUCKET_AUDIT_KEYSPACE.to_string(),
             intent.key().into(),
@@ -255,6 +261,10 @@ fn refused<T>(state: &str, received: Event) -> Result<T, UnlockError> {
 impl Operation for UnlockIntent {
     type Output = PreparedUnlock;
     type Error = UnlockError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> IntentTurn {
         let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
@@ -321,6 +331,7 @@ pub struct UnlockBucketOperation {
     activated: Option<UnlockStatus>,
     outcome: Option<BucketAuditRecord>,
     finished: Option<Result<UnlockStatus, UnlockError>>,
+    ids: IdMint,
 }
 
 impl UnlockBucketOperation {
@@ -338,6 +349,7 @@ impl UnlockBucketOperation {
             activated: None,
             outcome: None,
             finished: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -392,7 +404,8 @@ impl UnlockBucketOperation {
             Ok(_) => AuditOutcome::Applied,
             Err(_) => AuditOutcome::Failed,
         };
-        let mut record = audit_record(&self.input, self.max, self.session, outcome);
+        let event_id = self.ids.mint(self.input.now_ms);
+        let mut record = audit_record(&self.input, self.max, self.session, (outcome, event_id));
         // An applied unlock records the deadline of the session as it was activated.
         record.deadline_ms = match &result {
             Ok(status) => status.deadline_ms,
@@ -457,6 +470,10 @@ impl Operation for UnlockBucketOperation {
     type Output = UnlockStatus;
     type Error = UnlockError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> UnlockTurn {
         let private_key = self.private_key.take().ok_or(UnlockError::NotFinished)?;
         let intent = UnlockIntent {
@@ -468,6 +485,7 @@ impl Operation for UnlockBucketOperation {
             record: None,
             ticket: None,
             intent: None,
+            ids: IdMint::default(),
         };
         self.call(UnlockStep::Intent, IoCall::child(intent))
     }

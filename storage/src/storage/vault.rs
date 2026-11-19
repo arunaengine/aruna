@@ -8,6 +8,8 @@ use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::NODE_VAULT_KEYSPACE;
 use aruna_core::node_vault::{NodeVaultKey, VaultEntry};
 
+use super::sealing::fresh_nonce;
+
 fn not_open() -> StorageError {
     StorageError::KeyspaceError("node vault is not open".to_string())
 }
@@ -26,7 +28,7 @@ pub(super) fn vault_effect(
         } => {
             let value = vault_key
                 .ok_or_else(not_open)?
-                .seal(entry, secret.bytes())
+                .seal(entry, secret.bytes(), fresh_nonce()?)
                 .map_err(|error| StorageError::WriteError(error.to_string()))?;
             let write = StorageEffect::Write {
                 key_space,

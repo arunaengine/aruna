@@ -10,6 +10,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::PathRestriction;
@@ -44,6 +45,8 @@ pub struct RefreshS3Operation {
     drawn: Option<Secret>,
     pending: Option<S3SessionCredentials>,
     phase: RefreshPhase,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl RefreshS3Operation {
@@ -54,6 +57,8 @@ impl RefreshS3Operation {
             drawn: None,
             pending: None,
             phase: RefreshPhase::Secret,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -108,6 +113,7 @@ impl RefreshS3Operation {
             self.config.issued_by,
             &self.encryption_key,
             self.drawn.take().ok_or(S3SessionError::Failed)?,
+            aruna_core::id_mint::id_nonce(self.ids.mint(self.now_ms)),
         )?;
         // Requests signed before this refresh stay valid until the old expiry.
         pending.session.previous = Some(PreviousCredential {
@@ -145,6 +151,14 @@ impl RefreshS3Operation {
 impl Operation for RefreshS3Operation {
     type Output = S3SessionCredentials;
     type Error = S3SessionError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<S3SessionCredentials>, S3SessionError> {
         if !S3Session::valid_access_key(&self.config.access_key) {

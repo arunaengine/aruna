@@ -54,7 +54,7 @@ fn link() -> RepositoryLink {
 fn secret(link_id: Ulid) -> RepositoryCredential {
     let link = link();
     RepositoryCredential::seal_link(
-        &CredentialEncryptionKey::derive(&[1; 32]),
+        (&CredentialEncryptionKey::derive(&[1; 32]), [3; 24]),
         link.created_by,
         link.group_id,
         link.connector_id,

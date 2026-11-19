@@ -152,7 +152,7 @@ impl CreateRealmOperation {
         })
     }
 
-    fn reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateRealmError> {
+    fn reducer_seed_writes(&mut self) -> Result<Vec<(String, Key, Value)>, CreateRealmError> {
         let realm_id = self.config.actor.realm_id;
         let config_doc = self
             .config_doc
@@ -175,6 +175,7 @@ impl CreateRealmOperation {
             AdminDocumentOperation::RealmRoleCreated {
                 role: AdminRoleDefinition::from(realm_admin_role),
             },
+            self.ids.mint(self.now_ms),
         )?;
 
         let config_target = AdminDocumentTarget::RealmConfig { realm_id };
@@ -185,18 +186,21 @@ impl CreateRealmOperation {
                 node_id: self.config.actor.node_id,
                 kind: RealmNodeKind::Management,
             },
+            self.ids.mint(self.now_ms),
         )?;
         let mut config_events = vec![config_node_event];
         for pool in &config_doc.band_pools {
             config_events.push(config_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::BandPoolAssigned { pool: *pool },
+                self.ids.mint(self.now_ms),
             )?);
         }
         for range in &config_doc.placement_handle_ranges {
             config_events.push(config_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::HandleRangeGranted { range: *range },
+                self.ids.mint(self.now_ms),
             )?);
         }
         let mut oidc_providers = self.config.oidc_providers.clone();
@@ -205,6 +209,7 @@ impl CreateRealmOperation {
             config_events.push(config_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::OidcProviderUpserted { provider },
+                self.ids.mint(self.now_ms),
             )?);
         }
         config_events.push(config_state.apply_operation(
@@ -213,28 +218,34 @@ impl CreateRealmOperation {
                 metadata_replication: config_doc.metadata_replication.clone(),
                 discovery: config_doc.discovery.clone(),
             },
+            self.ids.mint(self.now_ms),
         )?);
         config_events.push(config_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::ConfigDescriptionSet {
                 description: config_doc.description.clone(),
             },
+            self.ids.mint(self.now_ms),
         )?);
         config_events.extend(seed_placement_events(
             &mut config_state,
             &self.config.actor,
             config_doc,
+            &mut self.ids,
+            self.now_ms,
         )?);
         config_events.push(config_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::NodePlacementSet {
                 entry: self.creating_node_placement()?,
             },
+            self.ids.mint(self.now_ms),
         )?);
         for map in &config_doc.candidate_maps {
             config_events.push(config_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::CandidateMapPublished { map: map.clone() },
+                self.ids.mint(self.now_ms),
             )?);
             for strategy in &config_doc.strategies {
                 config_events.push(config_state.apply_operation(
@@ -243,6 +254,7 @@ impl CreateRealmOperation {
                         strategy_id: strategy.strategy_id,
                         candidate_map_epoch: map.epoch,
                     },
+                    self.ids.mint(self.now_ms),
                 )?);
             }
         }
@@ -252,6 +264,7 @@ impl CreateRealmOperation {
             AdminDocumentOperation::MergeCoordinatorSet {
                 node_id: self.config.actor.node_id,
             },
+            self.ids.mint(self.now_ms),
         )?);
 
         let realm_auth_target = DocumentTarget::RealmAuthorization { realm_id };
@@ -383,6 +396,8 @@ pub(crate) fn seed_placement_events(
     state: &mut AdminDocumentState,
     actor: &Actor,
     document: &RealmConfigDocument,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut events = Vec::new();
     for strategy in &document.strategies {
@@ -391,6 +406,7 @@ pub(crate) fn seed_placement_events(
             AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: strategy.clone(),
             },
+            ids.mint(now_ms),
         )?);
     }
     for binding in &document.placement_bindings {
@@ -399,12 +415,14 @@ pub(crate) fn seed_placement_events(
             AdminDocumentOperation::PlacementBindingAppended {
                 binding: binding.clone(),
             },
+            ids.mint(now_ms),
         )?);
     }
     if let Some(strategy_id) = document.default_strategy_id {
         events.push(state.apply_operation(
             actor,
             AdminDocumentOperation::ConfigStrategySet { strategy_id },
+            ids.mint(now_ms),
         )?);
     }
     events.push(state.apply_operation(
@@ -412,6 +430,7 @@ pub(crate) fn seed_placement_events(
         AdminDocumentOperation::JobFamilySet {
             strategy_id: document.family_strategy_id,
         },
+        ids.mint(now_ms),
     )?);
     for binding in &document.strategy_bindings {
         events.push(state.apply_operation(
@@ -419,6 +438,7 @@ pub(crate) fn seed_placement_events(
             AdminDocumentOperation::StrategyBindingSet {
                 binding: binding.clone(),
             },
+            ids.mint(now_ms),
         )?);
     }
     Ok(events)

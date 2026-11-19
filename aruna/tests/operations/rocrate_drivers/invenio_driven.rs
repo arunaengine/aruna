@@ -119,7 +119,14 @@ pub(super) async fn seal_credential(
 ) -> Result<RepositoryCredential, TransferError> {
     let connector = ConnectorViewOperation::new(destination.group_id, destination.connector_id);
     let view = drive(connector, context).await?;
-    seal_token(&context.node_scope(), auth.user_id, &view, None, token)
+    seal_token(
+        &context.node_scope(),
+        auth.user_id,
+        &view,
+        None,
+        token,
+        [3; 24],
+    )
 }
 
 pub(super) async fn seal_link_token(
@@ -131,7 +138,14 @@ pub(super) async fn seal_link_token(
     token: &str,
 ) -> Result<RepositoryCredential, TransferError> {
     let view = drive(ConnectorViewOperation::new(group_id, connector_id), context).await?;
-    seal_token(&context.node_scope(), user, &view, Some(link_id), token)
+    seal_token(
+        &context.node_scope(),
+        user,
+        &view,
+        Some(link_id),
+        token,
+        [3; 24],
+    )
 }
 
 pub(super) async fn search(

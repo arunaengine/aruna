@@ -211,7 +211,7 @@ impl GroupCreate {
         Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn reducer_seed_writes(&self) -> Result<Vec<(String, Key, Value)>, CreateGroupError> {
+    fn reducer_seed_writes(&mut self) -> Result<Vec<(String, Key, Value)>, CreateGroupError> {
         let group_id = self
             .group
             .as_ref()
@@ -233,12 +233,14 @@ impl GroupCreate {
                 display_name: self.config.display_name.clone(),
                 owner: self.config.actor.user_id,
             },
+            self.ids.mint(self.now_ms),
         )?);
         admin_events.push(reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::GroupLocationSet {
                 location: Some(DatasetLocation::group_default(group_id)),
             },
+            self.ids.mint(self.now_ms),
         )?);
 
         for role in &roles {
@@ -247,6 +249,7 @@ impl GroupCreate {
                 AdminDocumentOperation::GroupRoleCreated {
                     role: AdminRoleDefinition::from(*role),
                 },
+                self.ids.mint(self.now_ms),
             )?);
         }
 
@@ -261,6 +264,7 @@ impl GroupCreate {
                     role_id: admin_role.role_id,
                     user_id,
                 },
+                self.ids.mint(self.now_ms),
             )?);
         }
 

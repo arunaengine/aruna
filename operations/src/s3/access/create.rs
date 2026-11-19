@@ -23,9 +23,7 @@ use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::encryption::BucketEncryption;
-use aruna_core::structs::storage::key_audit::{
-    AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
-};
+use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
@@ -139,7 +137,7 @@ impl TokenPlan {
         values: Vec<Option<Value>>,
         caller: UserId,
         access_key: &str,
-        group: GroupId,
+        (group, ids): (GroupId, &mut IdMint),
     ) -> Result<(), CreateUserError> {
         let (_, node_id) = self.origin.ok_or(CreateUserError::CreateAccessFailed)?;
         let mut values = values.into_iter();
@@ -156,7 +154,7 @@ impl TokenPlan {
             let active = BucketEncryption::from_row(settings.as_deref())?.active_key();
             let key = active.ok_or_else(|| CreateUserError::NotEncrypted(bucket.clone()))?;
             let audit = BucketAuditRecord {
-                event_id: next_event_id(self.now_ms),
+                event_id: ids.mint(self.now_ms),
                 bucket_id: key.bucket_id,
                 at_ms: self.now_ms,
                 action: AuditAction::TokenCreated,
@@ -256,7 +254,11 @@ impl CreateUserOperation {
             issued_by: self.config.issued_by,
             revoked_at: None,
         };
-        access.encrypt_secret(&self.encryption_key, drawn.expose())?;
+        access.encrypt_secret(
+            &self.encryption_key,
+            drawn.expose(),
+            aruna_core::id_mint::id_nonce(self.ids.mint(self.now_ms)),
+        )?;
         self.pending_secret = Some(drawn);
         self.access = Some(access);
         let reads = vec![
@@ -401,7 +403,7 @@ impl CreateUserOperation {
             .tokens
             .as_mut()
             .ok_or(CreateUserError::CreateAccessFailed)?;
-        plan.check_buckets(read, caller, &access_key, group)?;
+        plan.check_buckets(read, caller, &access_key, (group, &mut self.ids))?;
         self.write_credentials()
     }
 

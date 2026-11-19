@@ -88,7 +88,9 @@ fn stored(spec: &ExecutionSpec, record: &JobRecord, expiry: SystemTime) -> UserA
         issued_by: *node().as_bytes(),
         revoked_at: None,
     };
-    access.encrypt_secret(&key(), "stored secret").unwrap();
+    access
+        .encrypt_secret(&key(), "stored secret", [3; 24])
+        .unwrap();
     access
 }
 

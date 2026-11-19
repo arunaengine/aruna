@@ -428,6 +428,8 @@ impl StorageHandle {
         if let StorageEffect::CompilePolicies(sets) = &effect {
             return StorageEvent::PoliciesCompiled(self.policies.compile(sets));
         }
+        #[cfg(debug_assertions)]
+        super::ledger::record_outbox(&effect);
         if let StorageEffect::RealmOpen(sealed) = &effect {
             let keys = self.realm_keys.get();
             let result = keys.map_or(Err(RealmVaultError::NoKey), |keys| sealed.open(keys));

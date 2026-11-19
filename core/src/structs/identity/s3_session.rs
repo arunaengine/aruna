@@ -102,8 +102,9 @@ impl S3Session {
         &mut self,
         key: &CredentialEncryptionKey,
         plaintext: &str,
+        nonce: [u8; 24],
     ) -> Result<(), EncryptionError> {
-        self.secret = EncryptedS3Secret::encrypt(key, plaintext, &self.credential_aad())?;
+        self.secret = EncryptedS3Secret::encrypt(key, plaintext, &self.credential_aad(), nonce)?;
         Ok(())
     }
 
@@ -203,10 +204,10 @@ mod tests {
         let key = CredentialEncryptionKey::random();
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let mut old = session(start + SESSION_MAX_TTL);
-        old.encrypt_secret(&key, "old-secret").unwrap();
+        old.encrypt_secret(&key, "old-secret", [3; 24]).unwrap();
         let mut current = session(start + 2 * SESSION_MAX_TTL);
         current.token_hash = S3Session::hash_token("new-token");
-        current.encrypt_secret(&key, "new-secret").unwrap();
+        current.encrypt_secret(&key, "new-secret", [3; 24]).unwrap();
         current.previous = Some(PreviousCredential {
             secret: old.secret,
             token_hash: old.token_hash,

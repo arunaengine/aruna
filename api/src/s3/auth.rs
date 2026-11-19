@@ -1296,6 +1296,7 @@ mod tests {
             .encrypt_secret(
                 &CredentialEncryptionKey::derive(&[7u8; 32]),
                 "plaintext-secret",
+                [3; 24],
             )
             .unwrap();
         access
@@ -1323,6 +1324,7 @@ mod tests {
             .encrypt_secret(
                 &CredentialEncryptionKey::derive(&[7u8; 32]),
                 "temporary-secret",
+                [3; 24],
             )
             .unwrap();
         session
@@ -1526,7 +1528,7 @@ mod tests {
             S3Session::build_access_key(&ulid::Ulid::generate().to_string()).unwrap();
         long_lived.secret = EncryptedS3Secret::empty();
         long_lived
-            .encrypt_secret(&provider.encryption_key, "long-lived-secret")
+            .encrypt_secret(&provider.encryption_key, "long-lived-secret", [3; 24])
             .unwrap();
         store_access(&provider, &long_lived).await;
 
@@ -1564,6 +1566,7 @@ mod tests {
         old.encrypt_secret(
             &CredentialEncryptionKey::derive(&[7u8; 32]),
             "previous-secret",
+            [3; 24],
         )
         .unwrap();
         let mut session = S3Session {
@@ -1575,6 +1578,7 @@ mod tests {
             .encrypt_secret(
                 &CredentialEncryptionKey::derive(&[7u8; 32]),
                 "temporary-secret",
+                [3; 24],
             )
             .unwrap();
         session.previous = Some(PreviousCredential {

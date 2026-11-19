@@ -47,7 +47,7 @@ fn credential(group_id: Ulid) -> UserAccess {
 fn issued_access(state: &ServerState, group_id: Ulid) -> UserAccess {
     let mut access = credential(group_id);
     access
-        .encrypt_secret(state.credential_encryption_key(), TES_SECRET)
+        .encrypt_secret(state.credential_encryption_key(), TES_SECRET, [3; 24])
         .unwrap();
     access
 }
@@ -1502,7 +1502,7 @@ async fn basic_foreign_owner() {
         let mut access = credential(Ulid::from_bytes([5u8; 16]));
         access.user_identity = owner;
         access
-            .encrypt_secret(state.credential_encryption_key(), TES_SECRET)
+            .encrypt_secret(state.credential_encryption_key(), TES_SECRET, [3; 24])
             .unwrap();
         write_credential(&state, &access).await;
         let result = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET)).await;

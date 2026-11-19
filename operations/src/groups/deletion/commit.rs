@@ -323,6 +323,7 @@ impl CommitWrite {
                     AdminDocumentOperation::GroupDeleted {
                         certificate: Box::new(self.certificate.clone()),
                     },
+                    self.ids.mint(self.now_ms),
                 )
                 .map_err(|error| GroupDeletionError::Invalid(error.to_string()))?,
         };

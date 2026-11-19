@@ -248,7 +248,8 @@ impl ServiceWrite {
             }),
         ];
         for operation in operations.into_iter().flatten() {
-            let event = reducer_state.apply_operation(actor, operation)?;
+            let event =
+                reducer_state.apply_operation(actor, operation, self.ids.mint(self.now_ms))?;
             let record = new_identified_record(
                 event.event_id,
                 actor.node_id,

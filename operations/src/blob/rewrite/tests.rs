@@ -434,7 +434,11 @@ mod envelopes {
             _ => None,
         };
         if let Some(plan) = plan {
-            let (envelope, _) = create_envelope(EnvelopePlan { epoch, ..plan }).unwrap();
+            let (envelope, _) = create_envelope(
+                EnvelopePlan { epoch, ..plan },
+                &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+            )
+            .unwrap();
             let created = BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope)));
             step = operation.next(event(Event::Blob(created)));
         }
@@ -624,7 +628,9 @@ mod envelopes {
             object_key: object.to_string(),
             bucket_public: [2; 32],
         };
-        create_envelope(plan).unwrap().0
+        create_envelope(plan, &mut aruna_core::key_seal::SeedRng::new(&[7; 32]))
+            .unwrap()
+            .0
     }
 
     fn written<'a>(writes: &'a [(String, Key, Value)], space: &str) -> Option<&'a Value> {

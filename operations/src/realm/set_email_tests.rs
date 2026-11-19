@@ -223,7 +223,11 @@ fn concurrent_firsts() -> (AdminDocumentState, BTreeSet<RealmVaultEntry>) {
         let (operations, profile) = operation.email_writes(&state).unwrap();
         entries.insert(profile.unwrap().password.unwrap().entry);
         for operation in operations {
-            rivals.push(state.apply_operation(&actor(seed), operation).unwrap());
+            rivals.push(
+                state
+                    .apply_operation(&actor(seed), operation, ulid::Ulid::generate())
+                    .unwrap(),
+            );
         }
     }
     for event in &rivals {
@@ -241,7 +245,9 @@ fn apply_change(
     let mut operation = EmailWrite::new(Arc::new(email_config(&actor(1), profile)));
     let (operations, profile) = operation.email_writes(state).unwrap();
     for operation in operations {
-        state.apply_operation(&actor(1), operation).unwrap();
+        state
+            .apply_operation(&actor(1), operation, ulid::Ulid::generate())
+            .unwrap();
     }
     profile
 }

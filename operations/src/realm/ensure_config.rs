@@ -293,6 +293,7 @@ impl EnsureConfigOperation {
             events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::BandPoolAssigned { pool },
+                self.ids.mint(self.now_ms),
             )?);
         }
         if !resources.range_is_noop {
@@ -301,18 +302,21 @@ impl EnsureConfigOperation {
                 AdminDocumentOperation::HandleRangeGranted {
                     range: resources.assigned_range,
                 },
+                self.ids.mint(self.now_ms),
             )?);
         }
         if let Some(binding) = resources.job_binding {
             events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::PlacementBindingAppended { binding },
+                self.ids.mint(self.now_ms),
             )?);
         }
         if let Some(pool) = resources.transfer_pool {
             events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::BandPoolAssigned { pool },
+                self.ids.mint(self.now_ms),
             )?);
         }
         // Reducer events preserve fresh placement identity and family routing during rebuilds.
@@ -324,6 +328,8 @@ impl EnsureConfigOperation {
                 reducer_state,
                 &self.config.actor,
                 document,
+                &mut self.ids,
+                self.now_ms,
             )?);
         }
         Ok(events)
@@ -1126,7 +1132,9 @@ mod pure_tests {
                 record: record.clone(),
             },
         ] {
-            state.apply_operation(&actor, op).unwrap();
+            state
+                .apply_operation(&actor, op, ulid::Ulid::generate())
+                .unwrap();
         }
 
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
@@ -1156,6 +1164,7 @@ mod pure_tests {
                         owner: UserId::nil(realm_id),
                     },
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
 
@@ -1175,6 +1184,7 @@ mod pure_tests {
                     node_id: device,
                     cutoffs: Vec::new(),
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         overlay_reducer_state(&mut config, &state, 0);

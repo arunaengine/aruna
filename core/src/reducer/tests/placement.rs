@@ -220,7 +220,9 @@ fn realm_config_deterministically() {
             record: owned_override.clone(),
         },
     ] {
-        state.apply_operation(&actor, op).unwrap();
+        state
+            .apply_operation(&actor, op, ulid::Ulid::generate())
+            .unwrap();
     }
 
     overlay_placement(&mut config, &state, 0);

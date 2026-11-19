@@ -1657,8 +1657,9 @@ impl UserAccess {
         &mut self,
         key: &CredentialEncryptionKey,
         plaintext: &str,
+        nonce: [u8; 24],
     ) -> Result<(), EncryptionError> {
-        self.secret = EncryptedS3Secret::encrypt(key, plaintext, &self.credential_aad())?;
+        self.secret = EncryptedS3Secret::encrypt(key, plaintext, &self.credential_aad(), nonce)?;
         Ok(())
     }
 
@@ -1877,7 +1878,7 @@ mod tests {
             issued_by: issuer,
             revoked_at: None,
         };
-        access.encrypt_secret(&key, "the-secret").unwrap();
+        access.encrypt_secret(&key, "the-secret", [3; 24]).unwrap();
         assert_eq!(access.open_secret(&key).unwrap(), "the-secret");
 
         let other = CredentialEncryptionKey::derive(&[1u8; 32]);

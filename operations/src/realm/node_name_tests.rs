@@ -154,7 +154,9 @@ fn write_keeps_newer() {
         node_id: node(3),
         display_name: Some("laptop".to_string()),
     };
-    elsewhere.apply_operation(&actor(), laptop).unwrap();
+    elsewhere
+        .apply_operation(&actor(), laptop, ulid::Ulid::generate())
+        .unwrap();
     let mut operation = NodeNameOperation::new(config(
         node(2),
         Some("store"),
