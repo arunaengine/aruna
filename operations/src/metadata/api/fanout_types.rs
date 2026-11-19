@@ -1,12 +1,8 @@
-//! Holds the realm fan-out call types and the bearer and query checks they use.
+//! Holds the realm fan-out scope and stats types and the bearer and query checks they use.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{ApiQueryMode, Arc, AuthToken, BoxFuture, MetadataApiError, MetadataReadError, NodeId};
-use futures_util::future::FutureExt;
-
-pub(super) type MetadataNodeCall<T> =
-    Arc<dyn Fn(NodeId) -> BoxFuture<'static, Result<T, MetadataReadError>> + Send + Sync>;
+use super::{ApiQueryMode, AuthToken, MetadataApiError, NodeId};
 
 #[derive(Clone, Copy)]
 pub(super) enum MetadataFanoutOperation {
@@ -42,19 +38,18 @@ pub struct MetadataFanoutStats {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RealmNodeDiscovery {
-    pub(crate) nodes: Vec<NodeId>,
-    pub(crate) failed: bool,
+pub struct RealmNodeDiscovery {
+    pub nodes: Vec<NodeId>,
+    pub failed: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct MetadataFanoutScope {
     pub(super) mode: Option<ApiQueryMode>,
     pub(super) target_nodes: Option<Vec<NodeId>>,
     pub(super) allow_partial: bool,
     pub(super) discovery_failed: bool,
     pub(super) subject: Option<[u8; 32]>,
-    pub(super) deadline: Option<tokio::time::Instant>,
     /// Discovered nodes not to ask, such as those a cursor says are done.
     pub(super) skip: Vec<NodeId>,
 }
@@ -71,7 +66,6 @@ impl MetadataFanoutScope {
             allow_partial,
             discovery_failed: false,
             subject: None,
-            deadline: None,
             skip: Vec::new(),
         }
     }
@@ -88,11 +82,6 @@ impl MetadataFanoutScope {
 
     pub(super) fn with_subject(mut self, subject: [u8; 32]) -> Self {
         self.subject = Some(subject);
-        self
-    }
-
-    pub(super) fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
-        self.deadline = Some(deadline);
         self
     }
 }
@@ -267,17 +256,4 @@ pub fn forwarded_bearer(token: Option<&str>) -> Result<Option<AuthToken>, Metada
 
 pub(super) fn fanout_bearer(token: Option<&str>) -> Option<AuthToken> {
     token.and_then(|token| AuthToken::bearer(token).ok())
-}
-
-pub(super) fn metadata_node_call<C, T, F, Fut>(context: C, call: F) -> MetadataNodeCall<T>
-where
-    C: Clone + Send + Sync + 'static,
-    T: Send + 'static,
-    F: Fn(C, NodeId) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<T, MetadataReadError>> + Send + 'static,
-{
-    Arc::new(move |node_id| {
-        let context = context.clone();
-        call(context, node_id).boxed()
-    })
 }
