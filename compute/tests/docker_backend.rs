@@ -97,6 +97,7 @@ impl DockerTestExt for DockerBackend {
             output_paths: spec.output_paths.clone(),
             env: spec.env.clone(),
             secret_env: spec.secret_env.clone(),
+            vault_env: spec.vault_env.clone(),
             resources: spec.resources.clone(),
             workspace: spec.workspace.clone(),
             security: spec.security.clone(),

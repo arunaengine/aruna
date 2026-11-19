@@ -231,7 +231,9 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
 async fn capture_inputs(harness: &Harness, spec: &ExecutionSpec) -> Vec<CapturedInput> {
     let mut captured = Vec::with_capacity(spec.inputs.len());
     for input in &spec.inputs {
-        let InputSource::S3 { version_id, .. } = &input.source;
+        let InputSource::S3 { version_id, .. } = &input.source else {
+            panic!("the input names an object");
+        };
         let version = version_id
             .as_deref()
             .map(|version| Ulid::from_string(version).unwrap());

@@ -243,8 +243,8 @@ pub struct SubmitExecutionRequest {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Scheduling tags. `aruna-engine.org/label/<key>` demands a matching target
-    /// label, at most 16 of them. The workspace tags of that namespace are
-    /// reserved and refused. Defaults to empty.
+    /// label, at most 16 of them. The workspace tags of that namespace and every
+    /// `aruna-engine.org/plugin-` tag are reserved and refused. Defaults to empty.
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
     /// Absolute working directory inside the container, for example `/work`.

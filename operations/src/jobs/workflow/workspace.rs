@@ -48,7 +48,10 @@ pub(super) fn source_object(input: &InputSelection) -> Result<SourceObject, JobE
         bucket,
         key,
         version_id,
-    } = &input.source;
+    } = &input.source
+    else {
+        return Err(JobError::permanent("an inline input names no object"));
+    };
     ensure_confined_path(Path::new(key))
         .map_err(|error| JobError::permanent(format!("invalid input key: {error}")))?;
     let path = input

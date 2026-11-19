@@ -1169,6 +1169,33 @@ async fn device_checks_group() {
 }
 
 #[tokio::test]
+async fn refuses_plugin_tags() {
+    // Only the plugin host tags the jobs of plugin tasks; REST and MCP share this check.
+    let (_dir, state) = build_state().await;
+    let mut request = local_request();
+    request.target = None;
+    request.tags.insert(
+        "aruna-engine.org/plugin-install".to_string(),
+        Ulid::nil().to_string(),
+    );
+
+    let result = submit_job(
+        State(state),
+        Extension(auth_for(user(2))),
+        Extension(None),
+        Json(request),
+    )
+    .await;
+
+    match result {
+        Err(ServerError::BadRequestMessage(message)) => {
+            assert!(message.contains("reserved for plugin tasks"), "{message}");
+        }
+        other => panic!("expected a refusal, got {:?}", other.err()),
+    }
+}
+
+#[tokio::test]
 async fn local_refuses_stranger() {
     let (_dir, state) = build_state().await;
     enroll_device(&state, user(2)).await;

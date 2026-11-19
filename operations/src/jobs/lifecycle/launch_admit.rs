@@ -868,6 +868,10 @@ fn materialize_local(
 ) -> Result<JobRecord, LaunchDecline> {
     let mut payload = spec.payload.clone();
     for input in &mut payload.inputs {
+        // Inline bytes travel in the spec; nothing pins them.
+        if input.source.is_inline() {
+            continue;
+        }
         let Some(pin) = intent
             .inputs
             .iter()
@@ -875,8 +879,9 @@ fn materialize_local(
         else {
             return Err(LaunchDecline::Unauthorized);
         };
-        let InputSource::S3 { version_id, .. } = &mut input.source;
-        *version_id = Some(pin.version_id.to_string());
+        if let InputSource::S3 { version_id, .. } = &mut input.source {
+            *version_id = Some(pin.version_id.to_string());
+        }
         // The plan picked which holder the bytes come from; no source means the
         // target already holds the compliant copy.
         input.source_node_id = pin.source_node_id.or(Some(local));
@@ -1179,7 +1184,10 @@ mod tests {
         };
         let InputSource::S3 {
             version_id: pinned, ..
-        } = &payload.inputs[0].source;
+        } = &payload.inputs[0].source
+        else {
+            panic!("the input names an object");
+        };
         let expected_version = version_id.to_string();
         assert_eq!(pinned.as_deref(), Some(expected_version.as_str()));
         assert_eq!(payload.resources.cpu_cores, Some(spec.resources.cpu_cores));

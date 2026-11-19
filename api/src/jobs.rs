@@ -201,6 +201,11 @@ pub(crate) async fn admit_execution(
                 .map(|bearer| bearer.expires_at_secs().saturating_mul(1_000)),
         )
         .map_err(|error| JobRequestError::BadRequestMessage(error.to_string()))?;
+    if let Some(key) = aruna_core::structs::execution::job::plugin_tag(&command.tags) {
+        return Err(JobRequestError::BadRequestMessage(format!(
+            "tag `{key}` is reserved for plugin tasks"
+        )));
+    }
     let target = command.target.unwrap_or_default();
     let auth = match target {
         ExecutionTarget::Realm => {

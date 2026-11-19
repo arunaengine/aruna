@@ -229,6 +229,31 @@ fn input(key: &str, mode: InputMode, version: Option<&str>) -> InputSelection {
     }
 }
 
+#[test]
+fn inline_appends_variant() {
+    // Stored object inputs keep their encoding; inline bytes are a new variant after them.
+    let object = input("a", InputMode::ExactReference, Some("v"));
+    let encoded = postcard::to_allocvec(&object.source).unwrap();
+    assert_eq!(encoded[0], 0);
+    assert_eq!(
+        postcard::from_bytes::<InputSource>(&encoded).unwrap(),
+        object.source
+    );
+    let inline = InputSource::Inline {
+        bytes: b"x".to_vec(),
+    };
+    let encoded = postcard::to_allocvec(&inline).unwrap();
+    assert_eq!(encoded[0], 1);
+    assert_eq!(
+        postcard::from_bytes::<InputSource>(&encoded).unwrap(),
+        inline
+    );
+    // An inline input pins no version, so no input mode refuses it.
+    let mut pinned = object;
+    pinned.source = inline;
+    assert!(plan_composition(vec![pinned], CollisionPolicy::Reject).is_ok());
+}
+
 fn colliding() -> Vec<InputSelection> {
     let mut second = input("a", InputMode::Snapshot, None);
     second.source = InputSource::S3 {

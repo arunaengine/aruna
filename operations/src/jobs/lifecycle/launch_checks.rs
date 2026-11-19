@@ -15,7 +15,7 @@ use aruna_core::node_state::{
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::execution::job::{
-    CapturedInput, InputSource, LaunchIntent, LogicalJobSpec,
+    CapturedInput, InputSource, LaunchIntent, LogicalJobSpec, object_count,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -402,13 +402,15 @@ fn pinned_policies(
     intent: &LaunchIntent,
     local: NodeId,
 ) -> Result<(Vec<Vec<PlacementPolicyRef>>, Vec<PlacementPolicyRef>), LaunchDecline> {
-    let inputs_count = spec.payload.inputs.len();
-    if intent.inputs.len() != inputs_count || spec.captured_inputs.len() != inputs_count {
+    let objects = object_count(&spec.payload.inputs);
+    if intent.inputs.len() != objects || spec.captured_inputs.len() != objects {
         return Err(LaunchDecline::Unauthorized);
     }
     let mut inputs: Vec<Vec<PlacementPolicyRef>> = Vec::new();
     for input in &spec.payload.inputs {
-        let InputSource::S3 { version_id, .. } = &input.source;
+        let InputSource::S3 { version_id, .. } = &input.source else {
+            continue;
+        };
         let pin = intent
             .inputs
             .iter()

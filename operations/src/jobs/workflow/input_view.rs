@@ -493,8 +493,11 @@ pub fn creator(record: &JobRecord, realm_id: RealmId) -> AuthContext {
 }
 
 fn source_of(entry: &ViewEntry) -> (&str, &str) {
-    let InputSource::S3 { bucket, key, .. } = &entry.input.source;
-    (bucket, key)
+    match &entry.input.source {
+        InputSource::S3 { bucket, key, .. } => (bucket, key),
+        // An inline input has no captured input, so it is never a view entry.
+        InputSource::Inline { .. } => ("", ""),
+    }
 }
 
 fn source_error(error: SourceReadError) -> ViewError {

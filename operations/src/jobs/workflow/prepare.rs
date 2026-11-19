@@ -376,6 +376,7 @@ pub fn build_task_spec(
         workdir: spec.workdir.clone(),
         env,
         secret_env: secrets,
+        vault_env: BTreeMap::new(),
         resources,
         workspace,
         security: SecurityContext {

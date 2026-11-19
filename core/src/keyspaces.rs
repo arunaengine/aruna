@@ -468,6 +468,9 @@ pub const FAMILY_PENDING_KEYSPACE: &str = "job_family_pending";
 pub const FAMILY_CONFLICT_KEYSPACE: &str = "job_family_conflicts";
 /// Alias index: one accepted `JobId` to the request family that admitted it.
 pub const FAMILY_ALIAS_KEYSPACE: &str = "job_family_aliases";
+/// Closure rows of plugin task submissions this node answered as not admitted; admission reads
+/// them, so no admission of that submission commits here afterwards.
+pub const SUBMISSION_CLOSURE_KEYSPACE: &str = "job_submission_closures";
 /// Per-family projection cache and its bounded revision. Derived state only; it
 /// is rebuilt from the immutable records and is never authority.
 pub const FAMILY_PROJECTION_KEYSPACE: &str = "job_family_projections";
@@ -810,6 +813,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     FAMILY_PENDING_KEYSPACE,
     FAMILY_CONFLICT_KEYSPACE,
     FAMILY_ALIAS_KEYSPACE,
+    SUBMISSION_CLOSURE_KEYSPACE,
     FAMILY_PROJECTION_KEYSPACE,
     FAMILY_OUTBOX_KEYSPACE,
     JOB_RESERVATION_KEYSPACE,

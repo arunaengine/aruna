@@ -12,7 +12,7 @@ use aruna_core::scheduling::{
     ResolvedInput, TargetCandidate,
 };
 use aruna_core::structs::execution::job::{
-    CapturedInput, InputSource, LogicalJobSpec, WorkspaceMode,
+    CapturedInput, InputSource, LogicalJobSpec, WorkspaceMode, object_count,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -444,7 +444,7 @@ fn pinned_inputs(
     config: &RealmConfigDocument,
     spec: &LogicalJobSpec,
 ) -> Result<Vec<ResolvedInput>, PlanBuildError> {
-    if spec.captured_inputs.len() != spec.payload.inputs.len() {
+    if spec.captured_inputs.len() != object_count(&spec.payload.inputs) {
         return Err(PlanBuildError::Unavailable(
             "captured inputs are incomplete".to_string(),
         ));
@@ -455,7 +455,10 @@ fn pinned_inputs(
             bucket,
             key,
             version_id,
-        } = &input.source;
+        } = &input.source
+        else {
+            continue;
+        };
         let captured: &CapturedInput = spec
             .captured_inputs
             .iter()
