@@ -11,7 +11,6 @@ use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{
     Event, GroupEvent, GroupResult, MetadataAnswer, NetEvent, PeerRequestError,
 };
-use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, decode_answer, encode_message, metadata_request,
 };
@@ -233,36 +232,6 @@ impl std::fmt::Debug for PeerFrame {
             .field("frame_bytes", &self.0.len())
             .finish()
     }
-}
-
-/// The call that sends one encoded request to `peer`; [`peer_reply`] reads its answer.
-pub(crate) fn peer_call(peer: NodeId, frame: Vec<u8>, timeout: Duration) -> IoCall {
-    let request = metadata_request(peer, frame, timeout);
-    IoCall::Effect(Box::new(Effect::Net(NetEffect::MetadataRequest(Box::new(
-        request,
-    )))))
-}
-
-/// The decoded answer of `peer` to a [`peer_call`], or why there is none.
-pub(crate) fn peer_reply(
-    peer: NodeId,
-    result: IoResult,
-) -> Result<Result<MetadataTransportMessage, PeerRequestError>, IoError> {
-    let Event::Net(NetEvent::MetadataAnswer(answer)) = aruna_core::rows::event(result)? else {
-        return Err(IoError::Unexpected {
-            expected: "a peer answer",
-            got: "another event",
-        });
-    };
-    if answer.peer != peer {
-        return Ok(Err(PeerRequestError::Failed(MetadataError::Backend(
-            "the answer came from another peer".to_string(),
-        ))));
-    }
-    Ok(answer.result.and_then(|bytes| {
-        decode_answer(&bytes)
-            .map_err(|error| PeerRequestError::Failed(MetadataError::Backend(error)))
-    }))
 }
 
 /// One peer's answer, or why there is none.

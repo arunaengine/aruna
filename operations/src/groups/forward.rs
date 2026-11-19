@@ -7,7 +7,7 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{
     ForwardAuthError, ForwardedCallerOperation, forward_auth_error, write_check,
 };
-use crate::forward::fetch::{PeerFrame, peer_call, peer_reply};
+use crate::forward::fetch::PeerFrame;
 use crate::forward::transport::reject;
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
 use crate::realm::peer_trust::is_sync_eligible;
@@ -16,7 +16,9 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::events::PeerRequestError;
 use aruna_core::metadata::AuthToken;
-use aruna_core::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, WriteAuthError, peer_call, peer_reply,
+};
 use aruna_core::operation::Operation;
 use aruna_core::placement::selector::select_top_peers;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};

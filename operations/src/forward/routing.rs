@@ -2,11 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::fetch::{PeerFrame, peer_call, peer_reply};
+use super::fetch::PeerFrame;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::events::PeerRequestError;
-use aruna_core::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, WriteAuthError, peer_call, peer_reply,
+};
 use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
 use aruna_core::placement::resolve_shard_holders;

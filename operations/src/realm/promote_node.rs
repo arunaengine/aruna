@@ -20,11 +20,10 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use thiserror::Error;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::fetch::{peer_call, peer_reply};
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
 use crate::realm::mutate_placement::{is_management, node_kind};
 use aruna_core::metadata::protocol::{
-    MetadataReadError, MetadataTransportMessage, RealmKeyPem, encode_message,
+    MetadataReadError, MetadataTransportMessage, RealmKeyPem, encode_message, peer_call, peer_reply,
     transport_message_kind,
 };
 

@@ -6,14 +6,18 @@ use std::time::{Duration, SystemTime};
 
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
 use crate::audit::{AuditPageRequest, AuditPageResponse, MAX_PAGE_BYTES};
+use crate::calls::{IoCall, IoError, IoResult};
 use crate::document::DocumentTarget;
+use crate::effects::{Effect, NetEffect};
 use crate::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
 use crate::effects::{FrameShape, MetadataRequestEffect};
+use crate::events::{Event, NetEvent, PeerRequestError};
 use crate::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use crate::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataError, MetadataQueryResults, MetadataSearchHit,
     ProfileValidationFinding, ProfileValidationStatus,
 };
+use crate::rows::event;
 use crate::structs::execution::job::SubmissionId;
 use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
 use crate::structs::placement::policy::document::PlacementPolicyDocument;
@@ -1284,6 +1288,36 @@ pub fn transport_message_kind(message: &MetadataTransportMessage) -> &'static st
         MetadataTransportMessage::ForwardedGraphPending { .. } => "forwarded_graph_pending",
         MetadataTransportMessage::ExportAnswer { .. } => "export_answer",
     }
+}
+
+/// The call that sends one encoded request to `peer`; [`peer_reply`] reads its answer.
+pub fn peer_call(peer: NodeId, frame: Vec<u8>, timeout: Duration) -> IoCall {
+    let request = metadata_request(peer, frame, timeout);
+    IoCall::Effect(Box::new(Effect::Net(NetEffect::MetadataRequest(Box::new(
+        request,
+    )))))
+}
+
+/// The decoded answer of `peer` to a [`peer_call`], or why there is none.
+pub fn peer_reply(
+    peer: NodeId,
+    result: IoResult,
+) -> Result<Result<MetadataTransportMessage, PeerRequestError>, IoError> {
+    let Event::Net(NetEvent::MetadataAnswer(answer)) = event(result)? else {
+        return Err(IoError::Unexpected {
+            expected: "a peer answer",
+            got: "another event",
+        });
+    };
+    if answer.peer != peer {
+        return Ok(Err(PeerRequestError::Failed(MetadataError::Backend(
+            "the answer came from another peer".to_string(),
+        ))));
+    }
+    Ok(answer.result.and_then(|bytes| {
+        decode_answer(&bytes)
+            .map_err(|error| PeerRequestError::Failed(MetadataError::Backend(error)))
+    }))
 }
 
 #[cfg(test)]

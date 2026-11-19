@@ -31,11 +31,12 @@ use super::fanout_types::{
 use super::node_fanout::{FanoutParts, NodeCalls, NodeFanoutOperation};
 use super::read_types::MetadataQueryExecution;
 use super::{ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
-use crate::forward::fetch::{peer_call, peer_reply};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::query_cache::{RemoteKeyInput, credential_digest, remote_key};
-use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, encode_message, metadata_read_error, peer_call, peer_reply,
+};
 
 /// Where one partition query runs.
 #[derive(Clone, Debug, PartialEq)]

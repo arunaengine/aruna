@@ -20,7 +20,6 @@ use ulid::Ulid;
 
 use super::super::write::batch_refusal;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::fetch::{peer_call, peer_reply};
 use crate::forward::routing::{
     ForwardHoldersOperation, HolderWriteError, distinct_holders, holder_intersection,
 };
@@ -31,7 +30,9 @@ use crate::metadata::forward::replay::routed_record_matches;
 use crate::metadata::forward::write::{MetadataWriteError, unexpected_response};
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use crate::realm::load_config::config_unavailable;
-use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, encode_message, peer_call, peer_reply,
+};
 
 /// How long one holder may take to answer a forwarded device edit, which it merges and commits.
 const BATCH_FORWARD_TIMEOUT: Duration = Duration::from_secs(120);
