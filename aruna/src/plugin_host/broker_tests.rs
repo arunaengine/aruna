@@ -30,6 +30,7 @@ use aruna_operations::metadata::api::read_types::DocumentQueryRequest;
 use aruna_operations::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
 use aruna_operations::metadata::create_entry::CreateEntryOperation;
 use aruna_operations::plugins::host_calls::VisibleObjects;
+use aruna_operations::plugins::host_steps::GrantedCall;
 use aruna_operations::plugins::store::Txn;
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::queued;
@@ -172,18 +173,10 @@ async fn object_calls() {
     let refused = broker.objects_info(&cx(), &path, pinned).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::NotGranted);
     let meta = format!("/{}/g/{}/meta/x", fixture.actor.realm_id, fixture.group_id);
-    assert!(
-        broker
-            .checked(Permission::MetadataRead, &meta)
-            .await
-            .is_ok()
-    );
-    assert!(
-        broker
-            .checked(Permission::ObjectsRead, &path)
-            .await
-            .is_err()
-    );
+    let meta_read = GrantedCall::target(&broker.scope, Permission::MetadataRead, &meta);
+    assert!(drive(meta_read, &broker.ctx).await.is_ok());
+    let object_read = GrantedCall::target(&broker.scope, Permission::ObjectsRead, &path);
+    assert!(drive(object_read, &broker.ctx).await.is_err());
 
     // With `read` on the whole group, objects of other nodes and buckets outside it are refused.
     let reads = serde_json::json!({ "permissions": { "required": ["objects.read"] } });
