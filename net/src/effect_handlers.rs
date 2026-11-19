@@ -12,7 +12,7 @@ use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
     DhtEntry, DhtEvent, ExecutionSignEvent, JobControlEvent, MetadataAnswer, NetEvent,
-    PeerAuthRefusal, PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
+    PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::metadata::MetadataError;
@@ -274,11 +274,7 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
             "artifact copies must be dispatched by the operations runner".to_string(),
         )),
-        // Token validation state lives in the metadata handle the runner holds.
-        NetEffect::WritePeerAuth(_) => NetEvent::WritePeerAuth(Err(PeerAuthRefusal::Unavailable(
-            "peer authorization must be dispatched by the operations runner".to_string(),
-        ))),
-        // Peer contacts live in the metadata handle the runner holds.
+        // Peer contacts live on the net handle the runner holds.
         NetEffect::PeerContact(_) => NetEvent::PeerContact,
         // The routed export reads through the handles the runner holds.
         NetEffect::DatasetSummary(_) => {
@@ -319,9 +315,6 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::MissingTopicPeers { .. } => NetEvent::MissingTopicPeers(Err(
             "topic members must be read by the operations runner".to_string(),
         )),
-        NetEffect::RevocationClaims(_) => NetEvent::RevocationClaims(Err(
-            "token checks must be dispatched by the operations runner".to_string(),
-        )),
         NetEffect::Notification(_) => NetEvent::Notification(Err(
             "notification requests must be dispatched by the operations runner".to_string(),
         )),
@@ -331,6 +324,7 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         | NetEffect::DashboardChanged
         | NetEffect::RecordSuppression(_)
         | NetEffect::LocalNode
+        | NetEffect::LocalRealm
         | NetEffect::WatchHolders { .. }
         | NetEffect::RegisterInterest { .. }
         | NetEffect::RetractInterest(_)
@@ -683,7 +677,6 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::GrantedRead(_) => "granted_read",
         NetEffect::DelegatedRead(_) => "delegated_read",
         NetEffect::DatasetSummary(_) => "dataset_summary",
-        NetEffect::WritePeerAuth(_) => "write_peer_auth",
         NetEffect::PeerContact(_) => "peer_contact",
         NetEffect::GrantSign(_) => "grant_sign",
         NetEffect::DelegationSign(_) => "delegation_sign",
@@ -694,7 +687,6 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::AllowTopicPeers { .. } => "allow_topic_peers",
         NetEffect::SyncTopic { .. } => "sync_topic",
         NetEffect::MissingTopicPeers { .. } => "missing_topic_peers",
-        NetEffect::RevocationClaims(_) => "revocation_claims",
         NetEffect::Notification(_) => "notification",
         NetEffect::WakeInbox(_) => "wake_inbox",
         NetEffect::Heartbeat(_) => "heartbeat",
@@ -702,6 +694,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::DashboardChanged => "dashboard_changed",
         NetEffect::RecordSuppression(_) => "record_suppression",
         NetEffect::LocalNode => "local_node",
+        NetEffect::LocalRealm => "local_realm",
         NetEffect::WatchHolders { .. } => "watch_holders",
         NetEffect::RegisterInterest { .. } => "register_interest",
         NetEffect::RetractInterest(_) => "retract_interest",

@@ -21,14 +21,12 @@ use aruna_net::NetHandle;
 use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
 
-use crate::auth::bearer_token::{
-    DecodeTokenOperation, IssuerKeyCache, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
-};
+use crate::auth::bearer_token::{DecodeTokenOperation, IssuerKeyCache, TokenChecks, claims_auth};
 use crate::auth::error::ArunaBearerError;
 use crate::driver::{DriverContext, drive};
+use crate::metadata::write_peer::forwarded_checks;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::auth::TokenClaims;
 
 mod effects;
 mod forward_serve;
@@ -129,12 +127,6 @@ pub struct MetadataHandle {
 }
 
 #[derive(Debug)]
-pub(crate) enum WritePeerError {
-    Unauthorized,
-    Unavailable(MetadataError),
-}
-
-#[derive(Debug)]
 pub(crate) struct MetadataRequestError {
     delivery: MetadataRequestDelivery,
     error: MetadataError,
@@ -204,24 +196,14 @@ impl AuthValidationState {
     }
 
     /// Verifies `token`. Without realm state this node holds no revocation authority at all;
-    /// once it has any, the token's own issuing realm answers, unless `blind` skips revocation.
-    async fn decode(&self, token: &str, blind: bool) -> Result<TokenClaims, ArunaBearerError> {
-        let revocation = match (blind, self.realm_id) {
-            (false, Some(_)) => RevocationCheck::Realm,
-            _ => RevocationCheck::Skipped,
-        };
+    /// once it has any, the token's own issuing realm answers.
+    async fn validate(&self, token: &str) -> Result<AuthContext, ArunaBearerError> {
         let checks = TokenChecks {
-            trust: IssuerTrust::Stored,
-            revocation,
-            linked_realm: self.realm_id,
             keys: Some(self.issuer_keys.clone()),
+            ..forwarded_checks(self.realm_id, false)
         };
         let context = DriverContext::storage_only(self.storage_handle.clone());
-        drive(DecodeTokenOperation::new(token, checks), &context).await
-    }
-
-    async fn validate(&self, token: &str) -> Result<AuthContext, ArunaBearerError> {
-        claims_auth(self.decode(token, false).await?)
+        claims_auth(drive(DecodeTokenOperation::new(token, checks), &context).await?)
     }
 }
 

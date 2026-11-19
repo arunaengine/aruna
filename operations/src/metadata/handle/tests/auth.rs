@@ -2,8 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::WritePeerError;
-use super::super::peer_auth::{authorize_peer, remote_auth_context, replay_authority};
+use super::super::peer_auth::{authorize_peer, remote_auth_context};
 use super::*;
 use crate::testing::sign_token;
 use aruna_core::auth::REALMS_LIST_KEY;
@@ -230,21 +229,25 @@ async fn revocation_blind_decode() {
     let (_dir, storage) = auth_storage();
     persist_auth_state(&storage, REALMS_LIST_KEY, &HashSet::from([realm_id])).await;
     persist_revoked_config(&storage, realm_id, &token).await;
-    let state = AuthValidationState::new(storage, Some(realm_id));
+    let state = AuthValidationState::new(storage.clone(), Some(realm_id));
 
     assert!(matches!(
         state.validate(&token).await,
         Err(ArunaBearerError::TokenRevoked)
     ));
-    let claims = state
-        .decode(&token, true)
+    let blind = |storage: &StorageHandle| {
+        let checks = crate::metadata::write_peer::forwarded_checks(Some(realm_id), true);
+        let context = DriverContext::storage_only(storage.clone());
+        let decode = crate::auth::bearer_token::DecodeTokenOperation::new(&token, checks);
+        async move { crate::driver::drive(decode, &context).await }
+    };
+    let claims = blind(&storage)
         .await
         .expect("revoked token still decodes for revocation");
     assert_eq!(claims.sub, user_id.to_string());
 
     let (_untrusted_dir, untrusted_storage) = auth_storage();
-    let untrusted = AuthValidationState::new(untrusted_storage, Some(realm_id));
-    assert!(untrusted.decode(&token, true).await.is_err());
+    assert!(blind(&untrusted_storage).await.is_err());
 }
 
 #[tokio::test]
@@ -424,42 +427,4 @@ async fn auth_allows_missing() {
             .expect("missing token is anonymous"),
         None
     );
-}
-
-// A replay older than the owner's token cutoff is refused; a newer one keeps its authority.
-#[tokio::test]
-async fn replay_respects_cutoff() {
-    let realm_id = RealmId([21; 32]);
-    let user_id = UserId::new(Ulid::from_bytes([22; 16]), realm_id);
-    let cutoff = aruna_core::time::unix_timestamp_secs() - 60;
-    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-    config.revoked_tokens.push(TokenRevocation {
-        token_hash: aruna_core::auth::user_cutoff_hash(&user_id),
-        expires_at: aruna_core::auth::user_cutoff_expiry(cutoff),
-    });
-    let (_dir, storage) = auth_storage();
-    write_realm_config(&storage, realm_id, &config).await;
-    let auth = AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    let replay = |issued: u64, authored_ms: u64| AuthToken::Replay {
-        auth: auth.clone(),
-        issued_at: issued,
-        authored_at_ms: authored_ms,
-    };
-
-    let fresh = replay_authority(&storage, replay(cutoff, (cutoff + 5) * 1000)).await;
-    assert!(matches!(fresh, Ok(AuthToken::Internal(ref kept)) if *kept == auth));
-    assert!(matches!(
-        replay_authority(&storage, replay(cutoff - 1, (cutoff + 5) * 1000)).await,
-        Err(WritePeerError::Unauthorized)
-    ));
-    // An authoring time before the cutoff is as old as the replay gets.
-    assert!(matches!(
-        replay_authority(&storage, replay(cutoff, (cutoff - 1) * 1000)).await,
-        Err(WritePeerError::Unauthorized)
-    ));
 }
