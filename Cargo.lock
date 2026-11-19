@@ -331,6 +331,7 @@ dependencies = [
  "aruna-net",
  "aruna-operations",
  "aruna-outbound",
+ "aruna-plugin-types",
  "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
@@ -520,6 +521,7 @@ name = "aruna-cli"
 version = "3.0.0-alpha.207"
 dependencies = [
  "apple-native-keyring-store",
+ "aruna-plugin-types",
  "aruna-plugins",
  "aruna-wire",
  "aws-sdk-s3",
@@ -812,11 +814,10 @@ dependencies = [
  "aruna-net",
  "aruna-operations",
  "aruna-outbound",
- "aruna-plugins",
+ "aruna-plugin-types",
  "aruna-storage",
  "aruna-tasks",
  "astral_async_zip",
- "async-compression",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -833,13 +834,11 @@ dependencies = [
  "futures-util",
  "globset",
  "hex",
- "http",
  "iroh",
  "irokle",
  "jsonwebtoken",
  "lru",
  "md5",
- "opentelemetry",
  "oxrdf",
  "oxttl",
  "percent-encoding",
@@ -860,10 +859,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-opentelemetry",
  "tracing-subscriber",
  "ulid 3.0.0",
- "unicode-normalization",
  "url",
  "zip",
 ]
@@ -906,18 +903,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-plugin-types"
+version = "3.0.0-alpha.207"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
+ "toml 1.1.8+spec-1.1.0",
+ "url",
+ "wasm-encoder 0.258.3",
+ "wasmparser 0.258.3",
+]
+
+[[package]]
 name = "aruna-plugins"
 version = "3.0.0-alpha.207"
 dependencies = [
+ "aruna-plugin-types",
  "async-trait",
  "bytes",
  "getrandom 0.4.3",
- "hex",
  "lru",
  "rustix",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3475,6 +3486,7 @@ name = "elabftw-sync"
 version = "0.1.0"
 dependencies = [
  "aruna-plugin",
+ "aruna-plugin-types",
  "aruna-plugins",
  "async-trait",
  "hex",

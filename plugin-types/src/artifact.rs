@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn checks_artifacts() {
-        let fixture = include_bytes!("../tests/fixture.wasm");
+        let fixture = include_bytes!("../../plugins/tests/fixture.wasm");
         assert_eq!(check_artifact(fixture).unwrap().name, "fixture");
         assert!(check_artifact(&fixture[..fixture.len() / 2]).is_err());
         assert!(check_artifact(b"not wasm").is_err());
