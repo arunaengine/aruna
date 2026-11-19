@@ -44,7 +44,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::node_state::DrainStateOperation;
 use aruna_core::node_state::SetDrainOperation;
-use aruna_core::placement::{build_view, held_buckets};
+use aruna_core::placement::held_buckets;
+use aruna_core::placement::resolver::build_view;
 use aruna_core::storage_entries::metadata_registry_key;
 use aruna_core::structs::execution::job::record_keys::kind_prefix;
 use aruna_core::structs::execution::job::record_rows::ProjectionCache;

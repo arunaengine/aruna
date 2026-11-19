@@ -8,10 +8,11 @@ use std::collections::BTreeMap;
 use aruna_core::compute::{ExecutionTargetId, ExecutorCapability, NetworkAccess, StagingMode};
 use aruna_core::id::NodeId;
 use aruna_core::job_request;
-use aruna_core::scheduling::{
-    ExecutionPlan, InputHolder, MAX_INPUT_HOLDERS, MAX_TARGET_SCAN, PlanRequest, Planner,
-    ResolvedInput, TargetCandidate,
+use aruna_core::scheduling::ExecutionPlan;
+use aruna_core::scheduling::inputs::{
+    InputHolder, MAX_INPUT_HOLDERS, MAX_TARGET_SCAN, PlanRequest, ResolvedInput, TargetCandidate,
 };
+use aruna_core::scheduling::scan::Planner;
 use aruna_core::structs::execution::job::{
     CapturedInput, InputSource, LogicalJobSpec, WorkspaceMode,
 };
@@ -57,7 +58,7 @@ pub enum PlanBuildError {
     #[error("planning inputs are unavailable: {0}")]
     Unavailable(String),
     #[error(transparent)]
-    Plan(#[from] aruna_core::scheduling::PlanError),
+    Plan(#[from] aruna_core::scheduling::inputs::PlanError),
     #[error(transparent)]
     Request(#[from] job_request::RequestError),
 }

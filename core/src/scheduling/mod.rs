@@ -2,22 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod cost;
-mod digest;
-mod eligibility;
-mod inputs;
+pub mod cost;
+pub mod digest;
+pub mod eligibility;
+pub mod inputs;
 mod rank;
-mod scan;
+pub mod scan;
 
-pub use cost::{InputRoute, UNKNOWN_PERMILLE};
-pub use digest::{PLAN_DIGEST_DOMAIN, plan_digest};
-pub use eligibility::{PolicyVerdict, RejectionVerdict};
-pub use inputs::{
-    InputHolder, MAX_INPUT_HOLDERS, MAX_PLAN_ALTERNATIVES, MAX_PLAN_CANDIDATES,
-    MAX_PLAN_REJECTIONS, MAX_TARGET_SCAN, PlanError, PlanRequest, ResolvedInput, TargetCandidate,
-    TargetScore,
-};
-pub use scan::Planner;
+use cost::InputRoute;
+use eligibility::RejectionVerdict;
+use inputs::{MAX_TARGET_SCAN, PlanError, PlanRequest, TargetCandidate, TargetScore};
+use scan::Planner;
 
 use crate::compute::ExecutionTargetId;
 use crate::structs::placement::compute_config::RealmComputeConfig;

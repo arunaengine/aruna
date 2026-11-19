@@ -30,11 +30,11 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::api::CreateDocumentPayload;
-use aruna_core::placement::transition::{TransitionRequest, plan_transition};
-use aruna_core::placement::{
-    PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
-    resolve_shard_holders, strategy_for_target,
+use aruna_core::placement::resolver::{
+    PlacementResolutionContext, meta_bucket_subject, strategy_for_target,
 };
+use aruna_core::placement::transition::{TransitionRequest, plan_transition};
+use aruna_core::placement::{bucket_membership, choose_origin_bucket, resolve_shard_holders};
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, TokenClaims};

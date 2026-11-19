@@ -233,7 +233,7 @@ fn maps_submit_errors() {
     use aruna_core::compute::quota::{QuotaDenied, QuotaDimension, QuotaScope};
     use aruna_core::job_request::SubmitJobError;
     use aruna_core::structs::execution::job::CompositionError;
-    use aruna_core::structured_id::ClockHealthError;
+    use aruna_core::structured_id::clock_health::ClockHealthError;
 
     let cases = [
         (

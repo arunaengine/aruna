@@ -18,8 +18,9 @@ use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataEffect, MetadataEventPayload, MetadataEventRecord,
 };
-use aruna_core::placement::{
-    PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
+use aruna_core::placement::choose_origin_bucket;
+use aruna_core::placement::resolver::{
+    PlacementResolutionContext, strategy_for_target, subject_bytes,
 };
 use aruna_core::storage_entries::{
     create_event_entry, create_projection_entries, event_log_prefix, graph_lifecycle_entry,

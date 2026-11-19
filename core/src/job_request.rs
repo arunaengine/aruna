@@ -18,9 +18,8 @@ use crate::structs::execution::job::{
 };
 use crate::structs::placement::policy::{MAX_SELECTOR_LABELS, PlacementPolicyRef};
 use crate::structs::placement::record::{LabelMatch, shard_for_subject};
-use crate::structured_id::{
-    BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredId,
-};
+use crate::structured_id::clock_health::ClockHealthError;
+use crate::structured_id::{BucketId, JobId as RoutableJobId, PlacementHandle, StructuredId};
 use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

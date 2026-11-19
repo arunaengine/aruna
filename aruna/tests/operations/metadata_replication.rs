@@ -25,10 +25,10 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataBatchSource, MetadataDeleteRecord, MetadataEffect, MetadataEvent,
     MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
 };
-use aruna_core::placement::{
-    PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
-    strategy_for_target, subject_bytes,
+use aruna_core::placement::resolver::{
+    PlacementResolutionContext, strategy_for_target, subject_bytes,
 };
+use aruna_core::placement::{choose_origin_bucket, held_buckets, resolve_shard_holders};
 use aruna_core::storage_entries::{
     create_event_entry, event_log_key, lifecycle_revision_change, metadata_registry_key,
 };

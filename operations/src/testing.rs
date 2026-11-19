@@ -5,7 +5,8 @@
 use aruna_core::id_mint::IdMint;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structured_id::{BucketId, ClockHealthError, PlacementHandle};
+use aruna_core::structured_id::clock_health::ClockHealthError;
+use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::time::unix_timestamp_millis;
 
 /// A fresh job id for `(handle, bucket)` at the current time, as a submit would mint it.

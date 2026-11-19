@@ -15,7 +15,8 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::PLAN_EXPLAIN_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
+use aruna_core::scheduling::ExecutionPlan;
+use aruna_core::scheduling::inputs::MAX_PLAN_CANDIDATES;
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 use aruna_core::structs::execution::job::{
     ExecutionClaim, JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,

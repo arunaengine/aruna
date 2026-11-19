@@ -22,9 +22,9 @@ use ulid::Ulid;
 
 use crate::placement::selector::{ROLE_SHARD, rank_weighted};
 
-pub use resolver::{
-    PlacementResolutionContext, PlacementView, ResolvedNode, build_view, document_class,
-    meta_bucket_subject, resolve_holders, strategy_for_target, subject_bytes, view_from_map,
+use resolver::{
+    PlacementResolutionContext, PlacementView, build_view, resolve_holders, strategy_for_target,
+    subject_bytes, view_from_map,
 };
 
 /// Canonical rendezvous subject for a shard's holder resolution:

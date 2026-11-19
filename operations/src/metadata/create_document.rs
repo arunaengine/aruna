@@ -33,9 +33,8 @@ use aruna_core::structs::placement::record::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
-use aruna_core::structured_id::{
-    BucketId, ClockHealthError, MetaResourceId, PlacementHandle, StructuredId,
-};
+use aruna_core::structured_id::clock_health::ClockHealthError;
+use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
@@ -46,10 +45,10 @@ use crate::metadata::profile::rules::{
     submission_profile_tag,
 };
 use crate::sync::shard_placement::sort_node_ids;
-use aruna_core::placement::{
-    PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
-    resolve_shard_holders, strategy_for_target,
+use aruna_core::placement::resolver::{
+    PlacementResolutionContext, meta_bucket_subject, strategy_for_target,
 };
+use aruna_core::placement::{choose_origin_bucket, holds_placement, resolve_shard_holders};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::storage_entries::create_projection_entries;
 
@@ -126,7 +125,7 @@ pub enum CreateDocumentError {
     PlacementBinding(#[from] BindingError),
     /// The structured-id generator refused to mint under a clock-health fault.
     #[error(transparent)]
-    ClockHealth(#[from] aruna_core::structured_id::ClockHealthError),
+    ClockHealth(#[from] aruna_core::structured_id::clock_health::ClockHealthError),
     #[error("metadata raw update budget exceeded")]
     RawLimit,
     #[error("topic announcement failed: {0}")]

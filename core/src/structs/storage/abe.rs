@@ -416,9 +416,6 @@ impl EnvelopeArchive {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-pub use getrandom::SysRng;
-
 #[derive(Debug, PartialEq)]
 pub enum AbeEffect {
     Issue(super::abe_access::GrantContext),
