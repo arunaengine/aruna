@@ -1234,8 +1234,14 @@ mod pure_tests {
             placement: PlacementRef::NIL,
         };
         let previous = Some(postcard::to_allocvec(&previous_revision).unwrap().into());
-        let (_, turn) = read_user(request, &stored_user(user_id), vec![None, previous, None]);
-        let writes = writes(turn);
+        // The run's stamp is the revision's time and, above the previous one, its generation.
+        let mut operation = write(request);
+        operation.stamp(5_000);
+        operation.first().unwrap();
+        let owner = actor(realm_id, user_id);
+        let stored = stored_user(user_id).to_bytes(&owner).unwrap().into();
+        let rows = vec![Some(stored), None, previous, None];
+        let writes = writes(operation.next(IoResult::Values(rows)));
         let updated = User::from_bytes(row(&writes, USER_KEYSPACE)).unwrap();
         assert_eq!(updated.name, "Alice Updated");
 
@@ -1253,7 +1259,8 @@ mod pure_tests {
         assert_eq!(revision.base, Some(previous_revision.current));
         assert_eq!(revision.current.actor, expected_actor.node_id);
         assert!(revision.current.generation > previous_revision.current.generation);
-        assert!(revision.current.updated_at_ms > 0);
+        assert_eq!(revision.current.generation, 5_000);
+        assert_eq!(revision.current.updated_at_ms, 5_000);
         assert_eq!(revision.kind, DocumentChangeKind::Upsert);
     }
 

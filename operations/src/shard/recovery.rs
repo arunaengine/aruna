@@ -533,10 +533,11 @@ mod tests {
         assert_eq!(status.snapshot().state, RecoveryState::Pending);
         assert_eq!(status.snapshot().last_progress_timestamp, 0);
 
+        // The snapshot shows unix seconds of the stamped milliseconds.
         status.begin_pass(1_000);
         let started = status.snapshot();
         assert_eq!(started.state, RecoveryState::Running);
-        assert_eq!(started.last_progress_timestamp, 1_000);
+        assert_eq!(started.last_progress_timestamp, 1);
 
         status.set_remaining(5);
         let unchanged = status.snapshot();
@@ -549,7 +550,7 @@ mod tests {
         status.note_progress(4, 2_000);
         let snapshot = status.snapshot();
         assert_eq!(snapshot.topics_remaining, 4);
-        assert_eq!(snapshot.last_progress_timestamp, 2_000);
+        assert_eq!(snapshot.last_progress_timestamp, 2);
 
         status.finish_pass(
             RecoveryOutcome::Partial,

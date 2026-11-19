@@ -588,6 +588,8 @@ mod tests {
             create_new: false,
         });
         let document_target = DocumentTarget::User { user_id };
+        // The run's stamp is the first revision's time and generation.
+        operation.stamp(5_000);
 
         let writes = write_call(answer_subject(&mut operation, None));
         assert_eq!(writes.len(), 7);
@@ -610,8 +612,8 @@ mod tests {
         assert_eq!(revision_key, &sync_revision_key(&document_target));
         assert_eq!(revision.base, None);
         assert_eq!(revision.current.actor, actor.node_id);
-        assert!(revision.current.generation > 0);
-        assert!(revision.current.updated_at_ms > 0);
+        assert_eq!(revision.current.generation, 5_000);
+        assert_eq!(revision.current.updated_at_ms, 5_000);
         assert_eq!(revision.kind, DocumentChangeKind::Upsert);
     }
 

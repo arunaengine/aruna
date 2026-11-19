@@ -124,9 +124,12 @@ fn ended(step: Step) -> Result<(RewriteOutcome, Vec<IoCall>), RewriteError> {
     }
 }
 
+/// The rewrite of one version, seeded as the runner would, so the ids it mints are not nil.
 fn operation(transition: EncryptionTransition) -> RewriteVersionOperation {
     let key = VersionKey::new("b", "k", Ulid::from_bytes([2; 16]));
-    RewriteVersionOperation::new(key, transition, SystemTime::UNIX_EPOCH)
+    let mut operation = RewriteVersionOperation::new(key, transition, SystemTime::UNIX_EPOCH);
+    operation.seed(7);
+    operation
 }
 
 fn lease(old: &BackendLocation) -> ReadLease {

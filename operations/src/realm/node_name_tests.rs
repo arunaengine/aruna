@@ -83,6 +83,9 @@ fn drive_write(
         ));
     }
     let mut write = operation.write();
+    // Each write after the stored state runs with other entropy, as the runner gives it, so its
+    // event ids differ from the stored ones.
+    write.seed((stored.map_or(0, |state| state.applied_event_ids.len()) as u128 + 1) << 32);
     assert_eq!(write.transaction(), TransactionMode::Write);
     assert!(matches!(write.first(), Ok(Next::Call(IoCall::Read(_)))));
     let state = stored.map(|state| postcard::to_allocvec(state).unwrap().into());
