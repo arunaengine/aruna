@@ -85,12 +85,3 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 zip = { workspace = true }
-
-[[test]]
-name = "integration"
-path = "tests/main.rs"
-
-# Prints workload rates on request (cargo run --release --example measure); never a test.
-[[example]]
-name = "measure"
-test = false

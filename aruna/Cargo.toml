@@ -77,6 +77,16 @@ rustix = { workspace = true }
 
 [dev-dependencies]
 aruna-cli = { workspace = true }
+aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
+async_zip = { workspace = true }
+bytes = { workspace = true }
+craqle = { workspace = true }
+oxrdf = { workspace = true }
+percent-encoding = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+url = { workspace = true }
+zip = { workspace = true }
 aruna-operations = { workspace = true, features = ["test-hooks"] }
 keyring-core = { workspace = true }
 aruna-kpabe = { workspace = true }
@@ -94,3 +104,12 @@ tempfile = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+[[test]]
+name = "operations"
+path = "tests/operations/main.rs"
+
+# Prints workload rates on request (cargo run --release --example measure); never a test.
+[[example]]
+name = "measure"
+test = false

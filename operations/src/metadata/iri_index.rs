@@ -630,7 +630,7 @@ enum RebuildStage {
 /// the registry a page at a time so its size never bounds the rebuild. Answers how many
 /// postings it wrote.
 #[derive(Debug, PartialEq, Default)]
-pub(crate) struct RebuildIrisOperation {
+pub struct RebuildIrisOperation {
     next: Option<Key>,
     current: VecDeque<MetadataRegistryRecord>,
     written: usize,
@@ -638,7 +638,7 @@ pub(crate) struct RebuildIrisOperation {
 }
 
 impl RebuildIrisOperation {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 

@@ -32,11 +32,11 @@ use super::store::store_call::StoreCall;
 
 const WRITE_MAX_ATTEMPTS: u32 = 5;
 /// How long a deferred job waits before it may run again.
-pub(crate) const RETRY_AFTER_MS: u64 = 1_000;
+pub const RETRY_AFTER_MS: u64 = 1_000;
 
 /// The terminal state one write gives a job.
 #[derive(Debug, PartialEq)]
-pub(crate) enum TerminalWrite {
+pub enum TerminalWrite {
     Complete {
         result: JobResultPayload,
         progress: JobProgress,
@@ -50,7 +50,7 @@ pub(crate) enum TerminalWrite {
 /// a storage error would otherwise leave it `Running` until the sweep runs it again. Token and
 /// transition races are legitimate and end the write at once.
 #[derive(Debug, PartialEq)]
-pub(crate) struct TerminalWriteOperation {
+pub struct TerminalWriteOperation {
     job_id: JobId,
     token: Ulid,
     write: TerminalWrite,
@@ -60,7 +60,7 @@ pub(crate) struct TerminalWriteOperation {
 }
 
 impl TerminalWriteOperation {
-    pub(crate) fn new(job_id: JobId, token: Ulid, write: TerminalWrite, now_ms: u64) -> Self {
+    pub fn new(job_id: JobId, token: Ulid, write: TerminalWrite, now_ms: u64) -> Self {
         Self {
             job_id,
             token,
@@ -112,7 +112,7 @@ impl Operation for TerminalWriteOperation {
 }
 
 /// Logs how a terminal write ended; a lost race leaves the winner's state.
-pub(crate) fn log_terminal(result: &Result<JobRecord, JobMutationError>, job_id: JobId) {
+pub fn log_terminal(result: &Result<JobRecord, JobMutationError>, job_id: JobId) {
     match result {
         Ok(_) => {}
         Err(JobMutationError::TokenMismatch) => {
@@ -126,7 +126,7 @@ pub(crate) fn log_terminal(result: &Result<JobRecord, JobMutationError>, job_id:
 }
 
 /// A transient failure after a durable checkpoint advanced spends no attempt of a long job.
-pub(crate) fn requeue_call(
+pub fn requeue_call(
     job_id: JobId,
     token: Ulid,
     now_ms: u64,
@@ -151,7 +151,7 @@ enum KeyStep {
 /// Parks a job that needs locked keys, then wakes it for any key unlocked meanwhile. The output
 /// says whether the job was cancelled, so its cleanup handler is due.
 #[derive(Debug, PartialEq)]
-pub(crate) struct AwaitKeysOperation {
+pub struct AwaitKeysOperation {
     job_id: JobId,
     token: Ulid,
     waits: Vec<KeyWait>,
@@ -161,7 +161,7 @@ pub(crate) struct AwaitKeysOperation {
 }
 
 impl AwaitKeysOperation {
-    pub(crate) fn new(job_id: JobId, token: Ulid, waits: Vec<KeyWait>, now_ms: u64) -> Self {
+    pub fn new(job_id: JobId, token: Ulid, waits: Vec<KeyWait>, now_ms: u64) -> Self {
         Self {
             job_id,
             token,
@@ -268,7 +268,7 @@ enum SettleStep {
 /// Writes what a finished run of an in-process job leaves behind. The output says whether the
 /// job's cleanup handler is due, which the caller runs.
 #[derive(Debug, PartialEq)]
-pub(crate) struct SettleRunOperation {
+pub struct SettleRunOperation {
     job_id: JobId,
     token: Ulid,
     outcome: Option<JobRunOutcome>,
@@ -281,7 +281,7 @@ pub(crate) struct SettleRunOperation {
 impl SettleRunOperation {
     /// `now_ms` is read after the payload ran, so finish time, backoff and retention reflect
     /// its completion and not its start.
-    pub(crate) fn new(
+    pub fn new(
         (job_id, token): (JobId, Ulid),
         outcome: JobRunOutcome,
         (progress, checkpointed): (JobProgress, bool),
@@ -404,12 +404,12 @@ impl Operation for SettleRunOperation {
 
 /// Reads one page of the jobs that hold a lease: their ids and the key to continue after.
 #[derive(Debug, PartialEq)]
-pub(crate) struct LeasePageOperation {
+pub struct LeasePageOperation {
     after: Option<Key>,
 }
 
 impl LeasePageOperation {
-    pub(crate) fn new(after: Option<Key>) -> Self {
+    pub fn new(after: Option<Key>) -> Self {
         Self { after }
     }
 }
@@ -439,7 +439,7 @@ impl Operation for LeasePageOperation {
 
 /// What a restart did with one job it found holding a lease.
 #[derive(Debug, PartialEq)]
-pub(crate) enum Recovery {
+pub enum Recovery {
     Recovered,
     Untouched,
     /// A submitted external attempt: only the reconciler may decide about it.
@@ -456,14 +456,14 @@ enum RecoverStep {
 /// At startup every holder of a lease is dead. An in-process job goes back to the queue; a
 /// blind requeue of an external attempt would run it twice, so it goes to the reconciler.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RecoverJobOperation {
+pub struct RecoverJobOperation {
     job_id: JobId,
     now_ms: u64,
     step: RecoverStep,
 }
 
 impl RecoverJobOperation {
-    pub(crate) fn new(job_id: JobId, now_ms: u64) -> Self {
+    pub fn new(job_id: JobId, now_ms: u64) -> Self {
         Self {
             job_id,
             now_ms,

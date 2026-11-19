@@ -53,15 +53,15 @@ pub struct JobShutdownReport {
 }
 
 /// The slot of one admitted run.
-pub(crate) struct RunSlot {
-    pub(crate) nonce: u64,
-    pub(crate) claim_token: ulid::Ulid,
-    pub(crate) cancel: CancellationToken,
-    pub(crate) progress: Option<ProgressReporter>,
+pub struct RunSlot {
+    pub nonce: u64,
+    pub claim_token: ulid::Ulid,
+    pub cancel: CancellationToken,
+    pub progress: Option<ProgressReporter>,
 }
 
 /// What the registry did with a claimed job.
-pub(crate) enum Admission {
+pub enum Admission {
     Run(RunSlot),
     /// A shutdown began, so the claim is being released.
     Draining,
@@ -69,7 +69,7 @@ pub(crate) enum Admission {
 }
 
 /// What the registry did with an adopted external attempt.
-pub(crate) enum RecoveredAdmission {
+pub enum RecoveredAdmission {
     Run {
         nonce: u64,
         cancel: CancellationToken,
@@ -82,7 +82,7 @@ pub(crate) enum RecoveredAdmission {
 }
 
 /// One running job a shutdown waits for.
-pub(crate) type RunWaiter = (JobId, JobExecutionClass, ulid::Ulid, watch::Receiver<bool>);
+pub type RunWaiter = (JobId, JobExecutionClass, ulid::Ulid, watch::Receiver<bool>);
 
 /// Registry of locally executing jobs, their cancellation tokens, and per-class caps.
 pub struct JobsRuntime {
@@ -165,7 +165,7 @@ impl JobsRuntime {
             .clone()
     }
 
-    pub(crate) fn set_reconciler(&self, reconciler: Arc<dyn ExternalReconciler>) {
+    pub fn set_reconciler(&self, reconciler: Arc<dyn ExternalReconciler>) {
         *self.reconciler.lock().expect("reconciler mutex poisoned") = Some(reconciler);
     }
 
@@ -224,7 +224,7 @@ impl JobsRuntime {
             .collect()
     }
 
-    pub(crate) fn is_started(&self) -> bool {
+    pub fn is_started(&self) -> bool {
         self.started.load(Ordering::Acquire)
     }
 
@@ -307,25 +307,25 @@ impl JobsRuntime {
         nonce
     }
 
-    pub(crate) fn is_draining(&self) -> bool {
+    pub fn is_draining(&self) -> bool {
         self.state().draining
     }
 
-    pub(crate) fn claim_gate(&self) -> &RwLock<()> {
+    pub fn claim_gate(&self) -> &RwLock<()> {
         &self.claim_producer_barrier
     }
 
-    pub(crate) fn shutdown_signal(&self) -> CancellationToken {
+    pub fn shutdown_signal(&self) -> CancellationToken {
         self.shutdown.clone()
     }
 
-    pub(crate) fn turns(&self) -> RangeTurns {
+    pub fn turns(&self) -> RangeTurns {
         self.range_turns.clone()
     }
 
     /// Takes a slot for a claimed job. A claim that raced the drain stop starts `release`
     /// under the lock, so a shutdown that follows always finds the release to wait for.
-    pub(crate) fn admit(
+    pub fn admit(
         &self,
         record: &JobRecord,
         now_ms: u64,
@@ -367,7 +367,7 @@ impl JobsRuntime {
     }
 
     /// Takes a slot for an adopted external supervisor under the normal class cap.
-    pub(crate) fn admit_recovered(&self, record: &JobRecord, now_ms: u64) -> RecoveredAdmission {
+    pub fn admit_recovered(&self, record: &JobRecord, now_ms: u64) -> RecoveredAdmission {
         let job_id = record.job_id;
         let Some(claim_token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
             return RecoveredAdmission::NoClaim;
@@ -412,7 +412,7 @@ impl JobsRuntime {
     }
 
     /// Frees the slot of the run `nonce` names; a newer run of the same job keeps its own.
-    pub(crate) fn retire(&self, job_id: JobId, nonce: u64) {
+    pub fn retire(&self, job_id: JobId, nonce: u64) {
         let removed = {
             let mut state = self.state();
             match state.running.get(&job_id) {
@@ -425,7 +425,7 @@ impl JobsRuntime {
         }
     }
 
-    pub(crate) fn running_waiters(&self) -> Vec<RunWaiter> {
+    pub fn running_waiters(&self) -> Vec<RunWaiter> {
         let state = self.state();
         (state.running.iter())
             .map(|(job_id, job)| {
@@ -435,16 +435,16 @@ impl JobsRuntime {
             .collect()
     }
 
-    pub(crate) fn is_running(&self, job_id: JobId) -> bool {
+    pub fn is_running(&self, job_id: JobId) -> bool {
         self.state().running.contains_key(&job_id)
     }
 
-    pub(crate) fn completion_of(&self, job_id: JobId) -> Option<watch::Receiver<bool>> {
+    pub fn completion_of(&self, job_id: JobId) -> Option<watch::Receiver<bool>> {
         let state = self.state();
         (state.running.get(&job_id)).map(|job| job.completion.subscribe())
     }
 
-    pub(crate) fn take_releases(&self) -> Vec<JoinHandle<()>> {
+    pub fn take_releases(&self) -> Vec<JoinHandle<()>> {
         std::mem::take(&mut self.state().pending_releases)
     }
 }

@@ -232,7 +232,7 @@ fn publishes_soon(config: &RealmConfigDocument, node_id: NodeId) -> bool {
 /// Moves the registry publication up on the reporting node after replicated realm settings
 /// materialize here, also when another management node served the change. True when armed.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PublishSoonOperation {
+pub struct PublishSoonOperation {
     realm_id: RealmId,
     node_id: NodeId,
     arming: bool,

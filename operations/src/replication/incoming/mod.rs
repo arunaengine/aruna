@@ -3426,7 +3426,7 @@ pub(crate) fn same_reference(existing: &BlobVersion, incoming: &BlobVersion) -> 
 }
 
 mod admission;
-pub(crate) mod stream;
+pub mod stream;
 
 #[cfg(test)]
 mod pure_tests;

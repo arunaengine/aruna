@@ -718,7 +718,7 @@ impl Operation for PruneTimerOperation {
 }
 
 /// Whether any prune job is queued, due or not; repairs the queue on the way.
-pub(crate) fn jobs_queued() -> DuePruneOperation {
+pub fn jobs_queued() -> DuePruneOperation {
     DuePruneOperation::new(u64::MAX, 1)
 }
 

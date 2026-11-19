@@ -4,16 +4,16 @@
 
 pub(crate) mod bao_read;
 pub(crate) mod bootstrap;
-pub(crate) mod catch_up;
+pub mod catch_up;
 pub mod drain;
 mod error;
-pub(crate) mod incoming;
+pub mod incoming;
 pub mod live_queue;
 pub mod locations;
 pub(crate) mod managed_read;
 pub mod members;
 mod obligations;
-pub(crate) mod page;
+pub mod page;
 pub mod parking;
 pub mod plaintext;
 pub mod protocol;

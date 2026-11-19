@@ -334,6 +334,7 @@ dependencies = [
  "aruna-storage",
  "aruna-tasks",
  "aruna-wire",
+ "astral_async_zip",
  "async-trait",
  "aws-sdk-s3",
  "aws-smithy-http-client",
@@ -341,8 +342,10 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "blake3",
+ "bytes",
  "byteview",
  "chrono",
+ "craqle",
  "crypto_box",
  "dirs 7.0.0",
  "dotenvy",
@@ -359,6 +362,8 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "oxrdf",
+ "percent-encoding",
  "postcard",
  "rand 0.10.3",
  "rcgen",
@@ -379,6 +384,8 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "ulid 3.0.0",
+ "url",
+ "zip",
 ]
 
 [[package]]

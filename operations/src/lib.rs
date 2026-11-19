@@ -16,14 +16,13 @@ pub mod device;
 pub mod distribution;
 pub mod document_repository;
 pub mod driver;
-pub(crate) mod effect_adapters;
+pub mod effect_adapters;
 pub(crate) mod endpoint_screening;
 pub mod federation;
 pub mod forward;
 pub mod git;
 pub mod groups;
 pub mod harvest;
-pub mod inbound;
 pub mod jobs;
 pub mod metadata;
 pub mod node;
@@ -49,7 +48,6 @@ pub mod staging;
 pub(crate) mod stepper;
 pub mod storage_read;
 pub mod sync;
-pub mod tasks;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod testing;
 #[cfg(any(test, feature = "test-hooks"))]

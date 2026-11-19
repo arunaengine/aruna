@@ -6,7 +6,7 @@ mod audit;
 mod blob;
 mod compute;
 mod git;
-pub(crate) mod job;
+pub mod job;
 mod metadata;
 mod net;
 mod session;

@@ -4,7 +4,7 @@
 
 pub mod announce;
 pub mod document_outbox;
-pub(crate) mod evicted;
+pub mod evicted;
 pub mod mirror_repair;
 pub mod outbox_record;
 pub mod reconcile;

@@ -12,7 +12,7 @@ mod prepare;
 mod resources;
 
 pub use check::{CheckGroupOperation, GroupBlockers};
-pub(crate) use coordinator::SyncDecisionOperation;
+pub use coordinator::SyncDecisionOperation;
 pub use coordinator::{DeleteGroupOperation, InstallOnboardingOperation};
 pub(crate) use peer::ApplyRequestOperation;
 

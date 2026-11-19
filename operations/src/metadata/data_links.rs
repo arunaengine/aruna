@@ -523,7 +523,7 @@ enum RetryStage {
 /// member's index, else by asking the set's members. A verified link gains its set posting; a
 /// version no set holds stops counting. Answers the posting to continue after, if more follow.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RetryUnverifiedOperation {
+pub struct RetryUnverifiedOperation {
     ids: NodeRealm,
     after: Option<Vec<u8>>,
     next: Option<Vec<u8>>,
@@ -534,7 +534,7 @@ pub(crate) struct RetryUnverifiedOperation {
 
 impl RetryUnverifiedOperation {
     /// `after` is where the previous pass stopped; `None` starts at the first posting.
-    pub(crate) fn new(ids: NodeRealm, after: Option<Vec<u8>>) -> Self {
+    pub fn new(ids: NodeRealm, after: Option<Vec<u8>>) -> Self {
         Self {
             ids,
             after,

@@ -6,7 +6,6 @@ pub(crate) mod access;
 pub(crate) mod calls;
 pub(crate) mod device;
 pub(crate) mod import;
-pub(crate) mod incoming;
 pub(crate) mod locations;
 pub(crate) mod metadata;
 pub(crate) mod metadata_api;

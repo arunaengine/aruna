@@ -254,7 +254,7 @@ enum PrepareStep {
 
 /// Checks a peer's read under its relationship, grant or delegation, then prepares the answer.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PrepareReferenceOperation {
+pub struct PrepareReferenceOperation {
     ids: Option<Ids>,
     peer: NodeId,
     request: NativeReferenceRequest,
@@ -266,7 +266,7 @@ pub(crate) struct PrepareReferenceOperation {
 type PrepareTurn = Result<Next<PreparedReference>, Reject>;
 
 impl PrepareReferenceOperation {
-    pub(crate) fn new(ids: Option<Ids>, peer: NodeId, request: NativeReferenceRequest) -> Self {
+    pub fn new(ids: Option<Ids>, peer: NodeId, request: NativeReferenceRequest) -> Self {
         Self {
             ids,
             peer,

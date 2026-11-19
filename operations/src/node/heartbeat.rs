@@ -142,14 +142,14 @@ impl Operation for SendHeartbeatOperation {
 /// Keeps one heartbeat frame `peer` sent when it decodes, names this node's realm, and is newer
 /// than the held one of a sync peer. Every refusal is only logged.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReceiveHeartbeatOperation {
+pub struct ReceiveHeartbeatOperation {
     peer: NodeId,
     realm_id: RealmId,
     frame: Vec<u8>,
 }
 
 impl ReceiveHeartbeatOperation {
-    pub(crate) fn new(peer: NodeId, realm_id: RealmId, frame: Vec<u8>) -> Self {
+    pub fn new(peer: NodeId, realm_id: RealmId, frame: Vec<u8>) -> Self {
         Self {
             peer,
             realm_id,

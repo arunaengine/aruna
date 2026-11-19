@@ -27,7 +27,7 @@ const SCAN_PAGE_SIZE: usize = 512;
 
 /// Pages through every tenant backend record and keeps the disabled ones.
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct DisabledScanOperation {
+pub struct DisabledScanOperation {
     disabled: Vec<GroupStorage>,
 }
 
@@ -66,7 +66,7 @@ const HOLDING_KEYSPACES: [&str; 3] = [
 /// multipart upload. Parts have no location row, and they are deleted in the
 /// same transaction as the upload record, so that record covers them.
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct HoldingScanOperation {
+pub struct HoldingScanOperation {
     keyspace: usize,
     holding: BTreeSet<BackendRef>,
 }
