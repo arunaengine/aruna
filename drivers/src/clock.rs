@@ -10,7 +10,7 @@ use aruna_core::structured_id::{IdEnvironment, MAX_ID_SKEW, SystemEnvironment};
 use tracing::error;
 
 /// The clock every drive of this process stamps from.
-static RUN_CLOCK: LazyLock<RunClock> =
+static RUN_CLOCK: LazyLock<RunClock<SystemEnvironment>> =
     LazyLock::new(|| RunClock::new(SystemEnvironment::new(), MAX_ID_SKEW));
 
 /// The time the runner stamps on a run now.
