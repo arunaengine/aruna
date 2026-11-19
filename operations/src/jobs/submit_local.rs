@@ -4,6 +4,7 @@
 
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
@@ -43,6 +44,8 @@ pub struct MintJobOperation {
     subject: Vec<u8>,
     fresh: bool,
     serving: ServingNode,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl MintJobOperation {
@@ -58,6 +61,8 @@ impl MintJobOperation {
             subject: dedup_key.map(<[u8]>::to_vec).unwrap_or_default(),
             fresh: dedup_key.is_none(),
             serving,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 }
@@ -66,15 +71,20 @@ impl Operation for MintJobOperation {
     type Output = JobId;
     type Error = SubmitJobError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn seed(&mut self, entropy: u128) {
         if self.fresh {
             self.subject = entropy.to_be_bytes().to_vec();
         }
+        self.ids = IdMint::new(entropy);
     }
 
     fn first(&mut self) -> Result<Next<JobId>, SubmitJobError> {
         let Some((local, serving_realm)) = self.serving else {
-            return mint_unplaced(&self.subject).map(Next::Done);
+            return mint_unplaced(&self.subject, &mut self.ids, self.now_ms).map(Next::Done);
         };
         if local != self.owner_node_id || serving_realm != self.realm_id {
             return Err(unavailable("job owner does not match the serving node"));
@@ -86,7 +96,8 @@ impl Operation for MintJobOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<JobId>, SubmitJobError> {
         let config = result.child::<RealmConfigDocument, GetConfigError>()?;
         let config = config.map_err(|_| unavailable("realm config unavailable"))?;
-        mint_configured_job(&config, self.owner_node_id, &self.subject).map(Next::Done)
+        let (owner, now_ms) = (self.owner_node_id, self.now_ms);
+        mint_configured_job(&config, owner, &self.subject, &mut self.ids, now_ms).map(Next::Done)
     }
 }
 

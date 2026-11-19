@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     ExecutionSpec, JobId, JobPayload, MAX_EXECUTION_OUTPUTS, OutputDestination, WorkspaceMode,
@@ -112,13 +113,17 @@ pub(crate) fn validate_execution(
 }
 
 /// A job id for a node without a net transport, in the first grantable handle.
-pub(crate) fn mint_unplaced(subject: &[u8]) -> Result<JobId, SubmitJobError> {
+pub(crate) fn mint_unplaced(
+    subject: &[u8],
+    ids: &mut IdMint,
+    now_ms: u64,
+) -> Result<JobId, SubmitJobError> {
     let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE)
         .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
     let shard = shard_for_subject(subject, DEFAULT_SHARD_COUNT);
     let bucket = BucketId::new(shard as u16)
         .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-    Ok(mint_job_id(handle, bucket)?)
+    Ok(mint_job_id(handle, bucket, ids, now_ms)?)
 }
 
 /// One execution job request, with the node that serves it.
@@ -145,6 +150,7 @@ pub struct SubmitExecutionOperation {
     dedup_key: Option<Vec<u8>>,
     /// The placement subject of a job without a dedup key.
     entropy: [u8; 16],
+    ids: IdMint,
     minted: bool,
 }
 
@@ -158,6 +164,7 @@ impl SubmitExecutionOperation {
             submission,
             dedup_key,
             entropy: [0; 16],
+            ids: IdMint::default(),
             minted: false,
         }
     }
@@ -192,6 +199,7 @@ impl Operation for SubmitExecutionOperation {
 
     fn seed(&mut self, entropy: u128) {
         self.entropy = entropy.to_be_bytes();
+        self.ids = IdMint::new(entropy);
     }
 
     fn first(&mut self) -> Result<Next<SubmitJobResult>, SubmitJobError> {
@@ -203,7 +211,8 @@ impl Operation for SubmitExecutionOperation {
         )?;
         let (serving, owner) = (submission.serving, submission.owner_node_id);
         let Some((node_id, realm_id)) = serving else {
-            let job_id = mint_unplaced(self.subject())?;
+            let subject = self.subject().to_vec();
+            let job_id = mint_unplaced(&subject, &mut self.ids, self.submission.now_ms)?;
             return self.submit(job_id);
         };
         if node_id != owner {
@@ -226,7 +235,9 @@ impl Operation for SubmitExecutionOperation {
                 warn!(error = %error, "realm config unavailable; querying the local replica only");
                 SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
             })?;
-        let job_id = mint_configured_job(&config, self.submission.owner_node_id, self.subject())?;
+        let (subject, owner) = (self.subject().to_vec(), self.submission.owner_node_id);
+        let now_ms = self.submission.now_ms;
+        let job_id = mint_configured_job(&config, owner, &subject, &mut self.ids, now_ms)?;
         self.submit(job_id)
     }
 }

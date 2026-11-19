@@ -28,7 +28,7 @@ use tempfile::tempdir;
 use ulid::Ulid;
 
 fn job_id() -> JobId {
-    aruna_operations::jobs::submit::mint_job_id(
+    aruna_operations::testing::fresh_job_id(
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
         BucketId::new(0).unwrap(),
     )
