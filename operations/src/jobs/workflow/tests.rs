@@ -167,13 +167,7 @@ async fn supervise_and_finalize(
     let scope = attempt_scope(&context, (job_id, token), &backend, &fence, &spec, &bucket);
     let context = with_backend(&context, &backend);
     let supervise = SuperviseOperation::new(scope);
-    if under_lease(&context, (job_id, token), cancel, supervise)
-        .await
-        .is_none()
-    {
-        let abandon = supervise::AbandonSessionOperation::new(job_id);
-        drive(abandon, &context).await.unwrap();
-    }
+    let _ = under_lease(&context, (job_id, token), cancel, supervise).await;
 }
 
 #[allow(clippy::too_many_arguments)]

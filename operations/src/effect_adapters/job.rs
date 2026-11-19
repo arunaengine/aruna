@@ -9,6 +9,8 @@ use std::io;
 use std::sync::Arc;
 
 use aruna_blob::archive::{self, EntrySpan};
+use aruna_compute::ExecutorRegistry;
+use aruna_compute::session::Session;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::jobs::{
@@ -43,6 +45,12 @@ pub trait JobHost: Send + Sync {
         &'a self,
         turns: &'a BTreeSet<(Ulid, Ulid)>,
     ) -> BoxFuture<'a, Box<dyn Any + Send>>;
+    /// Remembers the session this run opened, so a replacement under its job id stays apart.
+    fn keep_session(&self, _session: Arc<Session>) {}
+    /// The session this run opened for `job_id`.
+    fn kept_session(&self, _job_id: &str) -> Option<Arc<Session>> {
+        None
+    }
 }
 
 /// Runs `future` with `host` answering the job effects of every operation it drives.
@@ -52,6 +60,12 @@ pub async fn with_job_host<F: Future>(host: Arc<dyn JobHost>, future: F) -> F::O
 
 pub(super) fn current_host() -> Option<Arc<dyn JobHost>> {
     JOB_HOST.try_with(Arc::clone).ok()
+}
+
+/// The session of `job_id` this run opened, else the one registered on this node.
+pub(super) fn run_session(registry: &ExecutorRegistry, job_id: &str) -> Option<Arc<Session>> {
+    (current_host().and_then(|host| host.kept_session(job_id)))
+        .or_else(|| registry.sessions().get(job_id))
 }
 
 pub(super) async fn dispatch_job(

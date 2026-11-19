@@ -10,6 +10,7 @@ use futures_util::stream;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
+use super::job::run_session;
 use crate::driver::DriverContext;
 
 pub(super) async fn dispatch_session(
@@ -17,7 +18,7 @@ pub(super) async fn dispatch_session(
     context: &DriverContext,
 ) -> SessionAnswer {
     let session = (context.compute_handle.as_ref())
-        .and_then(|registry| registry.sessions().get(&effect.job_id));
+        .and_then(|registry| run_session(registry, &effect.job_id));
     let Some(session) = session else {
         return SessionAnswer::Missing;
     };
