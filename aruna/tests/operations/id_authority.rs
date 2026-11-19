@@ -16,6 +16,7 @@ use aruna_core::StructuredId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::job_request::SubmitJobError;
 use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, PENDING_PROJECTION_KEYSPACE};
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::metadata::protocol::PersistentIdResolution;
@@ -28,7 +29,7 @@ use aruna_core::structs::{
     persistent_id_key,
 };
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
+use aruna_operations::jobs::submit::SubmitJobResult;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,

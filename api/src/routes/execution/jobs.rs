@@ -471,9 +471,9 @@ fn encode_report_cursor(
 }
 
 pub(crate) fn map_submit_error(
-    error: aruna_operations::jobs::submit::SubmitJobError,
+    error: aruna_core::job_request::SubmitJobError,
 ) -> ServerError {
-    use aruna_operations::jobs::submit::SubmitJobError;
+    use aruna_core::job_request::SubmitJobError;
     match error {
         SubmitJobError::JobPlanConflict { existing_job_id } => ServerError::JobPlanConflict(
             format!("idempotency key already bound to job {existing_job_id}"),
@@ -502,7 +502,7 @@ pub(crate) fn map_submit_error(
             ServerError::ServiceUnavailableReason(moving.to_string())
         }
         SubmitJobError::Upload(error) => {
-            use aruna_operations::jobs::import::upload::UploadClaimError;
+            use aruna_core::job_request::UploadClaimError;
             match error {
                 UploadClaimError::NotFound => ServerError::NotFound,
                 UploadClaimError::WrongOwner => ServerError::Forbidden,

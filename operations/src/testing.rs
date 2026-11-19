@@ -337,7 +337,7 @@ impl aruna_tasks::InboundTaskHandler for RecordingTaskHandler {
 /// A fresh job id for `(handle, bucket)` at the current time, as a submit would mint it.
 pub fn fresh_job_id(handle: PlacementHandle, bucket: BucketId) -> Result<JobId, ClockHealthError> {
     let mut ids = IdMint::new(ulid::Ulid::generate().random());
-    crate::jobs::submit::mint_job_id(handle, bucket, &mut ids, unix_timestamp_millis())
+    aruna_core::job_request::mint_job_id(handle, bucket, &mut ids, unix_timestamp_millis())
 }
 
 /// The graph handle a test installed on its context.

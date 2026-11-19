@@ -232,8 +232,8 @@ fn maps_submit_errors() {
     // must keep the status the native submit surface answers with.
     use aruna_core::ClockHealthError;
     use aruna_core::compute::quota::{QuotaDenied, QuotaDimension, QuotaScope};
+    use aruna_core::job_request::SubmitJobError;
     use aruna_core::structs::execution::job::CompositionError;
-    use aruna_operations::jobs::submit::SubmitJobError;
 
     let cases = [
         (

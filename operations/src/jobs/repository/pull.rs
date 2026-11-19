@@ -27,8 +27,9 @@ use super::links::{LinkChange, LinkError};
 use super::push::creator_auth;
 use super::submit::{LinkJob, LinkJobOperation};
 use crate::jobs::store::job_rows::ReadJobOperation;
-use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
+use crate::jobs::submit::SubmitJobResult;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
+use aruna_core::job_request::SubmitJobError;
 
 /// How often a check waits for a running pull before it looks again.
 const ACTIVE_RETRY_MS: u64 = 60_000;

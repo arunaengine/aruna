@@ -62,6 +62,6 @@
     "state_clones": 2,
     "test_sleeps": 64,
     "trigger_arms": 24,
-    "upward_refs": 95
+    "upward_refs": 91
   }
 }

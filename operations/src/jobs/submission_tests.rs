@@ -25,11 +25,11 @@ use super::job_cancel::CancelOwnedOperation;
 use super::job_reads::tests::{read_owned_job, read_owned_report};
 use super::job_reports::{JobReportLookup, ReportQuery};
 use super::store::row_calls::preserve_artifact_tombstone;
-use super::submit::SubmitJobError;
 use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation, validate_execution};
 use super::submit_local::DedupLookupOperation;
 use crate::jobs::store::test_calls::read_job_record;
 use crate::jobs::store::test_calls::{insert_job, submit_execution_job};
+use aruna_core::job_request::SubmitJobError;
 use aruna_drivers::driver::{DriverContext, drive};
 
 fn node_id() -> NodeId {

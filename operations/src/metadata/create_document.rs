@@ -654,7 +654,7 @@ impl CreateCommitOperation {
             }
         };
         let dedup_key = pid_dedup_key(create_event.record.document_id);
-        let job_id = crate::jobs::submit::mint_configured_job(
+        let job_id = aruna_core::job_request::mint_configured_job(
             realm_config,
             create_event.node_id,
             &dedup_key,

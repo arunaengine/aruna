@@ -55,7 +55,7 @@ pub enum ImportRuleError {
     #[error("storage read failed: {0}")]
     Read(String),
     #[error(transparent)]
-    Submit(#[from] crate::jobs::submit::SubmitJobError),
+    Submit(#[from] aruna_core::job_request::SubmitJobError),
     #[error("unexpected event in state {0}")]
     Unexpected(&'static str),
     #[error("import rule storage failed: {0}")]

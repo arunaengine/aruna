@@ -1,21 +1,27 @@
-//! Normalizes a submission request and derives the identities that follow from it.
-//! The same bytes must give the same identity on every node, so nothing local enters a digest.
+//! Normalizes a submission request, derives the identities that follow from it, mints job ids
+//! and names why a submission fails. Nothing local enters a digest, so every node agrees.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::UserId;
+use crate::calls::IoError;
 use crate::compute::SessionMount;
 use crate::compute::runtimes::{
     MOUNT_PATH_TAG, MOUNT_PREFIX_TAG, SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_RUNTIME_TAG,
     SESSION_TAG, SESSION_TAG_NOTEBOOK,
 };
-use crate::errors::ConversionError;
+use crate::errors::{ConversionError, StorageError};
 use crate::id::NodeId;
+use crate::id_mint::IdMint;
 use crate::structs::execution::job::{
-    CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, SubmissionId, WorkspaceMode,
+    CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, JobId, SubmissionId,
+    WorkspaceMode,
 };
 use crate::structs::placement::policy::{MAX_SELECTOR_LABELS, PlacementPolicyRef};
-use crate::structs::placement::record::LabelMatch;
+use crate::structs::placement::record::{LabelMatch, shard_for_subject};
+use crate::structured_id::{
+    BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredId,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -256,6 +262,151 @@ pub fn effective_resources(spec: &ExecutionSpec) -> EffectiveResources {
             .max_walltime_ms
             .unwrap_or(DEFAULT_WALLTIME_MS),
         preemptible: spec.resources.preemptible,
+    }
+}
+
+/// The largest time and the largest nonce of a structured id, both 48 bits wide.
+const FIELD_MAX: u64 = (1 << 48) - 1;
+
+/// A job id for `(handle, bucket)` at `now_ms`, with its time and nonce from the run's `ids`. The
+/// ids of one run strictly increase; ids of separate runs differ by their random nonce.
+pub fn mint_job_id(
+    handle: PlacementHandle,
+    bucket: BucketId,
+    ids: &mut IdMint,
+    now_ms: u64,
+) -> Result<JobId, ClockHealthError> {
+    let overflow = |timestamp_ms| ClockHealthError::TimestampOverflow { timestamp_ms };
+    if now_ms > FIELD_MAX {
+        return Err(overflow(now_ms));
+    }
+    let minted = ids.mint(now_ms);
+    let nonce = minted.random() as u64 & FIELD_MAX;
+    RoutableJobId::from_parts(minted.timestamp_ms(), handle, bucket, nonce)
+        .map(JobId::from_routable)
+        .map_err(|_| overflow(minted.timestamp_ms()))
+}
+
+/// The owner's job-control handle and the bucket of `subject` in its strategy.
+pub fn job_placement(
+    config: &crate::structs::identity::realm::RealmConfigDocument,
+    owner_node_id: NodeId,
+    subject: &[u8],
+) -> Result<(PlacementHandle, BucketId), SubmitJobError> {
+    let handle = config.job_control_handle(&owner_node_id).ok_or_else(|| {
+        SubmitJobError::PlacementUnavailable(
+            "serving node has no job-control binding yet".to_string(),
+        )
+    })?;
+    let tuple = config
+        .binding_directory()
+        .resolve(handle)
+        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    let strategy = config.strategy(&tuple.strategy_id).ok_or_else(|| {
+        SubmitJobError::PlacementUnavailable("job-control strategy unavailable".to_string())
+    })?;
+    let shard = shard_for_subject(subject, strategy.shard_count);
+    let bucket = u16::try_from(shard)
+        .ok()
+        .and_then(|shard| BucketId::new(shard).ok())
+        .ok_or_else(|| {
+            SubmitJobError::PlacementUnavailable("job bucket is out of range".to_string())
+        })?;
+    Ok((handle, bucket))
+}
+
+/// Synchronous form used by producer transactions that already fenced and read
+/// the realm config. The resulting job id and dedup shard can therefore be
+/// written atomically with the producer's own records.
+pub fn mint_configured_job(
+    config: &crate::structs::identity::realm::RealmConfigDocument,
+    owner_node_id: NodeId,
+    subject: &[u8],
+    ids: &mut IdMint,
+    now_ms: u64,
+) -> Result<JobId, SubmitJobError> {
+    let (handle, bucket) = job_placement(config, owner_node_id, subject)?;
+    Ok(mint_job_id(handle, bucket, ids, now_ms)?)
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum SubmitJobError {
+    #[error(transparent)]
+    GroupWrite(#[from] crate::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    ClockHealth(#[from] ClockHealthError),
+    #[error("job placement unavailable: {0}")]
+    PlacementUnavailable(String),
+    /// The routed authority no longer has the document the job is scoped to.
+    #[error("persistent id target document is absent")]
+    DocumentMissing,
+    /// The routed authority refused the caller's permission on the document.
+    #[error("persistent id submission is not authorized")]
+    AuthorityDenied,
+    #[error("{0}: input read denied")]
+    InputDenied(String),
+    #[error("idempotency key already bound to job {existing_job_id} with a different plan")]
+    JobPlanConflict { existing_job_id: JobId },
+    #[error("invalid workspace: {0}")]
+    InvalidWorkspace(String),
+    #[error("a job may declare at most {limit} outputs")]
+    TooManyOutputs { limit: usize },
+    /// Standing compute quota refused the new logical admission.
+    #[error("compute quota denied: {0}")]
+    QuotaDenied(#[from] crate::compute::quota::QuotaDenied),
+    #[error(transparent)]
+    Composition(#[from] crate::structs::execution::job::CompositionError),
+    #[error("active RO-Crate job limit reached ({limit})")]
+    ActiveJobLimit { limit: u32 },
+    #[error(transparent)]
+    Upload(#[from] UploadClaimError),
+    #[error("the import rule does not exist")]
+    ImportMissing,
+    #[error("the last run of this import has not finished")]
+    ImportRunning,
+    #[error("the harvest source does not exist")]
+    SourceMissing,
+    #[error("the last run of this harvest source has not finished")]
+    SourceRunning,
+    #[error("unexpected event while submitting job: {0}")]
+    UnexpectedEvent(String),
+    #[error("a key range of distributed bucket {0} is moving away from this node; retry later")]
+    RangeMoving(ulid::Ulid),
+}
+
+impl From<IoError> for SubmitJobError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::UnexpectedEvent(other.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum UploadClaimError {
+    #[error("upload not found")]
+    NotFound,
+    #[error("upload is owned by another user")]
+    WrongOwner,
+    #[error("upload expired")]
+    Expired,
+    #[error("upload is already claimed")]
+    AlreadyClaimed,
+    #[error("upload record is invalid: {0}")]
+    Invalid(String),
+    #[error("upload storage failed: {0}")]
+    Storage(String),
+}
+
+impl From<IoError> for UploadClaimError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.to_string())
     }
 }
 

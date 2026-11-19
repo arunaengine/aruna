@@ -41,12 +41,13 @@ use super::push::{creator_auth, parse_checkpoint, read_checkpoint};
 use super::submit::{LinkJob, LinkJobOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::store::job_rows::ReadJobOperation;
-use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
+use crate::jobs::submit::SubmitJobResult;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::raw_events::RawReadError;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
 use crate::metadata::revision_read::{RawViewOperation, RawViewOutput};
 use crate::queue_backoff::{due_after, min_due_at};
+use aruna_core::job_request::SubmitJobError;
 
 const QUEUE_PAGE: usize = 256;
 const ERROR_RETRY_MS: u64 = 60_000;

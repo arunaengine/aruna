@@ -35,8 +35,9 @@ use crate::jobs::records::pages::ServingNode;
 use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
-use crate::jobs::submit::{SubmitJobError, SubmitJobResult, SubmitJobSpec};
+use crate::jobs::submit::{SubmitJobResult, SubmitJobSpec};
 use crate::jobs::submit_local::{DedupJobOperation, MintJobOperation, QueueJobOperation};
+use aruna_core::job_request::SubmitJobError;
 
 fn record_call(job: JobId) -> IoCall {
     IoCall::child(read_job_record(job))

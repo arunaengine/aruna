@@ -30,9 +30,8 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::write_peer::WritePeerOperation;
 use crate::jobs::records::pages::{LoadChainOperation, PageReadError, StoreEntriesOperation};
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::submit::SubmitJobError;
 use crate::realm::peer_trust::peer_acts_for;
-use aruna_core::job_request::{RequestIdentity, SubmissionRequest};
+use aruna_core::job_request::{RequestIdentity, SubmissionRequest, SubmitJobError};
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Whether the caller may write in a group: its grants, then the request policies.

@@ -19,9 +19,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::jobs::JOB_RETENTION_MS;
-use crate::jobs::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, job_placement, mint_job_id,
-};
+use crate::jobs::submit::{SubmitJobOperation, SubmitJobResult, SubmitJobSpec};
+use aruna_core::job_request::{SubmitJobError, job_placement, mint_job_id};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EnqueueError {

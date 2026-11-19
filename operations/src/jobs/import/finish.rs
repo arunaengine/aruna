@@ -39,7 +39,7 @@ use crate::jobs::export::CrateJsonOperation;
 use crate::jobs::repository::links::LinkError;
 use crate::jobs::repository::pull::{PullRunningOperation, SettleImportOperation};
 use crate::jobs::repository::{TransferError, is_reference};
-use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
+use crate::jobs::submit::SubmitJobResult;
 use crate::jobs::submit_local::SubmitLocalOperation;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentResult,
@@ -57,6 +57,7 @@ use crate::s3::object::delete::bulk::{
 };
 use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
 use aruna_core::errors::StorageReadError;
+use aruna_core::job_request::SubmitJobError;
 use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 
 fn actor_of(run: &ImportRun) -> Actor {

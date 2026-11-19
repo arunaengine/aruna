@@ -17,7 +17,7 @@ use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use aruna_core::structs::storage::blob::{CONTENT_TYPE_KEY, object_permission_path};
 use ulid::Ulid;
 
-use super::upload::{ClaimUploadOperation, UploadClaimError};
+use super::upload::ClaimUploadOperation;
 use super::{
     ImportFailure, ImportInput, ImportRun, bucket_call, bucket_result, classify_blob, classify_get,
     classify_read, hidden_delete, job_call, permission_call, permission_result, precheck_size,
@@ -34,6 +34,7 @@ use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation,
 use crate::staging::read_source::{
     ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
 };
+use aruna_core::job_request::UploadClaimError;
 
 /// What acquiring a source leaves.
 #[derive(Debug, PartialEq)]

@@ -39,8 +39,7 @@ use crate::jobs::lifecycle::submit_external::{ExternalSubmission, SubmitExternal
 use crate::jobs::node_inputs::{ingress_node, launch_node};
 use crate::jobs::records::audit::AuditPage;
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
-use crate::jobs::submit::SubmitJobError;
-use aruna_core::job_request::SubmissionScope;
+use aruna_core::job_request::{SubmissionScope, SubmitJobError};
 use aruna_drivers::driver::{DriverContext, drive};
 
 pub(super) fn resources() -> EffectiveResources {

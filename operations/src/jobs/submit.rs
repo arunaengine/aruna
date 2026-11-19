@@ -5,11 +5,9 @@
 use std::time::Duration;
 
 use aruna_core::UserId;
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
-use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
-use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, BACKEND_IMPORT_KEYSPACE, DEDUP_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE,
     HARVEST_SOURCE_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -21,22 +19,18 @@ use aruna_core::structs::execution::job::{
     ActiveJobKind, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
     RoCrateUploadRecord, WorkspaceMode, job_active_prefix, job_record_key, parse_dedup_value,
 };
-use aruna_core::structs::placement::record::shard_for_subject;
 use aruna_core::structs::storage::backend_import::{BackendImport, import_key};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::DistributionView;
-use aruna_core::structured_id::{
-    BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredId,
-};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tracing::warn;
 
-use super::import::upload::{UploadClaimError, claim_upload};
+use super::import::upload::claim_upload;
 use crate::harvest::repository::source_key;
 use crate::s3::imports::cron::is_running;
+use aruna_core::job_request::{SubmitJobError, UploadClaimError};
 use aruna_core::structs::execution::job::upload_key;
 use aruna_core::structs::execution::job::{dedup_index_key, job_insert_entries};
 
@@ -46,70 +40,6 @@ pub fn schedule_drain_effect() -> Effect {
         key: TaskKey::DrainJobQueue,
         after: Duration::ZERO,
     })
-}
-
-/// The largest time and the largest nonce of a structured id, both 48 bits wide.
-const FIELD_MAX: u64 = (1 << 48) - 1;
-
-/// A job id for `(handle, bucket)` at `now_ms`, with its time and nonce from the run's `ids`. The
-/// ids of one run strictly increase; ids of separate runs differ by their random nonce.
-pub fn mint_job_id(
-    handle: PlacementHandle,
-    bucket: BucketId,
-    ids: &mut IdMint,
-    now_ms: u64,
-) -> Result<JobId, ClockHealthError> {
-    let overflow = |timestamp_ms| ClockHealthError::TimestampOverflow { timestamp_ms };
-    if now_ms > FIELD_MAX {
-        return Err(overflow(now_ms));
-    }
-    let minted = ids.mint(now_ms);
-    let nonce = minted.random() as u64 & FIELD_MAX;
-    RoutableJobId::from_parts(minted.timestamp_ms(), handle, bucket, nonce)
-        .map(JobId::from_routable)
-        .map_err(|_| overflow(minted.timestamp_ms()))
-}
-
-/// The owner's job-control handle and the bucket of `subject` in its strategy.
-pub(crate) fn job_placement(
-    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-    owner_node_id: NodeId,
-    subject: &[u8],
-) -> Result<(PlacementHandle, BucketId), SubmitJobError> {
-    let handle = config.job_control_handle(&owner_node_id).ok_or_else(|| {
-        SubmitJobError::PlacementUnavailable(
-            "serving node has no job-control binding yet".to_string(),
-        )
-    })?;
-    let tuple = config
-        .binding_directory()
-        .resolve(handle)
-        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-    let strategy = config.strategy(&tuple.strategy_id).ok_or_else(|| {
-        SubmitJobError::PlacementUnavailable("job-control strategy unavailable".to_string())
-    })?;
-    let shard = shard_for_subject(subject, strategy.shard_count);
-    let bucket = u16::try_from(shard)
-        .ok()
-        .and_then(|shard| BucketId::new(shard).ok())
-        .ok_or_else(|| {
-            SubmitJobError::PlacementUnavailable("job bucket is out of range".to_string())
-        })?;
-    Ok((handle, bucket))
-}
-
-/// Synchronous form used by producer transactions that already fenced and read
-/// the realm config. The resulting job id and dedup shard can therefore be
-/// written atomically with the producer's own records.
-pub(crate) fn mint_configured_job(
-    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-    owner_node_id: NodeId,
-    subject: &[u8],
-    ids: &mut IdMint,
-    now_ms: u64,
-) -> Result<JobId, SubmitJobError> {
-    let (handle, bucket) = job_placement(config, owner_node_id, subject)?;
-    Ok(mint_job_id(handle, bucket, ids, now_ms)?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,65 +62,6 @@ pub struct SubmitJobResult {
     pub job_id: JobId,
     /// `false` when a job with the same `dedup_key` already existed.
     pub created: bool,
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub enum SubmitJobError {
-    #[error(transparent)]
-    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error(transparent)]
-    Conversion(#[from] ConversionError),
-    #[error(transparent)]
-    ClockHealth(#[from] ClockHealthError),
-    #[error("job placement unavailable: {0}")]
-    PlacementUnavailable(String),
-    /// The routed authority no longer has the document the job is scoped to.
-    #[error("persistent id target document is absent")]
-    DocumentMissing,
-    /// The routed authority refused the caller's permission on the document.
-    #[error("persistent id submission is not authorized")]
-    AuthorityDenied,
-    #[error("{0}: input read denied")]
-    InputDenied(String),
-    #[error("idempotency key already bound to job {existing_job_id} with a different plan")]
-    JobPlanConflict { existing_job_id: JobId },
-    #[error("invalid workspace: {0}")]
-    InvalidWorkspace(String),
-    #[error("a job may declare at most {limit} outputs")]
-    TooManyOutputs { limit: usize },
-    /// Standing compute quota refused the new logical admission.
-    #[error("compute quota denied: {0}")]
-    QuotaDenied(#[from] aruna_core::compute::quota::QuotaDenied),
-    #[error(transparent)]
-    Composition(#[from] aruna_core::structs::execution::job::CompositionError),
-    #[error("active RO-Crate job limit reached ({limit})")]
-    ActiveJobLimit { limit: u32 },
-    #[error(transparent)]
-    Upload(#[from] UploadClaimError),
-    #[error("the import rule does not exist")]
-    ImportMissing,
-    #[error("the last run of this import has not finished")]
-    ImportRunning,
-    #[error("the harvest source does not exist")]
-    SourceMissing,
-    #[error("the last run of this harvest source has not finished")]
-    SourceRunning,
-    #[error("unexpected event while submitting job: {0}")]
-    UnexpectedEvent(String),
-    #[error("a key range of distributed bucket {0} is moving away from this node; retry later")]
-    RangeMoving(ulid::Ulid),
-}
-
-impl From<IoError> for SubmitJobError {
-    fn from(error: IoError) -> Self {
-        match error {
-            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
-            IoError::Storage(error) => Self::Storage(error),
-            other => Self::UnexpectedEvent(other.to_string()),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -686,6 +557,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
     use aruna_core::structs::storage::backend_import::BackendImportSpec;
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;

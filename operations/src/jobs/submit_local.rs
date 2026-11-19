@@ -23,11 +23,10 @@ use super::records::pages::ServingNode;
 use super::staging::{SeedCheckpointOperation, StagingStoreError};
 use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::{find_dedup_plan, read_job_record};
-use super::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
-};
+use super::submit::{SubmitJobOperation, SubmitJobResult, SubmitJobSpec};
 use super::submit_execution::mint_unplaced;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_core::job_request::{SubmitJobError, mint_configured_job};
 
 fn unavailable(reason: &str) -> SubmitJobError {
     SubmitJobError::PlacementUnavailable(reason.to_string())

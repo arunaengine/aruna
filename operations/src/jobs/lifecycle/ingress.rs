@@ -10,11 +10,10 @@ mod tests {
         reference_content, reference_shape, refusal_of, resolve_answer, resolver_admits,
         sources_match,
     };
-    use crate::jobs::submit::SubmitJobError;
     use crate::tests::records::captured_input;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::job_request::store_workspace;
+    use aruna_core::job_request::{SubmitJobError, store_workspace};
     use aruna_core::jobs::SubmissionRefusal;
     use aruna_core::metadata::protocol::MetadataTransportMessage;
     use aruna_core::structs::execution::job::OutputDestination;

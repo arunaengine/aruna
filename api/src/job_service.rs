@@ -7,6 +7,7 @@ use std::ops::Range;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
+use aruna_core::job_request::SubmitJobError;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
 use aruna_core::structs::execution::job::{
@@ -33,7 +34,7 @@ use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::jobs::store::list_jobs::ListJobsOperation;
 use aruna_operations::jobs::store::mutation_error::JobMutationError;
 use aruna_operations::jobs::store::row_calls;
-use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
+use aruna_operations::jobs::submit::SubmitJobResult;
 use aruna_operations::jobs::submit_local::{DedupLookupOperation, SubmitLocalOperation};
 
 /// Jobs the serving node owns for this user. Listings are per origin by contract.

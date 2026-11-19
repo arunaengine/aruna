@@ -22,7 +22,7 @@ use super::submit_external::IngressNode;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::write_peer::WritePeerOperation;
 use crate::jobs::JOB_RETENTION_MS;
-use crate::jobs::submit::SubmitJobError;
+use aruna_core::job_request::SubmitJobError;
 
 #[derive(Debug, PartialEq)]
 enum ServeStep {

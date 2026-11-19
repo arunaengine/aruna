@@ -20,11 +20,9 @@ use aruna_core::structs::placement::record::{
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use tracing::warn;
 
-use super::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
-    mint_job_id,
-};
+use super::submit::{SubmitJobOperation, SubmitJobResult, SubmitJobSpec};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_core::job_request::{SubmitJobError, mint_configured_job, mint_job_id};
 
 /// Normalizes one execution request and enforces every bound that holds
 /// regardless of where the job runs: composition, the shared output bound, and
