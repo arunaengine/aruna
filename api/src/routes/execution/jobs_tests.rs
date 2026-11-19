@@ -1478,3 +1478,41 @@ fn mount_path_checked() {
         format!("{bucket}/raw/2024")
     );
 }
+
+#[test]
+fn reports_placed_backend() {
+    // The placement and every candidate name the backend next to the executor kind.
+    use aruna_core::compute::ExecutionTargetId;
+    use aruna_core::scheduling::{CandidateVerdict, PlanCandidate};
+    use aruna_operations::jobs::lifecycle::report::PlanEstimate;
+    let node = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+    let mut report = family_report_fixture();
+    report.plan = Some(PlanEstimate {
+        target: Some(ExecutionTargetId {
+            node_id: node,
+            backend: "lab".to_string(),
+            executor_kind: "docker".to_string(),
+        }),
+        scheduler_node_id: None,
+        estimated_transfer_bytes: 0,
+        estimated_transfer_ms: 0,
+        alternatives: 0,
+        rejected: 0,
+        omitted: 0,
+        stored_at_ms: 1,
+        inputs: Vec::new(),
+        candidates: vec![PlanCandidate {
+            node_id: node,
+            backend: Some("lab".to_string()),
+            executor_kind: Some("docker".to_string()),
+            verdict: CandidateVerdict::Selected,
+            rank: None,
+            reason: None,
+        }],
+    });
+    let placement = family_response(&report)
+        .placement
+        .expect("a plan was stored");
+    assert_eq!(placement.backend.as_deref(), Some("lab"));
+    assert_eq!(placement.candidates[0].backend.as_deref(), Some("lab"));
+}

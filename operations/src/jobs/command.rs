@@ -201,6 +201,10 @@ pub struct SubmitExecutionCommand {
     /// Optional executor selector. Leave unset unless the realm documents one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_constraint: Option<String>,
+    /// Optional compute backend name, for example `default`. Names are node-local, so a name
+    /// matches that backend on every node; a node label pins one node as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     /// Objects staged into or mounted for the run.
     #[serde(default)]
     pub inputs: Vec<ExecutionInput>,
@@ -436,6 +440,7 @@ mod pure_tests {
             ram_bytes: None,
             max_walltime_ms: None,
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             output_prefixes: Vec::new(),
@@ -467,6 +472,7 @@ mod pure_tests {
             ram_bytes: Some(1_000_000_000),
             max_walltime_ms: None,
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             output_prefixes: Vec::new(),

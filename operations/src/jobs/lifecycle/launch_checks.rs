@@ -132,7 +132,10 @@ impl LocalCapabilityOperation {
         let capability = document
             .executors
             .iter()
-            .find(|capability| capability.kind == self.intent.target.executor_kind)
+            .find(|capability| {
+                let target = &self.intent.target;
+                capability.backend == target.backend && capability.kind == target.executor_kind
+            })
             .cloned()
             .ok_or(LaunchDecline::Unauthorized)?;
         if capability.policy_draining {
@@ -144,6 +147,8 @@ impl LocalCapabilityOperation {
                 .executor_constraint
                 .as_deref()
                 .is_some_and(|kind| kind.trim() != capability.kind.trim())
+            || (spec.payload.backend.as_deref())
+                .is_some_and(|name| name.trim() != capability.backend)
             || !capability.supports(REALM_STAGING)
             || (ids::session_of(&spec.payload).is_some()
                 && network_access(spec) != NetworkAccess::Open

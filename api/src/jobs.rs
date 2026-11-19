@@ -290,7 +290,7 @@ pub(crate) async fn admit_execution(
             preemptible: false,
         },
         executor_constraint: command.executor_constraint,
-        backend: None,
+        backend: command.backend,
         inputs,
         file_outputs,
         workspace_outputs,
@@ -771,6 +771,9 @@ pub struct JobInputResponse {
 #[schema(as = JobPlacementCandidateResponse)]
 pub struct JobCandidateResponse {
     pub node_id: String,
+    /// The compute backend's node-local name. Absent where the report names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_kind: Option<String>,
     /// `selected`, `ranked` or `rejected`.
@@ -788,6 +791,9 @@ pub struct JobCandidateResponse {
 /// Only a local planning round supplies `alternatives`, `rejected`, and `omitted` counts.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JobPlacementResponse {
+    /// The compute backend's node-local name on the target node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_kind: Option<String>,
     /// The node the execution was planned to run on.
@@ -1056,6 +1062,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
         locally_exhausted: report.locally_exhausted,
         cancel_requested: report.cancel_requested,
         placement: report.plan.as_ref().map(|plan| JobPlacementResponse {
+            backend: plan.target.as_ref().map(|target| target.backend.clone()),
             executor_kind: plan
                 .target
                 .as_ref()
@@ -1086,6 +1093,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
                 .iter()
                 .map(|candidate| JobCandidateResponse {
                     node_id: candidate.node_id.to_string(),
+                    backend: candidate.backend.clone(),
                     executor_kind: candidate.executor_kind.clone(),
                     verdict: candidate.verdict.name().to_string(),
                     rank: candidate.rank,

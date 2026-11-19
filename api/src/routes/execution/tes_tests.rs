@@ -1982,3 +1982,19 @@ fn projects_input_identity() {
         }
     );
 }
+
+#[test]
+fn maps_backend_tag() {
+    // The compute backend tag names the backend a task runs on and is reported back.
+    let group = Ulid::from_bytes([5u8; 16]);
+    let mut task = sample_task(group);
+    task.tags.insert(
+        "aruna-engine.org/compute-backend".to_string(),
+        "lab".to_string(),
+    );
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
+    assert_eq!(spec.backend.as_deref(), Some("lab"));
+    let projected = project_tags(&spec);
+    let tag = projected.get("aruna-engine.org/compute-backend");
+    assert_eq!(tag.map(String::as_str), Some("lab"));
+}

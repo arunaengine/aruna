@@ -905,6 +905,7 @@ fn materialize_local(
     payload.resources.max_walltime_ms = Some(spec.resources.max_walltime_ms);
     payload.resources.preemptible = spec.resources.preemptible;
     payload.executor_constraint = Some(intent.target.executor_kind.clone());
+    payload.backend = Some(intent.target.backend.clone());
     let (mode, bucket) = workspace_of(&spec.payload);
     let (physical_mode, physical_bucket) = match mode {
         WorkspaceMode::Existing if local != spec.ingress_node_id => {
