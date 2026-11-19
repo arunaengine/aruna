@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use aruna_core::admin_documents::AdminDocumentClock;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::{ExecutorCapability, ResourceEnvelope};
 use aruna_core::effects::{
@@ -22,7 +23,7 @@ use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::execution::job::{
     ExecutionClaim, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobId, JobPayload,
     JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionState, WorkspaceMode,
+    Membership, PhysicalExecutionState, WorkspaceMode, membership,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
@@ -36,6 +37,7 @@ use super::cancel::FlagLocalRunOperation;
 use super::fetch::{FetchFamilyOperation, FetchedFamily};
 use super::ids::workspace_of;
 use super::launch_checks::{CheckError, LaunchCheck, LaunchChecksOperation, Verdict};
+use super::membership::MembershipViewOperation;
 use super::outbox::schedule_outbox_drain;
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -51,6 +53,7 @@ use crate::jobs::records::pages::{
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::submit::{mint_configured_job, schedule_drain_effect};
+use crate::secrets::owner::WriterView;
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -500,6 +503,7 @@ enum AdmitStep {
     Append { retried: bool },
     PullBeforeAppend,
     Decide,
+    Interval,
     Checks,
     Membership(Box<ExecutorCapability>),
     Sign(Box<PreparedReceipt>),
@@ -526,6 +530,8 @@ pub(crate) struct AdmitLaunchOperation {
     intent: Option<LaunchIntent>,
     spec: Option<LogicalJobSpec>,
     planned: Option<LaunchIntent>,
+    /// This node's applied realm config clock, which the receipt cites.
+    clock: AdminDocumentClock,
     ids: IdMint,
     step: AdmitStep,
 }
@@ -541,6 +547,7 @@ impl AdmitLaunchOperation {
             intent: None,
             spec: None,
             planned: None,
+            clock: AdminDocumentClock::default(),
             ids: IdMint::default(),
             step: AdmitStep::Config,
         }
@@ -641,6 +648,21 @@ impl AdmitLaunchOperation {
         if already_running(family, &records, self.node.local) {
             return Ok(Next::Done(Err(LaunchDecline::AlreadyRunning)));
         }
+        let read = MembershipViewOperation::new(self.node.realm_id);
+        self.call(AdmitStep::Interval, IoCall::child(read))
+    }
+
+    /// A launch binds the target's membership interval the scheduler saw; an interval that
+    /// closed since then never accepts it, also after the target was added again.
+    fn bound(&mut self, view: WriterView) -> AdmitNext {
+        let cited = &self.intent()?.config_clock;
+        match membership(self.node.local, cited, &view.intervals, &view.clock) {
+            Membership::Open => self.clock = view.clock,
+            Membership::Unknown => return Err(LaunchUndecided),
+            Membership::Left | Membership::Absent => {
+                return Ok(Next::Done(Err(LaunchDecline::WrongInterval)));
+            }
+        }
         let check = LaunchCheck {
             config: self.config()?.clone(),
             local: self.node.local,
@@ -704,6 +726,7 @@ impl AdmitLaunchOperation {
             subject_generation: capability.subject.generation,
             subject_digest: capability.subject_digest,
             accepted_at_ms: node.now_ms,
+            config_clock: self.clock.clone(),
         };
         let claim = ExecutionClaim {
             realm_id: node.realm_id,
@@ -836,6 +859,10 @@ impl Operation for AdmitLaunchOperation {
                 self.append_launch(true)
             }
             AdmitStep::Decide => self.decide(family_read(result)?),
+            AdmitStep::Interval => match result.child::<Option<WriterView>, IoError>()? {
+                Ok(Some(view)) => self.bound(view),
+                _ => Err(LaunchUndecided),
+            },
             AdmitStep::Checks => match result.child::<Verdict, CheckError>()? {
                 Ok(Ok(capability)) => self.checked(capability),
                 Ok(Err(reason)) => Ok(Next::Done(Err(reason))),
@@ -1055,6 +1082,48 @@ mod tests {
             operation.decide(vec![cancel]),
             declined(LaunchDecline::Cancelled)
         );
+    }
+
+    // A launch whose cited clock shows no open interval of this target is declined; a view that
+    // does not cover the cited clock leaves the offer undecided.
+    #[test]
+    fn interval_bounds_launch() {
+        use aruna_core::admin_documents::{AdminDocumentDot, NodeInterval};
+        let family = Family::new([8; 32]);
+        let mut operation = prepared(&family, Some(limits()));
+        let read = IoCall::child(MembershipViewOperation::new(operation.node.realm_id));
+        assert_eq!(operation.decide(Vec::new()), Ok(Next::Call(read)));
+        let closed = operation.bound(WriterView::default());
+        assert_eq!(closed, declined(LaunchDecline::WrongInterval));
+        let added = AdminDocumentDot {
+            event_id: Ulid::nil(),
+            origin_node_id: family.holder.public(),
+            origin_seq: 1,
+        };
+        let mut clock = AdminDocumentClock::default();
+        clock.advance(added.origin_node_id, 1);
+        let interval = NodeInterval {
+            node_id: operation.node.local,
+            added,
+            removed: Vec::new(),
+        };
+        let open = WriterView {
+            clock: clock.clone(),
+            intervals: vec![interval],
+        };
+        let cite = |operation: &mut AdmitLaunchOperation, clock: &AdminDocumentClock| {
+            let intent = operation.intent.as_mut().expect("intent");
+            intent.config_clock = clock.clone();
+        };
+        cite(&mut operation, &clock);
+        assert!(matches!(
+            operation.bound(open),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(operation.clock, clock);
+        let mut behind = prepared(&family, Some(limits()));
+        cite(&mut behind, &clock);
+        assert_eq!(behind.bound(WriterView::default()), Err(LaunchUndecided));
     }
 
     // A replayed offer answers with the stored receipt instead of reserving again.

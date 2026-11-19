@@ -101,7 +101,7 @@ pub struct WriterView {
 
 impl WriterView {
     /// The view of a stored realm config reducer state; none yet is the empty view.
-    fn read(value: Option<&[u8]>) -> Result<Self, OwnerSecretError> {
+    pub(crate) fn read(value: Option<&[u8]>) -> Result<Self, OwnerSecretError> {
         let Some(value) = value else {
             return Ok(Self::default());
         };

@@ -1181,6 +1181,7 @@ mod tests {
             created_at_ms: 1,
             subject_generation: 1,
             subject_digest: [0; 32],
+            config_clock: Default::default(),
         }
     }
 

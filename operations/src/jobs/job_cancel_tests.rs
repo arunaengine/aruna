@@ -50,6 +50,7 @@ fn reservation(logical: u8, physical: u8) -> JobReservationRecord {
         created_at_ms: 1,
         subject_generation: 0,
         subject_digest: [0u8; 32],
+        config_clock: Default::default(),
     }
 }
 

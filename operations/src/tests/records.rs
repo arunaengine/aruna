@@ -189,6 +189,7 @@ impl Family {
             plan_digest: [5u8; 32],
             spec_digest: spec.spec_digest,
             created_at_ms: 1_002,
+            config_clock: Default::default(),
         }
     }
 
@@ -215,6 +216,7 @@ impl Family {
             subject_generation: 1,
             subject_digest: [6u8; 32],
             accepted_at_ms: 1_003,
+            config_clock: Default::default(),
         }
     }
 

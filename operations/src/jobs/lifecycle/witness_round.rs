@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use aruna_core::admin_documents::AdminDocumentClock;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::{ExecutionTargetId, ExecutorKind, ResourceEnvelope};
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, NetEffect};
@@ -30,6 +31,7 @@ use ulid::Ulid;
 
 use super::LifecycleError;
 use super::launch_admit::{AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided};
+use super::membership::{MembershipViewOperation, family_not_run};
 use super::offer::{OfferLaunchOperation, OfferOutcome};
 use super::plan::{BuildPlanOperation, PlanBuildError, PlanRound};
 use super::witness_arm::WitnessExplain;
@@ -46,6 +48,7 @@ use crate::jobs::records::verify::FamilyView;
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::store_call::{RowBatch, RowRead};
 use crate::realm::load_config::config_unavailable;
+use crate::secrets::owner::WriterView;
 use aruna_core::structs::execution::job::PageManifest;
 
 /// Wall-clock budget of one launch offer.
@@ -106,6 +109,7 @@ fn retry(after_ms: u64) -> RoundNext {
 enum RoundStep {
     Config,
     Family,
+    Interval,
     Silence,
     BudgetSigned,
     BudgetStored,
@@ -138,6 +142,8 @@ struct RoundFacts {
     base_ms: u64,
     window_ms: u64,
     records: Vec<JobRecordEnvelope>,
+    /// This node's applied realm config clock, which a new launch cites.
+    clock: AdminDocumentClock,
     spec: Option<LogicalJobSpec>,
     max_launches: u32,
     sequence: u32,
@@ -261,6 +267,7 @@ impl WitnessRoundOperation {
             base_ms,
             window_ms,
             records: Vec::new(),
+            clock: AdminDocumentClock::default(),
             spec: None,
             max_launches: 0,
             sequence: 0,
@@ -286,8 +293,23 @@ impl WitnessRoundOperation {
                 return retry(self.base_ms()?);
             }
         };
-        let running = running_nodes(self.family, &records);
         self.facts()?.records = records;
+        let read = MembershipViewOperation::new(self.node()?.realm_id);
+        self.call(RoundStep::Interval, IoCall::child(read))
+    }
+
+    /// Open work whose nodes all left is not run, and such a family is not launched again.
+    fn interval_read(&mut self, result: IoResult) -> RoundNext {
+        let Ok(Some(view)) = result.child::<Option<WriterView>, IoError>()? else {
+            return retry(self.base_ms()?);
+        };
+        let family = self.family;
+        let facts = self.facts()?;
+        if family_not_run(&facts.records, &view).family {
+            return finished();
+        }
+        facts.clock = view.clock;
+        let running = running_nodes(family, &facts.records);
         if running.is_empty() {
             return self.judged(&BTreeSet::new(), &running);
         }
@@ -543,6 +565,7 @@ impl WitnessRoundOperation {
             plan_digest: selection.plan_digest,
             spec_digest: spec.spec_digest,
             created_at_ms: now_ms,
+            config_clock: facts.clock.clone(),
         };
         // Planned inputs too large for the launch record go to pages this node serves.
         let store = StoreEntriesOperation::launch(&launch);
@@ -696,6 +719,7 @@ impl Operation for WitnessRoundOperation {
                 }
             },
             RoundStep::Family => self.family_read(result),
+            RoundStep::Interval => self.interval_read(result),
             RoundStep::Silence => self.silence_read(result),
             RoundStep::BudgetSigned => {
                 let Some(frame) = signed_frame(result)? else {
@@ -750,7 +774,8 @@ fn permanent_decline(reason: &LaunchDecline) -> bool {
         | LaunchDecline::Draining
         | LaunchDecline::Cancelled
         | LaunchDecline::AlreadyRunning
-        | LaunchDecline::Expired => false,
+        | LaunchDecline::Expired
+        | LaunchDecline::WrongInterval => false,
     }
 }
 

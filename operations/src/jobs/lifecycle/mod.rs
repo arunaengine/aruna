@@ -31,6 +31,7 @@ mod input_capture;
 mod input_walk;
 pub mod launch_admit;
 pub(crate) mod launch_checks;
+pub mod membership;
 pub mod offer;
 pub mod outbox;
 mod output_policies;

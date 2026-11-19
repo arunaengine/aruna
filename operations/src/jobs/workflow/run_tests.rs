@@ -48,6 +48,7 @@ fn reservation(subject_generation: u64) -> JobReservationRecord {
         created_at_ms: 1,
         subject_generation,
         subject_digest: [4; 32],
+        config_clock: Default::default(),
     }
 }
 

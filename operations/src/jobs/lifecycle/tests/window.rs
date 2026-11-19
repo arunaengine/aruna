@@ -1,4 +1,4 @@
-//! Tests that a target declines a launch whose window passed and still answers its replay.
+//! Tests that a target declines a launch past its window or outside its membership interval.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -48,4 +48,20 @@ async fn replays_after_window() {
         &stored.envelope().record,
         JobFamilyRecord::Receipt(replayed) if replayed.execution_id == receipt.execution_id
     ));
+}
+
+#[tokio::test]
+async fn declines_closed_interval() {
+    // A fresh launch whose cited clock shows no open interval of this target is declined.
+    let family = Family::new([62u8; 32]);
+    let (_dir, ctx) = node_context(&family, &family.target).await;
+    seed_family(&ctx, &family).await;
+    let mut launch = family.launch(&family.spec(), family.holder.public(), 1);
+    launch.created_at_ms = unix_timestamp_millis();
+    let record = JobFamilyRecord::Launch(Box::new(launch));
+    let frame = LaunchFrame::new(family.sign(&family.holder, record)).expect("bounded launch");
+
+    let answer = admit_launch(&ctx, frame).await;
+
+    assert!(matches!(answer, Some(Err(LaunchDecline::WrongInterval))));
 }

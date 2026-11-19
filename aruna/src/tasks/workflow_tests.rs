@@ -1896,6 +1896,7 @@ async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, dig
         created_at_ms: 1,
         subject_generation: generation,
         subject_digest: digest,
+        config_clock: Default::default(),
     };
     let _ = context
         .storage_handle

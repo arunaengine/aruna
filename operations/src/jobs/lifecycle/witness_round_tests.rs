@@ -50,6 +50,18 @@ fn configured(fixture: &Family) -> WitnessRoundOperation {
     operation
 }
 
+/// Answers the family read with `records`, then the membership read with `view`.
+fn viewed(
+    operation: &mut WitnessRoundOperation,
+    records: Vec<JobRecordEnvelope>,
+    view: WriterView,
+) -> RoundNext {
+    let read = IoCall::child(MembershipViewOperation::new(REALM));
+    let family = operation.next(child(Ok::<_, FamilyReadError>(records)));
+    assert_eq!(family, Ok(Next::Call(read)));
+    operation.next(child(Ok::<_, IoError>(Some(view))))
+}
+
 fn offering(fixture: &Family, retry_after_ms: u64) -> WitnessRoundOperation {
     let mut operation = configured(fixture);
     let facts = operation.facts().unwrap();
@@ -110,11 +122,47 @@ fn family_read_required() {
         RoundOutcome::Retry { after_ms: base }
     );
     let mut operation = configured(&fixture);
-    let empty = child(Ok::<_, FamilyReadError>(Vec::<JobRecordEnvelope>::new()));
-    assert_eq!(
-        outcome(operation.next(empty)),
-        RoundOutcome::Retry { after_ms: base }
-    );
+    let empty = viewed(&mut operation, Vec::new(), WriterView::default());
+    assert_eq!(outcome(empty), RoundOutcome::Retry { after_ms: base });
+    // An unreadable membership view is no verdict either.
+    let mut operation = configured(&fixture);
+    operation
+        .next(child(Ok::<_, FamilyReadError>(Vec::new())))
+        .unwrap();
+    let unknown = operation.next(child(Ok::<Option<WriterView>, IoError>(None)));
+    assert_eq!(outcome(unknown), RoundOutcome::Retry { after_ms: base });
+}
+
+// A family whose only open launch went to a target that left the realm is not run.
+#[test]
+fn left_target_ends() {
+    use aruna_core::admin_documents::{AdminDocumentDot, NodeInterval};
+    let fixture = Family::new([26u8; 32]);
+    let origin = fixture.holder.public();
+    let dot = |origin_seq| AdminDocumentDot {
+        event_id: Ulid::nil(),
+        origin_node_id: origin,
+        origin_seq,
+    };
+    let (mut cited, mut clock) = (AdminDocumentClock::default(), AdminDocumentClock::default());
+    cited.advance(origin, 1);
+    clock.advance(origin, 2);
+    let mut launch = fixture.launch(&fixture.spec(), origin, 0);
+    launch.config_clock = cited;
+    let target = launch.target.node_id;
+    let record = fixture.sign(&fixture.holder, JobFamilyRecord::Launch(Box::new(launch)));
+    let interval = NodeInterval {
+        node_id: target,
+        added: dot(1),
+        removed: vec![dot(2)],
+    };
+    let left = WriterView {
+        clock,
+        intervals: vec![interval],
+    };
+    let mut operation = configured(&fixture);
+    let answer = viewed(&mut operation, vec![record], left);
+    assert_eq!(outcome(answer), RoundOutcome::Done);
 }
 
 // A first round stores this witness's launch budget before anything else.
@@ -128,8 +176,7 @@ fn budget_signed_first() {
         fixture.sign(&fixture.holder, JobFamilyRecord::Spec(Box::new(spec))),
         fixture.sign(&fixture.holder, claim),
     ];
-    let records = child(Ok::<_, FamilyReadError>(family));
-    let next = operation.next(records).unwrap();
+    let next = viewed(&mut operation, family, WriterView::default()).unwrap();
     let Next::Call(IoCall::Effect(effect)) = next else {
         panic!("expected the signature request");
     };

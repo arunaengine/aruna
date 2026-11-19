@@ -127,6 +127,7 @@ fn holds_static_ceilings() {
         created_at_ms: 1,
         subject_generation: 1,
         subject_digest: [0u8; 32],
+        config_clock: Default::default(),
     }];
     assert!(fits(&held, &resources(), &envelope(2)));
     assert!(!fits(&held, &resources(), &envelope(1)));
@@ -157,6 +158,7 @@ async fn pages_reservations() {
                 created_at_ms: index as u64,
                 subject_generation: 1,
                 subject_digest: [0u8; 32],
+                config_clock: Default::default(),
             };
             (
                 JOB_RESERVATION_KEYSPACE.to_string(),

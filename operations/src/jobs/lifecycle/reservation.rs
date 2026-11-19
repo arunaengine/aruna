@@ -169,7 +169,7 @@ impl ReserveExecutionOperation {
         if receipt.verify(&view.context(evidence, None))? != RecordVerdict::Authentic {
             return Err(LifecycleError::NotHolder);
         }
-        let JobFamilyRecord::Receipt(_) = &receipt.record else {
+        let JobFamilyRecord::Receipt(signed) = &receipt.record else {
             return Err(LifecycleError::NotHolder);
         };
         if self.config.record.job_id != self.config.job_id {
@@ -189,6 +189,7 @@ impl ReserveExecutionOperation {
                         created_at_ms: self.config.now_ms,
                         subject_generation: self.config.subject_generation,
                         subject_digest: self.config.subject_digest,
+                        config_clock: signed.config_clock.clone(),
                     })?
                     .as_slice(),
                 ),

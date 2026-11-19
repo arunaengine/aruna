@@ -30,6 +30,7 @@ fn row(seed: u8) -> JobReservationRecord {
         created_at_ms: 10,
         subject_generation: 0,
         subject_digest: [0; 32],
+        config_clock: Default::default(),
     }
 }
 
