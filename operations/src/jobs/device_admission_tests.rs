@@ -7,6 +7,7 @@ use aruna_core::calls::IoCall;
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::compute::backend::{Suitability, WorkloadSuitability};
 use aruna_core::compute::offer::BackendCaps;
+use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use aruna_core::structs::execution::job::JobErrorKind;
 
 use super::*;
@@ -78,6 +79,22 @@ fn refuses_by_rule() {
         backend_refusal(&unsuitable, &spec()),
         Some(RejectionVerdict::Unsuitable)
     );
+}
+
+// A session needs a backend with the session channel; the same run without one starts there.
+#[test]
+fn session_needs_channel() {
+    let mut session = spec();
+    let notebook = (SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+    session.tags.extend([notebook]);
+    let plain = offer("a", |_| {});
+    assert_eq!(
+        backend_refusal(&plain, &session),
+        Some(RejectionVerdict::Session)
+    );
+    assert_eq!(backend_refusal(&plain, &spec()), None);
+    let bridged = offer("a", |caps| caps.session = true);
+    assert_eq!(backend_refusal(&bridged, &session), None);
 }
 
 // A named backend or a kind constraint passes over every other backend without a reason.

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use aruna_core::compute::{AttemptPhase, NOBODY};
 use aruna_core::structs::execution::job::LocalAdmission;
 
@@ -70,11 +71,27 @@ fn unreceipted_job_resolved() {
     let expected = ResolvedBackend {
         facts: facts(),
         receipted: None,
+        config_generation: 0,
     };
     assert_eq!(
         reading_held().next(held(Vec::new())),
         Ok(Next::Done(expected))
     );
+}
+
+// A session run never starts on a backend without the session channel, whatever its network.
+#[test]
+fn session_needs_channel() {
+    let mut session = spec();
+    session
+        .tags
+        .insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+    let mut resolve = ResolveBackendOperation::new(&session, job());
+    resolve.first().unwrap();
+    resolve.next(selected()).unwrap();
+    let refused = resolve.next(held(Vec::new()));
+    let message = "compute backend docker cannot host sessions";
+    assert_eq!(refused, Err(JobError::permanent(message)));
 }
 
 // A receipt without a subject names the execution and needs no fence.
@@ -230,6 +247,7 @@ fn resolved() -> ExecutionRunOperation {
     let found = ResolvedBackend {
         facts: facts(),
         receipted: None,
+        config_generation: 0,
     };
     let write = transition_to_preparing(job(), token(), NOW);
     assert_eq!(
