@@ -485,16 +485,6 @@ mod tests {
         }
     }
 
-    /// The compiled-set cache is process-wide and keyed by content, so a test
-    /// that asserts on entry identity must own its policy id: a concurrent test
-    /// compiling the same bytes would otherwise replace the entry.
-    fn owned_policy(expression: &str) -> RequestPolicy {
-        RequestPolicy {
-            policy_id: Ulid::from_bytes([9u8; 16]),
-            ..policy(expression)
-        }
-    }
-
     #[test]
     fn compile_failure_unavailable() {
         // A policy set that will not compile denies as unavailable, not allows.

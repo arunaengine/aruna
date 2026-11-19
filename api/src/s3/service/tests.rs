@@ -622,7 +622,8 @@ async fn put_expands_watch() {
     ));
     install_watch_authorization(&context, realm_id, net.node_id(), group_id, watcher).await;
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-    let subscription = WatchSubscription::new(ulid::Ulid::new(), watcher, watch_prefix, mask, 0);
+    let subscription =
+        WatchSubscription::new(ulid::Ulid::generate(), watcher, watch_prefix, mask, 0);
     drive(StoreWatchOperation::create(subscription, None), &context)
         .await
         .expect("watch subscription creates");

@@ -249,6 +249,7 @@ pub(crate) fn widening_notices(
     node_id: Option<NodeId>,
     actor: UserId,
     now_ms: u64,
+    ids: &mut aruna_core::id_mint::IdMint,
 ) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
     if !widens_use(old, new) {
         return Ok(Vec::new());
@@ -276,7 +277,7 @@ pub(crate) fn widening_notices(
         realm_auth: realm_auth.as_ref(),
         realm_id,
     };
-    (route_resource_event(&event, context, now_ms).into_iter())
+    (route_resource_event(&event, context, now_ms, ids).into_iter())
         .map(|record| {
             let outbox_id = record.notification_id;
             outbox_write_entry(&NotificationOutboxRecord { outbox_id, record })

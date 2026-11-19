@@ -390,6 +390,7 @@ struct OnboardedNoticeOperation {
     realm_id: RealmId,
     node_id: NodeId,
     now_ms: u64,
+    ids: aruna_core::id_mint::IdMint,
     emitting: bool,
 }
 
@@ -399,6 +400,7 @@ impl OnboardedNoticeOperation {
             realm_id,
             node_id,
             now_ms: 0,
+            ids: aruna_core::id_mint::IdMint::default(),
             emitting: false,
         }
     }
@@ -410,6 +412,10 @@ impl Operation for OnboardedNoticeOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = aruna_core::id_mint::IdMint::new(entropy);
     }
 
     fn first(&mut self) -> Result<Next<()>, IoError> {
@@ -445,6 +451,7 @@ impl Operation for OnboardedNoticeOperation {
                 realm_id,
             },
             self.now_ms,
+            &mut self.ids,
         );
         if records.is_empty() {
             return Ok(Next::Done(()));

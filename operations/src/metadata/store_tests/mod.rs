@@ -9,8 +9,6 @@ use aruna_core::metadata::ApplyRoCrateRequest;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::storage_entries::graph_lifecycle_key;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::DriverContext;

@@ -221,7 +221,7 @@ impl CompleteUploadOperation {
         let set_hint = self.set_hint;
         let version_id = *self
             .version_id
-            .get_or_insert_with(|| mint_version(Ulid::generate(), set_hint));
+            .get_or_insert_with(|| mint_version(self.ids.mint(self.now_ms), set_hint));
         // An import may register a listed object's version before the finalize commits it; an
         // upload opened at a provider path stays one after its rule was removed.
         if self.plain.as_ref().is_some_and(|target| target.listed) || self.plain_upload().is_some()
@@ -278,7 +278,7 @@ impl CompleteUploadOperation {
         let location = location.ok_or(CompleteUploadError::CompleteUploadFailed)?;
         let version_id = self.version_id;
         let version_id = version_id.ok_or(CompleteUploadError::CompleteUploadFailed)?;
-        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(self.now_ms);
         let created_at = *self.version_created_at.get_or_insert(now);
         let upload_record = self.upload_record.as_ref();
         let upload_record = upload_record.ok_or(CompleteUploadError::CompleteUploadFailed)?;

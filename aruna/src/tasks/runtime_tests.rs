@@ -782,7 +782,7 @@ async fn deferred_for_delay() {
     };
     let now = unix_timestamp_millis();
     let notification = NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         owner,
         NotificationClass::Direct,
         kind,

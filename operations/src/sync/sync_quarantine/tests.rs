@@ -17,7 +17,6 @@ use aruna_core::structs::{
 };
 use aruna_core::types::{Key, Value};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_storage::storage;
 use ulid::Ulid;
 
 fn context() -> (DriverContext, tempfile::TempDir) {

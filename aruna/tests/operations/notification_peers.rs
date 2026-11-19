@@ -257,7 +257,7 @@ async fn read_inbox(node: &Node) -> Vec<NotificationRecord> {
 fn watch_record(recipient: UserId, seed: u8) -> NotificationRecord {
     let key = format!("object-{seed}");
     let mut record = NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Transient,
         NotificationKind::DataUploaded {
@@ -325,7 +325,7 @@ fn share_upload(from: &Node, recipient: UserId, bucket: &str, at: u64) -> Notifi
         size_bytes: 1,
     };
     NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         kind,
@@ -480,7 +480,7 @@ async fn dropped_upload_unqueued() {
         group_id: data_group_id(),
     };
     let deletion = NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         deleted,

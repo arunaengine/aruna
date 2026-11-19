@@ -439,7 +439,8 @@ impl CreateImportOperation {
     }
 
     fn write(&mut self) -> Turn {
-        let record = self.record(self.ids.mint(self.now_ms));
+        let id = self.ids.mint(self.now_ms);
+        let record = self.record(id);
         let mut writes = vec![(
             BACKEND_IMPORT_KEYSPACE.to_string(),
             record.key(),

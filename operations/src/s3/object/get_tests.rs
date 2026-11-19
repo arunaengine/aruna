@@ -2218,7 +2218,7 @@ async fn offered_drift_replaces() {
         .unwrap();
     std::fs::write(&file, b"one-changed").unwrap();
 
-    let mut operation = GetObjectOperation::new(GetObjectInput {
+    let operation = GetObjectOperation::new(GetObjectInput {
         bucket: offer.bucket.clone(),
         key: "data.bin".to_string(),
         version_id: None,

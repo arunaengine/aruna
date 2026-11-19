@@ -225,14 +225,6 @@ impl Operation for CreateS3Operation {
     type Output = S3SessionCredentials;
     type Error = S3SessionError;
 
-    fn seed(&mut self, entropy: u128) {
-        self.ids = IdMint::new(entropy);
-    }
-
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
-
     fn first(&mut self) -> Result<Next<S3SessionCredentials>, S3SessionError> {
         // Minted once, so a rerun after a conflict keeps the key id.
         if std::mem::take(&mut self.mint_key) {

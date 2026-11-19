@@ -14,6 +14,7 @@ use crate::s3::policy::successor::{
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{read_row, values};
@@ -318,6 +319,7 @@ impl Operation for CloseRun {
 #[derive(Debug, PartialEq)]
 pub struct PolicyBulkOperation {
     config: BulkConfig,
+    ids: IdMint,
     state: BulkState,
     group_id: Option<Ulid>,
     /// The set hint of a distributed bucket, so planned successor ids carry it.
@@ -350,6 +352,7 @@ impl PolicyBulkOperation {
         };
         Self {
             config,
+            ids: IdMint::default(),
             state: BulkState::Authorize,
             group_id: None,
             set_hint: None,
@@ -618,7 +621,10 @@ impl PolicyBulkOperation {
                         operation_id: self.config.operation_id,
                         key: candidate.key.clone(),
                         observed_head: candidate.pointer.clone(),
-                        successor_version_id: mint_version(Ulid::generate(), self.set_hint),
+                        successor_version_id: mint_version(
+                            self.ids.mint(self.config.now_ms),
+                            self.set_hint,
+                        ),
                         outcome: PolicyIntentOutcome::Planned,
                     }
                 }
@@ -755,6 +761,10 @@ fn covered(version: &BlobVersion, target: &[PlacementPolicyRef]) -> bool {
 impl Operation for PolicyBulkOperation {
     type Output = BulkReport;
     type Error = BulkError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> BulkTurn {
         let path = policy_admin_path(self.config.auth_context.realm_id);

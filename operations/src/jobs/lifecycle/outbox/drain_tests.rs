@@ -12,7 +12,7 @@ use aruna_core::structs::execution::job::record_rows::{OutboxEntry, to_bytes};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::{Key, Value};
 
-use super::DrainOutboxOperation;
+use super::{DrainOutboxOperation, scan};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::outbox::OUTBOX_DRAIN_BATCH;
 use crate::tests::records::{Family, REALM, actor, node};

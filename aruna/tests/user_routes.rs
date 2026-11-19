@@ -43,10 +43,7 @@ use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOpera
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
-use axum::Json;
-use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::get;
 use base64::Engine;
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;

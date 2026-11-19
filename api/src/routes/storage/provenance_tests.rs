@@ -173,7 +173,7 @@ async fn revoked_token_stops() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(status, format!("Incomplete: {REVOKED}"));
+    assert_eq!(status, "Incomplete: the token expired or was revoked");
     assert!(entity(&root, &start).is_none());
 }
 

@@ -11,7 +11,6 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
-use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE};
 use aruna_core::metadata::{
     MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload,
@@ -333,7 +332,6 @@ impl CreateDocumentOperation {
             pending: None,
             created: None,
             now_ms: 0,
-            ids: IdMint::default(),
         }
     }
 }
@@ -415,7 +413,6 @@ pub struct CreateCommitOperation {
     pending: Option<Resolved>,
     created: Option<CreateDocumentResult>,
     now_ms: u64,
-    ids: IdMint,
 }
 
 impl CreateCommitOperation {

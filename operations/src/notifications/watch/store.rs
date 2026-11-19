@@ -340,7 +340,7 @@ mod call_tests {
     fn subscription() -> WatchSubscription {
         let mask = WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]);
         WatchSubscription::new(
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             user(1, 2),
             "meta/x".to_string(),
             mask,

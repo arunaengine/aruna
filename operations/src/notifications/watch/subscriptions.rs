@@ -271,8 +271,13 @@ mod tests {
     fn stored_identity_required() {
         let owner = user(1, 1);
         let watch_id = Ulid::from_bytes([9u8; 16]);
-        let mut subscription =
-            WatchSubscription::new(ulid::Ulid::new(), owner, "prefix".to_string(), mask(), 1);
+        let mut subscription = WatchSubscription::new(
+            ulid::Ulid::generate(),
+            owner,
+            "prefix".to_string(),
+            mask(),
+            1,
+        );
         subscription.watch_id = watch_id;
         let bytes = subscription.to_bytes().expect("subscription encodes");
         let key = aruna_core::structs::execution::notification_watch::watch_subscription_key(
@@ -433,7 +438,7 @@ mod tests {
                     realm,
                 );
                 let mut subscription = WatchSubscription::new(
-                    ulid::Ulid::new(),
+                    ulid::Ulid::generate(),
                     owner,
                     format!("p/{index}"),
                     mask(),

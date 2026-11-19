@@ -980,7 +980,7 @@ async fn notify_owner(
         size_bytes: size,
     };
     let record = NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         link.created_by,
         NotificationClass::Direct,
         kind,

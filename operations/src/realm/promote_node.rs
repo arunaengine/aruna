@@ -278,7 +278,6 @@ fn request_owner(document: &RealmConfigDocument) -> Option<NodeId> {
 mod tests {
     use super::*;
     use crate::metadata::protocol::decode_message;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::{Effect, NetEffect};
     use aruna_core::events::{Event, MetadataAnswer, NetEvent};

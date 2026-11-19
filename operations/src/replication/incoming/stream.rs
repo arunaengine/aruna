@@ -326,7 +326,8 @@ impl AcceptVersionOperation {
     }
 
     /// The event of an applied materialized version; nothing else is announced.
-    fn watch_event(&self, result: &IncomingVersionResult) -> Option<WatchEvent> {
+    fn watch_event(&mut self, result: &IncomingVersionResult) -> Option<WatchEvent> {
+        let event_id = self.ids.mint(self.now_ms);
         let manifest = &self.manifest;
         let group_id = result.group_id?;
         if !result.applied || manifest.kind != ReplicationItemKind::Materialized {
@@ -334,7 +335,7 @@ impl AcceptVersionOperation {
         }
         let node_id = self.stream.local_node;
         Some(WatchEvent {
-            event_id: self.ids.mint(self.now_ms),
+            event_id,
             realm_id: manifest.auth_context.realm_id,
             kind: WatchEventKind::DataUploaded,
             path: watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),

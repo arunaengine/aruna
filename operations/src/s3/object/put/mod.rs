@@ -926,7 +926,7 @@ impl PutObjectOperation {
         let set_hint = self.set_hint;
         let version_id = *self
             .version_id
-            .get_or_insert_with(|| mint_version(Ulid::generate(), set_hint));
+            .get_or_insert_with(|| mint_version(self.ids.mint(self.now_ms), set_hint));
         let mut child = Self::new(self.config.without_body());
         child.publishing = true;
         child.state = PutObjectState::CheckPurgeFence;

@@ -404,6 +404,7 @@ impl CreateUserOperation {
     }
 
     fn write_credentials(&mut self) -> CreateTurn {
+        let audit_id = self.issuer.map(|_| self.ids.mint(self.now_ms));
         let access = self.new_access()?;
         let mut writes = vec![
             (
@@ -417,9 +418,8 @@ impl CreateUserOperation {
                 encode_index(&self.index)?,
             ),
         ];
-        if let Some(actor) = self.issuer {
+        if let (Some(actor), Some(audit_id)) = (self.issuer, audit_id) {
             let action = AdminAuditAction::ServiceCredentialIssued;
-            let audit_id = self.ids.mint(self.now_ms);
             let mut audit =
                 AdminAuditRecord::new(audit_id, action, actor, self.config.user_identity);
             audit.group_id = Some(self.config.group_id);
