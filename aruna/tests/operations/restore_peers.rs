@@ -11,6 +11,7 @@ use aruna_operations::shard::recovery::RecoveryError;
 use aruna_operations::shard::recovery::RecoveryStop;
 use aruna_operations::shard::restore::irokle::TopicId;
 use aruna_operations::shard::restore_plan::ShardRestoreCursor;
+use aruna_operations::tests::shard::flat_config;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -120,14 +121,6 @@ fn test_config(
         placements.push(placement);
     }
     (config, placements)
-}
-
-fn flat_config(realm_id: RealmId, nodes: &[NodeId]) -> RealmConfigDocument {
-    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
-    for node_id in nodes {
-        config.ensure_node(*node_id, RealmNodeKind::Server);
-    }
-    config
 }
 
 async fn save_config(node: &RecoveryNode, config: &RealmConfigDocument) {

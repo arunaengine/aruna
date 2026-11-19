@@ -406,3 +406,11 @@ where
         ),
     }
 }
+
+/// The graph handle a test installed on its context.
+pub fn installed_graph_handle(context: &DriverContext) -> &aruna_graph::GraphHandle {
+    context
+        .graph_handle
+        .as_ref()
+        .expect("graph handle installed")
+}

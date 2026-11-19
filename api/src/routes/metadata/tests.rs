@@ -11,15 +11,18 @@ use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::metadata::*;
 use crate::server::state::ServerState;
+use crate::tests::metadata_fixtures::{
+    create_test_document, drain_metadata_background, state_realm_nodes, test_realm_id, write_doc,
+};
 use crate::tests::routes::{seed_group_docs, seed_realm_auth, test_state, test_storage};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::api::node_fanout::DiscoveryOperation;
 use aruna_operations::metadata::api::read_types::ApiQueryMode;
 use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
+use aruna_operations::testing::installed_graph_handle;
 use aruna_operations::testing::test_context;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -60,9 +63,7 @@ use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
 use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::{
-    drain_projection_queue, replay_event_log, schedule_projection_drain,
-};
+use aruna_operations::testing::{drain_projection_queue, schedule_projection_drain};
 use aruna_operations::testing::{process_graph_tombstones, prune_jobs_exist};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
@@ -71,13 +72,6 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::time::SystemTime;
 use tempfile::TempDir;
-
-async fn state_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
-    let ctx = state.get_ctx();
-    let discovery = DiscoveryOperation::new(state.get_realm_id(), state.get_node_id());
-    let discovery = drive(discovery, ctx.as_ref()).await;
-    Ok(discovery.map_or_else(|_| vec![state.get_node_id()], |discovery| discovery.nodes))
-}
 
 pub(crate) struct TestState {
     _storage_dir: TempDir,
@@ -110,13 +104,6 @@ async fn write_status(state: &ServerState, status: &MaterializationStatusRecord)
         Event::Storage(StorageEvent::WriteResult { .. }) => {}
         other => panic!("unexpected status write: {other:?}"),
     }
-}
-
-fn installed_graph_handle(context: &DriverContext) -> &GraphHandle {
-    context
-        .graph_handle
-        .as_ref()
-        .expect("graph handle installed")
 }
 
 #[tokio::test]
@@ -3227,42 +3214,6 @@ async fn preflight_locates_unread() {
     );
 }
 
-async fn create_test_document(
-    state: Arc<ServerState>,
-    auth: AuthContext,
-    group_id: Ulid,
-    path: &str,
-    name: &str,
-    public: bool,
-) {
-    let _ = create_metadata_document(
-        State(state),
-        RealmAuth(auth),
-        Extension(None),
-        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
-            group_id: group_id.to_string(),
-            path: path.to_string(),
-            name: name.to_string(),
-            description: "Remote metadata access fixture".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-            public,
-            message: None,
-            storage_location: None,
-        })),
-    )
-    .await
-    .unwrap();
-}
-
-fn test_realm_id(seed: u8) -> RealmId {
-    RealmId::from_bytes(
-        SigningKey::from_bytes(&[seed; 32])
-            .verifying_key()
-            .to_bytes(),
-    )
-}
-
 pub(crate) async fn setup_state() -> TestState {
     let (storage_dir, storage_handle) = test_storage();
     let metadata_dir = tempfile::tempdir().unwrap();
@@ -3453,15 +3404,6 @@ pub(crate) async fn setup_network_state() -> TestState {
     }
 }
 
-pub(crate) async fn drain_metadata_background(state: &ServerState) {
-    let ctx = state.get_ctx();
-    let drained = drain_projection_queue(ctx.as_ref()).await.unwrap();
-    if drained.markers_examined == 0 {
-        replay_event_log(ctx.as_ref()).await.unwrap();
-    }
-    process_materialization_batch(ctx.as_ref()).await.unwrap();
-}
-
 async fn setup_closed_storage() -> Arc<ServerState> {
     let (storage_handle, receivers) = storage::StorageHandle::new();
     drop(receivers);
@@ -3489,27 +3431,6 @@ async fn setup_closed_storage() -> Arc<ServerState> {
         )
         .await,
     )
-}
-
-async fn write_doc(
-    driver_ctx: &Arc<DriverContext>,
-    key_space: &str,
-    key: byteview::ByteView,
-    value: byteview::ByteView,
-) {
-    let event = driver_ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key,
-            value,
-            txn_id: None,
-        }))
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
 }
 
 async fn read_task_timer(ctx: &DriverContext, key: &TaskKey) -> Option<PersistedTaskTimer> {

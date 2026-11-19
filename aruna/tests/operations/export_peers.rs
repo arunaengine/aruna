@@ -36,12 +36,9 @@ use aruna_operations::jobs::executor::JobRunOutcome;
 use aruna_operations::jobs::export::ExportCheckpoint;
 use aruna_operations::jobs::export::ExportEntity;
 use aruna_operations::jobs::export::ExportFailure;
-use aruna_operations::jobs::export::METADATA_PATH;
-use aruna_operations::jobs::export::ProbedEntry;
 use aruna_operations::jobs::export::archive::*;
 use aruna_operations::jobs::export::consent::UnheldBucketOperation;
 use aruna_operations::jobs::export::open::OpenCandidateOperation;
-use aruna_operations::jobs::export::probe::{CandidateFailures, ProbeSourcesOperation};
 use aruna_operations::jobs::export::resolve::CandidateSource;
 use aruna_operations::jobs::export::resolve::ExportCandidate;
 use aruna_operations::jobs::export::sources::{
@@ -49,13 +46,15 @@ use aruna_operations::jobs::export::sources::{
 };
 use aruna_operations::jobs::export::*;
 use aruna_operations::jobs::key_locks::AskWaitsOperation;
-use aruna_operations::jobs::repository::test_support::{job_id, owner_node};
+use aruna_operations::jobs::repository::test_support::owner_node;
 use aruna_operations::replication::bao_read::BaoReadOutput;
 use aruna_operations::replication::plaintext::HolderCheckOperation;
+use aruna_operations::tests::export::{
+    crate_document, job_context, probe_sources, recognized_entities, remote_spec, scope_of,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::io::AsyncWriteExt;
-use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::BTreeMap;
 use ulid::Ulid;
@@ -66,18 +65,16 @@ use aruna_core::UserId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::structs::execution::job::RoCrateLimits;
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
 };
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef, BlobLocationKey};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::jobs::executor::ProgressReporter;
 use aruna_storage::FjallStorage;
 use std::collections::HashMap;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
@@ -155,21 +152,6 @@ async fn node_with(realm_id: RealmId, metadata: bool) -> BaoNode {
         _tempdir: tempdir,
         net,
         driver,
-    }
-}
-
-fn remote_spec(realm_id: RealmId, user_id: UserId) -> ExportRoCrateSpec {
-    ExportRoCrateSpec {
-        selection: None,
-        destination: None,
-        auth_context: AuthContext {
-            user_id,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        },
-        document_id: Ulid::from_bytes([91; 16]),
-        limits: RoCrateLimits::default(),
     }
 }
 
@@ -296,15 +278,6 @@ fn byte_stream(bytes: &'static [u8]) -> BackendStream<Result<Bytes, StreamError>
     )]))
 }
 
-fn recognized_entities(
-    document: &JsonValue,
-    realm_id: RealmId,
-) -> Result<Vec<ExportEntity>, ExportFailure> {
-    let jsonld = serde_json::to_string(document).unwrap();
-    let canonical = craqle::canonicalize_jsonld(&jsonld).unwrap();
-    recognize_entities(document, &canonical.nquads, realm_id)
-}
-
 #[tokio::test]
 async fn stale_holder_offline() {
     let realm_id = RealmId::from_bytes([61; 32]);
@@ -426,28 +399,6 @@ async fn remote_read_ephemeral() {
     }
     client.net.shutdown().await;
     source.net.shutdown().await;
-}
-
-fn job_context(driver: Arc<DriverContext>, owner_node_id: NodeId) -> JobContext {
-    JobContext {
-        driver,
-        job_id: JobId::from_bytes([84; 16]),
-        owner_node_id,
-        claim_token: Ulid::from_bytes([85; 16]),
-        final_attempt: false,
-        cancel: tokio_util::sync::CancellationToken::new(),
-        shutdown: tokio_util::sync::CancellationToken::new(),
-        progress: ProgressReporter::from_progress(
-            &aruna_core::structs::execution::job::JobProgress {
-                current: 0,
-                total: None,
-                unit: "entries".to_string(),
-                paused_until: None,
-            },
-        ),
-        range_turns: Default::default(),
-        handlers: Default::default(),
-    }
 }
 
 /// Seeds one node with a locally stored object and the checkpoint candidate
@@ -726,30 +677,6 @@ async fn foreign_arn_located() {
         CandidateSource::Local { bucket, key, .. } if bucket == "remote" && key == "payload"
     ) && found.resolved_version == Some(version)));
     node.net.shutdown().await;
-}
-
-fn crate_document(parts: &[JsonValue]) -> JsonValue {
-    let mut graph = vec![
-        json!({
-            "@id": "./",
-            "@type": "Dataset",
-            "name": "test",
-            "description": "test crate",
-            "datePublished": "2026-07-23",
-            "hasPart": parts
-                .iter()
-                .map(|part| json!({"@id": part["@id"]}))
-                .collect::<Vec<_>>()
-        }),
-        json!({
-            "@id": METADATA_PATH,
-            "@type": "CreativeWork",
-            "about": {"@id": "./"},
-            "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
-        }),
-    ];
-    graph.extend(parts.iter().cloned());
-    json!({"@context": "https://w3id.org/ro/crate/1.2/context", "@graph": graph})
 }
 
 /// Writes a bucket's encryption settings row on `node`.
@@ -1369,13 +1296,6 @@ async fn consent_resolves_hashes() {
     node.net.shutdown().await;
 }
 
-fn scope_of(ctx: &JobContext, spec: &ExportRoCrateSpec) -> SourceScope {
-    SourceScope {
-        spec: Arc::new(spec.clone()),
-        owner_node: ctx.owner_node_id,
-    }
-}
-
 async fn open_candidate(
     driver: &DriverContext,
     spec: &ExportRoCrateSpec,
@@ -1405,23 +1325,6 @@ async fn hash_lookup(
     drive(lookup, ctx.driver.as_ref()).await
 }
 
-async fn probe_sources(
-    ctx: &JobContext,
-    spec: &ExportRoCrateSpec,
-    checkpoint: &mut ExportCheckpoint,
-    failures: &CandidateFailures,
-) -> Result<Vec<ProbedEntry>, ExportFailure> {
-    let probe = ProbeSourcesOperation::new(
-        scope_of(ctx, spec),
-        checkpoint.entities.clone(),
-        failures.clone(),
-        AliasState::default(),
-    );
-    let probed = drive(probe, ctx.driver.as_ref()).await?;
-    checkpoint.entities = probed.entities;
-    Ok(probed.entries)
-}
-
 async fn unheld_bucket(
     driver: &DriverContext,
     spec: &ExportRoCrateSpec,
@@ -1430,18 +1333,4 @@ async fn unheld_bucket(
 ) -> Result<Option<String>, String> {
     let check = UnheldBucketOperation::new(spec.clone(), node_id, jsonld.to_string());
     drive(check, driver).await.map_err(|error| error.0)
-}
-
-pub(super) fn destination() -> aruna_core::repository::RepositoryDestination {
-    aruna_core::repository::RepositoryDestination {
-        group_id: Ulid::from_parts(2, 2),
-        connector_id: Ulid::from_parts(4, 4),
-        draft_id: None,
-        published_id: None,
-        metadata_json: "{}".to_string(),
-        publish: false,
-        public_files: false,
-        credential: None,
-        link: None,
-    }
 }

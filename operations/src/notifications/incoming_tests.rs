@@ -8,7 +8,8 @@ use crate::notifications::checks::{
 };
 use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;
-use aruna_core::NodeId;
+use crate::tests::notifications::{data_group_id, data_node_id};
+use crate::tests::notifications::{record, upload_event};
 use aruna_core::UserId;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -19,30 +20,6 @@ use aruna_core::structs::execution::notification_watch::{
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
-
-fn data_group_id() -> Ulid {
-    Ulid::from_bytes([31u8; 16])
-}
-
-fn data_node_id() -> NodeId {
-    iroh::SecretKey::from_bytes(&[31u8; 32]).public()
-}
-
-fn data_path(key: &str) -> String {
-    watch_resource_path(data_group_id(), data_node_id(), "bucket", key)
-}
-
-fn record(recipient: UserId, seed: u8) -> NotificationRecord {
-    NotificationRecord::new(
-        recipient,
-        NotificationClass::Direct,
-        NotificationKind::AddedToGroup {
-            group_id: Ulid::from_bytes([seed; 16]),
-            actor_user_id: recipient,
-        },
-        1_700_000_000_000 + seed as u64,
-    )
-}
 
 #[test]
 fn join_payload_validates() {
@@ -97,25 +74,6 @@ fn transient_batch_cap() {
     assert!(error.contains("notification batch count"));
     records.truncate(OUTBOX_BATCH_SIZE);
     assert!(validate_inbound_batch(&records, unix_timestamp_millis()).is_ok());
-}
-
-fn upload_event(realm_id: RealmId, actor: UserId, path: &str) -> WatchEvent {
-    let (_, key) = path.split_once('/').expect("bucket/key fixture");
-    WatchEvent {
-        event_id: Ulid::from_bytes([7u8; 16]),
-        realm_id,
-        kind: WatchEventKind::DataUploaded,
-        path: data_path(key),
-        actor,
-        occurred_at_ms: 1_700_000_000_000,
-        detail: WatchEventDetail::DataUploaded {
-            group_id: data_group_id(),
-            node_id: data_node_id(),
-            bucket: "bucket".to_string(),
-            key: key.to_string(),
-            size_bytes: 16,
-        },
-    }
 }
 
 #[test]

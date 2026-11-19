@@ -4,7 +4,7 @@
 
 use aruna_api::auth::RealmAuth;
 use aruna_api::auth::ValidatedBearer;
-use aruna_api::error::{ServerError, ServerResult};
+use aruna_api::error::ServerError;
 use aruna_api::metadata::*;
 use aruna_api::routes::metadata::documents::*;
 use aruna_api::routes::metadata::query::*;
@@ -12,17 +12,20 @@ use aruna_api::routes::metadata::references::*;
 use aruna_api::routes::metadata::rocrate::*;
 use aruna_api::routes::metadata::validation::*;
 use aruna_api::server::state::ServerState;
+use aruna_api::tests::metadata_fixtures::{
+    create_test_document, drain_metadata_background, state_realm_nodes, test_realm_id, write_doc,
+};
 use aruna_core::MetaResourceId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::MetadataApiError;
-use aruna_operations::metadata::api::node_fanout::DiscoveryOperation;
 use aruna_operations::metadata::api::read::query_metadata as run_query_metadata;
 use aruna_operations::metadata::api::read_types::{ApiQueryMode, MetadataQueryRequest};
 use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
+use aruna_operations::testing::installed_graph_handle;
 use aruna_operations::testing::sign_token;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -31,7 +34,7 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 use aruna::inbound::initialize_incoming_fixture;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -49,28 +52,12 @@ use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::{drain_projection_queue, replay_event_log};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
 use std::collections::HashSet;
 use tempfile::TempDir;
-
-async fn state_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
-    let ctx = state.get_ctx();
-    let discovery = DiscoveryOperation::new(state.get_realm_id(), state.get_node_id());
-    let discovery = drive(discovery, ctx.as_ref()).await;
-    Ok(discovery.map_or_else(|_| vec![state.get_node_id()], |discovery| discovery.nodes))
-}
-
-fn installed_graph_handle(context: &DriverContext) -> &GraphHandle {
-    context
-        .graph_handle
-        .as_ref()
-        .expect("graph handle installed")
-}
 
 #[tokio::test]
 async fn presence_tracks_config() {
@@ -984,34 +971,6 @@ async fn install_group_documents(
     .await;
 }
 
-async fn create_test_document(
-    state: Arc<ServerState>,
-    auth: AuthContext,
-    group_id: Ulid,
-    path: &str,
-    name: &str,
-    public: bool,
-) {
-    let _ = create_metadata_document(
-        State(state),
-        RealmAuth(auth),
-        Extension(None),
-        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
-            group_id: group_id.to_string(),
-            path: path.to_string(),
-            name: name.to_string(),
-            description: "Remote metadata access fixture".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-            public,
-            message: None,
-            storage_location: None,
-        })),
-    )
-    .await
-    .unwrap();
-}
-
 async fn query_remote_names(
     test: &DistributedAccessState,
     auth: Option<AuthContext>,
@@ -1118,14 +1077,6 @@ fn test_signing_key() -> SigningKey {
     generate_signing_key()
 }
 
-fn test_realm_id(seed: u8) -> RealmId {
-    RealmId::from_bytes(
-        SigningKey::from_bytes(&[seed; 32])
-            .verifying_key()
-            .to_bytes(),
-    )
-}
-
 fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenClaims {
     let now = chrono::Utc::now().timestamp().max(0) as u64;
     TokenClaims {
@@ -1143,34 +1094,4 @@ fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenCla
         via: None,
         auth_time: None,
     }
-}
-
-pub(crate) async fn drain_metadata_background(state: &ServerState) {
-    let ctx = state.get_ctx();
-    let drained = drain_projection_queue(ctx.as_ref()).await.unwrap();
-    if drained.markers_examined == 0 {
-        replay_event_log(ctx.as_ref()).await.unwrap();
-    }
-    process_materialization_batch(ctx.as_ref()).await.unwrap();
-}
-
-async fn write_doc(
-    driver_ctx: &Arc<DriverContext>,
-    key_space: &str,
-    key: byteview::ByteView,
-    value: byteview::ByteView,
-) {
-    let event = driver_ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key,
-            value,
-            txn_id: None,
-        }))
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
 }

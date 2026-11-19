@@ -6,10 +6,14 @@
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::notifications::inbox::UpsertInboxOperation;
+use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
+};
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_storage::storage::{FjallStorage, StorageHandle};
@@ -67,11 +71,7 @@ pub async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
 }
 
 /// Stores one register write of a setting on this node, as a local write or sync would.
-pub async fn store_setting(
-    storage: &StorageHandle,
-    target: &DocumentTarget,
-    bytes: Vec<u8>,
-) {
+pub async fn store_setting(storage: &StorageHandle, target: &DocumentTarget, bytes: Vec<u8>) {
     let write = aruna_core::effects::StorageEffect::Write {
         key_space: target.storage_keyspace().to_string(),
         key: target.storage_key(),
@@ -154,4 +154,47 @@ pub fn peer_input() -> crate::notifications::deliver::DeliverInput {
         local_realm: user(1, 2).realm_id,
         now_ms: 1_000,
     }
+}
+
+pub fn record(recipient: UserId, seed: u8) -> NotificationRecord {
+    NotificationRecord::new(
+        recipient,
+        NotificationClass::Direct,
+        NotificationKind::AddedToGroup {
+            group_id: Ulid::from_bytes([seed; 16]),
+            actor_user_id: recipient,
+        },
+        1_700_000_000_000 + seed as u64,
+    )
+}
+
+pub fn upload_event(realm_id: RealmId, actor: UserId, path: &str) -> WatchEvent {
+    let (_, key) = path.split_once('/').expect("bucket/key fixture");
+    WatchEvent {
+        event_id: Ulid::from_bytes([7u8; 16]),
+        realm_id,
+        kind: WatchEventKind::DataUploaded,
+        path: data_path(key),
+        actor,
+        occurred_at_ms: 1_700_000_000_000,
+        detail: WatchEventDetail::DataUploaded {
+            group_id: data_group_id(),
+            node_id: data_node_id(),
+            bucket: "bucket".to_string(),
+            key: key.to_string(),
+            size_bytes: 16,
+        },
+    }
+}
+
+pub fn data_group_id() -> Ulid {
+    Ulid::from_bytes([31u8; 16])
+}
+
+pub fn data_node_id() -> NodeId {
+    iroh::SecretKey::from_bytes(&[31u8; 32]).public()
+}
+
+pub fn data_path(key: &str) -> String {
+    watch_resource_path(data_group_id(), data_node_id(), "bucket", key)
 }

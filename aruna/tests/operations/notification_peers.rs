@@ -17,8 +17,8 @@ use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord, NotificationTransportMessage,
 };
 use aruna_core::structs::execution::notification_watch::{
-    WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
-    interest_dirty_key, watch_resource_path,
+    WatchAuthorizationBinding, WatchEvent, WatchEventKind, WatchEventMask, interest_dirty_key,
+    watch_resource_path,
 };
 use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -44,6 +44,8 @@ use aruna_operations::notifications::watch::listing::{ListWatchesOperation, Watc
 use aruna_operations::notifications::watch::records::WATCH_SUBSCRIPTION_UNAUTHORIZED;
 use aruna_operations::realm::load_config::config_unavailable;
 use aruna_operations::tests::notifications::create_local_watch;
+use aruna_operations::tests::notifications::{data_group_id, data_node_id, data_path};
+use aruna_operations::tests::notifications::{record, upload_event};
 use aruna_storage::FjallStorage;
 use byteview::ByteView;
 use std::sync::Arc;
@@ -95,18 +97,6 @@ async fn spawn(realm_id: RealmId, secret: [u8; 32]) -> Node {
 
 async fn connect(from: &Node, to: &Node) {
     from.net.add_peer_addr(to.net.endpoint_addr()).await;
-}
-
-fn data_group_id() -> Ulid {
-    Ulid::from_bytes([31u8; 16])
-}
-
-fn data_node_id() -> NodeId {
-    iroh::SecretKey::from_bytes(&[31u8; 32]).public()
-}
-
-fn data_path(key: &str) -> String {
-    watch_resource_path(data_group_id(), data_node_id(), "bucket", key)
 }
 
 /// Adds the record's creating token to the holder's replicated revocation set.
@@ -263,18 +253,6 @@ async fn read_inbox(node: &Node) -> Vec<NotificationRecord> {
             .collect(),
         other => panic!("unexpected inbox iter event: {other:?}"),
     }
-}
-
-fn record(recipient: UserId, seed: u8) -> NotificationRecord {
-    NotificationRecord::new(
-        recipient,
-        NotificationClass::Direct,
-        NotificationKind::AddedToGroup {
-            group_id: Ulid::from_bytes([seed; 16]),
-            actor_user_id: recipient,
-        },
-        1_700_000_000_000 + seed as u64,
-    )
 }
 
 fn watch_record(recipient: UserId, seed: u8) -> NotificationRecord {
@@ -1639,25 +1617,6 @@ async fn revoked_watch_unlisted() {
             .expect("list after delete succeeds")
             .is_empty()
     );
-}
-
-fn upload_event(realm_id: RealmId, actor: UserId, path: &str) -> WatchEvent {
-    let (_, key) = path.split_once('/').expect("bucket/key fixture");
-    WatchEvent {
-        event_id: Ulid::from_bytes([7u8; 16]),
-        realm_id,
-        kind: WatchEventKind::DataUploaded,
-        path: data_path(key),
-        actor,
-        occurred_at_ms: 1_700_000_000_000,
-        detail: WatchEventDetail::DataUploaded {
-            group_id: data_group_id(),
-            node_id: data_node_id(),
-            bucket: "bucket".to_string(),
-            key: key.to_string(),
-            size_bytes: 16,
-        },
-    }
 }
 
 #[tokio::test]
