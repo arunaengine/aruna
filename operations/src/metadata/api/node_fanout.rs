@@ -259,10 +259,9 @@ enum FanoutStage {
     Nodes(Vec<NodeId>),
 }
 
-/// Asks this node alone in local mode. Otherwise it asks the realm's nodes, at most
-/// `QUERY_MAX_NODES` of them chosen by rank, `QUERY_FANOUT_LIMIT` at a time, all within the
-/// scope's deadline. A forbidden answer fails the fanout; a missing document anywhere is
-/// unavailable; any failed node fails a caller that asked for a complete answer.
+/// Asks this node alone in local mode, else at most `QUERY_MAX_NODES` realm nodes by rank,
+/// `QUERY_FANOUT_LIMIT` at a time, within the scope's deadline. A forbidden answer fails it,
+/// a document missing anywhere is unavailable, and a failed node fails a complete answer.
 #[derive(Debug, PartialEq)]
 pub(super) struct NodeFanoutOperation<C: NodeCalls> {
     realm_id: RealmId,

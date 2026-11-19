@@ -342,10 +342,9 @@ enum DistributedStage {
 /// The caller of a distributed query: its own authority here and the bearer it forwards.
 pub type QueryCaller = (Option<AuthContext>, Option<String>);
 
-/// Runs one query across the realm. A query no partition can answer alone, a bounded join, runs
-/// each side across the realm and joins them; otherwise every node answers for its own graphs
-/// and the parts merge, in order for an ordered query. Complete answers of the same credential
-/// scope come from and go to this node's query cache.
+/// Runs one query across the realm. A bounded join no partition answers alone runs each side
+/// across the realm and joins them; otherwise each node answers for its own graphs and the parts
+/// merge, in order when ordered. Complete answers per credential scope use the query cache.
 #[derive(Debug, PartialEq)]
 pub struct DistributedQueryOperation {
     realm_id: RealmId,

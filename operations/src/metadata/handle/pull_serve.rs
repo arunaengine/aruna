@@ -1,6 +1,5 @@
-//! Serves a device's sync requests on this node: admits a pull, runs it in the background
-//! while the device polls, and lists heads. The decisions are operations; this file only
-//! drives them and keeps the pulls in flight.
+//! Serves a device's sync requests: admits a pull, runs it in the background while the device
+//! polls, and lists heads. This file drives the deciding operations and tracks pulls in flight.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
