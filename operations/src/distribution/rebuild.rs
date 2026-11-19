@@ -515,7 +515,7 @@ impl Operation for RebuildOperation {
 }
 
 /// The set, range and account of one range account row; `None` for a malformed row.
-pub(super) fn decode(key: &[u8], value: &[u8]) -> Option<(Ulid, Ulid, RangeAccount)> {
+pub(crate) fn decode(key: &[u8], value: &[u8]) -> Option<(Ulid, Ulid, RangeAccount)> {
     let set_id = Ulid::from_bytes(key.get(..16)?.try_into().ok()?);
     let range_id = Ulid::from_bytes(key.get(16..32)?.try_into().ok()?);
     let account = RangeAccount::from_bytes(value).ok()?;

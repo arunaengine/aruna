@@ -26,8 +26,8 @@ use super::{
     BuildTurn, Candidate, Checked, HeadCandidate, HitBuilder, HitWalk, ObjectKeyMatch,
     SearchNodeHit, SearchNodePage, SearchObjectsError, SearchObjectsInput, SearchTurn, WalkTurn,
 };
-use crate::distribution::feed_walks::{FeedError, RangeProgressOperation, state_key};
 use crate::replication::members::{ReadRecordOperation, RecordError};
+use crate::transfer::feed_walks::{FeedError, RangeProgressOperation, state_key};
 use aruna_core::structs::storage::distribution::search::IndexProgress;
 use std::collections::BTreeMap;
 

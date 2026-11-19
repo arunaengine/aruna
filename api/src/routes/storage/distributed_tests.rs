@@ -8,11 +8,11 @@ use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::distribution::search::IndexProgress;
 use aruna_core::structs::storage::distribution::{DistributionError, DistributionRevision};
 use aruna_operations::distribution::guard::GuardError;
-use aruna_operations::distribution::status::{
+use aruna_operations::replication::members::CopyLag;
+use aruna_operations::transfer::status_view::{
     CopyStatus, DeletionStatus, FillProgress, FillStatus, LifecycleStatus, MemberStatus,
     RangeStatus, TransferStatus,
 };
-use aruna_operations::replication::members::CopyLag;
 
 use super::*;
 use crate::auth::RealmAuth;
@@ -421,7 +421,7 @@ fn report_lists_members() {
     let report = CreationReport {
         set_id: Ulid::from_bytes([1; 16]),
         active: true,
-        members: vec![aruna_operations::distribution::create::MemberOutcome {
+        members: vec![aruna_operations::transfer::create::MemberOutcome {
             member_id: Ulid::from_bytes([2; 16]),
             node_id: node,
             admitted: false,

@@ -19,7 +19,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::VaultRecords;
 use tracing::warn;
 
-use crate::distribution::forward::serve_admission;
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
@@ -37,6 +36,7 @@ use crate::metadata::serve::publish::serve_publish;
 use crate::placement::policy::transport::PolicyAnswer;
 use crate::placement::policy::{ApplyPolicyOperation, ServePolicyOperation};
 use crate::s3::bucket::forward::BucketForwardOperation;
+use crate::transfer::forward::serve_admission;
 use crate::users::vault_route::{ApplyVaultOperation, ServeVaultOperation};
 use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage as Message};
 

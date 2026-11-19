@@ -21,7 +21,7 @@ use aruna_core::structs::storage::distribution::{
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use super::submit::{StateOperation, Stated};
+use crate::distribution::submit::{StateOperation, Stated};
 use crate::s3::usage::{LoadCountersError, LoadCountersOperation};
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 

@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::guard::{authority_reads, write_target};
+use crate::distribution::guard::{authority_reads, write_target};
 use crate::s3::object::metadata::{
     QueueRefreshOperation, QueueRefreshResult, ReferenceRefresh, ReferenceRefreshError,
 };

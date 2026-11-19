@@ -79,12 +79,12 @@ fn resume_key(transfer_id: Ulid, job_id: JobId) -> Vec<u8> {
     [RESUME_PREFIX, &transfer_id.to_bytes(), &job_id.to_bytes()].concat()
 }
 
-pub(super) fn jobs_key(transfer_id: Ulid) -> Vec<u8> {
+pub(crate) fn jobs_key(transfer_id: Ulid) -> Vec<u8> {
     [JOBS_PREFIX, &transfer_id.to_bytes()].concat()
 }
 
 /// The prefix of the rows that resume the imports of a transfer.
-pub(super) fn resume_prefix(transfer_id: Ulid) -> Vec<u8> {
+pub(crate) fn resume_prefix(transfer_id: Ulid) -> Vec<u8> {
     [RESUME_PREFIX, &transfer_id.to_bytes()].concat()
 }
 
@@ -177,7 +177,7 @@ enum KeepStep {
 /// Keeps the open imports of `bucket` and where each stands, before the range of `transfer_id`
 /// is fenced: pages committed after it only repeat work the new coordinator does again.
 #[derive(Debug, PartialEq)]
-pub(super) struct KeepResumeOperation {
+pub(crate) struct KeepResumeOperation {
     bucket: String,
     transfer_id: Ulid,
     step: KeepStep,
@@ -187,7 +187,7 @@ pub(super) struct KeepResumeOperation {
 }
 
 impl KeepResumeOperation {
-    pub(super) fn new(bucket: &str, transfer_id: Ulid) -> Self {
+    pub(crate) fn new(bucket: &str, transfer_id: Ulid) -> Self {
         Self {
             bucket: bucket.to_string(),
             transfer_id,
@@ -260,7 +260,7 @@ enum FencedStep {
 /// The imports of `bucket` to hand over: those open now and those kept before the fence of
 /// `transfer_id`, finished ones too, since a job may end while it skips the fenced range's keys.
 #[derive(Debug, PartialEq)]
-pub(super) struct FencedImportsOperation {
+pub(crate) struct FencedImportsOperation {
     bucket: String,
     transfer_id: Ulid,
     step: FencedStep,
@@ -269,7 +269,7 @@ pub(super) struct FencedImportsOperation {
 }
 
 impl FencedImportsOperation {
-    pub(super) fn new(bucket: &str, transfer_id: Ulid) -> Self {
+    pub(crate) fn new(bucket: &str, transfer_id: Ulid) -> Self {
         Self {
             bucket: bucket.to_string(),
             transfer_id,
@@ -446,7 +446,7 @@ enum FetchStep {
 /// source root, and keeps them until this node coordinates the range. `true` once all are
 /// fetched; an unanswered request or a root no connector here reads waits for the next pass.
 #[derive(Debug, PartialEq)]
-pub(super) struct FetchImportsOperation {
+pub(crate) struct FetchImportsOperation {
     set_id: Ulid,
     range_id: Ulid,
     transfer_id: Ulid,
@@ -461,7 +461,7 @@ pub(super) struct FetchImportsOperation {
 type Fetching = Result<Next<bool>, ImportError>;
 
 impl FetchImportsOperation {
-    pub(super) fn new(
+    pub(crate) fn new(
         (set_id, range_id, transfer_id): (Ulid, Ulid, Ulid),
         local: NodeId,
         from: NodeId,
@@ -674,7 +674,7 @@ enum ContinueStep {
 /// Finds the kept imports of every range this node now coordinates; a transfer that ended
 /// without this node drops them, one still on its way leaves them waiting.
 #[derive(Debug, PartialEq)]
-pub(super) struct ContinueImportsOperation {
+pub(crate) struct ContinueImportsOperation {
     local: NodeId,
     step: ContinueStep,
     rows: VecDeque<(Key, Value)>,
@@ -687,7 +687,7 @@ pub(super) struct ContinueImportsOperation {
 type Continuing = Result<Next<Vec<KeptStart>>, ImportError>;
 
 impl ContinueImportsOperation {
-    pub(super) fn new(local: NodeId) -> Self {
+    pub(crate) fn new(local: NodeId) -> Self {
         Self {
             local,
             step: ContinueStep::Page,

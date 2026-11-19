@@ -31,7 +31,7 @@ use ulid::Ulid;
 
 use super::forward::AdmitMemberOperation;
 use super::status_view::{ReadViewOperation, StatusError};
-use super::submit::{PublishLocalOperation, SendAdminOperation, SubmitOperation};
+use crate::distribution::submit::{PublishLocalOperation, SendAdminOperation, SubmitOperation};
 use crate::document_repository::{config_of, realm_config};
 use crate::forward::transport::{peer_answer, peer_call};
 use crate::realm::peer_trust::is_sync_eligible;

@@ -37,11 +37,11 @@ use bytes::Bytes;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::held::{HeldElsewhere, PullRequest, admitted, held_answer, held_call};
-use super::keep::{
+use super::purge_steps::{DropCopyOperation, PurgeError};
+use crate::distribution::held::{HeldElsewhere, PullRequest, admitted, held_answer, held_call};
+use crate::distribution::keep::{
     ClaimFillOperation, Claimed, KeepError, KeptCopy, PublishKeptOperation, Published,
 };
-use super::purge_steps::{DropCopyOperation, PurgeError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectResult};

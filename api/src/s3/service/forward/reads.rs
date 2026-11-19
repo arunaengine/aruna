@@ -10,12 +10,12 @@ use aruna_core::member_read::MemberBody;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_drivers::driver::drive;
-use aruna_operations::distribution::status::node_reach;
 use aruna_operations::s3::object::member_read::{
     MemberCallOperation, MemberFailure, MemberKey, MemberRead, MemberReadOperation, MemberRefusal,
     MemberTextOperation,
 };
 use aruna_operations::s3::object::range_list::DelegatedCaller;
+use aruna_operations::transfer::status_view::node_reach;
 use http::HeaderMap;
 use s3s::dto::{
     ChecksumType, ETag, GetObjectOutput, HeadObjectOutput, StreamingBlob, Timestamp,

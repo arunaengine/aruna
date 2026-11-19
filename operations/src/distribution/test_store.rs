@@ -364,12 +364,12 @@ pub async fn crowd_sample(handle: &StorageHandle, set_id: Ulid, range_seed: u8, 
 
 /// A range index feeder for tests: its passes keep their cursors, as the node's loop does.
 pub struct Feeder {
-    limits: crate::distribution::feed_walks::FeedLimits,
-    cursors: crate::distribution::feed_walks::FeedCursors,
+    limits: crate::transfer::feed_walks::FeedLimits,
+    cursors: crate::transfer::feed_walks::FeedCursors,
 }
 
 impl Feeder {
-    pub fn new(limits: crate::distribution::feed_walks::FeedLimits) -> Self {
+    pub fn new(limits: crate::transfer::feed_walks::FeedLimits) -> Self {
         Self {
             limits,
             cursors: Default::default(),
@@ -384,15 +384,15 @@ impl Feeder {
     }
 
     /// The next bounded pass, which takes the kept cursors.
-    pub fn next_pass(&mut self) -> crate::distribution::feed_walks::FeedPassOperation {
+    pub fn next_pass(&mut self) -> crate::transfer::feed_walks::FeedPassOperation {
         let cursors = std::mem::take(&mut self.cursors);
-        crate::distribution::feed_walks::FeedPassOperation::new(self.limits, cursors)
+        crate::transfer::feed_walks::FeedPassOperation::new(self.limits, cursors)
     }
 
     /// Keeps the cursors of a finished pass; true when it changed an index or a row.
     pub fn passed<E>(
         &mut self,
-        pass: Result<crate::distribution::feed_walks::FeedPass, E>,
+        pass: Result<crate::transfer::feed_walks::FeedPass, E>,
     ) -> bool {
         match pass {
             Ok(pass) => {

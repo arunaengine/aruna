@@ -40,8 +40,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::feed_walks::split_key;
-use super::imports::{jobs_key, resume_prefix};
-use super::inventory::{Walk, route};
+use crate::distribution::imports::{jobs_key, resume_prefix};
+use crate::distribution::inventory::{Walk, route};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,

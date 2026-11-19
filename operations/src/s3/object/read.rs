@@ -40,8 +40,6 @@ use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::blob::promote::{PromoteError, PromotePendingOperation, Promotion};
 use crate::blob::unlocked::DropReceivedOperation;
 use crate::distribution::held::{HeldElsewhere, PullRequest};
-use crate::distribution::pull::{PullThroughOperation, Pulled, pin_call, pinned};
-use crate::distribution::source_keep::{KeepFirstOperation, KeepStart};
 use crate::distribution::source_plan::SourceKeep;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
@@ -49,6 +47,8 @@ use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::lookup::{LookupError, summary_from_value};
+use crate::transfer::pull::{PullThroughOperation, Pulled, pin_call, pinned};
+use crate::transfer::source_keep::{KeepFirstOperation, KeepStart};
 use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use aruna_core::structs::storage::object_read::ObjectInfo;
 

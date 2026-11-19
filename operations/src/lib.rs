@@ -51,6 +51,7 @@ pub mod testing;
 #[cfg(any(test, feature = "test-hooks"))]
 #[path = "test_objects.rs"]
 pub mod testing_objects;
+pub mod transfer;
 pub mod triggers;
 pub mod users;
 

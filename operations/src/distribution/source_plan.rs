@@ -48,12 +48,12 @@ pub struct SourceKeep {
 /// What a keeping member keeps of one reference version.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
-    pub(super) kind: KeptKind,
-    pub(super) pull: PullPlan,
-    pub(super) set_id: Ulid,
-    pub(super) member_id: Ulid,
-    pub(super) identity: [u8; 32],
-    pub(super) version: BlobVersion,
+    pub(crate) kind: KeptKind,
+    pub(crate) pull: PullPlan,
+    pub(crate) set_id: Ulid,
+    pub(crate) member_id: Ulid,
+    pub(crate) identity: [u8; 32],
+    pub(crate) version: BlobVersion,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -83,7 +83,7 @@ type PlanNext = Result<Next<Option<Plan>>, PlanError>;
 
 /// Reads the version and this member's strategy; outputs `None` when nothing is to be kept.
 #[derive(Debug, PartialEq)]
-pub(super) struct KeepPlanOperation {
+pub(crate) struct KeepPlanOperation {
     keep: SourceKeep,
     state: PlanState,
     version: Option<(BlobVersion, [u8; 32])>,
@@ -91,7 +91,7 @@ pub(super) struct KeepPlanOperation {
 }
 
 impl KeepPlanOperation {
-    pub(super) fn new(keep: SourceKeep) -> Self {
+    pub(crate) fn new(keep: SourceKeep) -> Self {
         Self {
             keep,
             state: PlanState::Version,
@@ -231,7 +231,7 @@ impl Operation for KeepPlanOperation {
 
 #[derive(Debug, Error, PartialEq)]
 #[error("{0}")]
-pub(super) struct SpoolError(String);
+pub(crate) struct SpoolError(String);
 
 impl From<IoError> for SpoolError {
     fn from(error: IoError) -> Self {
@@ -244,7 +244,7 @@ fn spool_error(reason: impl Into<String>) -> SpoolError {
 }
 
 /// A verified hidden copy: its location, BLAKE3 digest and size.
-pub(super) type SpooledCopy = (BackendLocation, [u8; 32], u64);
+pub(crate) type SpooledCopy = (BackendLocation, [u8; 32], u64);
 
 /// What the pending call of a source copy answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,7 +264,7 @@ const NO_REFERENCE: &str = "the version is no reference";
 /// recorded ETag binds the read, or the recorded digests must match the copy. A copy that does
 /// not match is deleted again.
 #[derive(Debug, PartialEq)]
-pub(super) struct SpoolSourceOperation {
+pub(crate) struct SpoolSourceOperation {
     keep: SourceKeep,
     plan: Plan,
     step: SpoolStep,
@@ -272,7 +272,7 @@ pub(super) struct SpoolSourceOperation {
 }
 
 impl SpoolSourceOperation {
-    pub(super) fn new(keep: SourceKeep, plan: Plan) -> Self {
+    pub(crate) fn new(keep: SourceKeep, plan: Plan) -> Self {
         Self {
             keep,
             plan,

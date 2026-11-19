@@ -29,7 +29,7 @@ use ulid::Ulid;
 use super::create::{AdmitPendingOperation, CreateError, CreationReport};
 use super::sharding::{RangeSampleOperation, split_point};
 use super::status_view::{Reach, ReadViewOperation, StatusError, node_reach};
-use super::submit::SendAdminOperation;
+use crate::distribution::submit::SendAdminOperation;
 use crate::document_repository::{config_of, realm_config};
 use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::heartbeat::{Heard, Here};

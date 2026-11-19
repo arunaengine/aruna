@@ -14,9 +14,9 @@ use aruna_core::structs::storage::distribution::on_use::{
 };
 use tracing::warn;
 
-use super::keep::{ClaimFillOperation, Claimed, KeepError, KeptCopy};
 use super::pull::{KeepCopyOperation, ReleaseClaimOperation};
-use super::source_plan::{
+use crate::distribution::keep::{ClaimFillOperation, Claimed, KeepError, KeptCopy};
+use crate::distribution::source_plan::{
     KeepPlanOperation, Plan, PlanError, SourceKeep, SpoolError, SpoolSourceOperation, SpooledCopy,
 };
 

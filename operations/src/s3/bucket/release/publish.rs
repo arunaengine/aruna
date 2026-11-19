@@ -45,7 +45,6 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
-use crate::distribution::status::{StatusError, read_view};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
@@ -57,6 +56,8 @@ use crate::s3::object::origin::{OriginError, OriginView, ReadOriginOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use crate::transfer::status::read_view;
+use crate::transfer::status_view::StatusError;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::request_policy::PolicyRequestExtras;

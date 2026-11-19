@@ -16,11 +16,11 @@ pub fn held_ranges(bucket: &str) -> HeldRangesOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::charged_ranges::{charged_rows, sum_rows};
-    use crate::distribution::replica_shares::{
+    use crate::replication::members::BoundRecordOperation;
+    use crate::transfer::charged_ranges::{charged_rows, sum_rows};
+    use crate::transfer::replica_shares::{
         BindingShareOperation, GroupShare, ReplicaSharesOperation,
     };
-    use crate::replication::members::BoundRecordOperation;
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{

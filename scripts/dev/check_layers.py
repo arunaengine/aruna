@@ -30,7 +30,7 @@ GROUPS = (
             "placement shard sync owner_index document_repository endpoint_screening forward tasks".split()
         ),
     ),
-    ("data", frozenset("s3 blob staging replication distribution metadata git shares connectors device".split())),
+    ("data", frozenset("s3 blob staging replication distribution transfer metadata git shares connectors device".split())),
     ("work and integrations", frozenset("jobs plugins assistant notifications federation harvest node".split())),
 )
 ANY_CRATE = "*"

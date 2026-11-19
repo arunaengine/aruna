@@ -25,10 +25,10 @@ use aruna_core::types::{GroupId, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::distribution::feed_walks::{FeedError, RangeProgressOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::replication::bootstrap::{BootstrapError, ReadCursorOperation};
 use crate::replication::members::{CopyLag, CopyLagOperation, LagMap, RecordError};
+use crate::transfer::feed_walks::{FeedError, RangeProgressOperation};
 use aruna_core::heartbeat::Heard;
 use aruna_core::structs::storage::distribution::search::IndexProgress;
 

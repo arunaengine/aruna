@@ -27,10 +27,10 @@ use aruna_core::structs::storage::format::Compression;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::admit::{AdmitConfig, AdmitError, AdmitOperation};
-use super::publish::PublishError;
 use crate::auth::error::{AuthorizeError, pull_refusal};
 use crate::auth::request_authorization::AuthorizeOperation;
+use crate::distribution::admit::{AdmitConfig, AdmitError, AdmitOperation};
+use crate::distribution::publish::PublishError;
 use crate::document_repository::{config_of, realm_config};
 use crate::forward::transport::reject;
 use crate::forward::write_peer::WritePeerOperation;

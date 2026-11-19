@@ -38,17 +38,17 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::fence_row::{FenceChange, FenceError, UpdateFenceOperation};
-use super::imports::{
-    FencedImportsOperation, FetchImportsOperation, ImportError, KeepResumeOperation,
-};
 use super::purge_steps::{
     ClearSetOperation, DeleteRowsOperation, DropResumeOperation, PurgeError, PurgeRangeOperation,
     PurgeRestOperation, PurgeTarget, Purged, RangeUploadsOperation, ReadRowOperation,
 };
-use super::roots::{RootsCheckOperation, RootsError, RootsOutcome, Sweep};
 use super::status_view::{ReadViewOperation, StatusError};
-use super::submit::{StateOperation, Stated};
+use crate::distribution::fence_row::{FenceChange, FenceError, UpdateFenceOperation};
+use crate::distribution::imports::{
+    FencedImportsOperation, FetchImportsOperation, ImportError, KeepResumeOperation,
+};
+use crate::distribution::roots::{RootsCheckOperation, RootsError, RootsOutcome, Sweep};
+use crate::distribution::submit::{StateOperation, Stated};
 use crate::replication::members::{OwesFanoutOperation, RecordError};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::usage::{MarkDirtyOperation, dirty_rows};
