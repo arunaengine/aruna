@@ -7,16 +7,17 @@ use super::job_calls::{
     AdoptOutcome, CancelRequestOutcome, ClaimOutcome, ExecutionCompleteOutcome, ParkOutcome,
     ReleaseOutcome, RequeueOutcome,
 };
+use super::list_jobs::ListJobsOperation;
 use super::store_call::RowBatch;
 use super::*;
 use crate::jobs::store::test_calls::{
     adopt_external_attempt, begin_external_running, cancel_running_job, claim_job,
     complete_execution, complete_job, defer_job, delete_finished_run, exhaust_job, fail_job,
-    find_dedup_job, handoff_external_attempt, insert_job, list_job_entries, list_user_jobs,
-    mark_indeterminate, persist_output_record, put_job_entry, put_state, read_attempt_control,
-    read_crate_status, read_job_record, read_launch_record, read_state, record_attempt_intent,
-    release_job, renew_lease, requeue_before_attempt, requeue_job, set_cancel_requested,
-    settle_attempt, transition_to_running,
+    find_dedup_job, handoff_external_attempt, insert_job, list_job_entries, mark_indeterminate,
+    persist_output_record, put_job_entry, put_state, read_attempt_control, read_crate_status,
+    read_job_record, read_launch_record, read_state, record_attempt_intent, release_job,
+    renew_lease, requeue_before_attempt, requeue_job, set_cancel_requested, settle_attempt,
+    transition_to_running,
 };
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -1365,9 +1366,12 @@ async fn filter_scans_pages() {
     .await
     .unwrap();
 
-    let (page, cursor) = list_user_jobs(&context, owner, None, 1, |record| {
-        record.state == JobState::Failed
-    })
+    let (page, cursor) = drive(
+        ListJobsOperation::new(owner, None, 1, |record: &JobRecord| {
+            record.state == JobState::Failed
+        }),
+        &context,
+    )
     .await
     .unwrap();
     assert_eq!(page.len(), 1, "the older Failed job is found across pages");
@@ -1420,9 +1424,12 @@ async fn internal_jobs_hidden() {
     )
     .await
     .unwrap();
-    let (listed, cursor) = list_user_jobs(&context, owner, None, 1, |_| true)
-        .await
-        .unwrap();
+    let (listed, cursor) = drive(
+        ListJobsOperation::new(owner, None, 1, |_: &JobRecord| true),
+        &context,
+    )
+    .await
+    .unwrap();
     assert!(listed.is_empty(), "stale owner entries stay hidden");
     assert!(cursor.is_none());
 }
@@ -1471,9 +1478,12 @@ async fn cleanup_jobs_hidden() {
     )
     .await
     .unwrap();
-    let (listed, cursor) = list_user_jobs(&context, owner, None, 1, |_| true)
-        .await
-        .unwrap();
+    let (listed, cursor) = drive(
+        ListJobsOperation::new(owner, None, 1, |_: &JobRecord| true),
+        &context,
+    )
+    .await
+    .unwrap();
     assert!(listed.is_empty());
     assert!(cursor.is_none());
 }
@@ -1666,9 +1676,12 @@ async fn run_delete_rules() {
             .unwrap()
             .is_none()
     );
-    let (listed, _) = list_user_jobs(&context, owner, None, 10, |_| true)
-        .await
-        .unwrap();
+    let (listed, _) = drive(
+        ListJobsOperation::new(owner, None, 10, |_: &JobRecord| true),
+        &context,
+    )
+    .await
+    .unwrap();
     let ids: Vec<JobId> = listed.iter().map(|record| record.job_id).collect();
     assert!(!ids.contains(&finished.job_id));
     assert!(!ids.contains(&probe.job_id));
@@ -2486,7 +2499,6 @@ fn capacity_not_conflict() {
 // A listing reads the record of an index row that carries none, and a short page ends it.
 #[test]
 fn list_reads_bare_rows() {
-    use super::list_jobs::ListJobsOperation;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
     let record = queued_record(job_id(1_000));

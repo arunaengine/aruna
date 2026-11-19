@@ -12,7 +12,6 @@ use super::job_calls::ReleaseOutcome;
 use super::job_calls::RenewOutcome;
 use super::job_calls::RequeueOutcome;
 use super::job_calls::RunSuccess;
-use super::list_jobs::ListJobsOperation;
 use super::mutation::{MutateJobOperation, NoGuard};
 use super::park_wake::AwaitOutcome;
 use super::*;
@@ -231,21 +230,6 @@ pub async fn list_job_entries(
 ) -> Result<(Vec<(Vec<u8>, Value)>, Option<Vec<u8>>), String> {
     drive(
         row_calls::list_job_entries(job_id, last_key, limit),
-        context,
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
-pub async fn list_user_jobs(
-    context: &DriverContext,
-    user_id: UserId,
-    cursor: Option<Vec<u8>>,
-    limit: usize,
-    filter: impl Fn(&JobRecord) -> bool + Send,
-) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
-    drive(
-        ListJobsOperation::new(user_id, cursor, limit, filter),
         context,
     )
     .await

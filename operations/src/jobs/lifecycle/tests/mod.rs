@@ -24,7 +24,6 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_millis;
-use ulid::Ulid;
 
 use crate::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
 use crate::jobs::lifecycle::cancel::{CancelFamilyOperation, PublishDeletionOperation};
@@ -95,28 +94,20 @@ pub(super) async fn family_audit(
     drive(read, context).await.transpose()
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Submits `spec` for the test user under the idempotency key `key`, without a workspace.
 pub(super) async fn submit_external_job(
     context: &DriverContext,
     spec: ExecutionSpec,
-    created_by: UserId,
-    idempotency_key: Option<String>,
-    workspace_mode: WorkspaceMode,
-    workspace_bucket: Option<String>,
-    retention_ms: u64,
+    key: &str,
     auth_token: Option<AuthToken>,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
-    let scope = match idempotency_key {
-        Some(key) => SubmissionScope::Keyed(key),
-        None => SubmissionScope::Unkeyed(Ulid::generate()),
-    };
     let submission = ExternalSubmission {
         spec,
-        created_by,
-        scope,
-        workspace_mode,
-        workspace_bucket,
-        retention_ms,
+        created_by: crate::tests::records::user(),
+        scope: SubmissionScope::Keyed(key.to_string()),
+        workspace_mode: WorkspaceMode::None,
+        workspace_bucket: None,
+        retention_ms: 60_000,
         auth_token,
     };
     let submit = SubmitExternalOperation::new(

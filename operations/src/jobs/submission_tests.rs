@@ -20,7 +20,8 @@ use ulid::Ulid;
 
 use super::job_artifacts::{ArtifactLookup, OwnedArtifactOperation};
 use super::job_cancel::CancelJobOutcome;
-use super::job_reads::tests::{cancel_owned_job, read_owned_job, read_owned_report};
+use super::job_cancel::CancelOwnedOperation;
+use super::job_reads::tests::{read_owned_job, read_owned_report};
 use super::job_reports::{JobReportLookup, ReportQuery};
 use super::store::row_calls::preserve_artifact_tombstone;
 use super::submit::SubmitJobError;
@@ -29,7 +30,6 @@ use super::submit_local::DedupLookupOperation;
 use crate::jobs::store::test_calls::read_job_record;
 use crate::jobs::store::test_calls::{insert_job, submit_execution_job};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_drivers::jobs::runtime::JobsRuntime;
 
 fn node_id() -> NodeId {
     iroh::SecretKey::from_bytes(&[7u8; 32]).public()
@@ -434,7 +434,6 @@ async fn internal_access_hidden() {
         outbound_handle: None,
     };
     let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
-    let runtime = JobsRuntime::new();
     for (job_id, payload) in [
         (
             JobId::from_bytes([0xC3; 16]),
@@ -460,12 +459,10 @@ async fn internal_access_hidden() {
                 .unwrap()
                 .is_none()
         );
-        assert!(matches!(
-            cancel_owned_job(&context, &runtime, owner, job_id)
-                .await
-                .unwrap(),
-            CancelJobOutcome::NotFound
-        ));
+        let cancel = CancelOwnedOperation::new(owner, job_id, unix_timestamp_millis());
+        let report = drive(cancel, &context).await.unwrap();
+        assert!(report.running.is_empty());
+        assert!(matches!(report.outcome, CancelJobOutcome::NotFound));
         let stored = read_job_record(&context, job_id, None)
             .await
             .unwrap()

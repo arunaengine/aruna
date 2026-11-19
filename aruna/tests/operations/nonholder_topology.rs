@@ -459,21 +459,11 @@ async fn cap_stays_local() -> TestResult<()> {
     };
     let ingress = realm.node(0);
     seed_upload(ingress, realm.user_id, 1).await?;
-    let first = submit_rocrate_import(
-        ingress.context.as_ref(),
-        import_spec(1),
-        ingress.node_id(),
-        None,
-    )
-    .await?;
+    let first =
+        submit_rocrate_import(ingress.context.as_ref(), import_spec(1), ingress.node_id()).await?;
     assert!(first.created);
-    let capped = submit_rocrate_import(
-        ingress.context.as_ref(),
-        import_spec(2),
-        ingress.node_id(),
-        None,
-    )
-    .await;
+    let capped =
+        submit_rocrate_import(ingress.context.as_ref(), import_spec(2), ingress.node_id()).await;
     assert!(matches!(
         capped,
         Err(SubmitJobError::ActiveJobLimit { limit: 1 })
@@ -481,13 +471,8 @@ async fn cap_stays_local() -> TestResult<()> {
 
     let other = realm.node(1);
     seed_upload(other, realm.user_id, 3).await?;
-    let accepted = submit_rocrate_import(
-        other.context.as_ref(),
-        import_spec(3),
-        other.node_id(),
-        None,
-    )
-    .await?;
+    let accepted =
+        submit_rocrate_import(other.context.as_ref(), import_spec(3), other.node_id()).await?;
     assert!(accepted.created, "another origin counts its own cap");
 
     realm.shutdown().await;
