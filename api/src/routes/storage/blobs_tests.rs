@@ -10,9 +10,8 @@ use crate::auth::RealmAuth;
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
 use crate::server::state::ServerState;
+use crate::tests::routes::write_fixture;
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
@@ -308,23 +307,6 @@ fn realm_for(seed: u8) -> RealmId {
             .verifying_key()
             .as_bytes(),
     )
-}
-
-async fn write_fixture(state: &ServerState, key_space: &str, key: ByteView, value: ByteView) {
-    match state
-        .get_ctx()
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key,
-            value,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => panic!("unexpected fixture write event: {other:?}"),
-    }
 }
 
 /// A realm holding one group whose owner may read `TEST_BUCKET`.

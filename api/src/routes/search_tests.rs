@@ -11,6 +11,7 @@ use crate::metadata::{
 };
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::rocrate::replace_metadata_rocrate;
+use crate::routes::metadata::tests::drain_metadata_background;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -29,8 +30,6 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::{drain_projection_queue, replay_event_log};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use axum::extract::Path;
@@ -337,15 +336,6 @@ async fn attach_file(fx: &Fixture, document_id: &str, name: &str) {
     )
     .await
     .unwrap();
-}
-
-async fn drain_projection(state: &ServerState) {
-    let ctx = state.get_ctx();
-    let drained = drain_projection_queue(ctx.as_ref()).await.unwrap();
-    if drained.markers_examined == 0 {
-        replay_event_log(ctx.as_ref()).await.unwrap();
-    }
-    process_materialization_batch(ctx.as_ref()).await.unwrap();
 }
 
 async fn flush_search(state: &ServerState) {
@@ -827,9 +817,9 @@ async fn documents_include_types() {
     let fx = setup().await;
     let document_id = create_doc(&fx, fx.groups[0], "datasets/reef", "epsilon-reef").await;
     // The crate can only be replaced once its graph is materialized.
-    drain_projection(&fx.state).await;
+    drain_metadata_background(&fx.state).await;
     attach_file(&fx, &document_id, "epsilon-reef").await;
-    drain_projection(&fx.state).await;
+    drain_metadata_background(&fx.state).await;
     flush_search(&fx.state).await;
 
     let documents = search(
@@ -871,7 +861,7 @@ async fn filters_documents_group() {
     let fx = setup().await;
     create_doc(&fx, fx.groups[0], "datasets/one", "gamma-one").await;
     create_doc(&fx, fx.groups[1], "datasets/two", "gamma-two").await;
-    drain_projection(&fx.state).await;
+    drain_metadata_background(&fx.state).await;
     flush_search(&fx.state).await;
 
     let documents = search(
