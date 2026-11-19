@@ -29,9 +29,8 @@ use aruna_core::structs::storage::distribution::accounting::{
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, Position, range_interval,
 };
-use aruna_core::structs::storage::distribution::search::{IndexState, decode_feed};
+use aruna_core::structs::storage::distribution::search::{IndexProgress, IndexState, decode_feed};
 use aruna_core::types::{Key, Value};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -98,16 +97,6 @@ pub struct FeedCursors {
 pub struct FeedPass {
     pub busy: bool,
     pub cursors: FeedCursors,
-}
-
-/// How far this node's search index of one range is.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct IndexProgress {
-    pub ready: bool,
-    /// Keys in the index as of its last commit.
-    pub indexed: u64,
-    /// Keys of the range by this node's range counters; a split child counts its parent's too.
-    pub keys: u64,
 }
 
 /// The index state row of a range, keyed like its account row.

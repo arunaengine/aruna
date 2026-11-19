@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::object::search::{
-    ObjectInventoryChecksum, ObjectInventoryHit, ObjectKeyMatch, SEARCH_MAX_LIMIT, SearchNodeHit,
-    SearchNodePage, SearchObjectsError, SearchObjectsInput,
+use crate::s3::object::search::{SEARCH_MAX_LIMIT, SearchObjectsError, SearchObjectsInput};
+use aruna_core::search::{
+    ObjectInventoryChecksum, ObjectInventoryHit, ObjectKeyMatch, SearchNodeHit, SearchNodePage,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

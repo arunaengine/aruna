@@ -75,6 +75,7 @@ pub mod rocrate_archive;
 pub mod row_plan;
 pub mod rows;
 pub mod scheduling;
+pub mod search;
 pub mod search_enrichment;
 pub mod secret_registers;
 pub mod secrets;

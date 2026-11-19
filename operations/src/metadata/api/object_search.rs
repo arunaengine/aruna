@@ -38,8 +38,9 @@ use super::{DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::load_config::config_unavailable;
-use crate::s3::object::search::{SearchNodePage, SearchObjectsError, SearchObjectsInput};
+use crate::s3::object::search::{SearchObjectsError, SearchObjectsInput};
 use crate::s3::object::search_scan::SearchObjectsOperation;
+use aruna_core::search::SearchNodePage;
 
 /// How the object fanout asks each node, from where the cursor left that node.
 #[derive(Debug, PartialEq)]

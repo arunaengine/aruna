@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::object::search::{ObjectInventoryHit, ObjectKeyMatch, SearchNodeHit};
 use aruna_core::UserId;
+use aruna_core::search::{ObjectInventoryHit, ObjectKeyMatch, SearchNodeHit};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BlobHeadKey;
 use ulid::Ulid;

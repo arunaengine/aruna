@@ -41,9 +41,8 @@ use crate::metadata::api::export_types::RoCrateExportView;
 use crate::metadata::api::preflight_types::{ReferenceNodeExecution, ReferenceNodeRequest};
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::update_document::UpdateDocumentMutation;
-use crate::s3::bucket::search::BucketPage;
-use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
+use aruna_core::search::{BucketPage, ObjectKeyMatch, SearchNodePage};
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
 use aruna_core::metadata::AuthToken;

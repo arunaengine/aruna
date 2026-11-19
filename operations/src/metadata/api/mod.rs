@@ -55,8 +55,6 @@ use super::search_cursor::{
 };
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::repository::LIST_METADATA_SIZE;
-use crate::s3::bucket::search::{BucketPage, BucketSearchHit};
-use crate::s3::object::search::{ObjectInventoryHit, ObjectKeyMatch, SearchNodePage};
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT};
 use aruna_core::placement::selector::{
@@ -65,6 +63,9 @@ use aruna_core::placement::selector::{
 use aruna_core::placement::{
     holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
     registry_strategy, resolve_holders_limit, resolve_shard_holders,
+};
+use aruna_core::search::{
+    BucketPage, BucketSearchHit, ObjectInventoryHit, ObjectKeyMatch, SearchNodePage,
 };
 
 pub(crate) mod access;

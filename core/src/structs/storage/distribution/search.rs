@@ -47,6 +47,16 @@ pub fn decode_feed(bytes: &[u8]) -> Result<Option<HeadEntry>, ConversionError> {
     Ok(postcard::from_bytes(bytes)?)
 }
 
+/// How far this node's search index of one range is.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndexProgress {
+    pub ready: bool,
+    /// Keys in the index as of its last commit.
+    pub indexed: u64,
+    /// Keys of the range by this node's range counters; a split child counts its parent's too.
+    pub keys: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,3 +78,4 @@ mod tests {
         assert_ne!(value, feed_value(None).unwrap());
     }
 }
+

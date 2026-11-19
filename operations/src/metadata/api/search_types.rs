@@ -9,7 +9,7 @@ use super::{
     SystemTime,
 };
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::distribution::feed_walks::IndexProgress;
+use aruna_core::structs::storage::distribution::search::IndexProgress;
 
 #[derive(Clone, PartialEq)]
 pub struct MetadataSearchRequest {

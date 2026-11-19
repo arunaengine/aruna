@@ -35,9 +35,10 @@ use crate::metadata::text_search::LocalSearchOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::LocalBucketSearch;
 use crate::s3::bucket::release::publish::{HolderAnswerOperation, PublishError};
-use crate::s3::bucket::search::{BucketPage, SearchBucketsError, SearchBucketsInput};
-use crate::s3::object::search::{SearchNodePage, SearchObjectsError, SearchObjectsInput};
+use crate::s3::bucket::search::{SearchBucketsError, SearchBucketsInput};
+use crate::s3::object::search::{SearchObjectsError, SearchObjectsInput};
 use crate::s3::object::search_scan::SearchObjectsOperation;
+use aruna_core::search::{BucketPage, SearchNodePage};
 
 /// The reply a forwarded read answers with.
 #[derive(Clone, Copy, Debug, PartialEq)]
