@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::peer_auth::authorize_peer;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,9 +16,7 @@ use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use tracing::Span;
 
-use super::peer_auth::{
-    bucket_search_auth, config_digest_matches, release_auth, search_reader_auth,
-};
+use super::peer_auth::config_digest_matches;
 use super::query::query_local_graphs;
 use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
@@ -33,12 +30,14 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
+use crate::forward::authorize::ForwardedCallerOperation;
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
 use crate::metadata::message_kind::transport_message_kind;
 use crate::metadata::protocol::metadata_read_error;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
+use crate::metadata::read_peer::{PeerReader, ReadPeerOperation, SearchPeerOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::LocalBucketSearch;
 use crate::s3::bucket::release::publish::{HolderAnswerOperation, PublishError};
@@ -55,6 +54,38 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::node_state::ReadInfoOperation;
 
 impl MetadataHandle {
+    /// The caller of a read `peer` forwarded, as [`ReadPeerOperation`] checks it.
+    async fn read_caller(
+        &self,
+        context: &DriverContext,
+        peer: NodeId,
+        auth_token: Option<AuthToken>,
+        trusted: bool,
+    ) -> Result<Option<AuthContext>, MetadataReadError> {
+        let net = self.inner.net_handle.as_ref();
+        let realm_id = net
+            .map(|net| *net.realm_id())
+            .ok_or(MetadataReadError::Unavailable)?;
+        let check = ReadPeerOperation::new((peer, realm_id), auth_token, trusted);
+        drive(check, context).await
+    }
+
+    /// The caller of a search or release request `peer` forwarded, as `reader` admits it.
+    async fn search_caller(
+        &self,
+        context: &DriverContext,
+        peer: NodeId,
+        auth_token: Option<AuthToken>,
+        reader: PeerReader,
+    ) -> Result<AuthContext, MetadataReadError> {
+        let net = self.inner.net_handle.as_ref();
+        let realm_id = net
+            .map(|net| *net.realm_id())
+            .ok_or(MetadataReadError::Unavailable)?;
+        let check = SearchPeerOperation::new((peer, realm_id), auth_token, reader);
+        drive(check, context).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn apply_sync_mirror(
         &self,
@@ -71,20 +102,16 @@ impl MetadataHandle {
             return MetadataTransportMessage::Reject("mirror_internal".to_string());
         };
         let vouched = matches!(auth_token, Some(AuthToken::Internal(_)));
-        let auth = match authorize_peer(
-            &self.inner.auth_validation,
-            &self.inner.storage_handle,
-            peer,
-            Some(*net_handle.realm_id()),
-            auth_token,
-            true,
-        )
-        .await
-        {
-            Ok(Some(auth)) => auth,
-            Ok(None) => {
+        // A mirror needs a caller; a device replay vouches for writes, not for mirrors.
+        let token = match auth_token {
+            Some(AuthToken::Replay { .. }) | None => {
                 return MetadataTransportMessage::Reject("access_denied".to_string());
             }
+            Some(token) => token,
+        };
+        let check = ForwardedCallerOperation::for_token(peer, *net_handle.realm_id(), Some(token));
+        let auth = match drive(check, context.as_ref()).await {
+            Ok(auth) => auth,
             Err(_) => return MetadataTransportMessage::Reject("access_denied".to_string()),
         };
 
@@ -323,7 +350,7 @@ impl MetadataHandle {
                 sparql,
             } => {
                 Box::pin(async {
-                    match self.authorize_read_peer(peer, auth_token, false).await {
+                    match self.read_caller(context, peer, auth_token, false).await {
                         Ok(auth_context) => {
                             match query_local_graphs(
                                 self.inner.clone(),
@@ -355,7 +382,7 @@ impl MetadataHandle {
                 group_id,
             } => {
                 Box::pin(async {
-                    match self.authorize_read_peer(peer, auth_token, false).await {
+                    match self.read_caller(context, peer, auth_token, false).await {
                         Ok(auth_context) => match search_local_graphs(
                             context,
                             self.inner.clone(),
@@ -393,7 +420,7 @@ impl MetadataHandle {
                 group_id,
             } => {
                 Box::pin(async {
-                    match self.authorize_read_peer(peer, auth_token, false).await {
+                    match self.read_caller(context, peer, auth_token, false).await {
                         Ok(auth_context) => match search_local_graphs(
                             context,
                             self.inner.clone(),
@@ -437,7 +464,7 @@ impl MetadataHandle {
                 request,
             } => {
                 Box::pin(async {
-                    let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                    let result = match self.read_caller(context, peer, auth_token, false).await {
                         Ok(auth) => match context.net_handle.as_ref() {
                             Some(net) => {
                                 let local = net.node_id();
@@ -487,14 +514,7 @@ impl MetadataHandle {
                 database,
             } => {
                 Box::pin(async {
-                    match search_reader_auth(
-                        &self.inner.auth_validation,
-                        &self.inner.storage_handle,
-                        peer,
-                        self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
-                        auth_token,
-                    )
-                    .await
+                    match (self.search_caller(context, peer, auth_token, PeerReader::Buckets)).await
                     {
                         Ok(auth) => match self.inner.net_handle.as_ref() {
                             Some(net_handle) => match crate::driver::drive(
@@ -542,14 +562,7 @@ impl MetadataHandle {
                 as_of,
             } => {
                 Box::pin(async {
-                    match bucket_search_auth(
-                        &self.inner.auth_validation,
-                        &self.inner.storage_handle,
-                        peer,
-                        self.inner.net_handle.as_ref().map(|net| *net.realm_id()),
-                        auth_token,
-                    )
-                    .await
+                    match (self.search_caller(context, peer, auth_token, PeerReader::Objects)).await
                     {
                         Ok(auth) => match self.inner.net_handle.as_ref() {
                             Some(net_handle) => match crate::driver::drive(
@@ -595,11 +608,10 @@ impl MetadataHandle {
                 ask,
             } => {
                 let result = Box::pin(async {
-                    let realm_id = self.inner.net_handle.as_ref().map(|net| *net.realm_id());
-                    let storage = &self.inner.storage_handle;
-                    let validation = &self.inner.auth_validation;
-                    let auth =
-                        release_auth(validation, storage, peer, realm_id, auth_token).await?;
+                    let reader = PeerReader::Release;
+                    let auth = self
+                        .search_caller(context, peer, auth_token, reader)
+                        .await?;
                     let net_handle =
                         (self.inner.net_handle.as_ref()).ok_or(MetadataReadError::Unavailable)?;
                     let scope = (*net_handle.realm_id(), net_handle.node_id());
@@ -693,7 +705,7 @@ impl MetadataHandle {
                 config_digest,
             } => {
                 Box::pin(async {
-                    let result = match self.authorize_read_peer(peer, auth_token, true).await {
+                    let result = match self.read_caller(context, peer, auth_token, true).await {
                         Ok(auth) => match context.net_handle.as_ref() {
                             Some(net) => {
                                 let realm_id = *net.realm_id();
@@ -744,7 +756,7 @@ impl MetadataHandle {
             } => {
                 Box::pin(async {
                     let result =
-                        match self.authorize_read_peer(peer, auth_token, false).await {
+                        match self.read_caller(context, peer, auth_token, false).await {
                             Ok(auth) => match context.net_handle.as_ref() {
                                 Some(net) => {
                                     let realm_id = *net.realm_id();
@@ -898,7 +910,7 @@ impl MetadataHandle {
             .ok_or(MetadataReadError::Unavailable)?;
         let auth_token = request.auth_token.clone();
         let auth =
-            tokio::time::timeout_at(deadline, self.authorize_read_peer(peer, auth_token, false))
+            tokio::time::timeout_at(deadline, self.read_caller(context, peer, auth_token, false))
                 .await
                 .map_err(|_| MetadataReadError::Unavailable)??
                 .ok_or(MetadataReadError::Unauthorized)?;
@@ -1194,7 +1206,7 @@ impl MetadataHandle {
                 value,
                 endpoint,
             } => {
-                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                let result = match self.read_caller(context, peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
                         Some(net_handle) => {
                             use crate::metadata::identifier_lookup::{
@@ -1221,7 +1233,7 @@ impl MetadataHandle {
                 auth_token,
                 request,
             } => {
-                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                let result = match self.read_caller(context, peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
                         Some(net_handle) => {
                             use crate::metadata::api::links::local::LinksLocalOperation;
@@ -1239,7 +1251,7 @@ impl MetadataHandle {
                 (MetadataTransportMessage::DataLinkResults { result }, None)
             }
             MetadataTransportMessage::BucketOwner { auth_token, bucket } => {
-                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                let result = match self.read_caller(context, peer, auth_token, false).await {
                     Ok(Some(_)) => crate::driver::drive(
                         crate::s3::bucket::get::GetBucketOperation::new(bucket),
                         context.as_ref(),
@@ -1262,7 +1274,7 @@ impl MetadataHandle {
                 set_id,
                 limit,
             } => {
-                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                let result = match self.read_caller(context, peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
                         Some(net_handle) => {
                             use crate::metadata::api::links::local::SetPreviewOperation;

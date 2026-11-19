@@ -41,6 +41,7 @@ use crate::metadata::profile::validation::RevalidateOperation;
 use crate::metadata::profile::validation::ValidationStatusOperation;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::metadata::read_peer::ReadPeerOperation;
 use crate::metadata::update_document::UpdateDocumentConfig;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentOperation;
@@ -95,13 +96,11 @@ pub(crate) async fn apply_forwarded_write(
     } = &message
     {
         return Box::pin(async {
-            let Some(metadata) = context.metadata_handle.as_ref() else {
+            if context.metadata_handle.is_none() {
                 return reject("forwarded metadata read needs a metadata handle");
-            };
-            let result = match metadata
-                .authorize_read_peer(peer, auth_token.clone(), false)
-                .await
-            {
+            }
+            let check = ReadPeerOperation::new((peer, realm_id), auth_token.clone(), false);
+            let result = match drive(check, context.as_ref()).await {
                 Ok(auth)
                     if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
                 {
@@ -135,15 +134,13 @@ pub(crate) async fn apply_forwarded_write(
     } = &message
     {
         return Box::pin(async {
-            let Some(metadata) = context.metadata_handle.as_ref() else {
+            if context.metadata_handle.is_none() {
                 return MetadataTransportMessage::ForwardedValidationStatus {
                     result: Err(MetadataReadError::Unavailable),
                 };
-            };
-            let result = match metadata
-                .authorize_read_peer(peer, auth_token.clone(), false)
-                .await
-            {
+            }
+            let check = ReadPeerOperation::new((peer, realm_id), auth_token.clone(), false);
+            let result = match drive(check, context.as_ref()).await {
                 Ok(auth)
                     if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
                 {
@@ -514,13 +511,12 @@ pub(crate) async fn apply_forwarded_export(
     if config.digest().ok() != Some(config_digest) {
         return Err(MetadataReadError::Unavailable);
     }
-    let metadata = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataReadError::Unavailable)?;
-    let auth = metadata
-        .authorize_read_peer(peer, auth_token, false)
-        .await?;
+    let check = ReadPeerOperation::new((peer, realm_id), auth_token, false);
+    let auth = drive(check, context.as_ref()).await?;
     if !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id) {
         return Err(MetadataReadError::Unavailable);
     }
@@ -567,13 +563,12 @@ pub(crate) async fn apply_document_query(
     {
         return Err(MetadataReadError::Unavailable);
     }
-    let metadata = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataReadError::Unavailable)?;
-    let auth = metadata
-        .authorize_read_peer(peer, auth_token, false)
-        .await?;
+    let check = ReadPeerOperation::new((peer, realm_id), auth_token, false);
+    let auth = drive(check, context.as_ref()).await?;
     let record = drive(
         VisibleRecordOperation::new(
             realm_id,

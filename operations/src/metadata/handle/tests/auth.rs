@@ -5,8 +5,6 @@
 use super::super::WritePeerError;
 use super::super::peer_auth::{authorize_peer, remote_auth_context, replay_authority};
 use super::*;
-use crate::metadata::handle::peer_auth::{bucket_search_auth, search_reader_auth};
-use crate::metadata::protocol::MetadataReadError;
 use crate::testing::sign_token;
 use aruna_core::auth::REALMS_LIST_KEY;
 use aruna_core::effects::StorageEffect;
@@ -220,56 +218,6 @@ async fn internal_foreign_user() {
             false => assert!(result.is_err()),
         }
     }
-}
-
-#[tokio::test]
-async fn bad_bucket_token() {
-    let (_dir, storage) = auth_storage();
-    let realm_id = RealmId([17u8; 32]);
-    let auth = bucket_search_auth(
-        &AuthValidationState::new(storage.clone(), Some(realm_id)),
-        &storage,
-        node_id_seed(18),
-        Some(realm_id),
-        Some(AuthToken::bearer("invalid-token").unwrap()),
-    )
-    .await;
-
-    assert_eq!(auth, Err(MetadataReadError::Unauthorized));
-}
-
-#[tokio::test]
-async fn bucket_realm_mismatch() {
-    // The same valid token authorizes its own realm and is denied for
-    // another one, so the denial is the realm boundary and not a bad token.
-    let (realm_signing_key, realm_id, user_id) = realm_fixture();
-    let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
-    let peer = node_id_seed(31);
-    let (_dir, storage) = auth_storage();
-    persist_auth_state(&storage, REALMS_LIST_KEY, &HashSet::from([realm_id])).await;
-    persist_realm_config(&storage, realm_id, &[peer]).await;
-    let state = AuthValidationState::new(storage.clone(), Some(realm_id));
-    let auth_token = AuthToken::bearer(token).unwrap();
-
-    let allowed = bucket_search_auth(
-        &state,
-        &storage,
-        peer,
-        Some(realm_id),
-        Some(auth_token.clone()),
-    )
-    .await;
-    let denied = bucket_search_auth(
-        &state,
-        &storage,
-        peer,
-        Some(RealmId([21u8; 32])),
-        Some(auth_token),
-    )
-    .await;
-
-    assert_eq!(allowed.map(|auth| auth.realm_id), Ok(realm_id));
-    assert_eq!(denied, Err(MetadataReadError::Forbidden));
 }
 
 #[tokio::test]
@@ -513,18 +461,4 @@ async fn replay_respects_cutoff() {
         replay_authority(&storage, replay(cutoff, (cutoff - 1) * 1000)).await,
         Err(WritePeerError::Unauthorized)
     ));
-}
-
-#[tokio::test]
-async fn signed_out_search() {
-    // A bucket search without a bearer reads as Everyone, from a configured member only.
-    let realm_id = RealmId([23u8; 32]);
-    let (peer, stranger) = (node_id_seed(24), node_id_seed(25));
-    let (_dir, storage) = auth_storage();
-    persist_auth_state(&storage, REALMS_LIST_KEY, &HashSet::from([realm_id])).await;
-    persist_realm_config(&storage, realm_id, &[peer]).await;
-    let state = AuthValidationState::new(storage.clone(), Some(realm_id));
-    let reader = |node| search_reader_auth(&state, &storage, node, Some(realm_id), None);
-    assert_eq!(reader(peer).await, Ok(AuthContext::anonymous(realm_id)));
-    assert_eq!(reader(stranger).await, Err(MetadataReadError::Unavailable));
 }

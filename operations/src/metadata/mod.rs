@@ -43,6 +43,7 @@ pub mod public_preview;
 mod query_cache;
 pub(crate) mod raw_events;
 pub mod raw_revision;
+pub(crate) mod read_peer;
 pub mod realm_counts;
 pub mod record_reads;
 pub mod repository;
