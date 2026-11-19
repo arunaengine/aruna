@@ -114,6 +114,8 @@ pub fn final_of(projection: &JobProjection) -> Option<Summary> {
         LogicalJobState::Succeeded => FinalState::Succeeded,
         LogicalJobState::Failed => FinalState::Failed,
         LogicalJobState::Cancelled => FinalState::Cancelled,
+        // Every open execution belongs to a node that left, so the outcome is unknown.
+        LogicalJobState::NotRun => FinalState::Unknown,
         LogicalJobState::Queued | LogicalJobState::Running | LogicalJobState::Indeterminate => {
             return None;
         }
