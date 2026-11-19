@@ -457,7 +457,7 @@ fn batch_syncs_graphs() {
 }
 
 #[test]
-fn busy_slot_syncs_inline() {
+fn busy_slot_waits() {
     // Without a free background slot the drain waits for the sync instead of dropping it.
     let graph_iri = event().record.graph_iri;
     let mut batch = syncing(&graph_iri);
