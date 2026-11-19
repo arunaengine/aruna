@@ -9,7 +9,6 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -31,7 +30,6 @@ use crate::forward::authorize::forward_auth_error;
 use crate::forward::authorize::write_check;
 use crate::forward::routing::{ForwardHoldersOperation, HolderWriteError};
 use crate::forward::transport::reject;
-use crate::jobs::submit_local::SubmitLocalOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::create_document::resolve_metadata_id;
@@ -42,7 +40,6 @@ use crate::metadata::pid_transition::PidTransition;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::StorageReadError;
 use crate::realm::load_config::config_unavailable;
-use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, PersistentIdOutcome, PersistentIdRequest,
     PersistentIdResolution,
@@ -135,29 +132,6 @@ pub fn outcome_resolution(
     match outcome {
         PersistentIdOutcome::Resolution(resolution) => Ok(resolution),
         _ => Err(MetadataApiError::ServiceUnavailable),
-    }
-}
-
-/// The authority's mint job, from a submission outcome.
-pub fn outcome_submission(outcome: PersistentIdOutcome) -> Result<SubmitJobResult, SubmitJobError> {
-    match outcome {
-        PersistentIdOutcome::Submission { job_id, created } => {
-            Ok(SubmitJobResult { job_id, created })
-        }
-        _ => Err(SubmitJobError::PlacementUnavailable(
-            "the authority answered without a job".to_string(),
-        )),
-    }
-}
-
-/// A job submission's failure as the routed mint reports it.
-pub fn submission_error(error: MetadataApiError) -> SubmitJobError {
-    match error {
-        MetadataApiError::NotFound => SubmitJobError::DocumentMissing,
-        MetadataApiError::Unauthorized | MetadataApiError::Forbidden => {
-            SubmitJobError::AuthorityDenied
-        }
-        error => SubmitJobError::PlacementUnavailable(error.to_string()),
     }
 }
 
@@ -297,9 +271,7 @@ fn transition(request: &PersistentIdRequest) -> Option<PidChange> {
                 occurred_at_ms,
             });
         }
-        PersistentIdRequest::SubmitMint { .. }
-        | PersistentIdRequest::Resolve { .. }
-        | PersistentIdRequest::Status => return None,
+        PersistentIdRequest::Resolve { .. } | PersistentIdRequest::Status => return None,
     };
     Some(PidChange::Transition(transition))
 }
@@ -322,8 +294,6 @@ pub(crate) struct LocalPidOperation {
     document_id: Ulid,
     request: PersistentIdRequest,
     caller: Option<AuthContext>,
-    owner: Option<NodeId>,
-    now_ms: u64,
     stage: LocalStage,
 }
 
@@ -339,16 +309,8 @@ impl LocalPidOperation {
             document_id,
             request,
             caller,
-            owner: None,
-            now_ms: 0,
             stage: LocalStage::Answer,
         }
-    }
-
-    /// The node that owns a mint job submitted here; a networked node owns its own jobs.
-    pub(crate) fn with_owner(mut self, owner: Option<NodeId>) -> Self {
-        self.owner = owner;
-        self
     }
 
     fn answer(&mut self) -> Result<Next<PersistentIdOutcome>, MetadataApiError> {
@@ -363,26 +325,6 @@ impl LocalPidOperation {
                 self.document_id,
                 pid.clone(),
             )),
-            PersistentIdRequest::SubmitMint {
-                minted_by,
-                retention_ms,
-            } => {
-                let spec = MintPersistentSpec {
-                    document_id: self.document_id,
-                    minted_by: *minted_by,
-                };
-                let serving = local_node.map(|node| (node, realm_id));
-                let owner =
-                    (local_node.or(self.owner)).ok_or(MetadataApiError::ServiceUnavailable)?;
-                IoCall::child(SubmitLocalOperation::mint_pid(
-                    spec,
-                    realm_id,
-                    owner,
-                    *retention_ms,
-                    serving,
-                    self.now_ms,
-                ))
-            }
             request => {
                 let change = transition(request).ok_or(MetadataApiError::BadRequest)?;
                 let change =
@@ -402,15 +344,6 @@ impl LocalPidOperation {
             PersistentIdRequest::Resolve { .. } => PersistentIdOutcome::Resolution(
                 result.child::<PersistentIdResolution, MetadataApiError>()??,
             ),
-            PersistentIdRequest::SubmitMint { .. } => {
-                let submitted = result.child::<SubmitJobResult, SubmitJobError>()?;
-                let submitted =
-                    submitted.map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-                PersistentIdOutcome::Submission {
-                    job_id: submitted.job_id,
-                    created: submitted.created,
-                }
-            }
             _ => {
                 let changed = result.child::<(PersistentIdMapping, bool), PersistentIdError>()?;
                 let (mapping, changed) = changed.map_err(pid_error)?;
@@ -426,10 +359,6 @@ impl LocalPidOperation {
 impl Operation for LocalPidOperation {
     type Output = PersistentIdOutcome;
     type Error = MetadataApiError;
-
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
 
     fn first(&mut self) -> Result<Next<PersistentIdOutcome>, MetadataApiError> {
         if !matches!(self.request, PersistentIdRequest::AddIdentifiers { .. }) {
@@ -473,15 +402,13 @@ impl Operation for LocalPidOperation {
 
 #[derive(Debug, PartialEq)]
 enum RouteStage {
-    Known,
     Config,
     Local,
     Forward,
 }
 
 /// Runs one PID request on the document's authority: here when this node is it or has no
-/// network, otherwise forwarded to it. A mint job submission first asks the authority for a
-/// job the mapping already names, so alternating ingress nodes join one job.
+/// network, otherwise forwarded to it.
 #[derive(Debug, PartialEq)]
 pub struct PidRouteOperation {
     node: PidNode,
@@ -489,7 +416,6 @@ pub struct PidRouteOperation {
     request: PersistentIdRequest,
     auth_token: Option<AuthToken>,
     caller: Option<AuthContext>,
-    owner: Option<NodeId>,
     stage: RouteStage,
 }
 
@@ -507,15 +433,8 @@ impl PidRouteOperation {
             request,
             auth_token,
             caller,
-            owner: None,
             stage: RouteStage::Config,
         }
-    }
-
-    /// The node that owns a mint job submitted on a node without a network.
-    pub fn with_owner(mut self, owner: NodeId) -> Self {
-        self.owner = Some(owner);
-        self
     }
 
     fn local(&mut self) -> Result<Next<PersistentIdOutcome>, MetadataApiError> {
@@ -525,8 +444,7 @@ impl PidRouteOperation {
             self.document_id,
             self.request.clone(),
             self.caller.clone(),
-        )
-        .with_owner(self.owner);
+        );
         Ok(Next::Call(IoCall::child(local)))
     }
 
@@ -612,33 +530,11 @@ impl Operation for PidRouteOperation {
     type Error = MetadataApiError;
 
     fn first(&mut self) -> Result<Next<PersistentIdOutcome>, MetadataApiError> {
-        if !matches!(self.request, PersistentIdRequest::SubmitMint { .. }) {
-            return self.route();
-        }
-        self.stage = RouteStage::Known;
-        let known = Self::new(
-            self.node,
-            self.document_id,
-            PersistentIdRequest::Status,
-            (self.auth_token.clone(), None),
-        );
-        Ok(Next::Call(IoCall::child(known)))
+        self.route()
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<PersistentIdOutcome>, MetadataApiError> {
         match self.stage {
-            RouteStage::Known => {
-                let known =
-                    outcome_status(result.child::<PersistentIdOutcome, MetadataApiError>()??)?;
-                if let Some(job_id) = known.and_then(|mapping| mapping.job_id) {
-                    let joined = PersistentIdOutcome::Submission {
-                        job_id,
-                        created: false,
-                    };
-                    return Ok(Next::Done(joined));
-                }
-                self.route()
-            }
             RouteStage::Config => {
                 let config = pid_config(result)?;
                 self.configured(config)
@@ -746,8 +642,7 @@ impl ServePidOperation {
         // The minting subject is the token's own subject: a routing hop may not attribute a
         // mint to a user it merely relays for.
         let subject = match &self.request {
-            PersistentIdRequest::Mint { minted_by, .. }
-            | PersistentIdRequest::SubmitMint { minted_by, .. } => Some(*minted_by),
+            PersistentIdRequest::Mint { minted_by, .. } => Some(*minted_by),
             PersistentIdRequest::Withdraw { withdrawn_by, .. } => Some(*withdrawn_by),
             _ => None,
         };
