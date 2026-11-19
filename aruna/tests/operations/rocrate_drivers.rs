@@ -100,7 +100,7 @@ fn job_id() -> JobId {
 
 const ELABFTW: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/operations/fixtures/elabftw.eln"
+    "/../operations/tests/fixtures/elabftw.eln"
 ));
 const BUCKET: &str = "rocrate-target";
 const TARGET_KEY: &str = "imported/data.txt";
