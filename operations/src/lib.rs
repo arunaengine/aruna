@@ -36,6 +36,7 @@ pub mod plugins;
 pub mod realm;
 pub mod realm_vault;
 pub mod recorder;
+pub mod relay;
 pub mod replication;
 pub mod s3;
 pub mod secrets;
