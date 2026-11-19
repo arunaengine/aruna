@@ -89,7 +89,7 @@ enum LiveVersionState {
 }
 
 /// Queues one committed version or delete marker for continuous replication. Answers whether
-/// the drain timer was set.
+/// the drain timer was set, and warns here when it was not, so every caller reports it.
 #[derive(Debug, PartialEq)]
 pub struct LiveVersionOperation {
     input: LiveVersionInput,
@@ -160,7 +160,19 @@ impl Operation for LiveVersionOperation {
             LiveVersionState::WriteObligation => {
                 self.obligation_written(result.child::<(), IoError>()?)
             }
-            LiveVersionState::ScheduleDrain => Ok(Next::Done(drain_scheduled(result))),
+            LiveVersionState::ScheduleDrain => {
+                let scheduled = drain_scheduled(result);
+                if !scheduled {
+                    let input = &self.input;
+                    warn!(
+                        bucket = %input.bucket,
+                        key = %input.key,
+                        version_id = %input.version_id,
+                        "Live replication obligation stored but its drain timer was not set"
+                    );
+                }
+                Ok(Next::Done(scheduled))
+            }
         }
     }
 
@@ -265,5 +277,19 @@ mod tests {
         let error = IoError::Storage(StorageError::Timeout);
         let failed = failing.next(live_written(Err(error.clone())));
         assert_eq!(failed, Err(error));
+    }
+
+    // An unset drain timer leaves the obligation queued and answers false; its warning is the
+    // only other effect.
+    #[test]
+    fn unarmed_drain_false() {
+        let mut operation = live_operation();
+        operation.first().unwrap();
+        operation.next(live_written(Ok(()))).unwrap();
+        let refused = IoResult::Event(Box::new(Event::Task(TaskEvent::Error {
+            key: None,
+            message: "full".to_string(),
+        })));
+        assert_eq!(operation.next(refused), Ok(Next::Done(false)));
     }
 }
