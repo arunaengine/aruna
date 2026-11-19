@@ -94,6 +94,11 @@ pub(crate) struct ReadAccess {
 }
 
 impl ReadAccess {
+    /// The number of groups the caller's read rules cover.
+    pub(crate) fn group_count(&self) -> usize {
+        self.permissions.group_count()
+    }
+
     /// Whether the caller may read `record`: RBAC or public visibility, then the metadata.read
     /// request policies of its scope. A scope without policies hides its records.
     pub(crate) fn shows(&self, record: &MetadataRegistryRecord) -> bool {

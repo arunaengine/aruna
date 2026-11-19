@@ -21,7 +21,7 @@ use crate::metadata::iri_index::{MetadataIriError, ReferenceLookupOperation, Ref
 use crate::metadata::registry_cache::{Registry, RegistryReadOperation, cache_answer};
 use crate::metadata::search_cursor::{compare_hits, tie_order};
 use crate::metadata::span_timing::ReadTiming;
-use crate::metadata::visible_scope::ReadScopeOperation;
+use crate::metadata::visible_scope::{ReadScopeOperation, VisibleRecords};
 
 type Turn = Result<Next<Vec<MetadataSearchHit>>, MetadataError>;
 
@@ -162,6 +162,7 @@ impl Operation for LocalSearchOperation {
             graph_filter_count = self.graph_iris.as_ref().map_or(0, Vec::len) as u64,
             registry_records = field::Empty,
             authorized_graphs = field::Empty,
+            readable_groups = field::Empty,
             lazy = self.realm_wide(),
             registry_ms = field::Empty,
             authorization_ms = field::Empty,
@@ -212,7 +213,12 @@ impl LocalSearchOperation {
                 self.scope(&records, Some(matches))
             }
             SearchStage::Scope(matches) => {
-                let visible = result.child::<Vec<MetadataRegistryRecord>, MetadataError>()??;
+                let visible = result.child::<VisibleRecords, MetadataError>()??;
+                if self.realm_wide() {
+                    self.timing
+                        .note("readable_groups", visible.readable_groups as u64);
+                }
+                let visible = visible.records;
                 self.search(visible, matches)
             }
             SearchStage::Describe => match cache_answer(result)? {
