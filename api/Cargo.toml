@@ -33,6 +33,8 @@ percent-encoding = { workspace = true }
 prometheus-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+fjall = { workspace = true }
+rustix = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

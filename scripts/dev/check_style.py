@@ -24,6 +24,7 @@ EXTERNAL_NAMES = {}
 SMALL_DOMAINS = {
     "api/src/https": "grouped shared-prefix domain",
     "api/src/metadata": "grouped shared-prefix domain",
+    "api/src/provenance": "grouped shared-prefix domain",
     "api/src/routes/access/credentials": "grouped shared-prefix domain",
     "api/src/routes/access/users": "grouped shared-prefix domain",
     "api/src/routes/device/folders": "grouped shared-prefix domain",
@@ -64,7 +65,6 @@ SMALL_DOMAINS = {
     "operations/src/metadata/api/links": "grouped shared-prefix domain",
     "operations/src/metadata/forward": "grouped shared-prefix domain",
     "operations/src/metadata/profile": "grouped shared-prefix domain",
-    "operations/src/metadata/provenance": "grouped shared-prefix domain",
     "operations/src/placement": "coherent ownership scope",
     "operations/src/plugins": "coherent ownership scope",
     "operations/src/replication/incoming": "grouped shared-prefix domain",

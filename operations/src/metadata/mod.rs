@@ -36,7 +36,6 @@ pub(crate) mod pid_transition;
 pub mod profile;
 pub mod projection;
 pub mod protocol;
-pub mod provenance;
 pub mod prune_jobs;
 pub mod prune_queue;
 pub mod public_preview;

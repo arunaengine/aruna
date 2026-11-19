@@ -14,6 +14,7 @@ use self::spool::{Spool, SpoolResult};
 pub use self::spool::{scratch_dir, scratch_file, scratch_name};
 
 use aruna_core::structs::storage::data::identity::text_values;
+use aruna_core::structs::storage::release::{RELEASE_INCOMPLETE, RELEASE_MEMBERSHIP};
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use serde_json::{Map, Value, json};
 
@@ -21,10 +22,6 @@ const CRATE_CONTEXT: &str = "https://w3id.org/ro/crate/1.2/context";
 const CRATE_SPEC: &str = "https://w3id.org/ro/crate/1.2";
 /// Marks a folder as a nested crate (RO-Crate 1.2).
 const NESTED_CRATE: &str = "https://w3id.org/ro/crate";
-
-/// Marks an entity whose release membership could not be checked everywhere.
-pub const RELEASE_MEMBERSHIP: &str = "https://w3id.org/aruna/terms/release-membership";
-pub const RELEASE_INCOMPLETE: &str = "Release membership could not be checked everywhere";
 
 /// What a hop reads next.
 #[derive(Clone, Debug, Eq, PartialEq)]

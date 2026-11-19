@@ -16,6 +16,10 @@ use crate::structs::storage::bucket_metadata::ReleaseRef;
 use crate::structs::storage::origin::{OriginVersion, SourcePin};
 use crate::types::GroupId;
 
+/// Marks an entity whose release membership could not be checked everywhere.
+pub const RELEASE_MEMBERSHIP: &str = "https://w3id.org/aruna/terms/release-membership";
+pub const RELEASE_INCOMPLETE: &str = "Release membership could not be checked everywhere";
+
 /// One exact version whose releases are asked for.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MembershipQuery {

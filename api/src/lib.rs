@@ -23,6 +23,7 @@ pub mod metadata;
 pub mod monitoring;
 pub mod openapi;
 pub mod portal;
+pub mod provenance;
 pub mod rate_limit;
 pub mod routes;
 pub mod s3;
