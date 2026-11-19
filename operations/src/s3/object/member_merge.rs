@@ -779,3 +779,395 @@ pub struct MergedMarkersOperation<S: MarkerSource> {
     step: MarkerStep,
 }
 
+impl<S: MarkerSource> MergedMarkersOperation<S> {
+    pub fn new(source: S, max: usize) -> Self {
+        Self {
+            source,
+            max,
+            view: None,
+            fence: None,
+            ranges: VecDeque::new(),
+            parts: Vec::new(),
+            prefixes: Vec::new(),
+            entries: 0,
+            next_markers: None,
+            last: None,
+            first: true,
+            bytes: 0,
+            visited: 0,
+            step: MarkerStep::View,
+        }
+    }
+
+    fn snapshot(&self) -> Result<&DistributionSnapshot, IoError> {
+        Ok(self.view.as_ref().ok_or(IoError::Unfinished)?.snapshot())
+    }
+
+    fn plan(&mut self) -> MarkerTurn<S::Part> {
+        let prefix = self.source.prefix().unwrap_or_default().to_string();
+        let marker = self.source.key_marker().filter(|marker| !marker.is_empty());
+        let ranges = (self.snapshot()?.listed_ranges(&prefix).into_iter())
+            .filter(|range| {
+                marker.is_none_or(|key| range.upper.as_deref().is_none_or(|upper| key < upper))
+            })
+            .cloned()
+            .collect();
+        self.ranges = ranges;
+        self.next_range()
+    }
+
+    fn finish(&mut self) -> MarkerTurn<S::Part> {
+        Ok(Next::Done(MergedMarkers {
+            parts: std::mem::take(&mut self.parts),
+            prefixes: std::mem::take(&mut self.prefixes),
+            next: self.next_markers.take(),
+        }))
+    }
+
+    fn next_range(&mut self) -> MarkerTurn<S::Part> {
+        let Some(range) = self.ranges.pop_front() else {
+            return self.finish();
+        };
+        let visited = self.visited;
+        self.visited += 1;
+        let remaining = self.max.saturating_sub(self.entries + self.prefixes.len());
+        if remaining == 0 || visited == MAX_PAGE_RANGES || self.bytes >= MAX_PAGE_BYTES {
+            // Nothing listed yet: the nil id starts the next page at this range.
+            let start = || (range.lower.clone(), Some(Ulid::nil().to_string()));
+            self.next_markers = Some(self.last.clone().map_or_else(start, |key| (key, None)));
+            return self.finish();
+        }
+        // The key marker skips a common prefix in every range; the id only in the first.
+        let source = &self.source;
+        let key = source.key_marker().filter(|key| !key.is_empty());
+        let id = source.id_marker().filter(|_| self.first);
+        let markers = (key.map(str::to_string), id.map(str::to_string));
+        self.first = false;
+        let snapshot = self.snapshot()?;
+        let local = source.is_local(snapshot, self.fence.as_ref(), &range);
+        let call = source.call((snapshot, &range, local), markers, remaining)?;
+        self.step = MarkerStep::Part(local);
+        Ok(Next::Call(call))
+    }
+
+    fn part_listed(&mut self, listed: MarkerPart<S::Part>) -> MarkerTurn<S::Part> {
+        let MarkerPart {
+            part,
+            keys,
+            prefixes,
+            next,
+        } = listed;
+        let names = keys.iter().chain(prefixes.iter());
+        self.bytes += names.map(String::len).sum::<usize>();
+        for prefix in prefixes {
+            if self.prefixes.last() != Some(&prefix) {
+                self.prefixes.push(prefix);
+            }
+        }
+        let greatest = keys.iter().chain(self.prefixes.last()).max().cloned();
+        self.last = greatest.or(self.last.take());
+        self.entries += keys.len();
+        self.parts.push(part);
+        if next.is_some() {
+            self.next_markers = next;
+            return self.finish();
+        }
+        self.next_range()
+    }
+}
+
+impl<S: MarkerSource> Operation for MergedMarkersOperation<S> {
+    type Output = MergedMarkers<S::Part>;
+    type Error = MergeError;
+
+    fn first(&mut self) -> MarkerTurn<S::Part> {
+        Ok(Next::Call(IoCall::child(bound_view(self.source.binding()))))
+    }
+
+    fn next(&mut self, result: IoResult) -> MarkerTurn<S::Part> {
+        match self.step {
+            MarkerStep::View => {
+                self.view = Some(result.child::<DistributionView, GuardError>()??);
+                if !self.source.needs_fence() {
+                    return self.plan();
+                }
+                self.step = MarkerStep::Fence;
+                let fence = local_fence(self.source.binding().set_id);
+                Ok(Next::Call(IoCall::child(fence)))
+            }
+            MarkerStep::Fence => {
+                self.fence = Some(result.child::<LocalFence, GuardError>()??);
+                self.plan()
+            }
+            MarkerStep::Part(local) => {
+                let listed = self.source.take(local, result)?;
+                self.part_listed(listed)
+            }
+        }
+    }
+}
+
+/// What a marker listing filters by.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkerQuery {
+    pub bucket: String,
+    pub prefix: Option<String>,
+    pub delimiter: Option<String>,
+    pub key_marker: Option<String>,
+    pub id_marker: Option<String>,
+}
+
+impl MarkerQuery {
+    /// The query parameters a member's listing of this query takes.
+    fn base(
+        &self,
+        (kind, limit_name, id_name): (&'static str, &'static str, &'static str),
+        (key, id): (Option<String>, Option<String>),
+        remaining: usize,
+    ) -> Vec<(&'static str, String)> {
+        let mut base = vec![(kind, String::new()), (limit_name, remaining.to_string())];
+        base.extend(self.prefix.clone().map(|prefix| ("prefix", prefix)));
+        base.extend(self.delimiter.clone().map(|group| ("delimiter", group)));
+        base.extend(key.map(|key| ("key-marker", key)));
+        base.extend(id.map(|id| (id_name, id)));
+        base
+    }
+}
+
+/// The common prefixes and next markers of a member's marker listing.
+fn listed_rest(body: &str, id_tag: &str) -> (Vec<String>, Option<(String, Option<String>)>) {
+    let prefixes = (xml_elements(body, "CommonPrefixes").into_iter())
+        .filter_map(|entry| xml_field(entry, "Prefix"))
+        .collect();
+    let next = (xml_field(body, "IsTruncated").as_deref() == Some("true")).then(|| {
+        let key = xml_field(body, "NextKeyMarker").unwrap_or_default();
+        (key, xml_field(body, id_tag))
+    });
+    (prefixes, next)
+}
+
+/// A version entry another member listed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoteVersion {
+    pub key: String,
+    pub version_id: Option<String>,
+    pub is_latest: Option<bool>,
+    pub last_modified: Option<String>,
+    pub etag: Option<String>,
+    pub size: Option<i64>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum VersionsPart {
+    Local(Box<ListVersionsResult>),
+    Remote {
+        versions: Vec<RemoteVersion>,
+        markers: Vec<RemoteVersion>,
+    },
+}
+
+fn remote_version(entry: &str) -> Option<RemoteVersion> {
+    Some(RemoteVersion {
+        key: xml_field(entry, "Key")?,
+        version_id: xml_field(entry, "VersionId"),
+        is_latest: xml_field(entry, "IsLatest").map(|value| value == "true"),
+        last_modified: xml_field(entry, "LastModified"),
+        etag: xml_field(entry, "ETag"),
+        size: xml_field(entry, "Size").and_then(|size| size.parse().ok()),
+    })
+}
+
+/// The ranges of a version listing: this member's ordered inventory, or a holder.
+#[derive(Debug, PartialEq)]
+pub struct VersionSource {
+    pub from: MergeCaller,
+    pub query: MarkerQuery,
+}
+
+impl MarkerSource for VersionSource {
+    type Part = VersionsPart;
+
+    fn prefix(&self) -> Option<&str> {
+        self.query.prefix.as_deref()
+    }
+
+    fn key_marker(&self) -> Option<&str> {
+        self.query.key_marker.as_deref()
+    }
+
+    fn id_marker(&self) -> Option<&str> {
+        self.query.id_marker.as_deref()
+    }
+
+    fn binding(&self) -> &DistributionBinding {
+        &self.from.binding
+    }
+
+    fn needs_fence(&self) -> bool {
+        true
+    }
+
+    fn is_local(
+        &self,
+        snapshot: &DistributionSnapshot,
+        fence: Option<&LocalFence>,
+        range: &KeyRange,
+    ) -> bool {
+        let member = self.from.binding.member_id;
+        fence.is_some_and(|fence| snapshot.lists_locally(member, range, fence))
+    }
+
+    fn call(
+        &self,
+        (snapshot, range, local): (&DistributionSnapshot, &KeyRange, bool),
+        (key, id): (Option<String>, Option<String>),
+        remaining: usize,
+    ) -> Result<IoCall, MergeError> {
+        let query = &self.query;
+        if local {
+            let id = (id.as_deref().map(Ulid::from_string).transpose())
+                .map_err(|_| MergeError::VersionMarker)?;
+            let list = InventoryVersionsOperation::new(InventoryVersionsInput {
+                set_id: self.from.binding.set_id,
+                bucket: query.bucket.clone(),
+                prefix: query.prefix.clone(),
+                delimiter: query.delimiter.clone(),
+                key_marker: key,
+                version_id_marker: id,
+                max_keys: remaining,
+                lower: range.lower.clone(),
+                upper: range.upper.clone(),
+            });
+            return Ok(IoCall::child(list));
+        }
+        let names = ("versions", "max-keys", "version-id-marker");
+        let base = query.base(names, (key, id), remaining);
+        let request = (
+            "ListObjectVersions",
+            query.bucket.as_str(),
+            range_query(&base, range),
+        );
+        let asked = (range, false, None);
+        let ask = AskMembersOperation::new(&self.from, snapshot, asked, request);
+        Ok(IoCall::child(ask))
+    }
+
+    fn take(&self, local: bool, result: IoResult) -> Result<MarkerPart<VersionsPart>, MergeError> {
+        if local {
+            let listed = result.child::<ListVersionsResult, InventoryVersionsError>()?;
+            let listed = listed.map_err(|error| {
+                MergeError::Failed(format!("The version listing failed: {error}"))
+            })?;
+            let keys = (listed.items.iter())
+                .map(|item| match item {
+                    ListVersionsItem::Version { key, .. }
+                    | ListVersionsItem::DeleteMarker { key, .. } => key.clone(),
+                })
+                .collect();
+            let next = listed.is_truncated.then(|| {
+                (
+                    listed.next_key_marker.clone().unwrap_or_default(),
+                    listed.next_version_marker.map(|id| id.to_string()),
+                )
+            });
+            let prefixes = listed.common_prefixes.clone();
+            return Ok(MarkerPart {
+                part: VersionsPart::Local(Box::new(listed)),
+                keys,
+                prefixes,
+                next,
+            });
+        }
+        let (body, _) = result.child::<(String, NodeId), MergeError>()??;
+        let entries = |tag: &str| {
+            (xml_elements(&body, tag).into_iter())
+                .filter_map(remote_version)
+                .collect::<Vec<_>>()
+        };
+        let (versions, markers) = (entries("Version"), entries("DeleteMarker"));
+        let keys = (versions.iter().chain(markers.iter()))
+            .map(|entry| entry.key.clone())
+            .collect();
+        let (prefixes, next) = listed_rest(&body, "NextVersionIdMarker");
+        Ok(MarkerPart {
+            part: VersionsPart::Remote { versions, markers },
+            keys,
+            prefixes,
+            next,
+        })
+    }
+}
+
+/// An open upload another member listed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoteUpload {
+    pub key: String,
+    pub upload_id: Option<String>,
+    pub initiated: Option<String>,
+    pub initiator: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum UploadsPart {
+    /// This member's uploads with the ids clients see, in the listing's order.
+    Local(Box<ListUploadsResult>, Vec<String>),
+    Remote(Vec<RemoteUpload>),
+}
+
+#[derive(Debug, PartialEq)]
+enum LocalUploadsStep {
+    List,
+    Tags(Box<ListUploadsResult>),
+}
+
+/// One range's uploads from this member's inventory, ids as clients see them.
+#[derive(Debug, PartialEq)]
+struct LocalUploadsOperation {
+    input: Option<InventoryUploadsInput>,
+    binding: DistributionBinding,
+    step: LocalUploadsStep,
+}
+
+type LocalUploads = (Box<ListUploadsResult>, Vec<String>);
+
+impl Operation for LocalUploadsOperation {
+    type Output = LocalUploads;
+    type Error = MergeError;
+
+    fn first(&mut self) -> Result<Next<LocalUploads>, MergeError> {
+        let input = self.input.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(InventoryUploadsOperation::new(
+            input,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<LocalUploads>, MergeError> {
+        match std::mem::replace(&mut self.step, LocalUploadsStep::List) {
+            LocalUploadsStep::List => {
+                let listed = result.child::<ListUploadsResult, InventoryUploadsError>()?;
+                let listed = listed.map_err(|error| {
+                    MergeError::Failed(format!("The upload listing failed: {error}"))
+                })?;
+                let uploads: Vec<(String, Ulid)> = (listed.uploads.iter())
+                    .map(|upload| (upload.key.clone(), upload.upload_id))
+                    .collect();
+                self.step = LocalUploadsStep::Tags(Box::new(listed));
+                let tags = upload_tags(&self.binding, &uploads);
+                Ok(Next::Call(IoCall::child(tags)))
+            }
+            LocalUploadsStep::Tags(listed) => {
+                let tags = result.child::<Vec<UploadTag>, GuardError>()??;
+                let tags = tags.iter().map(UploadTag::encode).collect();
+                Ok(Next::Done((listed, tags)))
+            }
+        }
+    }
+}
+
+/// The ranges of an upload listing: uploads live only on the coordinator of their key's range.
+#[derive(Debug, PartialEq)]
+pub struct UploadSource {
+    pub from: MergeCaller,
+    pub query: MarkerQuery,
+}
+
