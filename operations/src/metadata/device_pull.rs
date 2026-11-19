@@ -4,230 +4,99 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNC_RECEIPT_KEYSPACE;
+use aruna_core::metadata::AuthToken;
+use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::storage::blob::{
+    BucketInfo, bucket_permission_path, object_permission_path,
+};
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionSnapshot, KeyRange, RouteError, WriteRoute,
+    DistributionBinding, DistributionView, KeyRange, LocalFence, RouteError, WriteRoute,
 };
 use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
+use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::structs::{
     ORIGIN_DEVICE_TAG, RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull,
-    SyncPullAck, SyncPullStatus, SyncRefusal, SyncVersionPage,
+    SyncPullAck, SyncRefusal, SyncVersionPage,
 };
 use aruna_core::types::{GroupId, Key, Value};
 use futures_util::StreamExt;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::auth::error::AuthorizeError;
-use crate::auth::error::PolicyEnforcementError;
+use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::guard::GuardError;
-use crate::distribution::routing::local_fence;
-use crate::distribution::routing::{bound_view, route_write};
-use crate::distribution::versions::{InventoryVersionsInput, InventoryVersionsOperation};
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive, node_routing};
-use crate::groups::routing::{BucketRules, SnapshotOperation};
-use crate::metadata::handle::WritePeerError;
-use crate::metadata::protocol::MetadataTransportMessage;
-use crate::realm::load_config::config_unavailable;
+use crate::distribution::routing::{bound_view, local_fence, route_write};
+use crate::distribution::versions::{
+    InventoryVersionsError, InventoryVersionsInput, InventoryVersionsOperation,
+};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::forward::authorize::{ForwardAuthError, ForwardedCallerOperation};
+use crate::forward::fetch::{peer_call, peer_reply};
+use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
+use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::realm::mutate_placement::node_kind;
-use crate::realm::peer_trust::peer_acts_for;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation, QueueLiveOperation};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::replication::queue::LiveVersionInput;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
-use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
-use crate::staging::bucket_guard::BucketGuardOperation;
+use crate::s3::object::delete::{
+    DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
+};
+use crate::s3::object::put::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
+use crate::s3::object::versions::{
+    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
+    ListVersionsResult,
+};
+use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};
 use crate::staging::offered_directory::OfferedDirectoryError;
 
-/// Pulls this node is running, by receipt key. The registry lives as long as the process, so a
-/// restart forgets a running pull and the device asks for it again.
-#[derive(Debug, Default)]
-pub(crate) struct PullRegistry(Mutex<HashMap<Key, PullTask>>);
+/// How long a forwarded listing waits for the holder of a range.
+const HOLDER_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Debug)]
-enum PullTask {
-    Running {
-        bytes_done: Arc<AtomicU64>,
-        total: u64,
-    },
-    /// Kept until the device asks once, so it learns why the pull ended.
-    Refused(SyncRefusal),
-}
+/// The node and realm a pull or listing is served on.
+pub type ServingNode = (NodeId, RealmId);
 
-impl PullRegistry {
-    fn pulls(&self) -> std::sync::MutexGuard<'_, HashMap<Key, PullTask>> {
-        self.0.lock().unwrap_or_else(|error| error.into_inner())
-    }
-
-    /// Claims `key` for a new run, or answers with the run that already holds it.
-    fn claim(&self, key: Key, total: u64) -> Result<Arc<AtomicU64>, SyncPullStatus> {
-        let mut pulls = self.pulls();
-        if let Some(PullTask::Running { bytes_done, total }) = pulls.get(&key) {
-            let bytes_done = bytes_done.load(Ordering::Relaxed);
-            return Err(SyncPullStatus::Pending {
-                bytes_done,
-                total: *total,
-            });
-        }
-        let bytes_done = Arc::new(AtomicU64::new(0));
-        let running = PullTask::Running {
-            bytes_done: bytes_done.clone(),
-            total,
-        };
-        pulls.insert(key, running);
-        Ok(bytes_done)
-    }
-
-    /// Ends a run. A commit is answered by its receipt from now on, a refusal by its entry.
-    fn finish(&self, key: Key, result: &Result<SyncPullAck, SyncRefusal>) {
-        let mut pulls = self.pulls();
-        match result {
-            Ok(_) => pulls.remove(&key),
-            Err(refusal) => pulls.insert(key, PullTask::Refused(refusal.clone())),
-        };
-    }
-
-    /// The run `key` names. A refusal is handed out once.
-    fn status(&self, key: &Key) -> Option<SyncPullStatus> {
-        let mut pulls = self.pulls();
-        if let PullTask::Running { bytes_done, total } = pulls.get(key)? {
-            let bytes_done = bytes_done.load(Ordering::Relaxed);
-            return Some(SyncPullStatus::Pending {
-                bytes_done,
-                total: *total,
-            });
-        }
-        match pulls.remove(key) {
-            Some(PullTask::Refused(refusal)) => Some(SyncPullStatus::Refused(refusal)),
-            _ => None,
-        }
+fn forward_refusal(error: ForwardAuthError) -> SyncRefusal {
+    match error {
+        ForwardAuthError::Unauthorized | ForwardAuthError::Forbidden => SyncRefusal::Unauthorized,
+        ForwardAuthError::Unavailable(_) => SyncRefusal::Unavailable,
     }
 }
 
-/// Serves one forwarded sync pull.
-pub(crate) async fn serve_sync_pull(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    message: MetadataTransportMessage,
-) -> MetadataTransportMessage {
-    let MetadataTransportMessage::ForwardSyncPull { auth_token, pull } = message else {
-        return MetadataTransportMessage::Reject("unexpected metadata control message".to_string());
-    };
-    let status = accept_pull(context, peer, auth_token, *pull).await;
-    MetadataTransportMessage::ForwardedSyncPull { status }
+/// The owner the device forwards for. A User peer is owner-bound, so the binding is checked
+/// rather than trusted; a pull carries no binding proof, so the owner's WRITE permission is the
+/// authority, exactly as for S3.
+fn caller(peer: NodeId, realm_id: RealmId, auth_token: AuthToken) -> IoCall {
+    IoCall::child(ForwardedCallerOperation::owner_token(
+        peer, realm_id, auth_token,
+    ))
 }
 
-/// Serves one poll of an accepted sync pull.
-pub(crate) async fn serve_pull_status(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    message: MetadataTransportMessage,
-) -> MetadataTransportMessage {
-    let MetadataTransportMessage::ForwardPullStatus { auth_token, pull } = message else {
-        return MetadataTransportMessage::Reject("unexpected metadata control message".to_string());
-    };
-    let status = pull_status(context, peer, auth_token, &pull).await;
-    MetadataTransportMessage::ForwardedSyncPull { status }
+fn called(result: IoResult) -> Result<AuthContext, SyncRefusal> {
+    let caller = result.child::<AuthContext, ForwardAuthError>();
+    caller
+        .map_err(|_| SyncRefusal::Unavailable)?
+        .map_err(forward_refusal)
 }
 
-/// Starts pulling one device version of `peer` and answers at once: a replay with its
-/// receipt, a refusal with its reason, otherwise the running pull, which the device polls.
-pub async fn accept_pull(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    auth_token: aruna_core::metadata::AuthToken,
-    request: SyncPull,
-) -> SyncPullStatus {
-    let auth = authorize_peer(context, peer, auth_token)
-        .await
-        .and_then(|auth| own_source(peer, &request).map(|()| auth));
-    let auth = match auth {
-        Ok(auth) => auth,
-        Err(refusal) => return refused(peer, &request, refusal),
-    };
-    // A replay answers with the version it produced, even after its range moved away.
-    if let Some(ack) = replayed(context, &request).await {
-        return SyncPullStatus::Done(ack);
-    }
-    let admitted = match admit_pull(context, auth, &request).await {
-        Ok(admitted) => admitted,
-        Err(refusal) => return refused(peer, &request, refusal),
-    };
-    let (Some(metadata), Ok(key)) = (context.metadata_handle.as_ref(), receipt_of(&request)) else {
-        return refused(peer, &request, SyncRefusal::Unavailable);
-    };
-    let bytes_done = match metadata.sync_pulls().claim(key.clone(), request.size) {
-        Ok(bytes_done) => bytes_done,
-        Err(running) => return running,
-    };
-    let total = request.size;
-    let context = context.clone();
-    tokio::spawn(async move {
-        let (auth, node_id, bucket) = admitted;
-        let result = run_pull(&context, &auth, node_id, &bucket, &request, &bytes_done).await;
-        if let Err(refusal) = &result {
-            let bucket = &request.target_bucket;
-            warn!(peer = %peer, bucket = %bucket, refusal = refusal_kind(refusal), "A synced-folder pull failed");
-        }
-        if let Some(metadata) = context.metadata_handle.as_ref() {
-            metadata.sync_pulls().finish(key, &result);
-        }
-    });
-    SyncPullStatus::Pending {
-        bytes_done: 0,
-        total,
-    }
-}
-
-/// Where the pull of one device version of `peer` stands on this node.
-pub async fn pull_status(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    auth_token: aruna_core::metadata::AuthToken,
-    request: &SyncPull,
-) -> SyncPullStatus {
-    let checked = authorize_peer(context, peer, auth_token)
-        .await
-        .and_then(|_| own_source(peer, request))
-        .and_then(|()| receipt_of(request));
-    let key = match checked {
-        Ok(key) => key,
-        Err(refusal) => return SyncPullStatus::Refused(refusal),
-    };
-    let pulls = context.metadata_handle.as_ref().map(|m| m.sync_pulls());
-    if let Some(status) = pulls.and_then(|pulls| pulls.status(&key)) {
-        return status;
-    }
-    match replayed(context, request).await {
-        Some(ack) => SyncPullStatus::Done(ack),
-        None => SyncPullStatus::Unknown,
-    }
-}
-
-fn refused(peer: NodeId, request: &SyncPull, refusal: SyncRefusal) -> SyncPullStatus {
-    let bucket = &request.target_bucket;
-    warn!(peer = %peer, bucket = %bucket, refusal = refusal_kind(&refusal), "Refused a synced-folder pull");
-    SyncPullStatus::Refused(refusal)
-}
-
-/// The device may only ask for a version it serves itself: a peer must not
-/// make this node read another node's object under its own authority.
+/// The device may only ask for a version it serves itself: a peer must not make this node read
+/// another node's object under its own authority.
 fn own_source(peer: NodeId, request: &SyncPull) -> Result<(), SyncRefusal> {
     match request.source.node_id == peer {
         true => Ok(()),
@@ -237,46 +106,222 @@ fn own_source(peer: NodeId, request: &SyncPull) -> Result<(), SyncRefusal> {
     }
 }
 
-/// This node and the target bucket of a pull the authorized owner may write.
-async fn admit_pull(
-    context: &Arc<DriverContext>,
+/// The owner of a pull `peer` forwards, checked to name `peer` as its source.
+#[derive(Debug, PartialEq)]
+pub struct PullCallerOperation {
+    peer: NodeId,
+    realm_id: RealmId,
+    auth_token: Option<AuthToken>,
+    request: SyncPull,
+}
+
+impl PullCallerOperation {
+    pub fn new(
+        (peer, realm_id): (NodeId, RealmId),
+        auth_token: AuthToken,
+        request: SyncPull,
+    ) -> Self {
+        Self {
+            peer,
+            realm_id,
+            auth_token: Some(auth_token),
+            request,
+        }
+    }
+}
+
+impl Operation for PullCallerOperation {
+    type Output = AuthContext;
+    type Error = SyncRefusal;
+
+    fn first(&mut self) -> Result<Next<AuthContext>, SyncRefusal> {
+        let token = self.auth_token.take().ok_or(SyncRefusal::Unauthorized)?;
+        Ok(Next::Call(caller(self.peer, self.realm_id, token)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<AuthContext>, SyncRefusal> {
+        let auth = called(result)?;
+        own_source(self.peer, &self.request)?;
+        Ok(Next::Done(auth))
+    }
+}
+
+/// The version this device's exact source already produced here, if any. Its receipt commits
+/// with it, so a later unrelated write cannot make a replay mint a second copy.
+#[derive(Debug, PartialEq)]
+pub struct ReceiptOperation {
+    key: Option<Key>,
+}
+
+impl ReceiptOperation {
+    pub fn new(request: &SyncPull) -> Self {
+        Self {
+            key: receipt_of(request).ok(),
+        }
+    }
+}
+
+impl Operation for ReceiptOperation {
+    type Output = Option<Ulid>;
+    type Error = SyncRefusal;
+
+    fn first(&mut self) -> Result<Next<Option<Ulid>>, SyncRefusal> {
+        let Some(key) = self.key.take() else {
+            return Ok(Next::Done(None));
+        };
+        Ok(Next::Call(IoCall::Read(vec![(
+            SYNC_RECEIPT_KEYSPACE.to_string(),
+            key,
+        )])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<Ulid>>, SyncRefusal> {
+        let value = result.value().ok().flatten();
+        let version = value.and_then(|value| <[u8; 16]>::try_from(value.as_ref()).ok());
+        Ok(Next::Done(version.map(Ulid::from_bytes)))
+    }
+}
+
+fn replay_ack(version_id: Ulid) -> SyncPullAck {
+    SyncPullAck {
+        version_id,
+        already_applied: true,
+    }
+}
+
+/// Where an accepted pull stands before it runs.
+#[derive(Debug, PartialEq)]
+pub enum Admission {
+    /// The device version already committed here.
+    Replayed(SyncPullAck),
+    /// The pull may write the target bucket.
+    Admitted(BucketInfo),
+}
+
+#[derive(Debug, PartialEq)]
+enum AdmitStage {
+    Receipt,
+    Bucket,
+    Guard(BucketInfo),
+    Route(BucketInfo),
+    Write(BucketInfo),
+}
+
+/// Admits one pull of the authorized owner: a replay answers with its receipt; otherwise the
+/// target bucket must exist, accept client writes, be coordinated here and be writable.
+#[derive(Debug, PartialEq)]
+pub struct AdmitPullOperation {
+    node_id: NodeId,
     auth: AuthContext,
-    request: &SyncPull,
-) -> Result<(AuthContext, NodeId, BucketInfo), SyncRefusal> {
-    let node_id = local_node(context)?;
-    let bucket = read_bucket(context, &request.target_bucket).await?;
-    guard_target(context, &request.target_bucket).await?;
-    coordinates(context, &bucket, &request.target_key).await?;
-    ensure_write(context, &auth, node_id, &bucket, request).await?;
-    Ok((auth, node_id, bucket))
+    request: SyncPull,
+    stage: AdmitStage,
+}
+
+impl AdmitPullOperation {
+    pub fn new(node_id: NodeId, auth: AuthContext, request: SyncPull) -> Self {
+        Self {
+            node_id,
+            auth,
+            request,
+            stage: AdmitStage::Receipt,
+        }
+    }
+}
+
+impl Operation for AdmitPullOperation {
+    type Output = Admission;
+    type Error = SyncRefusal;
+
+    fn first(&mut self) -> Result<Next<Admission>, SyncRefusal> {
+        Ok(Next::Call(IoCall::child(ReceiptOperation::new(
+            &self.request,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Admission>, SyncRefusal> {
+        let unavailable = |_| SyncRefusal::Unavailable;
+        match std::mem::replace(&mut self.stage, AdmitStage::Receipt) {
+            AdmitStage::Receipt => {
+                // A replay answers with the version it produced, even after its range moved away.
+                let receipt = result
+                    .child::<Option<Ulid>, SyncRefusal>()
+                    .map_err(unavailable)??;
+                if let Some(version_id) = receipt {
+                    return Ok(Next::Done(Admission::Replayed(replay_ack(version_id))));
+                }
+                self.stage = AdmitStage::Bucket;
+                let bucket = self.request.target_bucket.clone();
+                Ok(Next::Call(IoCall::child(GetBucketOperation::new(bucket))))
+            }
+            AdmitStage::Bucket => {
+                let bucket = read_bucket(result, &self.request.target_bucket)?;
+                self.stage = AdmitStage::Guard(bucket);
+                let guard = BucketGuardOperation::new(self.request.target_bucket.as_str());
+                Ok(Next::Call(IoCall::child(guard)))
+            }
+            AdmitStage::Guard(bucket) => {
+                let guarded = result
+                    .child::<(), BucketGuardError>()
+                    .map_err(unavailable)?;
+                guarded.map_err(|error| guard_refusal(error, &self.request.target_bucket))?;
+                let Some(binding) = bucket.distribution.as_ref() else {
+                    return self.authorize(bucket);
+                };
+                let route = route_write(binding, &self.request.target_key);
+                self.stage = AdmitStage::Route(bucket);
+                Ok(Next::Call(IoCall::child(route)))
+            }
+            AdmitStage::Route(bucket) => {
+                let route = result
+                    .child::<WriteRoute, GuardError>()
+                    .map_err(unavailable)?;
+                route_refusal(route)?;
+                self.authorize(bucket)
+            }
+            AdmitStage::Write(bucket) => {
+                let checked = result.child::<(), AuthorizeError>().map_err(unavailable)?;
+                checked.map_err(pull_refusal)?;
+                Ok(Next::Done(Admission::Admitted(bucket)))
+            }
+        }
+    }
+}
+
+impl AdmitPullOperation {
+    fn authorize(&mut self, bucket: BucketInfo) -> Result<Next<Admission>, SyncRefusal> {
+        let check = write_authorization(&self.auth, self.node_id, &bucket, &self.request);
+        self.stage = AdmitStage::Write(bucket);
+        Ok(Next::Call(IoCall::child(check)))
+    }
+}
+
+/// Reads the target bucket. Only a bucket that is really absent is `NotFound`: the drain parks
+/// that permanently, so a storage or decoding failure has to stay retryable instead.
+fn read_bucket(result: IoResult, bucket: &str) -> Result<BucketInfo, SyncRefusal> {
+    let read = result
+        .child::<BucketInfo, GetBucketError>()
+        .map_err(|_| SyncRefusal::Unavailable)?;
+    read.map_err(|error| {
+        debug!(error = %error, bucket = %bucket, "A sync pull could not read its target bucket");
+        bucket_refusal(error)
+    })
 }
 
 /// A pull writes like a client, so a bucket that is read-only for clients refuses it too.
-async fn guard_target(context: &DriverContext, bucket: &str) -> Result<(), SyncRefusal> {
-    match drive(BucketGuardOperation::new(bucket), context)
-        .await
-        .map_err(OfferedDirectoryError::from)
-    {
-        Ok(()) => Ok(()),
-        Err(OfferedDirectoryError::ReadOnly(_)) => Err(SyncRefusal::Forbidden),
-        Err(error) => {
+fn guard_refusal(error: BucketGuardError, bucket: &str) -> SyncRefusal {
+    match OfferedDirectoryError::from(error) {
+        OfferedDirectoryError::ReadOnly(_) => SyncRefusal::Forbidden,
+        error => {
             debug!(error = %error, bucket = %bucket, "A sync pull could not check its target bucket");
-            Err(SyncRefusal::Unavailable)
+            SyncRefusal::Unavailable
         }
     }
 }
 
 /// Only the coordinator of the key's range writes a distributed bucket; the device takes the
 /// pull there, since the pull reads the device's bytes under its own peer identity.
-async fn coordinates(
-    context: &Arc<DriverContext>,
-    bucket: &BucketInfo,
-    key: &str,
-) -> Result<(), SyncRefusal> {
-    let Some(binding) = bucket.distribution.as_ref() else {
-        return Ok(());
-    };
-    match drive(route_write(binding, key), context).await {
+fn route_refusal(route: Result<WriteRoute, GuardError>) -> Result<(), SyncRefusal> {
+    match route {
         Ok(WriteRoute::Local { .. }) => Ok(()),
         Ok(WriteRoute::Forward { node_id, .. }) => Err(SyncRefusal::Coordinator(node_id)),
         Err(
@@ -290,87 +335,8 @@ async fn coordinates(
     }
 }
 
-/// Commits one admitted pull, counting the bytes that arrive into `bytes_done`.
-async fn run_pull(
-    context: &Arc<DriverContext>,
-    auth: &AuthContext,
-    node_id: NodeId,
-    bucket: &BucketInfo,
-    request: &SyncPull,
-    bytes_done: &Arc<AtomicU64>,
-) -> Result<SyncPullAck, SyncRefusal> {
-    if let Some(ack) = replayed(context, request).await {
-        return Ok(ack);
-    }
-    let result = match request.deleted {
-        true => delete_target(context, auth, node_id, bucket, request).await,
-        false => commit_pull(context, auth, node_id, bucket, request, bytes_done).await,
-    };
-    // An overlapping pull of the same version committed first; its receipt is the answer.
-    match result {
-        Err(refusal) => replayed(context, request).await.ok_or(refusal),
-        ok => ok,
-    }
-}
-
-/// The answer to a pull whose device version already has a receipt here.
-async fn replayed(context: &Arc<DriverContext>, request: &SyncPull) -> Option<SyncPullAck> {
-    applied_version(context, request)
-        .await
-        .map(|version_id| SyncPullAck {
-            version_id,
-            already_applied: true,
-        })
-}
-
-/// The owner the device forwards for. A User peer is owner-bound, so the
-/// binding is re-checked rather than trusted; a pull carries no binding proof,
-/// so the owner's WRITE permission is the authority, exactly as for S3.
-pub(crate) async fn authorize_peer(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    auth_token: aruna_core::metadata::AuthToken,
-) -> Result<AuthContext, SyncRefusal> {
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(SyncRefusal::Unavailable)?;
-    let auth = metadata
-        .authorize_write_peer(peer, Some(auth_token))
-        .await
-        .map_err(|error| match error {
-            WritePeerError::Unauthorized => SyncRefusal::Unauthorized,
-            WritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
-        })?;
-    let config = drive(GetConfigOperation::new(auth.realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or(SyncRefusal::Unavailable)?;
-    match peer_acts_for(&config, peer, auth.user_id) {
-        true => Ok(auth),
-        false => Err(SyncRefusal::Unauthorized),
-    }
-}
-
-/// Reads the target bucket. Only a bucket that is really absent is `NotFound`:
-/// the drain parks that permanently, so a storage or decoding failure has to
-/// stay retryable instead.
-async fn read_bucket(
-    context: &Arc<DriverContext>,
-    bucket: &str,
-) -> Result<BucketInfo, SyncRefusal> {
-    match drive(GetBucketOperation::new(bucket.to_string()), context).await {
-        Ok(info) => Ok(info),
-        Err(error) => {
-            debug!(error = %error, bucket = %bucket, "A sync pull could not read its target bucket");
-            Err(bucket_refusal(error))
-        }
-    }
-}
-
-/// A bucket that is not there is permanent; everything else is this node's
-/// problem and must not park the device's upload.
+/// A bucket that is not there is permanent; everything else is this node's problem and must not
+/// park the device's upload.
 fn bucket_refusal(error: GetBucketError) -> SyncRefusal {
     match error {
         GetBucketError::NotFound => SyncRefusal::NotFound,
@@ -378,68 +344,48 @@ fn bucket_refusal(error: GetBucketError) -> SyncRefusal {
     }
 }
 
-/// This node's own id. A pull cannot be attributed without it.
-fn local_node(context: &Arc<DriverContext>) -> Result<NodeId, SyncRefusal> {
-    context
-        .net_handle
-        .as_ref()
-        .map(|net| net.node_id())
-        .ok_or(SyncRefusal::Unavailable)
-}
-
-async fn ensure_write(
-    context: &Arc<DriverContext>,
+/// The WRITE check of a pull, judged as the put or delete it performs.
+fn write_authorization(
     auth: &AuthContext,
     node_id: NodeId,
     bucket: &BucketInfo,
     request: &SyncPull,
-) -> Result<(), SyncRefusal> {
+) -> AuthorizeOperation {
     let operation = match request.deleted {
         true => "s3.DeleteObject",
         false => "s3.PutObject",
     };
-    authorize_pull(
-        context,
-        auth,
-        object_permission_path(
-            auth.realm_id,
-            bucket.group_id,
-            node_id,
-            &request.target_bucket,
-            &request.target_key,
-        ),
-        Permission::WRITE,
-        operation,
-    )
-    .await
+    let (bucket_name, key) = (&request.target_bucket, &request.target_key);
+    let path = object_permission_path(auth.realm_id, bucket.group_id, node_id, bucket_name, key);
+    authorization(auth, path, Permission::WRITE, operation)
 }
 
-/// The same boundary the equivalent S3 request passes: RBAC first, then the
-/// realm and group request policies. A pull is an ordinary write by the owner,
-/// so a policy that denies their put or delete denies this too.
-pub(crate) async fn authorize_pull(
-    context: &Arc<DriverContext>,
+/// The READ check of a listing, judged as the version listing an S3 client would make.
+fn read_authorization(
+    auth: &AuthContext,
+    node_id: NodeId,
+    group_id: GroupId,
+    bucket: &str,
+) -> AuthorizeOperation {
+    let path = bucket_permission_path(auth.realm_id, group_id, node_id, bucket);
+    authorization(auth, path, Permission::READ, "s3.ListObjectVersions")
+}
+
+/// The same boundary the equivalent S3 request passes: RBAC first, then the realm and group
+/// request policies. A pull is an ordinary write by the owner, so a policy that denies their
+/// put or delete denies this too.
+fn authorization(
     auth: &AuthContext,
     path: String,
     permission: Permission,
     operation: &'static str,
-) -> Result<(), SyncRefusal> {
-    drive(
-        AuthorizeOperation::new(
-            auth.realm_id,
-            auth,
-            &path,
-            &permission,
-            PolicyRequestExtras::operation(operation),
-        ),
-        context,
-    )
-    .await
-    .map_err(pull_refusal)
+) -> AuthorizeOperation {
+    let extras = PolicyRequestExtras::operation(operation);
+    AuthorizeOperation::new(auth.realm_id, auth, &path, &permission, extras)
 }
 
-/// Only a real denial refuses the caller; an unreadable policy state or a
-/// failed check is this node's problem and stays retryable.
+/// Only a real denial refuses the caller; an unreadable policy state or a failed check is this
+/// node's problem and stays retryable.
 pub(crate) fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
     match error {
         AuthorizeError::PermissionDenied
@@ -450,151 +396,7 @@ pub(crate) fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
     }
 }
 
-async fn delete_target(
-    context: &Arc<DriverContext>,
-    auth: &AuthContext,
-    node_id: NodeId,
-    bucket: &BucketInfo,
-    request: &SyncPull,
-) -> Result<SyncPullAck, SyncRefusal> {
-    let (guards, receipts) = pull_fence(request)?;
-    let result = drive(
-        DeleteObjectOperation::new(DeleteObjectInput {
-            bucket: request.target_bucket.clone(),
-            key: request.target_key.clone(),
-            version_id: None,
-            group_id: bucket.group_id,
-            realm_id: auth.realm_id,
-            node_id,
-            deleted_by: auth.user_id,
-        })
-        // The marker carries the device version it came from, and the receipt
-        // committed with it makes a retried delete the same one.
-        .with_metadata(pull_tags(request))
-        .with_fence(guards, receipts),
-        context,
-    )
-    .await
-    .map_err(|error| {
-        debug!(error = %error, "A forwarded sync delete failed");
-        SyncRefusal::Unavailable
-    })?;
-    drive(
-        QueueLiveOperation::new(LiveVersionInput {
-            local_node_id: node_id,
-            auth_context: auth.clone(),
-            bucket: request.target_bucket.clone(),
-            key: request.target_key.clone(),
-            version_id: result.version_id,
-            delete_marker: result.delete_marker,
-        }),
-        context,
-    )
-    .await
-    .ok();
-    Ok(SyncPullAck {
-        version_id: result.version_id,
-        already_applied: false,
-    })
-}
-
-/// Reads the device's exact version and commits it as the owner's own write.
-async fn commit_pull(
-    context: &Arc<DriverContext>,
-    auth: &AuthContext,
-    node_id: NodeId,
-    bucket: &BucketInfo,
-    request: &SyncPull,
-    bytes_done: &Arc<AtomicU64>,
-) -> Result<SyncPullAck, SyncRefusal> {
-    let (guards, receipts) = pull_fence(request)?;
-    let read = BaoReadRequest {
-        auth_context: auth.clone(),
-        realm_id: auth.realm_id,
-        target: BaoReadTarget::ExactVersion(request.source.clone()),
-        expected_blake3: request.blake3,
-        metadata_only: false,
-        destination: None,
-        known_refs: Vec::new(),
-        range: None,
-    };
-    let blob = match drive(
-        ManagedReadOperation::new(request.source.node_id, read),
-        context,
-    )
-    .await
-    {
-        Ok(BaoReadOutput::Stream { blob, .. }) => counted(blob, bytes_done.clone()),
-        // A metadata-only answer to a full read is a broken exchange, not an
-        // absent object: parking the upload on it would lose the file.
-        Ok(BaoReadOutput::Metadata { .. }) => return Err(SyncRefusal::Unavailable),
-        Err(error) => {
-            debug!(error = %error, "Could not read a device version for a sync pull");
-            return Err(read_refusal(&error));
-        }
-    };
-    let routing = drive(
-        SnapshotOperation::new(
-            &node_routing(context),
-            bucket.group_id,
-            BucketRules::Named(request.target_bucket.to_string()),
-        ),
-        context,
-    )
-    .await
-    .map_err(|_| SyncRefusal::Unavailable)?;
-    let quota = drive(GetConfigOperation::new(auth.realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .and_then(|config| config.quota.effective_group_ceiling(&bucket.group_id));
-    let operation = PutObjectOperation::new(PutObjectConfig {
-        user_id: auth.user_id,
-        group_id: bucket.group_id,
-        realm_id: auth.realm_id,
-        node_id,
-        request: PutObjectInput {
-            bucket: request.target_bucket.clone(),
-            key: request.target_key.clone(),
-            content_length: Some(request.size),
-            body: Some(blob),
-        },
-        expected_checksums: Vec::new(),
-        checksum_type: None,
-        exists: false,
-        version_source: None,
-        preassigned_version_id: None,
-        quota_ceiling: quota,
-        routing,
-    })
-    .with_bucket_guard(bucket.clone())
-    .with_metadata(pull_tags(request))
-    .with_version_origin(Some(pull_origin(node_id, request)))
-    .with_fence(guards, receipts);
-    let result = drive(operation, context).await.map_err(|error| {
-        debug!(error = %error, "A forwarded sync pull could not be written");
-        SyncRefusal::Unavailable
-    })?;
-    drive(
-        CompletePutOperation::new(CompletePutInput {
-            realm_id: auth.realm_id,
-            node_id,
-            auth: auth.clone(),
-            group_id: bucket.group_id,
-            bucket: request.target_bucket.clone(),
-            key: request.target_key.clone(),
-            version_id: result.version_id,
-            size_bytes: result.location.blob_size,
-        }),
-        context,
-    )
-    .await
-    .ok();
-    Ok(SyncPullAck {
-        version_id: result.version_id,
-        already_applied: false,
-    })
-}
+type PullBody = BackendStream<Result<bytes::Bytes, StreamError>>;
 
 /// The device's bytes as the write consumes them, adding each chunk to `bytes_done`.
 fn counted(blob: PullBody, bytes_done: Arc<AtomicU64>) -> PullBody {
@@ -606,11 +408,9 @@ fn counted(blob: PullBody, bytes_done: Arc<AtomicU64>) -> PullBody {
     BackendStream(Box::pin(chunks))
 }
 
-type PullBody = BackendStream<Result<bytes::Bytes, StreamError>>;
-
-/// Why a device read failed. Bytes that do not answer for the hash the upload
-/// named are the request's own fault: retrying re-reads the same mismatch, so
-/// the row is parked for the owner instead. Everything else is infrastructure.
+/// Why a device read failed. Bytes that do not answer for the hash the upload named are the
+/// request's own fault: retrying re-reads the same mismatch, so the row is parked for the owner
+/// instead. Everything else is infrastructure.
 fn read_refusal(error: &BaoReadError) -> SyncRefusal {
     match error {
         BaoReadError::Refused(BaoReadRefusal::HashMismatch) => SyncRefusal::Invalid(
@@ -645,7 +445,7 @@ fn pull_origin(node_id: NodeId, request: &SyncPull) -> VersionOrigin {
 }
 
 /// The receipt row of this device version: absent until the version or marker commits.
-fn receipt_of(request: &SyncPull) -> Result<Key, SyncRefusal> {
+pub(crate) fn receipt_of(request: &SyncPull) -> Result<Key, SyncRefusal> {
     request
         .receipt_key()
         .map(Key::from)
@@ -662,58 +462,270 @@ fn pull_fence(request: &SyncPull) -> Result<FenceRows, SyncRefusal> {
     Ok((vec![(space.clone(), key.clone(), None)], vec![(space, key)]))
 }
 
-/// The version this device's exact source already produced here, if any. Its receipt
-/// commits with it, so a later unrelated write cannot make a replay mint a second copy.
-async fn applied_version(context: &Arc<DriverContext>, request: &SyncPull) -> Option<Ulid> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: SYNC_RECEIPT_KEYSPACE.to_string(),
-            key: receipt_of(request).ok()?,
-            txn_id: None,
-        })
-        .await;
-    let Event::Storage(StorageEvent::ReadResult {
-        value: Some(value), ..
-    }) = event
-    else {
-        return None;
-    };
-    <[u8; 16]>::try_from(value.as_ref())
-        .ok()
-        .map(Ulid::from_bytes)
+enum CommitStage {
+    Start,
+    Replay,
+    Deleted,
+    Read,
+    Routing(Box<PullBody>),
+    Quota(Box<PullBody>, RoutingSnapshot),
+    Written,
+    /// A step failed; an overlapping pull of the same version may have committed first.
+    Failed(SyncRefusal),
 }
 
-/// Serves one bounded listing of the current heads under a bucket prefix.
-pub(crate) async fn serve_list_versions(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    message: MetadataTransportMessage,
-) -> MetadataTransportMessage {
-    let MetadataTransportMessage::ForwardListVersions {
-        auth_token,
-        bucket,
-        prefix,
-        cursor,
-        limit,
-    } = message
-    else {
-        return MetadataTransportMessage::Reject("unexpected metadata control message".to_string());
-    };
-    let result = list_heads(
-        context,
-        peer,
-        auth_token,
-        bucket.clone(),
-        prefix,
-        cursor,
-        limit,
-    )
-    .await;
-    if let Err(refusal) = &result {
-        warn!(peer = %peer, bucket = %bucket, refusal = refusal_kind(refusal), "Refused a synced-folder listing");
+/// Commits one admitted pull as the owner's own write: a delete marker, or the device's exact
+/// version read from the device, counting the bytes that arrive into `bytes_done`. A failure
+/// whose device version committed anyway answers with that receipt.
+pub struct CommitPullOperation {
+    node: (NodeId, NodeRouting),
+    auth: AuthContext,
+    bucket: BucketInfo,
+    request: SyncPull,
+    bytes_done: Arc<AtomicU64>,
+    stage: CommitStage,
+}
+
+type CommitTurn = Result<Next<SyncPullAck>, SyncRefusal>;
+
+impl CommitPullOperation {
+    /// `routing` is this node's storage routing, which the write is placed by.
+    pub fn new(
+        node: (NodeId, NodeRouting),
+        (auth, bucket): (AuthContext, BucketInfo),
+        request: SyncPull,
+        bytes_done: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            node,
+            auth,
+            bucket,
+            request,
+            bytes_done,
+            stage: CommitStage::Start,
+        }
     }
-    MetadataTransportMessage::ForwardedVersions { result }
+
+    fn failed(&mut self, refusal: SyncRefusal) -> CommitTurn {
+        self.stage = CommitStage::Failed(refusal);
+        Ok(Next::Call(IoCall::child(ReceiptOperation::new(
+            &self.request,
+        ))))
+    }
+
+    fn delete(&mut self) -> CommitTurn {
+        let (guards, receipts) = match pull_fence(&self.request) {
+            Ok(fence) => fence,
+            Err(refusal) => return self.failed(refusal),
+        };
+        let input = DeleteObjectInput {
+            bucket: self.request.target_bucket.clone(),
+            key: self.request.target_key.clone(),
+            version_id: None,
+            group_id: self.bucket.group_id,
+            realm_id: self.auth.realm_id,
+            node_id: self.node.0,
+            deleted_by: self.auth.user_id,
+        };
+        // The marker carries the device version it came from, and the receipt committed with
+        // it makes a retried delete the same one.
+        let delete = DeleteObjectOperation::new(input)
+            .with_metadata(pull_tags(&self.request))
+            .with_fence(guards, receipts);
+        self.stage = CommitStage::Deleted;
+        Ok(Next::Call(IoCall::child(delete)))
+    }
+
+    fn read(&mut self) -> CommitTurn {
+        let read = BaoReadRequest {
+            auth_context: self.auth.clone(),
+            realm_id: self.auth.realm_id,
+            target: BaoReadTarget::ExactVersion(self.request.source.clone()),
+            expected_blake3: self.request.blake3,
+            metadata_only: false,
+            destination: None,
+            known_refs: Vec::new(),
+            range: None,
+        };
+        self.stage = CommitStage::Read;
+        let read = ManagedReadOperation::new(self.request.source.node_id, read);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn put(&mut self, blob: PullBody, routing: RoutingSnapshot, quota: Option<u64>) -> CommitTurn {
+        let (guards, receipts) = match pull_fence(&self.request) {
+            Ok(fence) => fence,
+            Err(refusal) => return self.failed(refusal),
+        };
+        let (auth, request) = (&self.auth, &self.request);
+        let node_id = self.node.0;
+        let put = PutObjectOperation::new(PutObjectConfig {
+            user_id: auth.user_id,
+            group_id: self.bucket.group_id,
+            realm_id: auth.realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: request.target_bucket.clone(),
+                key: request.target_key.clone(),
+                content_length: Some(request.size),
+                body: Some(blob),
+            },
+            expected_checksums: Vec::new(),
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: quota,
+            routing,
+        })
+        .with_bucket_guard(self.bucket.clone())
+        .with_metadata(pull_tags(request))
+        .with_version_origin(Some(pull_origin(node_id, request)))
+        .with_fence(guards, receipts);
+        self.stage = CommitStage::Written;
+        Ok(Next::Call(IoCall::child(put)))
+    }
+}
+
+impl Operation for CommitPullOperation {
+    type Output = SyncPullAck;
+    type Error = SyncRefusal;
+
+    fn first(&mut self) -> CommitTurn {
+        self.stage = CommitStage::Replay;
+        Ok(Next::Call(IoCall::child(ReceiptOperation::new(
+            &self.request,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> CommitTurn {
+        let unavailable = |_| SyncRefusal::Unavailable;
+        match std::mem::replace(&mut self.stage, CommitStage::Start) {
+            CommitStage::Start => Err(SyncRefusal::Unavailable),
+            CommitStage::Replay => {
+                let receipt = result
+                    .child::<Option<Ulid>, SyncRefusal>()
+                    .map_err(unavailable)??;
+                if let Some(version_id) = receipt {
+                    return Ok(Next::Done(replay_ack(version_id)));
+                }
+                match self.request.deleted {
+                    true => self.delete(),
+                    false => self.read(),
+                }
+            }
+            CommitStage::Deleted => {
+                let deleted = result.child::<DeleteObjectResult, DeleteObjectError>();
+                let deleted = match deleted.map_err(unavailable).and_then(|deleted| {
+                    deleted.map_err(|error| {
+                        debug!(error = %error, "A forwarded sync delete failed");
+                        SyncRefusal::Unavailable
+                    })
+                }) {
+                    Ok(deleted) => deleted,
+                    Err(refusal) => return self.failed(refusal),
+                };
+                let live = QueueLiveOperation::new(LiveVersionInput {
+                    local_node_id: self.node.0,
+                    auth_context: self.auth.clone(),
+                    bucket: self.request.target_bucket.clone(),
+                    key: self.request.target_key.clone(),
+                    version_id: deleted.version_id,
+                    delete_marker: deleted.delete_marker,
+                });
+                Ok(Next::Then {
+                    output: SyncPullAck {
+                        version_id: deleted.version_id,
+                        already_applied: false,
+                    },
+                    calls: vec![IoCall::child(live)],
+                })
+            }
+            CommitStage::Read => {
+                let read = result
+                    .child::<BaoReadOutput, BaoReadError>()
+                    .map_err(unavailable);
+                let blob = match read {
+                    Ok(Ok(BaoReadOutput::Stream { blob, .. })) => {
+                        counted(blob, self.bytes_done.clone())
+                    }
+                    // A metadata-only answer to a full read is a broken exchange, not an absent
+                    // object: parking the upload on it would lose the file.
+                    Ok(Ok(BaoReadOutput::Metadata { .. })) | Err(_) => {
+                        return self.failed(SyncRefusal::Unavailable);
+                    }
+                    Ok(Err(error)) => {
+                        debug!(error = %error, "Could not read a device version for a sync pull");
+                        return self.failed(read_refusal(&error));
+                    }
+                };
+                let rules = BucketRules::Named(self.request.target_bucket.clone());
+                let routing = SnapshotOperation::new(&self.node.1, self.bucket.group_id, rules);
+                self.stage = CommitStage::Routing(Box::new(blob));
+                Ok(Next::Call(IoCall::child(routing)))
+            }
+            CommitStage::Routing(blob) => {
+                let routing = result.child::<RoutingSnapshot, RoutingInputsError>();
+                let Ok(Ok(routing)) = routing else {
+                    return self.failed(SyncRefusal::Unavailable);
+                };
+                self.stage = CommitStage::Quota(blob, routing);
+                Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+                    self.auth.realm_id,
+                ))))
+            }
+            CommitStage::Quota(blob, routing) => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>();
+                let group_id = self.bucket.group_id;
+                let quota = match config {
+                    Ok(Ok(config)) => config.quota.effective_group_ceiling(&group_id),
+                    Ok(Err(error)) => {
+                        crate::realm::load_config::config_unavailable(&error);
+                        None
+                    }
+                    Err(_) => None,
+                };
+                self.put(*blob, routing, quota)
+            }
+            CommitStage::Written => {
+                let written = result.child::<PutObjectResult, PutObjectError>();
+                let written = match written {
+                    Ok(Ok(written)) => written,
+                    Ok(Err(error)) => {
+                        debug!(error = %error, "A forwarded sync pull could not be written");
+                        return self.failed(SyncRefusal::Unavailable);
+                    }
+                    Err(_) => return self.failed(SyncRefusal::Unavailable),
+                };
+                let complete = CompletePutOperation::new(CompletePutInput {
+                    realm_id: self.auth.realm_id,
+                    node_id: self.node.0,
+                    auth: self.auth.clone(),
+                    group_id: self.bucket.group_id,
+                    bucket: self.request.target_bucket.clone(),
+                    key: self.request.target_key.clone(),
+                    version_id: written.version_id,
+                    size_bytes: written.location.blob_size,
+                });
+                Ok(Next::Then {
+                    output: SyncPullAck {
+                        version_id: written.version_id,
+                        already_applied: false,
+                    },
+                    calls: vec![IoCall::child(complete)],
+                })
+            }
+            CommitStage::Failed(refusal) => {
+                // An overlapping pull of the same version committed first; its receipt is the
+                // answer.
+                let receipt = result.child::<Option<Ulid>, SyncRefusal>();
+                match receipt {
+                    Ok(Ok(Some(version_id))) => Ok(Next::Done(replay_ack(version_id))),
+                    _ => Err(refusal),
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn refusal_kind(refusal: &SyncRefusal) -> &'static str {
@@ -727,181 +739,374 @@ pub(crate) fn refusal_kind(refusal: &SyncRefusal) -> &'static str {
     }
 }
 
-async fn list_heads(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    auth_token: aruna_core::metadata::AuthToken,
-    bucket: String,
-    prefix: String,
-    cursor: Option<SyncListCursor>,
-    limit: SyncPageLimit,
-) -> Result<SyncVersionPage, SyncRefusal> {
-    let auth = authorize_peer(context, peer, auth_token).await?;
-    let node_id = local_node(context)?;
-    let info = read_bucket(context, &bucket).await?;
-    ensure_read(context, &auth, node_id, info.group_id, &bucket).await?;
-    if let Some(binding) = info.distribution.as_ref() {
-        let listing = SetListing {
-            bucket,
-            prefix,
-            cursor,
-            limit,
-        };
-        return set_heads(context, (peer, &auth), binding, listing).await;
-    }
-    let (key_marker, version_id_marker) = match cursor {
-        Some(cursor) => (Some(cursor.key), cursor.version_id),
-        None => (None, None),
-    };
-    let result = drive(
-        ListVersionsOperation::new(ListVersionsInput {
-            bucket,
-            prefix: (!prefix.is_empty()).then(|| listing_prefix(&prefix)),
-            delimiter: None,
-            key_marker,
-            version_id_marker,
-            max_keys: Some(limit.get()),
-        }),
-        context,
-    )
-    .await
-    .map_err(|_| SyncRefusal::Unavailable)?;
-    let heads = result
-        .items
-        .iter()
-        .filter_map(|item| head_of(item, &prefix))
-        .collect();
-    let next = result.is_truncated.then(|| SyncListCursor {
-        key: result.next_key_marker.unwrap_or_default(),
-        version_id: result.next_version_marker,
-    });
-    SyncVersionPage::new(heads, next).map_err(|error| SyncRefusal::Invalid(error.to_string()))
+/// Logs a refused pull and answers with the refusal.
+pub(crate) fn refused(peer: NodeId, request: &SyncPull, refusal: SyncRefusal) -> SyncRefusal {
+    let bucket = &request.target_bucket;
+    warn!(peer = %peer, bucket = %bucket, refusal = refusal_kind(&refusal), "Refused a synced-folder pull");
+    refusal
 }
 
 /// Ranges one page of a distributed bucket's heads visits at most.
 const MAX_PAGE_RANGES: usize = 64;
 
-/// One device listing of a distributed bucket's heads.
-struct SetListing {
+/// One device listing of a bucket's heads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetListing {
+    pub bucket: String,
+    pub prefix: String,
+    pub cursor: Option<SyncListCursor>,
+    pub limit: SyncPageLimit,
+}
+
+#[derive(Debug, PartialEq)]
+enum HeadsStage {
+    Caller,
+    Bucket,
+    Read(BucketInfo),
+    Plain,
+    Set,
+}
+
+/// One bounded listing of the current heads under a bucket prefix for the owner `peer` forwards.
+#[derive(Debug, PartialEq)]
+pub struct ListHeadsOperation {
+    peer: NodeId,
+    node: ServingNode,
+    auth_token: Option<AuthToken>,
+    auth: Option<AuthContext>,
     bucket: String,
     prefix: String,
-    cursor: Option<SyncListCursor>,
-    limit: SyncPageLimit,
+    listing: Option<SetListing>,
+    stage: HeadsStage,
+}
+
+impl ListHeadsOperation {
+    pub fn new(
+        peer: NodeId,
+        node: ServingNode,
+        auth_token: AuthToken,
+        listing: SetListing,
+    ) -> Self {
+        Self {
+            peer,
+            node,
+            auth_token: Some(auth_token),
+            auth: None,
+            bucket: listing.bucket.clone(),
+            prefix: listing.prefix.clone(),
+            listing: Some(listing),
+            stage: HeadsStage::Caller,
+        }
+    }
+
+    fn listing(&mut self) -> Result<SetListing, SyncRefusal> {
+        self.listing.take().ok_or(SyncRefusal::Unavailable)
+    }
+}
+
+type HeadsTurn = Result<Next<SyncVersionPage>, SyncRefusal>;
+
+impl Operation for ListHeadsOperation {
+    type Output = SyncVersionPage;
+    type Error = SyncRefusal;
+
+    fn first(&mut self) -> HeadsTurn {
+        let token = self.auth_token.take().ok_or(SyncRefusal::Unauthorized)?;
+        Ok(Next::Call(caller(self.peer, self.node.1, token)))
+    }
+
+    fn next(&mut self, result: IoResult) -> HeadsTurn {
+        let unavailable = |_| SyncRefusal::Unavailable;
+        match std::mem::replace(&mut self.stage, HeadsStage::Plain) {
+            HeadsStage::Caller => {
+                self.auth = Some(called(result)?);
+                self.stage = HeadsStage::Bucket;
+                let read = GetBucketOperation::new(self.bucket.clone());
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            HeadsStage::Bucket => {
+                let info = read_bucket(result, &self.bucket)?;
+                let auth = self.auth.as_ref().ok_or(SyncRefusal::Unavailable)?;
+                let check = read_authorization(auth, self.node.0, info.group_id, &self.bucket);
+                self.stage = HeadsStage::Read(info);
+                Ok(Next::Call(IoCall::child(check)))
+            }
+            HeadsStage::Read(info) => {
+                let checked = result.child::<(), AuthorizeError>().map_err(unavailable)?;
+                checked.map_err(pull_refusal)?;
+                let listing = self.listing()?;
+                let auth = self.auth.take().ok_or(SyncRefusal::Unavailable)?;
+                if let Some(binding) = info.distribution {
+                    let set =
+                        SetHeadsOperation::new((self.peer, self.node), auth, binding, listing);
+                    self.stage = HeadsStage::Set;
+                    return Ok(Next::Call(IoCall::child(set)));
+                }
+                let (key_marker, version_id_marker) = match listing.cursor {
+                    Some(cursor) => (Some(cursor.key), cursor.version_id),
+                    None => (None, None),
+                };
+                let prefix = (!listing.prefix.is_empty()).then(|| listing_prefix(&listing.prefix));
+                let list = ListVersionsOperation::new(ListVersionsInput {
+                    bucket: listing.bucket,
+                    prefix,
+                    delimiter: None,
+                    key_marker,
+                    version_id_marker,
+                    max_keys: Some(listing.limit.get()),
+                });
+                self.stage = HeadsStage::Plain;
+                Ok(Next::Call(IoCall::child(list)))
+            }
+            HeadsStage::Plain => {
+                let listed = result.child::<ListVersionsResult, ListVersionsError>();
+                let listed = listed.map_err(unavailable)?.map_err(unavailable)?;
+                let heads = (listed.items.iter())
+                    .filter_map(|item| head_of(item, &self.prefix))
+                    .collect();
+                let next = listed.is_truncated.then(|| SyncListCursor {
+                    key: listed.next_key_marker.unwrap_or_default(),
+                    version_id: listed.next_version_marker,
+                });
+                let page = SyncVersionPage::new(heads, next);
+                Ok(Next::Done(page.map_err(|error| {
+                    SyncRefusal::Invalid(error.to_string())
+                })?))
+            }
+            HeadsStage::Set => {
+                let page = result
+                    .child::<SyncVersionPage, SyncRefusal>()
+                    .map_err(unavailable)??;
+                Ok(Next::Done(page))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum SetStage {
+    View,
+    Fence(DistributionView),
+    Range,
+    Holder,
+    Forwarded(NodeId),
 }
 
 /// One page of a distributed bucket's heads in key order, range by range from this member's
-/// inventory. A range it does not list ends the page there; a page that starts there is
-/// read from a holder of the range for a device, and refused for a forwarded listing.
-async fn set_heads(
-    context: &Arc<DriverContext>,
-    (peer, auth): (NodeId, &AuthContext),
-    binding: &DistributionBinding,
+/// inventory. A range it does not list ends the page there; a page that starts there is read
+/// from a holder of the range for a device, and refused for a forwarded listing.
+#[derive(Debug, PartialEq)]
+pub struct SetHeadsOperation {
+    peer: NodeId,
+    node: ServingNode,
+    auth: AuthContext,
+    binding: DistributionBinding,
     listing: SetListing,
-) -> Result<SyncVersionPage, SyncRefusal> {
-    let view = drive(bound_view(binding), context)
-        .await
-        .map_err(|_| SyncRefusal::Unavailable)?;
-    let snapshot = view.snapshot();
-    let fence = drive(local_fence(binding.set_id), context)
-        .await
-        .map_err(|_| SyncRefusal::Unavailable)?;
-    let prefix = (!listing.prefix.is_empty()).then(|| listing_prefix(&listing.prefix));
-    let (mut marker, mut version_marker) = match listing.cursor.clone() {
-        Some(cursor) => (Some(cursor.key), cursor.version_id),
-        None => (None, None),
-    };
-    let start = marker.clone().unwrap_or_default();
-    let ranges = (snapshot
-        .listed_ranges(prefix.as_deref().unwrap_or_default())
-        .into_iter())
-    .filter(|range| {
-        range
-            .upper
-            .as_deref()
-            .is_none_or(|upper| start.as_str() < upper)
-    });
-    let (mut heads, mut next) = (Vec::new(), None);
-    for (visited, range) in ranges.enumerate() {
-        let remaining = listing.limit.get().saturating_sub(heads.len());
-        let here = snapshot.lists_locally(binding.member_id, range, &fence);
-        if remaining == 0 || visited == MAX_PAGE_RANGES || (!here && visited > 0) {
+    view: Option<DistributionView>,
+    fence: LocalFence,
+    ranges: Vec<KeyRange>,
+    visited: usize,
+    marker: Option<String>,
+    version_marker: Option<Ulid>,
+    heads: Vec<RemoteHead>,
+    stage: SetStage,
+}
+
+impl SetHeadsOperation {
+    pub fn new(
+        (peer, node): (NodeId, ServingNode),
+        auth: AuthContext,
+        binding: DistributionBinding,
+        listing: SetListing,
+    ) -> Self {
+        let (marker, version_marker) = match listing.cursor.clone() {
+            Some(cursor) => (Some(cursor.key), cursor.version_id),
+            None => (None, None),
+        };
+        Self {
+            peer,
+            node,
+            auth,
+            binding,
+            listing,
+            view: None,
+            fence: LocalFence::default(),
+            ranges: Vec::new(),
+            visited: 0,
+            marker,
+            version_marker,
+            heads: Vec::new(),
+            stage: SetStage::View,
+        }
+    }
+
+    fn prefix(&self) -> Option<String> {
+        (!self.listing.prefix.is_empty()).then(|| listing_prefix(&self.listing.prefix))
+    }
+
+    fn page(&mut self, next: Option<SyncListCursor>) -> HeadsTurn {
+        let heads = std::mem::take(&mut self.heads);
+        let page = SyncVersionPage::new(heads, next);
+        Ok(Next::Done(page.map_err(|error| {
+            SyncRefusal::Invalid(error.to_string())
+        })?))
+    }
+
+    /// Lists the next range here, ends the page, or asks a holder for a first range kept
+    /// elsewhere.
+    fn range(&mut self) -> HeadsTurn {
+        let Some(range) = self.ranges.get(self.visited).cloned() else {
+            return self.page(None);
+        };
+        let snapshot = self
+            .view
+            .as_ref()
+            .ok_or(SyncRefusal::Unavailable)?
+            .snapshot();
+        let remaining = self.listing.limit.get().saturating_sub(self.heads.len());
+        let here = snapshot.lists_locally(self.binding.member_id, &range, &self.fence);
+        if remaining == 0 || self.visited == MAX_PAGE_RANGES || (!here && self.visited > 0) {
             // The nil version id starts the next page at the first key of this range.
-            next = Some(SyncListCursor {
+            let next = SyncListCursor {
                 key: range.lower.clone(),
                 version_id: Some(Ulid::nil()),
-            });
-            break;
+            };
+            return self.page(Some(next));
         }
         if !here {
-            return holder_heads(context, (peer, auth), (snapshot, range), listing).await;
+            self.stage = SetStage::Holder;
+            return Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+                self.auth.realm_id,
+            ))));
         }
-        let operation = InventoryVersionsOperation::new(InventoryVersionsInput {
-            set_id: binding.set_id,
-            bucket: listing.bucket.clone(),
-            prefix: prefix.clone(),
+        self.visited += 1;
+        let list = InventoryVersionsOperation::new(InventoryVersionsInput {
+            set_id: self.binding.set_id,
+            bucket: self.listing.bucket.clone(),
+            prefix: self.prefix(),
             delimiter: None,
-            key_marker: marker.take(),
-            version_id_marker: version_marker.take(),
+            key_marker: self.marker.take(),
+            version_id_marker: self.version_marker.take(),
             max_keys: remaining,
             lower: range.lower.clone(),
             upper: range.upper.clone(),
         });
-        let result = drive(operation, context.as_ref())
-            .await
-            .map_err(|_| SyncRefusal::Unavailable)?;
-        heads.extend(
-            result
-                .items
-                .iter()
-                .filter_map(|item| head_of(item, &listing.prefix)),
-        );
-        if result.is_truncated {
-            next = Some(SyncListCursor {
-                key: result.next_key_marker.unwrap_or_default(),
-                version_id: result.next_version_marker,
-            });
-            break;
+        self.stage = SetStage::Range;
+        Ok(Next::Call(IoCall::child(list)))
+    }
+
+    /// The page a ready holder of the first range answers; only a device's listing is passed
+    /// on, once.
+    fn holder(&mut self, config: RealmConfigDocument) -> HeadsTurn {
+        let range = self
+            .ranges
+            .get(self.visited)
+            .cloned()
+            .ok_or(SyncRefusal::Unavailable)?;
+        let snapshot = self
+            .view
+            .as_ref()
+            .ok_or(SyncRefusal::Unavailable)?
+            .snapshot();
+        let device = node_kind(&config, self.peer).is_some_and(|kind| kind.owner().is_some());
+        let (local, peer) = (self.node.0, self.peer);
+        let holder = (snapshot.list_holder(&range).into_iter())
+            .map(|member| member.node_id)
+            .find(|node_id| *node_id != local && *node_id != peer);
+        let (Some(holder), true) = (holder, device) else {
+            return Err(SyncRefusal::Unavailable);
+        };
+        let message = MetadataTransportMessage::ForwardListVersions {
+            auth_token: AuthToken::internal(self.auth.clone()),
+            bucket: self.listing.bucket.clone(),
+            prefix: self.listing.prefix.clone(),
+            cursor: self.listing.cursor.clone(),
+            limit: self.listing.limit,
+        };
+        let frame = encode_message(&message).map_err(|_| SyncRefusal::Unavailable)?;
+        self.stage = SetStage::Forwarded(holder);
+        Ok(Next::Call(peer_call(holder, frame, HOLDER_TIMEOUT)))
+    }
+}
+
+impl Operation for SetHeadsOperation {
+    type Output = SyncVersionPage;
+    type Error = SyncRefusal;
+
+    fn first(&mut self) -> HeadsTurn {
+        Ok(Next::Call(IoCall::child(bound_view(&self.binding))))
+    }
+
+    fn next(&mut self, result: IoResult) -> HeadsTurn {
+        let unavailable = |_| SyncRefusal::Unavailable;
+        match std::mem::replace(&mut self.stage, SetStage::Range) {
+            SetStage::View => {
+                let view = result
+                    .child::<DistributionView, GuardError>()
+                    .map_err(unavailable)?;
+                let view = view.map_err(unavailable)?;
+                self.stage = SetStage::Fence(view);
+                Ok(Next::Call(IoCall::child(local_fence(self.binding.set_id))))
+            }
+            SetStage::Fence(view) => {
+                let fence = result
+                    .child::<LocalFence, GuardError>()
+                    .map_err(unavailable)?;
+                self.fence = fence.map_err(unavailable)?;
+                let start = self.marker.clone().unwrap_or_default();
+                let prefix = self.prefix().unwrap_or_default();
+                let listed = view.snapshot().listed_ranges(&prefix).into_iter();
+                self.ranges = listed
+                    .filter(|range| {
+                        range
+                            .upper
+                            .as_deref()
+                            .is_none_or(|upper| start.as_str() < upper)
+                    })
+                    .cloned()
+                    .collect();
+                self.view = Some(view);
+                self.range()
+            }
+            SetStage::Range => {
+                let listed = result.child::<ListVersionsResult, InventoryVersionsError>();
+                let listed = listed.map_err(unavailable)?.map_err(unavailable)?;
+                let prefix = self.listing.prefix.clone();
+                let heads = listed
+                    .items
+                    .iter()
+                    .filter_map(|item| head_of(item, &prefix));
+                self.heads.extend(heads);
+                if listed.is_truncated {
+                    let next = SyncListCursor {
+                        key: listed.next_key_marker.unwrap_or_default(),
+                        version_id: listed.next_version_marker,
+                    };
+                    return self.page(Some(next));
+                }
+                self.range()
+            }
+            SetStage::Holder => {
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()
+                    .map_err(unavailable)?;
+                let config = config
+                    .inspect_err(crate::realm::load_config::config_unavailable)
+                    .map_err(unavailable)?;
+                self.holder(config)
+            }
+            SetStage::Forwarded(holder) => match peer_reply(holder, result).map_err(unavailable)? {
+                Ok(MetadataTransportMessage::ForwardedVersions { result }) => {
+                    Ok(Next::Done(result?))
+                }
+                _ => Err(SyncRefusal::Unavailable),
+            },
         }
     }
-    SyncVersionPage::new(heads, next).map_err(|error| SyncRefusal::Invalid(error.to_string()))
 }
 
-/// The page a ready holder of `range` answers; only a device's listing is passed on, once.
-async fn holder_heads(
-    context: &Arc<DriverContext>,
-    (peer, auth): (NodeId, &AuthContext),
-    (snapshot, range): (&DistributionSnapshot, &KeyRange),
-    listing: SetListing,
-) -> Result<SyncVersionPage, SyncRefusal> {
-    let config = drive(GetConfigOperation::new(auth.realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or(SyncRefusal::Unavailable)?;
-    let device = node_kind(&config, peer).is_some_and(|kind| kind.owner().is_some());
-    let local = local_node(context)?;
-    let holder = (snapshot.list_holder(range).into_iter())
-        .map(|member| member.node_id)
-        .find(|node_id| *node_id != local && *node_id != peer);
-    let (Some(holder), true, Some(metadata)) = (holder, device, context.metadata_handle.as_ref())
-    else {
-        return Err(SyncRefusal::Unavailable);
-    };
-    let message = MetadataTransportMessage::ForwardListVersions {
-        auth_token: aruna_core::metadata::AuthToken::internal(auth.clone()),
-        bucket: listing.bucket,
-        prefix: listing.prefix,
-        cursor: listing.cursor,
-        limit: listing.limit,
-    };
-    match metadata.request_forwarded_write(holder, message).await {
-        Ok(MetadataTransportMessage::ForwardedVersions { result }) => result,
-        _ => Err(SyncRefusal::Unavailable),
-    }
-}
-
-/// The listing prefix a bound folder maps to, always ending in a separator so
-/// a sibling directory with the same leading characters is not listed too.
+/// The listing prefix a bound folder maps to, always ending in a separator so a sibling
+/// directory with the same leading characters is not listed too.
 fn listing_prefix(prefix: &str) -> String {
     format!("{}/", prefix.trim_end_matches('/'))
 }
@@ -961,27 +1166,9 @@ fn relative_key(key: &str, prefix: &str) -> Option<String> {
     }
 }
 
-async fn ensure_read(
-    context: &Arc<DriverContext>,
-    auth: &AuthContext,
-    node_id: NodeId,
-    group_id: GroupId,
-    bucket: &str,
-) -> Result<(), SyncRefusal> {
-    authorize_pull(
-        context,
-        auth,
-        aruna_core::structs::storage::blob::bucket_permission_path(
-            auth.realm_id,
-            group_id,
-            node_id,
-            bucket,
-        ),
-        Permission::READ,
-        "s3.ListObjectVersions",
-    )
-    .await
-}
+#[cfg(test)]
+#[path = "device_pull_tests.rs"]
+mod call_tests;
 
 #[cfg(test)]
 mod tests {
@@ -989,8 +1176,11 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
 
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::errors::{ConversionError, StorageError};
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -1002,6 +1192,71 @@ mod tests {
     use aruna_core::structs::storage::replication::VersionedObjectArn;
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
+
+    async fn guard_target(context: &DriverContext, bucket: &str) -> Result<(), SyncRefusal> {
+        let guard = drive(BucketGuardOperation::new(bucket), context).await;
+        guard.map_err(|error| guard_refusal(error, bucket))
+    }
+
+    async fn read_bucket(context: &DriverContext, bucket: &str) -> Result<BucketInfo, SyncRefusal> {
+        let read = drive(GetBucketOperation::new(bucket.to_string()), context).await;
+        read.map_err(bucket_refusal)
+    }
+
+    async fn coordinates(
+        context: &DriverContext,
+        bucket: &BucketInfo,
+        key: &str,
+    ) -> Result<(), SyncRefusal> {
+        let Some(binding) = bucket.distribution.as_ref() else {
+            return Ok(());
+        };
+        route_refusal(drive(route_write(binding, key), context).await)
+    }
+
+    async fn ensure_write(
+        context: &DriverContext,
+        auth: &AuthContext,
+        node_id: NodeId,
+        bucket: &BucketInfo,
+        request: &SyncPull,
+    ) -> Result<(), SyncRefusal> {
+        let check = write_authorization(auth, node_id, bucket, request);
+        drive(check, context).await.map_err(pull_refusal)
+    }
+
+    async fn ensure_read(
+        context: &DriverContext,
+        auth: &AuthContext,
+        node_id: NodeId,
+        group_id: GroupId,
+        bucket: &str,
+    ) -> Result<(), SyncRefusal> {
+        let check = read_authorization(auth, node_id, group_id, bucket);
+        drive(check, context).await.map_err(pull_refusal)
+    }
+
+    async fn applied_version(context: &DriverContext, request: &SyncPull) -> Option<Ulid> {
+        drive(ReceiptOperation::new(request), context)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn replayed(context: &DriverContext, request: &SyncPull) -> Option<SyncPullAck> {
+        applied_version(context, request).await.map(replay_ack)
+    }
+
+    async fn set_heads(
+        context: &DriverContext,
+        (peer, auth): (NodeId, &AuthContext),
+        binding: &DistributionBinding,
+        listing: SetListing,
+    ) -> Result<SyncVersionPage, SyncRefusal> {
+        let node = (peer, (peer, auth.realm_id));
+        let set = SetHeadsOperation::new(node, auth.clone(), binding.clone(), listing);
+        drive(set, context).await
+    }
 
     fn deny_policy(expression: &str) -> RequestPolicy {
         RequestPolicy {
