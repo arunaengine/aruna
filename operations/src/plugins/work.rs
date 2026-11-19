@@ -11,6 +11,7 @@ use aruna_core::plugin_runs::{RUN_RETENTION_MS, run_key};
 use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::execution::job::input::{JobPayload, PluginWorkSpec};
 use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload, OutputObject};
+use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -21,7 +22,9 @@ use super::rows::{
     Row, Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row, unexpected, values,
 };
-use crate::jobs::prune::{JobPruneOutcome, PruneDueOperation, PruneError, PruneJobsOperation};
+use crate::jobs::prune::{
+    DueJobs, JobPruneOutcome, PruneDueOperation, PruneError, PruneJobsOperation,
+};
 
 /// The row of a work under its key.
 pub(crate) fn row_of(key: Vec<u8>, work: &WorkRow) -> Result<Row, StoreError> {
@@ -438,12 +441,15 @@ impl Operation for HoldsJob {
 
 /// One job prune pass that keeps a due plugin work job while [`holds_job`] says so. Both prune
 /// steps use the time of the run's start, so no job falls due between the check and the prune.
+/// The prune deletes only checked jobs; held jobs do not fill a window, so later jobs progress.
 #[derive(Debug, PartialEq)]
 pub struct PruneKeepingWork {
     page_size: usize,
     now_ms: Option<u64>,
     checks: Vec<(JobId, PluginWorkSpec)>,
+    checked: BTreeSet<JobId>,
     kept: BTreeSet<JobId>,
+    after: Option<Key>,
     phase: KeepPhase,
 }
 
@@ -462,9 +468,17 @@ impl PruneKeepingWork {
             page_size,
             now_ms: None,
             checks: Vec::new(),
+            checked: BTreeSet::new(),
             kept: BTreeSet::new(),
+            after: None,
             phase: KeepPhase::Due,
         }
+    }
+
+    fn due(&mut self) -> PruneNext {
+        self.phase = KeepPhase::Due;
+        let due = PruneDueOperation::new(self.now(), self.page_size, self.after.take());
+        Ok(Next::Call(IoCall::child(due)))
     }
 
     fn now(&self) -> u64 {
@@ -476,9 +490,13 @@ impl PruneKeepingWork {
             self.phase = KeepPhase::Holds(job_id);
             return Ok(Next::Call(IoCall::child(holds_job(&spec))));
         }
+        let waiting = self.checked.len().saturating_sub(self.kept.len());
+        if self.after.is_some() && waiting < self.page_size.saturating_mul(4) {
+            return self.due();
+        }
         self.phase = KeepPhase::Prune;
-        let kept = std::mem::take(&mut self.kept);
-        let prune = PruneJobsOperation::new(self.now(), self.page_size, kept);
+        let (kept, checked) = (std::mem::take(&mut self.kept), std::mem::take(&mut self.checked));
+        let prune = PruneJobsOperation::new(self.now(), self.page_size, kept).within(checked);
         Ok(Next::Call(IoCall::child(prune)))
     }
 }
@@ -492,15 +510,16 @@ impl Operation for PruneKeepingWork {
     }
 
     fn first(&mut self) -> PruneNext {
-        let due = PruneDueOperation::new(self.now(), self.page_size);
-        Ok(Next::Call(IoCall::child(due)))
+        self.due()
     }
 
     fn next(&mut self, result: IoResult) -> PruneNext {
         match std::mem::replace(&mut self.phase, KeepPhase::Prune) {
             KeepPhase::Due => {
-                let due = result.child::<Vec<(JobId, JobPayload)>, PruneError>()??;
-                for (job_id, payload) in due.into_iter().rev() {
+                let due = result.child::<DueJobs, PruneError>()??;
+                self.after = due.after;
+                for (job_id, payload) in due.jobs.into_iter().rev() {
+                    self.checked.insert(job_id);
                     if let JobPayload::PluginWork(spec) = payload {
                         self.checks.push((job_id, spec));
                     }

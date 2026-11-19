@@ -53,6 +53,13 @@ impl From<JobMutationError> for PruneError {
     }
 }
 
+/// The due jobs of one window, and the index row to continue after when the window was full.
+#[derive(Debug, Default, PartialEq)]
+pub struct DueJobs {
+    pub jobs: Vec<(JobId, JobPayload)>,
+    pub after: Option<Key>,
+}
+
 /// The due jobs of the next prune pass, for the payload handlers that may keep one for now.
 #[derive(Debug, PartialEq)]
 pub struct PruneDueOperation {
@@ -62,12 +69,14 @@ pub struct PruneDueOperation {
     next_page: Option<Key>,
     due: Vec<(JobId, JobPayload)>,
     reading: Option<JobId>,
+    last: Option<Key>,
 }
 
-type DueNext = Result<Next<Vec<(JobId, JobPayload)>>, PruneError>;
+type DueNext = Result<Next<DueJobs>, PruneError>;
 
 impl PruneDueOperation {
-    pub fn new(now_ms: u64, page_size: usize) -> Self {
+    /// Starts after the index row `after`, or at the first row.
+    pub fn new(now_ms: u64, page_size: usize, after: Option<Key>) -> Self {
         Self {
             now_ms,
             page_size,
@@ -75,7 +84,18 @@ impl PruneDueOperation {
             next_page: None,
             due: Vec::new(),
             reading: None,
+            last: after,
         }
+    }
+
+    fn done(&mut self, full: bool) -> DueNext {
+        let jobs = std::mem::take(&mut self.due);
+        let after = if full && !jobs.is_empty() {
+            self.last.clone()
+        } else {
+            None
+        };
+        Ok(Next::Done(DueJobs { jobs, after }))
     }
 
     fn page(&self, after: Option<Key>) -> IoCall {
@@ -87,25 +107,29 @@ impl PruneDueOperation {
             let Ok((expiry_ms, job_id)) = parse_schedule_key(key.as_ref()) else {
                 continue;
             };
-            if expiry_ms > self.now_ms || self.due.len() >= self.page_size.saturating_mul(4) {
-                return Ok(Next::Done(std::mem::take(&mut self.due)));
+            if expiry_ms > self.now_ms {
+                return self.done(false);
             }
+            if self.due.len() >= self.page_size.saturating_mul(4) {
+                return self.done(true);
+            }
+            self.last = Some(key);
             self.reading = Some(job_id);
             return Ok(Next::Call(IoCall::child(read_job_record(job_id))));
         }
         match self.next_page.take() {
             Some(next) => Ok(Next::Call(self.page(Some(next)))),
-            None => Ok(Next::Done(std::mem::take(&mut self.due))),
+            None => self.done(false),
         }
     }
 }
 
 impl Operation for PruneDueOperation {
-    type Output = Vec<(JobId, JobPayload)>;
+    type Output = DueJobs;
     type Error = PruneError;
 
     fn first(&mut self) -> DueNext {
-        Ok(Next::Call(self.page(None)))
+        Ok(Next::Call(self.page(self.last.clone())))
     }
 
     fn next(&mut self, result: IoResult) -> DueNext {
@@ -144,6 +168,7 @@ pub struct PruneJobsOperation {
     page_size: usize,
     deletion_cap: usize,
     kept: BTreeSet<JobId>,
+    checked: Option<BTreeSet<JobId>>,
     deletes: Vec<(KeySpace, Key)>,
     outcome: JobPruneOutcome,
     processed: usize,
@@ -174,6 +199,7 @@ impl PruneJobsOperation {
             page_size,
             deletion_cap: page_size.saturating_mul(4),
             kept,
+            checked: None,
             deletes: Vec::new(),
             outcome: JobPruneOutcome::default(),
             processed: 0,
@@ -181,6 +207,12 @@ impl PruneJobsOperation {
             next_page: None,
             step: PruneStep::Page,
         }
+    }
+
+    /// Limits the pass to the jobs a due window checked; the first other job ends the pass.
+    pub fn within(mut self, checked: BTreeSet<JobId>) -> Self {
+        self.checked = Some(checked);
+        self
     }
 
     fn call(&mut self, step: PruneStep, call: IoCall) -> PruneNext {
@@ -257,6 +289,11 @@ impl PruneJobsOperation {
             ));
             return self.counted();
         };
+        if let Some(checked) = &self.checked
+            && !checked.contains(&record.job_id)
+        {
+            return self.more_left();
+        }
         if !matches!(&record.payload, JobPayload::Execution(_)) {
             return self.cleanup_clear(Box::new(record));
         }
@@ -546,12 +583,50 @@ pub(crate) mod tests {
     #[test]
     fn due_list_stops() {
         let (due, later) = (JobId::from_bytes([6u8; 16]), JobId::from_bytes([7u8; 16]));
-        let mut list = PruneDueOperation::new(10, 4);
+        let mut list = PruneDueOperation::new(10, 4, None);
         assert!(matches!(list.first(), Ok(Next::Call(IoCall::Child(_)))));
         let page = page_of(vec![prune_key(5, due), prune_key(20, later)]);
         assert!(matches!(list.next(page), Ok(Next::Call(IoCall::Child(_)))));
         let missing = child(Ok::<Option<JobRecord>, JobMutationError>(None));
-        assert!(matches!(list.next(missing), Ok(Next::Done(found)) if found.is_empty()));
+        let found = list.next(missing);
+        assert!(matches!(found, Ok(Next::Done(found)) if found == DueJobs::default()));
+    }
+
+    // A full window names the last row it read, so the next window starts after it.
+    #[test]
+    fn full_window_continues() {
+        let mut list = PruneDueOperation::new(10, 1, None);
+        list.first().unwrap();
+        let keys = (1..=5u8).map(|seed| prune_key(5, JobId::from_bytes([seed; 16])));
+        assert!(is_child(&list.next(page_of(keys.collect()))));
+        for seed in 1..=4u8 {
+            let record = terminal_record(JobId::from_bytes([seed; 16]), 1);
+            let read = list.next(child(Ok::<_, JobMutationError>(Some(record))));
+            if seed < 4 {
+                assert!(is_child(&read));
+                continue;
+            }
+            let Ok(Next::Done(window)) = read else {
+                panic!("a full window ends");
+            };
+            assert_eq!(window.jobs.len(), 4);
+            let last = prune_key(5, JobId::from_bytes([4u8; 16]));
+            assert_eq!(window.after, Some(last));
+        }
+    }
+
+    // A due job outside the checked window waits for the next pass and is not deleted.
+    #[test]
+    fn unchecked_job_waits() {
+        let (checked, later) = (JobId::from_bytes([8u8; 16]), JobId::from_bytes([9u8; 16]));
+        let only = BTreeSet::from([checked]);
+        let mut prune = PruneJobsOperation::new(10, 4, BTreeSet::new()).within(only);
+        let read = prune.record_read(prune_key(5, later), Some(terminal_record(later, 1)));
+        assert!(is_child(&read));
+        assert_eq!(prune.step, PruneStep::Deletes);
+        assert!(prune.deletes.is_empty());
+        assert!(prune.outcome.has_more);
+        assert_eq!(prune.outcome.pruned, 0);
     }
 
     fn node_id(seed: u8) -> NodeId {
