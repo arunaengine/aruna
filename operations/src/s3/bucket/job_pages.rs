@@ -22,10 +22,10 @@ use super::rename::RenameError;
 use crate::auth::bearer_token::GrantValidOperation;
 use crate::auth::error::{ArunaBearerError, AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::{AuthorizeOperation, BucketAccess, BucketAccessOperation};
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::migration::shared::MigrationError;
 use crate::blob::unify::UnifyJobOperation;
 use crate::s3::bucket::remap::{RemapJobOperation, RemapScope};
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Delay between pages of a running job, and before a waiting job tries again.
 const CONTINUE: Duration = Duration::from_secs(1);

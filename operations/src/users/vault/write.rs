@@ -13,14 +13,13 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, done, event, values};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
-    MAX_KEY_RECORDS, MAX_PREDECESSORS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecordError,
-    VaultRecords, VaultRevision, head_rows, record_rows, user_record_prefix,
+    MAX_KEY_RECORDS, MAX_PREDECESSORS, MAX_VAULT_HEADS, UserKeyRecord, VaultAppended, VaultChange,
+    VaultRecordError, VaultRecords, VaultRevision, head_rows, record_rows, user_record_prefix,
 };
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_core::vault_format::key_fingerprint;
 use aruna_core::{NodeId, UserId};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -28,44 +27,6 @@ use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
-
-/// One change a user makes to their own vault records.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VaultChange {
-    /// A new head replacing `predecessors`, the heads the client read.
-    Save {
-        payload: String,
-        predecessors: Vec<Ulid>,
-    },
-    /// Replaces every current head with a delete marker.
-    Delete,
-    PublishKey {
-        key_id: String,
-        public_key: [u8; 32],
-        has_recovery: bool,
-    },
-}
-
-/// Shows the payload size only, so no formatted message carries vault ciphertext.
-impl std::fmt::Debug for VaultChange {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Save {
-                payload,
-                predecessors,
-            } => formatter
-                .debug_struct("Save")
-                .field("payload_bytes", &payload.len())
-                .field("predecessors", predecessors)
-                .finish(),
-            Self::Delete => formatter.write_str("Delete"),
-            Self::PublishKey { key_id, .. } => formatter
-                .debug_struct("PublishKey")
-                .field("key_id", key_id)
-                .finish_non_exhaustive(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppendVaultConfig {
@@ -77,20 +38,6 @@ pub struct AppendVaultConfig {
     pub record_id: Ulid,
     pub change: VaultChange,
     pub now_ms: u64,
-}
-
-/// The heads after a save or delete, or the published key record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VaultAppended {
-    Heads(Vec<VaultRevision>),
-    Key(Box<UserKeyRecord>),
-}
-
-/// Why a holder refused a forwarded vault change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VaultRefusal {
-    Invalid,
-    TooManyKeys,
 }
 
 #[derive(Debug, Error, PartialEq)]

@@ -4,49 +4,50 @@
 
 use std::time::{Duration, SystemTime};
 
-use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
-use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_PAGE_BYTES};
-use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
-use aruna_core::effects::{FrameShape, MetadataRequestEffect};
-use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
-use aruna_core::metadata::{
+use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
+use crate::audit::{AuditPageRequest, AuditPageResponse, MAX_PAGE_BYTES};
+use crate::document::DocumentTarget;
+use crate::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
+use crate::effects::{FrameShape, MetadataRequestEffect};
+use crate::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
+use crate::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataError, MetadataQueryResults, MetadataSearchHit,
     ProfileValidationFinding, ProfileValidationStatus,
 };
-use aruna_core::structs::execution::job::SubmissionId;
-use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
-use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef};
-use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::storage::distribution::capacity::RangeSize;
-use aruna_core::structs::storage::distribution::{
+use crate::structs::execution::job::SubmissionId;
+use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
+use crate::structs::placement::policy::document::PlacementPolicyDocument;
+use crate::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef};
+use crate::structs::placement::record::PlacementRef;
+use crate::structs::storage::distribution::capacity::RangeSize;
+use crate::structs::storage::distribution::request::PublishRefusal;
+use crate::structs::storage::distribution::source_root::HandedImport;
+use crate::structs::storage::distribution::{
     DistributionRequest, DistributionRevision, SignedSnapshot, SignedStatement,
 };
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::storage::node_info::NodeInfoDocument;
-use aruna_core::structs::{
+use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+use crate::structs::storage::node_info::NodeInfoDocument;
+use crate::structs::{
     PathClaimRecord, PersistentIdFailure, PersistentIdMapping, SyncListCursor, SyncPageLimit,
     SyncPull, SyncPullStatus, SyncRefusal, SyncRelationship, SyncVersionPage,
 };
-use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use crate::types::GroupId;
+use crate::{NodeId, UserId};
 use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::jobs::lifecycle::ids::SubmissionRequest;
-use crate::metadata::api::export_types::RoCrateExportView;
-use crate::metadata::api::preflight_types::{ReferenceNodeExecution, ReferenceNodeRequest};
-use crate::metadata::create_document::CreateDocumentPayload;
-use crate::metadata::update_document::UpdateDocumentMutation;
-use crate::s3::bucket::search::BucketPage;
-use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
-use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
-use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
+use crate::job_request::SubmissionRequest;
+use crate::jobs::{SubmissionAck, SubmissionRefusal};
+use crate::metadata::api::{
+    CreateDocumentPayload, ReferenceNodeExecution, ReferenceNodeRequest, RoCrateExportView,
+    UpdateDocumentMutation,
+};
+use crate::request_policy::PolicyRequestExtras;
+use crate::search::{BucketPage, ObjectKeyMatch, SearchNodePage};
+use crate::structs::storage::release::{HolderAnswer, HolderAsk};
 
-use aruna_core::metadata::AuthToken;
+use crate::metadata::AuthToken;
 
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const AUDIT_FRAME_OVERHEAD: usize = 256;
@@ -65,7 +66,7 @@ pub struct MetadataPathCandidate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataPathWinner {
-    pub realm_id: aruna_core::structs::identity::realm::RealmId,
+    pub realm_id: crate::structs::identity::realm::RealmId,
     pub group_id: GroupId,
     pub document_id: Ulid,
     pub document_path: String,
@@ -159,7 +160,7 @@ pub enum MetadataTransportMessage {
         /// Admits a bucket by READ on this key or key prefix inside it instead of on its root.
         key: Option<String>,
         /// An MCP tool's policy context whose policies must also allow each hit.
-        extras: Option<crate::auth::request_policy::PolicyRequestExtras>,
+        extras: Option<crate::request_policy::PolicyRequestExtras>,
         limit: usize,
         group_id: Option<GroupId>,
         /// Continues after this bucket name or this node's sealed scan position.
@@ -253,7 +254,7 @@ pub enum MetadataTransportMessage {
     /// publish realm administration events.
     ForwardTokenRevocation {
         auth_token: AuthToken,
-        token: aruna_core::compute::Secret,
+        token: crate::compute::Secret,
     },
     ForwardedTokenRevoked,
     #[serde(rename = "ForwardedTokenRevocationCapacity")]
@@ -481,23 +482,23 @@ pub enum MetadataTransportMessage {
     },
     GroupDeletion {
         auth_token: Option<AuthToken>,
-        action: aruna_core::structs::identity::group_delete::GroupDeleteAction,
+        action: crate::structs::identity::group_delete::GroupDeleteAction,
     },
     GroupDeletionResult {
         result: Result<
-            Option<aruna_core::structs::identity::group_delete::GroupDeleteProof>,
-            aruna_core::structs::identity::group_delete::GroupDeletionError,
+            Option<crate::structs::identity::group_delete::GroupDeleteProof>,
+            crate::structs::identity::group_delete::GroupDeletionError,
         >,
     },
     /// Readable documents in the node's reverse index that hold one external identifier.
     LookupIdentifier {
         auth_token: Option<AuthToken>,
-        kind: aruna_core::structs::secondary_id::SecondaryIdKind,
+        kind: crate::structs::secondary_id::SecondaryIdKind,
         value: String,
         endpoint: Option<String>,
     },
     IdentifierMatches {
-        result: Result<Vec<crate::metadata::secondary_ids::IdentifierMatch>, MetadataReadError>,
+        result: Result<Vec<crate::metadata::api::IdentifierMatch>, MetadataReadError>,
     },
     /// A forwarded update refused because the document moved past the expected revision.
     ForwardedRevisionConflict {
@@ -509,23 +510,23 @@ pub enum MetadataTransportMessage {
     ForwardVaultChange {
         auth_token: Option<AuthToken>,
         record_id: Ulid,
-        change: Box<crate::users::vault_write::VaultChange>,
+        change: Box<crate::structs::identity::user::vault::VaultChange>,
         created_at_ms: u64,
     },
     ForwardedVaultChange {
         result: Result<
-            crate::users::vault_write::VaultAppended,
-            crate::users::vault_write::VaultRefusal,
+            crate::structs::identity::user::vault::VaultAppended,
+            crate::structs::identity::user::vault::VaultRefusal,
         >,
     },
     /// One user's vault heads or key records asked of a holder.
     FetchVaultRecords {
-        user_id: aruna_core::UserId,
-        query: aruna_core::effects::VaultQuery,
+        user_id: crate::UserId,
+        query: crate::effects::VaultQuery,
     },
     /// An empty answer means this holder has no records, never that the vault is absent.
     FetchedVaultRecords {
-        result: Result<aruna_core::structs::identity::user::vault::VaultRecords, MetadataReadError>,
+        result: Result<crate::structs::identity::user::vault::VaultRecords, MetadataReadError>,
     },
     /// Whether the device owner may write under `prefix` of one bucket the realm node holds,
     /// asked before a publish copies anything. Appended last to keep discriminants stable.
@@ -576,15 +577,15 @@ pub enum MetadataTransportMessage {
         statement: Box<SignedStatement>,
     },
     DistributionAccepted {
-        result: Result<DistributionRevision, crate::distribution::forward::PublishRefusal>,
+        result: Result<DistributionRevision, PublishRefusal>,
     },
     /// One node's data link postings for the caller's lookup, read under the caller's token.
     DataLinks {
         auth_token: Option<AuthToken>,
-        request: Box<crate::metadata::api::links::types::LinkNodeRequest>,
+        request: Box<crate::metadata::api::LinkNodeRequest>,
     },
     DataLinkResults {
-        result: Result<Box<crate::metadata::api::links::types::LinkNodePage>, MetadataReadError>,
+        result: Result<Box<crate::metadata::api::LinkNodePage>, MetadataReadError>,
     },
     /// The group that owns a local bucket, asked by a management node for a database mark.
     BucketOwner {
@@ -592,7 +593,7 @@ pub enum MetadataTransportMessage {
         bucket: String,
     },
     BucketOwnerResult {
-        result: Result<aruna_core::types::GroupId, MetadataReadError>,
+        result: Result<crate::types::GroupId, MetadataReadError>,
     },
     /// One node's first page of the documents that link a set, for its deletion preview.
     SetPreview {
@@ -601,22 +602,22 @@ pub enum MetadataTransportMessage {
         limit: usize,
     },
     SetPreviewResults {
-        result: Result<Box<crate::metadata::api::links::types::SetPreviewPage>, MetadataReadError>,
+        result: Result<Box<crate::metadata::api::SetPreviewPage>, MetadataReadError>,
     },
     /// A staging job the former coordinator of a range hands over in transfer `transfer_id`.
     StagingSpec {
         transfer_id: Ulid,
-        job_id: aruna_core::structs::execution::job::JobId,
+        job_id: crate::structs::execution::job::JobId,
     },
     StagingSpecResult {
-        result: Result<Box<crate::distribution::imports::HandedImport>, MetadataReadError>,
+        result: Result<Box<HandedImport>, MetadataReadError>,
     },
     /// Reference records of one range from its coordinator, applied in one transaction.
     ReferencePage {
-        page: Box<crate::replication::page::ReferencePage>,
+        page: Box<crate::replication_protocol::ReferencePage>,
     },
     ReferencePageAnswer {
-        answer: crate::replication::page::PageAnswer,
+        answer: crate::replication_protocol::PageAnswer,
     },
     /// The realm signing key a management node hands a server node it promotes.
     HandRealmKey {
@@ -632,24 +633,24 @@ pub enum MetadataTransportMessage {
     },
     /// One input page of a job family by its digest; only realm infrastructure nodes ask.
     JobInputPage {
-        submission: aruna_core::structs::execution::job::SubmissionId,
+        submission: crate::structs::execution::job::SubmissionId,
         digest: [u8; 32],
     },
     InputPageResult {
-        page: Option<Box<aruna_core::structs::execution::job::InputPage>>,
+        page: Option<Box<crate::structs::execution::job::InputPage>>,
     },
     /// Inputs an ingress asks their source node to resolve and grant, under the caller's bearer.
     ResolveJobInputs {
         auth_token: AuthToken,
-        request: Box<aruna_core::jobs::InputResolveRequest>,
+        request: Box<crate::jobs::InputResolveRequest>,
     },
     ResolvedJobInputs {
         result: Result<
             Vec<(
-                aruna_core::structs::execution::job::InputSelection,
-                aruna_core::structs::execution::job::CapturedInput,
+                crate::structs::execution::job::InputSelection,
+                crate::structs::execution::job::CapturedInput,
             )>,
-            aruna_core::jobs::SubmissionRefusal,
+            crate::jobs::SubmissionRefusal,
         >,
     },
     /// Release membership or release files of some ranges, asked of their coordinator with the
@@ -664,23 +665,23 @@ pub enum MetadataTransportMessage {
     },
     /// One revision of a realm vault entry, asked of a management node; Debug hides the secret.
     RealmSecret {
-        entry: aruna_core::realm_vault::RealmVaultEntry,
+        entry: crate::realm_vault::RealmVaultEntry,
         revision: ulid::Ulid,
     },
     RealmSecretResult {
-        result: Result<aruna_core::compute::SecretBytes, MetadataReadError>,
+        result: Result<crate::compute::SecretBytes, MetadataReadError>,
     },
     /// The sealed secret of a setting document, asked of a management node; Debug hides it.
     OpenSetting {
         target: DocumentTarget,
-        bytes: aruna_core::compute::SecretBytes,
+        bytes: crate::compute::SecretBytes,
     },
     OpenSettingResult {
-        result: Result<aruna_core::compute::SecretBytes, MetadataReadError>,
+        result: Result<crate::compute::SecretBytes, MetadataReadError>,
     },
     /// One chunk of a plugin artifact a management node hands another to keep before publishing.
     StoreArtifact {
-        chunk: aruna_core::plugins::Chunk,
+        chunk: crate::plugins::Chunk,
     },
     /// `true` once the receiver holds the whole artifact and it checked out.
     ArtifactStored {
@@ -692,7 +693,7 @@ pub enum MetadataTransportMessage {
         index: u32,
     },
     FetchedArtifact {
-        result: Result<aruna_core::plugins::Chunk, MetadataReadError>,
+        result: Result<crate::plugins::Chunk, MetadataReadError>,
     },
     /// The clock of an infrastructure node, asked to map an install's activation time.
     ProbeClock,
@@ -701,26 +702,26 @@ pub enum MetadataTransportMessage {
     },
     /// Matched plugin events and gap counts for the install's receiver to decide.
     ForwardEvents {
-        batch: aruna_core::plugin_runs::EventBatch,
+        batch: crate::plugin_runs::EventBatch,
     },
     EventsDecided {
-        result: Result<aruna_core::plugin_runs::Decisions, MetadataReadError>,
+        result: Result<crate::plugin_runs::Decisions, MetadataReadError>,
     },
     /// A plugin install's receiver asks for the secret bound to one of its slots.
     ReleaseSecret {
-        request: aruna_core::plugins::ReleaseRequest,
+        request: crate::plugins::ReleaseRequest,
     },
     SecretReleased {
-        result: Result<aruna_core::plugins::Released, aruna_core::plugins::ReleaseError>,
+        result: Result<crate::plugins::Released, crate::plugins::ReleaseError>,
     },
     /// A server node asks an install's receiver whether it holds a node secret of a kind, and
     /// which header the secret checks; never its value.
     CheckNodeSecret {
-        name: aruna_core::secrets::SecretName,
-        kind: aruna_core::secrets::SecretKind,
+        name: crate::secrets::SecretName,
+        kind: crate::secrets::SecretKind,
     },
     NodeSecretChecked {
-        result: Result<Option<String>, aruna_core::plugins::NodeCheckError>,
+        result: Result<Option<String>, crate::plugins::NodeCheckError>,
     },
     /// A forwarded update refused, without an effect, because the holder's graph has not applied
     /// its expected revision yet; the caller retries.
@@ -731,7 +732,7 @@ pub enum MetadataTransportMessage {
     /// that asked, and it never crosses the wire.
     ExportAnswer {
         result: Result<
-            Box<crate::metadata::api::export_types::ExportMetadataResult>,
+            Box<crate::metadata::api::ExportMetadataResult>,
             MetadataReadError,
         >,
     },
@@ -801,11 +802,11 @@ pub struct RealmDocuments {
     /// refuses a copy that has seen less than the one it already holds.
     pub clock: AdminDocumentClock,
     /// Display names of realm nodes from the serving node's realm config state.
-    pub node_names: std::collections::BTreeMap<aruna_core::NodeId, String>,
+    pub node_names: std::collections::BTreeMap<crate::NodeId, String>,
     /// Map places of realm nodes from the serving node's realm config state.
     pub node_places: std::collections::BTreeMap<
-        aruna_core::NodeId,
-        aruna_core::structs::identity::realm::NodePlace,
+        crate::NodeId,
+        crate::structs::identity::realm::NodePlace,
     >,
 }
 
@@ -845,7 +846,7 @@ pub enum PersistentIdRequest {
     Status,
     /// Union external identifiers into the mapping; needs WRITE on the document.
     AddIdentifiers {
-        identifiers: Vec<aruna_core::structs::secondary_id::SecondaryIdentifier>,
+        identifiers: Vec<crate::structs::secondary_id::SecondaryIdentifier>,
         occurred_at_ms: u64,
     },
 }
@@ -862,7 +863,7 @@ pub enum PersistentIdOutcome {
     /// The authority's mint job: its id is owned by the authority, and `created`
     /// is false for a caller that joined the job another submitter opened.
     Submission {
-        job_id: aruna_core::structs::execution::job::JobId,
+        job_id: crate::structs::execution::job::JobId,
         created: bool,
     },
 }
@@ -892,14 +893,14 @@ pub enum MetadataReadError {
 }
 
 /// A runner failure is no verdict about the request, so the peer may ask again.
-impl From<aruna_core::calls::IoError> for MetadataReadError {
-    fn from(_: aruna_core::calls::IoError) -> Self {
+impl From<crate::calls::IoError> for MetadataReadError {
+    fn from(_: crate::calls::IoError) -> Self {
         Self::Unavailable
     }
 }
 
 /// The read verdict of a failed graph effect: a missing graph is not found, all else unavailable.
-pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
+pub fn metadata_read_error(error: MetadataError) -> MetadataReadError {
     match error {
         MetadataError::GraphNotFound => MetadataReadError::NotFound,
         MetadataError::InvalidInput(_)
@@ -922,7 +923,7 @@ pub enum WriteAuthError {
     Forbidden,
 }
 
-pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
+pub fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
     if frame_class(message) == AUDIT_FRAME {
         let size =
             postcard::experimental::serialized_size(message).map_err(|err| err.to_string())?;
@@ -941,18 +942,18 @@ pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u
 /// How long one stream step of a metadata request may take.
 pub const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a sender waits for a member's answer to a reference page.
-pub(crate) const PAGE_ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
+pub const PAGE_ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 /// The bytes an export body may carry beyond its metadata.
-pub(crate) const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
+pub const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The largest export body for `metadata_bytes` of metadata.
-pub(crate) fn metadata_body_limit(metadata_bytes: u64) -> u64 {
+pub fn metadata_body_limit(metadata_bytes: u64) -> u64 {
     metadata_bytes.saturating_add(METADATA_ENVELOPE_BYTES)
 }
 
 /// How a request travels and the bounds its answer is read within; an export is followed by a
 /// body of at most its metadata plus the envelope.
-pub(crate) fn request_shape(message: &MetadataTransportMessage) -> FrameShape {
+pub fn request_shape(message: &MetadataTransportMessage) -> FrameShape {
     let body_cap = match message {
         MetadataTransportMessage::ForwardExportDocument { metadata_bytes, .. } => {
             Some(metadata_body_limit(*metadata_bytes))
@@ -979,7 +980,7 @@ pub(crate) fn request_shape(message: &MetadataTransportMessage) -> FrameShape {
 
 /// The effect that sends one encoded request to `peer`, with the bounds its answer is read
 /// within; a frame that does not decode carries no shape and is never sent.
-pub(crate) fn metadata_request(
+pub fn metadata_request(
     peer: NodeId,
     frame: Vec<u8>,
     timeout: Duration,
@@ -997,7 +998,7 @@ pub(crate) fn metadata_request(
 
 /// Decodes the answer a peer request read. An export header is followed by its body, which is
 /// read back into one export answer.
-pub(crate) fn decode_answer(bytes: &[u8]) -> Result<MetadataTransportMessage, String> {
+pub fn decode_answer(bytes: &[u8]) -> Result<MetadataTransportMessage, String> {
     let answer = decode_message(bytes).map_err(|error| error.to_string())?;
     let MetadataTransportMessage::ForwardedExport { result } = answer else {
         return Ok(answer);
@@ -1026,7 +1027,7 @@ pub fn mirror_created_answer() -> Vec<u8> {
 
 /// Decodes one frame. A realm node that predates `node_places` or `node_names` ends its realm
 /// documents before them, and an empty map is one zero byte; only that exact reply is padded.
-pub(crate) fn decode_message(bytes: &[u8]) -> Result<MetadataTransportMessage, postcard::Error> {
+pub fn decode_message(bytes: &[u8]) -> Result<MetadataTransportMessage, postcard::Error> {
     postcard::from_bytes(bytes).or_else(|error| {
         // One zero byte supplies `node_places`, two supply `node_names` as well.
         for missing in 1..=2 {
@@ -1049,7 +1050,7 @@ pub fn audit_frame_cap() -> usize {
     MAX_PAGE_BYTES.saturating_add(AUDIT_FRAME_OVERHEAD)
 }
 
-pub(crate) fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
+pub fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
     let Some(&last) = prefix.last() else {
         return Ok(None);
     };
@@ -1061,18 +1062,18 @@ pub(crate) fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
         .map_err(|_| ())
 }
 
-pub(crate) fn is_audit_variant(variant: u32) -> bool {
+pub fn is_audit_variant(variant: u32) -> bool {
     variant == AUDIT_REQUEST_VARIANT || variant == AUDIT_RESPONSE_VARIANT
 }
 
-pub(crate) fn response_cap(message: &MetadataTransportMessage) -> usize {
+pub fn response_cap(message: &MetadataTransportMessage) -> usize {
     match message {
         MetadataTransportMessage::ForwardAuditPage { .. } => audit_frame_cap(),
         _ => MAX_MESSAGE_SIZE,
     }
 }
 
-pub(crate) fn frame_class(message: &MetadataTransportMessage) -> u8 {
+pub fn frame_class(message: &MetadataTransportMessage) -> u8 {
     match message {
         MetadataTransportMessage::ForwardAuditPage { .. }
         | MetadataTransportMessage::ForwardedAuditPage { .. } => AUDIT_FRAME,
@@ -1134,15 +1135,166 @@ pub fn encode_frame(message: &MetadataTransportMessage) -> Result<Vec<u8>, Strin
     Ok(frame)
 }
 
+/// A stable label of `message` for logs and traces.
+pub fn transport_message_kind(message: &MetadataTransportMessage) -> &'static str {
+    match message {
+        MetadataTransportMessage::QueryGraphs { .. } => "query_graphs",
+        MetadataTransportMessage::QueryResults { .. } => "query_results",
+        MetadataTransportMessage::SearchGraphs { .. } => "search_graphs",
+        MetadataTransportMessage::FilteredSearchGraphs { .. } => "filtered_search_graphs",
+        MetadataTransportMessage::SearchResults { .. } => "search_results",
+        MetadataTransportMessage::SearchBuckets { .. } => "search_buckets",
+        MetadataTransportMessage::BucketSearchResults { .. } => "bucket_search_results",
+        MetadataTransportMessage::ReleaseHolder { .. } => "release_holder",
+        MetadataTransportMessage::ReleaseHolderResults { .. } => "release_holder_results",
+        MetadataTransportMessage::SearchObjects { .. } => "search_objects",
+        MetadataTransportMessage::ObjectSearchResults { .. } => "object_search_results",
+        MetadataTransportMessage::CreateSyncMirror { .. } => "create_sync_mirror",
+        MetadataTransportMessage::DeleteSyncMirror { .. } => "delete_sync_mirror",
+        MetadataTransportMessage::SyncMirrorCreated => "sync_mirror_created",
+        MetadataTransportMessage::SyncMirrorDeleted => "sync_mirror_deleted",
+        MetadataTransportMessage::ForwardCreateDocument { .. } => "forward_create_document",
+        MetadataTransportMessage::ForwardUpdateDocument { .. } => "forward_update_document",
+        MetadataTransportMessage::ForwardDeleteDocument { .. } => "forward_delete_document",
+        MetadataTransportMessage::ForwardReadDocument { .. } => "forward_read_document",
+        MetadataTransportMessage::ForwardedRecord { .. } => "forwarded_record",
+        MetadataTransportMessage::ForwardedRead { .. } => "forwarded_read",
+        MetadataTransportMessage::ForwardPathLookup { .. } => "forward_path_lookup",
+        MetadataTransportMessage::ForwardedPathLookup { .. } => "forwarded_path_lookup",
+        MetadataTransportMessage::ForwardPathResolution { .. } => "forward_path_resolution",
+        MetadataTransportMessage::ForwardedPathResolution { .. } => "forwarded_path_resolution",
+        MetadataTransportMessage::ForwardedWriteDenied { .. } => "forwarded_write_denied",
+        MetadataTransportMessage::WriteNotFound => "forwarded_write_not_found",
+        MetadataTransportMessage::ForwardedWriteUnavailable => "forwarded_write_unavailable",
+        MetadataTransportMessage::ForwardedDelete => "forwarded_delete",
+        MetadataTransportMessage::ForwardExportDocument { .. } => "forward_export_document",
+        MetadataTransportMessage::ForwardExportProfile { .. } => "forward_export_profile",
+        MetadataTransportMessage::ForwardedExport { .. } => "forwarded_export",
+        MetadataTransportMessage::QueryDocument { .. } => "query_document",
+        MetadataTransportMessage::DocumentQueryResults { .. } => "document_query_results",
+        MetadataTransportMessage::Reject(_) => "reject",
+        MetadataTransportMessage::UpdateInvalidInput { .. } => "forwarded_update_invalid_input",
+        MetadataTransportMessage::ForwardAuditPage { .. } => "forward_audit_page",
+        MetadataTransportMessage::ForwardedAuditPage { .. } => "forwarded_audit_page",
+        MetadataTransportMessage::ForwardTokenRevocation { .. } => "forward_token_revocation",
+        MetadataTransportMessage::ForwardedTokenRevoked => "forwarded_token_revoked",
+        MetadataTransportMessage::TokenRevocationCapacity => "forwarded_token_revocation_capacity",
+        MetadataTransportMessage::MetadataHistoryCapacity => "forwarded_metadata_history_capacity",
+        MetadataTransportMessage::ForwardPersistentId { .. } => "forward_persistent_id",
+        MetadataTransportMessage::ForwardedPersistentId { .. } => "forwarded_persistent_id",
+        MetadataTransportMessage::ForwardPlacementPolicy { .. } => "forward_placement_policy",
+        MetadataTransportMessage::ForwardedPlacementPolicy { .. } => "forwarded_placement_policy",
+        MetadataTransportMessage::ForwardCreatePolicy { .. } => "forward_create_placement_policy",
+        MetadataTransportMessage::PlacementPolicyCreated { .. } => {
+            "forwarded_placement_policy_created"
+        }
+        MetadataTransportMessage::ForwardJobRecord { .. } => "forward_job_record",
+        MetadataTransportMessage::ForwardedJobRecord { .. } => "forwarded_job_record",
+        MetadataTransportMessage::ForwardRecordPage { .. } => "forward_job_record_page",
+        MetadataTransportMessage::ForwardedRecordPage { .. } => "forwarded_job_record_page",
+        MetadataTransportMessage::ForwardLaunchOffer { .. } => "forward_launch_offer",
+        MetadataTransportMessage::ForwardedLaunchOffer { .. } => "forwarded_launch_offer",
+        MetadataTransportMessage::ForwardJobSubmission { .. } => "forward_job_submission",
+        MetadataTransportMessage::ForwardedJobSubmission { .. } => "forwarded_job_submission",
+        MetadataTransportMessage::ForwardedProfileValidation { .. } => {
+            "forwarded_profile_validation"
+        }
+        MetadataTransportMessage::ForwardValidationStatus { .. } => {
+            "forward_profile_validation_status"
+        }
+        MetadataTransportMessage::ForwardedValidationStatus { .. } => {
+            "forwarded_profile_validation_status"
+        }
+        MetadataTransportMessage::ReferencePreflight { .. } => "reference_preflight",
+        MetadataTransportMessage::ReferencePreflightResults { .. } => "reference_preflight_results",
+        MetadataTransportMessage::ForwardAdminEvent { .. } => "forward_admin_event",
+        MetadataTransportMessage::AdminEventQueued => "forwarded_admin_event_queued",
+        MetadataTransportMessage::ForwardGroupCreate { .. } => "forward_group_create",
+        MetadataTransportMessage::ForwardedGroupCreated { .. } => "forwarded_group_created",
+        MetadataTransportMessage::GroupDeletion { .. } => "group_deletion",
+        MetadataTransportMessage::GroupDeletionResult { .. } => "group_deletion_result",
+        MetadataTransportMessage::LookupIdentifier { .. } => "lookup_identifier",
+        MetadataTransportMessage::IdentifierMatches { .. } => "identifier_matches",
+        MetadataTransportMessage::ForwardedRevisionConflict { .. } => "forwarded_revision_conflict",
+        MetadataTransportMessage::ForwardVaultChange { .. } => "forward_vault_change",
+        MetadataTransportMessage::ForwardedVaultChange { .. } => "forwarded_vault_change",
+        MetadataTransportMessage::FetchVaultRecords { .. } => "fetch_vault_records",
+        MetadataTransportMessage::FetchedVaultRecords { .. } => "fetched_vault_records",
+        MetadataTransportMessage::ForwardAdmitMember { .. } => "forward_admit_member",
+        MetadataTransportMessage::AdmittedMember { .. } => "admitted_member",
+        MetadataTransportMessage::ForwardDistributionRequest { .. } => {
+            "forward_distribution_request"
+        }
+        MetadataTransportMessage::SubmitDistributionStatement { .. } => {
+            "submit_distribution_statement"
+        }
+        MetadataTransportMessage::DistributionAccepted { .. } => "distribution_accepted",
+        MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
+        MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
+        MetadataTransportMessage::ForwardPullStatus { .. } => "forward_pull_status",
+        MetadataTransportMessage::ForwardListVersions { .. } => "forward_list_versions",
+        MetadataTransportMessage::ForwardedVersions { .. } => "forwarded_versions",
+        MetadataTransportMessage::ForwardCreateBucket { .. } => "forward_create_bucket",
+        MetadataTransportMessage::ForwardedBucketCreated { .. } => "forwarded_bucket_created",
+        MetadataTransportMessage::ForwardCheckBucket { .. } => "forward_check_bucket",
+        MetadataTransportMessage::ForwardedBucketChecked { .. } => "forwarded_bucket_checked",
+        MetadataTransportMessage::ForwardNewBucket { .. } => "forward_new_bucket",
+        MetadataTransportMessage::ForwardedNewBucket { .. } => "forwarded_new_bucket",
+        MetadataTransportMessage::FetchRealmDocuments { .. } => "fetch_realm_documents",
+        MetadataTransportMessage::FetchedRealmDocuments { .. } => "fetched_realm_documents",
+        MetadataTransportMessage::FetchGraphState { .. } => "fetch_graph_state",
+        MetadataTransportMessage::FetchedGraphState { .. } => "fetched_graph_state",
+        MetadataTransportMessage::ForwardApplyBatch { .. } => "forward_apply_batch",
+        MetadataTransportMessage::ForwardedApplyBatch { .. } => "forwarded_apply_batch",
+        MetadataTransportMessage::GroupCreateConflict { .. } => "forwarded_group_create_conflict",
+        MetadataTransportMessage::DataLinks { .. } => "data_links",
+        MetadataTransportMessage::DataLinkResults { .. } => "data_link_results",
+        MetadataTransportMessage::BucketOwner { .. } => "bucket_owner",
+        MetadataTransportMessage::BucketOwnerResult { .. } => "bucket_owner_result",
+        MetadataTransportMessage::SetPreview { .. } => "set_preview",
+        MetadataTransportMessage::SetPreviewResults { .. } => "set_preview_results",
+        MetadataTransportMessage::StagingSpec { .. } => "staging_spec",
+        MetadataTransportMessage::StagingSpecResult { .. } => "staging_spec_result",
+        MetadataTransportMessage::ReferencePage { .. } => "reference_page",
+        MetadataTransportMessage::ReferencePageAnswer { .. } => "reference_page_answer",
+        MetadataTransportMessage::HandRealmKey { .. } => "hand_realm_key",
+        MetadataTransportMessage::RealmKeyStored { .. } => "realm_key_stored",
+        MetadataTransportMessage::PromotionCheck => "promotion_check",
+        MetadataTransportMessage::PromotionReady { .. } => "promotion_ready",
+        MetadataTransportMessage::JobInputPage { .. } => "job_input_page",
+        MetadataTransportMessage::InputPageResult { .. } => "job_input_page_result",
+        MetadataTransportMessage::ResolveJobInputs { .. } => "resolve_job_inputs",
+        MetadataTransportMessage::ResolvedJobInputs { .. } => "resolved_job_inputs",
+        MetadataTransportMessage::RealmSecret { .. } => "realm_secret",
+        MetadataTransportMessage::RealmSecretResult { .. } => "realm_secret_result",
+        MetadataTransportMessage::OpenSetting { .. } => "open_setting",
+        MetadataTransportMessage::OpenSettingResult { .. } => "open_setting_result",
+        MetadataTransportMessage::StoreArtifact { .. } => "store_artifact",
+        MetadataTransportMessage::ArtifactStored { .. } => "artifact_stored",
+        MetadataTransportMessage::FetchArtifact { .. } => "fetch_artifact",
+        MetadataTransportMessage::FetchedArtifact { .. } => "fetched_artifact",
+        MetadataTransportMessage::ProbeClock => "probe_clock",
+        MetadataTransportMessage::ClockProbed { .. } => "clock_probed",
+        MetadataTransportMessage::ForwardEvents { .. } => "forward_events",
+        MetadataTransportMessage::EventsDecided { .. } => "events_decided",
+        MetadataTransportMessage::ReleaseSecret { .. } => "release_secret",
+        MetadataTransportMessage::SecretReleased { .. } => "secret_released",
+        MetadataTransportMessage::CheckNodeSecret { .. } => "check_node_secret",
+        MetadataTransportMessage::NodeSecretChecked { .. } => "node_secret_checked",
+        MetadataTransportMessage::ForwardedGraphPending { .. } => "forwarded_graph_pending",
+        MetadataTransportMessage::ExportAnswer { .. } => "export_answer",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
-    use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
-    use aruna_core::metadata::MAX_TOKEN_LEN;
-    use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::storage::metadata_registry::{
+    use crate::UserId;
+    use crate::audit::{AuditPageEntry, AuditPageRequest};
+    use crate::metadata::MAX_TOKEN_LEN;
+    use crate::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+    use crate::structs::identity::realm::RealmId;
+    use crate::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
     };
 
@@ -1233,7 +1385,7 @@ mod tests {
         });
         assert_auth_token(MetadataTransportMessage::ForwardTokenRevocation {
             auth_token: AuthToken::bearer("revoke-token").unwrap(),
-            token: aruna_core::compute::Secret::new("target-token"),
+            token: crate::compute::Secret::new("target-token"),
         });
     }
 
@@ -1241,7 +1393,7 @@ mod tests {
     fn revocation_debug_hidden() {
         let message = MetadataTransportMessage::ForwardTokenRevocation {
             auth_token: AuthToken::bearer("caller-token").unwrap(),
-            token: aruna_core::compute::Secret::new("target-token"),
+            token: crate::compute::Secret::new("target-token"),
         };
         let shown = format!("{message:?}");
         assert!(!shown.contains("caller-token"));
@@ -1250,7 +1402,7 @@ mod tests {
 
     #[test]
     fn revocation_wire_same() {
-        let token = aruna_core::compute::Secret::new("target-token");
+        let token = crate::compute::Secret::new("target-token");
         assert_eq!(
             postcard::to_allocvec(&token).unwrap(),
             postcard::to_allocvec("target-token").unwrap()
@@ -1263,14 +1415,14 @@ mod tests {
             target: DocumentTarget::RealmConfig {
                 realm_id: RealmId::from_bytes([1; 32]),
             },
-            bytes: aruna_core::compute::SecretBytes::new(vec![201; 32]),
+            bytes: crate::compute::SecretBytes::new(vec![201; 32]),
         };
         assert!(!format!("{message:?}").contains("201, 201"));
     }
 
     #[test]
     fn setting_wire_same() {
-        let bytes = aruna_core::compute::SecretBytes::new(vec![201; 32]);
+        let bytes = crate::compute::SecretBytes::new(vec![201; 32]);
         assert_eq!(
             postcard::to_allocvec(&bytes).unwrap(),
             postcard::to_allocvec(&vec![201u8; 32]).unwrap()
@@ -1566,7 +1718,7 @@ mod tests {
 
     fn placed(documents: &mut RealmDocuments) {
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let place = aruna_core::structs::identity::realm::NodePlace {
+        let place = crate::structs::identity::realm::NodePlace {
             name: Some("Giessen".to_string()),
             coordinates: None,
         };
@@ -1653,7 +1805,7 @@ mod tests {
         let message = MetadataTransportMessage::ForwardedAuditPage {
             result: Ok(AuditPageResponse {
                 records: vec![AuditPageEntry {
-                    key: vec![0u8; aruna_core::audit::AUDIT_KEY_BYTES],
+                    key: vec![0u8; crate::audit::AUDIT_KEY_BYTES],
                     record: MetadataAuditRecord {
                         realm_id: RealmId([1u8; 32]),
                         group_id: Ulid::from_bytes([2u8; 16]),

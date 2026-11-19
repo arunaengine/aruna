@@ -18,7 +18,6 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 
-use super::ids::session_of;
 use super::report::{
     AuditPaging, AuditRange, FamilyReport, ReportDetails, ReportDetailsOperation, started_at,
 };
@@ -33,6 +32,7 @@ use crate::jobs::records::project::{
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
+use aruna_core::job_request::session_of;
 
 /// A projection that lost its transaction every time is busy, not failed: the
 /// caller reads again rather than seeing a storage error.

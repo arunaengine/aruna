@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::users::vault_write::VaultChange;
 use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::structs::identity::user::vault::VaultChange;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()

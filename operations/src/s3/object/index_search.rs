@@ -26,10 +26,9 @@ use super::{
     BuildTurn, Candidate, Checked, HeadCandidate, HitBuilder, HitWalk, ObjectKeyMatch,
     SearchNodeHit, SearchNodePage, SearchObjectsError, SearchObjectsInput, SearchTurn, WalkTurn,
 };
-use crate::distribution::feed_walks::{
-    FeedError, IndexProgress, RangeProgressOperation, state_key,
-};
+use crate::distribution::feed_walks::{FeedError, RangeProgressOperation, state_key};
 use crate::replication::members::{ReadRecordOperation, RecordError};
+use aruna_core::structs::storage::distribution::search::IndexProgress;
 use std::collections::BTreeMap;
 
 /// Index candidates one node page examines at most, visible or not.

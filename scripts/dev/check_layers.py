@@ -69,6 +69,14 @@ CRATE_TARGETS = {
     "aruna-plugin-types": (),
     "aruna-graph": ("aruna-core",),
     "aruna-outbound": ("aruna-core",),
+    # Test helpers that drive operations; only dev-dependencies name it.
+    "aruna-test-support": (
+        "aruna-core",
+        "aruna-operations",
+        "aruna-drivers",
+        "aruna-storage",
+        "aruna-tasks",
+    ),
     "aruna-core": ("aruna-kpabe",),
     # Host clocks and the OS random source; core and operations never reach them.
     "aruna-clock": ("aruna-core",),
@@ -260,6 +268,7 @@ def is_test(rel):
     name = os.path.basename(rel)
     return (
         "/tests/" in "/" + rel
+        or "_tests/" in rel
         or name == "tests.rs"
         or name.endswith("_tests.rs")
         or name.startswith(("test_", "tests_"))

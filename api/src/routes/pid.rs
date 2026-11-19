@@ -20,6 +20,10 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::holder_choice::{HolderCandidate, HolderChoiceOperation, pick};
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::api::IdentifierMatch;
+use aruna_core::metadata::protocol::{
+    PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::secondary_id::{
@@ -34,7 +38,6 @@ use aruna_core::structs::{
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::identifier_fanout::lookup_identifier_distributed;
 use aruna_operations::metadata::identifier_lookup::IdentifierQuery;
@@ -42,8 +45,6 @@ use aruna_operations::metadata::persistent_id::forward::{
     PidRouteOperation, outcome_mapping, outcome_resolution, outcome_status,
 };
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
-use aruna_operations::metadata::secondary_ids::IdentifierMatch;
-use aruna_operations::metadata::{PersistentIdOutcome, PersistentIdRequest};
 
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, ensure_permission};

@@ -112,7 +112,7 @@ mod tests {
     use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 
     fn context(dir: &tempfile::TempDir) -> DriverContext {
-        crate::testing::path_context(dir.path().to_str().unwrap())
+        aruna_drivers::testing::path_context(dir.path().to_str().unwrap())
     }
 
     /// Reads the name row and answers it with `stored`.

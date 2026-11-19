@@ -28,7 +28,7 @@ use aruna_core::placement::{
 };
 
 use crate::forward::fetch::{Answer, Budget, Fetched, HolderFetchOperation, HolderRecord};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadVaultConfig {
@@ -610,7 +610,7 @@ mod tests {
         result: Result<VaultRecords, MetadataReadError>,
     ) -> Event {
         let message = MetadataTransportMessage::FetchedVaultRecords { result };
-        let frame = crate::metadata::protocol::encode_message(&message).unwrap();
+        let frame = aruna_core::metadata::protocol::encode_message(&message).unwrap();
         reply(peer, seconds, Ok(frame))
     }
 

@@ -4,12 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::api::ExportMetadataResult;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_drivers::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::api::MetadataApiError;
-use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, ExportMetadataResult};
+use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
 use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
 use aruna_operations::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
@@ -23,11 +24,10 @@ use aruna_operations::plugins::install::{pick_version, read_manifest};
 use std::collections::BTreeMap;
 
 use super::*;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::read_types::DocumentQueryRequest;
-use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
-};
+use aruna_operations::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
 use aruna_operations::metadata::create_entry::CreateEntryOperation;
 use aruna_operations::plugins::host_calls::VisibleObjects;
 use aruna_operations::plugins::store::Txn;
@@ -1085,7 +1085,7 @@ async fn superseded_merge_journaled() {
     let source = MetadataBatchSource::UpsertDataEntity {
         jsonld: r#"{"@id":"./d.txt","@type":"File","name":"d"}"#.to_string(),
     };
-    let planned = aruna_operations::testing::send_metadata_effect(
+    let planned = aruna_drivers::testing::send_metadata_effect(
         &broker.ctx,
         MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
@@ -1621,7 +1621,7 @@ async fn unprojected_event_refused() {
         source: source.clone(),
     };
     let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) =
-        aruna_operations::testing::send_metadata_effect(&broker.ctx, plan).await
+        aruna_drivers::testing::send_metadata_effect(&broker.ctx, plan).await
     else {
         panic!("expected a planned batch");
     };

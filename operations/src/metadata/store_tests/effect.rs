@@ -4,12 +4,12 @@
 
 use super::auth::{auth_storage, node_id_seed};
 use super::*;
-use crate::metadata::protocol::{MetadataReadError, metadata_read_error};
 use aruna_core::metadata::MetadataBatch;
 use aruna_core::metadata::MetadataBatchSource;
 use aruna_core::metadata::MetadataCrateRequest;
 use aruna_core::metadata::MetadataGraphPolicy;
 use aruna_core::metadata::MetadataRequestDurability;
+use aruna_core::metadata::protocol::{MetadataReadError, metadata_read_error};
 pub(super) fn memory_handle(storage: StorageHandle) -> (TempDir, DriverContext) {
     let metadata_dir = tempdir().expect("metadata dir");
     let graph_handle = aruna_graph::GraphHandle::open(

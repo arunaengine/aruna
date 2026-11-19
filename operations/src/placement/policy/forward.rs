@@ -15,10 +15,11 @@ use tracing::warn;
 
 use crate::forward::authorize::{ForwardAuthError, ForwardedCallerOperation, forward_auth_error};
 use crate::forward::routing::{ForwardHoldersOperation, HolderWriteError};
-use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
-use crate::metadata::transport_message_kind;
 use crate::placement::policy::create::{
     CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation,
+};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, WriteAuthError, transport_message_kind,
 };
 
 /// Why a routed publication did not commit. The local outcome and the delivery

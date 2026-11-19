@@ -5,11 +5,12 @@
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::delete_document::DeleteDocumentError;
-use crate::metadata::protocol::MetadataReadError;
-use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::protocol::metadata_request;
 use crate::metadata::update_document::UpdateDocumentError;
 use aruna_core::calls::IoError;
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, decode_message, encode_message, metadata_request,
+    transport_message_kind,
+};
 use thiserror::Error;
 
 /// Why a request forwarded to peers ended without being accepted.
@@ -95,7 +96,7 @@ pub(crate) fn read_error(error: MetadataApiError) -> MetadataReadError {
 pub(crate) fn unexpected_response(response: MetadataTransportMessage) -> MetadataWriteError {
     MetadataWriteError::Undeliverable(format!(
         "unexpected forwarded metadata response: {}",
-        crate::metadata::message_kind::transport_message_kind(&response)
+        transport_message_kind(&response)
     ))
 }
 
@@ -144,8 +145,7 @@ pub(crate) fn peer_call_within(
     message: &MetadataTransportMessage,
     timeout: std::time::Duration,
 ) -> Result<aruna_core::calls::IoCall, String> {
-    let frame =
-        crate::metadata::protocol::encode_message(message).map_err(|error| error.to_string())?;
+    let frame = encode_message(message).map_err(|error| error.to_string())?;
     let request = metadata_request(peer, frame, timeout);
     let effect = aruna_core::effects::Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(
         Box::new(request),
@@ -198,9 +198,7 @@ pub(crate) fn timed_answer(
         }
     };
     let decoded = match answer.result {
-        Ok(bytes) => {
-            crate::metadata::protocol::decode_message(&bytes).map_err(|error| error.to_string())
-        }
+        Ok(bytes) => decode_message(&bytes).map_err(|error| error.to_string()),
         Err(error) => Err(format!("{error:?}")),
     };
     Ok((decoded, answer.elapsed))

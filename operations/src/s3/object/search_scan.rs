@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::object::search::{
-    ObjectInventoryChecksum, ObjectInventoryHit, ObjectKeyMatch, SEARCH_MAX_LIMIT, SearchNodeHit,
-    SearchNodePage, SearchObjectsError, SearchObjectsInput,
+use crate::s3::object::search::{SEARCH_MAX_LIMIT, SearchObjectsError, SearchObjectsInput};
+use aruna_core::search::{
+    ObjectInventoryChecksum, ObjectInventoryHit, ObjectKeyMatch, SearchNodeHit, SearchNodePage,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -29,8 +29,8 @@ use aruna_core::types::{Key, Value};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 #[path = "index_search.rs"]
 mod index_search;

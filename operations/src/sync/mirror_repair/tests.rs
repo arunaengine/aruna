@@ -210,7 +210,7 @@ async fn store_record(context: &DriverContext, record: SyncMirrorRecord) {
         repair_key(&record.relationship),
         record.to_bytes().unwrap().into(),
     );
-    crate::testing::write_entries(&context.storage_handle, vec![row]).await;
+    aruna_drivers::testing::write_entries(&context.storage_handle, vec![row]).await;
 }
 
 async fn settle(context: &DriverContext, record: &SyncMirrorRecord) -> RollbackClaim {

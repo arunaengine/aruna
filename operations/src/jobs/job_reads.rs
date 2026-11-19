@@ -28,9 +28,9 @@ use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::{read_crate_status, read_job_record, read_key_waits};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::load_config::config_unavailable;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// A local job read failed; the text is what the caller reports.
 #[derive(Debug, Error, PartialEq)]

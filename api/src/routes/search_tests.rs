@@ -910,7 +910,7 @@ fn search_maps_partiality() {
     let healthy = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
     let failed = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
     let result = ObjectExecution {
-        hits: vec![aruna_operations::s3::object::search::ObjectInventoryHit {
+        hits: vec![aruna_core::search::ObjectInventoryHit {
             node_id: healthy,
             group_id: Ulid::from_bytes([23u8; 16]),
             bucket: "data".to_string(),

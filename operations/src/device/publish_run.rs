@@ -30,7 +30,7 @@ use crate::forward::transport::{no_peer_transport, peer_answer, peer_call};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls;
 use crate::jobs::workflow::run_crate::RecordCrateOperation;
-use crate::metadata::protocol::MetadataTransportMessage;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PublishRunInput {
@@ -244,7 +244,7 @@ impl PublishRunOperation {
                 });
             }
             other => {
-                let kind = crate::metadata::transport_message_kind(&other);
+                let kind = aruna_core::metadata::protocol::transport_message_kind(&other);
                 return Err(PublishRunError::Unreachable(kind.to_string()));
             }
         }

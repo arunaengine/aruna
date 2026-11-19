@@ -27,7 +27,6 @@ pub mod list_documents;
 pub(crate) mod live_records;
 pub mod local_query;
 pub mod materialization_queue;
-pub(crate) mod message_kind;
 pub mod mirror_request;
 pub(crate) mod object_version;
 pub mod persistent_id;
@@ -35,7 +34,6 @@ pub mod pid_read;
 pub(crate) mod pid_transition;
 pub mod profile;
 pub mod projection;
-pub mod protocol;
 pub mod provenance;
 pub mod prune_jobs;
 pub mod prune_queue;
@@ -65,11 +63,6 @@ pub(crate) mod visible_scope;
 pub mod write_peer;
 
 pub use builtin::builtin_shapes;
-pub use message_kind::transport_message_kind;
-pub use protocol::{
-    MetadataPathWinner, MetadataReadError, PersistentIdOutcome, PersistentIdRequest,
-    PersistentIdResolution,
-};
 
 #[cfg(test)]
 mod store_tests;

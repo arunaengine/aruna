@@ -24,7 +24,8 @@ use aruna_operations::sync::sync_quarantine::{
     AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
     QuarantinePage, QuarantinePageRequest, ReadQuarantineOperation,
 };
-use aruna_operations::testing::{reconcile_topics, write_entries};
+use aruna_test_support::documents::reconcile_topics;
+use aruna_drivers::testing::write_entries;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use ulid::Ulid;

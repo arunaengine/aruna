@@ -15,6 +15,7 @@ use aruna_core::alpn::{ADMISSION_CLOSE, MEMBERSHIP_CLOSE};
 use aruna_core::auth::revocation_live;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
+use aruna_core::entropy::shuffle;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::keyspaces::{
@@ -31,21 +32,18 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, KeySpace, Value};
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::document_repository::{config_of, realm_config};
 use crate::forward::transport::{peer_call_within, timed_answer};
-use crate::metadata::protocol::{
-    DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
-};
-use crate::metadata::transport_message_kind;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::node_name::NodeDisplays;
+use aruna_core::metadata::protocol::{
+    DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
+    transport_message_kind,
+};
 use aruna_core::structs::identity::realm::NodeRealm;
 
 /// Attempts in which every answering peer served a copy the marker does not
@@ -303,8 +301,7 @@ pub struct FetchDocumentsOperation {
     asked: Option<NodeId>,
     selection: Selection,
     installed: bool,
-    /// The run's entropy, which orders the realm's nodes.
-    entropy: u64,
+    entropy: u128,
 }
 
 type Fetching = Result<Next<bool>, IoError>;
@@ -359,7 +356,7 @@ impl FetchDocumentsOperation {
         Ok(Next::Call(read))
     }
 
-    /// A different node answers first in every run, so one lagging peer never owns this device's
+    /// A different node answers first every time, so one lagging peer never owns this device's
     /// view of the realm.
     fn configured(&mut self, config: Option<RealmConfigDocument>) -> Fetching {
         let (Some(config), Some((node_id, _))) = (config, self.ids) else {
@@ -369,7 +366,7 @@ impl FetchDocumentsOperation {
             return Ok(Next::Done(false));
         };
         let mut peers = realm_peers(&config, node_id);
-        peers.shuffle(&mut StdRng::seed_from_u64(self.entropy));
+        shuffle(&mut peers, self.entropy);
         self.start(owner, peers)
     }
 
@@ -516,7 +513,7 @@ impl Operation for FetchDocumentsOperation {
     type Error = IoError;
 
     fn seed(&mut self, entropy: u128) {
-        self.entropy = entropy as u64;
+        self.entropy = entropy;
     }
 
     fn first(&mut self) -> Fetching {

@@ -36,7 +36,7 @@ use ulid::Ulid;
 
 use super::{RebuildStatsError, RebuildStatsOperation};
 use crate::node::rebuild_counts::CounterDeltas;
-use crate::testing::path_context;
+use aruna_drivers::testing::path_context;
 use aruna_drivers::driver::DriverContext;
 
 const GROUP_A: GroupId = Ulid::from_parts(1, 1);

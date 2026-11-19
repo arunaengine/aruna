@@ -27,6 +27,7 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::placement::transition::{TransitionRequest, plan_transition};
 use aruna_core::placement::{
     PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
@@ -55,7 +56,7 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
@@ -66,8 +67,8 @@ use aruna_operations::realm::announce_presence::{
 };
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
-use aruna_operations::testing::sync_topics;
-use aruna_operations::testing::{project_logged_events, replay_event_log};
+use aruna_test_support::documents::sync_topics;
+use aruna_test_support::projection::{project_logged_events, replay_event_log};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;

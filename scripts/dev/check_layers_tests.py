@@ -111,6 +111,7 @@ class SpansTest(unittest.TestCase):
         self.assertTrue(check_layers.is_test("operations/tests/main.rs"))
         self.assertTrue(check_layers.is_test("operations/src/realm_vault_tests.rs"))
         self.assertTrue(check_layers.is_test("operations/src/jobs/tests_outbox.rs"))
+        self.assertTrue(check_layers.is_test("operations/src/metadata/store_tests/mod.rs"))
         self.assertFalse(check_layers.is_test("operations/src/jobs/testing.rs"))
 
 

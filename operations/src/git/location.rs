@@ -28,9 +28,9 @@ use super::state::reduce;
 use super::{GitError, records};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_core::git_state::Ancestry;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 type Document = MetadataRegistryRecord;
 type Chosen = (DatasetLocation, bool);

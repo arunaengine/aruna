@@ -22,8 +22,7 @@ use super::sources::export_failure;
 use super::{CandidateOpen, ExportFailure, OpenStatus, SourceScope};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-use crate::s3::object::get::leased;
+use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 /// What a local open needs after the access check.
 #[derive(Debug, PartialEq)]
@@ -144,7 +143,7 @@ impl OpenCandidateOperation {
                     }
                 } else {
                     let blob = match held {
-                        Some(lease) => leased(blob, lease),
+                        Some(lease) => blob.keep(lease),
                         None => blob,
                     };
                     BaoReadOutput::Stream {

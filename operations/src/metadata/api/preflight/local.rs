@@ -20,10 +20,6 @@ use ulid::Ulid;
 
 use super::super::access::{child_results, children};
 use super::super::list::PendingRecordsOperation;
-use super::super::preflight_types::{
-    MetadataNodeFreshness, MetadataPreflightLocation, MetadataVisibleReference,
-    ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,
-};
 use super::super::readable::RecordReadableOperation;
 use super::super::title::DocumentTitleOperation;
 use super::super::{MAX_PAGINATION_DEPTH, MetadataApiError, REGISTRY_CANDIDATE_LIMIT};
@@ -37,6 +33,10 @@ use crate::metadata::iri_index::{
     BacklinkError, BacklinkPage, BacklinksOperation, IriFreshness, iri_freshness, status_rows,
 };
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
+use aruna_core::metadata::api::{
+    MetadataNodeFreshness, MetadataPreflightLocation, MetadataVisibleReference,
+    ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,
+};
 
 type Backlinks = (BacklinkPage, LinkBudget);
 type PendingRecords = HashMap<GroupId, Vec<MetadataRegistryRecord>>;

@@ -10,6 +10,7 @@ use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
+use aruna_core::metadata::api::ReferenceNodeExecution;
 use aruna_core::metadata::{
     MetadataError, MetadataEventRecord, MetadataQueryResults, MetadataRoCratePage,
     MetadataSearchHit,
@@ -45,19 +46,17 @@ use self::list_types::{
 use self::path_types::replica_query_nodes;
 use self::path_types::select_fanout_nodes;
 
-use super::protocol::{
-    MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
-    MetadataTransportMessage,
-};
 use super::search_cursor::{
     CursorEnvelopeError, MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchWatermark,
     SignedCursor, paginate, query_fingerprint,
 };
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::repository::LIST_METADATA_SIZE;
-use crate::s3::bucket::search::{BucketPage, BucketSearchHit};
-use crate::s3::object::search::{ObjectInventoryHit, ObjectKeyMatch, SearchNodePage};
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::protocol::{
+    MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
+    MetadataTransportMessage,
+};
 use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT};
 use aruna_core::placement::selector::{
     ROLE_NODE, neg_log2_q48, peer_rank, select_top_peers, selector_hash,
@@ -65,6 +64,9 @@ use aruna_core::placement::selector::{
 use aruna_core::placement::{
     holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
     registry_strategy, resolve_holders_limit, resolve_shard_holders,
+};
+use aruna_core::search::{
+    BucketPage, BucketSearchHit, ObjectInventoryHit, ObjectKeyMatch, SearchNodePage,
 };
 
 pub(crate) mod access;
@@ -105,7 +107,6 @@ use self::fanout_types::MetadataFanoutStats;
 #[cfg(test)]
 use self::path_types::PathShardView;
 
-use self::preflight_types::ReferenceNodeExecution;
 #[cfg(test)]
 use self::preflight_types::authorized_realm_nodes;
 use self::read_types::ApiQueryMode;

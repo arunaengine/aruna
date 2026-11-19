@@ -27,13 +27,13 @@ use aruna_core::structs::storage::distribution::{
 use ulid::Ulid;
 
 use super::create::{AdmitPendingOperation, CreateError, CreationReport};
-use super::forward::PublishRefusal;
 use super::sharding::{RangeSampleOperation, split_point};
 use super::status_view::{Reach, ReadViewOperation, StatusError, node_reach};
 use super::submit::SendAdminOperation;
 use crate::document_repository::{config_of, realm_config};
 use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::heartbeat::{Heard, Here};
+use aruna_core::structs::storage::distribution::request::PublishRefusal;
 
 /// The caller of an admin change: its own token context and, for a remote publisher, the
 /// bearer token forwarded there.

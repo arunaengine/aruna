@@ -25,7 +25,7 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::document_repository::GetConfigOperation;
-use crate::testing::path_context;
+use aruna_drivers::testing::path_context;
 use aruna_core::placement::transition::{TransitionRequest, plan_transition};
 use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits,
@@ -152,7 +152,7 @@ fn create_event(actor: &Actor, strategy_id: Ulid, document_seed: u8) -> Metadata
 }
 
 async fn write_entries(context: &DriverContext, writes: Vec<(String, Key, Value)>) {
-    crate::testing::write_entries(&context.storage_handle, writes).await;
+    aruna_drivers::testing::write_entries(&context.storage_handle, writes).await;
 }
 
 #[tokio::test]

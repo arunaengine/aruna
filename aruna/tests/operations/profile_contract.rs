@@ -12,6 +12,8 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, EVENT_LOG_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::ProfileValidationStatus;
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
+use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::metadata::{
     CRATE_PROFILE_IRI, INVENIO_PROFILE_IRI, MetadataEffect, MetadataError, MetadataEvent,
     ProfileValidationSeverity, ProfileValidationState, ZENODO_PROFILE_IRI,
@@ -25,10 +27,8 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::forward::profile_export::ProfileLocalOperation;
 use aruna_operations::metadata::forward::read::admits_profile_peer;
@@ -38,7 +38,7 @@ use aruna_operations::metadata::profile::validation::{
     ValidationStatusOperation, profile_public_iri, profile_verdict,
 };
 use aruna_operations::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use aruna_operations::metadata::update_entry::UpdateEntryOperation;
 use aruna_operations::testing::{drain_projection_queue, process_materialization_batch};
@@ -1417,7 +1417,7 @@ async fn graph_exists(
         aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(
             document_id,
         );
-    match aruna_operations::testing::send_metadata_effect(
+    match aruna_drivers::testing::send_metadata_effect(
         &test.context,
         MetadataEffect::ContainsGraph { graph_iri },
     )

@@ -242,7 +242,7 @@ async fn counts_current_managers() {
 
 /// A finished window member with the answer `stored`.
 fn answered(index: usize, stored: Result<bool, String>) -> IoResult {
-    let result = stored.map_err(|_| crate::metadata::protocol::MetadataReadError::Unavailable);
+    let result = stored.map_err(|_| aruna_core::metadata::protocol::MetadataReadError::Unavailable);
     let answer = MetadataTransportMessage::ArtifactStored { result };
     let event = Event::Net(NetEvent::MetadataAnswer(Box::new(
         aruna_core::events::MetadataAnswer {

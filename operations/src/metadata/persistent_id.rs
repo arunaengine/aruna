@@ -298,7 +298,7 @@ mod tests {
     }
 
     fn context_at(path: &str) -> DriverContext {
-        crate::testing::path_context(path)
+        aruna_drivers::testing::path_context(path)
     }
 
     fn realm() -> RealmId {

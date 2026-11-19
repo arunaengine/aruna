@@ -41,7 +41,7 @@ use aruna_operations::jobs::harvest::{HarvestJobOperation, harvest_outcome};
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::testing::fresh_job_id;
 use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::replay_event_log;
+use aruna_test_support::projection::replay_event_log;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use axum::Router;

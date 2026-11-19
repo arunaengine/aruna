@@ -22,7 +22,7 @@ use crate::metadata::device_pull::{
     Admission, AdmitPullOperation, CommitPullOperation, ListHeadsOperation, PullCallerOperation,
     PullError, ReceiptOperation, SetListing, receipt_of, refusal_kind, refused,
 };
-use crate::metadata::protocol::MetadataTransportMessage as Message;
+use aruna_core::metadata::protocol::MetadataTransportMessage as Message;
 
 /// A forwarded synced-folder request with the owner's token.
 #[derive(Debug, PartialEq)]

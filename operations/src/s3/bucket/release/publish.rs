@@ -43,13 +43,11 @@ use super::{
 };
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
 use crate::distribution::status::{StatusError, read_view};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::metadata::protocol::MetadataReadError;
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -60,6 +58,8 @@ use crate::s3::object::origin::{OriginError, OriginView, ReadOriginOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_core::metadata::protocol::MetadataReadError;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PublishError {
@@ -651,7 +651,6 @@ impl PutCrateOperation {
         let group_id = scope.info.group_id;
         let bytes = std::mem::take(&mut self.bytes);
         let size = bytes.len() as u64;
-        let body = futures_util::stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
         let tags = HashMap::from([
             (RELEASE_TAG.to_string(), input.spec.label.clone()),
             (RELEASE_PREFIX_TAG.to_string(), input.spec.prefix.clone()),
@@ -669,7 +668,7 @@ impl PutCrateOperation {
                 bucket: scope.bucket.clone(),
                 key: input.key.clone(),
                 content_length: Some(size),
-                body: Some(BackendStream::new(body)),
+                body: Some(BackendStream::once(Bytes::from(bytes))),
             },
             expected_checksums: Vec::new(),
             checksum_type: None,

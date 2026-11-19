@@ -25,6 +25,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
     PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
     ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, JobId, JobPayload,
@@ -49,11 +50,11 @@ use aruna_graph::GraphHandle;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::testing::fresh_job_id;
 use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::replay_event_log;
+use aruna_test_support::projection::replay_event_log;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use bytes::Bytes;

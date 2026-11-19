@@ -15,6 +15,7 @@ use aruna_core::keyspaces::{
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
     REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataEffect, MetadataEventPayload, MetadataEventRecord,
 };
@@ -32,21 +33,16 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
 use aruna_operations::metadata::registry_cache::RegistryReadOperation;
-use aruna_operations::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
-};
+use aruna_operations::metadata::update_document::{UpdateDocumentConfig, UpdateDocumentOperation};
 use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::{
-    drain_projection_queue, project_create_events, project_logged_event, replay_event_log,
-    schedule_projection_drain,
-};
+use aruna_operations::testing::{drain_projection_queue, project_create_events};
+use aruna_test_support::projection::{project_logged_event, replay_event_log, schedule_projection_drain};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;

@@ -13,7 +13,7 @@ use aruna_core::jobs::{ByteStream, GzipBroken, GzipWork, JobEffect, JobEvent};
 use aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
-use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
     StagingJobCheckpoint, StagingJobDirectory, StagingJobPhase, TableRead,
 };
@@ -422,7 +422,7 @@ impl ChunkReadOperation {
 /// Holds a kept stream's place while its work is out at the adapter.
 fn empty_work() -> GzipWork {
     GzipWork {
-        stream: BackendStream::new(futures_util::stream::empty::<Result<Bytes, StreamError>>()),
+        stream: BackendStream::empty(),
         cursor: GzipCursor::new(0, 0),
     }
 }
@@ -1298,9 +1298,7 @@ impl PutFolderOperation {
     ) -> Next<()> {
         let spec = &self.run.spec;
         let auth = &spec.auth_context;
-        let body = BackendStream::new(futures_util::stream::iter([Ok::<_, StreamError>(
-            Bytes::new(),
-        )]));
+        let body = BackendStream::once(Bytes::new());
         let mut operation = PutObjectOperation::new(PutObjectConfig {
             user_id: auth.user_id,
             group_id: self.bucket.group_id,

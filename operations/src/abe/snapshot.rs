@@ -4,8 +4,9 @@
 
 use super::*;
 use crate::auth::permission_rules::{CollectedRole, PermissionRules};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request, policy_request_with};
-use aruna_core::request_policy::{CompiledPolicySet, RequestPolicy};
+use aruna_core::request_policy::{
+    CompiledPolicySet, PolicyRequestExtras, RequestPolicy, policy_request, policy_request_with,
+};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};

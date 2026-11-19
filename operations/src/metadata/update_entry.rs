@@ -30,9 +30,8 @@ use crate::metadata::profile::rules::stale_status;
 use crate::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, submission_verdict,
 };
-use crate::metadata::update_document::{
-    UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
-};
+use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentOperation};
+use aruna_core::metadata::api::UpdateDocumentMutation;
 
 /// Pending projection markers read per page while looking for an unapplied event.
 const MARKER_PAGE: usize = 100;

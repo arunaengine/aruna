@@ -10,13 +10,13 @@ use crate::forward::authorize::{
 use crate::forward::fetch::{PeerFrame, peer_call, peer_reply};
 use crate::forward::transport::reject;
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
-use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
 use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::events::PeerRequestError;
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
 use aruna_core::operation::Operation;
 use aruna_core::placement::selector::select_top_peers;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};

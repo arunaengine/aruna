@@ -11,6 +11,7 @@ use crate::metadata::{
 use crate::routes::access::users::MIN_QUERY_CHARS;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
+use aruna_core::search::ObjectKeyMatch;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_drivers::driver::drive;
 use aruna_operations::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
@@ -23,7 +24,6 @@ use aruna_operations::metadata::api::search_types::{
     ObjectExecution, ObjectQueryMode, SearchQueryRequest,
 };
 use aruna_operations::s3::bucket::dataset::DatasetSummaryOperation;
-use aruna_operations::s3::object::search::ObjectKeyMatch;
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;

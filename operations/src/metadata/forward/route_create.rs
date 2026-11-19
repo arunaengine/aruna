@@ -28,9 +28,8 @@ use crate::metadata::create_document::{
     mint_forward_document,
 };
 use crate::metadata::create_entry::CreateEntryOperation;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{
-    MetadataTransportMessage, WriteAuthError, decode_message, encode_message,
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, WriteAuthError, decode_message, encode_message, metadata_request,
 };
 
 /// How long one holder may take to answer a forwarded create, which validates and commits it.

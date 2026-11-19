@@ -8,11 +8,10 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::operation::Operation;
+use aruna_core::replication_protocol::VersionReplicationMessage;
 use aruna_core::structs::identity::realm::RealmId;
 use thiserror::Error;
 use ulid::Ulid;
-
-use crate::replication::protocol::VersionReplicationMessage;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum VersionKeyError {

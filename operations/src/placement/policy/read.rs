@@ -27,7 +27,7 @@ use thiserror::Error;
 use aruna_core::placement::{PlacementResolveError, read_holder_sets};
 
 use crate::forward::fetch::{Answer, Budget, Fetched, HolderFetchOperation, HolderRecord};
-use crate::metadata::protocol::MetadataTransportMessage;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 
 /// Wall-clock budget one policy fetch may spend across its holders.
 pub const POLICY_FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -370,7 +370,7 @@ impl Operation for ReadPolicyOperation {
     }
 
     fn next(&mut self, result: IoResult) -> ReadTurn {
-        match self.state.clone() {
+        match std::mem::replace(&mut self.state, ReadPolicyState::ReadLocal) {
             ReadPolicyState::ReadLocal => {
                 let [policy_value, config_value, auth_value] = values::<3>(result)?;
                 self.store_realm(config_value, auth_value)?;

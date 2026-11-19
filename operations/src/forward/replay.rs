@@ -5,13 +5,13 @@
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::accepted_create_matches;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::protocol::MetadataTransportMessage;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{
     CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventRecord;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::holds_placement;
 use aruna_core::rows::{decode, page, read_row, values};

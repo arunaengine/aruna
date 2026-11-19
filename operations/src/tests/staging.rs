@@ -15,12 +15,13 @@ use crate::s3::object::head::HeadObjectOperation;
 use crate::s3::object::put::PutObjectConfig;
 use crate::s3::object::put::PutObjectInput;
 use crate::s3::object::put::PutObjectOperation;
-use crate::s3::object::search::{ObjectKeyMatch, SearchObjectsInput};
+use crate::s3::object::search::SearchObjectsInput;
 use crate::s3::object::search_scan::SearchObjectsOperation;
 use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::jobs::ProgressReporter;
+use aruna_core::search::ObjectKeyMatch;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
 use aruna_core::structs::execution::job::StagingJobSpec;
@@ -453,7 +454,7 @@ impl Fixture {
         hits.into_iter().map(|hit| hit.key).collect()
     }
 
-    pub async fn hits(&self, query: &str) -> Vec<crate::s3::object::search::ObjectInventoryHit> {
+    pub async fn hits(&self, query: &str) -> Vec<aruna_core::search::ObjectInventoryHit> {
         let auth = self.spec.auth_context.clone();
         let input = SearchObjectsInput {
             realm_id: auth.realm_id,

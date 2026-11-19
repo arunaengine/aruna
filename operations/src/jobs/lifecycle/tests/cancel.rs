@@ -21,8 +21,8 @@ use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::store::test_calls::read_job_record;
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::tests::records::{Family, REALM, serve_job_record, user};
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_drivers::driver::{DriverContext, drive};
 
 fn auth(user_id: UserId) -> AuthContext {

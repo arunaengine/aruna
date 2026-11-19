@@ -23,7 +23,6 @@ use aruna_core::structs::storage::origin::SourcePin;
 use aruna_core::structs::storage::read_grant::READ_OPERATION;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::GroupId;
-use futures_util::StreamExt;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -41,9 +40,9 @@ use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::store_call::StoreCall;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
 use crate::staging::granted_read::GrantedReadOperation;
+use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};
 
 /// The creator as admitted: submissions refuse path restricted credentials.
 fn creator_auth(run: &RunIdentity) -> AuthContext {
@@ -568,15 +567,8 @@ impl LoadInputsOperation {
         if let Some(pin) = pin {
             self.served.insert(file.dest_key, pin);
         }
-        let stream = file
-            .source
-            .blob
-            .map(|chunk| chunk.map_err(std::io::Error::other));
-        self.files.push(TaskInput::from_stream(
-            file.path,
-            file.size,
-            Box::pin(stream),
-        ));
+        let input = TaskInput::from_blob(file.path, file.size, file.source.blob);
+        self.files.push(input);
         self.next_input()
     }
 

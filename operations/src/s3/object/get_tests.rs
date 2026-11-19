@@ -4,14 +4,13 @@
 
 use crate::connectors::repository::source_connector_key;
 use crate::replication::bao_read::BaoReadError;
-use crate::replication::protocol::BaoReadRefusal;
 use crate::s3::object::get::{
     AdvanceEnd, AdvanceReference, AdvanceStep, GetObjectError, GetObjectInput, GetObjectOperation,
-    GetObjectResult, GetObjectState, MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL,
-    ObjectRangeRequest, Turn,
+    GetObjectResult, GetObjectState, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
+    Turn,
 };
 use crate::s3::object::read::{
-    GetRoutedOperation, HolderFailures, PromoteLeasedOperation, RoutedRead, routed_info, slice_blob,
+    GetRoutedOperation, HolderFailures, PromoteLeasedOperation, RoutedRead, routed_info,
 };
 use crate::s3::usage::{RowChange, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
@@ -28,6 +27,7 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::replication_protocol::BaoReadRefusal;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_MD5, HASH_SHA256};
@@ -48,8 +48,8 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
-use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
+use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, MAX_AUTO_ADVANCES};
 use aruna_core::structs::storage::usage::{UsageDelta, usage_group_key};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
@@ -2551,8 +2551,8 @@ mod sealed {
     #[test]
     fn remote_lock_typed() {
         use crate::replication::bao_read::BaoReadError;
-        use crate::replication::protocol::BaoReadRefusal;
         use crate::s3::object::read::HolderFailures;
+        use aruna_core::replication_protocol::BaoReadRefusal;
 
         let mut failures = HolderFailures::default();
         failures.record(BaoReadError::Refused(BaoReadRefusal::NotFound));
@@ -2734,10 +2734,7 @@ async fn slices_routed_range() {
             .into_iter()
             .map(|chunk| Ok(bytes::Bytes::from_static(chunk.as_bytes())))
             .collect();
-        let mut blob = slice_blob(
-            BackendStream::new(futures_util::stream::iter(chunks)),
-            range,
-        );
+        let mut blob = BackendStream::new(futures_util::stream::iter(chunks)).slice(range);
         let mut bytes = Vec::new();
         while let Some(chunk) = blob.0.next().await {
             bytes.extend_from_slice(&chunk.unwrap());

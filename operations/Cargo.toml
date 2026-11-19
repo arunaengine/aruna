@@ -15,6 +15,7 @@ autotests = false
 [features]
 # Test seams and shared test helpers; only dev-dependencies enable it.
 test-hooks = [
+    "dep:async-trait",
     "dep:tempfile",
     "dep:aruna-blob",
     "dep:aruna-graph",
@@ -43,9 +44,10 @@ aruna-net = { workspace = true, optional = true }
 aruna-outbound = { workspace = true, optional = true }
 aruna-tasks = { workspace = true, optional = true }
 craqle = { workspace = true }
-async-trait = { workspace = true }
+async-trait = { workspace = true, optional = true }
 base64 = { workspace = true }
 hex = { workspace = true }
+http = { workspace = true }
 md5 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
@@ -53,18 +55,15 @@ byteview = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
 globset = { workspace = true }
-futures-util = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
 postcard = { workspace = true }
 quick-xml = { workspace = true }
-rand = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
-spareval = { workspace = true }
 spargebra = { workspace = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
@@ -75,11 +74,11 @@ ed25519-dalek = { workspace = true }
 oxrdf = { workspace = true }
 oxttl = { workspace = true }
 percent-encoding = { workspace = true }
-reqwest = { workspace = true }
 url = { workspace = true }
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-graph = { workspace = true }
 aruna-net = { workspace = true }
@@ -94,7 +93,11 @@ aruna-storage = { workspace = true, features = ["test-hooks"] }
 aruna-tasks = { workspace = true }
 axum = { workspace = true }
 flate2 = { workspace = true }
+futures-util = { workspace = true }
 proptest = { workspace = true }
+reqwest = { workspace = true }
+rand = { workspace = true }
+spareval = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

@@ -30,11 +30,11 @@ use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::persistent_id::forward::pid_authority_node;
-use crate::metadata::protocol::MetadataTransportMessage as Message;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use crate::metadata::update_entry::UpdateEntryOperation;
+use aruna_core::metadata::protocol::MetadataTransportMessage as Message;
 
 #[derive(Debug, PartialEq)]
 enum WriteStage {

@@ -336,6 +336,7 @@ dependencies = [
  "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-test-support",
  "aruna-wire",
  "astral_async_zip",
  "async-trait",
@@ -407,6 +408,7 @@ dependencies = [
  "aruna-operations",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-test-support",
  "aruna-wire",
  "astral_async_zip",
  "async-trait",
@@ -672,6 +674,7 @@ dependencies = [
  "aruna-operations",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-test-support",
  "aruna-wire",
  "async-trait",
  "axum",
@@ -717,6 +720,7 @@ dependencies = [
  "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
+ "async-trait",
  "bytes",
  "byteview",
  "chacha20poly1305",
@@ -851,6 +855,7 @@ dependencies = [
  "futures-util",
  "globset",
  "hex",
+ "http",
  "iroh",
  "irokle",
  "jsonwebtoken",
@@ -1027,6 +1032,22 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "aruna-test-support"
+version = "3.0.0-alpha.207"
+dependencies = [
+ "aruna-core",
+ "aruna-drivers",
+ "aruna-operations",
+ "aruna-storage",
+ "aruna-tasks",
+ "chrono",
+ "ed25519-dalek 3.0.0",
+ "irokle",
+ "jsonwebtoken",
+ "ulid 3.0.0",
 ]
 
 [[package]]

@@ -26,8 +26,8 @@ use crate::jobs::lifecycle::reservation::{
 };
 use crate::jobs::lifecycle::stage::read_targets;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::replication::protocol::BaoReadTarget;
 use crate::tests::records::{Family, REALM, context, node};
+use aruna_core::replication_protocol::BaoReadTarget;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
 

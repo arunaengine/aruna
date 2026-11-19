@@ -15,10 +15,10 @@ use super::TransferError;
 use super::invenio::Session;
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::harvest::create_connector::INVENIO_TOKEN as CONNECTOR_TOKEN;
 use crate::harvest::read_connector::{ConnectorView, GetRepositoryOperation, ReadConnectorError};
 use crate::harvest::repository::{parse_secret_read, read_secret_effect};
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Reads the group's repository connector, with the failures a transfer reports.
 #[derive(Debug, PartialEq)]

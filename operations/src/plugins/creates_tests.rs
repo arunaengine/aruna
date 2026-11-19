@@ -9,12 +9,12 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
 
 use super::*;
-use crate::metadata::create_document::CreateDocumentPayload;
 use crate::plugins::cleanup::sweep_events;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::config;
 use crate::plugins::store::Txn;
 use crate::plugins::test_support::installed;
+use aruna_core::metadata::api::CreateDocumentPayload;
 
 fn pinned(fixture: &Fixture, name: &str) -> PinnedCreate {
     PinnedCreate {

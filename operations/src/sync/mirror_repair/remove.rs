@@ -10,12 +10,12 @@ use aruna_core::structs::SyncRelationship;
 
 use super::ensure::{creator_token, peer_failure};
 use super::{MirrorPeer, SyncMirrorError, delete_peer};
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::mirror_request::MirrorRequestOperation;
 use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, RemoveOutgoingOperation, SyncRelationshipDirection,
     SyncRelationshipError,
 };
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Removes this node's records of `relationship`: the outgoing one on the source, keeping a
 /// stub when it serves references, and the incoming one on the target.

@@ -646,7 +646,7 @@ mod tests {
     }
 
     fn test_ctx(root: &str) -> DriverContext {
-        crate::testing::path_context(root)
+        aruna_drivers::testing::path_context(root)
     }
 
     async fn ctx_with_net(

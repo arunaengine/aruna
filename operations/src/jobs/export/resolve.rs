@@ -34,8 +34,8 @@ use ulid::Ulid;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::replication::plaintext::{HolderCheckOperation, PlaintextError};
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 #[derive(Debug, PartialEq)]
 pub(super) enum ResolveResult {

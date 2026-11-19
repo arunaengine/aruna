@@ -1175,11 +1175,11 @@ pub(crate) async fn authorize_directory(
     drive(
         EnforcePolicyOperation::new(
             state.get_realm_id(),
-            aruna_operations::auth::request_policy::policy_request_with(
+            aruna_core::request_policy::policy_request_with(
                 &path,
                 &Permission::READ,
                 Some(auth),
-                aruna_operations::auth::request_policy::PolicyRequestExtras::rest(),
+                aruna_core::request_policy::PolicyRequestExtras::rest(),
             )
             .clone(),
         ),

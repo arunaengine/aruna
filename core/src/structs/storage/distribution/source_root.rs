@@ -12,7 +12,8 @@ use ulid::Ulid;
 
 use crate::errors::ConversionError;
 use crate::repository::invenio::{REFERENCE_FILE, REFERENCE_RECORD};
-use crate::structs::execution::source_connector::SourceConnectorKind;
+use crate::structs::execution::job::{StagingJobCheckpoint, StagingJobSpec};
+use crate::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use crate::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
 };
@@ -208,6 +209,18 @@ pub fn decode_key(key: &[u8]) -> Option<([u8; 32], bool)> {
         Some([CHECKED_TAG]) => Some((digest, true)),
         _ => None,
     }
+}
+
+/// A staging job a range's former coordinator hands over: its spec, the source root its
+/// connector reads, and where the job stood before the range was fenced.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandedImport {
+    pub spec: StagingJobSpec,
+    pub root: SourceRoot,
+    pub resume: Option<StagingJobCheckpoint>,
+    /// The connector's record when it holds no credentials, so the new coordinator can register
+    /// it under the same id, as the import's fan-out does.
+    pub shared: Option<SourceConnector>,
 }
 
 #[cfg(test)]

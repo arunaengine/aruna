@@ -26,9 +26,10 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 
 /// Upper bound of one page request; the transport's own step limits end it earlier.
 const FETCH_DEADLINE: Duration = Duration::from_secs(60);
@@ -195,7 +196,7 @@ fn answered_page(answer: MetadataAnswer, digest: &[u8; 32]) -> Result<Option<Inp
             .filter(|page| page.digest().ok().as_ref() == Some(digest))),
         other => Err(format!(
             "the node answered {}",
-            crate::metadata::transport_message_kind(&other)
+            aruna_core::metadata::protocol::transport_message_kind(&other)
         )),
     }
 }

@@ -24,8 +24,9 @@ use aruna_core::task::{TaskEffect, TaskKey};
 use tracing::{debug, warn};
 
 use super::LifecycleError;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 use aruna_core::structs::execution::job::record_keys::record_key;
 use aruna_core::structs::execution::job::record_rows::{OutboxEntry, from_bytes, to_bytes};
 
@@ -200,7 +201,7 @@ impl PublishRecordOperation {
                 }
                 Ok(other) => warn!(
                     peer = %holder,
-                    reply = crate::metadata::transport_message_kind(&other),
+                    reply = aruna_core::metadata::protocol::transport_message_kind(&other),
                     "Unexpected job record publish reply"
                 ),
                 Err(error) => {

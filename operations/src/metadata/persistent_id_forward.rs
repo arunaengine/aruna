@@ -42,14 +42,13 @@ use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::id_mapping::PersistentIdError;
 use crate::metadata::pid_transition::PidTransition;
-use crate::metadata::protocol::MetadataReadError;
-use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::protocol::PersistentIdOutcome;
-use crate::metadata::protocol::PersistentIdRequest;
-use crate::metadata::protocol::PersistentIdResolution;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::StorageReadError;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, PersistentIdOutcome, PersistentIdRequest,
+    PersistentIdResolution,
+};
 
 /// The one node that owns a document's PID state: rank-0 holder of the placement
 /// derived from the structured id, never the registry row (a delete removes it

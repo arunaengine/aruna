@@ -57,7 +57,7 @@ async fn s3_request<T>(
     let mut extensions = http::Extensions::new();
     extensions.insert(shared.members.user_on(on));
     extensions.insert(node.bucket().await);
-    extensions.insert(aruna_operations::auth::request_policy::PolicyRequestExtras::rest());
+    extensions.insert(aruna_core::request_policy::PolicyRequestExtras::rest());
     s3s::S3Request {
         input,
         method,

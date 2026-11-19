@@ -32,13 +32,14 @@ use super::selection::track_created;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-    CreateDocumentResult, mint_forward_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
+    mint_forward_document,
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::routed::write::ApplyBatchOperation;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::api::CreateDocumentPayload;
 
 /// Delay before a deferred pass looks for the realm again.
 pub const PUBLISH_DEFER_AFTER: Duration = Duration::from_secs(15);
@@ -635,7 +636,7 @@ mod tests {
 
     async fn store(context: &Arc<DriverContext>, entry: &PublishEntry) {
         let (key_space, key, value) = publish_entry(entry).unwrap();
-        crate::testing::write_value(&context.storage_handle, &key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, &key_space, key, value).await;
     }
 
     async fn claim_state(

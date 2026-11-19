@@ -15,7 +15,7 @@ use aruna_core::types::Value;
 use tracing::warn;
 
 use crate::document_repository::read_row;
-use crate::metadata::protocol::MetadataReadError;
+use aruna_core::metadata::protocol::MetadataReadError;
 
 /// The answer a peer gets: the stored document, none, or why it is refused.
 pub type PolicyAnswer = Result<Option<Box<PlacementPolicyDocument>>, MetadataReadError>;

@@ -27,10 +27,10 @@ use crate::groups::routing::RoutingInputsError;
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::placement::policy::GateContextError;
 use crate::replication::bao_read::BaoReadError;
-use crate::replication::protocol::BaoReadRefusal;
 use crate::s3::bucket::get::GetBucketError;
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::put::{PutObjectError, PutObjectResult};
+use aruna_core::replication_protocol::BaoReadRefusal;
 
 /// One declared input resolved to the object it names.
 #[derive(Clone, Debug, PartialEq)]

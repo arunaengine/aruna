@@ -12,6 +12,7 @@ use aruna_core::compute::session::{
     EndReason, EventKind, MAX_SCRATCH_BYTES, PendingInput, SessionAnswer, SessionError,
     SessionEvent, SessionRequest, SessionSnapshot, StagedInput,
 };
+use aruna_core::job_request::session_of;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{CopyJobSpec, JobId, JobPayload, JobRecord, JobState};
@@ -19,7 +20,6 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::jobs::lifecycle::ids::session_of;
 use aruna_operations::s3::object::copy::{
     CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };

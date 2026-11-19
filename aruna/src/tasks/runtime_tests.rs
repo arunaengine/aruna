@@ -34,7 +34,7 @@ use aruna_operations::jobs::store::test_calls::{
     adopt_external_attempt, cancel_running_job, claim_job, complete_job, insert_job, mutate_job,
     read_job_record, record_attempt_intent, requeue_job, set_cancel_requested,
 };
-use aruna_operations::testing::task_context;
+use aruna_drivers::testing::task_context;
 use aruna_storage::{FjallStorage, StorageHandle};
 use byteview::ByteView;
 use futures_util::future::FutureExt;

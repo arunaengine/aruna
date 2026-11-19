@@ -4,6 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
+use aruna_core::metadata::api::IdentifierMatch;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::structs::PersistentIdMapping;
@@ -127,15 +128,6 @@ impl Operation for AddIdentifiersOperation {
             }
         }
     }
-}
-
-/// One readable document that holds a looked-up identifier.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IdentifierMatch {
-    pub document_id: Ulid,
-    /// The document's w3id PID once it is active.
-    pub pid: Option<String>,
-    pub origin: IdentifierOrigin,
 }
 
 /// Merges answers from several nodes: one entry per document, `Published` first, then by id.

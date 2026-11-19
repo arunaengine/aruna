@@ -17,11 +17,11 @@ use aruna_core::types::GroupId;
 use super::{MirrorPeer, SyncMirrorError, create_peer};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::mirror_request::MirrorRequestOperation;
 use crate::sync::sync_relationship::{
     StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
+use aruna_core::request_policy::PolicyRequestExtras;
 
 #[derive(Debug, PartialEq)]
 enum Phase {

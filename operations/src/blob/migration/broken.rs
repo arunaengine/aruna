@@ -25,10 +25,10 @@ use super::drain::{BUCKET_PAGE, MIGRATION_CONTINUE, MIGRATION_PAGE};
 use super::shared::MigrationError;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
+use aruna_core::request_policy::PolicyRequestExtras;
 
 type Turn<T> = Result<Next<T>, MigrationError>;
 

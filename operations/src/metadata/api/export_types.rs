@@ -2,9 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{
-    AuthContext, Deserialize, MetadataRegistryRecord, MetadataRoCratePage, Serialize, Ulid,
-};
+use super::{AuthContext, Ulid};
+use aruna_core::metadata::api::RoCrateExportView;
 
 /// Data entities a page holds when the request names no limit, and at most.
 pub(crate) const PAGE_DEFAULT: usize = 100;
@@ -20,14 +19,6 @@ pub struct GetVisibleRequest {
     pub auth: Option<AuthContext>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RoCrateExportView {
-    Full,
-    Summary,
-    Page,
-    Raw,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportMetadataRequest {
     pub document_id: Ulid,
@@ -36,25 +27,4 @@ pub struct ExportMetadataRequest {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub after: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ExportMetadataResult {
-    Full {
-        record: MetadataRegistryRecord,
-        jsonld: String,
-    },
-    Summary {
-        record: MetadataRegistryRecord,
-        jsonld: String,
-    },
-    Page {
-        record: MetadataRegistryRecord,
-        page: MetadataRoCratePage,
-    },
-    Raw {
-        record: MetadataRegistryRecord,
-        raw: crate::metadata::revision_read::MetadataRawView,
-        dataset_digest: Option<[u8; 32]>,
-    },
 }

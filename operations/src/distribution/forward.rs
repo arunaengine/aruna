@@ -20,12 +20,12 @@ use aruna_core::structs::identity::realm::{NodeRealm, RealmConfigDocument, Realm
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
 use aruna_core::structs::storage::distribution::capacity::RangeSize;
+use aruna_core::structs::storage::distribution::request::PublishRefusal;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionMember, DistributionRequest, DistributionRevision,
     DistributionSnapshot, SignedSnapshot, SignedStatement,
 };
 use aruna_core::structs::storage::format::Compression;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -35,38 +35,17 @@ use super::publish::PublishError;
 use super::submit::PublishLocalOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{config_of, realm_config};
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::pull_refusal;
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::dataset::DatasetSummaryOperation;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-
-/// Why the publisher refused or could not take a request.
-#[derive(Clone, Debug, Error, Eq, PartialEq, Serialize, Deserialize)]
-pub enum PublishRefusal {
-    #[error("the bearer token is missing or invalid")]
-    Unauthorized,
-    #[error("caller may not administer the distributed bucket's owner group")]
-    Forbidden,
-    #[error("{0}")]
-    Rejected(String),
-    #[error("the statement is already part of the record")]
-    Replayed,
-    #[error("configuration changes unavailable: {0}")]
-    Unavailable(String),
-}
-
-impl From<IoError> for PublishRefusal {
-    fn from(error: IoError) -> Self {
-        Self::Unavailable(error.to_string())
-    }
-}
+use aruna_core::metadata::protocol::MetadataTransportMessage;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 impl From<PublishError> for PublishRefusal {
     fn from(error: PublishError) -> Self {

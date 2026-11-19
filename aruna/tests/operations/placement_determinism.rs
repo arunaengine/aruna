@@ -9,6 +9,7 @@ use aruna_core::document::{DocumentSyncPublish, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::placement::{build_view, resolve_holders, resolve_shard_holders};
 use aruna_core::reducer::AdminDocumentState;
@@ -24,7 +25,7 @@ use aruna_drivers::driver::drive;
 use aruna_drivers::driver::node_facts;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::realm::mutate_placement::{
@@ -33,7 +34,7 @@ use aruna_operations::realm::mutate_placement::{
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::testing::sync_topics;
+use aruna_test_support::documents::sync_topics;
 use ulid::Ulid;
 
 use crate::convergence;

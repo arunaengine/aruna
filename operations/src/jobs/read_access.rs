@@ -15,8 +15,8 @@ use thiserror::Error;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Why one source read is not allowed. Only `Denied` and `NotFound` are verdicts.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

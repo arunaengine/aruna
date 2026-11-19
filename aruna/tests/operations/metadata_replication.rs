@@ -19,6 +19,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     EVENT_LOG_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
 };
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataBatchSource, MetadataDeleteRecord, MetadataEffect, MetadataEvent,
     MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
@@ -38,12 +39,12 @@ use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, Struc
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use aruna_operations::metadata::update_entry::UpdateEntryOperation;
 use aruna_operations::realm::announce_presence::{
@@ -55,9 +56,12 @@ use aruna_operations::realm::mutate_placement::{
 };
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::{export_rocrate_jsonld, send_metadata_effect};
-use aruna_operations::testing::{project_create_events, replay_event_log};
-use aruna_operations::testing::{read_outbox_records, reconcile_topics};
+use aruna_operations::testing::export_rocrate_jsonld;
+use aruna_drivers::testing::send_metadata_effect;
+use aruna_operations::testing::project_create_events;
+use aruna_test_support::projection::replay_event_log;
+use aruna_operations::testing::read_outbox_records;
+use aruna_test_support::documents::reconcile_topics;
 use tokio::time::sleep;
 use ulid::Ulid;
 

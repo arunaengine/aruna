@@ -25,11 +25,12 @@ use aruna_core::types::{GroupId, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::distribution::feed_walks::{FeedError, IndexProgress, RangeProgressOperation};
+use crate::distribution::feed_walks::{FeedError, RangeProgressOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::replication::bootstrap::{BootstrapError, ReadCursorOperation};
 use crate::replication::members::{CopyLag, CopyLagOperation, LagMap, RecordError};
 use aruna_core::heartbeat::Heard;
+use aruna_core::structs::storage::distribution::search::IndexProgress;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum StatusError {

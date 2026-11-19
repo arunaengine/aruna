@@ -4,7 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::jobs::lifecycle::ids::store_workspace;
     use crate::jobs::lifecycle::input_walk::RangeHolderOperation;
     use crate::jobs::lifecycle::submission_rules::{
         admitted_description, answers_input, batch_len, exact_version, pin_outputs,
@@ -12,11 +11,12 @@ mod tests {
         sources_match,
     };
     use crate::jobs::submit::SubmitJobError;
-    use crate::metadata::protocol::MetadataTransportMessage;
     use crate::tests::records::captured_input;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::job_request::store_workspace;
     use aruna_core::jobs::SubmissionRefusal;
+    use aruna_core::metadata::protocol::MetadataTransportMessage;
     use aruna_core::structs::execution::job::OutputDestination;
     use aruna_core::structs::execution::job::{CapturedInput, WorkspaceMode};
     use aruna_core::structs::execution::job::{
@@ -306,7 +306,7 @@ mod tests {
         let inputs: Vec<InputSelection> = answers.iter().map(|(input, _)| input.clone()).collect();
         let encode = |answers: &[(InputSelection, CapturedInput)]| {
             let result = Ok(answers.to_vec());
-            crate::metadata::protocol::encode_message(
+            aruna_core::metadata::protocol::encode_message(
                 &MetadataTransportMessage::ResolvedJobInputs { result },
             )
         };

@@ -103,7 +103,7 @@ fn search_assembly_order() {
     let page = |node_id, key: Option<&str>| SearchNodePage {
         hits: key
             .map(|key| {
-                vec![crate::s3::object::search::SearchNodeHit {
+                vec![aruna_core::search::SearchNodeHit {
                     hit: ObjectInventoryHit {
                         node_id,
                         group_id: Ulid::nil(),
@@ -143,7 +143,7 @@ fn search_assembly_order() {
         query: plan.query.clone(),
         ..plan
     };
-    let progress = crate::distribution::feed_walks::IndexProgress {
+    let progress = aruna_core::structs::storage::distribution::search::IndexProgress {
         ready: false,
         indexed: 10,
         keys: 50,

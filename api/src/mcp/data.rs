@@ -899,7 +899,7 @@ pub(crate) async fn read_text(
     server: &McpServer,
     auth: &AuthContext,
     input: ReadObjectInput,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<ReadObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
     let max_bytes = bounded_bytes(input.max_bytes)?;
@@ -993,7 +993,7 @@ pub(crate) async fn write_text(
     server: &McpServer,
     auth: &AuthContext,
     input: WriteObjectInput,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
     (headers, bearer): (&http::HeaderMap, Option<&crate::auth::ValidatedBearer>),
 ) -> Result<WriteObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
@@ -1238,7 +1238,7 @@ fn bounded_bytes(max_bytes: Option<usize>) -> Result<usize, CallToolResult> {
 async fn authorize_search(
     server: &McpServer,
     auth: &AuthContext,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(server.state.as_ref(), auth, Permission::READ, extras)
         .await

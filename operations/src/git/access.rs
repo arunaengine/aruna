@@ -15,10 +15,10 @@ use super::GitError;
 use super::publish::HoldersOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::{parse_lifecycle_read, read_lifecycle_effect};
 use aruna_core::errors::StorageReadError;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 type Document = MetadataRegistryRecord;
 
