@@ -108,7 +108,7 @@ impl Operation for ReadSourceOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::staging::{
+    use aruna_test_support::staging::{
         create_http_connector, sample_connector, sample_resolved_connector, setup_driver_context,
     };
     use aruna_core::structs::execution::source_access::ResolvedSourceConnector;

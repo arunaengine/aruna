@@ -9,4 +9,5 @@ pub mod jobs;
 pub mod metadata;
 pub mod projection;
 pub mod s3;
+pub mod staging;
 pub mod tokens;

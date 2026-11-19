@@ -9,7 +9,7 @@ use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::staging::lanes::LANE_ROWS;
 use aruna_operations::jobs::staging::lanes::parse_lanes;
-use aruna_operations::tests::staging::spec;
+use aruna_test_support::staging::spec;
 use ulid::Ulid;
 
 /// An S3 endpoint that lists `keys` page by page, as ListObjectsV2 does.
@@ -132,7 +132,7 @@ async fn job_context(
     use aruna_operations::connectors::create_connector::{
         SourceConnectorInput, SourceConnectorOperation,
     };
-    use aruna_operations::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 

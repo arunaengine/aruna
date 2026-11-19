@@ -42,7 +42,7 @@ use crate::tests::import::{
     RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
     read_metadata, rewrite_document, signature_entry, validate_document,
 };
-use crate::tests::staging::setup_driver_context;
+use aruna_test_support::staging::setup_driver_context;
 use aruna_blob::blob::BlobHandle;
 use aruna_core::UserId;
 use aruna_core::structs::execution::job::RoCrateLimits;

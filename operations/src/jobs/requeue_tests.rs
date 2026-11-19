@@ -70,7 +70,7 @@ async fn panicked_import_kept() {
     use aruna_core::events::BlobEvent;
     use aruna_core::stream::BackendStream;
 
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let driver = Arc::new(fixture.driver_context);
     let storage = driver.storage_handle.clone();
     let job_id = JobId::from_bytes([0x4B; 16]);

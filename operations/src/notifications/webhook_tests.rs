@@ -6,7 +6,7 @@
 use super::*;
 use aruna_test_support::jobs::find_dedup_plan;
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
-use crate::tests::staging::setup_driver_context;
+use aruna_test_support::staging::setup_driver_context;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::job::user_dedup_key;

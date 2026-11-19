@@ -1114,7 +1114,7 @@ mod tests {
     #[tokio::test]
     async fn served_sources_kept() {
         use aruna_core::structs::execution::job::{CapturedInput, InputContent};
-        let test_context = crate::tests::staging::setup_driver_context().await;
+        let test_context = aruna_test_support::staging::setup_driver_context().await;
         let context = &test_context.driver_context;
         let realm_id = RealmId([1; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2; 16]), realm_id);

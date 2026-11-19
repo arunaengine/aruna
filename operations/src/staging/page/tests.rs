@@ -623,7 +623,7 @@ fn page_bounds_entries() {
 // A progress flush and a lease renewal that commit while the page is open must not conflict.
 #[tokio::test]
 async fn flush_keeps_page() {
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -678,7 +678,7 @@ async fn flush_keeps_page() {
 #[tokio::test]
 async fn bare_size_unchanged() {
     use crate::connectors::repository::source_connector_key;
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
     use aruna_drivers::driver::drive;
 
@@ -757,7 +757,7 @@ async fn bare_size_unchanged() {
 // registered head, so usage and connector rows are counted once.
 #[tokio::test]
 async fn replay_charges_once() {
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::IterStart;
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
@@ -853,7 +853,7 @@ fn guards_carry_hint() {
 #[tokio::test]
 async fn page_maintains_inventory() {
     use crate::distribution::test_store::{counters, has_row, install, range};
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::storage::distribution::accounting::generation_key;
     use aruna_core::structs::storage::distribution::inventory::head_position;
@@ -925,7 +925,7 @@ async fn page_needs_coordinator() {
     use crate::distribution::guard::GuardError;
     use crate::distribution::test_record::{binding, record as set_record};
     use crate::distribution::test_store::{has_row, install, range};
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::storage::distribution::inventory::head_position;
     use aruna_drivers::driver::drive;
@@ -1060,7 +1060,7 @@ fn print_sizes(
 #[tokio::test]
 async fn distributed_sizes_measured() {
     use crate::distribution::test_store::{install, range};
-    use crate::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_drivers::driver::drive;
 
@@ -1105,7 +1105,7 @@ async fn distributed_sizes_measured() {
 // for the entry size work, not a size contract. Run with `--nocapture` to read it.
 #[tokio::test]
 async fn entry_sizes_measured() {
-    use crate::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
     use aruna_drivers::driver::drive;
 
     const ENTRIES: usize = 100;
@@ -1191,7 +1191,7 @@ async fn count_exchanges(
 #[tokio::test]
 async fn page_exchanges_measured() {
     use crate::distribution::test_store::{install, range};
-    use crate::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 
     const ENTRIES: usize = 500;

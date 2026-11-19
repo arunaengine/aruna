@@ -335,7 +335,7 @@ mod tests {
     use ulid::Ulid;
 
     fn observation(content_length: u64) -> SourceMetadata {
-        crate::tests::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
+        aruna_test_support::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
     }
 
     fn mint(version_id: Ulid) -> MintSuccessorOperation {

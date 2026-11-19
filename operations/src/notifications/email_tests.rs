@@ -10,7 +10,7 @@ use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::notifications::opt_in::{EmailOptIn, SetEmailOperation};
 use crate::notifications::setting_rows::SettingError;
 use crate::tests::notifications::managers;
-use crate::tests::staging::setup_driver_context;
+use aruna_test_support::staging::setup_driver_context;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::compute::SecretBytes;
 use aruna_core::effects::{Effect, StorageEffect};

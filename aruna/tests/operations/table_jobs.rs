@@ -7,7 +7,7 @@ use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::execution::table::SEARCH_EXACT_KEY;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_operations::s3::bucket::get::GetBucketOperation;
-use aruna_operations::tests::staging::{
+use aruna_test_support::staging::{
     COLI, Fixture, HUMAN, STRUCTURE, Site, serve, summary_table, write_object,
 };
 use axum::http::Method;

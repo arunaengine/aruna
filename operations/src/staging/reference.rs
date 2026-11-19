@@ -684,7 +684,7 @@ mod tests {
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
     use crate::node::usage_rebuild::RebuildStatsOperation;
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{

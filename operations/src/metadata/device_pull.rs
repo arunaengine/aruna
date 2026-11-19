@@ -1472,7 +1472,7 @@ mod tests {
         use crate::tests::device::store_folder;
         use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
 
-        let fixture = crate::tests::staging::setup_driver_context().await;
+        let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("note.txt"), b"note").unwrap();

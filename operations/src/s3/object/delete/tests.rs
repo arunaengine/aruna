@@ -1548,7 +1548,7 @@ async fn head_id(context: &DriverContext, bucket: &str) -> Ulid {
 // deleting its row must not release it a second time.
 #[tokio::test]
 async fn stale_observation_uncharged() {
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let context = &fixture.driver_context;
     let (offer, stale) = offered_history(context, false).await;
 
@@ -1562,7 +1562,7 @@ async fn stale_observation_uncharged() {
 // is charged again.
 #[tokio::test]
 async fn promoted_observation_charged() {
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let context = &fixture.driver_context;
     let (offer, _) = offered_history(context, true).await;
     let marker = head_id(context, &offer.bucket).await;
@@ -1576,7 +1576,7 @@ async fn promoted_observation_charged() {
 // A delete marker over a head observation releases it, as a withdrawal does.
 #[tokio::test]
 async fn marker_releases_observation() {
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let context = &fixture.driver_context;
     let (offer, _) = offered_history(context, true).await;
     let marker = head_id(context, &offer.bucket).await;
