@@ -11,7 +11,6 @@ use aruna_core::git_state::{GitState, Projection};
 use aruna_core::keyspaces::{MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE};
 use aruna_core::metadata::{
     MaterializationState, MaterializationStatusRecord, MetadataEffect, MetadataEvent,
-    MetadataRawRevision,
 };
 use aruna_core::operation::{HoldScope, Operation, boxed_suboperation};
 use aruna_core::repo_layout::{Layout, metadata_layout};
@@ -67,14 +66,10 @@ enum CurrentStep {
 
 /// The materialized graph this node would snapshot, if it is ready. During materialization
 /// the graph is current before its status says so, which `materializing` states.
-pub(super) fn current(
-    document: &Document,
-    revision: Option<&MetadataRawRevision>,
-    materializing: bool,
-) -> CurrentOperation {
+pub(super) fn current(document: &Document, graph: Source, materializing: bool) -> CurrentOperation {
     CurrentOperation {
         document: document.clone(),
-        revision: revision.cloned(),
+        graph,
         materializing,
         step: CurrentStep::Capture,
     }
@@ -83,18 +78,19 @@ pub(super) fn current(
 #[derive(Debug, PartialEq)]
 pub(super) struct CurrentOperation {
     document: Document,
-    revision: Option<MetadataRawRevision>,
+    graph: Source,
     materializing: bool,
     step: CurrentStep,
 }
 
-type Source = Option<(Ulid, String)>;
+/// The event a graph shows and the graph as JSON-LD, when there is one to snapshot.
+pub type Source = Option<(Ulid, String)>;
 type CurrentTurn = Result<Next<Source>, GitError>;
 
 impl CurrentOperation {
     fn read_raw(&mut self) -> CurrentTurn {
-        if let Some(raw) = self.revision.take() {
-            return Ok(Next::Done(Some((raw.winning_event_id, raw.jsonld))));
+        if let Some(graph) = self.graph.take() {
+            return Ok(Next::Done(Some(graph)));
         }
         self.step = CurrentStep::Raw;
         let read = RawDisplayOperation::new(self.document.document_id);
@@ -191,13 +187,13 @@ enum UpdateStep {
 fn update(
     node: &GitNode,
     document: &Document,
-    revision: Option<MetadataRawRevision>,
+    graph: Source,
     materializing: bool,
 ) -> UpdateOperation {
     UpdateOperation {
         node: node.clone(),
         document: document.clone(),
-        revision,
+        graph,
         materializing,
         stages: StageTimes::default(),
         step: UpdateStep::Project,
@@ -210,7 +206,7 @@ fn update(
 struct UpdateOperation {
     node: GitNode,
     document: Document,
-    revision: Option<MetadataRawRevision>,
+    graph: Source,
     materializing: bool,
     stages: StageTimes,
     step: UpdateStep,
@@ -347,8 +343,8 @@ impl Operation for UpdateOperation {
                 }
                 self.step = UpdateStep::Current;
                 self.stages.start("git_source");
-                let revision = self.revision.as_ref();
-                let read = current(&self.document, revision, self.materializing);
+                let graph = self.graph.clone();
+                let read = current(&self.document, graph, self.materializing);
                 Ok(Next::Call(IoCall::child(read)))
             }
             UpdateStep::Current => self.canonicalize(result.child::<Source, GitError>()??),
@@ -721,16 +717,12 @@ impl Operation for ReadViewOperation {
 }
 
 /// Called after materialization; nodes that do not hold the document have nothing to do.
-pub fn capture(
-    node: &GitNode,
-    record: &Document,
-    revision: Option<&MetadataRawRevision>,
-) -> CaptureOperation {
+pub fn capture(node: &GitNode, record: &Document, graph: Source) -> CaptureOperation {
     CaptureOperation {
         held: Some(HeldCaptureOperation {
             node: node.clone(),
             record: record.clone(),
-            revision: revision.cloned(),
+            graph,
             forgotten: false,
         }),
         document_id: record.document_id,
@@ -769,7 +761,7 @@ impl Operation for CaptureOperation {
 struct HeldCaptureOperation {
     node: GitNode,
     record: Document,
-    revision: Option<MetadataRawRevision>,
+    graph: Source,
     forgotten: bool,
 }
 
@@ -789,7 +781,7 @@ impl Operation for HeldCaptureOperation {
         if !self.forgotten {
             self.forgotten = true;
             noted(result)?;
-            let run = update(&self.node, &self.record, self.revision.take(), true);
+            let run = update(&self.node, &self.record, self.graph.take(), true);
             return Ok(Next::Call(IoCall::child(run)));
         }
         match result.child::<Projection, GitError>()? {

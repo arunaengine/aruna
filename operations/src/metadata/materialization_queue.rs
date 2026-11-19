@@ -43,7 +43,7 @@ use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::topic_sync::GraphSyncOperation;
 use crate::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
-use aruna_core::git::{GitNode, schedule_capture_drain};
+use aruna_core::git::{CaptureMark, GitNode, schedule_capture_drain};
 
 use super::data_links::{DataLinkError, LinkRows};
 use super::iri_index::{MetadataIriError, ProjectRowsOperation};
@@ -94,6 +94,8 @@ struct CompletedMaterializationJob {
     sync: Option<CompletedMaterializationSync>,
     /// A merge renders the whole merged graph, so its raw state stays valid under a newer status.
     merge: bool,
+    /// The capture mark the job wrote; the finish that stores the graph marks it ready.
+    capture: Option<CaptureMark>,
 }
 
 impl CompletedMaterializationJob {
@@ -109,6 +111,7 @@ impl CompletedMaterializationJob {
             validation_write: None,
             sync: None,
             merge: false,
+            capture: None,
         }
     }
 }
@@ -613,9 +616,11 @@ fn plan_rows(
     for finished in finished {
         match finished {
             FinishedMaterializationJob::Completed(job) => {
+                let mut stored = false;
                 if let Some(status) = job.status {
                     let current = guard_status(snapshot, &planned, status.document_id);
                     if should_write_final(current, &status) {
+                        stored = true;
                         superseding.insert(status.document_id, status.event_id);
                         plan.writes.extend(job.iri_index_writes);
                         plan.deletes.extend(job.link_deletes);
@@ -632,6 +637,7 @@ fn plan_rows(
                         && let Some(raw_state_write) = job.raw_state_write
                     {
                         // A late merge keeps the newer status but stores the graph it published.
+                        stored = true;
                         plan.writes.push(raw_state_write);
                     }
                 }
@@ -639,8 +645,19 @@ fn plan_rows(
                     MATERIALIZATION_JOB_KEYSPACE.to_string(),
                     ByteView::from(job.job_key),
                 ));
-                // The capture mark stays until the Git capture drain took the snapshot.
                 if let Some(document_job_key) = job.document_job_key {
+                    let mark = ByteView::from(document_job_key.clone());
+                    let space = MATERIALIZATION_CAPTURE_KEYSPACE.to_string();
+                    // The finish that stores the graph marks its capture ready, and the mark stays
+                    // until the drain took the snapshot; a job that stored no graph drops its mark.
+                    match job.capture.filter(|_| stored) {
+                        Some(mut capture) => {
+                            capture.ready = true;
+                            let value = ByteView::from(capture.to_bytes()?);
+                            plan.writes.push((space, mark, value));
+                        }
+                        None => plan.deletes.push((space, mark)),
+                    }
                     plan.deletes.push((
                         DOCUMENT_JOB_KEYSPACE.to_string(),
                         ByteView::from(document_job_key),
@@ -1803,6 +1820,8 @@ enum JobStage {
     Merged(Box<ProfileValidationStatus>),
     Raw,
     Apply(Box<RawEventPlan>),
+    /// Exports the graph a job without a displayed revision materialized, for its mark.
+    Render(Box<MaterializedCreateEvent>),
     Mark(Box<MaterializedCreateEvent>),
     Checkpoint(Box<MaterializedCreateEvent>),
     Project(Box<MaterializedCreateEvent>),
@@ -1822,6 +1841,7 @@ struct MaterializationJobOperation {
     now_ms: u64,
     apply_started_ms: u64,
     craqle_elapsed: Duration,
+    capture: Option<CaptureMark>,
     stage: JobStage,
 }
 
@@ -1842,6 +1862,7 @@ impl MaterializationJobOperation {
             now_ms: 0,
             apply_started_ms: 0,
             craqle_elapsed: Duration::ZERO,
+            capture: None,
             stage: JobStage::Event,
         }
     }
@@ -2065,22 +2086,41 @@ impl MaterializationJobOperation {
     }
 
     // Refreshes keep off the raw view from here until the Git capture drain, after the finish
-    // batch stored this graph, takes its snapshot. The mark holds the revision this job
-    // displays, so a newer edit stored before the drain never takes its place.
+    // batch stored this graph, takes its snapshot. The mark holds the graph this job made: its
+    // displayed revision, or without one the graph exported right after the apply.
     fn mark(
         &mut self,
         materialized: MaterializedCreateEvent,
     ) -> MaterializationTurn<ProcessedMaterializationJob> {
         self.craqle_elapsed = elapsed(self.apply_started_ms, self.now_ms);
-        let revision =
-            postcard::to_allocvec(&materialized.raw_revision).map_err(ConversionError::from)?;
-        let mark = (
+        let Some(revision) = materialized.raw_revision.as_ref() else {
+            let graph_iri = self.event()?.record.graph_iri.clone();
+            self.stage = JobStage::Render(Box::new(materialized));
+            return Ok(graph_call(MetadataEffect::ExportRoCrate { graph_iri }));
+        };
+        let graph = (revision.winning_event_id, revision.jsonld.clone());
+        self.write_mark(materialized, graph)
+    }
+
+    fn write_mark(
+        &mut self,
+        materialized: MaterializedCreateEvent,
+        (event_id, jsonld): (Ulid, String),
+    ) -> MaterializationTurn<ProcessedMaterializationJob> {
+        let mark = CaptureMark {
+            materialized_at_ms: self.now_ms,
+            event_id,
+            jsonld,
+            ready: false,
+        };
+        let row = (
             MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
             document_job_key(self.job.document_id, self.job.event_id),
-            ByteView::from(revision),
+            ByteView::from(mark.to_bytes()?),
         );
+        self.capture = Some(mark);
         self.stage = JobStage::Mark(Box::new(materialized));
-        Ok(Next::Call(IoCall::Write(vec![mark])))
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 
     fn projected(
@@ -2109,6 +2149,7 @@ impl MaterializationJobOperation {
                 peers: event.record.holder_node_ids.clone(),
             }),
             merge: merges(event),
+            capture: self.capture.take(),
         };
         let elapsed = self.craqle_elapsed;
         self.finish(ProcessedMaterializationJob::completed(completed, elapsed))
@@ -2153,6 +2194,14 @@ impl Operation for MaterializationJobOperation {
                 );
                 self.settled(Some(status))
             }
+            JobStage::Render(materialized) => match graph_event(result) {
+                Ok(MetadataEvent::RoCrateExportResult { jsonld, .. }) => {
+                    let event_id = self.job.event_id;
+                    self.write_mark(*materialized, (event_id, jsonld))
+                }
+                Ok(other) => self.defer(&unexpected(other)),
+                Err(error) => self.defer(&error),
+            },
             JobStage::Mark(materialized) => {
                 if let Err(error) = result.done() {
                     return self.defer(&MetadataMaterializationError::from(error));

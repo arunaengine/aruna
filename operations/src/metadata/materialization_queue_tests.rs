@@ -1619,6 +1619,7 @@ async fn finish_keeps_newer() {
             validation_write: None,
             sync: None,
             merge: false,
+            capture: None,
         },
     )];
     let newer_job = MetadataMaterializationRecord {
@@ -1730,6 +1731,7 @@ async fn finish_not_regress() {
                 validation_write: None,
                 sync: None,
                 merge: false,
+                capture: None,
             },
         )],
     )
@@ -1817,6 +1819,12 @@ async fn finish_stores_merge() {
         validation_write: None,
         sync: None,
         merge: true,
+        capture: Some(CaptureMark {
+            materialized_at_ms: 1,
+            event_id: late_event.event_id,
+            jsonld: "{}".to_string(),
+            ready: false,
+        }),
     };
     finish_completed_jobs(
         &aruna_drivers::testing::test_context(storage.clone()),
@@ -1833,7 +1841,7 @@ async fn finish_stores_merge() {
         "the newer status stays"
     );
     assert!(storage_key_exists(&storage, RAW_REVISION_KEYSPACE, raw_state_key.to_vec()).await);
-    // The mark stays until the Git capture drain took the snapshot.
+    // The finish made the mark ready; it stays until the Git capture drain took the snapshot.
     assert!(capture_pending(&storage, document_id).await.unwrap());
 }
 
@@ -1914,6 +1922,7 @@ async fn late_merges_chain() {
                 validation_write: None,
                 sync: None,
                 merge: true,
+                capture: None,
             },
         ));
     }
@@ -2104,6 +2113,7 @@ async fn supersedes_prior_rows() {
             validation_write: None,
             sync: None,
             merge: false,
+            capture: None,
         }
     };
 
@@ -2437,6 +2447,7 @@ fn sync_dedupes_graphs() {
                 peers,
             }),
             merge: false,
+            capture: None,
         })
     };
     let finished = vec![completed(vec![node(1)]), completed(vec![node(2)])];
