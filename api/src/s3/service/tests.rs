@@ -998,20 +998,14 @@ fn refresh(
     metadata: SourceMetadata,
     refreshed_at: SystemTime,
 ) -> ReferenceRefresh {
-    ReferenceRefresh {
-        bucket: test.bucket.clone(),
-        key: test.key.clone(),
-        version_id: test.version_id,
-        metadata: Some(metadata),
+    let (bucket, key) = (test.bucket.clone(), test.key.clone());
+    aruna_operations::testing::reference_refresh(
+        bucket,
+        key,
+        test.version_id,
+        metadata,
         refreshed_at,
-        node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
-        auth_context: aruna_core::structs::identity::auth::AuthContext {
-            user_id: Default::default(),
-            realm_id: aruna_core::structs::identity::realm::RealmId([9u8; 32]),
-            path_restrictions: None,
-            session: None,
-        },
-    }
+    )
 }
 
 fn version_key(test: &TestState) -> Vec<u8> {

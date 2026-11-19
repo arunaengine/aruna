@@ -367,3 +367,25 @@ pub async fn export_rocrate_jsonld(
         ))),
     }
 }
+
+/// A refresh of `version_id` at `bucket`/`key` with `metadata`, by node 4 for a user of realm 9.
+pub fn reference_refresh(
+    bucket: String,
+    key: String,
+    version_id: ulid::Ulid,
+    metadata: aruna_core::structs::execution::source_access::SourceMetadata,
+    refreshed_at: std::time::SystemTime,
+) -> crate::s3::object::metadata::ReferenceRefresh {
+    crate::s3::object::metadata::ReferenceRefresh {
+        bucket,
+        key,
+        version_id,
+        metadata: Some(metadata),
+        refreshed_at,
+        node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+        auth_context: aruna_core::structs::identity::auth::AuthContext::new(
+            Default::default(),
+            RealmId([9u8; 32]),
+        ),
+    }
+}
