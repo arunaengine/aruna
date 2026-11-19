@@ -9,9 +9,9 @@ use std::sync::Arc;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::keyspaces::{GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE};
+use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MetadataEffect, MetadataError, MetadataEvent, REGISTRY_CANDIDATE_LIMIT,
+    MetadataEffect, MetadataError, MetadataEvent, REGISTRY_CANDIDATE_LIMIT,
 };
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::rows::event;
@@ -19,6 +19,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, Value};
 
 use crate::metadata::call_results::page_rows;
+use crate::metadata::read_scope::DeletedGraphsOperation;
 
 /// The live registry records of this node, ordered by document id.
 pub type Registry = Arc<Vec<MetadataRegistryRecord>>;
@@ -64,7 +65,6 @@ enum FillStage {
 pub(crate) struct RegistryFillOperation {
     generation: u64,
     records: Vec<MetadataRegistryRecord>,
-    deleted: HashSet<String>,
     stage: Option<FillStage>,
 }
 
@@ -84,16 +84,6 @@ impl RegistryFillOperation {
         }))
     }
 
-    fn lifecycle_page(&mut self, after: Option<Key>) -> Turn<Registry> {
-        self.stage = Some(FillStage::Lifecycle);
-        Ok(Next::Call(IoCall::Page {
-            space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            prefix: Key::from(Vec::new()),
-            after,
-            limit: REGISTRY_CANDIDATE_LIMIT.saturating_add(1),
-        }))
-    }
-
     fn registry_read(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> Turn<Registry> {
         if self.records.len().saturating_add(rows.len()) > REGISTRY_CANDIDATE_LIMIT {
             return Err(limit_exceeded());
@@ -107,41 +97,27 @@ impl RegistryFillOperation {
         }
         match next {
             Some(after) => self.registry_page(Some(after)),
-            None => self.lifecycle_page(None),
-        }
-    }
-
-    fn lifecycle_read(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> Turn<Registry> {
-        if self.deleted.len().saturating_add(rows.len()) > REGISTRY_CANDIDATE_LIMIT {
-            return Err(MetadataError::Backend(
-                "metadata lifecycle candidate limit exceeded".to_string(),
-            ));
-        }
-        for (_, value) in rows {
-            let record: GraphLifecycleRecord = postcard::from_bytes(&value)
-                .map_err(|error| MetadataError::Backend(error.to_string()))?;
-            if record.is_deleted() {
-                self.deleted.insert(record.graph_iri);
+            None => {
+                self.stage = Some(FillStage::Lifecycle);
+                Ok(Next::Call(IoCall::child(DeletedGraphsOperation::new())))
             }
         }
-        if let Some(after) = next {
-            return self.lifecycle_page(Some(after));
-        }
-        self.store()
     }
 
     // Lifecycle rows are deletion tombstones, so one sweep refreshes the deletion state of every
     // registry graph; snapshot readers binary-search the records by document id.
-    fn store(&mut self) -> Turn<Registry> {
+    fn store(&mut self, deleted: &HashSet<String>) -> Turn<Registry> {
         let mut records = std::mem::take(&mut self.records);
         records.sort_unstable_by_key(|record| record.document_id);
         let lifecycle = (records.iter())
             .map(|record| {
-                let deleted = self.deleted.contains(&record.graph_iri);
-                (record.graph_iri.clone(), deleted)
+                (
+                    record.graph_iri.clone(),
+                    deleted.contains(&record.graph_iri),
+                )
             })
             .collect();
-        records.retain(|record| !self.deleted.contains(&record.graph_iri));
+        records.retain(|record| !deleted.contains(&record.graph_iri));
         let registry = Arc::new(records);
         let store = MetadataEffect::StoreRegistry {
             records: registry.as_ref().clone(),
@@ -185,8 +161,8 @@ impl Operation for RegistryFillOperation {
                 self.registry_read(rows, next)
             }
             Some(FillStage::Lifecycle) => {
-                let (rows, next) = page_rows(result)?;
-                self.lifecycle_read(rows, next)
+                let deleted = result.child::<HashSet<String>, MetadataError>()??;
+                self.store(&deleted)
             }
             // A fill the cache refused still answers with what it read.
             Some(FillStage::Store(registry)) => match cache_answer(result)? {

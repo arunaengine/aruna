@@ -6,6 +6,7 @@ use super::*;
 use crate::tests::calls::{child, runs_child};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
+use std::collections::HashSet;
 use ulid::Ulid;
 
 fn record(seed: u64) -> MetadataRegistryRecord {
@@ -96,22 +97,11 @@ fn fill_stores_registry() {
         ],
         next: None,
     };
-    let page = fill.next(registry);
-    let Ok(Next::Call(IoCall::Page { space, .. })) = page else {
-        panic!("expected the lifecycle page, got {page:?}");
-    };
-    assert_eq!(space, GRAPH_LIFECYCLE_KEYSPACE);
-    let tombstone = GraphLifecycleRecord::deleted(
-        gone.graph_iri.clone(),
-        gone.realm_id,
-        gone.group_id,
-        gone.document_id,
-        1,
-    );
-    let lifecycle = IoResult::Page {
-        rows: vec![row(postcard::to_allocvec(&tombstone).unwrap())],
-        next: None,
-    };
+    let sweep = IoCall::child(DeletedGraphsOperation::new());
+    assert_eq!(fill.next(registry), Ok(Next::Call(sweep)));
+    let lifecycle = child(Ok::<_, MetadataError>(HashSet::from([gone
+        .graph_iri
+        .clone()])));
     let store = MetadataEffect::StoreRegistry {
         records: vec![live.clone()],
         lifecycle: vec![
