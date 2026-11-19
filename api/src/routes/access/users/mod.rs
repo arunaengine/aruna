@@ -23,6 +23,7 @@ use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs as now_timestamp;
 use aruna_core::user::validation::email_hash;
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 use aruna_operations::auth::token_subject::{SubjectCheckError, SubjectCheckOperation};
 use aruna_operations::device::remove_node::{
@@ -30,7 +31,6 @@ use aruna_operations::device::remove_node::{
 };
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::driver::drive;
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::delete_secret::{

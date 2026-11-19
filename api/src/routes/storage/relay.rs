@@ -5,7 +5,7 @@
 
 // The target checks the token and the caller's permissions again on its own path.
 
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 
 use aruna_core::NodeId;
 use aruna_core::compute::{SecretBytes, SharedSecret};

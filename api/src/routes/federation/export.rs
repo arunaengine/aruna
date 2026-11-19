@@ -20,7 +20,7 @@ use aruna_core::time::unix_timestamp_secs;
 use aruna_core::transfer::{
     ExportGrant, GrantError, ImportIntent, TransferError, check_remote, intent_digest,
 };
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::federation::grant::{
     AdmitGrantOperation, IssueExportOperation, IssueGrantConfig, ReadGrantOperation,
     RevokeGrantOperation, export_access,
@@ -498,7 +498,7 @@ mod tests {
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::transfer::MAX_TRANSFER_SECS;
-    use aruna_operations::testing::test_context;
+    use aruna_drivers::testing::test_context;
     use axum::Extension;
     use axum::http::HeaderValue;
     use axum::response::IntoResponse;

@@ -12,9 +12,9 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
+use aruna_drivers::driver::drive;
 use aruna_operations::blob::migration::misplaced::AccessRule;
 use aruna_operations::blob::purge::ScopeTotalsOperation;
-use aruna_operations::driver::drive;
 use aruna_operations::jobs::JOB_RETENTION_MS;
 use aruna_operations::metadata::api::links::set_preview_distributed;
 use aruna_operations::s3::bucket::release::BucketScope;
@@ -753,7 +753,7 @@ pub async fn delete_preview(
     let access = Arc::new(access);
     let readable = |key: &str| access.allows(Some(key), &Permission::READ);
     let rule = AccessRule::new(access.clone(), Permission::READ);
-    let routing = aruna_operations::driver::node_routing(&context);
+    let routing = aruna_drivers::driver::node_routing(&context);
     let totals = drive(ScopeTotalsOperation::new(routing, &scope, rule), &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
@@ -831,7 +831,7 @@ pub async fn delete_preview(
             } => (key.clone(), *version_id),
         })
         .collect();
-    let routing = aruna_operations::driver::node_routing(&context);
+    let routing = aruna_drivers::driver::node_routing(&context);
     let place = (bucket.as_str(), info.group_id);
     let lookup = aruna_operations::blob::purge::StorageFilesOperation::new(
         routing,

@@ -14,7 +14,7 @@ use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::VaultQuery;
 use aruna_core::structs::identity::user::vault::{KEY_ID_BYTES, UserKeyRecord, VaultRecords};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::s3::holder_seal::SealPublishedOperation;
 use aruna_operations::users::vault_write::{VaultAppended, VaultChange};
 use axum::extract::{Path, State};

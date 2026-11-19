@@ -10,7 +10,7 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendRef, bucket_permission_path};
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule, target_warnings};
-use aruna_operations::driver::{drive, node_routing};
+use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::groups::backends::query::GetBackendOperation;
 use aruna_operations::groups::default_rule::PutDefaultOperation;
 use aruna_operations::groups::storage_routing::{
@@ -746,7 +746,7 @@ pub async fn list_group_buckets(
     Path(group_id): Path<String>,
     axum::extract::Query(page): axum::extract::Query<BucketPageQuery>,
 ) -> ServerResult<Json<BucketStoragePage>> {
-    use aruna_operations::driver::node_routing;
+    use aruna_drivers::driver::node_routing;
     use aruna_operations::s3::bucket::bucket_storage::BucketStorageOperation;
     use aruna_operations::s3::bucket::list::bucket_cursor;
     let group_id = parse_group_id(&group_id)?;

@@ -11,8 +11,8 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage, valid_bucket};
+use aruna_drivers::driver::drive;
 use aruna_operations::blob::reclaim_sweep::BackendStatusOperation;
-use aruna_operations::driver::drive;
 use aruna_operations::groups::backends::create::{
     CreateBackendError, CreateBackendInput, CreateBackendOperation,
 };

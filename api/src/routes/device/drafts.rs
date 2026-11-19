@@ -23,6 +23,7 @@ use crate::metadata::{
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::Permission;
+use aruna_drivers::driver::drive;
 use aruna_operations::device::delete_draft::{DeleteDraftError, DeleteDraftOperation};
 use aruna_operations::device::enqueue_draft::{
     EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation,
@@ -30,7 +31,6 @@ use aruna_operations::device::enqueue_draft::{
 use aruna_operations::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
 use aruna_operations::device::list_drafts::ListDraftsOperation;
 use aruna_operations::device::publish_queue::{PublishEntry, PublishState, token_issued_at};
-use aruna_operations::driver::drive;
 use aruna_operations::metadata::profile::validation::ProfileAssessOperation;
 use aruna_operations::metadata::public_preview::RestrictedFilesOperation;
 

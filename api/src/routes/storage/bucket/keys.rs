@@ -26,7 +26,7 @@ use aruna_core::structs::storage::holders::{
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::key_wake::WakeUnlockedOperation;
 use aruna_operations::s3::bucket::holders::LookupKeysOperation;
 use aruna_operations::s3::bucket::key::extend::{ExtendBucketOperation, ExtendError, ExtendInput};

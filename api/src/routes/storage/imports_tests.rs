@@ -18,7 +18,7 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
 use aruna_core::structs::storage::routing::RoutingTarget;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::s3::bucket::routing::GetRoutingOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

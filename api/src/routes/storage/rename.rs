@@ -10,7 +10,7 @@ use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::s3::bucket::checked_rename::AuthorizedRenameOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::rename::{RenameError, RenameInput, RenameItem, RenamePlan};

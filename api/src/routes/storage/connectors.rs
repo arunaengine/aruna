@@ -16,6 +16,7 @@ use aruna_core::structs::execution::source_access::{
 };
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_drivers::driver::drive;
 use aruna_operations::connectors::create_connector::{
     SourceConnectorError, SourceConnectorInput, SourceConnectorOperation,
 };
@@ -35,7 +36,6 @@ use aruna_operations::connectors::resolver::{resolve_inline_access, validate_sou
 use aruna_operations::connectors::secret_config::{HasConfigError, HasConfigOperation};
 use aruna_operations::connectors::validation::validate_connector_input;
 use aruna_operations::connectors::{ResolveConnectorInput, ResolveConnectorOperation};
-use aruna_operations::driver::drive;
 use aruna_operations::staging::check_source::CheckSourceOperation;
 use aruna_operations::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation,

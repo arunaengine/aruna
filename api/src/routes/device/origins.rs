@@ -16,8 +16,8 @@ use utoipa_axum::routes;
 use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_drivers::driver::drive;
 use aruna_operations::device::sync::outbox::local_origin;
-use aruna_operations::driver::drive;
 
 use super::folders::map_folder_error;
 

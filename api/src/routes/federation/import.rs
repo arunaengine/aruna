@@ -20,7 +20,7 @@ use aruna_core::structs::execution::job::{RoCrateMediaType, RoCrateUploadRecord}
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::transfer::{ExportGrant, ImportDestination, ImportIntent, TransferError};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::federation::import::{
     AuthorizeImportOperation, GRANT_HEADER, ImportError, ReusableUploadOperation,
     WriteImportOperation, answer_error, header_value,
@@ -199,7 +199,7 @@ pub(crate) async fn pushed_upload(
     };
     // The source's push confirms its grant again; a paused import resumes with this consent.
     rebind(state, &push.intent, &push.grant, &push.key, upload_id).await?;
-    let record = aruna_operations::driver::drive(
+    let record = aruna_drivers::driver::drive(
         aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
         &context,
     )
@@ -255,7 +255,7 @@ pub(crate) async fn bind_upload(
         expires_at_ms: 0,
         ..record.clone()
     };
-    aruna_operations::driver::drive(
+    aruna_drivers::driver::drive(
         aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(losing.clone()),
         &context,
     )
@@ -263,7 +263,7 @@ pub(crate) async fn bind_upload(
     .map_err(|error| error.0)
     .map_err(ServerError::ServiceUnavailableReason)?;
     let bound = bound.map_err(import_refused)?;
-    aruna_operations::driver::drive(
+    aruna_drivers::driver::drive(
         aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(bound),
         &context,
     )

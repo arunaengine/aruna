@@ -13,8 +13,8 @@ use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{
     SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot, sync_relationship_key,
 };
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_storage::storage::FjallStorage;
 use std::time::SystemTime;
 

@@ -10,7 +10,7 @@ use crate::tests::routes::{
 };
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
-use aruna_operations::testing::test_context;
+use aruna_drivers::testing::test_context;
 use serde_json::json;
 use tempfile::TempDir;
 

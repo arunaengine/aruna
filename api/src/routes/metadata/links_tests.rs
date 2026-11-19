@@ -318,7 +318,7 @@ async fn confirms_hidden_dataset() {
     let other = stranger(&test);
     let links_local = |auth: &AuthContext, request: LinkNodeRequest| {
         let links = LinksLocalOperation::new(realm_id, Some(auth.clone()), request);
-        aruna_operations::driver::drive(links, context.as_ref())
+        aruna_drivers::driver::drive(links, context.as_ref())
     };
 
     let named = links_local(&other, request(Some(dataset))).await.unwrap();

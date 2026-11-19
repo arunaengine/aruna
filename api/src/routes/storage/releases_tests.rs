@@ -12,7 +12,7 @@ use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::s3::object::origin::ReadOriginOperation;
 
 use super::*;
@@ -187,7 +187,7 @@ async fn publish_needs_reads() {
             release_publish::PublishReleaseOperation::new(
                 scope,
                 input,
-                aruna_operations::driver::node_routing(state.get_ctx().as_ref()),
+                aruna_drivers::driver::node_routing(state.get_ctx().as_ref()),
             ),
             state.get_ctx().as_ref(),
         )
@@ -358,7 +358,7 @@ async fn browses_release_files() {
 async fn purge_keeps_pinned() {
     use crate::routes::storage::deletion::{PurgeScopeRequest, SubmitPurgeRequest, submit_purge};
     use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
-    use aruna_operations::driver::drive;
+    use aruna_drivers::driver::drive;
     use aruna_operations::s3::object::delete::pinned::{
         PinnedError, RefusePinnedOperation, RefuseScopeOperation,
     };

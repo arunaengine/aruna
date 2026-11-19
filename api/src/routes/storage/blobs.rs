@@ -15,9 +15,9 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::replication_queue::ReplicationMode;
 use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
+use aruna_drivers::driver::{drive, drive_until};
 use aruna_operations::blob::holders::{GetHoldersError, GetHoldersOperation};
 use aruna_operations::distribution::resolve::key_holders;
-use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::replication::locations::{
     LocationSummaryError, LocationSummaryOperation, QueuedNodesOperation, QueuedReplicas,
     RelationshipNodesOperation, RemoteLocationOperation,
@@ -823,7 +823,7 @@ fn peer_copy(
 /// Nodes the durable holder index says store these bytes. A version with no
 /// materialized content has no hash and therefore no holders.
 async fn holder_nodes(
-    ctx: &Arc<aruna_operations::driver::DriverContext>,
+    ctx: &Arc<aruna_drivers::driver::DriverContext>,
     blake3: Option<[u8; 32]>,
     realm_id: aruna_core::structs::identity::realm::RealmId,
     local_node: NodeId,

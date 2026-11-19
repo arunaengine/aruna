@@ -214,10 +214,10 @@ async fn reference_import_counted() {
     };
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_drivers::driver::drive;
     use aruna_operations::connectors::create_connector::{
         SourceConnectorInput, SourceConnectorOperation,
     };
-    use aruna_operations::driver::drive;
     use aruna_operations::staging::page::import::{
         PageEntry, PageImportInput, PageImportOperation,
     };

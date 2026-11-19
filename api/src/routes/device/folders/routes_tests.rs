@@ -18,9 +18,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, Value};
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::device::sync::repository::{action_entry, base_entry, folder_entry};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::http::StatusCode;
@@ -610,7 +610,7 @@ async fn sync_skips_scan() {
     .await
     .unwrap();
     assert_eq!(view.counters.observed, 0);
-    let offers = aruna_operations::driver::drive(
+    let offers = aruna_drivers::driver::drive(
         aruna_operations::staging::offer::list::ListOffersOperation::new(),
         &fixture.state.get_ctx(),
     )

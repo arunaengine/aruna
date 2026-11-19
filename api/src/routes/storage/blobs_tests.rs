@@ -22,7 +22,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::CopyOrigin;
 use aruna_core::structs::storage::format::Compression;
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::replication::locations::LocationSummaryError;
 use aruna_operations::replication::protocol::CopyCompliance;
 use aruna_operations::replication::protocol::{LocationCopyStorage, LocationSummary};
@@ -330,7 +330,7 @@ async fn setup_bucket(realm_id: RealmId, owner: UserId) -> (TempDir, Arc<ServerS
             NodeCapabilities::user_node(realm_id).expect("capabilities"),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );

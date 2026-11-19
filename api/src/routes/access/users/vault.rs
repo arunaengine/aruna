@@ -17,7 +17,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::user::vault::{
     MAX_PREDECESSORS, MAX_VAULT_BYTES, VaultRecordError, VaultRecords, VaultRevision,
 };
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::forward::routing::HolderWriteError;
 use aruna_operations::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
 use aruna_operations::users::vault_route::{AppendRoutedOperation, VaultRouteError};
@@ -348,8 +348,8 @@ pub(super) mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_drivers::testing::test_context;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::testing::test_context;
     use axum::response::IntoResponse;
     use tempfile::TempDir;
 

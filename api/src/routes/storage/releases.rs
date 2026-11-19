@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
-use aruna_operations::driver::{drive, node_routing};
+use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::s3::bucket::release::access::MembersCheckOperation;
 use aruna_operations::s3::bucket::release::publish::{
     self as release_publish, PublishError, PublishInput, ReleaseSpec,

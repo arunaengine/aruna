@@ -18,7 +18,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, SessionKind};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::s3::access::create::{
     CreateUserConfig, CreateUserError, CreateUserOperation,
 };
