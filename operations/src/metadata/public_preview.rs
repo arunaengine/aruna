@@ -25,7 +25,7 @@ use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};
-use crate::replication::protocol::LocationSummaryRequest;
+use aruna_core::replication_protocol::LocationSummaryRequest;
 use aruna_core::request_policy::PolicyRequestExtras;
 
 const FILE_TYPES: [&str; 4] = [

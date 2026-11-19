@@ -27,10 +27,10 @@ use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::metadata::global_entries::{LocalVersionError, LocalVersionOperation};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectInfo};
 use crate::s3::object::read::ObjectInfoOperation;
+use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};
 use aruna_core::request_policy::PolicyRequestExtras;
 
 type Document = MetadataRegistryRecord;

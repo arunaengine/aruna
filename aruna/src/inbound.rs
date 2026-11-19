@@ -1075,15 +1075,15 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_core::replication_protocol::{
+        LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
+    };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
-    use aruna_operations::replication::protocol::{
-        LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
-    };
     use aruna_storage::FjallStorage;
     use std::collections::HashMap;
     use tempfile::tempdir;

@@ -42,13 +42,13 @@ use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::{BaoReadError, IncomingBaoOperation, IncomingBaoResult};
 use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};
-use crate::replication::protocol::{
-    BaoReadRequest, BaoReadTarget, LocationSummaryRequest, VersionReplicationManifest,
-    VersionReplicationMessage,
-};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};
 use crate::staging::offered_directory::OfferedDirectoryError;
+use aruna_core::replication_protocol::{
+    BaoReadRequest, BaoReadTarget, LocationSummaryRequest, VersionReplicationManifest,
+    VersionReplicationMessage,
+};
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 type StreamTurn = Result<Next<()>, IoError>;

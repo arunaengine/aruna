@@ -15,9 +15,6 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 
-use crate::replication::protocol::{
-    MAX_VALUE_BYTES, MaterializedBlobInfo, VersionReplicationManifest, VersionReplicationMessage,
-};
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::s3::usage::{QuotaGate, QuotaGateError};
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
@@ -32,6 +29,9 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{EffectOperation, Operation, Runnable, TransactionMode};
+use aruna_core::replication_protocol::{
+    MAX_VALUE_BYTES, MaterializedBlobInfo, VersionReplicationManifest, VersionReplicationMessage,
+};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -176,9 +176,9 @@ fn envelope_rows(turn: &Turn) -> Vec<&(String, Key, Value)> {
 
 #[tokio::test]
 async fn refused_copy_absent() {
-    use crate::replication::protocol::VersionReplicationRequest;
     use crate::replication::version_replication::{ReplicateObjectError, ReplicateObjectOperation};
     use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
+    use aruna_core::replication_protocol::VersionReplicationRequest;
     use aruna_core::structs::storage::blob::VersionKey;
     use aruna_core::structs::storage::encryption::{
         BucketEncryption, BucketKeyRef, EncryptionMode,

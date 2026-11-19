@@ -16,7 +16,6 @@ mod obligations;
 pub mod page;
 pub mod parking;
 pub mod plaintext;
-pub mod protocol;
 pub mod queue;
 mod retire;
 pub(crate) mod source_rules;

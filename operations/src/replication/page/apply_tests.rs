@@ -37,7 +37,7 @@ use crate::distribution::test_record::{
     binding, member, realm, replicated, secret, store_record, with_settings,
 };
 use crate::distribution::test_store::{context, install, open};
-use crate::replication::protocol::VersionReplicationManifest;
+use aruna_core::replication_protocol::VersionReplicationManifest;
 use aruna_drivers::driver::drive;
 
 struct Member {

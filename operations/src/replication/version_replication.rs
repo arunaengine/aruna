@@ -13,10 +13,6 @@ use crate::placement::policy::{
     GateContext, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision, write_gate,
 };
 use crate::replication::error::ReplicationError;
-use crate::replication::protocol::{
-    MaterializedBlobInfo, MultipartObjectMetadata, VersionReplicationManifest,
-    VersionReplicationMessage, VersionReplicationRequest,
-};
 use crate::s3::object::put::abe::keyed;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -36,6 +32,10 @@ use aruna_core::managed_copy::{
 };
 use aruna_core::native_reference::NATIVE_RELATIONSHIP_ID;
 use aruna_core::operation::Operation;
+use aruna_core::replication_protocol::{
+    MaterializedBlobInfo, MultipartObjectMetadata, VersionReplicationManifest,
+    VersionReplicationMessage, VersionReplicationRequest,
+};
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::unmatched_checksum;
@@ -2927,7 +2927,6 @@ mod tests {
         ReplicationFailure, ReplicationVersion, SourceAuthorization, SyncTransferContext,
         target_key,
     };
-    use crate::replication::protocol::{VersionReplicationMessage, VersionReplicationRequest};
     use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
@@ -2939,6 +2938,7 @@ mod tests {
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
+    use aruna_core::replication_protocol::{VersionReplicationMessage, VersionReplicationRequest};
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::ReferenceHandling;
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};

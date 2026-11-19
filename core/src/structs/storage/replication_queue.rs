@@ -22,6 +22,10 @@ pub enum ReplicationMode {
     OnDemand,
 }
 
+/// Hard bound on automatic successors per explicit binding: the interval only
+/// slows growth, this stops it. Only a WRITE or rebind starts a fresh count.
+pub const MAX_AUTO_ADVANCES: u16 = 100;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReferenceAdvance {
     pub generation: u64,

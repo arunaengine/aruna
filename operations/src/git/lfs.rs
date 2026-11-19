@@ -21,8 +21,8 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use aruna_core::git_state::Ancestry;
+use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};
 use aruna_core::request_policy::PolicyRequestExtras;
 
 type Document = MetadataRegistryRecord;

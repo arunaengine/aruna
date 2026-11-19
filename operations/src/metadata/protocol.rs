@@ -614,10 +614,10 @@ pub enum MetadataTransportMessage {
     },
     /// Reference records of one range from its coordinator, applied in one transaction.
     ReferencePage {
-        page: Box<crate::replication::page::ReferencePage>,
+        page: Box<aruna_core::replication_protocol::ReferencePage>,
     },
     ReferencePageAnswer {
-        answer: crate::replication::page::PageAnswer,
+        answer: aruna_core::replication_protocol::PageAnswer,
     },
     /// The realm signing key a management node hands a server node it promotes.
     HandRealmKey {

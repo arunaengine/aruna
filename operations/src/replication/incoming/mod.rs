@@ -13,7 +13,6 @@ use crate::placement::policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::error::ReplicationError;
-use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::replication::queue::schedule_blob_drain;
 use crate::s3::abe_copies::copy_row;
 use crate::s3::bucket::create::CreateBucketOperation;
@@ -41,6 +40,7 @@ use aruna_core::keyspaces::{
 use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_entry};
 use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
+use aruna_core::replication_protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::table::searchable;
