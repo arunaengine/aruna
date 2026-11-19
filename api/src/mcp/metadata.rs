@@ -1047,7 +1047,6 @@ mod authorization_tests {
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::drive;
-    use aruna_operations::metadata::MetadataHandle;
     use aruna_operations::metadata::create_document::CreateDocumentPayload;
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
@@ -1129,15 +1128,9 @@ mod authorization_tests {
             aruna_graph::GraphOptions::default(),
         )
         .unwrap();
-        let metadata_handle = MetadataHandle::new(
-            metadata_dir.path(),
-            storage_handle.clone(),
-            None,
-            Default::default(),
-        );
+        aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
         let mut context = test_context(storage_handle);
         context.net_handle = Some(net);
-        context.metadata_handle = Some(metadata_handle);
         context.graph_handle = Some(graph_handle);
         context.task_handle = Some(TaskHandle::new());
         let driver_ctx = Arc::new(context);

@@ -41,7 +41,6 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::node_facts;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::placement::policy::{SubjectScanMode, SubjectSyncOperation, SubjectTrigger};
 use aruna_operations::realm::announce_presence::{
@@ -1104,7 +1103,7 @@ async fn initialize_context(
 ) -> TestResult<Arc<DriverContext>> {
     storage_handle.open_vault(vault);
     let task_handle = TaskHandle::new();
-    let (metadata_handle, graph_handle) = if let Some(config) = full_storage_config {
+    let graph_handle = if let Some(config) = full_storage_config {
         config.ensure_directories()?;
         let graph = aruna_graph::GraphHandle::open(
             &config.metadata_storage_path,
@@ -1113,15 +1112,10 @@ async fn initialize_context(
             Some(net.document_sync_database()),
             Default::default(),
         )?;
-        let metadata = MetadataHandle::new(
-            &config.metadata_storage_path,
-            storage_handle.clone(),
-            Some(net.clone()),
-            Default::default(),
-        );
-        (Some(metadata), Some(graph))
+        aruna_operations::metadata::install_indexes(&storage_handle, &config.metadata_storage_path);
+        Some(graph)
     } else {
-        (None, None)
+        None
     };
     let blob_handle = if let Some(config) = full_storage_config {
         Some(
@@ -1141,7 +1135,6 @@ async fn initialize_context(
         storage_handle,
         net_handle: Some(net),
         blob_handle,
-        metadata_handle,
         graph_handle,
         task_handle: Some(task_handle.clone()),
         compute_handle: compute,

@@ -74,6 +74,9 @@ impl NetHandle {
                 watch_interest: handle_state.watch_interest,
                 heartbeats: Arc::default(),
                 peer_contacts: Default::default(),
+                issuer_keys: Default::default(),
+                #[cfg(feature = "test-hooks")]
+                dropped_answer: Default::default(),
                 download_gauge: Arc::default(),
                 avoided_holders: Default::default(),
                 notification_watch_metrics: NotificationWatchMetrics::default(),

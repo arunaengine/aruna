@@ -24,8 +24,8 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_graph::GraphHandle;
 use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::{MetadataHandle, send_metadata_effect};
 use aruna_operations::testing::process_materialization_batch;
+use aruna_operations::testing::send_metadata_effect;
 use aruna_storage::{FjallStorage, StorageHandle};
 use craqle::{
     CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateEntityRequest,
@@ -362,7 +362,7 @@ async fn upsert_replay_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     );
     materialize_entity_upsert(metadata_handle, &patch_event).await?;
     let projected: serde_json::Value = serde_json::from_str(
-        &aruna_operations::metadata::export_rocrate_jsonld(
+        &aruna_operations::testing::export_rocrate_jsonld(
             metadata_handle,
             create_event.record.graph_iri.clone(),
         )
@@ -612,29 +612,23 @@ async fn build_context(with_metadata: bool) -> Result<TestContext, Box<dyn std::
     } else {
         None
     };
-    let (metadata_handle, graph_handle) = match metadata_dir.as_ref() {
-        Some(dir) => (
-            Some(MetadataHandle::new(
-                dir.path(),
-                storage_handle.clone(),
-                None,
-                Default::default(),
-            )),
+    let graph_handle = match metadata_dir.as_ref() {
+        Some(dir) => {
+            aruna_operations::metadata::install_indexes(&storage_handle, dir.path());
             Some(GraphHandle::open(
                 dir.path(),
                 node_id,
                 None,
                 None,
                 Default::default(),
-            )?),
-        ),
-        None => (None, None),
+            )?)
+        }
+        None => None,
     };
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle,
         graph_handle,
         task_handle: None,
         compute_handle: None,

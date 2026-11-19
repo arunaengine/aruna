@@ -41,6 +41,7 @@ use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::driver::drive;
+use aruna_operations::metadata::protocol::mirror_created_answer;
 use aruna_operations::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -1335,20 +1336,14 @@ async fn orphan_mirror_rollback() -> TestResult<()> {
         let target_bucket = "orphan-rollback-target";
         let realm_id = harness.seed.realm_id;
         let creator_id = UserId::local(Ulid::generate(), realm_id);
-        let seed_metadata = harness
-            .seed
-            .context
-            .metadata_handle
-            .clone()
-            .ok_or_else(|| std::io::Error::other("seed node has no metadata handle"))?;
+        let seed_net = (harness.seed.context.net_handle.clone())
+            .ok_or_else(|| std::io::Error::other("seed node has no net handle"))?;
 
         harness
             .create_bucket_pair(source_bucket, target_bucket)
             .await?;
         let creator_token = harness.add_member(creator_id).await?;
-        // Repair waits until the creator lost WRITE, so only a rollback can remove the mirror.
-        seed_metadata.hold_repair();
-        seed_metadata.drop_create_ack();
+        seed_net.drop_answer(mirror_created_answer());
         let response = reqwest::Client::new()
             .post(format!(
                 "{}/api/v1/data/sync/relationships",
@@ -1464,7 +1459,6 @@ async fn orphan_mirror_rollback() -> TestResult<()> {
             .await?
         );
 
-        seed_metadata.release_repair();
         wait_until(
             "orphan sync mirror rollback",
             shared::WAIT_CAP,

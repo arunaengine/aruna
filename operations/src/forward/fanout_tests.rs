@@ -19,13 +19,11 @@ fn fanout() -> FanoutOperation {
 }
 
 fn request(peer: NodeId, text: &str) -> Effect {
-    Effect::Net(NetEffect::MetadataRequest(Box::new(
-        MetadataRequestEffect {
-            peer,
-            frame: encode_message(&message(text)).unwrap(),
-            timeout: Duration::from_secs(5),
-        },
-    )))
+    Effect::Net(NetEffect::MetadataRequest(Box::new(metadata_request(
+        peer,
+        encode_message(&message(text)).unwrap(),
+        Duration::from_secs(5),
+    ))))
 }
 
 fn done(peer: NodeId, result: Result<Vec<u8>, PeerRequestError>) -> GroupResult {

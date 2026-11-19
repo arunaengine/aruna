@@ -133,3 +133,49 @@ fn checks_follow_realm() {
         RevocationCheck::Skipped
     );
 }
+
+#[test]
+fn mirror_refuses_replay() {
+    // A sync mirror never takes a device replay as its caller.
+    let replay = AuthToken::Replay {
+        auth: AuthContext::anonymous(REALM),
+        issued_at: 10,
+        authored_at_ms: 20_000,
+    };
+    let mut check = WritePeerOperation::mirror(node(1), replay);
+    check.first().unwrap();
+    assert_eq!(
+        check.next(realm_answer(Some(REALM))),
+        Err(PeerAuthRefusal::Unauthorized)
+    );
+}
+
+#[test]
+fn mirror_checks_foreign() {
+    // A bearer of another realm still needs the peer in that realm's config.
+    let foreign = RealmId([7u8; 32]);
+    let mut check = WritePeerOperation::mirror(node(1), AuthToken::bearer("token").unwrap());
+    check.first().unwrap();
+    assert!(runs_child(check.next(realm_answer(Some(REALM)))));
+    let claims = aruna_core::structs::identity::auth::TokenClaims {
+        sub: aruna_core::UserId::local(Ulid::from_bytes([1u8; 16]), foreign).to_string(),
+        iss: foreign.to_base64(),
+        iat: 1,
+        exp: 2,
+        jti: "token-id".to_string(),
+        sid: None,
+        session_kind: None,
+        restrictions: None,
+        issuer_pubkey: None,
+        delegation_signature: None,
+        name: None,
+        via: None,
+        auth_time: None,
+    };
+    let claims = child(Ok::<_, ArunaBearerError>(claims));
+    let read = vec![(
+        REALM_CONFIG_KEYSPACE.to_string(),
+        Key::from(foreign.as_bytes().to_vec()),
+    )];
+    assert_eq!(check.next(claims), Ok(Next::Call(IoCall::Read(read))));
+}

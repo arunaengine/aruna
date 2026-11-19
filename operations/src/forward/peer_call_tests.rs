@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult};
-use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 
 use super::*;
@@ -34,11 +34,7 @@ fn answered(result: Result<Vec<u8>, PeerRequestError>) -> IoResult {
 #[test]
 fn carries_encoded_message() {
     let frame = encode_message(&message()).unwrap();
-    let request = MetadataRequestEffect {
-        peer: peer(),
-        frame: frame.clone(),
-        timeout: PEER_DEADLINE,
-    };
+    let request = metadata_request(peer(), frame.clone(), PEER_DEADLINE);
     let effect = Effect::Net(NetEffect::MetadataRequest(Box::new(request)));
     assert_eq!(peer_call(peer(), &message()), Ok(IoCall::from(effect)));
     assert_eq!(peer_answer(answered(Ok(frame))), Ok(Ok(message())));

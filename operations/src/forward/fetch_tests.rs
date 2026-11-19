@@ -42,13 +42,11 @@ fn fetch(budget: Budget) -> HolderFetchOperation<String> {
 }
 
 fn asked(peer: NodeId, timeout: Duration) -> Effect {
-    Effect::Net(NetEffect::MetadataRequest(Box::new(
-        MetadataRequestEffect {
-            peer,
-            frame: encode_message(&request()).unwrap(),
-            timeout,
-        },
-    )))
+    Effect::Net(NetEffect::MetadataRequest(Box::new(metadata_request(
+        peer,
+        encode_message(&request()).unwrap(),
+        timeout,
+    ))))
 }
 
 fn answer(peer: NodeId, seconds: u64, text: &str) -> Event {

@@ -5,15 +5,14 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{
-    Effect, JobRecordFrame, LaunchFrame, MetadataRequestEffect, NetEffect, ReceiptFrame,
-};
+use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, NetEffect, ReceiptFrame};
 use aruna_core::events::{Event, LaunchDecline, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::JobFamilyRecord;
 
 use super::{OfferLaunchOperation, OfferOutcome};
 use crate::jobs::lifecycle::LifecycleError;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::tests::records::{Family, node};
 
@@ -55,11 +54,11 @@ fn accepts_receipt() {
     assert_eq!(
         offer.first(),
         Ok(Next::Call(IoCall::Effect(Box::new(Effect::Net(
-            NetEffect::MetadataRequest(Box::new(MetadataRequestEffect {
-                peer: node(4),
+            NetEffect::MetadataRequest(Box::new(metadata_request(
+                node(4),
                 frame,
-                timeout: Duration::from_secs(30),
-            }))
+                Duration::from_secs(30)
+            )))
         )))))
     );
     let receipt = receipt(&family);

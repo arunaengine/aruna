@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +15,15 @@ use crate::compute::{ExecutorAvailability, MAX_ADVERTISED_EXECUTORS};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::MAX_KIND_LEN;
 use crate::structs::storage::node_info::{AdvertisementEpoch, NodeInfoDocument, NodeUtilization};
+
+/// How recently a peer must have reached this node to count as seen. A device beats every 60
+/// seconds and shuffles which node it asks, so three beats keep one skipped turn from reading as gone.
+pub const PEER_CONTACT_WINDOW: Duration = Duration::from_secs(180);
+
+/// Whether a peer last seen at `seen_ms` still counts as seen at `now_ms`.
+pub fn seen_recently(seen_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(seen_ms) <= PEER_CONTACT_WINDOW.as_millis() as u64
+}
 
 /// Largest encoded heartbeat a peer accepts.
 pub const MAX_HEARTBEAT_BYTES: usize = 32 * 1024;

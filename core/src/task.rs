@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +11,7 @@ use ulid::Ulid;
 
 use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::synced_folder::{SyncPullAck, SyncPullStatus, SyncRefusal};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskKey {
@@ -128,9 +131,45 @@ pub enum TaskEffect {
         key: TaskKey,
         after: Duration,
     },
+    Pull(PullEffect),
 }
 
+/// The synced-folder pulls this node runs, by receipt key; answered by `TaskEvent::Pull`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PullEffect {
+    /// Claims a pull of `total` bytes: its progress, or the status of the run holding the key.
+    Claim { key: Vec<u8>, total: u64 },
+    /// Ends a run; a refusal is kept until the device asked for it once.
+    Finish {
+        key: Vec<u8>,
+        result: Result<SyncPullAck, SyncRefusal>,
+    },
+    /// Where the run of `key` stands, when this node runs or refused it.
+    Status { key: Vec<u8> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PullEvent {
+    Claimed(Result<PullProgress, SyncPullStatus>),
+    Finished,
+    Status(Option<SyncPullStatus>),
+}
+
+/// The bytes of a pull that arrived so far, shared with the poll that reports them. A run holds
+/// it until it ends, so a dropped run frees its claim.
+#[derive(Clone, Debug, Default)]
+pub struct PullProgress(pub Arc<AtomicU64>);
+
+/// Two progress counters are the same when they count the same pull.
+impl PartialEq for PullProgress {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PullProgress {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskEvent {
     TimerScheduled {
         key: TaskKey,
@@ -147,6 +186,7 @@ pub enum TaskEvent {
     BackgroundStarted {
         started: bool,
     },
+    Pull(PullEvent),
     Error {
         key: Option<TaskKey>,
         message: String,

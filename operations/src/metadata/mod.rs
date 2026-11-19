@@ -20,9 +20,9 @@ pub mod forward;
 pub mod get_document;
 pub mod global_entries;
 pub(crate) mod graph_deleted;
-pub(crate) mod handle;
 pub mod id_mapping;
 pub mod identifier_lookup;
+mod index_dir;
 pub mod iri_index;
 pub mod list_documents;
 pub(crate) mod live_records;
@@ -52,6 +52,7 @@ pub mod repository;
 pub mod revision_read;
 mod search_cursor;
 pub mod secondary_ids;
+pub mod serve;
 pub(crate) mod span_timing;
 pub mod stats;
 pub mod text_search;
@@ -110,12 +111,12 @@ impl MetadataPhaseSource {
 }
 
 pub use builtin::builtin_shapes;
-pub use handle::{
-    MetadataHandle, MetadataHandleOptions, accept_pull, export_rocrate_jsonld, pull_status,
-    send_metadata_effect,
-};
-pub(crate) use message_kind::transport_message_kind;
+pub use index_dir::{RANGE_INDEX_DIR, install_indexes};
+pub use message_kind::transport_message_kind;
 pub use protocol::{
     MetadataPathWinner, MetadataReadError, PersistentIdOutcome, PersistentIdRequest,
     PersistentIdResolution,
 };
+
+#[cfg(test)]
+mod store_tests;

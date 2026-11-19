@@ -43,7 +43,6 @@ use aruna_core::structs::placement::record::METADATA_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -833,17 +832,11 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    let metadata_handle = MetadataHandle::new(
-        node_dir.path().join("metadata"),
-        storage_handle.clone(),
-        Some(net.clone()),
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage_handle, node_dir.path().join("metadata"));
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        metadata_handle: Some(metadata_handle),
         graph_handle: Some(graph_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,

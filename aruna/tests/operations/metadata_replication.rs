@@ -46,7 +46,6 @@ use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
 use aruna_operations::metadata::update_entry::UpdateEntryOperation;
-use aruna_operations::metadata::{export_rocrate_jsonld, send_metadata_effect};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -56,6 +55,7 @@ use aruna_operations::realm::mutate_placement::{
 };
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use aruna_operations::testing::process_materialization_batch;
+use aruna_operations::testing::{export_rocrate_jsonld, send_metadata_effect};
 use aruna_operations::testing::{project_create_events, replay_event_log};
 use aruna_operations::testing::{read_outbox_records, reconcile_topics};
 use tokio::time::sleep;

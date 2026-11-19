@@ -27,7 +27,6 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, Value};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::local_query::LocalQueryOperation;
 use aruna_operations::metadata::text_search::LocalSearchOperation;
 use aruna_storage::FjallStorage;
@@ -42,7 +41,6 @@ struct TestHarness {
     _storage_dir: TempDir,
     _metadata_dir: TempDir,
     storage: aruna_storage::StorageHandle,
-    handle: MetadataHandle,
     context: DriverContext,
     group_id: GroupId,
 }
@@ -58,12 +56,7 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
         options = options.with_pool_size(pool_size);
     }
     let graph = aruna_graph::GraphHandle::open(metadata_dir.path(), node_id, None, None, options)?;
-    let handle = MetadataHandle::new(
-        metadata_dir.path(),
-        storage.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage, metadata_dir.path());
     // Policy loading fails closed without realm config and group documents.
     let group_id = Ulid::generate();
     let owner = aruna_core::UserId::nil(REALM);
@@ -125,14 +118,12 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: Some(handle.clone()),
             graph_handle: Some(graph),
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
         },
         storage,
-        handle,
         group_id,
     })
 }
@@ -201,7 +192,7 @@ async fn create_crate_graph(harness: &TestHarness, index: usize) -> Result<Strin
 }
 
 async fn create_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Result<(), BoxError> {
-    let event = aruna_operations::metadata::send_metadata_effect(
+    let event = aruna_operations::testing::send_metadata_effect(
         &harness.context,
         MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {
@@ -569,7 +560,7 @@ async fn graph_filter_first() -> Result<(), BoxError> {
 }
 
 async fn replay_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Result<(), BoxError> {
-    let event = aruna_operations::metadata::send_metadata_effect(
+    let event = aruna_operations::testing::send_metadata_effect(
         &harness.context,
         MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {
@@ -926,7 +917,7 @@ async fn concurrent_mutation_profile() -> Result<(), BoxError> {
                 let jsonld = format!(
                     "{{\"@id\": \"./load-{writer}-{round}.dat\", \"@type\": \"MediaObject\", \"name\": \"load-{writer}-{round}\", \"keywords\": [{keywords}]}}"
                 );
-                let event = aruna_operations::metadata::send_metadata_effect(&harness.context, MetadataEffect::UpsertDataEntity {
+                let event = aruna_operations::testing::send_metadata_effect(&harness.context, MetadataEffect::UpsertDataEntity {
                         request: UpsertEntityRequest {
                             graph_iri,
                             jsonld,

@@ -720,4 +720,28 @@ mod tests {
         assert!(batch.completed_nodes.contains(&node));
         assert!(batch.missing_nodes.is_empty());
     }
+
+    #[test]
+    fn missing_bounds_overflow() {
+        // Past the bound a missing node is counted, so an oversized list is never silently cut.
+        let mut batch = AuditPageBatch::with_limit(usize::MAX);
+        for seed in 1u8..=u8::try_from(MAX_AUDIT_PEERS + 1).unwrap() {
+            batch.mark_missing(iroh::SecretKey::from_bytes(&[seed; 32]).public());
+        }
+        assert!(batch.completed_nodes.is_empty());
+        assert_eq!(batch.missing_nodes.len(), MAX_AUDIT_PEERS);
+        assert_eq!(batch.missing_overflow, 1);
+    }
+
+    #[test]
+    fn missing_keeps_unique() {
+        let first = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let second = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut batch = AuditPageBatch::with_limit(usize::MAX);
+        for node in [second, first, first] {
+            batch.mark_missing(node);
+        }
+        assert_eq!(batch.missing_nodes, BTreeSet::from([first, second]));
+        assert_eq!(batch.missing_overflow, 0);
+    }
 }

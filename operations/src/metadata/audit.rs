@@ -13,10 +13,8 @@ use aruna_core::audit::{
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::cursor;
-use aruna_core::effects::{
-    AuditPageEffect, Effect, EffectGroup, GroupForm, IterStart, NetEffect, StorageEffect,
-};
-use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, StorageEvent};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, IterStart, NetEffect, StorageEffect};
+use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
 use aruna_core::metadata::AuthToken;
@@ -26,9 +24,12 @@ use aruna_core::structs::storage::metadata_registry::MetadataAuditRecord;
 use aruna_core::types::{GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
+use tracing::trace;
 use ulid::Ulid;
 
 use super::call_results::page_rows;
+use super::protocol::{MetadataTransportMessage, encode_message, metadata_request};
+use crate::forward::fetch::read_answer;
 use aruna_core::placement::selector::select_top_peers;
 
 pub const AUDIT_PAGE_LIMIT: usize = MAX_AUDIT_RECORDS;
@@ -39,6 +40,8 @@ const AUDIT_CURSOR_CHARS: usize = 384;
 const AUDIT_INBOUND_LIMIT: usize = 16;
 const AUDIT_OUTBOUND_LIMIT: usize = 16;
 pub const AUDIT_DEADLINE_SECS: u64 = 30;
+const AUDIT_FANOUT_CONCURRENCY: usize = 8;
+const AUDIT_PEER_DEADLINE: Duration = Duration::from_secs(3);
 pub(super) static AUDIT_INBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_INBOUND_LIMIT)));
 pub(super) static AUDIT_OUTBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
@@ -406,11 +409,22 @@ impl ListAuditOperation {
         }
     }
 
-    fn peers_effect(&self) -> Effect {
-        Effect::Net(NetEffect::AuditPage(Box::new(AuditPageEffect {
-            nodes: self.peers.clone(),
-            request: self.request(),
-        })))
+    // One request per peer; a request that cannot be encoded leaves every peer missing.
+    fn peer_members(&mut self) -> Vec<Effect> {
+        let request = self.request();
+        let Ok(frame) = encode_message(&MetadataTransportMessage::ForwardAuditPage { request })
+        else {
+            for node in std::mem::take(&mut self.peers) {
+                self.batch.mark_missing(node);
+            }
+            return Vec::new();
+        };
+        (self.peers.iter())
+            .map(|peer| {
+                let request = metadata_request(*peer, frame.clone(), AUDIT_PEER_DEADLINE);
+                Effect::Net(NetEffect::MetadataRequest(Box::new(request)))
+            })
+            .collect()
     }
 
     fn local_result(&mut self, result: GroupResult) -> Result<(), ListAuditError> {
@@ -445,44 +459,24 @@ impl ListAuditOperation {
         Ok(())
     }
 
-    fn peers_result(&mut self, result: GroupResult) -> Result<(), ListAuditError> {
-        let event = match result {
-            GroupResult::Done(event) => *event,
-            GroupResult::Unfinished | GroupResult::Refused => {
-                for node in &self.peers {
-                    self.batch.mark_missing(*node);
+    fn peers_result(&mut self, mut results: impl Iterator<Item = GroupResult>) {
+        let request = self.request();
+        let mut batch = AuditPageBatch::with_limit(self.limit);
+        for node in &self.peers {
+            match read_answer(*node, results.next()) {
+                Ok(MetadataTransportMessage::ForwardedAuditPage { result: Ok(page) }) => {
+                    // A rejected page marks its node missing.
+                    if let Err(error) = batch.add_page(*node, page, &request) {
+                        trace!(?node, ?error, "Rejected audit page");
+                    }
                 }
-                return Ok(());
+                _ => {
+                    trace!(?node, "Audit page unavailable");
+                    batch.mark_missing(*node);
+                }
             }
-        };
-        let Event::Net(NetEvent::AuditPages(mut batch)) = event else {
-            return Err(unexpected_event(event.label()));
-        };
-        if batch.completed_nodes.len() > MAX_AUDIT_PEERS
-            || batch.missing_nodes.len() > MAX_AUDIT_PEERS
-        {
-            return Err(failure("audit peer response exceeds its bound"));
-        }
-        let expected: BTreeSet<NodeId> = self.peers.iter().copied().collect();
-        let accounted: BTreeSet<NodeId> = batch
-            .completed_nodes
-            .union(&batch.missing_nodes)
-            .copied()
-            .collect();
-        if accounted.iter().any(|node| !expected.contains(node)) {
-            return Err(failure("unexpected audit peer response"));
-        }
-        if batch.records.values().any(|candidate| {
-            !batch.completed_nodes.contains(&candidate.source)
-                || !expected.contains(&candidate.source)
-        }) {
-            return Err(failure("unexpected audit peer record"));
-        }
-        for node in expected.difference(&accounted) {
-            batch.mark_missing(*node);
         }
         self.batch.merge(batch);
-        Ok(())
     }
 
     fn aggregate(&mut self) -> AuditAggregate {
@@ -552,13 +546,11 @@ impl Operation for ListAuditOperation {
             );
             members.push(local);
         }
-        if !self.peers.is_empty() {
-            members.push(self.peers_effect());
-        }
+        members.extend(self.peer_members());
         if members.is_empty() {
             return Ok(Next::Done(self.aggregate()));
         }
-        let limit = members.len();
+        let limit = usize::from(self.include_local) + AUDIT_FANOUT_CONCURRENCY;
         let form = GroupForm::All {
             deadline: self.wait,
         };
@@ -574,19 +566,11 @@ impl Operation for ListAuditOperation {
             return Err(unexpected_event(result.label()));
         };
         let mut results = results.into_iter();
-        let mut member = || {
-            results
-                .next()
-                .ok_or_else(|| failure("audit group result missing"))
-        };
         if self.include_local {
-            let local = member()?;
-            self.local_result(local)?;
+            let local = results.next();
+            self.local_result(local.ok_or_else(|| failure("audit group result missing"))?)?;
         }
-        if !self.peers.is_empty() {
-            let peers = member()?;
-            self.peers_result(peers)?;
-        }
+        self.peers_result(results);
         Ok(Next::Done(self.aggregate()))
     }
 }
@@ -598,8 +582,9 @@ mod tests {
         AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AUDIT_PAGE_LIMIT, AuditAggregate,
         AuditPageEntry, AuditPageResponse, Effect, Event, GroupEvent, GroupForm, GroupResult,
         IoCall, IoResult, Key, ListAuditError, ListAuditOperation, LocalPageOperation,
-        MAX_AUDIT_PEERS, METADATA_AUDIT_KEYSPACE, NetEffect, NetEvent, Next, Operation,
-        StorageEvent, Value, audit_scope, decode_cursor, encode_cursor, select_peers,
+        MAX_AUDIT_PEERS, METADATA_AUDIT_KEYSPACE, MetadataTransportMessage, NetEffect, Next,
+        Operation, StorageEvent, Value, audit_scope, decode_cursor, encode_cursor, encode_message,
+        select_peers,
     };
     use crate::driver::DriverContext;
     use crate::metadata::audit_entry::{admin_refusal, audit_member, outbound_admission};
@@ -609,6 +594,7 @@ mod tests {
     use aruna_core::audit::AUDIT_KEY_BYTES;
     use aruna_core::audit::{AuditPageBatch, AuditPageRequest};
     use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{MetadataAnswer, NetEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::metadata::AuthToken;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
@@ -716,8 +702,45 @@ mod tests {
         local_page(Vec::new())
     }
 
-    fn peer_pages(batch: AuditPageBatch) -> GroupResult {
-        GroupResult::Done(Box::new(Event::Net(NetEvent::AuditPages(batch))))
+    fn empty_page() -> AuditPageResponse {
+        AuditPageResponse {
+            records: Vec::new(),
+            next_start_after: None,
+        }
+    }
+
+    fn answer(node: aruna_core::id::NodeId, page: AuditPageResponse) -> GroupResult {
+        let message = MetadataTransportMessage::ForwardedAuditPage { result: Ok(page) };
+        let answer = MetadataAnswer {
+            peer: node,
+            elapsed: Duration::ZERO,
+            result: Ok(encode_message(&message).unwrap()),
+        };
+        GroupResult::Done(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
+            answer,
+        )))))
+    }
+
+    fn asked(operation: &mut ListAuditOperation) -> Vec<aruna_core::id::NodeId> {
+        (members(operation).into_iter())
+            .filter_map(|member| match member {
+                Effect::Net(NetEffect::MetadataRequest(request)) => Some(request.peer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each asked peer's result in member order: its page, or unfinished without one.
+    fn peer_pages(
+        operation: &mut ListAuditOperation,
+        pages: &[(aruna_core::id::NodeId, AuditPageResponse)],
+    ) -> Vec<GroupResult> {
+        (asked(operation).into_iter())
+            .map(|peer| match pages.iter().find(|(node, _)| *node == peer) {
+                Some((_, page)) => answer(peer, page.clone()),
+                None => GroupResult::Unfinished,
+            })
+            .collect()
     }
 
     /// Runs the operation's one group with `results` and returns the aggregate.
@@ -733,9 +756,8 @@ mod tests {
     }
 
     #[test]
-    fn peers_share_effect() {
-        // Every peer is asked in one adapter round: with one effect per peer the
-        // runner contacts them serially and unreachable nodes add up to a timeout.
+    fn one_request_each() {
+        // Each distinct peer gets its own request; the group bounds how many run at once.
         let unique: Vec<aruna_core::id::NodeId> = (1u8..=3)
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect();
@@ -753,20 +775,20 @@ mod tests {
             None,
             [0u8; 32],
         );
-        let members = members(&mut operation);
-        assert_eq!(members.len(), 2);
-        let Effect::Net(NetEffect::AuditPage(fan_out)) = &members[1] else {
-            panic!("the peer fan-out must be a single net effect");
+        let Ok(Next::Call(IoCall::Group(group))) = operation.first() else {
+            panic!("expected one audit group");
         };
+        assert_eq!(group.members.len(), 4);
+        assert_eq!(group.limit, 9);
+        let asked = asked(&mut operation);
+        assert_eq!(asked.len(), unique.len());
         assert_eq!(
-            fan_out.nodes.iter().copied().collect::<BTreeSet<_>>(),
+            asked.iter().copied().collect::<BTreeSet<_>>(),
             unique.iter().copied().collect::<BTreeSet<_>>()
         );
-        let mut batch = AuditPageBatch::new();
-        for node in &unique {
-            batch.mark_missing(*node);
-        }
-        let aggregate = aggregate(&mut operation, vec![empty_local(), peer_pages(batch)]).unwrap();
+        let mut results = vec![empty_local()];
+        results.extend(peer_pages(&mut operation, &[]));
+        let aggregate = aggregate(&mut operation, results).unwrap();
         assert!(aggregate.partial);
         assert_eq!(aggregate.missing_nodes.len(), unique.len());
         assert!(aggregate.records.is_empty());
@@ -847,11 +869,7 @@ mod tests {
                 None,
                 [0u8; 32],
             );
-            let members = members(&mut operation);
-            let Some(Effect::Net(NetEffect::AuditPage(effect))) = members.last() else {
-                panic!("the peer fan-out must be the last member");
-            };
-            assert_eq!(effect.nodes.len(), MAX_AUDIT_PEERS);
+            assert_eq!(asked(&mut operation).len(), MAX_AUDIT_PEERS);
         }
     }
 
@@ -881,9 +899,10 @@ mod tests {
             metadata_audit_key(group, doc, Ulid::from_bytes([4u8; 16])),
             postcard::to_allocvec(&record).unwrap().into(),
         )]);
-        let mut batch = AuditPageBatch::new();
-        batch.completed_nodes.extend(peers);
-        let result = aggregate(&mut operation, vec![local_page, peer_pages(batch)]).unwrap();
+        let pages: Vec<_> = peers.iter().map(|peer| (*peer, empty_page())).collect();
+        let mut results = vec![local_page];
+        results.extend(peer_pages(&mut operation, &pages));
+        let result = aggregate(&mut operation, results).unwrap();
         assert!(!result.partial);
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.missing_overflow, 0);
@@ -1002,31 +1021,17 @@ mod tests {
             None,
             [0u8; 32],
         );
-        let mut batch = AuditPageBatch::new();
-        batch
-            .add_page(
-                node,
-                page,
-                &AuditPageRequest {
-                    auth_token: None,
-                    config_digest: [0u8; 32],
-                    realm_id,
-                    group_id: group,
-                    document_id: Some(doc),
-                    start_after: None,
-                    limit: 10,
-                },
-            )
-            .unwrap();
-        let aggregate = aggregate(&mut operation, vec![empty_local(), peer_pages(batch)]).unwrap();
+        let mut results = vec![empty_local()];
+        results.extend(peer_pages(&mut operation, &[(node, page)]));
+        let aggregate = aggregate(&mut operation, results).unwrap();
         assert!(!aggregate.partial);
         assert!(aggregate.next_cursor.is_some());
     }
 
     #[test]
     fn silent_peer_missing() {
-        // A peer the adapter did not answer for must still be reported missing
-        // instead of leaving the page looking complete.
+        // A peer that never answered must still be reported missing instead of leaving the
+        // page looking complete.
         let peers: Vec<aruna_core::id::NodeId> = (4u8..=5)
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect();
@@ -1043,9 +1048,9 @@ mod tests {
             [0u8; 32],
         );
 
-        let mut batch = AuditPageBatch::new();
-        batch.completed_nodes.insert(peers[0]);
-        let aggregate = aggregate(&mut operation, vec![empty_local(), peer_pages(batch)]).unwrap();
+        let mut results = vec![empty_local()];
+        results.extend(peer_pages(&mut operation, &[(peers[0], empty_page())]));
+        let aggregate = aggregate(&mut operation, results).unwrap();
         assert!(aggregate.partial);
         assert_eq!(aggregate.missing_nodes, vec![peers[1]]);
     }
@@ -1084,9 +1089,8 @@ mod tests {
             None,
             [0u8; 32],
         );
-        let mut first_batch = batch(live, realm_id, group, Some(doc), live_page.clone());
-        first_batch.mark_missing(missing);
-        let results = vec![empty_local(), peer_pages(first_batch)];
+        let mut results = vec![empty_local()];
+        results.extend(peer_pages(&mut operation, &[(live, live_page.clone())]));
         let partial = aggregate(&mut operation, results).unwrap();
         assert!(partial.partial);
         assert!(partial.next_cursor.is_none());
@@ -1103,18 +1107,13 @@ mod tests {
             None,
             [0u8; 32],
         );
-        let mut retry_batch = batch(live, realm_id, group, Some(doc), live_page);
-        retry_batch.merge(batch(
-            missing,
-            realm_id,
-            group,
-            Some(doc),
-            AuditPageResponse {
-                records: vec![first_entry],
-                next_start_after: None,
-            },
-        ));
-        let results = vec![empty_local(), peer_pages(retry_batch)];
+        let missing_page = AuditPageResponse {
+            records: vec![first_entry],
+            next_start_after: None,
+        };
+        let pages = [(live, live_page), (missing, missing_page)];
+        let mut results = vec![empty_local()];
+        results.extend(peer_pages(&mut retry, &pages));
         let recovered = aggregate(&mut retry, results).unwrap();
         assert_eq!(
             recovered
@@ -1223,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_foreign_peer() {
+    fn foreign_answer_missing() {
         let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let stranger = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let mut operation = ListAuditOperation::new(
@@ -1238,10 +1237,10 @@ mod tests {
             None,
             [0u8; 32],
         );
-        let mut batch = AuditPageBatch::new();
-        batch.completed_nodes.insert(stranger);
-        let results = vec![empty_local(), peer_pages(batch)];
-        assert!(aggregate(&mut operation, results).is_err());
+        let results = vec![empty_local(), answer(stranger, empty_page())];
+        let aggregate = aggregate(&mut operation, results).unwrap();
+        assert!(aggregate.partial);
+        assert_eq!(aggregate.missing_nodes, vec![node]);
         assert!(operation.next(IoResult::Done).is_err());
     }
 
@@ -1299,7 +1298,7 @@ mod tests {
         );
         assert!(matches!(
             members(&mut operation).as_slice(),
-            [Effect::Net(NetEffect::AuditPage(_))]
+            [Effect::Net(NetEffect::MetadataRequest(_))]
         ));
     }
 
@@ -1312,7 +1311,6 @@ mod tests {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
@@ -1450,7 +1448,8 @@ mod tests {
             Ulid::from_bytes([2u8; 16]),
             Ulid::from_bytes([3u8; 16]),
         ];
-        let page = AuditPageResponse {
+        // Each page fits the limit; together they hold one record more than the page shows.
+        let page = |ids: &[Ulid]| AuditPageResponse {
             records: ids
                 .iter()
                 .map(|id| entry(group, doc, *id, realm_id))
@@ -1459,20 +1458,23 @@ mod tests {
         };
 
         let node = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let other = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
         let mut operation = ListAuditOperation::new(
             realm_id,
             node,
             true,
             group,
             Some(doc),
-            vec![node],
+            vec![node, other],
             None,
             2,
             None,
             [0u8; 32],
         );
-        let pages = peer_pages(batch(node, realm_id, group, Some(doc), page));
-        let aggregate = aggregate(&mut operation, vec![empty_local(), pages]).unwrap();
+        let pages = [(node, page(&ids[..2])), (other, page(&ids[2..]))];
+        let mut results = vec![empty_local()];
+        results.extend(peer_pages(&mut operation, &pages));
+        let aggregate = aggregate(&mut operation, results).unwrap();
         assert_eq!(aggregate.records.len(), 2);
         assert!(aggregate.next_cursor.is_some());
     }
@@ -1486,7 +1488,6 @@ mod tests {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,

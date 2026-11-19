@@ -3,23 +3,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
 
 use aruna_core::NodeId;
-
-/// How recently a peer must have reached this node to count as seen. A device
-/// beats every 60 seconds and shuffles which node it asks, so three beats keep
-/// one skipped turn from reading as gone.
-pub const PEER_CONTACT_WINDOW: Duration = Duration::from_secs(180);
+use aruna_core::heartbeat::seen_recently;
 
 /// Peers remembered before stale entries are swept. A realm configuration holds
 /// far fewer, so the sweep only ever answers an unexpected peer set.
 const PEER_CONTACT_CAPACITY: usize = 4096;
 
 /// Last contact per authenticated peer, in unix milliseconds.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PeerContacts(Arc<Mutex<HashMap<NodeId, u64>>>);
 
 impl PeerContacts {
@@ -28,19 +23,16 @@ impl PeerContacts {
         let mut seen = self.entries();
         seen.insert(peer, now_ms);
         if seen.len() > PEER_CONTACT_CAPACITY {
-            seen.retain(|_, at| within_window(*at, now_ms));
+            seen.retain(|_, at| seen_recently(*at, now_ms));
         }
     }
 
-    /// When this node last saw the peer, however long ago that was.
-    pub fn last_seen(&self, peer: &NodeId) -> Option<u64> {
-        self.entries().get(peer).copied()
-    }
-
-    /// Whether the peer reached this node within [`PEER_CONTACT_WINDOW`].
-    pub fn seen_recently(&self, peer: &NodeId, now_ms: u64) -> bool {
-        self.last_seen(peer)
-            .is_some_and(|at| within_window(at, now_ms))
+    /// When this node last saw each of `peers` it has seen.
+    pub fn last_seen_of(&self, peers: &[NodeId]) -> BTreeMap<NodeId, u64> {
+        let seen = self.entries();
+        (peers.iter())
+            .filter_map(|peer| seen.get(peer).map(|at| (*peer, *at)))
+            .collect()
     }
 
     fn entries(&self) -> MutexGuard<'_, HashMap<NodeId, u64>> {
@@ -48,14 +40,12 @@ impl PeerContacts {
     }
 }
 
-fn within_window(seen_ms: u64, now_ms: u64) -> bool {
-    now_ms.saturating_sub(seen_ms) <= PEER_CONTACT_WINDOW.as_millis() as u64
-}
-
 #[cfg(test)]
 mod pure_tests {
-    use super::{PEER_CONTACT_WINDOW, PeerContacts};
+    use super::PeerContacts;
     use aruna_core::NodeId;
+    use aruna_core::heartbeat::{PEER_CONTACT_WINDOW, seen_recently};
+    use std::collections::BTreeMap;
 
     fn peer(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -69,10 +59,10 @@ mod pure_tests {
         let window = PEER_CONTACT_WINDOW.as_millis() as u64;
         contacts.note(device, 1_000);
 
-        assert_eq!(contacts.last_seen(&device), Some(1_000));
-        assert!(contacts.seen_recently(&device, 1_000 + window));
-        assert!(!contacts.seen_recently(&device, 1_001 + window));
-        assert_eq!(contacts.last_seen(&peer(44)), None);
+        let seen = contacts.last_seen_of(&[device, peer(44)]);
+        assert_eq!(seen, BTreeMap::from([(device, 1_000)]));
+        assert!(seen_recently(1_000, 1_000 + window));
+        assert!(!seen_recently(1_000, 1_001 + window));
     }
 
     #[test]
@@ -82,6 +72,9 @@ mod pure_tests {
         contacts.note(device, 1_000);
         contacts.note(device, 5_000);
 
-        assert_eq!(contacts.last_seen(&device), Some(5_000));
+        assert_eq!(
+            contacts.last_seen_of(&[device]),
+            BTreeMap::from([(device, 5_000)])
+        );
     }
 }

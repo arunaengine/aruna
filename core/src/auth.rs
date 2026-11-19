@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
 pub const REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 pub const ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
 pub const ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
@@ -14,6 +16,11 @@ pub const MAX_TOKEN_LIFETIME: u64 = 366 * 24 * 60 * 60;
 /// only skew a replicated timestamp may be ahead of the local clock before it
 /// is treated as a rollback rather than as skew.
 pub const REVOCATION_GRACE_SECS: u64 = 5 * 60;
+
+/// Maximum number of issuer keys a process cache retains.
+pub const KEY_CACHE_CAPACITY: usize = 1024;
+/// Time a cached issuer key is retained before it is checked again.
+pub const KEY_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 pub fn credential_hash(value: impl AsRef<[u8]>) -> String {
     blake3::hash(value.as_ref()).to_string()

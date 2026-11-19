@@ -31,7 +31,6 @@ use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperati
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -113,17 +112,11 @@ async fn setup_fixture() -> Fixture {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    let metadata = MetadataHandle::new(
-        root.path().join("metadata"),
-        storage.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage, root.path().join("metadata"));
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: Some(blob),
-        metadata_handle: Some(metadata),
         graph_handle: Some(graph),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,

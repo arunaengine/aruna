@@ -222,7 +222,6 @@ mod tests {
 
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::metadata::MetadataHandle;
     use crate::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
 
     const REALM_SEED: [u8; 32] = [7u8; 32];
@@ -289,17 +288,11 @@ mod tests {
             aruna_graph::GraphOptions::default(),
         )
         .expect("metadata handle opens");
-        let metadata_handle = MetadataHandle::new(
-            metadata_dir.path(),
-            storage.clone(),
-            None,
-            Default::default(),
-        );
+        crate::metadata::install_indexes(&storage, metadata_dir.path());
         let context = Arc::new(DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: Some(metadata_handle),
             graph_handle: Some(graph_handle),
             task_handle: None,
             compute_handle: None,
@@ -397,7 +390,7 @@ mod tests {
                 root
             ]
         });
-        match crate::metadata::send_metadata_effect(
+        match crate::testing::send_metadata_effect(
             &fixture.context,
             MetadataEffect::ApplyRoCrate {
                 request: ApplyRoCrateRequest {
@@ -610,7 +603,6 @@ mod tests {
                 .expect("storage opens"),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
 use aruna_core::operation::Operation;
@@ -20,12 +20,13 @@ use super::apply::{ApplyInput, PageApplyOperation, page_answer};
 use super::build::{BuildError, BuildInput, Built, PageBuildOperation};
 use super::plan::PageError;
 use super::{PAGE_RECORDS, PageAnswer, ReferencePage};
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
+use crate::queue_backoff::{min_due_at, retry_delay_ms};
 use crate::replication::members::{
     BoundRecord, BoundRecordOperation, RecordError, member_publication,
 };
 use crate::replication::queue::BlobQueueError;
-use crate::queue_backoff::{min_due_at, retry_delay_ms};
 use aruna_core::structs::storage::replication_queue::BlobJobRecord;
 use aruna_core::structs::storage::replication_queue::MemberTarget;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
@@ -56,11 +57,7 @@ impl PageTransport for MetadataPages {
             page: Box::new(page),
         };
         let frame = encode_message(&message).map_err(|error| error.to_string())?;
-        let request = MetadataRequestEffect {
-            peer: node,
-            frame,
-            timeout: PAGE_DEADLINE,
-        };
+        let request = metadata_request(node, frame, PAGE_DEADLINE);
         let effect = Effect::Net(NetEffect::MetadataRequest(Box::new(request)));
         Ok(effect.into())
     }

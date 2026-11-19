@@ -533,7 +533,6 @@ mod tests {
     use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
     use crate::driver::DriverContext;
     use crate::driver::drive;
-    use crate::metadata::MetadataHandle;
     use crate::tests::device::record;
     use aruna_core::UserId;
     use aruna_core::calls::IoResult;
@@ -594,17 +593,11 @@ mod tests {
                 .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
         )
         .unwrap();
-        let metadata = MetadataHandle::new(
-            dir.path().join("metadata"),
-            storage.clone(),
-            None,
-            Default::default(),
-        );
+        crate::metadata::install_indexes(&storage, dir.path().join("metadata"));
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: Some(metadata),
             graph_handle: Some(graph),
             task_handle: None,
             compute_handle: None,
@@ -612,7 +605,7 @@ mod tests {
         });
         let record = record();
         assert!(matches!(
-            crate::metadata::send_metadata_effect(
+            crate::testing::send_metadata_effect(
                 &context,
                 MetadataEffect::CreateCrate {
                     request: MetadataCrateRequest {

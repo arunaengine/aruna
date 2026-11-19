@@ -275,7 +275,6 @@ async fn spawn_node(
         storage_handle,
         net_handle: Some(net_handle.clone()),
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,

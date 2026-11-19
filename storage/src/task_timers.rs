@@ -28,7 +28,9 @@ pub async fn persist_task_effect(
         TaskEffect::ResetTimer { key, after } => write_timer(storage, key, *after).await,
         TaskEffect::ShortenTimer { key, after } => shorten_timer(storage, key, *after).await,
         TaskEffect::CancelTimer { key } => delete_timer(storage, key).await,
-        TaskEffect::ScheduleIdleTimer { .. } | TaskEffect::AbortRunningHandlers { .. } => Ok(()),
+        TaskEffect::ScheduleIdleTimer { .. }
+        | TaskEffect::AbortRunningHandlers { .. }
+        | TaskEffect::Pull(_) => Ok(()),
     }
 }
 
@@ -64,7 +66,11 @@ fn timer_is_ephemeral(effect: &TaskEffect) -> bool {
     | TaskEffect::ShortenTimer { key, .. }
     | TaskEffect::ScheduleIdleTimer { key, .. }
     | TaskEffect::CancelTimer { key }
-    | TaskEffect::AbortRunningHandlers { key }) = effect;
+    | TaskEffect::AbortRunningHandlers { key }) = effect
+    else {
+        // A pull claim lives in memory only.
+        return true;
+    };
     matches!(key, TaskKey::LockBucket { .. })
 }
 

@@ -25,7 +25,7 @@ pub fn spawn_metadata_warmup(context: Arc<DriverContext>, shutdown: &Shutdown) {
     spawn_index_sweep(Arc::clone(&context), shutdown);
     spawn_visibility_index(Arc::clone(&context), shutdown);
     shutdown.spawn(async move {
-        if context.metadata_handle.is_none() {
+        if context.graph_handle.is_none() {
             return;
         }
         if let Err(error) = drive(WarmCachesOperation::new(), &context).await {

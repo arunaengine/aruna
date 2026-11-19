@@ -95,7 +95,6 @@ pub async fn setup_driver_context() -> StagingTestContext {
             storage_handle,
             net_handle: None,
             blob_handle: Some(blob_handle),
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,

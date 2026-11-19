@@ -15,7 +15,7 @@ use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::bearer_token::{
-    DecodeTokenOperation, IssuerTrust, RevocationCheck, TokenChecks,
+    DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
 };
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::auth::error::ArunaBearerError;
@@ -103,7 +103,6 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
@@ -213,7 +212,6 @@ pub async fn recover_initial_admin() -> Result<String, CliError> {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
@@ -469,7 +467,7 @@ impl DoctorValidationState {
                 self.revoked_token_hashes.iter().cloned().collect(),
             ),
             linked_realm: None,
-            keys: None,
+            keys: IssuerKeys::Uncached,
         };
         let mut decode = DecodeTokenOperation::new(token, checks);
         decode.stamp(unix_timestamp_millis());
@@ -487,7 +485,6 @@ pub async fn view_token(token: String) -> Result<String, CliError> {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: None,
         compute_handle: None,
@@ -799,7 +796,6 @@ mod tests {
             storage_handle: storage,
             net_handle: Some(net.clone()),
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,

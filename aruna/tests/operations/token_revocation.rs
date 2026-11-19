@@ -18,8 +18,8 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::NodePlacementEntry;
 use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_operations::auth::bearer_token::{
-    DecodeTokenOperation, IssuerTrust, RevocationCheck, TokenChecks, TokenRevokedOperation,
-    UserCutoffOperation,
+    DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
+    TokenRevokedOperation, UserCutoffOperation,
 };
 use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::auth::revoke_token::{
@@ -52,7 +52,7 @@ impl PeerAuthState {
             trust: IssuerTrust::Listed(HashSet::from([self.realm_id])),
             revocation: RevocationCheck::Realm,
             linked_realm: None,
-            keys: None,
+            keys: IssuerKeys::Uncached,
         };
         let context = DriverContext::storage_only(self.storage.clone());
         drive(DecodeTokenOperation::new(token, checks), &context).await

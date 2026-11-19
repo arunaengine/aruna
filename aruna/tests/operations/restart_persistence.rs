@@ -20,9 +20,9 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
-use aruna_operations::metadata::{MetadataHandle, send_metadata_effect};
 use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::replay_event_log;
+use aruna_operations::testing::send_metadata_effect;
 use aruna_storage::{FjallPersistPolicy, FjallStorage};
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -174,12 +174,7 @@ fn build_context(
             .with_search_storage(aruna_graph::MetadataSearchStorage::Disk)
             .with_sync_all(true),
     )?;
-    let metadata_handle = MetadataHandle::new(
-        metadata_path,
-        storage_handle.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage_handle, metadata_path);
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(actor.node_id, RealmNodeKind::Server);
@@ -190,7 +185,6 @@ fn build_context(
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: Some(metadata_handle),
             graph_handle: Some(graph_handle),
             task_handle: None,
             compute_handle: None,

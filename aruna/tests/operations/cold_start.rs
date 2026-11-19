@@ -19,7 +19,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use aruna_graph::{GraphHandle, GraphOptions, MetadataSearchStorage};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::local_query::LocalQueryOperation;
 use aruna_operations::metadata::registry_cache::{RegistryReadOperation, WarmCachesOperation};
 use aruna_storage::FjallStorage;
@@ -48,12 +47,11 @@ fn open_handle(
         None,
         GraphOptions::default().with_search_storage(MetadataSearchStorage::Memory),
     )?;
-    let metadata = MetadataHandle::new(metadata_dir, storage.clone(), None, Default::default());
+    aruna_operations::metadata::install_indexes(&storage, metadata_dir);
     Ok(DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: Some(metadata),
         graph_handle: Some(graph),
         task_handle: None,
         compute_handle: None,
@@ -114,7 +112,7 @@ async fn write_registry_records(
 }
 
 async fn create_crate_graph(handle: &DriverContext, index: usize) -> Result<(), BoxError> {
-    let event = aruna_operations::metadata::send_metadata_effect(
+    let event = aruna_operations::testing::send_metadata_effect(
         handle,
         MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {

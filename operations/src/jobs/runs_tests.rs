@@ -113,7 +113,6 @@ async fn run_read_rights() {
         storage_handle: aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: None,
         compute_handle: None,

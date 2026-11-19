@@ -10,8 +10,7 @@ use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{
-    Effect, EffectGroup, GroupForm, JobRecordFrame, MAX_RECORD_HOLDERS, MetadataRequestEffect,
-    NetEffect,
+    Effect, EffectGroup, GroupForm, JobRecordFrame, MAX_RECORD_HOLDERS, NetEffect,
 };
 use aruna_core::events::{
     Event, GroupEvent, GroupResult, JobRecordRejection, MetadataAnswer, NetEvent,
@@ -25,6 +24,7 @@ use aruna_core::task::{TaskEffect, TaskKey};
 use tracing::{debug, warn};
 
 use super::LifecycleError;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use aruna_core::structs::execution::job::record_keys::record_key;
 use aruna_core::structs::execution::job::record_rows::{OutboxEntry, from_bytes, to_bytes};
@@ -148,13 +148,11 @@ impl PublishRecordOperation {
         let members = pending
             .iter()
             .map(|holder| {
-                Effect::Net(NetEffect::MetadataRequest(Box::new(
-                    MetadataRequestEffect {
-                        peer: *holder,
-                        frame: frame.clone(),
-                        timeout: PUBLISH_DEADLINE,
-                    },
-                )))
+                Effect::Net(NetEffect::MetadataRequest(Box::new(metadata_request(
+                    *holder,
+                    frame.clone(),
+                    PUBLISH_DEADLINE,
+                ))))
             })
             .collect();
         self.asked = pending;

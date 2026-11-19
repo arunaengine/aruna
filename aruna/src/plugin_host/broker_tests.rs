@@ -22,7 +22,6 @@ use aruna_operations::plugins::install::{pick_version, read_manifest};
 use std::collections::BTreeMap;
 
 use super::*;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::read_types::DocumentQueryRequest;
 use aruna_operations::metadata::create_document::{
@@ -66,13 +65,10 @@ async fn broker() -> (Fixture, RunBroker, Ulid, tempfile::TempDir) {
         None,
         aruna_graph::GraphOptions::default(),
     );
-    let metadata = MetadataHandle::new(
+    aruna_operations::metadata::install_indexes(
+        &fixture.ctx.storage_handle,
         dir.path().join("meta"),
-        fixture.ctx.storage_handle.clone(),
-        None,
-        Default::default(),
     );
-    ctx.metadata_handle = Some(metadata);
     ctx.graph_handle = Some(graph.unwrap());
     let ctx = Arc::new(ctx);
     let create = CreateDocumentOperation::new(CreateDocumentConfig {
@@ -1088,7 +1084,7 @@ async fn superseded_merge_journaled() {
     let source = MetadataBatchSource::UpsertDataEntity {
         jsonld: r#"{"@id":"./d.txt","@type":"File","name":"d"}"#.to_string(),
     };
-    let planned = aruna_operations::metadata::send_metadata_effect(
+    let planned = aruna_operations::testing::send_metadata_effect(
         &broker.ctx,
         MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
@@ -1624,7 +1620,7 @@ async fn unprojected_event_refused() {
         source: source.clone(),
     };
     let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) =
-        aruna_operations::metadata::send_metadata_effect(&broker.ctx, plan).await
+        aruna_operations::testing::send_metadata_effect(&broker.ctx, plan).await
     else {
         panic!("expected a planned batch");
     };

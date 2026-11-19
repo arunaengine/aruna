@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{
     Event, GroupEvent, GroupResult, MetadataAnswer, NetEvent, PeerRequestError,
 };
@@ -18,7 +18,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
+use crate::metadata::protocol::{
+    MetadataTransportMessage, decode_answer, encode_message, metadata_request,
+};
 
 /// What one holder's answer means to the fetch.
 #[derive(Debug, PartialEq)]
@@ -114,11 +116,7 @@ impl<T: HolderRecord> HolderFetchOperation<T> {
         };
         self.asked = Some(index);
         smallvec![Effect::Net(NetEffect::MetadataRequest(Box::new(
-            MetadataRequestEffect {
-                peer,
-                frame: self.frame.bytes(),
-                timeout,
-            }
+            metadata_request(peer, self.frame.bytes(), timeout)
         )))]
     }
 
@@ -145,7 +143,7 @@ impl<T: HolderRecord> HolderFetchOperation<T> {
                 return self.ask(index + 1);
             }
         };
-        let message = match decode_message(&bytes) {
+        let message = match decode_answer(&bytes) {
             Ok(message) => message,
             Err(error) => {
                 warn!(peer = %holder, error = %error, fetch = T::LABEL, "Undecodable holder answer");
@@ -240,11 +238,7 @@ impl std::fmt::Debug for PeerFrame {
 
 /// The call that sends one encoded request to `peer`; [`peer_reply`] reads its answer.
 pub(crate) fn peer_call(peer: NodeId, frame: Vec<u8>, timeout: Duration) -> IoCall {
-    let request = MetadataRequestEffect {
-        peer,
-        frame,
-        timeout,
-    };
+    let request = metadata_request(peer, frame, timeout);
     IoCall::Effect(Box::new(Effect::Net(NetEffect::MetadataRequest(Box::new(
         request,
     )))))
@@ -267,8 +261,8 @@ pub(crate) fn peer_reply(
         ))));
     }
     Ok(answer.result.and_then(|bytes| {
-        decode_message(&bytes)
-            .map_err(|error| PeerRequestError::Failed(MetadataError::Backend(error.to_string())))
+        decode_answer(&bytes)
+            .map_err(|error| PeerRequestError::Failed(MetadataError::Backend(error)))
     }))
 }
 
@@ -323,7 +317,7 @@ pub(crate) fn read_answer(
             Event::Net(NetEvent::MetadataAnswer(answer)) if answer.peer == peer => {
                 let MetadataAnswer { result, .. } = *answer;
                 let bytes = result.map_err(|error| format!("{error:?}"))?;
-                decode_message(&bytes).map_err(|error| error.to_string())
+                decode_answer(&bytes)
             }
             other => Err(format!("unexpected answer {}", other.label())),
         },
@@ -341,11 +335,7 @@ impl Operation for FanoutOperation {
             .filter_map(|(peer, frame)| {
                 let frame = frame.as_ref().ok()?.bytes();
                 Some(Effect::Net(NetEffect::MetadataRequest(Box::new(
-                    MetadataRequestEffect {
-                        peer: *peer,
-                        frame,
-                        timeout: self.timeout,
-                    },
+                    metadata_request(*peer, frame, self.timeout),
                 ))))
             })
             .collect();

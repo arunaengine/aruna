@@ -15,7 +15,6 @@ fn context(dir: &tempfile::TempDir) -> DriverContext {
         storage_handle: FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: None,
         compute_handle: None,

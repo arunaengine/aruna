@@ -54,7 +54,6 @@ use aruna_operations::jobs::context::JobContext;
 use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::jobs::submit::mint_job_id;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{
@@ -1412,12 +1411,11 @@ async fn build_fixture(gated: bool) -> Result<Fixture, Box<dyn std::error::Error
         None,
         aruna_graph::GraphOptions::default(),
     )?;
-    let metadata = MetadataHandle::new(&metadata_path, storage.clone(), None, Default::default());
+    aruna_operations::metadata::install_indexes(&storage, &metadata_path);
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: Some(blob),
-        metadata_handle: Some(metadata),
         graph_handle: Some(graph),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,

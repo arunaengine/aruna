@@ -5,7 +5,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -29,6 +29,7 @@ use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::resolve_metadata_id;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, encode_message};
 use crate::realm::peer_trust::is_sync_eligible;
 
@@ -134,13 +135,11 @@ impl RoutedReadOperation {
                 true => Effect::SubOperation(boxed_suboperation(self.visible(), |result| {
                     Event::Child(ChildOutcome::new(result))
                 })),
-                false => Effect::Net(NetEffect::MetadataRequest(Box::new(
-                    MetadataRequestEffect {
-                        peer: *holder,
-                        frame: frame.clone(),
-                        timeout: READ_PEER_TIMEOUT,
-                    },
-                ))),
+                false => Effect::Net(NetEffect::MetadataRequest(Box::new(metadata_request(
+                    *holder,
+                    frame.clone(),
+                    READ_PEER_TIMEOUT,
+                )))),
             })
             .collect();
         self.placement = Some(placement);

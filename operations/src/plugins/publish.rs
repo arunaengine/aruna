@@ -9,13 +9,13 @@ use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
+use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, PeerRequestError};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::target_placement_ref;
-use aruna_core::plugins::{ArtifactStore, MAX_ARTIFACT, PublishedPlugin};
+use aruna_core::plugins::{Chunk, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
 use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
@@ -34,6 +34,9 @@ use super::copies_needed;
 use super::copy_rows::{StoreCopy, chunk_count, chunk_of};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::metadata::protocol::{
+    METADATA_IO_TIMEOUT, MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
@@ -288,8 +291,9 @@ impl CopyArtifact {
     fn send(&mut self, node_id: NodeId, index: u32) -> Effect {
         self.members.push((node_id, index));
         let chunk = chunk_of(&self.digest, &self.artifact, index);
-        let store = ArtifactStore { node_id, chunk };
-        Effect::Net(NetEffect::ArtifactStore(Box::new(store)))
+        Effect::Net(NetEffect::MetadataRequest(Box::new(store_request(
+            node_id, chunk,
+        ))))
     }
 
     /// The next chunk for the node of window member `index`, or nothing more for that node.
@@ -304,7 +308,7 @@ impl CopyArtifact {
         };
         let stored = match result {
             GroupResult::Done(event) => match *event {
-                Event::Net(NetEvent::ArtifactStored(stored)) => stored,
+                Event::Net(NetEvent::MetadataAnswer(answer)) => stored_answer(answer.result),
                 other => return Err(CopyError::Unexpected { got: other.label() }),
             },
             GroupResult::Unfinished | GroupResult::Refused => Err("not run".to_string()),
@@ -323,6 +327,24 @@ impl CopyArtifact {
             }
         }
         Ok(Next::Wait)
+    }
+}
+
+/// The request that hands a management node one artifact chunk, within the open, write and
+/// answer waits of one metadata request.
+pub(crate) fn store_request(node_id: NodeId, chunk: Chunk) -> MetadataRequestEffect {
+    let frame = encode_message(&MetadataTransportMessage::StoreArtifact { chunk });
+    metadata_request(node_id, frame.unwrap_or_default(), METADATA_IO_TIMEOUT * 3)
+}
+
+// Whether the node holds the whole, checked artifact, or why the chunk did not land.
+fn stored_answer(answer: Result<Vec<u8>, PeerRequestError>) -> Result<bool, String> {
+    let bytes = answer.map_err(|error| format!("{error:?}"))?;
+    match decode_message(&bytes).map_err(|error| error.to_string())? {
+        MetadataTransportMessage::ArtifactStored { result } => {
+            result.map_err(|error| format!("{error:?}"))
+        }
+        _ => Err("unexpected artifact store answer".to_string()),
     }
 }
 

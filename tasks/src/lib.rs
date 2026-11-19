@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod pulls;
 pub mod shutdown;
 pub mod wipe;
 
@@ -31,6 +32,7 @@ pub trait InboundTaskHandler: Send + Sync {
 pub struct TaskHandle {
     command_tx: mpsc::Sender<TaskCommand>,
     admission_closed: Arc<AtomicBool>,
+    pulls: Arc<pulls::PullRegistry>,
 }
 
 enum TaskCommand {
@@ -682,6 +684,7 @@ impl TaskHandle {
         Ok(Self {
             command_tx,
             admission_closed,
+            pulls: Arc::default(),
         })
     }
 
@@ -700,6 +703,7 @@ impl TaskHandle {
         Self {
             command_tx,
             admission_closed: Arc::new(AtomicBool::new(false)),
+            pulls: Arc::default(),
         }
     }
 
@@ -957,6 +961,7 @@ impl Handle for TaskHandle {
                     TaskEffect::AbortRunningHandlers { key } => {
                         self.abort_running_handlers(key).await
                     }
+                    TaskEffect::Pull(effect) => TaskEvent::Pull(self.pulls.answer(effect)),
                 };
                 Event::Task(event)
             }

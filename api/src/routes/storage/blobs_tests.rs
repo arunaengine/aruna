@@ -320,7 +320,6 @@ async fn setup_bucket(realm_id: RealmId, owner: UserId) -> (TempDir, Arc<ServerS
                 storage_handle: storage,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: None,
                 graph_handle: None,
                 task_handle: None,
                 compute_handle: None,

@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::inbound_frames;
 use aruna_blob::blob::{InboundError, refuse_stream};
 use aruna_blob::native;
 use aruna_core::alpn::Alpn;
@@ -33,10 +34,15 @@ use aruna_operations::jobs::protocol::{JobAnswer, JobRequestOperation};
 use aruna_operations::jobs::records::pages::ServePageOperation;
 use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::after_sync::AfterSyncOperation;
+use aruna_operations::metadata::audit_entry::inbound_admission;
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
-use aruna_operations::metadata::protocol::MetadataTransportMessage;
+use aruna_operations::metadata::protocol::{
+    INBOUND_FRAME_BYTES, MetadataReadError, MetadataTransportMessage,
+};
+use aruna_operations::metadata::serve::{
+    ServeNode, ServeRequestOperation, ServedReply, needs_view,
+};
 use aruna_operations::node::heartbeat::ReceiveHeartbeatOperation;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 use aruna_operations::notifications::email::RefreshMailOperation;
@@ -55,6 +61,7 @@ use aruna_operations::sync::evicted::ReemitEvictedOperation;
 use aruna_operations::triggers::{PeerInput, peer_operation};
 use aruna_tasks::shutdown::Shutdown;
 use async_trait::async_trait;
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, warn};
 use ulid::Ulid;
@@ -68,6 +75,8 @@ struct OperationsInboundHandler {
     context: Arc<DriverContext>,
     document_sync_reconcile: Arc<DocumentReconcileCoalescer>,
     rocrate_limits: RoCrateLimits,
+    /// The payload bytes of the metadata requests in flight on this node.
+    frame_budget: Arc<Semaphore>,
     jobs_runtime: Arc<JobsRuntime>,
 }
 
@@ -102,6 +111,7 @@ impl OperationsInboundHandler {
             context,
             document_sync_reconcile,
             rocrate_limits,
+            frame_budget: Arc::new(Semaphore::new(INBOUND_FRAME_BYTES)),
             jobs_runtime,
         }
     }
@@ -134,13 +144,13 @@ impl OperationsInboundHandler {
     /// Answers one inbound metadata stream under the rocrate byte limit held by
     /// this handler: jobs and plugins requests here, the rest by the metadata domain.
     async fn handle_metadata_stream(&self, stream: BiStream, node_id: NodeId) {
-        let Some(metadata_handle) = self.context.metadata_handle.clone() else {
-            warn!(peer = %node_id, "Dropping inbound metadata stream without metadata handle");
+        if self.context.graph_handle.is_none() {
+            warn!(peer = %node_id, "Dropping inbound metadata stream without metadata store");
             return;
-        };
+        }
         let served = serve_metadata_stream(
             &self.context,
-            &metadata_handle,
+            &self.frame_budget,
             stream,
             node_id,
             self.rocrate_limits.metadata_bytes,
@@ -154,7 +164,7 @@ impl OperationsInboundHandler {
 #[tracing::instrument(
     name = "metadata.remote.inbound",
     level = "debug",
-    skip(context, metadata, stream),
+    skip(context, budget, stream),
     fields(
         peer = ?peer,
         request = field::Empty,
@@ -168,41 +178,69 @@ impl OperationsInboundHandler {
 )]
 async fn serve_metadata_stream(
     context: &Arc<DriverContext>,
-    metadata: &MetadataHandle,
+    budget: &Arc<Semaphore>,
     mut stream: BiStream,
     peer: NodeId,
     metadata_bytes: u64,
 ) -> Result<(), MetadataError> {
     let total_started = Instant::now();
     let read_started = Instant::now();
-    let request = metadata.read_request(&mut stream).await?;
+    let request = inbound_frames::read_request(&mut stream, budget).await?;
     let span = Span::current();
     record_elapsed_ms(&span, "read_ms", read_started);
 
     let process_started = Instant::now();
-    let deadline = request.audit_deadline;
-    let audit = request.audit.then_some(deadline);
-    let (response, response_body) =
-        match peer_request(context, metadata, peer, request.message).await {
+    let audit = request.audit;
+    // An audit page is served only within the inbound audit slots.
+    let admission = audit.map(|_| inbound_admission());
+    let (response, response_body) = match admission {
+        Some(None) => {
+            let result = Err(MetadataReadError::Unavailable);
+            (
+                MetadataTransportMessage::ForwardedAuditPage { result },
+                None,
+            )
+        }
+        _ => match peer_request(context, peer, request.message).await {
             Ok(response) => (response, None),
-            Err(message) => {
-                metadata
-                    .answer_request(context, peer, metadata_bytes, deadline, message)
-                    .await
-            }
-        };
+            Err(message) => serve_request(context, peer, metadata_bytes, message).await,
+        },
+    };
     record_elapsed_ms(&span, "process_ms", process_started);
-    MetadataHandle::write_answer(stream, audit, &response, response_body).await?;
+    inbound_frames::write_answer(stream, audit, &response, response_body).await?;
     drop(request.budget);
+    drop(admission);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
     Ok(())
 }
 
 /// Answers a metadata transport request of the jobs or plugins domain, or hands the
 /// request back for the metadata domain.
+/// Answers a metadata request through the serve operation, with what this node offers it.
+async fn serve_request(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    metadata_bytes: u64,
+    message: MetadataTransportMessage,
+) -> ServedReply {
+    let view = needs_view(&message);
+    let serving = ServeNode {
+        local: context.node_and_realm(),
+        graph: context.graph_handle.is_some(),
+        indexed: context.storage_handle.range_indexes().is_some(),
+        metadata_bytes,
+        here: view.then(|| context.here()),
+        routing: view.then(|| node_routing(context)),
+    };
+    let serve = ServeRequestOperation::new(peer, serving, message);
+    match Box::pin(drive(serve, context.as_ref())).await {
+        Ok(reply) => reply,
+        Err(error) => (MetadataTransportMessage::Reject(error.to_string()), None),
+    }
+}
+
 async fn peer_request(
     context: &Arc<DriverContext>,
-    _metadata: &MetadataHandle,
     peer: NodeId,
     message: MetadataTransportMessage,
 ) -> Result<MetadataTransportMessage, MetadataTransportMessage> {
@@ -562,7 +600,7 @@ fn install_inbound_handler(
         warn!("Cannot initialize inbound handling without net handle");
         return None;
     };
-    let has_metadata = context.metadata_handle.is_some();
+    let has_metadata = context.graph_handle.is_some();
     let inbound_handler = Arc::new(OperationsInboundHandler::new(
         context.clone(),
         rocrate_limits,
@@ -1024,7 +1062,6 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
-    use aruna_operations::metadata::MetadataHandle;
     use aruna_operations::replication::protocol::{
         LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
     };
@@ -1093,7 +1130,6 @@ mod tests {
             storage_handle,
             net_handle: Some(net_handle.clone()),
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -1182,7 +1218,6 @@ mod tests {
                 storage_handle: storage_b,
                 net_handle: Some(net_b.clone()),
                 blob_handle: Some(blob_handle),
-                metadata_handle: None,
                 graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
@@ -1240,17 +1275,11 @@ mod tests {
                 aruna_graph::GraphOptions::default(),
             )
             .unwrap();
-            let metadata_handle = MetadataHandle::new(
-                dir.path().join("metadata"),
-                storage.clone(),
-                Some(net.clone()),
-                Default::default(),
-            );
+            aruna_operations::metadata::install_indexes(&storage, dir.path().join("metadata"));
             let context = Arc::new(DriverContext {
                 storage_handle: storage,
                 net_handle: Some(net.clone()),
                 blob_handle: None,
-                metadata_handle: Some(metadata_handle),
                 graph_handle: Some(graph_handle),
                 task_handle: None,
                 compute_handle: None,
@@ -1369,7 +1398,6 @@ mod tests {
                     storage_handle: storage_b,
                     net_handle: Some(net_b.clone()),
                     blob_handle: Some(blob_handle),
-                    metadata_handle: None,
                     graph_handle: None,
                     task_handle: None,
                     compute_handle: None,

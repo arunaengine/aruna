@@ -105,17 +105,11 @@ pub(crate) async fn node_state() -> Node {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    let metadata = aruna_operations::metadata::MetadataHandle::new(
-        dir.path().join("metadata"),
-        storage.clone(),
-        Some(net.clone()),
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage, dir.path().join("metadata"));
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net),
         blob_handle: Some(blob),
-        metadata_handle: Some(metadata),
         graph_handle: Some(graph),
         task_handle: None,
         compute_handle: None,

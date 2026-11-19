@@ -4,11 +4,11 @@
 
 use super::{
     GroupCapOverride, InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeKindInfo,
-    PeerContacts, PublicNode, RealmBinding, RealmBindingScope, RealmConnectionStatus,
-    RealmPlacementOverride, RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig,
-    RealmQuotaOverride, ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info,
-    get_realm_placement, get_usage, map_handle_error, map_placement_error, map_quota_error,
-    map_realm_nodes, mutate_realm_placement, presence_nodes, run_realm_info, set_realm_quota,
+    PublicNode, RealmBinding, RealmBindingScope, RealmConnectionStatus, RealmPlacementOverride,
+    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, RealmQuotaOverride,
+    ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info, get_realm_placement,
+    get_usage, map_handle_error, map_placement_error, map_quota_error, map_realm_nodes,
+    mutate_realm_placement, presence_nodes, run_realm_info, set_realm_quota,
 };
 use crate::auth::extract;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
@@ -415,19 +415,13 @@ async fn usage_counts_documents() {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    let metadata_handle = aruna_operations::metadata::MetadataHandle::new(
-        metadata_dir.path(),
-        storage_handle.clone(),
-        None,
-        Default::default(),
-    );
+    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
     let realm_signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
     let driver_ctx = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: Some(metadata_handle),
         graph_handle: Some(graph_handle),
         task_handle: None,
         compute_handle: None,
@@ -586,7 +580,6 @@ async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
@@ -1942,7 +1935,7 @@ async fn device_never_connected() {
         &config,
         present,
         BTreeMap::new(),
-        &PeerContacts::default(),
+        &BTreeMap::new(),
         &aruna_operations::realm::node_name::NodeDisplays::default(),
         10_000,
     );
@@ -1986,10 +1979,8 @@ async fn reports_device_seen() {
             });
     }
     let now_ms = 1_000_000;
-    let window = aruna_net::contacts::PEER_CONTACT_WINDOW.as_millis() as u64;
-    let contacts = PeerContacts::default();
-    contacts.note(recent, now_ms - window);
-    contacts.note(stale, now_ms - window - 1);
+    let window = aruna_core::heartbeat::PEER_CONTACT_WINDOW.as_millis() as u64;
+    let contacts = BTreeMap::from([(recent, now_ms - window), (stale, now_ms - window - 1)]);
 
     let nodes = map_realm_nodes(
         &state,

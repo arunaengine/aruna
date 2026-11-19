@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::audit::AuditPageBatch;
 use crate::compute::{SecretBytes, SharedSecret};
 use crate::effects::{
     FrameBoundsError, JOB_PAGE_BYTES, JobRecordFrame, MAX_RECORD_PAGE, encoded_len,
@@ -485,7 +484,6 @@ pub enum NetEvent {
     JobControl(JobControlEvent),
     /// Milliseconds since each asked node's last heartbeat, or since this node started.
     HeartbeatSilence(std::collections::BTreeMap<NodeId, u64>),
-    AuditPages(AuditPageBatch),
     PolicyFetch(PolicyFetchEvent),
     PolicySign(PolicySignEvent),
     VaultFetch(VaultFetchEvent),
@@ -494,17 +492,19 @@ pub enum NetEvent {
     StatementSign(StatementSignEvent),
     ExecutionSign(ExecutionSignEvent),
     Error(NetError),
-    /// Whether the node holds the complete artifact after the chunk, or why it was not stored.
-    ArtifactStored(Result<bool, String>),
     /// The holder's answer frame, or why none came.
     Notification(
         Result<Box<crate::structs::execution::notification::NotificationTransportMessage>, String>,
     ),
     InboxWoken,
+    /// The last contact of each asked peer this node saw, in unix milliseconds.
+    PeerContacts(std::collections::BTreeMap<NodeId, u64>),
     /// This node's id, or `None` on a node without a net handle.
     LocalNode(Option<crate::NodeId>),
     /// The realm this node serves, `None` without a network.
     LocalRealm(Option<crate::structs::identity::realm::RealmId>),
+    /// Whether the issuer key is a valid public key; `false` also when it went unchecked.
+    IssuerKey(bool),
     /// This node's id and the holders its watch interest matches; `None` without a net handle.
     WatchHolders(Option<(crate::NodeId, Vec<crate::NodeId>)>),
     Heartbeat(crate::heartbeat::HeartbeatEvent),
@@ -1047,7 +1047,6 @@ impl Event {
                     DocumentSync,
                     Stream,
                     JobControl,
-                    AuditPages,
                     PolicyFetch,
                     PolicySign,
                     VaultFetch,
@@ -1056,7 +1055,6 @@ impl Event {
                     StatementSign,
                     ExecutionSign,
                     Error,
-                    ArtifactStored,
                     MetadataAnswer,
                     DocumentPeers,
                     GrantedRead,
@@ -1072,8 +1070,10 @@ impl Event {
                     DeletePlanSigned,
                     Notification,
                     InboxWoken,
+                    PeerContacts,
                     LocalNode,
                     LocalRealm,
+                    IssuerKey,
                     WatchHolders,
                     Heartbeat,
                     HeartbeatSilence,
@@ -1118,6 +1118,7 @@ impl Event {
                     TimerCancelled,
                     BackgroundStarted,
                     RunningHandlersAborted,
+                    Pull,
                     Error,
                 }
             ),

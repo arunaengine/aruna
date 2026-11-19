@@ -12,7 +12,7 @@ use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::bearer_token::{
-    DecodeTokenOperation, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
+    DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
 };
 use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::testing::sign_token;
@@ -47,7 +47,7 @@ impl TestAuthState {
             trust: IssuerTrust::Listed(self.trusted_realms.clone()),
             revocation: RevocationCheck::Listed(self.revoked_hashes.iter().cloned().collect()),
             linked_realm: None,
-            keys: None,
+            keys: IssuerKeys::Uncached,
         };
         let mut decode = DecodeTokenOperation::new(token, checks);
         decode.stamp(self.now * 1000);

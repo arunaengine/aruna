@@ -1,18 +1,11 @@
-//! Names metadata transport messages for logs and says whether a failed request was sent.
+//! Names metadata transport messages for logs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::protocol::MetadataTransportMessage;
 
-/// Whether a failed metadata request may have reached its peer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MetadataRequestDelivery {
-    DefinitelyNotSent,
-    PossiblySent,
-}
-
 /// A stable label of `message` for logs and traces.
-pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'static str {
+pub fn transport_message_kind(message: &MetadataTransportMessage) -> &'static str {
     match message {
         MetadataTransportMessage::QueryGraphs { .. } => "query_graphs",
         MetadataTransportMessage::QueryResults { .. } => "query_results",

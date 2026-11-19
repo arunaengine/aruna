@@ -228,13 +228,7 @@ pub(crate) mod tests {
             None,
             aruna_graph::GraphOptions::default(),
         );
-        let metadata = crate::metadata::MetadataHandle::new(
-            dir.path().join("meta"),
-            storage,
-            None,
-            Default::default(),
-        );
-        ctx.metadata_handle = Some(metadata);
+        crate::metadata::install_indexes(&storage, dir.path().join("meta"));
         ctx.graph_handle = Some(graph.unwrap());
         let ctx = std::sync::Arc::new(ctx);
         let create = CreateDocumentOperation::new(CreateDocumentConfig {

@@ -142,7 +142,7 @@ async fn run_delivery(
     ctx: &JobContext,
     delivery: impl Future<Output = Result<DeliveryOutcome, IoError>>,
 ) -> JobRunOutcome {
-    if ctx.driver.metadata_handle.is_none() || ctx.driver.outbound_handle.is_none() {
+    if ctx.driver.graph_handle.is_none() || ctx.driver.outbound_handle.is_none() {
         return JobRunOutcome::DeferredFor(
             JobError::retryable("the metadata transport is unavailable"),
             Duration::from_millis(BACKOFF_START_MS),

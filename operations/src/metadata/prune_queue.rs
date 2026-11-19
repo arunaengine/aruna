@@ -739,7 +739,6 @@ mod tests {
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
 
-    use crate::metadata::MetadataHandle;
     use crate::testing::write_entries;
     use crate::tests::metadata::storage_key_exists;
 
@@ -816,7 +815,6 @@ mod tests {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -839,17 +837,11 @@ mod tests {
             aruna_graph::GraphOptions::default(),
         )
         .expect("metadata handle opens");
-        let metadata_handle = MetadataHandle::new(
-            metadata_dir.path(),
-            storage.clone(),
-            None,
-            Default::default(),
-        );
+        crate::metadata::install_indexes(&storage, metadata_dir.path());
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: Some(metadata_handle.clone()),
             graph_handle: Some(graph_handle.clone()),
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
@@ -913,17 +905,11 @@ mod tests {
             aruna_graph::GraphOptions::default(),
         )
         .expect("metadata handle opens");
-        let metadata_handle = MetadataHandle::new(
-            metadata_dir.path(),
-            storage.clone(),
-            None,
-            Default::default(),
-        );
+        crate::metadata::install_indexes(&storage, metadata_dir.path());
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: Some(metadata_handle),
             graph_handle: Some(graph_handle),
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
@@ -977,7 +963,6 @@ mod tests {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -1009,7 +994,6 @@ mod tests {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,
@@ -1068,7 +1052,6 @@ mod tests {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: None,
             compute_handle: None,

@@ -7,7 +7,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::audit::AuditPageBatch;
 use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
@@ -233,14 +232,10 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             }
         },
         NetEffect::Stream(stream_effect) => handle_stream_effect(stream_effect).await,
-        // The net handle runs job-control round trips itself; the operations
-        // runner executes audit effects. Neither reaches this handler.
+        // The net handle runs job-control round trips itself; they never reach this handler.
         NetEffect::JobControl(_) => NetEvent::JobControl(JobControlEvent::Unavailable(
             "job-control effect must be sent through the net handle".to_string(),
         )),
-        NetEffect::AuditPage(audit) => {
-            NetEvent::AuditPages(audit_fallback(audit.nodes, audit.request.limit))
-        }
         NetEffect::PolicySign(claim) => {
             NetEvent::PolicySign(crate::signing::sign_publication(&ctx.secret_key, *claim))
         }
@@ -270,9 +265,6 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             let signed = aruna_core::cursor::names_signer(&bytes, signer.as_bytes());
             NetEvent::CursorSigned(signed.then(|| ctx.secret_key.sign(&bytes)))
         }
-        NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
-            "artifact copies must be dispatched by the operations runner".to_string(),
-        )),
         // Peer contacts live on the net handle the runner holds.
         NetEffect::PeerContact(_) => NetEvent::PeerContact,
         // Metadata requests ride the metadata transport the runner holds.
@@ -318,8 +310,10 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         | NetEffect::HeartbeatSilence(_)
         | NetEffect::DashboardChanged
         | NetEffect::RecordSuppression(_)
+        | NetEffect::PeerContacts { .. }
         | NetEffect::LocalNode
         | NetEffect::LocalRealm
+        | NetEffect::IssuerKey { .. }
         | NetEffect::WatchHolders { .. }
         | NetEffect::RegisterInterest { .. }
         | NetEffect::RetractInterest(_)
@@ -394,16 +388,6 @@ pub(crate) fn sign_execution(key: &iroh::SecretKey, claim: ExecutionClaim) -> Ex
         Ok(envelope) => ExecutionSignEvent::Signed(Box::new(envelope)),
         Err(error) => ExecutionSignEvent::Unavailable(error.to_string()),
     }
-}
-
-fn audit_fallback(nodes: Vec<NodeId>, limit: usize) -> AuditPageBatch {
-    let mut batch = AuditPageBatch::with_limit(limit);
-    // Every node of a fallback batch is missing; mark_missing bounds the set and
-    // rolls the excess into missing_overflow, so nothing is silently dropped.
-    for node in nodes {
-        batch.mark_missing(node);
-    }
-    batch
 }
 
 #[tracing::instrument(
@@ -659,14 +643,12 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::DocumentSync(_) => "document_sync",
         NetEffect::Stream(_) => "stream",
         NetEffect::JobControl(_) => "job_control",
-        NetEffect::AuditPage(_) => "audit_page",
         NetEffect::PolicySign(_) => "policy_sign",
         NetEffect::SignDeletePlan(_) => "sign_delete_plan",
         NetEffect::VaultSign(_) => "vault_sign",
         NetEffect::SnapshotSign(_) => "snapshot_sign",
         NetEffect::StatementSign(_) => "statement_sign",
         NetEffect::ExecutionSign(_) => "execution_sign",
-        NetEffect::ArtifactStore(_) => "artifact_store",
         NetEffect::MetadataRequest(_) => "metadata_request",
         NetEffect::RefreshDocumentPeers(_) => "refresh_document_peers",
         NetEffect::GrantedRead(_) => "granted_read",
@@ -687,8 +669,10 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::HeartbeatSilence(_) => "heartbeat_silence",
         NetEffect::DashboardChanged => "dashboard_changed",
         NetEffect::RecordSuppression(_) => "record_suppression",
+        NetEffect::PeerContacts { .. } => "peer_contacts",
         NetEffect::LocalNode => "local_node",
         NetEffect::LocalRealm => "local_realm",
+        NetEffect::IssuerKey { .. } => "issuer_key",
         NetEffect::WatchHolders { .. } => "watch_holders",
         NetEffect::RegisterInterest { .. } => "register_interest",
         NetEffect::RetractInterest(_) => "retract_interest",
@@ -748,7 +732,6 @@ mod tests {
         ));
     }
     use crate::test_support::make_repeated_node;
-    use aruna_core::audit::MAX_AUDIT_PEERS;
     use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect};
     use aruna_core::events::{DhtEvent, NetEvent};
     use aruna_core::keys::realm_presence_key;
@@ -1391,35 +1374,5 @@ mod tests {
         cache.store(realm_id, vec![make_entry(4, realm_id)], start);
         cache.store(realm_id, Vec::new(), start);
         assert!(matches!(cache.serve(realm_id, start), PresenceServe::Cold));
-    }
-
-    #[test]
-    fn bounds_overflow() {
-        // A fallback batch has no completed node, so an oversized list must
-        // report the bounded prefix as missing instead of an empty page.
-        let nodes = (1u8..=u8::try_from(MAX_AUDIT_PEERS + 1).unwrap())
-            .map(make_repeated_node)
-            .collect();
-        let batch = audit_fallback(nodes, usize::MAX);
-
-        assert!(batch.records.is_empty());
-        assert!(batch.completed_nodes.is_empty());
-        assert_eq!(batch.missing_nodes.len(), MAX_AUDIT_PEERS);
-        assert_eq!(batch.missing_overflow, 1);
-    }
-
-    #[test]
-    fn keeps_unique() {
-        let first = make_repeated_node(1);
-        let second = make_repeated_node(2);
-        let batch = audit_fallback(vec![second, first, first], usize::MAX);
-
-        let mut expected = vec![first, second];
-        expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        assert_eq!(
-            batch.missing_nodes.into_iter().collect::<Vec<_>>(),
-            expected
-        );
-        assert_eq!(batch.missing_overflow, 0);
     }
 }

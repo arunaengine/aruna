@@ -15,8 +15,8 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
 
 use crate::auth::bearer_token::{
-    DecodeTokenOperation, IssuerTrust, RevocationCheck, TokenChecks, UserCutoffOperation,
-    claims_auth,
+    DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
+    UserCutoffOperation, claims_auth,
 };
 use crate::auth::error::ArunaBearerError;
 use crate::metadata::call_results::read_value;
@@ -43,7 +43,7 @@ pub(crate) fn forwarded_checks(local_realm: Option<RealmId>, blind: bool) -> Tok
         trust: IssuerTrust::Stored,
         revocation,
         linked_realm: local_realm,
-        keys: None,
+        keys: IssuerKeys::Net,
     }
 }
 
@@ -92,6 +92,8 @@ pub struct WritePeerOperation {
     peer: NodeId,
     token: Option<AuthToken>,
     contact: bool,
+    /// Refuses device replays and checks the peer in the realm of every bearer.
+    bound: bool,
     local_realm: Option<RealmId>,
     stage: PeerStage,
 }
@@ -103,6 +105,7 @@ impl WritePeerOperation {
             peer,
             token: Some(token),
             contact: true,
+            bound: false,
             local_realm: None,
             stage: PeerStage::Realm,
         }
@@ -113,6 +116,15 @@ impl WritePeerOperation {
         Self {
             contact: false,
             ..Self::new(peer, token)
+        }
+    }
+
+    /// The check of a sync mirror's caller: no device replay, a peer configured in the realm of
+    /// every bearer, and the peer's last-contact time left as it was.
+    pub(crate) fn mirror(peer: NodeId, token: AuthToken) -> Self {
+        Self {
+            bound: true,
+            ..Self::quiet(peer, token)
         }
     }
 
@@ -133,6 +145,7 @@ impl WritePeerOperation {
                 let decode = DecodeTokenOperation::new(token.as_str(), checks);
                 Ok(Next::Call(IoCall::child(decode)))
             }
+            AuthToken::Replay { .. } if self.bound => Err(PeerAuthRefusal::Unauthorized),
             AuthToken::Replay {
                 auth,
                 issued_at,
@@ -204,7 +217,7 @@ impl Operation for WritePeerOperation {
                 let auth =
                     (claims.and_then(claims_auth)).map_err(|_| PeerAuthRefusal::Unauthorized)?;
                 let local_realm = self.local_realm("forwarded metadata auth")?;
-                match auth.realm_id == local_realm {
+                match auth.realm_id == local_realm || self.bound {
                     true => self.config(auth, PeerTrust::Member),
                     false => self.accepted(auth),
                 }

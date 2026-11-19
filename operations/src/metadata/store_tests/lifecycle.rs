@@ -47,13 +47,8 @@ async fn tombstone_blocks_apply() {
             .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
     )
     .expect("metadata handle opens");
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        storage.clone(),
-        None,
-        Default::default(),
-    );
-    let context = graph_context(storage.clone(), metadata_handle, graph_handle);
+    install_indexes(&storage, metadata_dir.path());
+    let context = graph_context(storage.clone(), graph_handle);
     let record = registry_record("datasets/fenced");
     let tombstone = GraphLifecycleRecord::deleted(
         record.graph_iri.clone(),

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{BlobEffect, Effect, NetEffect};
 use aruna_core::events::{BlobEvent, Event, MetadataAnswer, NetEvent};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
@@ -19,6 +19,7 @@ use aruna_core::structs::storage::release::{
 use thiserror::Error;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, decode_message, encode_message,
 };
@@ -169,11 +170,7 @@ impl AskHolderOperation {
             ask,
         })
         .map_err(AskHolderError::Failed)?;
-        let request = MetadataRequestEffect {
-            peer: self.node_id,
-            frame,
-            timeout: HOLDER_DEADLINE,
-        };
+        let request = metadata_request(self.node_id, frame, HOLDER_DEADLINE);
         self.asking = true;
         let effect = Effect::Net(NetEffect::MetadataRequest(Box::new(request)));
         Ok(Next::Call(effect.into()))

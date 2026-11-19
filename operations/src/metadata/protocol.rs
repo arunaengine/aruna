@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_PAGE_BYTES};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
+use aruna_core::effects::{FrameShape, MetadataRequestEffect};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataError, MetadataQueryResults, MetadataSearchHit,
@@ -30,6 +30,7 @@ use aruna_core::structs::{
     SyncPull, SyncPullStatus, SyncRefusal, SyncRelationship, SyncVersionPage,
 };
 use aruna_core::types::GroupId;
+use aruna_core::{NodeId, UserId};
 use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -47,13 +48,13 @@ use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
 use aruna_core::metadata::AuthToken;
 
-pub(crate) const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const AUDIT_FRAME_OVERHEAD: usize = 256;
-pub(crate) const INBOUND_FRAME_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const STANDARD_FRAME: u8 = 0;
-pub(crate) const AUDIT_FRAME: u8 = 1;
-pub(crate) const POSTCARD_VARIANT_BYTES: usize = 5;
-const AUDIT_REQUEST_VARIANT: u32 = 31;
+pub const INBOUND_FRAME_BYTES: usize = 64 * 1024 * 1024;
+pub const STANDARD_FRAME: u8 = 0;
+pub const AUDIT_FRAME: u8 = 1;
+pub const POSTCARD_VARIANT_BYTES: usize = 5;
+pub const AUDIT_REQUEST_VARIANT: u32 = 31;
 const AUDIT_RESPONSE_VARIANT: u32 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -937,6 +938,92 @@ pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u
     Ok(bytes)
 }
 
+/// How long one stream step of a metadata request may take.
+pub const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a sender waits for a member's answer to a reference page.
+pub(crate) const PAGE_ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
+/// The bytes an export body may carry beyond its metadata.
+pub(crate) const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The largest export body for `metadata_bytes` of metadata.
+pub(crate) fn metadata_body_limit(metadata_bytes: u64) -> u64 {
+    metadata_bytes.saturating_add(METADATA_ENVELOPE_BYTES)
+}
+
+/// How a request travels and the bounds its answer is read within; an export is followed by a
+/// body of at most its metadata plus the envelope.
+pub(crate) fn request_shape(message: &MetadataTransportMessage) -> FrameShape {
+    let body_cap = match message {
+        MetadataTransportMessage::ForwardExportDocument { metadata_bytes, .. } => {
+            Some(metadata_body_limit(*metadata_bytes))
+        }
+        // The channel carries one Profile document; the holder caps the body.
+        MetadataTransportMessage::ForwardExportProfile { .. } => {
+            Some(metadata_body_limit(u64::MAX))
+        }
+        _ => None,
+    };
+    // A member answers a reference page only after its one commit, which takes longer.
+    let answer_wait = match message {
+        MetadataTransportMessage::ReferencePage { .. } => PAGE_ANSWER_TIMEOUT,
+        _ => METADATA_IO_TIMEOUT,
+    };
+    FrameShape {
+        class: frame_class(message),
+        io_wait: METADATA_IO_TIMEOUT,
+        answer_wait,
+        answer_cap: response_cap(message),
+        body_cap,
+    }
+}
+
+/// The effect that sends one encoded request to `peer`, with the bounds its answer is read
+/// within; a frame that does not decode carries no shape and is never sent.
+pub(crate) fn metadata_request(
+    peer: NodeId,
+    frame: Vec<u8>,
+    timeout: Duration,
+) -> MetadataRequestEffect {
+    let shape = decode_message(&frame)
+        .ok()
+        .map(|message| request_shape(&message));
+    MetadataRequestEffect {
+        peer,
+        frame,
+        timeout,
+        shape,
+    }
+}
+
+/// Decodes the answer a peer request read. An export header is followed by its body, which is
+/// read back into one export answer.
+pub(crate) fn decode_answer(bytes: &[u8]) -> Result<MetadataTransportMessage, String> {
+    let answer = decode_message(bytes).map_err(|error| error.to_string())?;
+    let MetadataTransportMessage::ForwardedExport { result } = answer else {
+        return Ok(answer);
+    };
+    let (_, body) = postcard::take_from_bytes::<MetadataTransportMessage>(bytes)
+        .map_err(|error| error.to_string())?;
+    let result = match result {
+        Err(error) => Err(error),
+        Ok(length) => {
+            let length = usize::try_from(length).map_err(|error| error.to_string())?;
+            let body = body
+                .get(..length)
+                .ok_or_else(|| "metadata export body ends early".to_string())?;
+            let export = postcard::from_bytes(body).map_err(|error| error.to_string())?;
+            Ok(Box::new(export))
+        }
+    };
+    Ok(MetadataTransportMessage::ExportAnswer { result })
+}
+
+/// Test hook: the answer a target sends once it stored a sync mirror, for the net handle to drop.
+#[cfg(feature = "test-hooks")]
+pub fn mirror_created_answer() -> Vec<u8> {
+    encode_message(&MetadataTransportMessage::SyncMirrorCreated).unwrap_or_default()
+}
+
 /// Decodes one frame. A realm node that predates `node_places` or `node_names` ends its realm
 /// documents before them, and an empty map is one zero byte; only that exact reply is padded.
 pub(crate) fn decode_message(bytes: &[u8]) -> Result<MetadataTransportMessage, postcard::Error> {
@@ -958,7 +1045,7 @@ pub(crate) fn decode_message(bytes: &[u8]) -> Result<MetadataTransportMessage, p
     })
 }
 
-pub(crate) fn audit_frame_cap() -> usize {
+pub fn audit_frame_cap() -> usize {
     MAX_PAGE_BYTES.saturating_add(AUDIT_FRAME_OVERHEAD)
 }
 
@@ -993,13 +1080,66 @@ pub(crate) fn frame_class(message: &MetadataTransportMessage) -> u8 {
     }
 }
 
+/// Refuses a frame header before its payload is read: an unknown class, or a length past
+/// `max_size` or the class's cap.
+pub fn check_header(class: u8, length: usize, max_size: usize) -> Result<(), String> {
+    if class != STANDARD_FRAME && class != AUDIT_FRAME {
+        return Err("invalid metadata frame class".to_string());
+    }
+    if length > max_size.min(MAX_MESSAGE_SIZE) {
+        return Err("metadata frame exceeds maximum size".to_string());
+    }
+    if class == AUDIT_FRAME && length > audit_frame_cap() {
+        return Err("metadata audit frame exceeds maximum size".to_string());
+    }
+    Ok(())
+}
+
+/// Whether `prefix` holds the whole variant number, which postcard writes as a varint.
+pub fn variant_read(prefix: &[u8]) -> bool {
+    prefix.last().is_none_or(|last| last & 0x80 == 0) || prefix.len() == POSTCARD_VARIANT_BYTES
+}
+
+/// Refuses an audit variant past the audit cap from the payload's variant bytes alone.
+pub fn check_variant(prefix: &[u8], length: usize) -> Result<(), String> {
+    let variant =
+        parse_variant(prefix).map_err(|_| "metadata frame variant is invalid".to_string())?;
+    if length > audit_frame_cap() && variant.is_some_and(is_audit_variant) {
+        return Err("metadata audit frame exceeds maximum size".to_string());
+    }
+    Ok(())
+}
+
+/// Decodes a payload read under `class`; a message of the other class is refused.
+pub fn decode_frame(class: u8, bytes: &[u8]) -> Result<MetadataTransportMessage, String> {
+    let message = decode_message(bytes).map_err(|error| error.to_string())?;
+    let decoded = frame_class(&message);
+    if decoded != class {
+        return Err("metadata frame class does not match message".to_string());
+    }
+    if decoded == AUDIT_FRAME && bytes.len() > audit_frame_cap() {
+        return Err("metadata audit frame exceeds maximum size".to_string());
+    }
+    Ok(message)
+}
+
+/// `message` as one frame: its class, its length and its payload.
+pub fn encode_frame(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
+    let payload = encode_message(message)?;
+    let length = u32::try_from(payload.len()).map_err(|_| "metadata frame is too large")?;
+    let mut frame = Vec::with_capacity(payload.len() + 5);
+    frame.push(frame_class(message));
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
     use super::*;
-    use crate::metadata::handle::frames::{read_message_budget, read_message_cap};
     use aruna_core::UserId;
     use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
     use aruna_core::metadata::MAX_TOKEN_LEN;
@@ -1304,53 +1444,6 @@ mod tests {
         assert!(AuthToken::bearer(oversized).is_err());
     }
 
-    #[tokio::test]
-    async fn audit_frame_rejects() {
-        let (mut writer, mut reader) = tokio::io::duplex(16);
-        let length = (audit_frame_cap() + 1) as u32;
-        writer.write_all(&[AUDIT_FRAME]).await.unwrap();
-        writer.write_all(&length.to_be_bytes()).await.unwrap();
-
-        let error = read_message_cap(&mut reader, audit_frame_cap())
-            .await
-            .unwrap_err();
-        assert_eq!(error, "metadata frame exceeds maximum size");
-    }
-
-    #[tokio::test]
-    async fn audit_rejects_early() {
-        let (mut writer, mut reader) = tokio::io::duplex(16);
-        let length = (audit_frame_cap() + 1) as u32;
-        writer.write_all(&[AUDIT_FRAME]).await.unwrap();
-        writer.write_all(&length.to_be_bytes()).await.unwrap();
-        let budget = Arc::new(Semaphore::new(1));
-
-        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
-            .await
-            .unwrap_err();
-        assert_eq!(error, "metadata audit frame exceeds maximum size");
-        assert_eq!(budget.available_permits(), 1);
-    }
-
-    #[tokio::test]
-    async fn audit_wire_cap() {
-        let (mut writer, mut reader) = tokio::io::duplex(16);
-        let length = (audit_frame_cap() + 1) as u32;
-        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
-        writer.write_all(&length.to_be_bytes()).await.unwrap();
-        writer
-            .write_all(&[AUDIT_REQUEST_VARIANT as u8])
-            .await
-            .unwrap();
-        let budget = Arc::new(Semaphore::new(INBOUND_FRAME_BYTES));
-
-        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
-            .await
-            .unwrap_err();
-        assert_eq!(error, "metadata audit frame exceeds maximum size");
-        assert_eq!(budget.available_permits(), INBOUND_FRAME_BYTES);
-    }
-
     #[test]
     fn audit_variants_match() {
         let messages = [
@@ -1384,198 +1477,6 @@ mod tests {
             assert_eq!(postcard::from_bytes::<u32>(&bytes).unwrap(), expected);
             assert_eq!(frame_class(&message), AUDIT_FRAME);
         }
-    }
-
-    #[tokio::test]
-    async fn audit_wire_varint() {
-        let (mut writer, mut reader) = tokio::io::duplex(16);
-        let length = (audit_frame_cap() + 1) as u32;
-        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
-        writer.write_all(&length.to_be_bytes()).await.unwrap();
-        writer.write_all(&[0x9f, 0]).await.unwrap();
-        let budget = Arc::new(Semaphore::new(INBOUND_FRAME_BYTES));
-
-        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
-            .await
-            .unwrap_err();
-        assert_eq!(error, "metadata audit frame exceeds maximum size");
-        assert_eq!(budget.available_permits(), INBOUND_FRAME_BYTES);
-    }
-
-    #[tokio::test]
-    async fn audit_variant_limit() {
-        for prefix in [
-            vec![0x80; POSTCARD_VARIANT_BYTES],
-            vec![0x9f, 0x80, 0x80, 0x80, 0x80, 0],
-        ] {
-            let (mut writer, mut reader) = tokio::io::duplex(16);
-            let length = (audit_frame_cap() + 1) as u32;
-            writer.write_all(&[STANDARD_FRAME]).await.unwrap();
-            writer.write_all(&length.to_be_bytes()).await.unwrap();
-            writer.write_all(&prefix).await.unwrap();
-            let budget = Arc::new(Semaphore::new(INBOUND_FRAME_BYTES));
-
-            let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
-                .await
-                .unwrap_err();
-            assert_eq!(error, "metadata frame variant is invalid");
-            assert_eq!(budget.available_permits(), INBOUND_FRAME_BYTES);
-        }
-    }
-
-    #[tokio::test]
-    async fn budget_releases() {
-        let message = MetadataTransportMessage::Reject(String::new());
-        let bytes = postcard::to_allocvec(&message).unwrap();
-        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
-        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
-        writer
-            .write_all(&(bytes.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
-        writer.write_all(&bytes).await.unwrap();
-        let budget = Arc::new(Semaphore::new(32));
-
-        let (decoded, permit) = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
-            .await
-            .unwrap();
-        assert_eq!(decoded, message);
-        assert_eq!(budget.available_permits(), 32 - bytes.len());
-        drop(permit);
-        assert_eq!(budget.available_permits(), 32);
-    }
-
-    #[tokio::test]
-    async fn budget_rejects() {
-        let (mut writer, mut reader) = tokio::io::duplex(16);
-        writer
-            .write_all(&[STANDARD_FRAME, 0, 0, 0, 8])
-            .await
-            .unwrap();
-        let budget = Arc::new(Semaphore::new(4));
-
-        let error = read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &budget)
-            .await
-            .unwrap_err();
-        assert_eq!(error, "metadata inbound frame budget unavailable");
-        assert_eq!(budget.available_permits(), 4);
-    }
-
-    #[tokio::test]
-    async fn budget_cancels() {
-        let (mut writer, reader) = tokio::io::duplex(16);
-        writer
-            .write_all(&[STANDARD_FRAME, 0, 0, 0, 8])
-            .await
-            .unwrap();
-        let budget = Arc::new(Semaphore::new(8));
-        let task_budget = budget.clone();
-        let task = tokio::spawn(async move {
-            let mut reader = reader;
-            read_message_budget(&mut reader, MAX_MESSAGE_SIZE, &task_budget).await
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while budget.available_permits() == 8 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        task.abort();
-        let _ = task.await;
-        assert_eq!(budget.available_permits(), 8);
-    }
-
-    #[tokio::test]
-    async fn audit_frame_reads() {
-        let message = MetadataTransportMessage::ForwardedAuditPage {
-            result: Ok(AuditPageResponse {
-                records: Vec::new(),
-                next_start_after: None,
-            }),
-        };
-        let bytes = postcard::to_allocvec(&message).unwrap();
-        assert!(bytes.len() <= audit_frame_cap());
-        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
-        writer.write_all(&[AUDIT_FRAME]).await.unwrap();
-        writer
-            .write_all(&(bytes.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
-        writer.write_all(&bytes).await.unwrap();
-
-        assert_eq!(
-            read_message_cap(&mut reader, audit_frame_cap())
-                .await
-                .unwrap(),
-            message
-        );
-    }
-
-    #[tokio::test]
-    async fn audit_cap_decoded() {
-        let realm_id = RealmId([1u8; 32]);
-        let message = MetadataTransportMessage::ForwardedAuditPage {
-            result: Ok(AuditPageResponse {
-                records: vec![AuditPageEntry {
-                    key: vec![0u8; aruna_core::audit::AUDIT_KEY_BYTES],
-                    record: MetadataAuditRecord {
-                        realm_id,
-                        group_id: Ulid::from_bytes([2u8; 16]),
-                        document_id: Ulid::from_bytes([3u8; 16]),
-                        graph_iri: "x".repeat(MAX_PAGE_BYTES + AUDIT_FRAME_OVERHEAD),
-                        user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
-                        node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
-                        operation: MetadataAuditOperation::Create,
-                        occurred_at_ms: 0,
-                        details: None,
-                    },
-                }],
-                next_start_after: None,
-            }),
-        };
-        let bytes = postcard::to_allocvec(&message).unwrap();
-        assert!(bytes.len() > audit_frame_cap());
-        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
-        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
-        writer
-            .write_all(&(bytes.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
-        writer.write_all(&bytes).await.unwrap();
-
-        assert_eq!(
-            read_message_cap(&mut reader, MAX_MESSAGE_SIZE)
-                .await
-                .unwrap_err(),
-            "metadata audit frame exceeds maximum size"
-        );
-    }
-
-    #[tokio::test]
-    async fn frame_class_matches() {
-        let message = MetadataTransportMessage::ForwardedAuditPage {
-            result: Ok(AuditPageResponse {
-                records: Vec::new(),
-                next_start_after: None,
-            }),
-        };
-        let bytes = postcard::to_allocvec(&message).unwrap();
-        let (mut writer, mut reader) = tokio::io::duplex(bytes.len() + 5);
-        writer.write_all(&[STANDARD_FRAME]).await.unwrap();
-        writer
-            .write_all(&(bytes.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
-        writer.write_all(&bytes).await.unwrap();
-
-        assert_eq!(
-            read_message_cap(&mut reader, MAX_MESSAGE_SIZE)
-                .await
-                .unwrap_err(),
-            "metadata frame class does not match message"
-        );
     }
 
     #[test]

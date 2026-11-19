@@ -18,7 +18,9 @@ pub(crate) mod document_sync;
 mod effect_handlers;
 pub mod error;
 mod eviction;
+pub mod frames;
 mod heartbeat;
+pub mod issuer_keys;
 pub mod job_control;
 pub mod notification;
 pub mod shard_manifest;
@@ -131,6 +133,10 @@ struct NetInner {
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     heartbeats: Arc<heartbeat::HeartbeatTable>,
     peer_contacts: contacts::PeerContacts,
+    issuer_keys: issuer_keys::IssuerKeys,
+    /// Test hook: the payload of the next answer a frame request drops as if lost.
+    #[cfg(feature = "test-hooks")]
+    dropped_answer: parking_lot::Mutex<Option<Vec<u8>>>,
     download_gauge: Arc<aruna_core::download_slots::DownloadGauge>,
     avoided_holders: aruna_core::download_slots::AvoidList,
     notification_watch_metrics: NotificationWatchMetrics,
@@ -544,12 +550,34 @@ impl NetHandle {
         &self.inner.avoided_holders
     }
 
-    /// Time since the last heartbeat of `node`, or since this node started without one.
     /// When this node last saw each authorized peer.
     pub fn peer_contacts(&self) -> contacts::PeerContacts {
         self.inner.peer_contacts.clone()
     }
 
+    /// The trusted issuer keys this node checked.
+    pub fn issuer_keys(&self) -> &issuer_keys::IssuerKeys {
+        &self.inner.issuer_keys
+    }
+
+    /// Test hook: the next frame request whose answer payload is `payload` fails as if the
+    /// answer was lost after the peer acted on the request.
+    #[cfg(feature = "test-hooks")]
+    pub fn drop_answer(&self, payload: Vec<u8>) {
+        *self.inner.dropped_answer.lock() = Some(payload);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn take_dropped(&self, answer: &[u8]) -> bool {
+        let mut dropped = self.inner.dropped_answer.lock();
+        let matches = dropped.as_deref() == Some(answer);
+        if matches {
+            dropped.take();
+        }
+        matches
+    }
+
+    /// Time since the last heartbeat of `node`, or since this node started without one.
     pub fn heartbeat_silence(&self, node: NodeId) -> Duration {
         self.inner.heartbeats.silence(&node)
     }
@@ -1086,14 +1114,12 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::DocumentSync(_)) => "document_sync",
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Net(NetEffect::JobControl(_)) => "job_control",
-        Effect::Net(NetEffect::AuditPage(_)) => "audit_page",
         Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
         Effect::Net(NetEffect::SignDeletePlan(_)) => "sign_delete_plan",
         Effect::Net(NetEffect::VaultSign(_)) => "vault_sign",
         Effect::Net(NetEffect::SnapshotSign(_)) => "snapshot_sign",
         Effect::Net(NetEffect::StatementSign(_)) => "statement_sign",
         Effect::Net(NetEffect::ExecutionSign(_)) => "execution_sign",
-        Effect::Net(NetEffect::ArtifactStore(_)) => "artifact_store",
         Effect::Net(NetEffect::MetadataRequest(_)) => "metadata_request",
         Effect::Net(NetEffect::RefreshDocumentPeers(_)) => "refresh_document_peers",
         Effect::Net(NetEffect::GrantedRead(_)) => "granted_read",
@@ -1114,8 +1140,10 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::HeartbeatSilence(_)) => "heartbeat_silence",
         Effect::Net(NetEffect::DashboardChanged) => "dashboard_changed",
         Effect::Net(NetEffect::RecordSuppression(_)) => "record_suppression",
+        Effect::Net(NetEffect::PeerContacts { .. }) => "peer_contacts",
         Effect::Net(NetEffect::LocalNode) => "local_node",
         Effect::Net(NetEffect::LocalRealm) => "local_realm",
+        Effect::Net(NetEffect::IssuerKey { .. }) => "issuer_key",
         Effect::Net(NetEffect::WatchHolders { .. }) => "watch_holders",
         Effect::Net(NetEffect::RegisterInterest { .. }) => "register_interest",
         Effect::Net(NetEffect::RetractInterest(_)) => "retract_interest",

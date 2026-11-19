@@ -39,7 +39,6 @@ use aruna_operations::jobs::context::JobContext;
 use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::harvest::{HarvestJobOperation, harvest_outcome};
 use aruna_operations::jobs::submit::mint_job_id;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::testing::process_materialization_batch;
 use aruna_operations::testing::replay_event_log;
@@ -149,12 +148,11 @@ async fn build_fixture() -> Result<Fixture, BoxError> {
         None,
         aruna_graph::GraphOptions::default(),
     )?;
-    let metadata = MetadataHandle::new(&metadata_path, storage.clone(), None, Default::default());
+    aruna_operations::metadata::install_indexes(&storage, &metadata_path);
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: Some(blob),
-        metadata_handle: Some(metadata),
         graph_handle: Some(graph),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,

@@ -300,7 +300,7 @@ impl TaskQueues {
         }
         // Before the first refresh: a queued edit is the one local change no
         // holder would hand back.
-        if context.metadata_handle.is_some() {
+        if context.graph_handle.is_some() {
             drive(
                 aruna_operations::device::edit::replay_queued_edits(),
                 &context,
@@ -629,16 +629,6 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_mirror_repair(&self) {
-        if self
-            .context
-            .metadata_handle
-            .as_ref()
-            .is_some_and(|handle| handle.repair_held())
-        {
-            self.reschedule_timer(TaskKey::DrainMirrorRepair, REPAIR_RETRY_AFTER)
-                .await;
-            return;
-        }
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             self.reschedule_timer(TaskKey::DrainMirrorRepair, REPAIR_RETRY_AFTER)
                 .await;
@@ -1058,7 +1048,6 @@ mod stop_tests {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
             graph_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,

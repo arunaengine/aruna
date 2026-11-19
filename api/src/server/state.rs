@@ -19,7 +19,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_operations::auth::bearer_token::{
-    DecodeTokenOperation, IssuerKeyCache, IssuerTrust, RevocationCheck, TokenChecks,
+    DecodeTokenOperation, IssuerKeyCache, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
 };
 use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -586,15 +586,6 @@ impl ServerState {
             .ok_or(OidcError::ProviderNotFound)
     }
 
-    /// Peer contacts from the net handle; empty without a network.
-    pub fn peer_contacts(&self) -> aruna_net::contacts::PeerContacts {
-        self.get_ctx()
-            .net_handle
-            .as_ref()
-            .map(aruna_net::NetHandle::peer_contacts)
-            .unwrap_or_default()
-    }
-
     pub fn is_management_node(&self) -> bool {
         matches!(
             self.identity.node_capabilities,
@@ -679,7 +670,7 @@ impl ServerState {
             trust: IssuerTrust::Listed(trusted.iter().copied().collect()),
             revocation,
             linked_realm: Some(self.get_realm_id()),
-            keys: Some(self.identity.issuer_keys.clone()),
+            keys: IssuerKeys::Cached(self.identity.issuer_keys.clone()),
         }
     }
 

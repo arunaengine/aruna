@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use crate::UserId;
 use crate::alpn::Alpn;
-use crate::audit::AuditPageRequest;
 use crate::compute::SharedSecret;
 use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
@@ -798,7 +797,6 @@ pub enum NetEffect {
     DocumentSync(DocumentEffect),
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
-    AuditPage(Box<AuditPageEffect>),
     /// Signs one policy publication claim with this node's key, after the
     /// operation checked the authorizing user's realm-admin permission.
     PolicySign(Box<PolicyPublicationClaim>),
@@ -810,8 +808,6 @@ pub enum NetEffect {
     StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
     /// Signs one job record of an execution; only a claim naming this node as publisher.
     ExecutionSign(Box<crate::structs::execution::job::ExecutionClaim>),
-    /// Sends one plugin artifact chunk to a management node; answers `NetEvent::ArtifactStored`.
-    ArtifactStore(Box<crate::plugins::ArtifactStore>),
     /// Sends one notification request frame to a holder and reads its answer frame.
     Notification(Box<crate::structs::execution::notification::NotificationRequest>),
     /// Wakes the live inbox streams of these local recipients.
@@ -879,10 +875,19 @@ pub enum NetEffect {
     DashboardChanged,
     /// Records one suppressed watch delivery in this node's watch metrics.
     RecordSuppression(crate::metrics::WatchMetricReason),
+    /// Asks when this node last saw each of `peers`; answers `NetEvent::PeerContacts`.
+    PeerContacts {
+        peers: Vec<NodeId>,
+    },
     /// Asks for this node's id; answers `NetEvent::LocalNode`.
     LocalNode,
     /// Asks for the realm this node serves; answers `NetEvent::LocalRealm`.
     LocalRealm,
+    /// Asks whether a trusted issuer's public key is one this node checked; answers
+    /// `NetEvent::IssuerKey`.
+    IssuerKey {
+        key: [u8; 32],
+    },
     /// Asks which holders this node's watch interest matches; answers `NetEvent::WatchHolders`.
     WatchHolders {
         realm_id: crate::structs::identity::realm::RealmId,
@@ -967,11 +972,25 @@ pub enum ShardNetEffect {
     },
 }
 
+/// One encoded metadata peer request with the bounds its answer is read within; no shape marks
+/// a frame its operation could not read back, which is never sent.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MetadataRequestEffect {
     pub peer: NodeId,
     pub frame: Vec<u8>,
     pub timeout: Duration,
+    pub shape: Option<FrameShape>,
+}
+
+/// How one peer request travels: the frame class it is sent in, how long stream I/O and the
+/// answer may take, how large the answer frame may be, and the cap of a body read after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameShape {
+    pub class: u8,
+    pub io_wait: Duration,
+    pub answer_wait: Duration,
+    pub answer_cap: usize,
+    pub body_cap: Option<u64>,
 }
 
 /// Shows the frame size only: a frame can carry credentials or the realm key.
@@ -981,6 +1000,7 @@ impl std::fmt::Debug for MetadataRequestEffect {
             .field("peer", &self.peer)
             .field("frame_bytes", &self.frame.len())
             .field("timeout", &self.timeout)
+            .field("shape", &self.shape)
             .finish()
     }
 }
@@ -1256,15 +1276,6 @@ pub struct VaultFetchEffect {
 pub struct JobControlEffect {
     pub owner: NodeId,
     pub request: JobRequest,
-}
-
-/// The audit fan-out: one page request asked of every listed node. The adapter
-/// performs the frame round-trips concurrently and answers with one aggregated
-/// event, so an unreachable node cannot delay the others.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AuditPageEffect {
-    pub nodes: Vec<NodeId>,
-    pub request: AuditPageRequest,
 }
 
 /// Default wall-clock budget for a DHT read whose caller has no tighter
