@@ -23,10 +23,7 @@ use aruna_core::structs::execution::notification_watch::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::notifications::dispatch;
-use aruna_operations::notifications::dispatch::{
-    InboxWakeReceiver, NotificationDispatchError, subscribe_inbox_wakes,
-};
+use aruna_operations::notifications::dispatch::NotificationDispatchError;
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_MAX_IDS;
 use aruna_operations::notifications::user_call::WatchDispatchError;
@@ -241,8 +238,27 @@ fn watch_authorized(subscription: &WatchSubscription) -> bool {
     !subscription.path_prefix.is_empty()
 }
 
+/// Receiver half of the inbox wake channel.
+type InboxWakeReceiver = tokio::sync::broadcast::Receiver<UserId>;
+
+/// Subscribes to local inbox-delivery wakes. `Unavailable` when the node runs
+/// without a net handle, matching the other dispatch paths.
+fn subscribe_inbox_wakes(
+    context: &DriverContext,
+) -> Result<InboxWakeReceiver, NotificationDispatchError> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(NotificationDispatchError::Unavailable)?;
+    Ok(net_handle.subscribe_notification_wakes())
+}
+
 fn record_watch_denial(state: &ServerState, reason: WatchMetricReason) {
-    dispatch::record_watch_denial(state.get_ctx().as_ref(), reason);
+    if let Some(net_handle) = state.get_ctx().net_handle.as_ref() {
+        net_handle
+            .notification_watch_metrics()
+            .record_creation_denial(reason);
+    }
     warn!(
         parent: None,
         reason = reason.as_str(),
