@@ -25,7 +25,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::distribution::replica_shares::{GroupShare, ReplicaSharesOperation};
-use crate::node::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation};
+use crate::s3::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation};
 use crate::s3::usage::{
     LoadCountersError, global_shard_rows, global_sum, schedule_snapshot_publish,
 };

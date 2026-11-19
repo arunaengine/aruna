@@ -17,11 +17,11 @@ use aruna_core::structs::storage::usage::{
     usage_group_key,
 };
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::node::usage_publish::{
     PublishUsageOperation, PublishedUsage, UsagePublishError,
 };
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };

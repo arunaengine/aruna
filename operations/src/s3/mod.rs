@@ -16,6 +16,7 @@ pub mod multipart;
 pub mod object;
 pub mod policy;
 pub mod purge_fence;
+pub mod realm_usage;
 pub mod restart_notice;
 mod row_fence;
 pub mod session;
