@@ -172,7 +172,7 @@ impl MintSuccessorOperation {
         let refresh = &self.refresh;
         let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         let hint = bucket.distribution.as_ref().map(DistributionBinding::hint);
-        let version_id = mint_version(hint);
+        let version_id = mint_version(ulid::Ulid::generate(), hint);
         let successor = BlobVersion::reference(
             source.clone(),
             self.observation.clone(),

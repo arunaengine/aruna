@@ -640,7 +640,7 @@ async fn index_content(state: &ServerState, set_id: Ulid, hash: [u8; 32]) -> Uli
         IndexEntry, VersionEntry, content_key, index_key, version_position,
     };
     use aruna_core::structs::storage::distribution::{OriginalEpoch, SetHint};
-    let version = mint_version(Some(SetHint::of_set(set_id)));
+    let version = mint_version(Ulid::generate(), Some(SetHint::of_set(set_id)));
     let position = version_position(set_id, "x/a.txt", OriginalEpoch(1), 1, version);
     let entry = IndexEntry {
         position,

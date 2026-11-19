@@ -623,7 +623,7 @@ impl PolicyBulkOperation {
                         operation_id: self.config.operation_id,
                         key: candidate.key.clone(),
                         observed_head: candidate.pointer.clone(),
-                        successor_version_id: mint_version(self.set_hint),
+                        successor_version_id: mint_version(Ulid::generate(), self.set_hint),
                         outcome: PolicyIntentOutcome::Planned,
                     }
                 }

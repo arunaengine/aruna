@@ -8,6 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
@@ -99,7 +100,7 @@ impl QueueBlobOperation {
     pub fn new(input: ReplicateScopeInput, source_delete_marker: Option<bool>) -> Self {
         Self {
             now_ms: 0,
-            job: BlobJobRecord::new(input, source_delete_marker, 0),
+            job: BlobJobRecord::new(input, source_delete_marker, 0, Ulid::nil()),
             state: QueueBlobState::ReadExisting,
             consent: None,
         }
@@ -120,7 +121,13 @@ impl QueueBlobOperation {
     ) -> Self {
         Self {
             now_ms: 0,
-            job: BlobJobRecord::new_relationship(input, source_delete_marker, relationship_id, 0),
+            job: BlobJobRecord::new_relationship(
+                input,
+                source_delete_marker,
+                relationship_id,
+                0,
+                Ulid::nil(),
+            ),
             state: QueueBlobState::ReadExisting,
             consent: None,
         }
@@ -213,6 +220,11 @@ impl Operation for QueueBlobOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    /// Mints the job id from the run, after the stamp.
+    fn seed(&mut self, entropy: u128) {
+        self.job.job_id = IdMint::new(entropy).mint(self.now_ms);
     }
 }
 
@@ -730,7 +742,13 @@ mod tests {
     #[test]
     fn queued_prefixes_match() {
         let [live, on_demand, obligations] = queued_prefixes("bucket").unwrap();
-        let job = blob_job_key(&BlobJobRecord::new(on_demand_input(), None, 42)).unwrap();
+        let job = blob_job_key(&BlobJobRecord::new(
+            on_demand_input(),
+            None,
+            42,
+            Ulid::generate(),
+        ))
+        .unwrap();
         assert!(job.starts_with(&on_demand.1) && !job.starts_with(&live.1));
         let other = queued_prefixes("bucke").unwrap();
         assert!(!job.starts_with(&other[1].1));
@@ -1144,8 +1162,8 @@ mod tests {
     async fn enqueue_renews_id() {
         // Jobs built in one millisecond differ by id; an enqueue that writes the row again gets
         // a new one, while a preferred queued job keeps its own (`duplicate_preserves_retry`).
-        let first = BlobJobRecord::new(on_demand_input(), None, 7);
-        let second = BlobJobRecord::new(on_demand_input(), None, 7);
+        let first = BlobJobRecord::new(on_demand_input(), None, 7, Ulid::generate());
+        let second = BlobJobRecord::new(on_demand_input(), None, 7, Ulid::generate());
         assert_ne!(first.job_id, second.job_id);
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
@@ -1184,8 +1202,8 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         };
-        let retired = BlobJobRecord::new(on_demand_input(), None, 7);
-        let replaced = BlobJobRecord::new(on_demand_input(), None, 7);
+        let retired = BlobJobRecord::new(on_demand_input(), None, 7, Ulid::generate());
+        let replaced = BlobJobRecord::new(on_demand_input(), None, 7, Ulid::generate());
         let key = blob_job_key(&retired).unwrap().to_vec();
         write_queue_record(
             &storage,
@@ -1332,7 +1350,13 @@ mod tests {
                 link.state = state;
                 write_relationship(&storage, &link).await;
             }
-            let job = BlobJobRecord::new_relationship(on_demand_input(), None, link.id, 7);
+            let job = BlobJobRecord::new_relationship(
+                on_demand_input(),
+                None,
+                link.id,
+                7,
+                Ulid::generate(),
+            );
             write_blob_job(&storage, &job).await.expect("job writes");
             let key = blob_job_key(&job).unwrap().to_vec();
 
@@ -1352,7 +1376,7 @@ mod tests {
             .expect("storage opens");
         let context = plain_context(&storage);
         write_bucket(&storage, "bucket").await;
-        let job = BlobJobRecord::new(on_demand_input(), None, 7);
+        let job = BlobJobRecord::new(on_demand_input(), None, 7, Ulid::generate());
         let key = blob_job_key(&job).unwrap().to_vec();
         retire_job(&context, key, &job, &BlobJobOutcome::Failed)
             .await
@@ -1371,8 +1395,9 @@ mod tests {
         write_bucket(&storage, "bucket").await;
         let link = relationship(91, 2, None, true);
         write_relationship(&storage, &link).await;
-        let job = BlobJobRecord::new_relationship(on_demand_input(), None, link.id, 0)
-            .with_reference_advance(reference_advance());
+        let job =
+            BlobJobRecord::new_relationship(on_demand_input(), None, link.id, 0, Ulid::generate())
+                .with_reference_advance(reference_advance());
         write_blob_job(&storage, &job).await.expect("job writes");
 
         let result = process_blob_batch(&context).await.expect("drain succeeds");
@@ -1620,9 +1645,14 @@ mod tests {
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
         let advance = reference_advance();
-        let mut job =
-            BlobJobRecord::new_relationship(on_demand_input(), None, Ulid::from_parts(78, 1), 42)
-                .with_reference_advance(advance);
+        let mut job = BlobJobRecord::new_relationship(
+            on_demand_input(),
+            None,
+            Ulid::from_parts(78, 1),
+            42,
+            Ulid::generate(),
+        )
+        .with_reference_advance(advance);
         job.writer_auth_context = None;
         let key = blob_job_key(&job).unwrap().to_vec();
 
@@ -1681,10 +1711,12 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         };
-        let mut job = BlobJobRecord::new(on_demand_input(), None, 0).with_member(MemberTarget {
-            set_id: Ulid::from_parts(3, 3),
-            member_id: Ulid::from_parts(4, 4),
-        });
+        let mut job = BlobJobRecord::new(on_demand_input(), None, 0, Ulid::generate()).with_member(
+            MemberTarget {
+                set_id: Ulid::from_parts(3, 3),
+                member_id: Ulid::from_parts(4, 4),
+            },
+        );
         job.reference_advance = Some(reference_advance());
         let (key_space, key, value) = blob_job_entry(&job).unwrap();
         let write = StorageEffect::Write {
@@ -2024,7 +2056,7 @@ mod tests {
 
     #[test]
     fn job_requires_writer() {
-        let mut record = BlobJobRecord::new(on_demand_input(), None, 42);
+        let mut record = BlobJobRecord::new(on_demand_input(), None, 42, Ulid::generate());
         record.writer_auth_context = None;
         let bytes = record.to_bytes().unwrap();
         assert!(BlobJobRecord::from_bytes(&bytes).is_err());
@@ -2032,9 +2064,20 @@ mod tests {
         let bytes = record.to_bytes().unwrap();
         assert_eq!(BlobJobRecord::from_bytes(&bytes).unwrap(), record);
 
-        let first = BlobJobRecord::new_relationship(on_demand_input(), None, Ulid::from(1u128), 42);
-        let second =
-            BlobJobRecord::new_relationship(on_demand_input(), None, Ulid::from(2u128), 42);
+        let first = BlobJobRecord::new_relationship(
+            on_demand_input(),
+            None,
+            Ulid::from(1u128),
+            42,
+            Ulid::generate(),
+        );
+        let second = BlobJobRecord::new_relationship(
+            on_demand_input(),
+            None,
+            Ulid::from(2u128),
+            42,
+            Ulid::generate(),
+        );
         assert_ne!(
             blob_job_key(&first).unwrap(),
             blob_job_key(&second).unwrap()
@@ -2065,12 +2108,18 @@ mod tests {
         }]);
         let reader = input.auth_context.clone();
         let creator = auth_context();
-        let mut job = BlobJobRecord::new_relationship(input, None, Ulid::from_parts(3, 3), 42)
-            .with_origin(Some(SyncOrigin {
-                relationship_id: Ulid::from_parts(3, 3),
-                hop_count: 0,
-            }))
-            .with_reference_advance(reference_advance());
+        let mut job = BlobJobRecord::new_relationship(
+            input,
+            None,
+            Ulid::from_parts(3, 3),
+            42,
+            Ulid::generate(),
+        )
+        .with_origin(Some(SyncOrigin {
+            relationship_id: Ulid::from_parts(3, 3),
+            hop_count: 0,
+        }))
+        .with_reference_advance(reference_advance());
         job.writer_auth_context = None;
 
         assert_eq!(job_source_auth(&job, &creator), &reader);
@@ -2084,7 +2133,7 @@ mod tests {
     #[test]
     fn job_rejects_malformed() {
         // Greenfield: pre-advance record bytes decode strictly or not at all.
-        let record = BlobJobRecord::new(on_demand_input(), None, 42);
+        let record = BlobJobRecord::new(on_demand_input(), None, 42, Ulid::generate());
         let encoded = record.to_bytes().unwrap();
         assert_eq!(BlobJobRecord::from_bytes(&encoded).unwrap(), record);
 
@@ -2142,7 +2191,16 @@ mod tests {
             version_id: Ulid::from(8u128),
             delete_marker: false,
         };
-        let job = relationship_job(node(1), target, link, None, &[]).unwrap();
+        let job = relationship_job(
+            node(1),
+            target,
+            link,
+            None,
+            &[],
+            unix_timestamp_millis(),
+            Ulid::generate(),
+        )
+        .unwrap();
         assert_eq!(job.input.auth_context.realm_id, realm());
         assert_eq!(job.input.auth_context.user_id.realm_id, foreign);
     }
@@ -2163,6 +2221,8 @@ mod tests {
                 hop_count: 4,
             }),
             &[],
+            unix_timestamp_millis(),
+            Ulid::generate(),
         );
 
         assert!(job.is_none());
@@ -2185,6 +2245,8 @@ mod tests {
             paused,
             None,
             &[],
+            unix_timestamp_millis(),
+            Ulid::generate(),
         );
 
         assert!(job.is_none());
@@ -2207,6 +2269,8 @@ mod tests {
             reference,
             None,
             &[],
+            unix_timestamp_millis(),
+            Ulid::generate(),
         )
         .unwrap();
 
@@ -2228,6 +2292,8 @@ mod tests {
             sync_link(21, 1, "a", 2, "b"),
             None,
             &[],
+            unix_timestamp_millis(),
+            Ulid::generate(),
         )
         .unwrap();
         let second = relationship_job(
@@ -2241,6 +2307,8 @@ mod tests {
             sync_link(22, 2, "b", 3, "c"),
             first.origin.as_ref(),
             &first.upstream_sources,
+            unix_timestamp_millis(),
+            Ulid::generate(),
         )
         .unwrap();
 
@@ -2255,6 +2323,8 @@ mod tests {
             sync_link(23, 3, "c", 1, "a"),
             second.origin.as_ref(),
             &second.upstream_sources,
+            unix_timestamp_millis(),
+            Ulid::generate(),
         );
 
         assert_eq!(first.upstream_sources.len(), 1);
@@ -2283,6 +2353,8 @@ mod tests {
                 hop_count: 1,
             }),
             &[upstream],
+            unix_timestamp_millis(),
+            Ulid::generate(),
         );
 
         assert!(job.is_some());
@@ -2532,6 +2604,8 @@ mod tests {
             link,
             None,
             &[],
+            unix_timestamp_millis(),
+            Ulid::generate(),
         )
         .expect("future job builds")
         .with_writer_auth(auth_context());
@@ -2655,7 +2729,7 @@ mod tests {
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
         let due_at_ms = unix_timestamp_millis().saturating_add(60_000);
-        let record = BlobJobRecord::new(on_demand_input(), None, due_at_ms);
+        let record = BlobJobRecord::new(on_demand_input(), None, due_at_ms, Ulid::generate());
         let (key_space, key, value) = blob_job_entry(&record).unwrap();
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -2729,7 +2803,12 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        let job = BlobJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
+        let job = BlobJobRecord::new(
+            on_demand_input(),
+            None,
+            unix_timestamp_millis(),
+            Ulid::generate(),
+        );
         write_blob_job(&storage, &job).await.expect("job writes");
 
         let before = storage.snapshot_metrics().requests_total;
@@ -2750,12 +2829,22 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        let first = BlobJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
+        let first = BlobJobRecord::new(
+            on_demand_input(),
+            None,
+            unix_timestamp_millis(),
+            Ulid::generate(),
+        );
         let mut second_input = on_demand_input();
         second_input.target = ReplicateScopeTarget::Object {
             key: "other".to_string(),
         };
-        let second = BlobJobRecord::new(second_input, None, unix_timestamp_millis());
+        let second = BlobJobRecord::new(
+            second_input,
+            None,
+            unix_timestamp_millis(),
+            Ulid::generate(),
+        );
         write_blob_job(&storage, &first)
             .await
             .expect("first job writes");
@@ -2813,7 +2902,12 @@ mod tests {
         .await;
         write_blob_job(
             &storage,
-            &BlobJobRecord::new(on_demand_input(), None, unix_timestamp_millis()),
+            &BlobJobRecord::new(
+                on_demand_input(),
+                None,
+                unix_timestamp_millis(),
+                Ulid::generate(),
+            ),
         )
         .await
         .expect("job writes");
@@ -2833,7 +2927,12 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        let job = BlobJobRecord::new(on_demand_input(), None, unix_timestamp_millis());
+        let job = BlobJobRecord::new(
+            on_demand_input(),
+            None,
+            unix_timestamp_millis(),
+            Ulid::generate(),
+        );
         let preferred = BlobJobRecord {
             attempts: 1,
             last_error: Some("retry".to_string()),
@@ -2874,6 +2973,7 @@ mod tests {
                     None,
                     relationship.id,
                     unix_timestamp_millis(),
+                    Ulid::generate(),
                 ),
             ),
             (
@@ -2883,6 +2983,7 @@ mod tests {
                     None,
                     relationship.id,
                     unix_timestamp_millis(),
+                    Ulid::generate(),
                 ),
             ),
         ];
@@ -3112,7 +3213,7 @@ mod tests {
             key: "key".to_string(),
             version_id,
         };
-        let job = BlobJobRecord::new(input, Some(false), 9_000);
+        let job = BlobJobRecord::new(input, Some(false), 9_000, Ulid::generate());
         assert_eq!(job.owed_since_ms(), 1_000);
     }
 
@@ -3175,7 +3276,7 @@ mod tests {
                 target,
                 ..on_demand_input()
             };
-            let mut job = BlobJobRecord::new(input, None, 5);
+            let mut job = BlobJobRecord::new(input, None, 5, Ulid::generate());
             job.attempts = attempts;
             job
         };
@@ -3478,7 +3579,8 @@ mod tests {
     fn job_stats_pages() {
         let relationship = Ulid::from_parts(7, 7);
         let row = |relationship_id, enqueued_at_ms| {
-            let mut record = BlobJobRecord::new(on_demand_input(), None, enqueued_at_ms);
+            let mut record =
+                BlobJobRecord::new(on_demand_input(), None, enqueued_at_ms, Ulid::generate());
             record.relationship_id = relationship_id;
             (
                 Key::from(b"row".to_vec()),

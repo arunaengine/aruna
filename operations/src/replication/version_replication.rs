@@ -4212,7 +4212,7 @@ mod tests {
             .unwrap();
         op.next(row(Some(head.to_bytes().unwrap().into()))).unwrap();
         let single = op.manifest.expect("manifest built");
-        let job = BlobJobRecord::new(input, Some(false), 0);
+        let job = BlobJobRecord::new(input, Some(false), 0, Ulid::generate());
         let paged = reference_manifest(&job, version, Some(&head), group_id, &publication);
         assert_eq!(paged, Some(single));
     }

@@ -40,7 +40,7 @@ impl CompleteUploadOperation {
         }
         let id = self
             .version_id
-            .unwrap_or_else(|| mint_version(self.set_hint));
+            .unwrap_or_else(|| mint_version(Ulid::generate(), self.set_hint));
         let (bucket, key) = (&self.input.bucket, &self.input.key);
         let target = self
             .routing
