@@ -401,3 +401,155 @@ pub fn copy_headers(metadata: &HashMap<String, String>, length: u64) -> Vec<Head
     headers
 }
 
+#[cfg(test)]
+mod tests {
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::storage::distribution::DistributionRevision;
+
+    use super::*;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn binding() -> DistributionBinding {
+        DistributionBinding {
+            set_id: Ulid::from_bytes([3; 16]),
+            member_id: Ulid::from_bytes([4; 16]),
+            incarnation: 0,
+            revision: DistributionRevision::default(),
+        }
+    }
+
+    fn child<T, E>(answer: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(answer))
+    }
+
+    fn caller() -> DelegatedCaller {
+        DelegatedCaller {
+            user_id: aruna_core::UserId::nil(RealmId::from_bytes([1; 32])),
+            group_id: Ulid::from_bytes([2; 16]),
+            credential_id: String::new(),
+            restrictions: None,
+            credential_expiry: 0,
+        }
+    }
+
+    fn entry(key: &str, version_id: Option<Ulid>) -> BulkDeleteEntry {
+        BulkDeleteEntry {
+            key: key.to_string(),
+            version_id,
+        }
+    }
+
+    #[test]
+    fn delegated_write_stays() {
+        let mut target = WriteTargetOperation::new(&binding(), "a", false, true);
+        assert_eq!(target.first(), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn forward_route_targets() {
+        let mut target = WriteTargetOperation::new(&binding(), "a", true, false);
+        assert!(matches!(target.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let range_id = Ulid::from_bytes([5; 16]);
+        let route = WriteRoute::Forward {
+            range_id,
+            node_id: node(2),
+            coordinator: Ulid::from_bytes([6; 16]),
+        };
+        let expected = MemberTarget {
+            set_id: binding().set_id,
+            range_id,
+            node_id: node(2),
+        };
+        let answer = target.next(child::<_, GuardError>(Ok(route)));
+        assert_eq!(answer, Ok(Next::Done(Some(expected))));
+    }
+
+    #[test]
+    fn versioned_deletes_stay() {
+        let version = Some(Ulid::from_bytes([9; 16]));
+        let entries = vec![entry("a", version)];
+        let held = binding();
+        let mut deletes =
+            ForwardDeletesOperation::new(None, caller(), ("b", Some(&held), false), entries);
+        let Ok(Next::Done(done)) = deletes.first() else {
+            panic!("nothing is forwarded");
+        };
+        assert_eq!(done.local, [entry("a", version)]);
+    }
+
+    #[test]
+    fn route_failure_reported() {
+        let held = binding();
+        let entries = vec![entry("a", None)];
+        let mut deletes =
+            ForwardDeletesOperation::new(None, caller(), ("b", Some(&held), false), entries);
+        deletes.first().unwrap();
+        let refused = GuardError::Unbound(held.set_id);
+        let Ok(Next::Done(done)) = deletes.next(child::<Option<MemberTarget>, _>(Err(refused)))
+        else {
+            panic!("the delete ends");
+        };
+        assert_eq!(done.answers.len(), 1);
+        assert!(done.answers[0].1.is_err());
+    }
+
+    #[test]
+    fn own_coordinator_streams() {
+        let mut path = CopyPathOperation::new(&binding(), ("a", false), node(1), Some(node(2)));
+        path.first().unwrap();
+        let answer = path.next(child::<Option<(Ulid, NodeId)>, GuardError>(Ok(None)));
+        assert_eq!(answer, Ok(Next::Done(CopyPath::Stream)));
+    }
+
+    #[test]
+    fn read_keeps_conditions() {
+        let headers = vec![
+            (
+                "x-amz-copy-source-if-match".to_string(),
+                "\"abc\"".to_string(),
+            ),
+            (
+                "x-amz-copy-source-range".to_string(),
+                "bytes=0-9".to_string(),
+            ),
+            ("content-type".to_string(), "text/plain".to_string()),
+        ];
+        let version = Ulid::from_bytes([5; 16]);
+        let read = source_read(("spire", "a/b", Some(version)), &headers);
+        assert_eq!(read.operation, "GetObject");
+        assert_eq!(read.query, Some(format!("versionId={version}")));
+        assert_eq!(
+            read.headers,
+            vec![
+                ("if-match".to_string(), "\"abc\"".to_string()),
+                ("range".to_string(), "bytes=0-9".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_keeps_metadata() {
+        let metadata = HashMap::from([
+            (CONTENT_TYPE_KEY.to_string(), "text/csv".to_string()),
+            ("owner".to_string(), "lab".to_string()),
+            ("aruna.sync.version".to_string(), "x".to_string()),
+        ]);
+        let mut headers = copy_headers(&metadata, 12);
+        headers.sort();
+        assert_eq!(
+            headers,
+            vec![
+                ("content-length".to_string(), "12".to_string()),
+                ("content-type".to_string(), "text/csv".to_string()),
+                ("x-amz-meta-owner".to_string(), "lab".to_string()),
+            ]
+        );
+    }
+}
