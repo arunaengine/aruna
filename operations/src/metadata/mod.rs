@@ -105,7 +105,6 @@ impl MetadataPhaseSource {
 
 pub use builtin::builtin_shapes;
 pub use contact::{PEER_CONTACT_WINDOW, PeerContacts};
-pub(crate) use handle::search_local_filtered;
 pub use handle::{
     MetadataHandle, MetadataHandleOptions, accept_pull, export_rocrate_jsonld, list_cached_group,
     list_cached_records, pull_status, query_authorized_local, search_authorized_local,

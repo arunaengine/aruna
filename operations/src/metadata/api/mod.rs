@@ -5,9 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
-use aruna_core::effects::StorageEffect;
-use aruna_core::errors::{AuthorizationError, ConversionError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::errors::ConversionError;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
@@ -35,18 +34,16 @@ use ulid::Ulid;
 
 use self::distributed_types::object_search_fingerprint;
 
-use self::fanout_types::forwarded_bearer;
-
 use self::fanout_types::MetadataFanoutOperation;
-use self::fanout_types::{fanout_bearer, query_union_safe};
+use self::fanout_types::fanout_bearer;
 #[cfg(test)]
 use self::list_types::{
     ANONYMOUS_METADATA_LIMIT, ESTIMATE_MIN_LIMIT, LIST_METADATA_LIMIT, MAX_METADATA_LIMIT,
     effective_list_limit,
 };
 
+use self::path_types::replica_query_nodes;
 use self::path_types::select_fanout_nodes;
-use self::path_types::{deduplicate_fanout_nodes, replica_query_nodes};
 
 use super::protocol::{
     MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
@@ -56,9 +53,8 @@ use super::search_cursor::{
     CursorEnvelopeError, MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchWatermark,
     SignedCursor, paginate, query_fingerprint,
 };
-use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::groups::list_groups::ListGroupOperation;
-use crate::metadata::repository::{LIST_METADATA_SIZE, StorageReadError};
+use crate::metadata::repository::LIST_METADATA_SIZE;
 use crate::s3::bucket::search::{BucketPage, BucketSearchHit};
 use crate::s3::object::search::{ObjectInventoryHit, ObjectKeyMatch, SearchNodePage};
 use aruna_core::metadata::AuthToken;
@@ -105,17 +101,16 @@ pub(crate) mod title;
 
 use self::fanout_types::MetadataFanoutScope;
 use self::fanout_types::MetadataFanoutStats;
-use self::fanout_types::RealmNodeDiscovery;
 
 #[cfg(test)]
 use self::path_types::PathShardView;
 
 use self::preflight_types::ReferenceNodeExecution;
 #[cfg(test)]
-use self::preflight_types::{authorized_realm_nodes, preflight_fingerprint};
+use self::preflight_types::authorized_realm_nodes;
 use self::read_types::ApiQueryMode;
 
-use self::search_types::{BucketSearchExecution, BucketSearchRequest, ObjectQueryMode};
+use self::search_types::ObjectQueryMode;
 #[cfg(test)]
 use self::search_types::{ObjectCursor, ObjectPartitionState, PendingBucket};
 
