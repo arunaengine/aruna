@@ -27,7 +27,7 @@ use crate::config_authority::AdminEventValidation;
 use crate::deferred_topics::DocumentSyncDependency;
 use crate::document::{
     AppliedStep, AppliedSync, DocumentChange, DocumentChangeKind, DocumentEvent,
-    DocumentReconcileResult, DocumentSyncRevision, DocumentTarget,
+    DocumentReconcileResult, DocumentSyncRevision, DocumentTarget, applied_sync_entry,
 };
 use crate::effects::{Effect, StorageEffect};
 use crate::events::{Event, StorageEvent};
@@ -42,17 +42,19 @@ use crate::storage_entries::{
     document_lifecycle_key, registry_delete_entries, registry_write_entries, sync_revision_key,
 };
 use crate::structs::execution::job::identity::JobId;
+use crate::structs::identity::realm::RealmConfigDocument;
 use crate::structs::persistent_id::{PersistentIdMapping, PersistentIdRevision};
 use crate::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyPublicationClaim,
 };
 use crate::structs::placement::policy::{PlacementPolicy, PlacementSelector, VerifiedPolicy};
-use crate::structs::placement::record::{LabelMatch, PlacementRef};
+use crate::structs::placement::record::{LabelMatch, METADATA_HANDLE, PlacementRef};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::sync_quarantine::{
     QUARANTINE_MAX_RECORDS, SyncQuarantineIdentity, SyncQuarantineUsage, SyncRejection,
     quarantine_usage_entry,
 };
+use crate::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 use crate::types::{Key, KeySpace, Value};
 use crate::user::id::UserId;
 
@@ -569,7 +571,62 @@ fn batch_moves_cursors() {
     assert!(run(plan, &nothing()).writes.contains(&cursor_row()));
 }
 
-// The follow-up row goes only with accepted creates; moving cursors alone queues none.
+/// A create whose structured id rides the seeded metadata binding, and the stored realm config
+/// that accepts its placement.
+fn accepted_create() -> (PendingCreateApply, Stored) {
+    let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+    config.seed_default_placement();
+    let strategy_id = config.default_strategy_id.expect("seeded default strategy");
+    let handle = PlacementHandle::new(METADATA_HANDLE).unwrap();
+    let id = MetaResourceId::from_parts(7, handle, BucketId::new(0).unwrap(), 9).unwrap();
+    let document_id = id.as_ulid();
+    let placement = PlacementRef {
+        strategy_id,
+        shard: 0,
+    };
+    let path = "datasets/accepted";
+    let mut record = create_event();
+    record.record = MetadataRegistryRecord {
+        document_id,
+        document_path: path.to_string(),
+        graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+        permission_path: MetadataRegistryRecord::permission_path_for(
+            &realm(),
+            group_id(),
+            path,
+            document_id,
+        ),
+        ..registry_record(placement)
+    };
+    let target = DocumentTarget::MetadataCreateEvent {
+        document_id,
+        event_id: record.event_id,
+    };
+    let pending = PendingCreateApply {
+        identity: identity(),
+        event: DocumentEvent::Upsert {
+            event_id: record.event_id,
+            target: target.clone(),
+            bytes: vec![1],
+            change: change(DocumentChangeKind::Upsert, placement),
+        },
+        target,
+        record,
+        bytes: vec![1],
+        lifecycle_revision: None,
+        message: None,
+    };
+    let config_target = DocumentTarget::RealmConfig { realm_id: realm() };
+    let row = (
+        config_target.storage_keyspace().to_string(),
+        config_target.storage_key(),
+    );
+    let stored = Stored::from([(row, Value::from(postcard::to_allocvec(&config).unwrap()))]);
+    (pending, stored)
+}
+
+// An accepted create writes the follow-up row with its target and event in the create
+// transaction; moving cursors alone queues none.
 #[test]
 fn batch_queues_accepted() {
     let followups = AppliedSync {
@@ -579,6 +636,16 @@ fn batch_queues_accepted() {
         result: DocumentReconcileResult::default(),
         next: AppliedStep::Usage,
     };
+    let (pending, stored) = accepted_create();
+    let accepted = (pending.target.clone(), pending.record.clone());
+    let plan = CreateBatchPlan::new(vec![pending], Vec::new(), Vec::new()).unwrap();
+    let ran = run(plan.queuing(Some(followups.clone())), &stored);
+    let mut queued = followups.clone();
+    queued.result.targets.push(accepted.0.clone());
+    queued.result.metadata_create_events.push(accepted.1.clone());
+    assert!(ran.writes.contains(&applied_sync_entry(&queued).unwrap()));
+    assert_eq!(ran.output().accepted, vec![accepted]);
+
     let cursor = vec![(config_topic(), cursor_row())];
     let plan = CreateBatchPlan::new(Vec::new(), cursor, Vec::new()).unwrap();
     let ran = run(plan.queuing(Some(followups)), &nothing());
