@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use crate::device::sync::pull::ForwardPullOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::transport::{peer_answer, peer_call};
+use crate::forward::transport::{no_peer_transport, peer_answer, peer_call};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls;
 use crate::jobs::workflow::run_crate::RecordCrateOperation;
@@ -229,6 +229,9 @@ impl PublishRunOperation {
     }
 
     fn bucket_checked(&mut self, result: IoResult) -> PublishTurn {
+        if no_peer_transport(&result) {
+            return Err(unavailable("metadata handle"));
+        }
         let target = &self.input.target;
         match peer_answer(result)?.map_err(PublishRunError::Unreachable)? {
             MetadataTransportMessage::ForwardedBucketChecked { result: Ok(()) } => {}
@@ -531,6 +534,24 @@ mod tests {
             publish_run(None, input()).hold_scope(),
             Some(HoldScope::RunPublish)
         );
+    }
+
+    // A node that cannot ask the realm node is unavailable; the realm node was not reached.
+    #[test]
+    fn missing_handle_unavailable() {
+        use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
+        let mut publish = publish_run(None, input());
+        publish.step = PublishStep::Bucket;
+        let missing = aruna_core::metadata::MetadataError::HandleMissing;
+        let answer = MetadataAnswer {
+            peer: input().target.node_id,
+            elapsed: std::time::Duration::ZERO,
+            result: Err(PeerRequestError::Failed(missing)),
+        };
+        let event = Event::Net(NetEvent::MetadataAnswer(Box::new(answer)));
+        let expected = PublishRunError::Unavailable("metadata handle".to_string());
+        let answer = publish.next(IoResult::Event(Box::new(event)));
+        assert_eq!(answer, Err(expected));
     }
 
     // A run this node does not know is not found.

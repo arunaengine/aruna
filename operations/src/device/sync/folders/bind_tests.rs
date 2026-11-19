@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::ChildOutcome;
+use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
+use aruna_core::metadata::MetadataError;
 use byteview::ByteView;
 
 use super::super::super::reconcile::pure_tests::folder;
@@ -119,4 +121,19 @@ fn drops_only_bindings() {
     let row = ByteView::from(binding(true).to_bytes().unwrap());
     let answer = held.next(IoResult::Values(vec![Some(row)]));
     assert!(matches!(answer, Ok(Next::Call(IoCall::Delete(_)))));
+}
+
+// A node that cannot send the request is unavailable; the realm node was never reached.
+#[test]
+fn missing_handle_unavailable() {
+    let answer = MetadataAnswer {
+        peer: folder().remote.node_id,
+        elapsed: std::time::Duration::ZERO,
+        result: Err(PeerRequestError::Failed(MetadataError::HandleMissing)),
+    };
+    let event = Event::Net(NetEvent::MetadataAnswer(Box::new(answer)));
+    let error = remote_answer(IoResult::Event(Box::new(event))).unwrap_err();
+    assert_eq!(error, RemoteError::Unavailable);
+    let remote = folder().remote;
+    assert_eq!(map_remote_error(error, &remote), FolderError::Unavailable);
 }
