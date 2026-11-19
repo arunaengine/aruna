@@ -33,9 +33,9 @@ use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ListBucketState {
-    ReadHeads,
-    ReadVersions,
-    ReadBlobLocations,
+    Heads,
+    Versions,
+    BlobLocations,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -165,7 +165,7 @@ impl ListBucketOperation {
     pub fn new(input: ListBucketInput) -> Self {
         Self {
             input,
-            state: ListBucketState::ReadHeads,
+            state: ListBucketState::Heads,
             round_candidates: Vec::new(),
             resolved: Vec::new(),
             location_reads: Vec::new(),
@@ -326,7 +326,7 @@ impl ListBucketOperation {
             },
         };
 
-        self.state = ListBucketState::ReadHeads;
+        self.state = ListBucketState::Heads;
         // An inclusive start needs the storage scan itself; it joins the read snapshot.
         let scan = Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -366,7 +366,7 @@ impl ListBucketOperation {
                 ),
             );
         }
-        self.state = ListBucketState::ReadBlobLocations;
+        self.state = ListBucketState::BlobLocations;
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
@@ -454,7 +454,7 @@ impl ListBucketOperation {
         let reads = reads?;
 
         self.round_candidates = candidates;
-        self.state = ListBucketState::ReadVersions;
+        self.state = ListBucketState::Versions;
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
@@ -671,9 +671,9 @@ impl Operation for ListBucketOperation {
 
     fn next(&mut self, result: IoResult) -> ListTurn {
         match self.state {
-            ListBucketState::ReadHeads => self.handle_heads_read(result.event()?),
-            ListBucketState::ReadVersions => self.round_versions_read(result.values()?),
-            ListBucketState::ReadBlobLocations => self.finish_hydration(result.values()?),
+            ListBucketState::Heads => self.handle_heads_read(result.event()?),
+            ListBucketState::Versions => self.round_versions_read(result.values()?),
+            ListBucketState::BlobLocations => self.finish_hydration(result.values()?),
         }
     }
 

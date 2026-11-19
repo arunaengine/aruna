@@ -22,7 +22,7 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, HashIndex, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::ReclaimCandidateKey;
-use aruna_core::types::{Key, Value};
+use aruna_core::types::{Key, PageRows, Value};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -736,7 +736,7 @@ fn other_version(value: Option<Value>, version: &str) -> Result<bool, MigrationE
     Ok(found.is_some_and(|found| found != version))
 }
 
-fn iter_rows(event: Event) -> Result<(Vec<(Key, Value)>, Option<Key>), MigrationError> {
+fn iter_rows(event: Event) -> Result<PageRows, MigrationError> {
     match event {
         Event::Storage(StorageEvent::IterResult {
             values,

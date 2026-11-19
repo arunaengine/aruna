@@ -411,8 +411,7 @@ impl OwnerSecretOperation {
                 Managers::Group(group_id, auth),
                 None,
                 self.input.actor,
-                self.input.now_ms,
-                &mut self.ids,
+                (self.input.now_ms, &mut self.ids),
             )?;
             self.notices = !notices.is_empty();
             writes.extend(notices);

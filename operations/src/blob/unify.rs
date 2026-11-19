@@ -192,6 +192,9 @@ type File = (BackendLocation, Vec<Reader>);
 /// The members of one content on one backend.
 type Group = (([u8; 32], Vec<u8>), Vec<Member>);
 
+/// The members of each content and backend.
+type Groups = BTreeMap<([u8; 32], Vec<u8>), Vec<Member>>;
+
 #[derive(Debug, PartialEq)]
 enum DuplicateStep {
     Twins,
@@ -358,10 +361,8 @@ impl Operation for DuplicatesOperation {
 }
 
 /// The versions on tenant storage with a linked or shared raw file, by content and backend.
-fn content_groups(
-    versions: Vec<Reader>,
-) -> Result<BTreeMap<([u8; 32], Vec<u8>), Vec<Member>>, MigrationError> {
-    let mut groups: BTreeMap<([u8; 32], Vec<u8>), Vec<Member>> = BTreeMap::new();
+fn content_groups(versions: Vec<Reader>) -> Result<Groups, MigrationError> {
+    let mut groups: Groups = BTreeMap::new();
     for (id, value) in versions {
         let version = BlobVersion::from_bytes(&value)?;
         let BlobVersionState::Materialized {
@@ -429,7 +430,7 @@ pub(super) fn id_named(rules: &[BackendImport], path: &str, id: Ulid) -> bool {
 }
 
 /// The ids of the versions grouped by content.
-fn versions_of(groups: &BTreeMap<([u8; 32], Vec<u8>), Vec<Member>>) -> Vec<Ulid> {
+fn versions_of(groups: &Groups) -> Vec<Ulid> {
     groups.values().flatten().map(|(id, ..)| *id).collect()
 }
 

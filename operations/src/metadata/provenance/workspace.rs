@@ -90,6 +90,9 @@ pub struct Workspace {
     queue_miss: bool,
 }
 
+/// The rows a step stores and the keys it deletes.
+pub(super) type StepWrites = (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>);
+
 impl Workspace {
     /// The overlay of a step that loads the rows of `export` as it needs them.
     pub(super) fn partial(export: Ulid) -> Self {
@@ -202,7 +205,7 @@ impl Workspace {
     }
 
     /// The writes of the step, rows to store and rows to delete; they count as read after.
-    pub(super) fn take_writes(&mut self) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>) {
+    pub(super) fn take_writes(&mut self) -> StepWrites {
         let (mut stored, mut deleted) = (Vec::new(), Vec::new());
         for (key, value) in std::mem::take(&mut self.writes) {
             self.rows.insert(key.clone(), value.clone());

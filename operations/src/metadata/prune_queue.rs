@@ -470,6 +470,9 @@ enum BatchStage {
     Finish,
 }
 
+/// One graph's prune records, by key.
+type PruneGroup = (String, Vec<(Vec<u8>, GraphPruneRecord)>);
+
 /// One drain pass of the prune queue: every due graph whose lifecycle is deleted loses its local
 /// copy and queues its repository link checks; a failure reschedules the graph's job.
 #[derive(Debug, PartialEq)]
@@ -477,8 +480,8 @@ pub struct PruneBatchOperation {
     scope: NodeScope,
     now_ms: u64,
     stage: BatchStage,
-    groups: VecDeque<(String, Vec<(Vec<u8>, GraphPruneRecord)>)>,
-    current: Option<(String, Vec<(Vec<u8>, GraphPruneRecord)>)>,
+    groups: VecDeque<PruneGroup>,
+    current: Option<PruneGroup>,
     completed: Vec<Vec<u8>>,
     processed: usize,
     jobs: usize,

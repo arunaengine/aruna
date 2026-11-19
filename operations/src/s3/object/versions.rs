@@ -56,9 +56,9 @@ const VERSION_SCAN_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ListVersionsState {
-    ReadHeads,
-    ReadVersionsKey,
-    ReadBlobLocations,
+    Heads,
+    VersionsKey,
+    BlobLocations,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -172,7 +172,7 @@ impl ListVersionsOperation {
     pub fn new(input: ListVersionsInput) -> Self {
         Self {
             input,
-            state: ListVersionsState::ReadHeads,
+            state: ListVersionsState::Heads,
             scan_prefix: Vec::new(),
             pending_start: None,
             last_head_key: None,
@@ -297,7 +297,7 @@ impl ListVersionsOperation {
                 .map(|key| IterStart::After(key.into()))
         };
 
-        self.state = ListVersionsState::ReadHeads;
+        self.state = ListVersionsState::Heads;
         // An inclusive start needs the storage scan itself; it joins the read snapshot.
         let scan = Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -381,7 +381,7 @@ impl ListVersionsOperation {
 
     fn issue_version_iter(&mut self, key: &str) -> VersionsTurn {
         let prefix = VersionKey::object_prefix(&self.input.bucket, key)?;
-        self.state = ListVersionsState::ReadVersionsKey;
+        self.state = ListVersionsState::VersionsKey;
         Ok(Next::Call(IoCall::Page {
             space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: prefix.into(),
@@ -527,7 +527,7 @@ impl ListVersionsOperation {
             );
         }
 
-        self.state = ListVersionsState::ReadBlobLocations;
+        self.state = ListVersionsState::BlobLocations;
         Ok(Next::Call(IoCall::Read(location_reads)))
     }
 
@@ -664,9 +664,9 @@ impl Operation for ListVersionsOperation {
 
     fn next(&mut self, result: IoResult) -> VersionsTurn {
         match self.state {
-            ListVersionsState::ReadHeads => self.handle_heads_read(result.event()?),
-            ListVersionsState::ReadVersionsKey => self.handle_versions_read(result.page()?),
-            ListVersionsState::ReadBlobLocations => self.finish_current_key(result.values()?),
+            ListVersionsState::Heads => self.handle_heads_read(result.event()?),
+            ListVersionsState::VersionsKey => self.handle_versions_read(result.page()?),
+            ListVersionsState::BlobLocations => self.finish_current_key(result.values()?),
         }
     }
 

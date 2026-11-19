@@ -14,7 +14,7 @@ use aruna_core::rows::{all_values, event};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::types::{GroupId, Key, PageRows, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -265,7 +265,7 @@ fn scan_call(start: IterStart, limit: usize) -> IoCall {
     IoCall::Effect(Box::new(scan_effect(start, limit)))
 }
 
-fn scanned(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), VisibilityError> {
+fn scanned(result: IoResult) -> Result<PageRows, VisibilityError> {
     Ok(parse_storage_scan(event(result)?)?)
 }
 

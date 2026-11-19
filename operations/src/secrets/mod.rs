@@ -248,8 +248,7 @@ pub(crate) fn widening_notices(
     managers: Managers<'_>,
     node_id: Option<NodeId>,
     actor: UserId,
-    now_ms: u64,
-    ids: &mut aruna_core::id_mint::IdMint,
+    (now_ms, ids): (u64, &mut aruna_core::id_mint::IdMint),
 ) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
     if !widens_use(old, new) {
         return Ok(Vec::new());

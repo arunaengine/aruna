@@ -401,7 +401,7 @@ impl DecodeTokenOperation {
             RevocationCheck::Realm => {
                 self.claims = Some(claims);
                 self.stage = DecodeStage::Config;
-                return Ok(Next::Call(config_call(issuer_realm)));
+                Ok(Next::Call(config_call(issuer_realm)))
             }
             RevocationCheck::Listed(hashes) if hashes.contains(&bearer_token_hash(&self.token)) => {
                 Err(ArunaBearerError::TokenRevoked)

@@ -421,7 +421,7 @@ impl PullThroughOperation {
         }
     }
 
-    fn from_holders(&mut self, range: Option<Range<u64>>, step: PullStep) -> PullTurn {
+    fn read_holders(&mut self, range: Option<Range<u64>>, step: PullStep) -> PullTurn {
         let read = FromHoldersOperation::new(&self.request, &self.holders, range);
         self.step = step;
         Ok(Next::Call(IoCall::child(read)))
@@ -444,8 +444,8 @@ impl PullThroughOperation {
         self.holders = member.holders.clone();
         let range = self.range.clone();
         match plan {
-            PullPlan::Stream => self.from_holders(range, PullStep::Serve),
-            PullPlan::SpoolFirst => self.from_holders(None, PullStep::Whole),
+            PullPlan::Stream => self.read_holders(range, PullStep::Serve),
+            PullPlan::SpoolFirst => self.read_holders(None, PullStep::Whole),
             PullPlan::FillFirst(kind) => {
                 let fill = FillOperation::new(self.request.clone(), kind, member);
                 self.step = PullStep::Fill;
@@ -453,7 +453,7 @@ impl PullThroughOperation {
             }
             PullPlan::ServeAndFill(kind) => {
                 self.fill = Some(FillOperation::new(self.request.clone(), kind, member));
-                self.from_holders(range, PullStep::Serve)
+                self.read_holders(range, PullStep::Serve)
             }
         }
     }
@@ -553,7 +553,7 @@ impl Operation for PullThroughOperation {
                 Some(location) => self.read_kept(location),
                 None => {
                     let range = self.range.clone();
-                    self.from_holders(range, PullStep::Serve)
+                    self.read_holders(range, PullStep::Serve)
                 }
             },
             PullStep::Kept => match result.event()? {
