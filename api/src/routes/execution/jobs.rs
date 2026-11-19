@@ -884,8 +884,9 @@ caller holds WRITE on the document it mints for. A repository link push is reada
 the link's group, who may manage the link.
 
 **Behavior**
-- `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed` or
-  `cancelled`.
+- `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed`,
+  `cancelled` or `not_run`. A distributed job is `not_run` when every execution and launch still
+  open belongs to a node that left the realm; such a job is not launched again.
 - A distributed execution job carries a `family` block reduced from the replicated records: the
   request's `submission_id`, the currently canonical alias, the canonical execution and its exact
   output VersionIds, how many physical executions and duplicate successes are known, the projection

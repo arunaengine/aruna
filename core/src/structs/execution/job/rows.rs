@@ -79,7 +79,7 @@ pub fn job_schedule_key(record: &JobRecord) -> Option<Key> {
                 .unwrap_or(record.due_at_ms);
             lease_index_key(lease, record.job_id)
         }
-        JobState::Succeeded | JobState::Failed | JobState::Cancelled => {
+        JobState::Succeeded | JobState::Failed | JobState::Cancelled | JobState::NotRun => {
             let finished = record.finished_at_ms.unwrap_or(record.updated_at_ms);
             job_prune_key(finished.saturating_add(record.retention_ms), record.job_id)
         }

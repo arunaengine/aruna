@@ -1689,6 +1689,7 @@ fn tes_state(record: &JobRecord) -> TesState {
             _ => TesState::SystemError,
         },
         JobState::Cancelled => TesState::Canceled,
+        JobState::NotRun => TesState::SystemError,
     }
 }
 

@@ -136,6 +136,7 @@ fn local_state(state: LogicalJobState) -> JobState {
         LogicalJobState::Succeeded => JobState::Succeeded,
         LogicalJobState::Cancelled => JobState::Cancelled,
         LogicalJobState::Failed => JobState::Failed,
+        LogicalJobState::NotRun => JobState::NotRun,
     }
 }
 

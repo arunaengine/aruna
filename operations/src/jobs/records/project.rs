@@ -389,5 +389,6 @@ fn bridged_state(state: LogicalJobState) -> Option<JobState> {
         LogicalJobState::Succeeded => Some(JobState::Succeeded),
         LogicalJobState::Cancelled => Some(JobState::Cancelled),
         LogicalJobState::Failed => Some(JobState::Failed),
+        LogicalJobState::NotRun => None,
     }
 }

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::UserId;
-use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
@@ -19,6 +19,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 
 use super::ids::session_of;
+use super::membership::{MembershipViewOperation, family_not_run, mark_not_run};
 use super::report::{
     AuditPaging, AuditRange, FamilyReport, ReportDetails, ReportDetailsOperation, started_at,
 };
@@ -33,6 +34,7 @@ use crate::jobs::records::project::{
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
+use crate::secrets::owner::WriterView;
 
 /// A projection that lost its transaction every time is busy, not failed: the
 /// caller reads again rather than seeing a storage error.
@@ -56,6 +58,8 @@ pub struct FamilyProjectionOperation {
     job_id: JobId,
     now_ms: u64,
     projected: Option<ProjectedFamily>,
+    /// The view and its records while this node's membership view is read.
+    viewing: Option<Box<(FamilyView, Vec<JobRecordEnvelope>)>>,
 }
 
 type ProjectionNext = Result<Next<Option<FamilyView>>, JobRouteError>;
@@ -66,6 +70,7 @@ impl FamilyProjectionOperation {
             job_id,
             now_ms,
             projected: None,
+            viewing: None,
         }
     }
 
@@ -84,19 +89,33 @@ impl FamilyProjectionOperation {
         Ok(Next::Call(IoCall::child(read)))
     }
 
+    /// Finds the spec, then reads the membership view the not-run reading needs.
     fn with_spec(
-        &self,
+        &mut self,
         projected: ProjectedFamily,
-        records: &[JobRecordEnvelope],
+        records: Vec<JobRecordEnvelope>,
     ) -> ProjectionNext {
         let canonical = (projected.projection.as_ref())
             .ok_or_else(no_projection)?
             .canonical_job_id;
         let spec = records.iter().find_map(|envelope| match &envelope.record {
-            JobFamilyRecord::Spec(spec) if spec.job_id == canonical => Some(spec.as_ref().clone()),
+            JobFamilyRecord::Spec(spec) if spec.job_id == canonical => {
+                Some((envelope.realm_id, spec.as_ref().clone()))
+            }
             _ => None,
         });
-        let spec = spec.ok_or_else(|| unavailable("job family spec unavailable"))?;
+        let (realm_id, spec) = spec.ok_or_else(|| unavailable("job family spec unavailable"))?;
+        self.viewing = Some(Box::new(((projected, spec), records)));
+        let read = MembershipViewOperation::new(realm_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    /// Not run is this node's reading of the records, so it is applied here and never cached.
+    fn viewed(&mut self, view: Option<WriterView>) -> ProjectionNext {
+        let ((mut projected, spec), records) = *self.viewing.take().ok_or_else(no_projection)?;
+        if let (Some(view), Some(projection)) = (view, projected.projection.as_mut()) {
+            mark_not_run(projection, &family_not_run(&records, &view));
+        }
         Ok(Next::Done(Some((projected, spec))))
     }
 }
@@ -121,11 +140,15 @@ impl Operation for FamilyProjectionOperation {
     }
 
     fn next(&mut self, result: IoResult) -> ProjectionNext {
+        if self.viewing.is_some() {
+            let view = result.child::<Option<WriterView>, IoError>()?;
+            return self.viewed(view.ok().flatten());
+        }
         match self.projected.take() {
             None => self.projected(result.child::<ProjectedFamily, RecordStoreError>()?),
             Some(projected) => {
                 let records = result.child::<Vec<JobRecordEnvelope>, FamilyReadError>()?;
-                self.with_spec(projected, &records.map_err(unavailable)?)
+                self.with_spec(projected, records.map_err(unavailable)?)
             }
         }
     }

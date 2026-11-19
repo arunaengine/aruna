@@ -1536,6 +1536,9 @@ pub enum LogicalJobState {
     Succeeded,
     Cancelled,
     Failed,
+    /// Every open execution and launch belongs to a node that left the realm. Derived at read
+    /// time from this node's membership view; never stored in a cached projection.
+    NotRun,
 }
 
 impl LogicalJobState {
@@ -1548,6 +1551,7 @@ impl LogicalJobState {
             LogicalJobState::Succeeded => "succeeded",
             LogicalJobState::Cancelled => "cancelled",
             LogicalJobState::Failed => "failed",
+            LogicalJobState::NotRun => "not_run",
         }
     }
 }

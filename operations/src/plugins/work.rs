@@ -859,6 +859,7 @@ pub fn work_state(row: &WorkRow, record: Option<&JobRecord>) -> &'static str {
         JobState::Succeeded => "succeeded",
         JobState::Failed => "failed",
         JobState::Cancelled => "cancelled",
+        JobState::NotRun => "unknown",
         JobState::Indeterminate if record.locally_exhausted => "unknown",
         JobState::Indeterminate => "error",
         JobState::Claimed
