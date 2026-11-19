@@ -85,7 +85,7 @@ fn sign_oidc_token(
 }
 
 async fn read_user(context: &DriverContext, user_id: UserId) -> User {
-    aruna_operations::testing::read_user(context, user_id).await
+    aruna_drivers::testing::read_user(context, user_id).await
 }
 
 async fn read_subject_index(context: &DriverContext, subject_key: &str) -> UserId {

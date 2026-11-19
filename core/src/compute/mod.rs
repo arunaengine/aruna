@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use globset::{Glob, GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -19,6 +19,7 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 use crate::NodeId;
+use crate::stream::{BackendStream, StreamError};
 use crate::structs::execution::job::EffectiveResources;
 use crate::structs::placement::policy::{MAX_KIND_LEN, PlacementPolicyError, PlacementSubject};
 
@@ -486,6 +487,16 @@ impl TaskInput {
             size,
             stream: Mutex::new(Some(stream)),
         }
+    }
+
+    /// An input read from a backend stream, whose errors become I/O errors.
+    pub fn from_blob(
+        path: impl Into<String>,
+        size: u64,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> Self {
+        let stream = blob.map(|chunk| chunk.map_err(io::Error::other));
+        Self::from_stream(path, size, Box::pin(stream))
     }
 
     pub fn from_bytes(path: impl Into<String>, bytes: impl Into<Bytes>) -> Self {

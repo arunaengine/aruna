@@ -54,7 +54,7 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::testing::fresh_job_id;
 use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::replay_event_log;
+use aruna_test_support::projection::replay_event_log;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use bytes::Bytes;

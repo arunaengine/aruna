@@ -270,7 +270,7 @@ impl Operation for MaterializeEntryOperation {
         let relative = self.input.relative.clone();
         let blob = std::mem::replace(
             &mut self.input.blob,
-            BackendStream(Box::pin(futures_util::stream::empty())),
+            BackendStream::empty(),
         );
         let effect = match self.input.conflicted {
             true => LocalFileEffect::WriteConflicted {
@@ -323,7 +323,7 @@ mod tests {
             remote: None,
             synced: None,
             audit: None,
-            blob: BackendStream(Box::pin(futures_util::stream::empty())),
+            blob: BackendStream::empty(),
         })
     }
 

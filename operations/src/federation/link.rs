@@ -518,7 +518,7 @@ mod tests {
     }
 
     async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     /// Two active local accounts and a realm that admits logins of every realm.

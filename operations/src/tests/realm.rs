@@ -8,7 +8,7 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
 use aruna_drivers::driver::DriverContext;
 
-use crate::testing::write_value;
+use aruna_drivers::testing::write_value;
 
 /// Stores `document` as the realm config, signed by `actor`.
 pub(crate) async fn seed_config(

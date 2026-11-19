@@ -25,7 +25,7 @@ use crate::tests::calls::node;
 
 /// A storage context with a loopback net and a task plane, its net handle and its directory.
 pub(crate) async fn net_context() -> (DriverContext, NetHandle, TempDir) {
-    let (dir, context) = crate::testing::temp_context();
+    let (dir, context) = aruna_drivers::testing::temp_context();
     let net_handle = NetHandle::new(
         aruna_drivers::testing::local_net(),
         context.storage_handle.clone(),

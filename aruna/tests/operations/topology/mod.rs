@@ -67,8 +67,8 @@ use aruna_operations::realm::announce_presence::{
 };
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
-use aruna_operations::testing::sync_topics;
-use aruna_operations::testing::{project_logged_events, replay_event_log};
+use aruna_test_support::documents::sync_topics;
+use aruna_test_support::projection::{project_logged_events, replay_event_log};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;

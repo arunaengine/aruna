@@ -86,6 +86,7 @@ s3s = { workspace = true }
 
 [dev-dependencies]
 aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-test-support = { workspace = true }
 aruna-graph = { workspace = true }
 aruna-operations = { workspace = true, features = ["test-hooks"] }
 aruna-drivers = { workspace = true, features = ["test-hooks"] }

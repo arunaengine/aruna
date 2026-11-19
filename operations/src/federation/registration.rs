@@ -187,7 +187,7 @@ fn accepted(result: IoResult) -> Result<Result<(), String>, IoError> {
         return Err(IoError::Unexpected { expected, got });
     };
     Ok(match result {
-        Ok(status) => match reqwest::StatusCode::from_u16(status) {
+        Ok(status) => match http::StatusCode::from_u16(status) {
             Ok(status) if status.is_success() => Ok(()),
             Ok(status) => Err(format!("registry answered {status}")),
             Err(_) => Err(format!("registry answered {status}")),

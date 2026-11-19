@@ -24,6 +24,7 @@ pub mod document_apply;
 pub mod download_slots;
 pub mod effects;
 pub mod egress;
+pub mod entropy;
 pub mod entity_patch;
 pub mod errors;
 pub mod events;

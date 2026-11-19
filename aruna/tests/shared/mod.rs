@@ -1364,3 +1364,24 @@ pub(crate) async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client
     let client = s3_client(endpoint, &credentials);
     Ok((seed, client))
 }
+
+/// A healthy Docker daemon with its own state root, so tests that run at once never contend for
+/// one owner lock. The tests that need it are ignored by default, so a missing daemon fails them.
+#[cfg(feature = "docker")]
+pub async fn docker_backend() -> aruna_compute::executor::docker::DockerBackend {
+    use aruna_compute::ExecutorBackend;
+    use aruna_compute::executor::docker::DockerBackend;
+    let config = aruna_compute::DockerConfig {
+        keep_failed: std::env::var("ARUNA_KEEP_FAILED").is_ok(),
+        state_root: std::env::temp_dir()
+            .join("aruna-compute-tests")
+            .join(ulid::Ulid::generate().to_string()),
+        ..aruna_compute::DockerConfig::default()
+    };
+    let backend = DockerBackend::with_config(config)
+        .unwrap_or_else(|error| panic!("no reachable docker daemon: {error}"));
+    if let Err(error) = backend.health().await {
+        panic!("docker daemon unhealthy: {error}");
+    }
+    backend
+}

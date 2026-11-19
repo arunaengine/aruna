@@ -7,7 +7,7 @@ use ulid::Ulid;
 use super::*;
 use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::tests::{actor, seed_config, strategy};
-use crate::testing::path_context;
+use aruna_drivers::testing::path_context;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::NodePlacementEntry;
 use aruna_drivers::driver::drive;

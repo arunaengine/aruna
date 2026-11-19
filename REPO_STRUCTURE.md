@@ -39,6 +39,7 @@ They start an operation in the same way as an HTTP request does.
 | Backends | `storage`, `net`, `blob`, `tasks`, `compute`, `plugins` | Fjall, Iroh and document sync, blob backends, timers, executors, the WASM host |
 | Foundations | `core`, `kpabe` | domain types, record formats, keyspaces, effects, events, the `Operation` trait, pure helpers |
 | Foundations | `clock` | host clocks and the OS random source for the runner, backends and inputs; never core or operations |
+| Tests | `test-support` (`aruna-test-support`) | test helpers that drive operations through the drivers; only dev-dependencies use it |
 
 Today `operations` also holds async services: handles, workers, queue drains,
 the timer map in `operations/src/tasks/incoming/mod.rs`, the peer message map in

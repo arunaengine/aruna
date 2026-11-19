@@ -112,7 +112,7 @@ async fn write_registry_records(
 }
 
 async fn create_crate_graph(handle: &DriverContext, index: usize) -> Result<(), BoxError> {
-    let event = aruna_operations::testing::send_metadata_effect(
+    let event = aruna_drivers::testing::send_metadata_effect(
         handle,
         MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {

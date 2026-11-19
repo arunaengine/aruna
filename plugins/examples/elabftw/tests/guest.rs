@@ -1,5 +1,5 @@
 //! Runs the plugin built for WASM in the plugin runtime, against the fake eLabFTW and Aruna
-//! behind a broker. Set ELABFTW_MODULE to the built module; the CI job does.
+//! behind a broker. Ignored by default; a run on purpose needs ELABFTW_MODULE, as the CI job sets.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -232,15 +232,13 @@ impl Broker for Hosted {
     }
 }
 
-/// The packaged plugin, or `None` when no module was built for this run.
-fn module() -> Option<Vec<u8>> {
-    let Some(path) = std::env::var_os("ELABFTW_MODULE") else {
-        eprintln!("skipping: set ELABFTW_MODULE to the module built for wasm32-unknown-unknown");
-        return None;
-    };
+/// The packaged plugin; the test fails when no module was built for this run.
+fn module() -> Vec<u8> {
+    let path = std::env::var_os("ELABFTW_MODULE")
+        .expect("set ELABFTW_MODULE to the module built for wasm32-unknown-unknown");
     let project = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut manifest = load_manifest(project).unwrap();
-    Some(package(&mut manifest, &std::fs::read(path).unwrap()).unwrap())
+    package(&mut manifest, &std::fs::read(path).unwrap()).unwrap()
 }
 
 /// Manual input as the node passes it on: checked against the `[manual]` form of plugin.toml,
@@ -275,17 +273,17 @@ struct Guest {
 }
 
 impl Guest {
-    async fn new() -> Option<Self> {
+    async fn new() -> Self {
         let runtime = Runtime::new(RuntimeConfig::default()).unwrap();
-        let compiled = runtime.prepare(module()?).await.unwrap();
+        let compiled = runtime.prepare(module()).await.unwrap();
         let (now, runs) = (AtomicU64::new(START), AtomicU64::new(0));
-        Some(Self {
+        Self {
             runtime,
             compiled,
             world: Arc::default(),
             now,
             runs,
-        })
+        }
     }
 
     /// A run id as the node makes them: a ULID, whose time the guest reads.
@@ -367,10 +365,9 @@ impl Guest {
 }
 
 #[tokio::test]
+#[ignore = "needs ELABFTW_MODULE, the plugin built for wasm32-unknown-unknown"]
 async fn guest_syncs_both() {
-    let Some(guest) = Guest::new().await else {
-        return;
-    };
+    let guest = Guest::new().await;
     let id = guest
         .world
         .experiment("Run 7", "<p>a</p>", &["aruna", "pcr"]);
@@ -440,10 +437,9 @@ async fn guest_syncs_both() {
 }
 
 #[tokio::test]
+#[ignore = "needs ELABFTW_MODULE, the plugin built for wasm32-unknown-unknown"]
 async fn guest_settles_conflicts() {
-    let Some(guest) = Guest::new().await else {
-        return;
-    };
+    let guest = Guest::new().await;
     let id = guest.world.experiment("Run 7", "", &["aruna"]);
     guest.poll().await;
     let (dataset, _) = guest.world.only_dataset();
@@ -483,10 +479,9 @@ async fn guest_settles_conflicts() {
 }
 
 #[tokio::test]
+#[ignore = "needs ELABFTW_MODULE, the plugin built for wasm32-unknown-unknown"]
 async fn guest_recovers_creates() {
-    let Some(guest) = Guest::new().await else {
-        return;
-    };
+    let guest = Guest::new().await;
     // A lost create reply, then an edit: the keyed create gives the same dataset.
     let id = guest.world.experiment("Run 7", "", &["aruna"]);
     guest.world.lock().create_unknown = true;
@@ -528,10 +523,9 @@ async fn guest_recovers_creates() {
 }
 
 #[tokio::test]
+#[ignore = "needs ELABFTW_MODULE, the plugin built for wasm32-unknown-unknown"]
 async fn guest_marks_problems() {
-    let Some(guest) = Guest::new().await else {
-        return;
-    };
+    let guest = Guest::new().await;
     let big = guest.world.experiment("Big", "", &["aruna"]);
     let id = guest.world.experiment("Run 7", "", &["aruna"]);
     guest.world.upload(id, 1, "a.bin", 10);
@@ -593,10 +587,9 @@ async fn guest_marks_problems() {
 }
 
 #[tokio::test]
+#[ignore = "needs ELABFTW_MODULE, the plugin built for wasm32-unknown-unknown"]
 async fn guest_checks_bucket() {
-    let Some(guest) = Guest::new().await else {
-        return;
-    };
+    let guest = Guest::new().await;
     let accepted = guest.invoke(Trigger::Timer(START)).await;
     assert!(
         accepted.is_ok(),

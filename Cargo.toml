@@ -20,6 +20,7 @@ members = [
     "operations",
     "drivers",
     "outbound",
+    "test-support",
     "aruna-doctor",
     "cli",
     "plugins",
@@ -63,6 +64,7 @@ aruna-plugin-types = { path = "plugin-types" }
 aruna-plugins = { path = "plugins", default-features = false }
 aruna-storage = { path = "storage" }
 aruna-tasks = { path = "tasks" }
+aruna-test-support = { path = "test-support" }
 aruna-wire = { path = "wire" }
 
 # Third-party crates

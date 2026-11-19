@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
-        crate::testing::temp_context()
+        aruna_drivers::testing::temp_context()
     }
 
     async fn is_protected(

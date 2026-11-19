@@ -19,7 +19,7 @@ use aruna_operations::device::selection::select_document;
 use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, GetVisibleRequest};
 use aruna_operations::metadata::create_document::mint_local_document;
 use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::replay_event_log;
+use aruna_test_support::projection::replay_event_log;
 use topology::{TestNode, TestResult, Topology, wait_until};
 use ulid::Ulid;
 

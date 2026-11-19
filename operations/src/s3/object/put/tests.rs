@@ -31,7 +31,7 @@ fn count_files(path: &Path) -> usize {
 }
 
 async fn read_value(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {
-    crate::testing::read_value(&context.storage_handle, key_space, key).await
+    aruna_drivers::testing::read_value(&context.storage_handle, key_space, key).await
 }
 
 fn test_location(created_by: UserId) -> BackendLocation {

@@ -37,7 +37,7 @@ use aruna_operations::notifications::watch::origin::EmitEventOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::testing::sync_topic;
+use aruna_test_support::documents::sync_topic;
 use ulid::Ulid;
 
 use crate::convergence::wait_for_convergence;

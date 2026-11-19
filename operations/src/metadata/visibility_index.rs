@@ -1142,7 +1142,7 @@ mod tests {
     }
 
     fn context() -> (DriverContext, tempfile::TempDir) {
-        let (dir, context) = crate::testing::temp_context();
+        let (dir, context) = aruna_drivers::testing::temp_context();
         (context, dir)
     }
 

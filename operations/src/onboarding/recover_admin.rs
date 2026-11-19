@@ -208,7 +208,7 @@ mod tests {
     use ulid::Ulid;
 
     fn context_at(path: &str) -> DriverContext {
-        crate::testing::path_context(path)
+        aruna_drivers::testing::path_context(path)
     }
 
     fn admin_record(secret_hash: &str) -> OnboardingSecretRecord {

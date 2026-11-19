@@ -15,7 +15,7 @@ use aruna_operations::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
 };
 use aruna_operations::auth::error::ArunaBearerError;
-use aruna_operations::testing::sign_token;
+use aruna_test_support::tokens::sign_token;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use jsonwebtoken::errors::ErrorKind;

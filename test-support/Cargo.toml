@@ -1,0 +1,24 @@
+# Manifest of aruna-test-support, the test helpers that drive operations through the runner.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+aruna-core = { workspace = true }
+aruna-drivers = { workspace = true, features = ["test-hooks"] }
+aruna-operations = { workspace = true }
+aruna-storage = { workspace = true }
+aruna-tasks = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+irokle = { workspace = true }
+jsonwebtoken = { workspace = true }
+ulid = { workspace = true }

@@ -5,7 +5,7 @@
 use super::*;
 use crate::document_repository::GetConfigOperation;
 use crate::secrets::tests::{create, name, token};
-use crate::testing::path_context;
+use aruna_drivers::testing::path_context;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

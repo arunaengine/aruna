@@ -200,7 +200,7 @@ pub(crate) fn classify_root_summary(
 
 #[cfg(test)]
 mod tests {
-    use crate::testing::write_entries;
+    use aruna_drivers::testing::write_entries;
     use std::sync::Arc;
 
     use aruna_core::events::Event;
@@ -390,7 +390,7 @@ mod tests {
                 root
             ]
         });
-        match crate::testing::send_metadata_effect(
+        match aruna_drivers::testing::send_metadata_effect(
             &fixture.context,
             MetadataEffect::ApplyRoCrate {
                 request: ApplyRoCrateRequest {
