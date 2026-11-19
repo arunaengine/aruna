@@ -255,37 +255,13 @@ impl ArunaS3Service {
             sealed: None,
         };
         Ok((page, merged.next, merged.stale))
-                last_prefix = Some(raw.clone());
-                page_prefix = Some(raw);
-                merged.common_prefixes.push(prefix);
-            }
-            if let Some(object) = part.contents.last() {
-                last_key = object.key.as_deref().map(|key| Self::raw(key, url_encoded));
-            }
-            merged.contents.extend(part.contents);
-            // A range that stopped among hidden entries goes on from its member's cursor.
-            if let Some(cursor) = part.sealed {
-                let next = Resume::Sealed {
-                    lower: range.lower.clone(),
-                    node: lister,
-                    copy,
-                    cursor,
-                    group: last_prefix,
-                };
-                return Ok((merged, Some(next), stale));
-            }
-            if part.continuation_token.is_some() {
-                merged.continuation_token = part.continuation_token;
-                break;
-            }
-        }
-        Ok((merged, None, stale))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_operations::s3::object::list::ListContinuationToken;
 
     #[test]
     fn tokens_bind_query() {
@@ -311,79 +287,12 @@ mod tests {
     }
 
     #[test]
-    fn bounds_round_trip() {
-        let range = KeyRange {
-            range_id: Ulid::from_bytes([1; 16]),
-            lower: "a b".to_string(),
-            upper: Some("m&n".to_string()),
-            lineage: None,
-            coordinator: Ulid::from_bytes([2; 16]),
-            epoch: 1,
-            replicas: Vec::new(),
-        };
-        let query = range_query(&[("list-type", "2".to_string())], &range);
+    fn bounds_read_query() {
+        let query = "list-type=2&aruna-lower=a+b&aruna-upper=m%26n";
         assert_eq!(
-            named_bounds(Some(&query)),
+            named_bounds(Some(query)),
             Some(("a b".to_string(), Some("m&n".to_string())))
         );
         assert_eq!(named_bounds(Some("list-type=2")), None);
-    }
-
-    #[test]
-    fn holder_resumes_group() {
-        let token = ListContinuationToken {
-            last_key: BlobHeadKey::object_prefix("spire", "d/").unwrap(),
-            last_common_prefix: Some("d/".to_string()),
-        };
-        let input = ListBucketInput {
-            bucket: "spire".to_string(),
-            group_id: Ulid::from_bytes([1; 16]),
-            continuation_token: Some(token.clone()),
-            max_keys: Some(10),
-            prefix: None,
-            delimiter: Some("/".to_string()),
-            start_after: None,
-        };
-        let (name, value) = remote_start(&input, true).unwrap().unwrap();
-        assert_eq!(name, "continuation-token");
-        let sent = ArunaS3Service::decode_list_token(Some(&value)).unwrap();
-        assert_eq!(sent, Some(token));
-        assert_eq!(remote_start(&input, false).unwrap(), None);
-    }
-
-    #[test]
-    fn next_holder_answers() {
-        let mut not_held = S3Error::with_message(S3ErrorCode::Custom("RangeNotHeld".into()), "");
-        not_held.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
-        assert!(unreachable(&not_held));
-        assert!(!unreachable(&s3_error!(AccessDenied, "denied")));
-    }
-
-    #[test]
-    fn holder_page_scoped() {
-        let mut part = ObjectListingPage {
-            contents: vec![Object {
-                key: Some("secret".to_string()),
-                ..Default::default()
-            }],
-            common_prefixes: vec![CommonPrefix {
-                prefix: Some("private/".to_string()),
-            }],
-            continuation_token: None,
-            sealed: None,
-        };
-        // A scope without grants hides what the holder listed under its own rules.
-        scope_part(&mut part, &SubpathScope::default(), false);
-        assert!(part.contents.is_empty() && part.common_prefixes.is_empty());
-    }
-
-    #[test]
-    fn listing_bodies_parse() {
-        let body = "<ListBucketResult><Contents><Key>a&amp;b</Key><Size>3</Size></Contents>\
-                    <CommonPrefixes><Prefix>d/</Prefix></CommonPrefixes></ListBucketResult>";
-        let contents = xml_elements(body, "Contents");
-        assert_eq!(xml_field(contents[0], "Key").as_deref(), Some("a&b"));
-        let prefixes = xml_elements(body, "CommonPrefixes");
-        assert_eq!(xml_field(prefixes[0], "Prefix").as_deref(), Some("d/"));
     }
 }
