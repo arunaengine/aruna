@@ -251,7 +251,7 @@ async fn plans_until_ended() {
     aruna_drivers::driver::drive(
         crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
             routing: aruna_drivers::driver::node_routing(&context),
-            has_blob: (&context).blob_handle.is_some(),
+            has_blob: context.blob_handle.is_some(),
         }),
         &context,
     )
@@ -290,7 +290,7 @@ async fn plans_until_ended() {
     aruna_drivers::driver::drive(
         crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
             routing: aruna_drivers::driver::node_routing(&context),
-            has_blob: (&context).blob_handle.is_some(),
+            has_blob: context.blob_handle.is_some(),
         }),
         &context,
     )

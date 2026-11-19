@@ -59,7 +59,7 @@ fn sweep_by_standing() {
         deletes: Vec::new(),
         dropped: 0,
     };
-    let replay = |install: Ulid| ([&[b'r'][..], &install.to_bytes()].concat(), Vec::new());
+    let replay = |install: Ulid| ([&b"r"[..], &install.to_bytes()].concat(), Vec::new());
     assert!(matches!(
         plan.first().unwrap(),
         Next::Call(IoCall::Page { .. })

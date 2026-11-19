@@ -49,7 +49,7 @@ fn bounds_in_query() {
 fn holder_page_parsed() {
     let body = "<ListBucketResult><Contents><Key>a&amp;b</Key><Size>3</Size></Contents>\
                 <CommonPrefixes><Prefix>d/</Prefix></CommonPrefixes></ListBucketResult>";
-    let part = remote_objects(body).ok().expect("the page reads");
+    let part = remote_objects(body).expect("the page reads");
     assert_eq!(part.objects[0].key(), "a&b");
     assert_eq!(part.prefixes, ["d/"]);
     assert!(part.token.is_none() && part.sealed.is_none());

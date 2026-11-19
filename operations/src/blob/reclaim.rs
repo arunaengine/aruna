@@ -918,7 +918,7 @@ mod tests {
         let outcome = aruna_drivers::driver::drive(
             crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
                 routing: aruna_drivers::driver::node_routing(&after),
-                has_blob: (&after).blob_handle.is_some(),
+                has_blob: after.blob_handle.is_some(),
             }),
             &after,
         )

@@ -1254,7 +1254,7 @@ pub mod test {
         group: &Group,
         auth_doc: &GroupAuthorizationDocument,
         closed: Option<u64>,
-    ) -> Result<Next<(Group, GroupAuthorizationDocument, bool, Vec<UserId>)>, AddRoleError> {
+    ) -> Result<Next<super::AddedRole>, AddRoleError> {
         let config = activated_config(actor);
         operation.first().unwrap();
         let group_row = Some(group.to_bytes(actor).unwrap().into());

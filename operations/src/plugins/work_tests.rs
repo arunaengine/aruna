@@ -379,7 +379,7 @@ async fn prunes_settled_rows() {
         .unwrap();
         let mut job_record = record(spec_of(&install, &row), job(seq), JobState::Succeeded);
         job_record.finished_at_ms = Some(1);
-        insert_job(&ctx, &job_record).await.unwrap();
+        insert_job(ctx, &job_record).await.unwrap();
         rows.push((run.run_id, row));
     }
     assert_eq!(settle_work(ctx, 1).await, Ok(2));
@@ -444,7 +444,7 @@ async fn removal_cancels_first() {
     .await
     .unwrap();
     let job_record = record(spec_of(&install, &rows[0]), job(1), JobState::Queued);
-    insert_job(&ctx, &job_record).await.unwrap();
+    insert_job(ctx, &job_record).await.unwrap();
     let settle = |row: &mut WorkRow| row.state = WorkState::Settled;
     edit_work(ctx, ids(&rows[1]), settle).await.unwrap();
     let removing = |config: &mut RealmConfigDocument| {
@@ -456,7 +456,7 @@ async fn removal_cancels_first() {
     assert_eq!(retire_work(ctx, &config, 5).await, Ok(2));
     let kept = drive(read_work(ids(&rows[0]).0, ids(&rows[0]).1), ctx).await;
     assert!(kept.unwrap().unwrap().cancel);
-    let cancelled = read_job_record(&ctx, job(1), None).await;
+    let cancelled = read_job_record(ctx, job(1), None).await;
     assert_eq!(cancelled.unwrap().unwrap().state, JobState::Cancelled);
     // The job settled; its summary is kept, then the row goes.
     assert_eq!(retire_work(ctx, &config, 6).await, Ok(0));
@@ -522,7 +522,7 @@ async fn removal_keeps_finished() {
     )
     .await
     .unwrap();
-    insert_job(&ctx, &finished(&install, &row, job(1)))
+    insert_job(ctx, &finished(&install, &row, job(1)))
         .await
         .unwrap();
     let removing = |config: &mut RealmConfigDocument| {

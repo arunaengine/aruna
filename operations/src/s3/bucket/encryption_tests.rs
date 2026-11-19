@@ -120,7 +120,7 @@ fn no_versions(operation: &mut EnableEncryptionOperation) -> Turn {
 }
 
 fn sealed(effects: &Turn) -> Vec<SealedCopy> {
-    let Effect::Blob(BlobEffect::SealHolderCopies { key, holders, .. }) = asked(&effects) else {
+    let Effect::Blob(BlobEffect::SealHolderCopies { key, holders, .. }) = asked(effects) else {
         panic!("expected sealing, got {effects:?}");
     };
     holders

@@ -1420,7 +1420,6 @@ mod tests {
         drive(GetConfigOperation::new(realm_id), context)
             .await
             .inspect_err(config_unavailable)
-            .ok()
             .expect("the realm config is stored")
     }
 

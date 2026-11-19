@@ -969,7 +969,7 @@ mod tests {
         };
 
         let turn = fenced(true);
-        assert_eq!(written(&turn), [row_written.clone()]);
+        assert_eq!(written(&turn), std::slice::from_ref(&row_written));
         // A removed rule refuses the version, so no row outlives it.
         assert_eq!(fenced(false).err(), Some(PutObjectError::ImportRemoved));
     }
@@ -993,7 +993,7 @@ mod tests {
         };
 
         let turn = rows(Ulid::from_parts(5, 5));
-        assert_eq!(written(&turn), [version_written.clone()]);
+        assert_eq!(written(&turn), std::slice::from_ref(&version_written));
         // Dedup keeps an older location, so the new one gets no version row.
         let turn = rows(Ulid::from_parts(6, 6));
         let mut versions = written(&turn).iter();

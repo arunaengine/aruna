@@ -472,7 +472,7 @@ pub(crate) mod pure_tests {
 
     /// The bucket the test spec was submitted for.
     pub(super) fn test_bucket(spec: &StagingJobSpec) -> BucketInfo {
-        let (group_id, created_at, created_by) = spec.bucket_identity.clone();
+        let (group_id, created_at, created_by) = spec.bucket_identity;
         BucketInfo {
             group_id,
             created_at,

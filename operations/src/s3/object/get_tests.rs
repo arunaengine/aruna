@@ -95,7 +95,7 @@ fn step<O: Operation>(operation: &mut O, event: Event) -> Result<Next<O::Output>
 /// The effect a step asks the adapter for.
 fn asked<T: std::fmt::Debug, E: std::fmt::Debug>(turn: &Result<Next<T>, E>) -> &Effect {
     match turn {
-        Ok(Next::Call(IoCall::Effect(effect))) => &**effect,
+        Ok(Next::Call(IoCall::Effect(effect))) => effect,
         other => panic!("expected an effect, got {other:?}"),
     }
 }

@@ -849,7 +849,7 @@ mod pure_tests {
     /// The effect a step asks the adapter for.
     fn asked(turn: &Turn) -> &Effect {
         match turn {
-            Ok(Next::Call(IoCall::Effect(effect))) => &**effect,
+            Ok(Next::Call(IoCall::Effect(effect))) => effect,
             other => panic!("expected an effect, got {other:?}"),
         }
     }

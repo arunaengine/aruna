@@ -78,7 +78,7 @@ fn filtered_query_caches() {
     let (mut query, lookup) = looked_up(Some(vec![graph_iri.clone()]), vec![record(1)]);
     let key = local_key(
         LocalScopeKind::Eager,
-        &graphs_digest(&[graph_iri.clone()]),
+        &graphs_digest(std::slice::from_ref(&graph_iri)),
         ASK,
     )
     .bytes();

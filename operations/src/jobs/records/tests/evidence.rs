@@ -435,15 +435,14 @@ fn refuses_partial_scan() {
     assert!(failed.is_err());
 }
 
-/// Answers every call of `operation` as an empty store would, after the realm config read,
-/// and returns its result and the rows it wrote.
-fn run_calls(
-    mut operation: AppendRecordOperation,
-    config: Vec<u8>,
-) -> (
+type CallsRun = (
     Result<AppendOutcome, RecordStoreError>,
     Vec<(String, Key, Value)>,
-) {
+);
+
+/// Answers every call of `operation` as an empty store would, after the realm config read,
+/// and returns its result and the rows it wrote.
+fn run_calls(mut operation: AppendRecordOperation, config: Vec<u8>) -> CallsRun {
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::operation::{Operation, TransactionMode};
     assert_eq!(operation.transaction(), TransactionMode::Write);

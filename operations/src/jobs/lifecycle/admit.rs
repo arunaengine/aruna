@@ -411,7 +411,7 @@ mod pure_tests {
             candidate: Box::new(AdmissionCandidate {
                 job_id,
                 spec: sign(JobFamilyRecord::Spec(Box::new(spec.clone()))),
-                claim: sign(JobFamilyRecord::Claim(claim.clone())),
+                claim: sign(JobFamilyRecord::Claim(claim)),
             }),
             now_ms: 3_000,
             quota_refusal: None,

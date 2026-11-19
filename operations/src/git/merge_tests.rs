@@ -40,15 +40,14 @@ fn changed(path: &str) -> IoResult {
 }
 
 fn editing() -> EditOperation {
-    let edit = edit(
+    edit(
         &git_node(),
         &auth(),
         id(),
         "draft",
         "{}".to_string(),
         options(None),
-    );
-    edit
+    )
 }
 
 /// An edit stepped to the answer of the store's edit.
