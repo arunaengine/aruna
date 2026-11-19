@@ -383,6 +383,7 @@ fn unserved_run_fails() {
 fn unresolved_backend_settles() {
     let mut run = run_of(claimed());
     run.first().unwrap();
+    run.next(IoResult::Values(vec![None])).unwrap();
     let error = JobError::retryable("no backend");
     let reply = child(Err::<ResolvedBackend, _>(error.clone()));
     assert_eq!(run.next(reply), Ok(failure(error, false)));
