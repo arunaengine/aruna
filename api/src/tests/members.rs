@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, NODE_INFO_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -26,7 +27,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
 };
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

@@ -7,14 +7,15 @@ use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::VaultQuery;
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::VaultRecords;
 use aruna_core::structs::storage::holders::KeyLookup;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
-use crate::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
+use crate::users::vault::read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
 
 /// How long one key directory lookup may wait for the holders of a user's vault.
 const KEY_LOOKUP_DEADLINE: Duration = Duration::from_secs(10);

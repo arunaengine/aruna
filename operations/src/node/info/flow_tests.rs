@@ -4,10 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::compute::quota::ResourceTotals;
 use aruna_core::events::Event;
 use aruna_core::heartbeat::RunningJobs;
+use aruna_core::id::NodeId;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::node_info::NodeUrls;
@@ -23,7 +23,7 @@ use crate::node::info::flows::{
 };
 use crate::node::info::inputs::{HeldDocumentsOperation, advertises_executors, held_placement_set};
 use crate::node::info::write::PUBLISH_OWED_KEY;
-use crate::placement::policy::{SubjectScanError, SubjectScanResult};
+use crate::placement::policy::subject::{SubjectScanError, SubjectScanResult};
 use aruna_core::compute::quota::ComputeDemandSnapshot;
 use aruna_core::compute::quota::ComputeReservationSnapshot;
 use aruna_core::compute::quota::{
@@ -199,7 +199,7 @@ async fn write_realm_config(ctx: &DriverContext, config: &RealmConfigDocument) {
         .unwrap_or_else(|| node(1));
     let actor = aruna_core::structs::identity::auth::Actor {
         node_id,
-        user_id: aruna_core::UserId::nil(config.realm_id),
+        user_id: aruna_core::user::id::UserId::nil(config.realm_id),
         realm_id: config.realm_id,
     };
     let target = DocumentTarget::RealmConfig {
@@ -262,7 +262,7 @@ fn device_advertises_nothing() {
     config.ensure_node(
         device,
         RealmNodeKind::User {
-            owner: aruna_core::UserId::nil(realm_id),
+            owner: aruna_core::user::id::UserId::nil(realm_id),
         },
     );
 
@@ -281,7 +281,7 @@ async fn device_seeds_empty() {
     config.ensure_node(
         local,
         RealmNodeKind::User {
-            owner: aruna_core::UserId::nil(realm_id),
+            owner: aruna_core::user::id::UserId::nil(realm_id),
         },
     );
     write_realm_config(&ctx, &config).await;
@@ -318,7 +318,7 @@ async fn device_publishes_locally() {
     config.ensure_node(
         local,
         RealmNodeKind::User {
-            owner: aruna_core::UserId::nil(realm_id),
+            owner: aruna_core::user::id::UserId::nil(realm_id),
         },
     );
     write_realm_config(&ctx, &config).await;
@@ -634,7 +634,7 @@ fn spec_record(realm_id: RealmId, family: JobFamilyId, group_id: Ulid) -> JobRec
         ingress_node_id: origin,
         realm_id,
         group_id,
-        created_by: aruna_core::UserId::nil(realm_id),
+        created_by: aruna_core::user::id::UserId::nil(realm_id),
         created_at_ms: 1_000,
         retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
         payload: aruna_core::structs::execution::job::ExecutionSpec {
@@ -919,7 +919,7 @@ async fn ignores_user_devices() {
     config.ensure_node(
         node(2),
         RealmNodeKind::User {
-            owner: aruna_core::UserId::nil(realm_id),
+            owner: aruna_core::user::id::UserId::nil(realm_id),
         },
     );
     write_realm_config(&ctx, &config).await;

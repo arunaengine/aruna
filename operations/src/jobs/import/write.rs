@@ -31,7 +31,7 @@ use crate::harvest::read_connector::ConnectorView;
 use crate::jobs::repository::connector::ConnectorViewOperation;
 use crate::jobs::repository::invenio::reference::WriteRepositoryReference;
 use crate::jobs::repository::{TransferError, is_reference, reference_source};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };

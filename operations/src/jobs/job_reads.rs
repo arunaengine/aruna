@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::JobStatusView;
@@ -18,6 +17,7 @@ use aruna_core::structs::identity::realm::{JobOwnerError, RealmConfigDocument};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

@@ -22,10 +22,11 @@ use aruna_drivers::testing::test_context;
 use aruna_drivers::testing::write_entries;
 use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
-use aruna_operations::sync::sync_quarantine::{
-    AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
-    QuarantinePage, QuarantinePageRequest, ReadQuarantineOperation,
-};
+use aruna_operations::sync::sync_quarantine::acknowledge::AcknowledgeQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::list::ListQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::prune::PruneQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::read::ReadQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::{QuarantinePage, QuarantinePageRequest};
 use aruna_storage::storage::handle::StorageHandle;
 use aruna_test_support::documents::reconcile_topics;
 use byteview::ByteView;
@@ -94,7 +95,7 @@ async fn fill_store(storage: &StorageHandle) -> SyncQuarantineUsage {
     usage
 }
 
-fn node_info_bytes(node_id: aruna_core::NodeId) -> Vec<u8> {
+fn node_info_bytes(node_id: aruna_core::id::NodeId) -> Vec<u8> {
     NodeInfoDocument {
         node_id,
         executors: Vec::new(),

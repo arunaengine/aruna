@@ -8,8 +8,7 @@ use aruna_core::structs::execution::job::OutputObject;
 use super::*;
 use crate::plugins::calls::*;
 use crate::plugins::submit::WorkRequest;
-use crate::plugins::submit::tests::{request, scope};
-use crate::plugins::work::tests::edit_work;
+use crate::plugins::test_support::{edit_work, request, scope};
 use crate::plugins::work::{FinalState, WorkState};
 use aruna_test_support::plugins::Fixture;
 use aruna_test_support::plugins::ready;
@@ -88,7 +87,7 @@ async fn status_from_row() {
     }
     // A reinstall under the same id has another account and does not see the job.
     let mut other = install.clone();
-    other.account = aruna_core::UserId::local(Ulid::from_parts(6, 6), fixture.actor.realm_id);
+    other.account = aruna_core::user::id::UserId::local(Ulid::from_parts(6, 6), fixture.actor.realm_id);
     let foreign = job_status(&fixture.ctx, (&other, local), &id.to_string()).await;
     assert_eq!(
         foreign.map(drop).map_err(|e| e.kind),

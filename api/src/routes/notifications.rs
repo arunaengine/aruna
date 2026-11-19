@@ -11,9 +11,8 @@ use crate::routes::notification_calls::{
     unread_for_user,
 };
 use crate::server::state::ServerState;
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::id::NodeId;
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -23,6 +22,7 @@ use aruna_core::structs::execution::notification_watch::{
     parse_watch_path, watch_resource_path,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::notifications::dispatch::NotificationDispatchError;
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;

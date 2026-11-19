@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::plugin_runs::HookRequest;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_drivers::driver::{DriverContext, drive};

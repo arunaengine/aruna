@@ -6,8 +6,6 @@
 // That transaction holds the signed revision, the accepted request and the outbox row.
 // Only committed revisions are published.
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -16,6 +14,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, SnapshotSignEvent};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     CATCH_UP_KEYSPACE, DISTRIBUTION_ACCEPT_KEYSPACE, DISTRIBUTION_KEYSPACE,
@@ -35,6 +34,7 @@ use aruna_core::structs::storage::distribution::{
     DistributionView, SetPhase, SignedSnapshot, next_snapshot, publisher_key,
 };
 use aruna_core::structs::storage::usage::dirty_share_key;
+use aruna_core::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;

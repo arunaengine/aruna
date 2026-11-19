@@ -13,7 +13,9 @@ use tracing::warn;
 
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::device::publish_queue::DrainOutcome;
-use aruna_operations::device::sync::folders::{finish_binding, finish_unbind, list_folders};
+use aruna_operations::device::sync::folders::bind::finish_binding;
+use aruna_operations::device::sync::folders::reads::list_folders;
+use aruna_operations::device::sync::folders::unbind::finish_unbind;
 use aruna_operations::device::sync::reconcile::ReconcilePlan;
 use aruna_operations::device::sync::{ReconcileFolderError, folder_pass, sync_timers};
 use aruna_operations::metadata::device::drain::publish_pending;

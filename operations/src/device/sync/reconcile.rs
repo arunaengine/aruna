@@ -701,11 +701,11 @@ impl ReconcileFolderOperation {
 #[cfg(test)]
 pub(super) mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::offered_directory::FileStat;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::{FolderMode, FolderState, RemoteBinding};
+    use aruna_core::user::id::UserId;
     use byteview::ByteView;
 
     pub(crate) fn folder() -> SyncedFolder {
@@ -716,7 +716,7 @@ pub(super) mod pure_tests {
             local_bucket: "folder-x".to_string(),
             group_id: Ulid::from_bytes([2u8; 16]),
             remote: RemoteBinding {
-                node_id: aruna_core::NodeId::from_bytes(&[3u8; 32]).expect("node id"),
+                node_id: aruna_core::id::NodeId::from_bytes(&[3u8; 32]).expect("node id"),
                 bucket: "lab".to_string(),
                 prefix: String::new(),
             },

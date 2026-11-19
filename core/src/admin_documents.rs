@@ -7,8 +7,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
-use crate::UserId;
+use crate::id::NodeId;
 use crate::structs::identity::auth::{Actor, Permission, Role};
 use crate::structs::identity::realm::{
     MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig, RealmId,
@@ -23,6 +22,7 @@ use crate::structs::placement::transition::{
     CandidatePlacementMap, CompletionProof, TransitionPlan,
 };
 use crate::types::{GroupId, RoleId};
+use crate::user::id::UserId;
 
 /// Domain separator for the origin signature over an administrative event.
 pub const DOCUMENT_EVENT_DOMAIN: &str = "aruna-admin-document-event-v1";
@@ -520,8 +520,7 @@ pub fn roles_narrowed(
 #[cfg(test)]
 mod tests {
     use super::{AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition};
-    use crate::NodeId;
-    use crate::UserId;
+    use crate::id::NodeId;
     use crate::structs::identity::auth::Permission;
     use crate::structs::identity::realm::{
         MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig, RealmId,
@@ -535,6 +534,7 @@ mod tests {
     };
     use crate::structured_id::PlacementHandle;
     use crate::types::{GroupId, RoleId};
+    use crate::user::id::UserId;
     use std::collections::BTreeMap;
     use ulid::Ulid;
 

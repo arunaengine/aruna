@@ -4,7 +4,7 @@
 
 use std::time::SystemTime;
 
-use aruna_core::UserId;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use crate::metadata::api::fanout_types::MetadataFanoutStats;

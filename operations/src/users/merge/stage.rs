@@ -8,6 +8,7 @@ use aruna_core::admin_documents::{
 };
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::ConversionError;
+use aruna_core::id::NodeId;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
@@ -16,7 +17,7 @@ use aruna_core::structs::identity::auth::{Actor, Role};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, KeySpace, RoleId, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashMap;
 

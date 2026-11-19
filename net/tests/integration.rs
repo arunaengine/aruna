@@ -6,12 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_clock::testing::poll_until;
-use aruna_core::TopicId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::id::{DhtKeyId, NodeId};
+use aruna_core::id::{DhtKeyId, NodeId, TopicId};
 use aruna_core::keys::realm_presence_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::{ConnectionAddressStatus, NetState, PeerConnectionStatus};

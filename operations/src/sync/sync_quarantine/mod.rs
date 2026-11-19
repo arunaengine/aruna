@@ -2,15 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod acknowledge;
-mod list;
-mod prune;
-mod read;
-
-pub use acknowledge::AcknowledgeQuarantineOperation;
-pub use list::ListQuarantineOperation;
-pub use prune::PruneQuarantineOperation;
-pub use read::ReadQuarantineOperation;
+pub mod acknowledge;
+pub mod list;
+pub mod prune;
+pub mod read;
 
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::errors::{ConversionError, StorageError};

@@ -605,7 +605,7 @@ async fn build_context(with_metadata: bool) -> Result<TestContext, Box<dyn std::
     let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
     let actor = Actor {
         node_id,
-        user_id: aruna_core::UserId::local(Ulid::from_parts(8, 1), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(8, 1), realm_id),
         realm_id,
     };
     let metadata_dir = if with_metadata {

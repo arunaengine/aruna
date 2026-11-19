@@ -5,8 +5,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::PrefixPages;
@@ -47,7 +47,7 @@ use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::object::list::{
     ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
@@ -1291,7 +1291,7 @@ mod tests {
         BucketInfo {
             group_id: Ulid::from_bytes([2; 16]),
             created_at: std::time::UNIX_EPOCH,
-            created_by: aruna_core::UserId::nil(realm_id),
+            created_by: aruna_core::user::id::UserId::nil(realm_id),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),

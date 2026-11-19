@@ -30,7 +30,7 @@ fn spec(scope: StoragePurgeScope) -> StoragePurgeSpec {
         scope,
         group_id: group(),
         auth_context: AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
             realm_id,
             path_restrictions: None,
             session: None,

@@ -6,13 +6,13 @@
 use aruna_core::id_mint::IdMint;
 use std::collections::BTreeSet;
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, PeerRequestError};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::target_placement_ref;
@@ -454,7 +454,7 @@ pub struct PublishEntryConfig {
     pub auth_context: AuthContext,
     pub plugin: PublishedPlugin,
     /// Management nodes that confirmed a complete, synced copy, this one included.
-    pub copies: BTreeSet<aruna_core::NodeId>,
+    pub copies: BTreeSet<aruna_core::id::NodeId>,
 }
 
 /// Writes one published plugin version into the realm config in one transaction, after the

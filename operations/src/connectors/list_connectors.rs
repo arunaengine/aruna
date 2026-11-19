@@ -10,9 +10,8 @@ use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 
-use crate::connectors::repository::{
-    LIST_CONNECTOR_SIZE, StorageReadError, source_connector_prefix,
-};
+use crate::connectors::repository::{LIST_CONNECTOR_SIZE, source_connector_prefix};
+use aruna_core::errors::StorageReadError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListSourceInput {

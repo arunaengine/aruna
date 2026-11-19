@@ -10,11 +10,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::NodeId;
-use crate::UserId;
+use crate::id::NodeId;
 use crate::structs::identity::auth::{PathRestriction, SessionRef};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::backend_import::TokenGrant;
+use crate::user::id::UserId;
 
 /// The query parameter a redirect carries its ticket in; request logs redact it.
 pub const TICKET_QUERY: &str = "ticket";

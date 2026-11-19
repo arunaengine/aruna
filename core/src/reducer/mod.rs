@@ -11,13 +11,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::NodeId;
-use crate::UserId;
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentTarget, AdminRoleDefinition,
 };
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained, valid_token_hash};
+use crate::id::NodeId;
 use crate::structs::identity::auth::Actor;
 use crate::structs::identity::realm::{
     MetadataReplicationConfig, NodePlace, OidcProviderConfig, QuotaConfig, RealmConfigDocument,
@@ -37,6 +36,7 @@ use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::reserved_label;
 use crate::structured_id::PlacementHandle;
 use crate::types::RoleId;
+use crate::user::id::UserId;
 use crate::user::validation::{
     UserAttributeError, validate_attribute_key, validate_attribute_value,
 };

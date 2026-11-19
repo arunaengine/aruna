@@ -39,7 +39,7 @@ use super::{
     entry_arn, entry_location, entry_report, failure_message, hidden_delete, hidden_deleted,
     permission_result, rollback_required, transfer_failure, validation_failure,
 };
-use crate::jobs::export::CrateJsonOperation;
+use crate::jobs::export::snapshot::CrateJsonOperation;
 use crate::jobs::repository::links::LinkError;
 use crate::jobs::repository::pull::{PullRunningOperation, SettleImportOperation};
 use crate::jobs::repository::{TransferError, is_reference};

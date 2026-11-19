@@ -3,9 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::id::NodeId;
 use std::cmp::Ordering;
-
-use crate::NodeId;
 
 pub const PLACEMENT_DOMAIN: &[u8] = b"aruna-placement-rendezvous-v3";
 pub const ROLE_LOCATION: u8 = b'L';

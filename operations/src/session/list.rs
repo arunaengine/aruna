@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::index::{decode_index, owner_key};
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::user::session::UserSession;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]

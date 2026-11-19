@@ -11,7 +11,6 @@ use aruna_api::cors::CorsConfig;
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{MAX_BODY_SIZE, Server, ServerConfig};
 use aruna_blob::blob::BlobHandler;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -26,6 +25,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_net::NetHandle;
@@ -1178,7 +1178,7 @@ async fn authoring_docs_resource() {
 }
 
 /// Publishes `api` as the api address of `node_id`.
-async fn publish_api(state: &ServerState, node_id: aruna_core::NodeId, api: &str) {
+async fn publish_api(state: &ServerState, node_id: aruna_core::id::NodeId, api: &str) {
     use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
     use aruna_core::structs::storage::node_info::{
         AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,

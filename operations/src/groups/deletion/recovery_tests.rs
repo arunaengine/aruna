@@ -25,7 +25,7 @@ use aruna_test_support::groups::{Fixture, context, node, read, write};
 async fn unauthorized_prepare_refuses() {
     let mut fixture = Fixture::new(&[1]).await;
     fixture.plan.requested_by =
-        aruna_core::UserId::local(Ulid::from_bytes([8; 16]), fixture.plan.realm_id);
+        aruna_core::user::id::UserId::local(Ulid::from_bytes([8; 16]), fixture.plan.realm_id);
     assert_eq!(
         prepare(&fixture, 1).await,
         Err(GroupDeletionError::Unauthorized)
@@ -44,7 +44,7 @@ async fn unauthorized_prepare_refuses() {
 #[tokio::test]
 async fn realm_admin_deletes() {
     let mut fixture = Fixture::new(&[1]).await;
-    let admin = aruna_core::UserId::local(Ulid::from_bytes([8; 16]), fixture.plan.realm_id);
+    let admin = aruna_core::user::id::UserId::local(Ulid::from_bytes([8; 16]), fixture.plan.realm_id);
     fixture.plan.requested_by = admin;
     fixture.actor.user_id = admin;
     fixture.auth.user_id = admin;

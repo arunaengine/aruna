@@ -249,7 +249,7 @@ fn relationship(source_bucket: &str) -> aruna_core::structs::SyncRelationship {
         reference_handling: Default::default(),
         reference_serving: false,
         replicate_deletes: true,
-        created_by: aruna_core::UserId::local(ulid::Ulid::from_bytes([8u8; 16]), realm_id),
+        created_by: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([8u8; 16]), realm_id),
         created_at: std::time::SystemTime::UNIX_EPOCH,
         state: SyncState::Enabled,
         status: SyncStatusSnapshot::default(),
@@ -277,7 +277,7 @@ fn workspace_delete_allowed() {
         stored.created_by,
         false
     ));
-    let other = aruna_core::UserId::local(ulid::Ulid::from_bytes([9u8; 16]), realm_id);
+    let other = aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([9u8; 16]), realm_id);
     assert!(!valid_sync_request(&stored, buckets, realm_id, other, true));
 }
 

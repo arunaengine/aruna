@@ -3,13 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::OriginVersion;
 use aruna_core::structs::storage::release::ReleaseMembers;
+use aruna_core::user::id::UserId;
 use std::time::SystemTime;
 
 use super::*;

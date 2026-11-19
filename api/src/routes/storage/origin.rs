@@ -606,7 +606,7 @@ async fn origin_answer(
 async fn copy_origin(
     state: &ServerState,
     (set_id, range_id): (Ulid, Ulid),
-    copies: Vec<aruna_core::NodeId>,
+    copies: Vec<aruna_core::id::NodeId>,
     path: &str,
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Json<OriginResponse>> {
@@ -781,8 +781,8 @@ async fn global_origin(
 /// Asks `holders` in turn for the origin; a copy's miss goes on, the coordinator's decides.
 async fn relay_origin(
     state: &ServerState,
-    (set_id, range_id, coordinator): (Ulid, Ulid, aruna_core::NodeId),
-    holders: Vec<aruna_core::NodeId>,
+    (set_id, range_id, coordinator): (Ulid, Ulid, aruna_core::id::NodeId),
+    holders: Vec<aruna_core::id::NodeId>,
     (path, sent): (&str, HeaderMap),
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Json<OriginResponse>> {

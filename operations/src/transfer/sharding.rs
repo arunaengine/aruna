@@ -10,9 +10,9 @@ use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::HeldHeartbeat;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
 };
@@ -34,7 +34,6 @@ use super::balance::{BalanceInputs, BalanceOperation, COOL_DOWN, balance_inputs}
 use super::lifecycle::{LifecycleCursors, LifecyclePass, TendLifecycleOperation};
 use super::refresh::{RefreshCursor, RefreshError, RefreshPass, RefreshRangesOperation};
 use crate::distribution::imports::{ContinueImportsOperation, ImportError, KeptStart};
-pub use crate::distribution::rebuild::BeginRebuildsError;
 use crate::distribution::rebuild::{
     BeginRebuildsOperation, RebuildConfig, RebuildError, RebuildOperation, RebuildOutcome, decode,
 };

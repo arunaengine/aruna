@@ -4,10 +4,10 @@
 
 use std::collections::HashSet;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::ConversionError;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -285,9 +285,9 @@ impl Operation for RealmUsageOperation {
 mod state_machine_tests {
     use std::collections::BTreeMap;
 
-    use aruna_core::NodeId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::document::DocumentTarget;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -323,7 +323,7 @@ mod state_machine_tests {
         config.seed_default_placement();
         config.ensure_node(node(1), RealmNodeKind::Server);
         config.ensure_node(node(2), RealmNodeKind::Server);
-        let owner = aruna_core::UserId::new(Ulid::from_bytes([9; 16]), REALM);
+        let owner = aruna_core::user::id::UserId::new(Ulid::from_bytes([9; 16]), REALM);
         config.ensure_node(node(3), RealmNodeKind::User { owner });
         Value::from(postcard::to_allocvec(&config).unwrap())
     }

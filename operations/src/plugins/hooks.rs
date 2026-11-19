@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::PLUGIN_HOOKS_KEYSPACE;
 use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::plugin_runs::{PluginRun, hook_key, hook_time_key};

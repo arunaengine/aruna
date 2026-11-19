@@ -10,9 +10,9 @@ use thiserror::Error;
 use ulid::Ulid;
 use url::Url;
 
-use crate::UserId;
 use crate::compute::{Secret, SecretBytes};
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 /// Encoded bytes a secret value may take.
 pub const MAX_VALUE_BYTES: usize = 16 * 1024;

@@ -24,7 +24,7 @@ use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use ulid::Ulid;
 
-pub async fn state_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
+pub async fn state_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::id::NodeId>> {
     let ctx = state.get_ctx();
     let discovery = DiscoveryOperation::new(state.get_realm_id(), state.get_node_id());
     let discovery = drive(discovery, ctx.as_ref()).await;

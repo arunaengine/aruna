@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::operation::Operation;
@@ -11,6 +10,7 @@ use aruna_core::structs::execution::notification_watch::{
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 
 use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
 use crate::notifications::unexpected;

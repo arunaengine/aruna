@@ -141,13 +141,13 @@ impl Operation for SearchGroupsOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::{SearchGroupsInput, SearchGroupsMatch, SearchGroupsOperation, SearchGroupsOutput};
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::Group;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::{Key, Value};
+    use aruna_core::user::id::UserId;
     use std::collections::HashSet;
     use ulid::Ulid;
 

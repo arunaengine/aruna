@@ -11,7 +11,6 @@ use crate::s3::row_fence::{FenceError, RowFence};
 use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
-use aruna_core::UserId;
 use aruna_core::blob_records::HeadAliasContext;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -46,6 +45,7 @@ use aruna_core::structs::storage::replication_queue::{
 };
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;

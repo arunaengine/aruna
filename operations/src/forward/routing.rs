@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::fetch::PeerFrame;
-use aruna_core::NodeId;
 use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::events::PeerRequestError;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, WriteAuthError, peer_call, peer_reply,
 };

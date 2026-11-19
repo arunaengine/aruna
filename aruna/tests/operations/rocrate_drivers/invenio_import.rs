@@ -62,7 +62,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
     );
     // Adding identifiers needs WRITE on the document, also on the authority itself.
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(ulid::Ulid::from_parts(7, 7), fixture.actor.realm_id),
+        user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_parts(7, 7), fixture.actor.realm_id),
         realm_id: fixture.actor.realm_id,
         path_restrictions: None,
         session: None,
@@ -362,7 +362,7 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn doi_keeps_case() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::resolve;
-    use aruna_operations::jobs::repository::RecordReference;
+    use aruna_operations::jobs::repository::invenio::query::RecordReference;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let connector_id = connector(&fixture, &server).await;

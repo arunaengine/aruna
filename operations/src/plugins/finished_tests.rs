@@ -17,11 +17,9 @@ use crate::plugins::rows::tests::page_result;
 use crate::plugins::rows::tests::values_result;
 use crate::plugins::runs::{list_runs, save_run};
 use crate::plugins::submit::WorkRequest;
-use crate::plugins::submit::tests::{request, scope};
-use crate::plugins::test_support::{install_as, install_request};
-use crate::plugins::work::tests::edit_work;
+use crate::plugins::test_support::{edit_work, install_as, install_request, request, scope};
 use crate::plugins::work::{FinalState, prune_work, read_work, summary_of};
-use crate::transfer::copy::test::seed_bucket;
+use aruna_drivers::testing::seed_bucket;
 use aruna_test_support::plugins::Fixture;
 use aruna_test_support::plugins::{path, ready};
 

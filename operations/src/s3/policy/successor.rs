@@ -8,7 +8,7 @@ use crate::distribution::guard::{GuardError, authority_reads, write_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::placement::policy::{PolicyGateError, split_drift_reads};
+use crate::placement::policy::gate::{PolicyGateError, split_drift_reads};
 use crate::s3::object::put::abe::keyed;
 use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::usage::{
@@ -807,7 +807,7 @@ fn reusable_copy(
 fn successor_version(
     predecessor: &BlobVersion,
     created_at: SystemTime,
-    created_by: aruna_core::UserId,
+    created_by: aruna_core::user::id::UserId,
 ) -> BlobVersion {
     let mut successor = predecessor.clone();
     successor.created_at = created_at;
@@ -913,7 +913,6 @@ mod pure_tests {
         SuccessorOutcome, SuccessorPlan, successor_version,
     };
     use crate::s3::purge_fence::PurgeFenceError;
-    use aruna_core::UserId;
     use aruna_core::blob_records::HeadAliasContext;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::id::NodeId;
@@ -944,6 +943,7 @@ mod pure_tests {
     use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
     use aruna_core::types::{Key, Value};
+    use aruna_core::user::id::UserId;
     use std::collections::{BTreeMap, HashMap};
     use std::time::{SystemTime, UNIX_EPOCH};
     use ulid::Ulid;

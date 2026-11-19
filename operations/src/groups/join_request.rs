@@ -547,13 +547,13 @@ impl Operation for JoinWrite {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::AdminRoleDefinition;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
 
     #[test]
     fn retries_commit_conflict() {

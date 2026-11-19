@@ -10,10 +10,10 @@ use crate::forward::write_peer::WritePeerOperation;
 use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
-use aruna_core::NodeId;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::PeerAuthRefusal;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::operation::Operation;
@@ -336,8 +336,8 @@ fn accept_existing(info: &BucketInfo, group_id: GroupId, bucket: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::user::id::UserId;
     use std::time::SystemTime;
     use ulid::Ulid;
 

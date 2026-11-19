@@ -5,12 +5,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentTarget;
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::user::id::UserId;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_net::streams::BiStream;
 use aruna_net::{InboundEventHandler, NetHandle};

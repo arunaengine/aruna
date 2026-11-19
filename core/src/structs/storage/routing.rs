@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::storage::backend_import::BackendImport;
 use crate::structs::storage::blob::{BackendRef, ResolvedBackend};
@@ -11,6 +10,7 @@ use crate::structs::storage::discovery::{DiscoveryRule, storage_path};
 use crate::structs::storage::format::Compression;
 use crate::structs::storage::group_backend::reserved_path;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};

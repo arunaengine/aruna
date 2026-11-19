@@ -293,7 +293,7 @@ impl JobsRuntime {
                     kind: JobKind::Probe,
                     target: None,
                     group_id: None,
-                    created_by: aruna_core::UserId::nil(
+                    created_by: aruna_core::user::id::UserId::nil(
                         aruna_core::structs::identity::realm::RealmId([0; 32]),
                     ),
                     progress: None,

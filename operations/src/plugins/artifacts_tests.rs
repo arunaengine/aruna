@@ -5,8 +5,8 @@
 use super::*;
 use crate::plugins::calls::*;
 use crate::plugins::runs::tests::opened;
-use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
 

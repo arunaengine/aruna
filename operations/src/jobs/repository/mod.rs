@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_core::repository::remote::{
     JobStop, NodeScope, RemoteAnswer, RemoteCall, RemoteFailure, RemoteRequest, StopReason,
 };
@@ -30,7 +30,6 @@ pub(crate) mod push;
 mod submit;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub use invenio::query::RecordReference;
 
 /// The running job an operation works for: its identity, stop signals and progress.
 #[derive(Clone)]
@@ -235,7 +234,7 @@ pub fn ensure_supported(
 /// `nonce` must never repeat under the node's credential key.
 pub fn seal_token(
     scope: &NodeScope,
-    user: aruna_core::UserId,
+    user: aruna_core::user::id::UserId,
     view: &ConnectorView,
     link_id: Option<Ulid>,
     token: &str,

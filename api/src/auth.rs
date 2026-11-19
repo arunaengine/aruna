@@ -740,7 +740,6 @@ mod test {
     };
     use crate::error::{ServerError, TokenError};
     use crate::server::state::ServerState;
-    use aruna_core::UserId;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::StorageError;
@@ -751,6 +750,7 @@ mod test {
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, TokenClaims};
     use aruna_core::structs::identity::realm::OidcProviderConfig;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::NetHandle;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

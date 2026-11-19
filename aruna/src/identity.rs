@@ -5,12 +5,12 @@
 #[path = "identity_enrollment.rs"]
 pub mod enrollment;
 
-use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW};
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase, OnboardingSecretError};
 use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -323,8 +323,8 @@ pub async fn mark_onboarding_phase(
 mod tests {
     use super::enrollment::{EnrollmentPlan, plan_enrollment};
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::user::id::UserId;
 
     /// The persisted record keeps its byte layout across the ownership move:
     /// the stored encoding is part of the deployed compatibility surface.

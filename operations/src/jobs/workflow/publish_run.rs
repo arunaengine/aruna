@@ -5,7 +5,6 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::RUN_PUBLISH_KEYSPACE;
@@ -21,6 +20,7 @@ use aruna_core::structs::identity::realm::{NodeRealm, RealmConfigDocument, Realm
 use aruna_core::structs::storage::data::identity::parse_hash;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{RemoteBinding, SyncPull, SyncPullAck, SyncRefusal};
+use aruna_core::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

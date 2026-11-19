@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
@@ -15,6 +14,7 @@ use aruna_core::structs::storage::replication_queue::{
     schedule_blob_drain,
 };
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -504,10 +504,9 @@ mod tests {
         .await
     }
     use super::super::version_replication::SourceAuthorizationError;
-    use crate::replication::mirror_repair::StoreStatusOperation;
-    use aruna_core::NodeId;
-    use aruna_core::UserId;
+    use crate::replication::mirror_repair::status::StoreStatusOperation;
     use aruna_core::effects::Effect;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
@@ -536,6 +535,7 @@ mod tests {
     };
     use aruna_core::structs::{ReferenceHandling, SyncStatusSnapshot, sync_relationship_key};
     use aruna_core::task::{TaskEvent, TaskKey};
+    use aruna_core::user::id::UserId;
     use aruna_net::NetHandle;
     use aruna_storage::storage::worker::FjallStorage;
     use std::time::{Duration, SystemTime};

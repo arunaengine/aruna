@@ -60,8 +60,8 @@ pub mod tests;
 
 /// Deterministic member order for records that several nodes must byte-match.
 pub(crate) fn sorted_user_ids(
-    user_ids: &std::collections::HashSet<aruna_core::UserId>,
-) -> Vec<aruna_core::UserId> {
+    user_ids: &std::collections::HashSet<aruna_core::user::id::UserId>,
+) -> Vec<aruna_core::user::id::UserId> {
     let mut user_ids: Vec<_> = user_ids.iter().copied().collect();
     user_ids.sort();
     user_ids

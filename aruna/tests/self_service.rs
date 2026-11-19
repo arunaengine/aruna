@@ -5,7 +5,7 @@
 use crate::shared;
 
 use aruna_api::routes::access::groups::CreateGroupRequest;
-use aruna_core::UserId;
+use aruna_core::user::id::UserId;
 use reqwest::StatusCode;
 use shared::{TestResult, create_bearer_token, spawn_seed_node};
 use ulid::Ulid;

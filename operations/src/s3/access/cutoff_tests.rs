@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
 use aruna_core::auth::{MAX_TOKEN_LIFETIME, user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::calls::ChildOutcome;
 use aruna_core::credential_encryption::EncryptedS3Secret;
@@ -11,6 +10,7 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::TokenRevocation;
 use aruna_core::structs::storage::blob::never_expiry;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 
 const CUTOFF: u64 = 1_000_000;
 

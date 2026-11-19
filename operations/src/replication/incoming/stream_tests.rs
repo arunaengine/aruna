@@ -4,7 +4,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -12,6 +11,7 @@ use aruna_core::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
 };
 use aruna_core::structs::identity::auth::PathRestriction;
+use aruna_core::user::id::UserId;
 use aruna_storage::storage::worker::FjallStorage;
 use tempfile::tempdir;
 
@@ -218,12 +218,12 @@ async fn rejects_foreign_peer() {
     config.ensure_node(
         user,
         aruna_core::structs::identity::realm::RealmNodeKind::User {
-            owner: aruna_core::UserId::nil(realm_id),
+            owner: aruna_core::user::id::UserId::nil(realm_id),
         },
     );
     let actor = aruna_core::structs::identity::auth::Actor {
         node_id: server,
-        user_id: aruna_core::UserId::nil(realm_id),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
         realm_id,
     };
     let target = DocumentTarget::RealmConfig { realm_id };
@@ -413,7 +413,8 @@ async fn checks_advance_policy() {
 
 #[tokio::test]
 async fn denies_offered_bucket() {
-    use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+    use crate::staging::offer::run::offer_directory;
+    use crate::staging::offered_directory::OfferDirectoryInput;
     use aruna_core::structs::synced_folder::folder_bucket;
     use aruna_drivers::driver::drive;
 

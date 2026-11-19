@@ -218,9 +218,8 @@ async fn reference_import_counted() {
     use aruna_operations::connectors::create_connector::{
         SourceConnectorInput, SourceConnectorOperation,
     };
-    use aruna_operations::staging::page::import::{
-        PageEntry, PageImportInput, PageImportOperation,
-    };
+    use aruna_operations::staging::page::import::PageImportOperation;
+    use aruna_operations::staging::page::rows::{PageEntry, PageImportInput};
     use std::time::{Duration, SystemTime};
 
     let node = node_state().await;

@@ -8,7 +8,6 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_compute::executor::ExecutorBackend;
 use aruna_compute::registry::ExecutorRegistry;
 use aruna_compute::session::{Session, SessionConfig};
-use aruna_core::UserId;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::compute::session::EndReason;
 use aruna_core::compute::{
@@ -25,6 +24,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::effect_adapters::job::with_job_host;
 use aruna_drivers::jobs::context::JobContext;

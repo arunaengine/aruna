@@ -272,8 +272,10 @@ pub async fn import_record(
     auth: UnrestrictedAuth,
     Json(request): Json<RepositoryImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    use aruna_operations::jobs::repository::invenio::query::ResolveRecordOperation;
-    use aruna_operations::jobs::repository::{RecordReference, TransferError};
+    use aruna_operations::jobs::repository::TransferError;
+    use aruna_operations::jobs::repository::invenio::query::{
+        RecordReference, ResolveRecordOperation,
+    };
     let reference = match (request.record_id, request.doi, request.url) {
         (Some(id), None, None) => RecordReference::Id(id),
         (None, Some(doi), None) => RecordReference::Doi(doi),

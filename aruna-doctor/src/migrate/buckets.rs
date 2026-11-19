@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::session_refs::Layout;
-use aruna_core::UserId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{BucketCorsConfiguration, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::StorageRoutingRule;
+use aruna_core::user::id::UserId;
 use serde::Deserialize;
 use std::time::SystemTime;
 use ulid::Ulid;

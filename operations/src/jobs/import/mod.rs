@@ -6,15 +6,13 @@ mod acquire;
 #[cfg(test)]
 mod consortium_tests;
 mod finish;
-mod job;
+pub mod job;
 mod plan;
 mod reports;
 pub(crate) mod rewrite;
 pub mod upload;
 pub mod upload_store;
 mod write;
-
-pub use job::ImportJobOperation;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,7 +46,7 @@ use super::metadata_class::MetadataFailure;
 use super::repository::JobScope;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::metadata::forward::write::MetadataWriteError;
-use crate::placement::policy::GateContextError;
+use crate::placement::policy::gate::GateContextError;
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::put::PutObjectError;
 use crate::staging::read_source::ReadSourceError;
@@ -685,12 +683,12 @@ pub(crate) mod tests {
     use crate::jobs::repository::test_support::{
         artifact, job_id, job_scope, local_scope, owner_node, realm,
     };
-    use aruna_core::UserId;
     use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateTarget, RoCrateLimits,
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::storage::blob::HIDDEN_BLOB_PREFIX;
+    use aruna_core::user::id::UserId;
     use std::time::SystemTime;
 
     pub(super) fn spec() -> ImportRoCrateSpec {

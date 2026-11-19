@@ -1252,7 +1252,7 @@ async fn uploads_merge_ranges() {
 // across its key ranges, as the S3 listing does, and every name is checked for Everyone.
 #[tokio::test]
 async fn folder_spans_ranges() {
-    use aruna_core::UserId;
+    use aruna_core::user::id::UserId;
     let members = members(3, &["f/m", "p"], 0).await;
     for key in ["f/a.txt", "f/z.txt", "g/other"] {
         put(&members, 0, key, b"public").await;

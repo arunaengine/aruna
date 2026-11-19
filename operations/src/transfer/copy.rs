@@ -6,7 +6,7 @@ pub mod sealed;
 
 use crate::distribution::held::record_only;
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::s3::fence_store::FenceCheckOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, reference_archive};
 use crate::s3::object::head::{
@@ -23,7 +23,6 @@ use crate::transfer::copy::sealed::{
     SealedCopyError, SealedCopyInput, SealedCopyOperation, SealedCopyResult,
 };
 use crate::transfer::read::{ReadSourceOperation, TokenRead};
-use aruna_core::UserId;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
@@ -48,6 +47,7 @@ use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot, resolve_backend};
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -942,8 +942,7 @@ impl Operation for KeepReferenceOperation {
 pub(crate) mod test {
     use super::*;
     use crate::s3::object::get::GetObjectOperation;
-    #[allow(unused_imports)]
-    pub(crate) use crate::testing_objects::put_config;
+    use crate::testing_objects::put_config;
     use crate::tests::policy::{seed_gate, subject};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -955,14 +954,14 @@ pub(crate) mod test {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
     use aruna_drivers::driver::{DriverContext, drive, node_routing};
-    pub(crate) use aruna_drivers::testing::seed_bucket;
+    use aruna_drivers::testing::seed_bucket;
     use aruna_test_support::s3::{full_context, spawn_reference_server, write_version};
     use futures_util::StreamExt;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    fn test_node_id() -> aruna_core::NodeId {
+    fn test_node_id() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[7; 32]).public()
     }
 

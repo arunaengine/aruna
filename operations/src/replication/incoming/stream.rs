@@ -38,10 +38,11 @@ use crate::distribution::resolve::{
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{QuotaOperation, RoutingInputsError};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::{BaoReadError, IncomingBaoOperation, IncomingBaoResult};
-use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};
+use crate::replication::locations::LocationSummaryError;
+use crate::replication::locations::local::{LocalSummary, LocationSummaryOperation};
 use crate::s3::bucket::write_guard::{BucketGuardError, BucketGuardOperation};
 use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};

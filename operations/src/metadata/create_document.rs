@@ -5,13 +5,12 @@
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::api::CreateDocumentPayload;
 
-use aruna_core::MetaResourceId;
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE};
 use aruna_core::metadata::{
     MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload,
@@ -34,7 +33,9 @@ use aruna_core::structs::placement::record::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
-use aruna_core::structured_id::{BucketId, ClockHealthError, PlacementHandle, StructuredId};
+use aruna_core::structured_id::{
+    BucketId, ClockHealthError, MetaResourceId, PlacementHandle, StructuredId,
+};
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
@@ -44,13 +45,13 @@ use crate::metadata::profile::rules::{
     crate_is_profile, not_profiled_status, profile_path_rule, stamp_unprofiled,
     submission_profile_tag,
 };
-use crate::metadata::repository::create_projection_entries;
 use crate::sync::shard_placement::sort_node_ids;
 use aruna_core::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
 };
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
+use aruna_core::storage_entries::create_projection_entries;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateDocumentConfig {
@@ -946,7 +947,6 @@ mod tests {
 
     use std::sync::Arc;
 
-    use aruna_core::StructuredId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
@@ -963,6 +963,7 @@ mod tests {
     use aruna_core::structs::placement::record::{
         FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, PlacementBinding,
     };
+    use aruna_core::structured_id::StructuredId;
     use aruna_storage::storage::handle::{EffectReceiver, StorageHandle};
     use aruna_storage::storage::worker::FjallStorage;
 
@@ -973,7 +974,7 @@ mod tests {
     fn actor(realm_id: RealmId, key_byte: u8) -> Actor {
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[key_byte; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             realm_id,
         }
     }

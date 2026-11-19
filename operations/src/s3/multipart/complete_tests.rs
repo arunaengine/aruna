@@ -1710,7 +1710,7 @@ fn share_outlives_compose() {
 /// The placement gate runs as a child before the compose and is rechecked in the finalize.
 mod decisions {
     use super::*;
-    use crate::placement::policy::PolicyCacheStats;
+    use crate::placement::policy::cache::PolicyCacheStats;
     use aruna_core::structs::placement::policy::{
         PlacementDecision, PlacementSubject, VerifiedPolicy,
     };

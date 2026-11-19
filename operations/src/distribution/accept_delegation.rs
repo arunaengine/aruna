@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::distribution::delegation::{
@@ -112,10 +112,10 @@ impl Operation for AcceptDelegationOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_core::structs::storage::distribution::delegation::Payload;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     const NOW: u64 = 105;

@@ -13,7 +13,6 @@ use crate::job_calls::{claim_job, complete_job, fail_job, transition_to_running}
 use aruna::tasks::job_host::run_storage_purge;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -45,6 +44,7 @@ use aruna_core::structs::storage::storage_purge::{
     StoragePurgeCheckpoint, StoragePurgeScope, StoragePurgeSpec,
 };
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_drivers::testing::read_value;

@@ -194,9 +194,9 @@ impl Operation for AppliedDrainOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::NodeId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::document::{DocumentReconcileResult, DocumentTarget};
+    use aruna_core::id::NodeId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::Value;
     use ulid::Ulid;

@@ -2,17 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
 use aruna_core::operation::Operation;
 use aruna_core::rows::PrefixPages;
 use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use ed25519_dalek::SigningKey;
 use thiserror::Error;
 
@@ -175,7 +175,6 @@ impl Operation for IssueSyncOperation {
 #[cfg(test)]
 mod tests {
     use super::{IssueSyncInput, IssueSyncOperation, TICKET_TTL_SECS};
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
@@ -183,6 +182,7 @@ mod tests {
     use aruna_core::keyspaces::USER_KEYSPACE;
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use byteview::ByteView;

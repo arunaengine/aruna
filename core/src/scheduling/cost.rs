@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
 use crate::compute::ExecutorCapability;
 use crate::compute::ResourceEnvelope;
+use crate::id::NodeId;
 use crate::scheduling::eligibility::allows;
 use crate::scheduling::inputs::{PlanRequest, ResolvedInput, TargetCandidate, TargetScore};
 use crate::structs::placement::compute_config::RealmComputeConfig;

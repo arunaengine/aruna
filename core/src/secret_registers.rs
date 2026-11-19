@@ -8,7 +8,6 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::admin_documents::{AdminDocumentClock, NodeInterval};
 use crate::errors::ConversionError;
 use crate::register::{RegisterStamp, current_write};
@@ -16,6 +15,7 @@ use crate::secrets::{
     MAX_DESCRIPTION, MAX_VALUE_BYTES, SecretKind, SecretName, SecretScope, SecretSettings, UseRule,
 };
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 /// Sealed bytes a value may take: the encoded fields plus the HPKE key and tag.
 pub const MAX_SEALED: usize = MAX_VALUE_BYTES + 64;

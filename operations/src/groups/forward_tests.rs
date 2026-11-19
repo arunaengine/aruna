@@ -4,10 +4,10 @@
 
 use super::*;
 use crate::tests::peers::peer_answer;
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::user::id::UserId;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()

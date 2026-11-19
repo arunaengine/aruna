@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::metadata::revision_read::RawViewOperation;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, MATERIALIZATION_CAPTURE_KEYSPACE,
     RAW_REVISION_KEYSPACE,
@@ -59,7 +59,7 @@ pub(super) fn create_event(document_id: Ulid, event_id: Ulid, name: &str) -> Met
     MetadataEventRecord {
         event_id,
         record,
-        user_id: aruna_core::UserId::local(Ulid::from_parts(7, 2), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(7, 2), realm_id),
         node_id: node(1),
         payload: MetadataEventPayload::Scaffold {
             name: name.to_string(),

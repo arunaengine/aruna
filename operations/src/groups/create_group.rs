@@ -453,7 +453,6 @@ mod test {
     use crate::groups::create_group::{
         CreateGroupConfig, CreateGroupError, CreateGroupOperation, GroupCreate,
     };
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
@@ -468,6 +467,7 @@ mod test {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::{Key, KeySpace, Value};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::NetHandle;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

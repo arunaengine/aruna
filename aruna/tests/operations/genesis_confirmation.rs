@@ -5,11 +5,11 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::document::{DocumentTarget, shard_topic_id};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::placement::{resolve_shard_holders, shard_subject_bytes};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{PlacementOverride, PlacementRef};

@@ -30,17 +30,13 @@ pub mod archive;
 mod assemble;
 pub mod consent;
 pub mod grant;
-mod job;
+pub mod job;
 pub mod open;
 pub mod probe;
 mod publish;
 pub mod resolve;
-mod snapshot;
+pub mod snapshot;
 pub mod sources;
-
-pub use consent::{ConsentCheckError, UnheldBucketOperation};
-pub use job::{ExportJobError, ExportJobOperation};
-pub use snapshot::CrateJsonOperation;
 
 pub const METADATA_PATH: &str = aruna_core::repository::rules::CRATE_FILES[0];
 const REPORT_PATH: &str = aruna_core::repository::rules::CRATE_FILES[1];

@@ -7,7 +7,8 @@ use aruna_core::operation::Operation;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::repository::{StorageReadError, parse_secret_read, read_secret_effect};
+use crate::connectors::repository::{parse_secret_read, read_secret_effect};
+use aruna_core::errors::StorageReadError;
 
 #[derive(Debug, PartialEq)]
 pub struct HasConfigOperation {

@@ -5,7 +5,6 @@
 use crate::error::CliError;
 use aruna::config::load;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::calls::Next;
 use aruna_core::onboarding::{
@@ -14,6 +13,7 @@ use aruna_core::onboarding::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
@@ -529,7 +529,6 @@ mod tests {
     use aruna_api::routes::onboarding::ListSecretsResponse;
     use aruna_api::server::state::ServerState;
     use aruna_api::server::{Server, ServerConfig};
-    use aruna_core::UserId;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -540,6 +539,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
     use aruna_core::structs::identity::user::User;
     use aruna_core::testing::EnvGuard;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::NetHandle;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

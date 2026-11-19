@@ -5,8 +5,6 @@
 
 use std::sync::Arc;
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::backoff::conflict_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxRecord, ShardManifest, shard_topic_id};
@@ -14,6 +12,7 @@ use aruna_core::document_apply::ApplyError;
 use aruna_core::effects::ShardNetEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::ShardNetEvent;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
@@ -29,6 +28,7 @@ use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits, TransitionStatus,
 };
 use aruna_core::types::Key;
+use aruna_core::user::id::UserId;
 use tracing::{debug, warn};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};

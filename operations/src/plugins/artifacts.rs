@@ -5,8 +5,8 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugins::{ArtifactBytes, Chunk, MemoryPermit, PublishedPlugin};
 use aruna_core::realm_vault::FetchScope;

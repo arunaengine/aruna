@@ -53,7 +53,9 @@ use ulid::Ulid;
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
 use crate::groups::storage_routing::routing_key;
 use crate::s3::object::put::fenced::{Fenced, FencedWrite};
-use crate::s3::object::put::{PlainRecord, intent_rows, owner_call, path_owned, same_name_path};
+use crate::s3::object::put::plain::{
+    PlainRecord, intent_rows, owner_call, path_owned, same_name_path,
+};
 use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::managed_copy::{ManagedCopyError, check_old_copy};
 use aruna_core::structs::storage::cleanup::schedule_cleanup_effect;
@@ -760,7 +762,7 @@ impl MigrateVersionOperation {
     }
 
     /// The source bytes are known, so the intent proves the copy even if no later record lands.
-    fn write_intent(&self, target: &PlainTarget, created_by: aruna_core::UserId) -> WriteIntent {
+    fn write_intent(&self, target: &PlainTarget, created_by: aruna_core::user::id::UserId) -> WriteIntent {
         let source = self.old.as_ref().and_then(|old| old.get_blake3());
         WriteIntent {
             key: self.version_key.key.clone(),
@@ -774,7 +776,7 @@ impl MigrateVersionOperation {
 
     /// A write to a linked folder stores its identity at the path and at its tagged path, and
     /// syncs it, before any byte moves; an import then registers the file as this version.
-    fn intent_first(&mut self, write: IoCall, created_by: aruna_core::UserId) -> Turn {
+    fn intent_first(&mut self, write: IoCall, created_by: aruna_core::user::id::UserId) -> Turn {
         let listed = self.plain.as_ref().filter(|target| target.listed);
         let (Some(target), Some(path)) = (listed, self.plain_path.as_ref()) else {
             return self.call(MigrateState::WriteBlob, write);

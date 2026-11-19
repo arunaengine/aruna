@@ -432,8 +432,8 @@ fn validate_bootstrap_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::user::id::UserId;
 
     fn state(status: PersistedNodeStatus, phase: Option<OnboardingPhase>) -> PersistedNodeState {
         let realm_signing_key = generate_signing_key();

@@ -14,7 +14,8 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use crate::connectors::reference_prune::prune_queue_write;
-use crate::connectors::repository::{REFERENCE_PAGE_SIZE, StorageReadError, references_connector};
+use crate::connectors::repository::{REFERENCE_PAGE_SIZE, references_connector};
+use aruna_core::errors::StorageReadError;
 
 /// Connector id bytes ahead of the version key in a reference row.
 const ROW_PREFIX: usize = 16;

@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
-use crate::UserId;
 use crate::auth::credential_hash;
 use crate::document::DocumentTarget;
+use crate::id::NodeId;
 use crate::structs::identity::realm::{RealmId, StaticRealmEndpoint};
+use crate::user::id::UserId;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::EndpointAddr;

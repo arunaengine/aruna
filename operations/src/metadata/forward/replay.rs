@@ -5,8 +5,8 @@
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::accepted_create_matches;
 use crate::metadata::create_document::resolve_metadata_id;
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };

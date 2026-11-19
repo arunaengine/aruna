@@ -4,12 +4,12 @@
 
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::node_facts;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
@@ -323,13 +323,13 @@ async fn provision_realm(
 /// placement map before it serves anything. A changed subject blocks governed
 /// serving until the local inventory has been revalidated under it.
 async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<(), String> {
-    let mode = aruna_operations::placement::policy::SubjectScanMode::Revalidate(
+    let mode = aruna_operations::placement::policy::subject::SubjectScanMode::Revalidate(
         aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
     );
-    let sync = aruna_operations::placement::policy::SubjectSyncOperation::new(
+    let sync = aruna_operations::placement::policy::reconcile::SubjectSyncOperation::new(
         config.realm_id,
         config.node_id,
-        aruna_operations::placement::policy::SubjectTrigger::Reconcile(mode),
+        aruna_operations::placement::policy::reconcile::SubjectTrigger::Reconcile(mode),
         aruna_clock::unix_timestamp_millis(),
     );
     aruna_drivers::driver::drive(sync, ctx)

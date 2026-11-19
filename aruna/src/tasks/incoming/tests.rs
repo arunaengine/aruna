@@ -6,7 +6,6 @@ use super::outbox::partition_drain_records;
 use super::outbox::publish_from_outbox;
 use super::restore::drain_delay;
 use super::*;
-use aruna_core::UserId;
 use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -21,6 +20,7 @@ use aruna_core::structs::execution::notification::{NotificationRecord, new_outbo
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::user::id::UserId;
 use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;

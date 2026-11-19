@@ -28,8 +28,6 @@ use std::path::Path;
 use thiserror::Error;
 use ulid::Ulid;
 
-pub use folders::folders_overlap;
-
 const RULE_PAGE: usize = 256;
 
 #[derive(Debug, Error, PartialEq)]
@@ -335,6 +333,7 @@ impl Operation for ReadEarlierOperation {
 
 #[cfg(test)]
 mod tests {
+    use super::folders::folders_overlap;
     use super::*;
 
     fn import_rule() -> BackendImport {

@@ -400,12 +400,12 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetQuotaError> {
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::structs::identity::realm::{
         GroupQuotaOverride, RealmConfigDocument, RealmId, RealmNodeKind, UserCapOverride,
     };
     use aruna_core::types::Key;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::path_context;
     use tempfile::tempdir;
@@ -851,14 +851,14 @@ mod tests {
             AdminDocumentClock, AdminDocumentEvent, AdminDocumentTarget,
         };
 
-        fn node(seed: u8) -> aruna_core::NodeId {
+        fn node(seed: u8) -> aruna_core::id::NodeId {
             iroh::SecretKey::from_bytes(&[seed; 32]).public()
         }
 
         let target = AdminDocumentTarget::RealmConfig { realm_id };
         let mut state = AdminDocumentState::new(target.clone());
         let quota_event =
-            |seed: u8, origin: aruna_core::NodeId, quota: QuotaConfig| AdminDocumentEvent {
+            |seed: u8, origin: aruna_core::id::NodeId, quota: QuotaConfig| AdminDocumentEvent {
                 event_id: Ulid::from_bytes([seed; 16]),
                 target: target.clone(),
                 origin_node_id: origin,

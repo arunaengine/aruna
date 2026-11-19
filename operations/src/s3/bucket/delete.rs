@@ -7,6 +7,7 @@ use crate::s3::usage::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_p
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, ABE_REKEY_KEYSPACE, AUTH_KEYSPACE,
@@ -39,7 +40,7 @@ use aruna_core::structs::storage::usage::{UsageDelta, usage_bucket_key};
 use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 use aruna_core::structs::execution::notification::schedule_drain_effect;
@@ -651,11 +652,11 @@ fn group_members(document: &GroupAuthorizationDocument, realm_id: RealmId) -> Ve
 #[cfg(test)]
 mod link_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::storage::backend_import::PLAIN_PATTERN;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
+    use aruna_core::user::id::UserId;
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -1178,7 +1179,7 @@ mod test {
                 BucketInfo {
                     group_id: Ulid::generate(),
                     created_at: SystemTime::now(),
-                    created_by: aruna_core::UserId::nil(RealmId::from_bytes([0u8; 32])),
+                    created_by: aruna_core::user::id::UserId::nil(RealmId::from_bytes([0u8; 32])),
                     cors_configuration: None,
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
@@ -1246,7 +1247,7 @@ mod test {
         let realm_id = RealmId::from_bytes([7; 32]);
         let local_node = iroh::SecretKey::from_bytes(&[8; 32]).public();
         let remote_node = iroh::SecretKey::from_bytes(&[9; 32]).public();
-        let creator = aruna_core::UserId::nil(realm_id);
+        let creator = aruna_core::user::id::UserId::nil(realm_id);
         let relationships = [
             SyncRelationship {
                 id: Ulid::from(1u128),

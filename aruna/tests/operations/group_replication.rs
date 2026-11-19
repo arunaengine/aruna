@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
+use aruna_core::id::NodeId;
 use aruna_core::placement::{
     PlacementResolutionContext, resolve_shard_holders, target_placement_ref,
 };
@@ -26,7 +26,7 @@ async fn creation_replicates_globally() -> Result<(), Box<dyn std::error::Error>
 
     let creator = Actor {
         node_id: nodes[0].net.node_id(),
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
     };
 
@@ -60,7 +60,7 @@ async fn unheld_group_replicates() -> Result<(), Box<dyn std::error::Error>> {
             CreateGroupOperation::new(CreateGroupConfig {
                 actor: Actor {
                     node_id: origin,
-                    user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                    user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
                     realm_id,
                 },
                 display_name: format!("unheld group {attempt}"),

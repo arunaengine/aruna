@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
@@ -25,8 +26,8 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifier};
+use aruna_core::structured_id::MetaResourceId;
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_core::{MetaResourceId, NodeId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{Span, debug_span, field};

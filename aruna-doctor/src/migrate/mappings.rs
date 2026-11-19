@@ -94,7 +94,6 @@ pub(super) fn index_rebuild(
 mod tests {
     use crate::migrate::migrate_output;
     use crate::migrate::tests::{read, write};
-    use aruna_core::UserId;
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, SECONDARY_ID_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_core::structs::LegacyMapping;
@@ -105,6 +104,7 @@ mod tests {
         IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier,
     };
     use aruna_core::structs::{PersistentIdMapping, PersistentIdRevision, persistent_id_change};
+    use aruna_core::user::id::UserId;
     use aruna_operations::sync::outbox_record::new_identified_record;
     use tempfile::tempdir;
     use ulid::Ulid;

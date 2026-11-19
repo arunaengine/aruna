@@ -18,7 +18,7 @@ use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::persistent_id::RegisterIdentifiersOperation;
 use aruna_operations::jobs::repository::connector::ConnectorViewOperation;
 use aruna_operations::jobs::repository::invenio::query::{
-    ResolveRecordOperation, SearchRecordsOperation,
+    RecordReference, ResolveRecordOperation, SearchRecordsOperation,
 };
 use aruna_operations::jobs::repository::invenio::remote::RemoteStateOperation;
 use aruna_operations::jobs::repository::link_queue::{
@@ -28,7 +28,7 @@ use aruna_operations::jobs::repository::link_queue::{
 use aruna_operations::jobs::repository::link_store::{ApplyChangeOperation, ListLinksOperation};
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::pull::StartPullOperation;
-use aruna_operations::jobs::repository::{RecordReference, TransferError, seal_token};
+use aruna_operations::jobs::repository::{TransferError, seal_token};
 use serde_json::Value;
 use ulid::Ulid;
 
@@ -136,7 +136,7 @@ pub(super) async fn seal_credential(
 
 pub(super) async fn seal_link_token(
     context: &DriverContext,
-    user: aruna_core::UserId,
+    user: aruna_core::user::id::UserId,
     group_id: Ulid,
     connector_id: Ulid,
     link_id: Ulid,

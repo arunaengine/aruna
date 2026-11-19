@@ -5,10 +5,10 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{ShardMembership, ShardNetEffect};
 use aruna_core::events::{GenesisProbe, ShardNetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use irokle::TopicId;
 use tracing::warn;

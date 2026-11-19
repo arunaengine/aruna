@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod exports;
-mod forwards;
+pub mod forwards;
 mod held;
 mod mirror;
 mod paths;
@@ -12,9 +12,9 @@ mod pulls;
 mod reads;
 mod writes;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::Here;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::realm_vault::RealmSecretRef;
@@ -437,4 +437,3 @@ impl Operation for ServeRequestOperation {
 #[path = "serve_tests.rs"]
 mod tests;
 
-pub use self::forwards::needs_view;

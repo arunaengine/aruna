@@ -12,7 +12,6 @@ mod tests {
     use crate::notifications::watch::records::decode_stored_subscription;
     use crate::tests::notifications::create_holder_watch;
     use crate::tests::notifications::{create_local_watch, delete_local_watch};
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::storage_entries::watch_write_entry;
@@ -20,6 +19,7 @@ mod tests {
     use aruna_core::structs::execution::notification_watch::{
         WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
     };
+    use aruna_core::user::id::UserId;
     use aruna_storage::storage::handle::StorageHandle;
     use ulid::Ulid;
 
@@ -62,7 +62,7 @@ mod tests {
 
     use crate::notifications::watch::records::WATCH_CAP_REACHED;
     use crate::tests::notifications::{context, temp_storage, user};
-    use aruna_core::NodeId;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::structs::execution::notification_watch::MAX_PREFIX_LEN;
     use aruna_core::structs::execution::notification_watch::{WatchEventKind, watch_resource_path};

@@ -7,14 +7,14 @@ use std::time::Duration;
 
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structured_id::StructuredId;
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use aruna_core::types::GroupId;
-use aruna_core::{MetaResourceId, NodeId};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::create_document::{
@@ -258,7 +258,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([3; 32]);
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         }
     }

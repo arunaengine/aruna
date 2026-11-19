@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::DISTRIBUTION_FENCE_KEYSPACE;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::upload::UploadTag;
@@ -12,7 +12,7 @@ use aruna_core::structs::storage::distribution::{
 };
 use ulid::Ulid;
 
-pub use super::route_query::RouteOperation;
+use super::route_query::RouteOperation;
 use super::route_query::{
     Bound, Decide, Interval, coordinator_of, copied_interval, fence_row, held_view, interval,
     listed_interval, listed_tags, new_tag, range_coordinated, range_holders, range_kept,

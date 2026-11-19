@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::document::{DocumentOutboxRecord, DocumentReconcileResult};
 use aruna_core::document_apply::ApplyError;
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
+use aruna_core::id::NodeId;
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_drivers::driver::{DriverContext, drive};

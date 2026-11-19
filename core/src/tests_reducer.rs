@@ -6,13 +6,14 @@ use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     AdminRoleDefinition,
 };
+use crate::id::NodeId;
 use crate::reducer::*;
 use crate::structs::identity::auth::{Actor, Permission};
 use crate::structs::identity::realm::{
     MetadataReplicationConfig, OidcProviderConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind,
 };
 use crate::types::{GroupId, RoleId};
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 use std::collections::BTreeMap;
 use ulid::Ulid;
 

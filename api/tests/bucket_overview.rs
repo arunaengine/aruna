@@ -17,7 +17,6 @@ use aruna_api::routes::storage::routing::{
     BucketRoutingRequest, get_bucket_routing, put_bucket_routing,
 };
 use aruna_api::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
@@ -32,6 +31,7 @@ use aruna_core::structs::storage::blob::{
     CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;

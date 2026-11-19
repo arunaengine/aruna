@@ -298,8 +298,8 @@ pub(super) fn audit_member(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn realm() -> RealmId {

@@ -547,12 +547,12 @@ mod tests {
     use crate::device::publish_queue::publish_entry;
     use crate::device::replica::ReplicaOrigin;
     use crate::device_node::sync_note::{NoteSyncOperation, SyncNote};
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::{FolderMode, RemoteBinding};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use std::sync::Arc;
 

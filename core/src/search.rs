@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::NodeId;
+use crate::id::NodeId;
 use crate::structs::storage::bucket_metadata::BucketMetadata;
 use crate::structs::storage::distribution::search::IndexProgress;
 use crate::types::GroupId;

@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::{DocumentSyncPublish, DocumentTarget};
+use aruna_core::document::{DocumentEffect, DocumentNetEvent, DocumentSyncPublish, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
@@ -20,7 +20,7 @@ use aruna_core::structs::placement::record::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeUrls;
-use aruna_core::{DocumentEffect, DocumentNetEvent, StructuredId};
+use aruna_core::structured_id::StructuredId;
 use aruna_drivers::driver::drive;
 use aruna_drivers::driver::node_facts;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -219,7 +219,7 @@ async fn node_info_propagates() -> Result<(), Box<dyn std::error::Error>> {
 fn test_actor(node: &TestNode, realm_id: RealmId) -> Actor {
     Actor {
         node_id: node.net.node_id(),
-        user_id: aruna_core::UserId::nil(realm_id),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
         realm_id,
     }
 }
@@ -234,7 +234,7 @@ async fn create_metadata_document(
         CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
                 node_id: node.net.node_id(),
-                user_id: aruna_core::UserId::local(Ulid::from_bytes([74; 16]), realm_id),
+                user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([74; 16]), realm_id),
                 realm_id,
             },
             group_id,
@@ -256,7 +256,7 @@ async fn create_metadata_document(
 
 async fn wait_holder_document(
     nodes: &[TestNode],
-    holders: &[aruna_core::NodeId],
+    holders: &[aruna_core::id::NodeId],
     target: &DocumentTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for holder in holders {
@@ -296,7 +296,7 @@ async fn wait_for_document(
 async fn wait_policy_convergence(
     nodes: &[TestNode],
     realm_id: RealmId,
-    draining_node: aruna_core::NodeId,
+    draining_node: aruna_core::id::NodeId,
     replica_count: u32,
 ) -> Result<Vec<RealmConfigDocument>, Box<dyn std::error::Error>> {
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
@@ -376,7 +376,7 @@ fn assert_distinct_resolution(nodes: &[TestNode], config: &RealmConfigDocument) 
     );
 }
 
-fn sort_node_ids(nodes: &mut [aruna_core::NodeId]) {
+fn sort_node_ids(nodes: &mut [aruna_core::id::NodeId]) {
     nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 }
 
@@ -527,7 +527,7 @@ async fn seed_config_topic(
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: nodes[1].net.node_id(),
-        user_id: aruna_core::UserId::nil(realm_id),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
         realm_id,
     };
     let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });

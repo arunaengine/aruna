@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::document::{
-    DocumentOutboxEvent, DocumentOutboxRecord, DocumentSyncPublish, DocumentTarget,
+    DocumentEffect, DocumentNetEvent, DocumentOutboxEvent, DocumentOutboxRecord,
+    DocumentSyncPublish, DocumentTarget,
 };
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
@@ -22,7 +23,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::Key;
-use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_tasks::shutdown::Shutdown;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
@@ -66,9 +66,9 @@ use aruna_operations::blob::reclaim_sweep::{
 };
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
 use aruna_operations::device::publish_queue::DrainOutcome;
+use aruna_operations::device::sync::outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER};
 use aruna_operations::device::sync::{
-    RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
-    UPLOAD_DEFER_AFTER,
+    RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER,
 };
 use aruna_operations::device_node::sync_note::{NoteSyncOperation, SyncNote};
 use aruna_operations::document_repository::GetConfigOperation;
@@ -166,8 +166,9 @@ use aruna_operations::realm::announce_presence::{
 use aruna_operations::replication::drain::{
     ProcessBatchOperation, REPLICATION_RETRY_AFTER, RestoreDrainOperation,
 };
-use aruna_operations::replication::mirror_repair::{
-    DrainRepairsOperation, REPAIR_RETRY_AFTER, RestoreTimerOperation,
+use aruna_operations::replication::mirror_repair::REPAIR_RETRY_AFTER;
+use aruna_operations::replication::mirror_repair::drain::{
+    DrainRepairsOperation, RestoreTimerOperation,
 };
 use aruna_operations::replication::page::deliver::MetadataPages;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
@@ -309,7 +310,7 @@ struct OutboxRotation {
     /// Topics whose FIFO is blocked for the rest of this rotation.
     blocked_topics: HashSet<irokle::TopicId>,
     /// Admin origin streams blocked for the rest of this rotation.
-    blocked_origins: HashSet<aruna_core::NodeId>,
+    blocked_origins: HashSet<aruna_core::id::NodeId>,
     /// Topics this node can never publish onto, for the rest of this rotation.
     undeliverable_topics: HashSet<irokle::TopicId>,
     totals: RotationTotals,
@@ -318,12 +319,12 @@ struct OutboxRotation {
 }
 
 struct DrainSubBatch {
-    peers: Vec<aruna_core::NodeId>,
+    peers: Vec<aruna_core::id::NodeId>,
     documents: Vec<DocumentSyncPublish>,
     topics: Vec<irokle::TopicId>,
     /// Admin origin of each entry, so a blocked publish also blocks the rest of
     /// that origin's sequence.
-    origins: Vec<Option<aruna_core::NodeId>>,
+    origins: Vec<Option<aruna_core::id::NodeId>>,
     targets: Vec<DocumentTarget>,
     record_keys: Vec<Vec<u8>>,
 }
@@ -337,7 +338,7 @@ struct DrainSyncOutcome {
     deleted: usize,
     /// Ordering domains to block for the rest of the rotation.
     blocked_topics: Vec<irokle::TopicId>,
-    blocked_origins: Vec<aruna_core::NodeId>,
+    blocked_origins: Vec<aruna_core::id::NodeId>,
 }
 
 /// Per-invocation defer state. The block sets are seeded from the open rotation;
@@ -348,7 +349,7 @@ struct DrainDeferState {
     topic_exists: HashMap<irokle::TopicId, bool>,
     topic_held: HashMap<irokle::TopicId, bool>,
     deferred_topics: HashSet<irokle::TopicId>,
-    blocked_origins: HashSet<aruna_core::NodeId>,
+    blocked_origins: HashSet<aruna_core::id::NodeId>,
     undeliverable_topics: HashSet<irokle::TopicId>,
 }
 
@@ -735,7 +736,7 @@ impl OperationsTaskHandler {
 
     // Kicks the placement reconciler immediately (not persisted; it is re-derived
     // from the realm config at startup by `RestoreTopicsOperation`).
-    async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::NodeId) {
+    async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::id::NodeId) {
         let task_id = TaskKey::SyncPlacements { realm_id, node_id };
         let Some(task_handle) = self.context.task_handle.as_ref() else {
             warn!(task_id = ?task_id, "Cannot schedule shard placement sync without task handle");
@@ -1162,7 +1163,7 @@ impl OperationsTaskHandler {
                 self.refresh_device_replicas().await;
             }),
             TaskKey::DrainUploadOutbox => Box::pin(async move {
-                let drain = aruna_operations::device::sync::drain_sync_outbox(
+                let drain = aruna_operations::device::sync::outbox::drain_sync_outbox(
                     self.context.node_and_realm(),
                 );
                 let outcome = drive(drain, &self.context).await;

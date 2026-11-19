@@ -2,24 +2,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::structs::AssistantChatHead;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use thiserror::Error;
 
 pub mod central;
-mod heads;
+pub mod heads;
 pub mod provider;
 #[cfg(test)]
 mod tests;
-mod turns;
-
-pub use heads::{DeleteChatOperation, ListChatOperation, WriteChatOperation};
-pub use turns::{ReadChatOperation, WriteTurnOperation};
+pub mod turns;
 
 pub const CHAT_CAP: &str = "a user may keep at most 20 chats";
 pub const TURN_CAP: &str = "a turn payload may hold at most 256 KiB";

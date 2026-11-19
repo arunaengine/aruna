@@ -17,6 +17,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::VaultQuery;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
@@ -35,8 +36,8 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::vault::VaultRecords;
 use aruna_core::types::{RoleId, Value};
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::UserAttributeError;
-use aruna_core::{NodeId, UserId};
 use byteview::ByteView;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -49,7 +50,7 @@ use crate::auth::revoke_token::{
     Revocation, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
 use crate::sync::outbox_record::schedule_drain_effect;
-use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
+use crate::users::vault::read::{ReadVaultConfig, ReadVaultOperation};
 use aruna_core::link::fresh_local;
 
 /// What the realm config records about the one node that runs account merges.

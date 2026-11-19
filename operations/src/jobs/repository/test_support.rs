@@ -5,11 +5,11 @@
 use std::fmt::Debug;
 use std::time::SystemTime;
 
-use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoResult};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
+use aruna_core::user::id::UserId;
 #[cfg(test)]
 use aruna_core::repository::remote::InvenioAccess;
 use aruna_core::repository::remote::{JobStop, NodeScope, RemoteAnswer, RemoteFailure};

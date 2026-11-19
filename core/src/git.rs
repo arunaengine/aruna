@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::effects::Effect;
 use crate::git_state::{Ancestry, Projection, ProjectionInputs};
+use crate::id::NodeId;
 use crate::keyspaces::GIT_RECORD_KEYSPACE;
 use crate::operation::SubOperation;
 use crate::structs::identity::realm::{NodeRealm, RealmId};
@@ -14,7 +15,7 @@ use crate::structs::storage::dataset_location::DatasetLocation;
 use crate::structs::storage::routing::NodeRouting;
 use crate::task::{TaskEffect, TaskKey};
 use crate::types::{GroupId, Key, KeySpace, Value};
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 use bytes::Bytes;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -1019,7 +1020,7 @@ mod tests {
         };
         assert_eq!(
             target.topic_id(),
-            crate::TopicId::metadata(record.document_id)
+            crate::id::TopicId::metadata(record.document_id)
         );
         assert!(target.uses_shard_topic());
         let (keyspace, key, _) = git_record_entry(&record).expect("entry");

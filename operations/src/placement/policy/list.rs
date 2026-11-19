@@ -162,7 +162,6 @@ impl Operation for ListPoliciesOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::{ListPoliciesError, ListPoliciesInput, ListPoliciesOperation, PolicyListPage};
-    use aruna_core::UserId;
     use aruna_core::calls::{IoResult, Next};
     use aruna_core::events::{Event, SubOperationEvent};
     use aruna_core::id::NodeId;
@@ -174,6 +173,7 @@ mod pure_tests {
         PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
     use aruna_core::types::Key;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use crate::tests::policy::signed_document;

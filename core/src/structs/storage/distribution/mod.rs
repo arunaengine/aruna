@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
+use crate::id::NodeId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::types::GroupId;
 

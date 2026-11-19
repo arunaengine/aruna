@@ -5,10 +5,10 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::events::PeerRequestError;
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{
@@ -371,7 +371,7 @@ mod tests {
         let config = PromoteNodeConfig {
             actor: Actor {
                 node_id: node(1),
-                user_id: aruna_core::UserId::nil(realm_id),
+                user_id: aruna_core::user::id::UserId::nil(realm_id),
                 realm_id,
             },
             node_id: node(2),

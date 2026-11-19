@@ -1183,7 +1183,7 @@ mod call_tests {
         let realm_id = RealmId::from_bytes([9u8; 32]);
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         }
     }
@@ -1278,7 +1278,7 @@ mod call_tests {
         MetadataEventRecord {
             event_id: record.establishing_event_id,
             record: record.clone(),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(2, 2), record.realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(2, 2), record.realm_id),
             node_id,
             payload: MetadataEventPayload::Scaffold {
                 name: "name".to_string(),

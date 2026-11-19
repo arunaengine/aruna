@@ -6,10 +6,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, NetEffect};
 use aruna_core::events::{BlobEvent, Event, MetadataAnswer, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -223,9 +223,9 @@ impl Operation for AskHolderOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn node() -> NodeId {

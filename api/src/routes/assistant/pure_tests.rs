@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
 use aruna_core::calls::IoError;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 
 #[test]
 fn server_rejects_private() {

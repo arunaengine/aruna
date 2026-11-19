@@ -6,11 +6,11 @@ use aruna_core::id_mint::IdMint;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     NODE_STATE_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE,
@@ -53,11 +53,11 @@ use super::version_replication::{
     SourceAuthorizationError,
 };
 use crate::groups::routing::{QuotaOperation, RoutingInputsError};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::queue_backoff::{due_after, min_due_at, retry_delay_ms};
-use crate::replication::mirror_repair::{
-    KickRepairOperation, StoreStatusOperation, SyncMirrorError,
-};
+use crate::replication::mirror_repair::SyncMirrorError;
+use crate::replication::mirror_repair::kick::KickRepairOperation;
+use crate::replication::mirror_repair::status::StoreStatusOperation;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::storage::replication_queue::MemberTarget;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;

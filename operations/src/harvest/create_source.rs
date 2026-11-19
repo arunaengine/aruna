@@ -4,7 +4,6 @@
 
 use std::time::{Duration, SystemTime};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{CONNECTOR_INDEX_KEYSPACE, HARVEST_SOURCE_KEYSPACE};
@@ -15,6 +14,7 @@ use aruna_core::structs::execution::harvest::{
 };
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

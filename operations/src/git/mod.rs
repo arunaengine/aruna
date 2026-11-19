@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod access;
+pub mod access;
 mod calls;
 pub mod capture_drain;
 pub mod changes;
@@ -25,12 +25,10 @@ pub mod snapshot;
 pub mod state;
 #[cfg(test)]
 mod testing;
-mod transport;
+pub mod transport;
 pub mod versions;
 
-pub use self::access::{DocumentAccessOperation, RepositoryOperation, document, repository};
 use self::changes::PropertyConflict;
-pub use self::transport::{TransportOperation, transport};
 use crate::auth::error::AuthorizeError;
 use thiserror::Error;
 

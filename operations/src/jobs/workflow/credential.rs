@@ -5,7 +5,6 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
@@ -22,6 +21,7 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, UserAccess, bucket_permission_path, group_permission_path,
 };
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 
 use super::DEFAULT_WALLTIME;
 use super::workspace::{authorization_error, bucket_lookup_error};

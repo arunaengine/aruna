@@ -13,10 +13,10 @@ use aruna_api::server::state::ServerState;
 use aruna_api::tests::metadata_fixtures::{
     create_test_document, drain_metadata_background, state_realm_nodes, test_realm_id, write_doc,
 };
-use aruna_core::MetaResourceId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structured_id::MetaResourceId;
 use aruna_drivers::driver::drive;
 use aruna_drivers::testing::installed_graph_handle;
 use aruna_operations::metadata::api::MetadataApiError;
@@ -443,7 +443,7 @@ impl SearchPaginationCluster {
 async fn setup_search_cluster(node_count: usize) -> SearchPaginationCluster {
     let realm_signing_key = test_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
 
     let mut nodes = Vec::new();
@@ -730,7 +730,7 @@ struct QueryNamesResult {
     names: Vec<String>,
     nodes_queried: usize,
     nodes_failed: usize,
-    failed_partitions: Vec<aruna_core::NodeId>,
+    failed_partitions: Vec<aruna_core::id::NodeId>,
 }
 
 struct SearchPathsResult {
@@ -742,8 +742,8 @@ struct SearchPathsResult {
 async fn setup_access_state() -> DistributedAccessState {
     let realm_signing_key = test_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
-    let denied_user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
+    let denied_user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
     let coordinator = spawn_metadata_node(realm_id).await;
     let remote = spawn_metadata_node(realm_id).await;
@@ -869,7 +869,7 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
 async fn install_realm_config(
     nodes: &[&DistributedMetadataNode],
     realm_id: RealmId,
-    user_node: Option<(aruna_core::NodeId, aruna_core::UserId)>,
+    user_node: Option<(aruna_core::id::NodeId, aruna_core::user::id::UserId)>,
 ) {
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.seed_default_placement();
@@ -887,7 +887,7 @@ async fn install_realm_config(
     for node in nodes {
         let actor = Actor {
             node_id: node.net.node_id(),
-            user_id: aruna_core::UserId::nil(realm_id),
+            user_id: aruna_core::user::id::UserId::nil(realm_id),
             realm_id,
         };
         write_doc(
@@ -904,7 +904,7 @@ async fn install_realm_config(
 async fn install_auth_documents(
     node: &DistributedMetadataNode,
     realm_id: RealmId,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
     group_id: Ulid,
 ) {
     let actor = Actor {
@@ -928,7 +928,7 @@ async fn install_auth_documents(
 async fn install_group_documents(
     node: &DistributedMetadataNode,
     realm_id: RealmId,
-    owner: aruna_core::UserId,
+    owner: aruna_core::user::id::UserId,
     group_id: Ulid,
 ) {
     let actor = Actor {
@@ -1068,6 +1068,6 @@ fn test_signing_key() -> SigningKey {
     generate_signing_key()
 }
 
-fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenClaims {
+fn test_token_claims(realm_id: RealmId, user_id: aruna_core::user::id::UserId) -> TokenClaims {
     aruna_test_support::tokens::token_claims(realm_id, user_id)
 }

@@ -13,6 +13,7 @@ use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 use aruna_core::errors::StorageError;
+use aruna_core::id::NodeId;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::structs::identity::auth::{AuthContext, Permission, SessionKind, SessionRef};
 use aruna_core::structs::identity::realm::RealmId;
@@ -25,7 +26,7 @@ use aruna_core::structs::storage::distribution::delegation::{
 };
 use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::structs::storage::share::SHARE_CREDENTIAL_PREFIX;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_operations::auth::bearer_token::AccountDeactivatedOperation;
 use aruna_operations::auth::bearer_token::UserCutoffOperation;
@@ -40,9 +41,9 @@ use aruna_operations::jobs::workflow::input_view::view_job;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
-use aruna_operations::s3::session::{
-    GetS3Operation, S3SessionError, TouchS3Config, TouchS3Operation,
-};
+use aruna_operations::s3::session::S3SessionError;
+use aruna_operations::s3::session::get::GetS3Operation;
+use aruna_operations::s3::session::touch::{TouchS3Config, TouchS3Operation};
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, Uri};

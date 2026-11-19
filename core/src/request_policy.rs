@@ -706,7 +706,7 @@ impl PolicyRequestExtras {
 pub fn policy_request(
     path: &str,
     permission: &crate::structs::identity::auth::Permission,
-    user: Option<&crate::UserId>,
+    user: Option<&crate::user::id::UserId>,
 ) -> PolicyRequest {
     PolicyRequest::basic(
         path.to_string(),

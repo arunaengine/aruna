@@ -9,7 +9,6 @@ use ulid::Ulid;
 
 use super::registry::Row;
 use super::{ApplyError, Step, invalid};
-use crate::UserId;
 use crate::admin_checks::{
     coalescible_config_op, config_mutation_allowed, validate_config_actor, validate_config_target,
     validate_revocation_snapshot,
@@ -40,6 +39,7 @@ use crate::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDoc
 use crate::structs::identity::user::User;
 use crate::structs::storage::abe_access::{due_rows, indexed_buckets};
 use crate::types::{GroupId, Key, KeySpace};
+use crate::user::id::UserId;
 
 /// What the caller still does after an admin operation committed.
 #[derive(Debug, Default, PartialEq, Eq)]

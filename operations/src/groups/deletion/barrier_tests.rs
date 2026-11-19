@@ -20,6 +20,7 @@ use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
 use ulid::Ulid;
 
+use super::coordinator::InstallOnboardingOperation;
 use super::prepare::PrepareOperation;
 use super::tests::{commit, prepare};
 use crate::groups::fence::GroupWriteOperation;
@@ -182,7 +183,7 @@ async fn ticket_installs_tombstone() {
     let joined = context(dir.path());
     for _ in 0..2 {
         drive(
-            super::InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(2), 100),
+            InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(2), 100),
             &joined,
         )
         .await
@@ -211,7 +212,7 @@ async fn ticket_installs_tombstone() {
     tampered.payload.group_deletions.clear();
     assert!(matches!(
         drive(
-            super::InstallOnboardingOperation::new(&tampered, fixture.plan.realm_id, node(2), 100),
+            InstallOnboardingOperation::new(&tampered, fixture.plan.realm_id, node(2), 100),
             &joined
         )
         .await,
@@ -219,7 +220,7 @@ async fn ticket_installs_tombstone() {
     ));
     assert!(matches!(
         drive(
-            super::InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(3), 100),
+            InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(3), 100),
             &joined
         )
         .await,
@@ -227,7 +228,7 @@ async fn ticket_installs_tombstone() {
     ));
     assert!(matches!(
         drive(
-            super::InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(2), 401),
+            InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(2), 401),
             &joined
         )
         .await,

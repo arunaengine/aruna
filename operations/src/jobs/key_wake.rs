@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
@@ -185,7 +185,6 @@ mod tests {
     use super::*;
     use crate::jobs::key_locks::{KeyCheckError, LockedInputsOperation, ParkLockedOperation};
     use crate::jobs::store::job_calls::ClaimOutcome;
-    use aruna_core::UserId;
     use aruna_core::keyspaces::{
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
         PATHS_INDEX_KEYSPACE,
@@ -197,6 +196,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, HashIndex, VersionKey};
     use aruna_core::structs::storage::encryption::BucketEncryption;
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_test_support::jobs::insert_job;
     use aruna_test_support::jobs::read_job_record;

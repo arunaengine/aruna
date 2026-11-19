@@ -2,14 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::USER_KEYSPACE;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::Key;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -153,13 +153,13 @@ impl Operation for SearchUsersOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::{SearchUsersInput, SearchUsersMatch, SearchUsersOperation, SearchUsersOutput};
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
     use aruna_core::types::{Key, Value};
+    use aruna_core::user::id::UserId;
     use std::collections::HashMap;
 
     fn actor(realm_id: RealmId, user_id: UserId) -> Actor {
@@ -212,7 +212,7 @@ mod pure_tests {
         let mut operation = SearchUsersOperation::new(input(realm_id, "ALi", 10));
 
         let scan = IoCall::Page {
-            space: aruna_core::USER_KEYSPACE.to_string(),
+            space: aruna_core::keyspaces::USER_KEYSPACE.to_string(),
             prefix: UserId::storage_prefix(realm_id),
             after: None,
             limit: 64,

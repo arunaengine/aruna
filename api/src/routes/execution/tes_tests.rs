@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use axum::body::to_bytes;
 
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
@@ -20,6 +19,7 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_core::structs::storage::blob::UserAccess;
+use aruna_core::user::id::UserId;
 use aruna_test_support::jobs::insert_job;
 
 fn user(byte: u8) -> UserId {
@@ -230,10 +230,10 @@ async fn redacts_internal_detail() {
 fn maps_submit_errors() {
     // A TES client retries 500, so every non-retryable admission refusal
     // must keep the status the native submit surface answers with.
-    use aruna_core::ClockHealthError;
     use aruna_core::compute::quota::{QuotaDenied, QuotaDimension, QuotaScope};
     use aruna_core::job_request::SubmitJobError;
     use aruna_core::structs::execution::job::CompositionError;
+    use aruna_core::structured_id::ClockHealthError;
 
     let cases = [
         (

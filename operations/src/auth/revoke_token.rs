@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::{
     revocation_live, revocation_retained, user_cutoff_expiry, user_cutoff_hash,
@@ -24,6 +23,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use ulid::Ulid;
@@ -670,7 +670,6 @@ mod tests {
     use crate::document_repository::GetConfigOperation;
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::sync::outbox_record::admin_outbox_prefix;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentOperation;
     use aruna_core::auth::MAX_TOKEN_LIFETIME;
     use aruna_core::auth::bearer_token_hash;
@@ -684,6 +683,7 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::{Key, Value};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;

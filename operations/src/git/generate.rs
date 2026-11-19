@@ -4,7 +4,6 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::git::{
     GitChange, GitCheckpoint, GitEffect, GitEvent, GitPack, GitRecord, GitSnapshot, GitStatus,
@@ -19,6 +18,7 @@ use aruna_core::storage_entries::event_log_key;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::NodeRealm;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use serde_json::Value;
 use ulid::Ulid;

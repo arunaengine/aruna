@@ -65,7 +65,8 @@ use super::store::job_calls::{
 };
 use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::read_job_record;
-use crate::placement::policy::{LocalSubjectOperation, SubjectScanError};
+use crate::placement::policy::reconcile::LocalSubjectOperation;
+use crate::placement::policy::subject::SubjectScanError;
 
 /// Fallback walltime when a spec declares none. Enforcement, reconcile
 /// validation, and credential expiry must all agree on this value.

@@ -7,11 +7,11 @@ use std::collections::HashSet;
 use std::ops::Deref;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
 use aruna_core::errors::DhtError;
 use aruna_core::events::{DhtEvent, Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keys::realm_presence_key;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;

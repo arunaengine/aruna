@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::shard::recovery::RecoveryError;
@@ -12,7 +12,6 @@ use aruna_operations::tests::shard::flat_config;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::UserId;
 use aruna_core::document::{DocumentTarget, shard_topic_id};
 use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEntry, DhtEvent, Event, NetEvent, StorageEvent};
@@ -21,6 +20,7 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::record::{PlacementOverride, PlacementStrategy};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_net::config::NetConfig;

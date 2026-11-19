@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
@@ -628,7 +628,6 @@ fn remove_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
 
 #[cfg(test)]
 mod pure_tests {
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentTarget,
@@ -652,6 +651,7 @@ mod pure_tests {
         StrategyBinding, band_start, coordinator_spans,
     };
     use aruna_core::types::{Key, KeySpace, Value};
+    use aruna_core::user::id::UserId;
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
@@ -660,7 +660,7 @@ mod pure_tests {
         overlay_reducer_state,
     };
 
-    fn node(seed: u8) -> aruna_core::NodeId {
+    fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
@@ -828,7 +828,7 @@ mod pure_tests {
 
     fn run_ensure(
         actor: &Actor,
-        target: aruna_core::NodeId,
+        target: aruna_core::id::NodeId,
         kind: RealmNodeKind,
         document: &RealmConfigDocument,
     ) -> (RealmConfigDocument, Vec<u8>) {
@@ -870,7 +870,7 @@ mod pure_tests {
 
         let (after_a, state_a) = run_ensure(&actor_a, joiner_a, RealmNodeKind::Server, &document);
         let (after_b, _) = run_ensure(&actor_b, joiner_b, RealmNodeKind::Server, &document);
-        let granted = |after: &RealmConfigDocument, owner: &aruna_core::NodeId| {
+        let granted = |after: &RealmConfigDocument, owner: &aruna_core::id::NodeId| {
             let granted = after.handle_range_directory().granted_to(owner);
             assert_eq!(granted.len(), 1, "one usable grant per joiner");
             granted[0]

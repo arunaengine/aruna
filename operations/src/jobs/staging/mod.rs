@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod item;
-mod job;
+pub mod job;
 pub mod lanes;
 mod limiter;
 mod manifest;
@@ -29,7 +29,6 @@ use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-pub use self::job::StagingJobOperation;
 use super::run_rows::SettledRowsOperation;
 use super::store::mutation_error::JobMutationError;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};

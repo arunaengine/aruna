@@ -8,12 +8,12 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::id::NodeId;
 use crate::structs::execution::staging::PortableSourceDescriptor;
 use crate::structs::identity::s3_session::S3Session;
 use crate::structs::storage::global_id::GlobalId;
 use crate::structs::storage::replication::VersionedObjectArn;
+use crate::user::id::UserId;
 
 /// A device name in an upload origin is at most this long.
 pub const MAX_DEVICE_BYTES: usize = 255;

@@ -4,10 +4,10 @@
 
 use super::*;
 use crate::document_repository::GetConfigOperation;
-use aruna_core::UserId;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
 use aruna_core::types::Key;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::path_context;
 use ed25519_dalek::SigningKey;

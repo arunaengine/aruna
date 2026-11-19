@@ -124,9 +124,9 @@ async fn pruned_runs() {
 
 #[tokio::test]
 async fn resolved_runs() {
-    use aruna_core::UserId;
     use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     let (_dir, ctx) = opened();
     let install = Ulid::from_parts(1, 1);
     let mut run = queued(install, 1);
@@ -205,9 +205,9 @@ async fn keeps_open_calls() {
 #[tokio::test]
 async fn unresolved_count() {
     // A run that needs attention keeps its place until a person resolves it.
-    use aruna_core::UserId;
     use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     let (_dir, ctx) = opened();
     let install = Ulid::from_parts(1, 1);
     let mut waiting = queued(install, 1);
@@ -253,10 +253,10 @@ async fn resolved_expire() {
     // A resolved run and its intents leave with the retention like any finished run.
     use crate::plugins::intents::{open_intent, unknown_row, written};
     use crate::plugins::rows::write_rows;
-    use aruna_core::UserId;
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
     use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_plugin_types::calls::Intent;
     let (_dir, ctx) = opened();
     let install = Ulid::from_parts(1, 1);
@@ -355,8 +355,8 @@ fn admission_bound() {
 
 #[test]
 fn resolve_decisions() {
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     let install = Ulid::from_parts(1, 1);
     let mut waiting = queued(install, 1);
     waiting.state = RunState::NeedsAttention;

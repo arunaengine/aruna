@@ -467,7 +467,6 @@ fn apply_reducer_federation(
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentDot;
     use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
@@ -475,6 +474,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         OidcProviderConfig, RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::path_context;
     use ed25519_dalek::SigningKey;

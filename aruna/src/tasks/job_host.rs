@@ -25,10 +25,12 @@ use aruna_drivers::driver::{drive, node_routing};
 use aruna_drivers::effect_adapters::job::{JobHost, with_job_host};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_drivers::jobs::executor::RangeTurns;
-use aruna_operations::jobs::backend_import::{BackendImportOperation, ImportJob};
+use aruna_operations::jobs::backend_import::ImportJob;
+use aruna_operations::jobs::backend_import::job::BackendImportOperation;
 use aruna_operations::jobs::copy::CopyJobOperation;
 use aruna_operations::jobs::repository::JobScope;
-use aruna_operations::jobs::staging::{StagingJobOperation, StagingRun};
+use aruna_operations::jobs::staging::StagingRun;
+use aruna_operations::jobs::staging::job::StagingJobOperation;
 use aruna_operations::jobs::workflow::purge::{PurgeJobOperation, PurgeRun};
 
 /// This job as the repository and harvest operations see it.

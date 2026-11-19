@@ -8,7 +8,8 @@ use crate::auth::UnrestrictedAuth;
 use aruna_core::structs::storage::abe_access::{
     GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope, MAX_REQUESTS,
 };
-use aruna_operations::abe::{MemberKeysOperation, ReissueOperation};
+use aruna_operations::abe::member::MemberKeysOperation;
+use aruna_operations::abe::reissue::ReissueOperation;
 use aruna_operations::auth::epoch_due::EpochDueOperation;
 use aruna_operations::transfer::abe_rekey::RekeyOperation;
 use axum::extract::Path;
@@ -144,7 +145,7 @@ pub(crate) async fn member_requests(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
-    members: Vec<aruna_core::UserId>,
+    members: Vec<aruna_core::user::id::UserId>,
 ) -> Vec<String> {
     let now = aruna_clock::unix_timestamp_millis();
     let node = state.get_node_id();

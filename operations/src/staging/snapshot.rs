@@ -4,7 +4,7 @@
 
 use crate::connectors::descriptor::build_source_binding;
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
@@ -12,7 +12,6 @@ use crate::staging::read_source::{
     ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
 };
 use crate::staging::snapshot_reuse::{Reusable, SnapshotReuseError, SnapshotReuseOperation};
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
@@ -27,6 +26,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -442,7 +442,7 @@ mod tests {
         let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([6u8; 32]);
         let node_id = iroh::SecretKey::generate().public();
-        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
         let expected_bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
         let input = MaterializeSnapshotInput {

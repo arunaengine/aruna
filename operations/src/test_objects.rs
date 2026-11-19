@@ -4,11 +4,11 @@
 
 use crate::s3::object::put::PutObjectConfig;
 use crate::s3::object::put::PutObjectInput;
-use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use ulid::Ulid;
 

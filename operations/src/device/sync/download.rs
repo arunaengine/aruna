@@ -5,8 +5,8 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
@@ -49,7 +49,7 @@ impl From<IoError> for FetchError {
 pub(super) struct FetchRemoteOperation {
     realm_id: RealmId,
     node_id: NodeId,
-    owner: aruna_core::UserId,
+    owner: aruna_core::user::id::UserId,
     bucket: String,
     key: String,
     version: Ulid,

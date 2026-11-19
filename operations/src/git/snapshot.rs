@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::git::{
@@ -19,19 +18,22 @@ use aruna_core::repo_layout::{Layout, metadata_layout};
 use aruna_core::storage_entries::{document_job_prefix, materialization_status_key};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use tracing::warn;
 use ulid::Ulid;
 
 use super::access::Repository;
 use super::calls::{
-    StageTimes, busy_call, canonical_answer, canonical_call, configured_call, forget_call,
-    git_call, git_event, git_flag, has_store, kept_projection, last_call, metadata_call,
-    metadata_event, noted, refresh_once_call, remember_call, timed_call, timed_outcome,
+    StageTimes, busy_call, canonical_answer, canonical_call, configured_call, forget_call, git_call,
+    git_event, git_flag, has_store, kept_projection, last_call, metadata_event, noted,
+    refresh_once_call, remember_call, timed_call, timed_outcome,
 };
 use super::generate::{checkpoint, generate};
 use super::project::{inputs, project, recent};
-use super::{GitError, document, pending, publish, records, repository};
+use super::{GitError, pending, publish, records};
+use crate::git::access::{document, repository};
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::raw_events::RawReadError;
 use crate::metadata::revision_read::RawDisplayOperation;
 use aruna_core::git::GitNode;

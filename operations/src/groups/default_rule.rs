@@ -5,7 +5,6 @@
 use crate::groups::backends::{backend_key, record_writes};
 use crate::groups::fence::group_fence_key;
 use crate::groups::storage_routing::{GroupInputsOperation, PutGroupError, routing_key};
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
@@ -25,6 +24,7 @@ use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, GroupStorageRouting, RoutingError, RoutingTarget,
 };
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use std::time::SystemTime;
 use ulid::Ulid;
 

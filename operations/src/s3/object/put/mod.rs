@@ -5,10 +5,11 @@
 use crate::distribution::guard::{GuardError, WriteAuthority, authority_reads, record_authority};
 use crate::distribution::inventory::{AddedVersion, stamp_head, stamp_version, version_written};
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
-use crate::placement::policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision,
-    split_drift_reads, union_refs, write_gate,
+use crate::placement::policy::gate::{
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, gate_decision, split_drift_reads,
+    union_refs, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::s3::purge_fence::{
     PurgeFenceError, check_fence_row, check_published, fence_key, publication_rows,
 };
@@ -18,7 +19,6 @@ use crate::s3::usage::{
     schedule_snapshot_publish,
 };
 use crate::s3::write_cleanup::{ReleaseWrite, RollbackWrite, WriteCleanup};
-use aruna_core::UserId;
 use aruna_core::blob_records::{HeadAliasContext, dht_registration_effect, release_rows};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
@@ -69,6 +69,7 @@ use aruna_core::structs::storage::replication_queue::{
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
@@ -1218,17 +1219,11 @@ impl Operation for PutObjectOperation {
 
 mod dedup;
 pub(crate) mod fenced;
-mod plain;
+pub(crate) mod plain;
 #[path = "publish.rs"]
 mod publish;
-mod sharing;
-mod trail;
-pub(crate) use sharing::{ReaderScan, RuleScan};
-pub(crate) use trail::{Trail, TrailScan, trail_ranges};
-
-pub(crate) use plain::{
-    PlainRecord, intent_keys, intent_rows, owner_call, path_owned, same_name_path, version_row,
-};
+pub(crate) mod sharing;
+pub(crate) mod trail;
 
 #[path = "abe.rs"]
 pub(crate) mod abe;

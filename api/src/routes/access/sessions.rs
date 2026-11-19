@@ -16,10 +16,12 @@ use aruna_core::structs::identity::auth::{
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::create_token::CreateTokenError;
-use aruna_operations::session::{
-    CreateSessionConfig, CreateSessionError, ListSessionOperation, MakeRoomOperation,
-    RevokeSessionError, RevokeSessionOperation, bound_session_expiry,
+use aruna_operations::session::create::{
+    CreateSessionConfig, CreateSessionError, bound_session_expiry,
 };
+use aruna_operations::session::limit::MakeRoomOperation;
+use aruna_operations::session::list::ListSessionOperation;
+use aruna_operations::session::revoke::{RevokeSessionError, RevokeSessionOperation};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -352,8 +354,8 @@ mod tests {
     use crate::auth::handle_token;
     use crate::error::TokenError;
     use crate::tests::realms::member_state;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::auth::SessionRef;
+    use aruna_core::user::id::UserId;
     use axum::response::IntoResponse;
     use tempfile::TempDir;
 

@@ -10,6 +10,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::federation::Signed;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DEDUP_INDEX_KEYSPACE, FEDERATION_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
 };
@@ -28,7 +29,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::transfer::{
     ExportGrant, ImportDestination, ImportIntent, TransferError, check_grant, check_intent,
 };
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use serde::Serialize;
 use thiserror::Error;
 use tracing::warn;

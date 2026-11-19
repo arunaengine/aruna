@@ -11,7 +11,6 @@ use aruna_api::routes::access::sessions::{CreateSessionRequest, CreateSessionRes
 use aruna_api::server::Server;
 use aruna_api::server::ServerConfig;
 use aruna_api::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::auth::ADMIN_CLAIMED_KEY;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -27,6 +26,7 @@ use aruna_core::structs::identity::auth::{
 };
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

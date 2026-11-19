@@ -5,8 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DEAD_LETTER_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE};
 use aruna_core::metadata::IriIndexRecord;
 use aruna_core::operation::Operation;

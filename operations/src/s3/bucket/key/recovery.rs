@@ -8,6 +8,7 @@ use crate::s3::bucket::key::rows::{
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, BUCKET_RECOVERY_KEYSPACE, KEY_COPY_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -23,7 +24,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::holders::{KeyLookup, RecoveryState, resolve_holders};
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 

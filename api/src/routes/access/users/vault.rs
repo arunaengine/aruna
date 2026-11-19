@@ -9,7 +9,6 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::effects::VaultQuery;
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::AuthToken;
@@ -18,11 +17,12 @@ use aruna_core::structs::identity::user::vault::{
     MAX_PREDECESSORS, MAX_VAULT_BYTES, VaultAppended, VaultChange, VaultRecordError, VaultRecords,
     VaultRefusal, VaultRevision,
 };
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::forward::routing::HolderWriteError;
-use aruna_operations::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
-use aruna_operations::users::vault_route::{AppendRoutedOperation, VaultRouteError};
-use aruna_operations::users::vault_write::{AppendVaultConfig, AppendVaultError};
+use aruna_operations::users::vault::read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
+use aruna_operations::users::vault::route::{AppendRoutedOperation, VaultRouteError};
+use aruna_operations::users::vault::write::{AppendVaultConfig, AppendVaultError};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};

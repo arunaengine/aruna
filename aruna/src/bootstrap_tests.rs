@@ -9,10 +9,10 @@ use super::{
 };
 use crate::inbound::initialize_incoming_fixture;
 use crate::tasks::incoming::OutboxDrainer;
-use aruna_core::NodeId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
 use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
 use aruna_core::structs::execution::notification_watch::{
@@ -43,10 +43,10 @@ use tempfile::tempdir;
 fn user_topics_deduplicate() {
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let first = DocumentTarget::User {
-        user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([2u8; 16]), realm_id),
+        user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([2u8; 16]), realm_id),
     };
     let second = DocumentTarget::User {
-        user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([3u8; 16]), realm_id),
+        user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([3u8; 16]), realm_id),
     };
     let first_shard = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: ulid::Ulid::from_bytes([4u8; 16]),
@@ -108,7 +108,7 @@ fn unreachable_peer_waited() {
 // selects it: infrastructure keeps fetching its documents over sync.
 #[test]
 fn device_identity_routes() {
-    let owner = aruna_core::UserId::nil(RealmId::from_bytes([2u8; 32]));
+    let owner = aruna_core::user::id::UserId::nil(RealmId::from_bytes([2u8; 32]));
     assert_eq!(PersistedNodeIdentity::User { owner }.owner(), Some(owner));
     assert_eq!(
         PersistedNodeIdentity::Server {
@@ -235,7 +235,7 @@ async fn write_config_nodes(
         .collect();
     let actor = Actor {
         node_id,
-        user_id: aruna_core::UserId::nil(realm_id),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
         realm_id,
     };
     assert!(matches!(
@@ -692,7 +692,7 @@ fn readiness_requires_all() {
 async fn read_digest(
     context: &DriverContext,
     realm_id: RealmId,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) -> WatchInterestDigest {
     match context
         .storage_handle

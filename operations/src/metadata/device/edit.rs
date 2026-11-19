@@ -6,11 +6,10 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::METADATA_ACTOR_KEYSPACE;
 use aruna_core::metadata::{
@@ -21,6 +20,7 @@ use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{metadata_actor_entry, metadata_actor_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::user::id::UserId;
 use craqle::ActorId;
 use thiserror::Error;
 use tracing::warn;
@@ -547,7 +547,6 @@ mod tests {
     };
     use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
     use crate::tests::device::record;
-    use aruna_core::UserId;
     use aruna_core::calls::IoResult;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -557,13 +556,14 @@ mod tests {
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::DriverContext;
     use aruna_drivers::driver::drive;
     use craqle::VectorClock;
     use std::sync::Arc;
     use ulid::Ulid;
 
-    fn node(seed: u8) -> aruna_core::NodeId {
+    fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 

@@ -7,7 +7,7 @@ use crate::admin::{AdminState, RealmStatus};
 use crate::store::tests::{realm_id, registration};
 use crate::store::{Entry, Store};
 use aruna_core::egress::EgressPolicy;
-use aruna_core::{BucketId, PlacementHandle, StructuredId};
+use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 use axum::extract::State;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -135,9 +135,9 @@ impl Sites {
     }
 }
 
-fn node_id() -> aruna_core::NodeId {
+fn node_id() -> aruna_core::id::NodeId {
     let key = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
-    aruna_core::NodeId::from_bytes(key.as_bytes()).unwrap()
+    aruna_core::id::NodeId::from_bytes(key.as_bytes()).unwrap()
 }
 
 fn redirect(target: &str) -> Answer {

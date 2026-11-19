@@ -11,8 +11,10 @@ use super::job_host::{job_scope, run_hosted};
 use aruna_core::jobs::JobRunOutcome;
 use aruna_drivers::driver::node_routing;
 use aruna_drivers::jobs::context::JobContext;
-use aruna_operations::jobs::export::{ExportJobOperation, ExportScope};
-use aruna_operations::jobs::import::{ImportJobOperation, ImportRun};
+use aruna_operations::jobs::export::ExportScope;
+use aruna_operations::jobs::export::job::ExportJobOperation;
+use aruna_operations::jobs::import::ImportRun;
+use aruna_operations::jobs::import::job::ImportJobOperation;
 
 pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> JobRunOutcome {
     let run = ImportRun {

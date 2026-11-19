@@ -9,9 +9,9 @@ use crate::auth::error::{AuthorizeError, PolicyEnforcementError, check_error};
 use crate::auth::permission_rules::{
     GroupPermissionRules, PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::readable_roots;
 use aruna_core::request_policy::{PolicyRequest, PolicyRequestExtras, policy_request_with};

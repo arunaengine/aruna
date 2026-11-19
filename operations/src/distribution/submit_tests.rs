@@ -67,7 +67,7 @@ fn accepted(result: Revision) -> IoResult {
 
 fn auth() -> AuthContext {
     AuthContext {
-        user_id: aruna_core::UserId::nil(realm()),
+        user_id: aruna_core::user::id::UserId::nil(realm()),
         realm_id: realm(),
         path_restrictions: None,
         session: None,

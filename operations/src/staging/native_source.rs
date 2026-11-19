@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StagingSourceError;
+use aruna_core::id::NodeId;
 use aruna_core::native_reference::{
     NativeAuthority, NativeReferenceReject, NativeReferenceRequest,
 };
@@ -30,12 +30,11 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::peer_trust::is_sync_eligible;
-use crate::replication::mirror_repair::{
-    KickRepairOperation, StoreStatusOperation, SyncMirrorError,
-};
-use crate::replication::sync_relationship::{
-    GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
-};
+use crate::replication::mirror_repair::SyncMirrorError;
+use crate::replication::mirror_repair::kick::KickRepairOperation;
+use crate::replication::mirror_repair::status::StoreStatusOperation;
+use crate::replication::sync_relationship::get::GetRelationshipOperation;
+use crate::replication::sync_relationship::{SyncRelationshipDirection, SyncRelationshipError};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -699,7 +698,7 @@ mod tests {
     fn missing_bucket_found() {
         let authority = NativeAuthority::Relationship(Ulid::from_bytes([4; 16]));
         let auth = AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([5; 16]), ids().1),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([5; 16]), ids().1),
             realm_id: ids().1,
             path_restrictions: None,
             session: None,
@@ -744,9 +743,8 @@ mod tests {
     async fn denial_journals_failure() {
         // A native read whose creator lost READ fails the relationship and journals its
         // `sync_failed` with that status write, with no replication job queued.
-        use crate::replication::sync_relationship::{
-            StoreRelationshipOperation, SyncRelationshipDirection,
-        };
+        use crate::replication::sync_relationship::SyncRelationshipDirection;
+        use crate::replication::sync_relationship::store::StoreRelationshipOperation;
         use aruna_core::structs::storage::blob::BucketInfo;
         use aruna_core::structs::storage::format::Compression;
         let tempdir = tempfile::tempdir().unwrap();
@@ -763,7 +761,7 @@ mod tests {
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let source = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let target = iroh::SecretKey::from_bytes(&[4; 32]).public();
-        let creator = aruna_core::UserId::local(Ulid::from_parts(5, 5), realm_id);
+        let creator = aruna_core::user::id::UserId::local(Ulid::from_parts(5, 5), realm_id);
         let relationship = SyncRelationship {
             id: Ulid::from_parts(2, 2),
             source: ArunaArn::s3_bucket(realm_id, source, "source").unwrap(),
@@ -825,7 +823,7 @@ mod tests {
             reference_handling: ReferenceHandling::Materialize,
             reference_serving: false,
             replicate_deletes: true,
-            created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            created_by: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             state: SyncState::Enabled,
             status: SyncStatusSnapshot::default(),

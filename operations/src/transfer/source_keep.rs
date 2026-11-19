@@ -197,9 +197,9 @@ impl Operation for KeepSourceOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use super::*;

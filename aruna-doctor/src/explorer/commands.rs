@@ -368,7 +368,7 @@ mod tests {
             backend_path: "path/blob.bin".to_string(),
             ulid: Ulid::from_bytes([5_u8; 16]),
             format: StoredFormat::default(),
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
             partial: false,
@@ -500,7 +500,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([7_u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[9_u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([9_u8; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([9_u8; 16]), realm_id),
             realm_id,
         };
         let group = Group {
@@ -508,7 +508,7 @@ mod tests {
             group_id,
             realm_id,
             roles: Default::default(),
-            owner: aruna_core::UserId::local(Ulid::from_bytes([10_u8; 16]), realm_id),
+            owner: aruna_core::user::id::UserId::local(Ulid::from_bytes([10_u8; 16]), realm_id),
         };
 
         {

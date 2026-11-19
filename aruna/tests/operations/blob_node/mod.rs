@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::time::UNIX_EPOCH;
 
 use aruna_blob::blob::{BlobHandle, BlobHandler};
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 
 use crate::convergence::TestResult;

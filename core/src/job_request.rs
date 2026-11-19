@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::calls::IoError;
 use crate::compute::SessionMount;
 use crate::compute::runtimes::{
@@ -22,6 +21,7 @@ use crate::structs::placement::record::{LabelMatch, shard_for_subject};
 use crate::structured_id::{
     BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredId,
 };
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;

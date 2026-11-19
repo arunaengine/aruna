@@ -59,13 +59,13 @@ impl AttemptControl {
     /// destination, so a distributed bucket's id carries its set hint. Reports any addition.
     pub fn reserve_outputs<F>(
         &mut self,
-        destinations: &[(crate::NodeId, String, String)],
+        destinations: &[(crate::id::NodeId, String, String)],
         mut mint: F,
     ) -> bool
     where
-        F: FnMut(&(crate::NodeId, String, String)) -> Ulid,
+        F: FnMut(&(crate::id::NodeId, String, String)) -> Ulid,
     {
-        let mut reserved: BTreeSet<(crate::NodeId, String, String)> = self
+        let mut reserved: BTreeSet<(crate::id::NodeId, String, String)> = self
             .output_commits
             .iter()
             .map(|commit| (commit.node_id, commit.bucket.clone(), commit.key.clone()))
@@ -91,7 +91,7 @@ impl AttemptControl {
 /// replayed capture reuses this VersionId instead of creating a second version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputCommitIntent {
-    pub node_id: crate::NodeId,
+    pub node_id: crate::id::NodeId,
     pub bucket: String,
     pub key: String,
     pub version_id: Ulid,
@@ -135,7 +135,7 @@ pub fn parse_dedup_value(bytes: &[u8]) -> Result<(JobId, [u8; 32]), ConversionEr
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputObject {
     /// Node-local endpoint that owns this exact version.
-    pub node_id: crate::NodeId,
+    pub node_id: crate::id::NodeId,
     pub bucket: String,
     pub key: String,
     /// Exact version this write created. Two executions writing one key keep two
@@ -282,7 +282,7 @@ impl JobResultPayload {
             return Err(JobRecordError::OutputIdentity);
         };
         self.check_outputs(control.execution_id)?;
-        let reserved: BTreeSet<(crate::NodeId, &str, &str, Ulid)> = control
+        let reserved: BTreeSet<(crate::id::NodeId, &str, &str, Ulid)> = control
             .output_commits
             .iter()
             .map(|commit| {

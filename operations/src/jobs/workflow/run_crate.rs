@@ -24,7 +24,7 @@ use aruna_core::structs::storage::data::identity::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::{MetaResourceId, StructuredId};
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
 use aruna_core::structs::storage::release::{RELEASE_INCOMPLETE, RELEASE_MEMBERSHIP};
@@ -55,7 +55,8 @@ use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::realm::mutate_placement::node_kind;
-use crate::replication::locations::{LocationSummaryError, RemoteLocationOperation};
+use crate::replication::locations::LocationSummaryError;
+use crate::replication::locations::remote::RemoteLocationOperation;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
@@ -1373,11 +1374,11 @@ mod pure_tests {
         assert!(is_transient(&profile_rejection("validator_unavailable")));
     }
 
-    use aruna_core::UserId;
     use aruna_core::structs::execution::job::{
         AttemptIntent, CapturedInput, InputMode, InputSelection, OutputObject,
     };
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use serde_json::Value;
 
     pub(super) fn execution_record() -> (JobRecord, ExecutionSpec) {

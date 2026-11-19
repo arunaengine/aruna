@@ -265,6 +265,6 @@ pub(crate) async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> 
         routing: aruna_drivers::driver::node_routing(&ctx.driver),
         seed: 7,
     };
-    let job = aruna_operations::jobs::staging::StagingJobOperation::new(run);
+    let job = aruna_operations::jobs::staging::job::StagingJobOperation::new(run);
     aruna::tasks::job_host::run_hosted(ctx, job).await
 }

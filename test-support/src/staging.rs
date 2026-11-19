@@ -4,7 +4,6 @@
 
 use aruna_blob::blob::BlobHandler;
 use aruna_blob::blob::registry::BackendRegistry;
-use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::jobs::ProgressReporter;
 use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
@@ -23,6 +22,7 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_net::NetHandle;
@@ -34,7 +34,7 @@ use aruna_operations::groups::routing::BucketRules;
 use aruna_operations::groups::routing::SnapshotOperation;
 use aruna_operations::metadata::api::object_search::search_objects;
 use aruna_operations::metadata::api::search_types::{ObjectQueryMode, SearchQueryRequest};
-use aruna_operations::placement::policy::GateOperation;
+use aruna_operations::placement::policy::gate::GateOperation;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::head::HeadObjectInput;
 use aruna_operations::s3::object::head::HeadObjectOperation;
@@ -655,7 +655,7 @@ pub fn test_spec() -> aruna_core::structs::execution::job::StagingJobSpec {
     let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
     aruna_core::structs::execution::job::StagingJobSpec {
         auth_context: aruna_core::structs::identity::auth::AuthContext {
-            user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([2; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([2; 16]), realm_id),
             realm_id,
             path_restrictions: None,
             session: None,

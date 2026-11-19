@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -12,6 +11,7 @@ use aruna_core::plugin_runs::{RUN_RETENTION_MS, run_key};
 use aruna_core::structs::execution::job::{
     JobId, JobPayload, JobRecord, JobResultPayload, JobState, OutputObject, PluginWorkSpec,
 };
+use aruna_core::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use ulid::Ulid;

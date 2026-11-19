@@ -167,7 +167,6 @@ pub(crate) async fn write_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::audit::{AuditPageEntry, AuditPageResponse};
     use aruna_core::metadata::protocol::{
         AUDIT_FRAME, AUDIT_REQUEST_VARIANT, INBOUND_FRAME_BYTES, STANDARD_FRAME, audit_frame_cap,
@@ -176,6 +175,7 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
     };
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     async fn read_capped(

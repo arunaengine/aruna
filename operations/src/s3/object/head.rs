@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
+use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
 use crate::s3::object::lookup::{FoundVersion, VersionLookup, VersionLookupError};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};

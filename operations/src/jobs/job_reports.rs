@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::jobs::{JobKind, JobReportView, JobRequest, JobResponse};
 use aruna_core::metadata::AuthToken;
@@ -12,6 +11,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 
 use super::job_reads::{JobReadError, OwnedJobOperation, ReadableJobOperation, internal};
 use super::job_routes::{FamilyRouteOperation, refused};

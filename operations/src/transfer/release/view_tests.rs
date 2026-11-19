@@ -6,13 +6,13 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use aruna_core::UserId;
 use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::OriginVersion;
 use aruna_core::structs::storage::release::ReleaseFile;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::user::id::UserId;
 
 use super::*;
 use crate::distribution::test_record::secret;

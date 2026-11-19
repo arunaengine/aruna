@@ -5,12 +5,12 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::heartbeat::Here;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;
@@ -22,7 +22,7 @@ use tracing::warn;
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
-use crate::groups::deletion::ApplyRequestOperation;
+use crate::groups::deletion::peer::ApplyRequestOperation;
 use crate::groups::forward::ApplyGroupOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::audit::AUDIT_DEADLINE_SECS;
@@ -33,11 +33,11 @@ use crate::metadata::device::serve::{
 use crate::metadata::persistent_id::forward::ServePidOperation;
 use crate::metadata::read_peer::ReadPeerOperation;
 use crate::metadata::serve::publish::serve_publish;
-use crate::placement::policy::transport::PolicyAnswer;
-use crate::placement::policy::{ApplyPolicyOperation, ServePolicyOperation};
+use crate::placement::policy::forward::ApplyPolicyOperation;
+use crate::placement::policy::transport::{PolicyAnswer, ServePolicyOperation};
 use crate::s3::bucket::forward::BucketForwardOperation;
 use crate::transfer::forward::serve_admission;
-use crate::users::vault_route::{ApplyVaultOperation, ServeVaultOperation};
+use crate::users::vault::route::{ApplyVaultOperation, ServeVaultOperation};
 use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage as Message};
 
 /// How a forwarded request's child outcome becomes the reply.

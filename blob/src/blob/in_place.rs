@@ -9,7 +9,6 @@ use super::io::{backend_version, reader_at};
 use crate::codec::Guard;
 use crate::part_chain::{PartAttempt, PartChain};
 use crate::s3::{NativeMultipart, multipart_etag};
-use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -24,6 +23,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::{Compression, PartLayout, StoredFormat, StoredLayout};
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use byteview::ByteView;
 use futures::StreamExt;

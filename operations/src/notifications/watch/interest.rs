@@ -5,10 +5,10 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::WATCH_INTEREST_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::notification_watch::{
@@ -576,7 +576,6 @@ mod call_tests;
 mod tests {
     use super::*;
     use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
@@ -591,6 +590,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::NetHandle;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

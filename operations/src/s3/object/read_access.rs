@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
@@ -248,16 +248,16 @@ mod tests {
 mod storage_tests {
     use std::time::SystemTime;
 
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use super::*;
-    use aruna_core::NodeId;
+    use aruna_core::id::NodeId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::read_grant::READ_OPERATION;
     use aruna_drivers::driver::{DriverContext, drive};

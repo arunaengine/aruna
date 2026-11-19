@@ -6,7 +6,6 @@ use super::{
     BUDGET_CAP, ChatStoreError, TURN_CAP, decode_heads, head_key, heads_page, live_head, read_head,
     turn_key, turns_page,
 };
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -14,6 +13,7 @@ use aruna_core::structs::{
     AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
 };
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 
 /// Reads the live turns of one chat in seq order, optionally only those after
 /// a seq the caller already holds.

@@ -190,7 +190,7 @@ mod tests {
             backend_path: String::new(),
             ulid: Ulid::from_bytes([3; 16]),
             format,
-            created_by: crate::UserId::default(),
+            created_by: crate::user::id::UserId::default(),
             created_at: UNIX_EPOCH + Duration::from_millis(written_ms),
             staging: false,
             partial: false,

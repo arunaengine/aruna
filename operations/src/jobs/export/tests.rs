@@ -40,16 +40,15 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use crate::tests::import::{
-    RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
-    read_metadata, rewrite_document, signature_entry, validate_document,
-};
+use crate::jobs::import::rewrite::{RewriteTarget, rewrite_document, validate_document};
+use aruna_blob::archive::{inspect_archive, open_archive, read_metadata};
 use aruna_blob::blob::BlobHandle;
-use aruna_core::UserId;
+use aruna_core::rocrate_archive::{file_id_candidates, payload_entries, signature_entry};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::data::identity::{ObjectLocation, normalized_id};
+use aruna_core::user::id::UserId;
 use aruna_storage::storage::worker::FjallStorage;
 use aruna_test_support::staging::setup_driver_context;
 use std::collections::HashMap;

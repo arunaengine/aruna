@@ -5,8 +5,8 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{CallIntent, StateRefusal, StateRemoval, StateWrite};

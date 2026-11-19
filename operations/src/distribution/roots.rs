@@ -5,6 +5,7 @@
 
 // One pass reads one page of roots; a sweep that met an unreadable root starts over.
 
+use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -19,8 +20,6 @@ use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
-
-use crate::connectors::{ResolveBindingInput, ResolveBindingOperation};
 
 /// Root rows one pass reads; a set has few roots, so one page is typical.
 const ROOT_PAGE: usize = 256;

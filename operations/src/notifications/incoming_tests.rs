@@ -10,7 +10,6 @@ use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;
 use crate::tests::notifications::{data_group_id, data_node_id};
 use crate::tests::notifications::{seeded_record, upload_event};
-use aruna_core::UserId;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
@@ -19,6 +18,7 @@ use aruna_core::structs::execution::notification_watch::{
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 #[test]

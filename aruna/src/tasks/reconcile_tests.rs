@@ -7,13 +7,13 @@ use aruna_clock::unix_timestamp_millis;
 use super::workflow_fixtures::{execution_spec, node_id};
 use crate::tasks::runner::ComputeReconciler;
 use aruna_compute::registry::ExecutorRegistry;
-use aruna_core::UserId;
 use aruna_core::structs::execution::job::{
     AttemptIntent, JobClaim, JobId, JobPayload, JobRecord, JobState,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::context::ExternalReconciler;
 use aruna_drivers::jobs::runtime::JobsRuntime;

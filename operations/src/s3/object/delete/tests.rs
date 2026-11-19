@@ -57,12 +57,12 @@ fn read(value: Option<aruna_core::types::Value>) -> IoResult {
     IoResult::Values(vec![value])
 }
 
-fn test_node_id() -> aruna_core::NodeId {
+fn test_node_id() -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[7; 32]).public()
 }
 
-fn test_user_id() -> aruna_core::UserId {
-    aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
+fn test_user_id() -> aruna_core::user::id::UserId {
+    aruna_core::user::id::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn begun_storage_failure() {
     );
 }
 
-fn deleted_version_value(user_id: aruna_core::UserId) -> aruna_core::types::Value {
+fn deleted_version_value(user_id: aruna_core::user::id::UserId) -> aruna_core::types::Value {
     BlobVersion::deleted(SystemTime::UNIX_EPOCH, user_id)
         .to_bytes()
         .unwrap()
@@ -281,7 +281,7 @@ fn deleted_version_entry(
     bucket: &str,
     key: &str,
     version_id: Ulid,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
 ) -> (aruna_core::types::Key, aruna_core::types::Value) {
     (
         VersionKey::new(bucket, key, version_id)
@@ -463,7 +463,7 @@ async fn read_value(
 fn delete_until_lookup(
     target_version_id: Ulid,
     all_version_ids: Vec<Ulid>,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
 ) -> DeleteObjectOperation {
     let mut op = DeleteObjectOperation::new(DeleteObjectInput {
         bucket: "bucket".to_string(),
@@ -665,7 +665,7 @@ async fn creates_tombstone() {
         outbound_handle: None,
     };
 
-    let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
     let group_id = Ulid::generate();
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = context.net_handle.as_ref().unwrap().node_id();
@@ -818,7 +818,7 @@ async fn deletes_version() {
         outbound_handle: None,
     };
 
-    let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
     let group_id = Ulid::generate();
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = context.net_handle.as_ref().unwrap().node_id();
@@ -1474,9 +1474,8 @@ async fn offered_history(
     context: &DriverContext,
     withdraw: bool,
 ) -> (crate::staging::offered_directory::OfferDirectoryInput, Ulid) {
-    use crate::staging::offered_directory::{
-        OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
-    };
+    use crate::staging::offer::run::{offer_directory, withdraw_offer};
+    use crate::staging::offered_directory::{OfferDirectoryInput, WithdrawOfferInput};
 
     let root = tempdir().unwrap();
     let file = root.path().join("data.bin");
@@ -1487,7 +1486,7 @@ async fn offered_history(
         group_id: Ulid::generate(),
         realm_id,
         node_id: test_node_id(),
-        user_id: aruna_core::UserId::new(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::new(Ulid::generate(), realm_id),
     };
     std::fs::write(&file, b"one").unwrap();
     let first = drive(offer_directory(offer.clone()), context)
@@ -1674,7 +1673,7 @@ async fn bucket_rows_sum() {
         outbound_handle: None,
     };
     let realm_id = RealmId::from_bytes([1u8; 32]);
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
     for bucket in ["one", "two"] {
         let info = BucketInfo {

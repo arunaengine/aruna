@@ -517,7 +517,7 @@ pub async fn test_put_object() {
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let group_id = Ulid::generate();
     let node_id = net_handle.node_id();
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let preassigned_version_id = Ulid::generate();
     let put_config = PutObjectConfig {
         user_id,
@@ -813,7 +813,7 @@ pub async fn deduplicates_blob() {
 
     let first = drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id,
@@ -840,7 +840,7 @@ pub async fn deduplicates_blob() {
 
     let second = drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id,
@@ -1015,7 +1015,7 @@ async fn put_routed(
 ) -> super::PutObjectResult {
     drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id: context.net_handle.as_ref().unwrap().node_id(),
@@ -1107,7 +1107,7 @@ async fn release_row_committed() {
     ]);
     let put = |key: &str, metadata: HashMap<String, String>| {
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id: context.net_handle.as_ref().unwrap().node_id(),
@@ -1207,7 +1207,7 @@ async fn delete_keeps_copy() {
                 group_id,
                 realm_id,
                 node_id: context.net_handle.as_ref().unwrap().node_id(),
-                deleted_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                deleted_by: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             },
         ),
         &context,
@@ -1277,7 +1277,7 @@ pub async fn overwrite_retains_index() {
 
     let first = drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id,
@@ -1304,7 +1304,7 @@ pub async fn overwrite_retains_index() {
 
     let second = drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id,
@@ -1459,7 +1459,7 @@ async fn mismatch_cleans_blob() {
     let data = b"hello, world!";
     let err = drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             group_id: Ulid::generate(),
             realm_id: RealmId::from_bytes([1u8; 32]),
             node_id: context.net_handle.as_ref().unwrap().node_id(),
@@ -2378,7 +2378,7 @@ mod routing {
 /// the shared placement gate, which runs as a child.
 mod decisions {
     use super::*;
-    use crate::placement::policy::PolicyCacheStats;
+    use crate::placement::policy::cache::PolicyCacheStats;
     use aruna_core::structs::placement::policy::{
         PlacementDecision, PlacementSubject, VerifiedPolicy,
     };

@@ -419,7 +419,7 @@ enum SettleStep {
 pub(crate) struct SettleImportOperation {
     scope: NodeScope,
     job_id: JobId,
-    owner_node: aruna_core::NodeId,
+    owner_node: aruna_core::id::NodeId,
     spec: ImportRoCrateSpec,
     progress: Option<PullProgress>,
     failure: Option<String>,
@@ -431,7 +431,7 @@ impl SettleImportOperation {
     pub(crate) fn new(
         scope: NodeScope,
         job_id: JobId,
-        owner_node: aruna_core::NodeId,
+        owner_node: aruna_core::id::NodeId,
         spec: ImportRoCrateSpec,
         progress: Option<PullProgress>,
         failure: Option<String>,

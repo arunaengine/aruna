@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{
@@ -20,6 +19,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::{GroupId, RoleId};
+use aruna_core::user::id::UserId;
 
 use super::grants::{InstallScope, READ_ROLE, WRITE_ROLE, parse_grants, role_name, role_paths};
 use super::rows::{StoreError, mapped_child, read_call, values};

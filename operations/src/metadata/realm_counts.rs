@@ -118,11 +118,11 @@ impl Operation for RealmGroupsOperation {
 mod tests {
     use std::sync::Arc;
 
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::rows::encode;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::{Key, Value};
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use super::*;

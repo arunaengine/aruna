@@ -30,7 +30,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::backends::query::{GetBackendOperation, GroupQueryError};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::s3::imports::folders::shares_folder;
 use crate::s3::imports::shared::SharedRule;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};

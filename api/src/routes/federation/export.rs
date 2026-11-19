@@ -23,11 +23,12 @@ use aruna_core::transfer::{
 };
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::federation::import::header_value;
+use aruna_operations::jobs::export::consent::UnheldBucketOperation;
 use aruna_operations::jobs::export::grant::{
     AdmitGrantOperation, IssueExportOperation, IssueGrantConfig, ReadGrantOperation,
     RevokeGrantOperation, export_access,
 };
-use aruna_operations::jobs::export::{CrateJsonOperation, UnheldBucketOperation};
+use aruna_operations::jobs::export::snapshot::CrateJsonOperation;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -369,7 +370,7 @@ pub async fn delete_grant(
 async fn check_holder(
     context: &Arc<DriverContext>,
     spec: &ExportRoCrateSpec,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) -> Result<(), GrantError> {
     let (auth, limit) = (&spec.auth_context, spec.limits.metadata_bytes);
     let local = context.net_handle.as_ref().map(|net| net.node_id());

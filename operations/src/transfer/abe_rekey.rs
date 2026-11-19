@@ -5,8 +5,8 @@
 use crate::abe::KeyError;
 use crate::blob::migration::rewrite::{RewriteError, RewriteOutcome, RewriteVersionOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_EPOCH_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, S3_BUCKET_KEYSPACE,

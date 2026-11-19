@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::user::id::UserId;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()

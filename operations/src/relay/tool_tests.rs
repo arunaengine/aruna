@@ -29,7 +29,7 @@ fn call() -> ToolCall {
 fn config() -> RealmConfigDocument {
     let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
     let device = RealmNodeKind::User {
-        owner: aruna_core::UserId::nil(realm()),
+        owner: aruna_core::user::id::UserId::nil(realm()),
     };
     for (seed, kind) in [(2, RealmNodeKind::Server), (3, device)] {
         config.nodes.push(RealmNode {

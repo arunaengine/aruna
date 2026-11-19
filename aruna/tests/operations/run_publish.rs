@@ -334,7 +334,7 @@ async fn crate_stays_local() -> TestResult<()> {
         .find(|entity| entity["conformsTo"]["@id"] == "https://w3id.org/ro/wfrun/process/0.5")
         .ok_or("the crate has a root")?;
     assert_eq!(root["@id"], "./");
-    let stranger = aruna_core::UserId::local(Ulid::from(9u128), realm.realm_id);
+    let stranger = aruna_core::user::id::UserId::local(Ulid::from(9u128), realm.realm_id);
     assert!(
         drive(local_run_crate(job_id, stranger), &device.context)
             .await

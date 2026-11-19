@@ -14,7 +14,6 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::onboarding::{authorize_onboarding_admin, map_consume_error, map_inspect_error};
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs as now_timestamp;
-use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission, Role, SessionKind,
@@ -22,6 +21,7 @@ use aruna_core::structs::identity::auth::{
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::email_hash;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::enforcement::EnforcePolicyOperation;
@@ -41,7 +41,8 @@ use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
 use aruna_operations::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
 };
-use aruna_operations::session::{CreateSessionConfig, CreateSessionError, MakeRoomOperation};
+use aruna_operations::session::create::{CreateSessionConfig, CreateSessionError};
+use aruna_operations::session::limit::MakeRoomOperation;
 use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
 use aruna_operations::users::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::users::list_users::{ListUsersInput, ListUsersOperation};
@@ -822,7 +823,7 @@ async fn get_token(
 
     ensure_active(&state, user_id).await?;
     let now = now_timestamp();
-    let expiry = aruna_operations::session::bound_session_expiry(
+    let expiry = aruna_operations::session::create::bound_session_expiry(
         now,
         query.expires_in_seconds,
         now.saturating_add(TOKEN_EXPIRY_SECONDS),
@@ -1606,7 +1607,7 @@ fn enrollment_status(claimed: bool, expires_at: u64, now: u64) -> &'static str {
 /// an outstanding enrollment secret only shows what has not landed yet.
 async fn owned_devices(
     state: &Arc<ServerState>,
-    owner: aruna_core::UserId,
+    owner: aruna_core::user::id::UserId,
 ) -> ServerResult<Vec<UserDeviceResponse>> {
     let config = drive(
         GetConfigOperation::new(state.get_realm_id()),
@@ -1762,7 +1763,7 @@ async fn revoke_user_device(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    let node_id = aruna_core::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
+    let node_id = aruna_core::id::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
     evict_node(&state, &auth, node_id, DeviceEvictionScope::Owner).await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1803,7 +1804,7 @@ async fn evict_device(
     Path(node_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = authorize_onboarding_admin(&state, auth).await?;
-    let node_id = aruna_core::NodeId::from_str(&node_id).map_err(|_| ServerError::NotFound)?;
+    let node_id = aruna_core::id::NodeId::from_str(&node_id).map_err(|_| ServerError::NotFound)?;
     evict_node(&state, &auth, node_id, DeviceEvictionScope::RealmAdmin).await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1815,7 +1816,7 @@ async fn evict_device(
 async fn evict_node(
     state: &Arc<ServerState>,
     auth: &AuthContext,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     scope: DeviceEvictionScope,
 ) -> ServerResult<()> {
     if let Some(enrollment_id) = claimed_enrollment(state, &node_id.to_string()).await? {

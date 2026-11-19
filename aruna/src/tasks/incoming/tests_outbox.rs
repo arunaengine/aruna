@@ -1457,7 +1457,7 @@ fn admin_placement(shard: u32) -> aruna_core::structs::placement::record::Placem
 
 fn admin_outbox(
     realm_id: RealmId,
-    origin: aruna_core::NodeId,
+    origin: aruna_core::id::NodeId,
     origin_seq: u64,
     target: DocumentTarget,
     placement: aruna_core::structs::placement::record::PlacementRef,
@@ -1465,7 +1465,7 @@ fn admin_outbox(
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
-    let user_id = aruna_core::UserId::nil(realm_id);
+    let user_id = aruna_core::user::id::UserId::nil(realm_id);
     aruna_operations::sync::outbox_record::new_identified_record(
         ulid::Ulid::generate(),
         node(1),
@@ -1491,7 +1491,7 @@ fn admin_outbox(
     )
 }
 
-fn admin_record(origin: aruna_core::NodeId, origin_seq: u64) -> DocumentOutboxRecord {
+fn admin_record(origin: aruna_core::id::NodeId, origin_seq: u64) -> DocumentOutboxRecord {
     admin_outbox(
         RealmId([3; 32]),
         origin,

@@ -25,7 +25,7 @@ const MONTH_SECS: u64 = 30 * 24 * 60 * 60;
 
 async fn create_bearer_token(
     context: &aruna_drivers::driver::DriverContext,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
     realm_id: aruna_core::structs::identity::realm::RealmId,
     capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
 ) -> TestResult<String> {
@@ -455,7 +455,7 @@ async fn deactivation_ends_credential() -> TestResult<()> {
     let (seed, admin, group_id) = lasting_seed("credentials-deactivate").await?;
     let (context, realm_id) = (seed.context.as_ref(), seed.realm_id);
     let s3 = seed.s3.clone().ok_or("missing s3 endpoint")?;
-    let member = aruna_core::UserId::local(ulid::Ulid::generate(), realm_id);
+    let member = aruna_core::user::id::UserId::local(ulid::Ulid::generate(), realm_id);
     let member_token =
         create_bearer_token(context, member, realm_id, seed.capabilities.clone()).await?;
     reqwest::Client::new()

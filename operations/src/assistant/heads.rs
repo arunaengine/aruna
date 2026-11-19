@@ -6,11 +6,11 @@ use super::{
     CHAT_CAP, ChatStoreError, decode_head, decode_heads, head_key, heads_page, read_head,
     turns_page,
 };
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::{AssistantChatHead, MAX_ASSISTANT_CHATS};
+use aruna_core::user::id::UserId;
 
 /// Lists one user's live chat heads, newest change first.
 #[derive(Debug, PartialEq)]

@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
@@ -15,6 +14,7 @@ use aruna_core::structs::execution::notification::{
     notification_cutoff_key, notification_inbox_key, notification_inbox_prefix,
 };
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 use crate::notifications::unexpected;

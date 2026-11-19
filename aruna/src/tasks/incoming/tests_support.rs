@@ -5,7 +5,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::UserId;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
     DocumentSyncRevision, DocumentTarget,
@@ -21,6 +20,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::user::id::UserId;
 use aruna_net::NetHandle;
 use aruna_net::config::NetConfig;
 use aruna_storage::storage::worker::FjallStorage;
@@ -82,7 +82,7 @@ pub(crate) async fn recv_progress(receiver: &mut mpsc::Receiver<()>) -> bool {
     receiver.recv().await.is_some()
 }
 
-pub(crate) fn node(seed: u8) -> aruna_core::NodeId {
+pub(crate) fn node(seed: u8) -> aruna_core::id::NodeId {
     let mut bytes = [0u8; 32];
     bytes[0] = seed;
     iroh::SecretKey::from_bytes(&bytes).public()
@@ -255,7 +255,7 @@ pub(crate) async fn write_realm_config(
     storage: &aruna_storage::storage::handle::StorageHandle,
     realm_id: RealmId,
     config: &RealmConfigDocument,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) {
     let actor = Actor {
         node_id,

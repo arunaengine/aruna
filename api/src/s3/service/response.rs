@@ -56,7 +56,7 @@ pub(super) fn reference_metadata_refresh(
     bucket: String,
     key: String,
     result: &GetObjectResult,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     auth_context: aruna_core::structs::identity::auth::AuthContext,
 ) -> Option<ReferenceRefresh> {
     if result.location.is_some() {
@@ -422,7 +422,7 @@ fn internal_delete_error(key: String, requested_version_id: Option<Ulid>) -> S3D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::NodeId;
+    use aruna_core::id::NodeId;
     use aruna_core::structs::identity::realm::RealmId;
 
     async fn test_service() -> (tempfile::TempDir, ArunaS3Service) {

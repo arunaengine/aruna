@@ -5,8 +5,8 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
+use crate::user::id::UserId;
 
 use super::RepositoryError;
 

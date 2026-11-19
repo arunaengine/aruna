@@ -5,14 +5,13 @@
 
 use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
 use crate::distribution::inventory::{
-    AddedVersion, InventoryChange, entry_of, outside_answer, stamp_head, stamp_version,
-    version_written,
+    AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::placement::policy::read::ReadPolicyError;
-use crate::placement::policy::{
+use crate::placement::policy::gate::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::s3::abe_copies::{copy_row, still_active};
 use crate::s3::object::put::abe::{abe_reads, keyed, located_rows, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_published, publication_rows};
@@ -20,7 +19,6 @@ use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
 use crate::transfer::abe_rekey::RekeyProgress;
-use aruna_core::UserId;
 use aruna_core::blob_records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
 };
@@ -38,7 +36,7 @@ use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_effe
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::plugin_runs::journaled;
-use aruna_core::rows::{StagedCall, read_row};
+use aruna_core::rows::{StagedCall, outside_answer, read_row};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -57,6 +55,7 @@ use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;

@@ -7,7 +7,6 @@ use crate::structs::placement::transition::ProofClaim;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use crate::UserId;
 use crate::alpn::Alpn;
 use crate::compute::SharedSecret;
 use crate::document::DocumentEffect;
@@ -36,6 +35,7 @@ use crate::structs::storage::multipart::{BackendUpload, MultipartPart, WorkingSh
 use crate::structs::storage::usage::{BucketDelta, UsageDelta};
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
+use crate::user::id::UserId;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
@@ -828,7 +828,7 @@ pub enum NetEffect {
     /// Sends one notification request frame to a holder and reads its answer frame.
     Notification(Box<crate::structs::execution::notification::NotificationRequest>),
     /// Wakes the live inbox streams of these local recipients.
-    WakeInbox(Vec<crate::UserId>),
+    WakeInbox(Vec<crate::user::id::UserId>),
     /// Records, sends or keeps a heartbeat; the runner carries it out with the net handle.
     Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
     /// Sends one encoded metadata protocol request to one peer and reads its answer.
@@ -851,7 +851,7 @@ pub enum NetEffect {
     /// Skips a holder that failed in holder choices for a while; answers
     /// `NetEvent::HolderAvoided`.
     AvoidHolder {
-        node_id: crate::NodeId,
+        node_id: crate::id::NodeId,
         now_ms: u64,
     },
     /// Signs the signing bytes of a search cursor; only a cursor naming this node as signer.

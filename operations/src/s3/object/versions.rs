@@ -689,7 +689,6 @@ mod test {
         ));
     }
 
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::checksum::HASH_MD5;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -700,6 +699,7 @@ mod test {
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::testing::test_context;
     use aruna_storage::storage;
     use std::collections::HashMap;

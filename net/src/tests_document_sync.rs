@@ -19,6 +19,7 @@ use aruna_core::document::{
 use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
     GRAPH_LIFECYCLE_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
@@ -44,7 +45,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
 use aruna_core::types::Value;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::persistence::FjallPersistPolicy;
 use byteview::ByteView;

@@ -3,12 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{S3SessionError, decode_index};
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::types::Key;
+use aruna_core::user::id::UserId;
 
 const OWNER_SCAN_BATCH: usize = 128;
 

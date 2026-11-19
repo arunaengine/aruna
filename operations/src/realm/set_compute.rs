@@ -313,7 +313,6 @@ fn apply_reducer_compute(document: &mut RealmConfigDocument, reducer_state: &Adm
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use aruna_core::UserId;
     use aruna_core::compute::quota::ComputeQuota;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
@@ -322,6 +321,7 @@ mod tests {
         RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::structs::placement::compute_config::{GroupComputeQuota, LocationLink};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::path_context;
     use tempfile::tempdir;

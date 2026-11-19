@@ -25,7 +25,7 @@ use ulid::Ulid;
 
 use crate::groups::routing::RoutingInputsError;
 use crate::jobs::lifecycle::stage::stage_error;
-use crate::placement::policy::GateContextError;
+use crate::placement::policy::gate::GateContextError;
 use crate::replication::bao_read::BaoReadError;
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::put::{PutObjectError, PutObjectResult};
@@ -427,7 +427,6 @@ pub(super) fn insert_output(
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
@@ -440,6 +439,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
+    use aruna_core::user::id::UserId;
     use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
 

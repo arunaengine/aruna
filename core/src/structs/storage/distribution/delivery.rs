@@ -11,7 +11,7 @@ use super::{
     DataStrategy, DistributionBinding, DistributionMember, DistributionSnapshot, KeyRange,
     MemberState, MetadataCoverage, PublicationEpoch,
 };
-use crate::NodeId;
+use crate::id::NodeId;
 
 /// What a coordinator's publication to one member asserts besides the version it carries.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]

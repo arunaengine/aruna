@@ -271,10 +271,10 @@ fn map_publish_error(error: PublishError) -> ServerError {
 mod tests {
     use super::*;
     use crate::tests::routes::{test_state, test_storage};
-    use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::testing::test_context;
     use ulid::Ulid;
 

@@ -894,7 +894,7 @@ async fn artifact_output(
     server: &McpServer,
     job_id: &str,
     output: crate::jobs::JobOutputResponse,
-    node_id: Option<aruna_core::NodeId>,
+    node_id: Option<aruna_core::id::NodeId>,
 ) -> JobArtifactOutput {
     let local = node_id.is_none_or(|node_id| node_id == server.state.get_node_id());
     let head = match (local, Ulid::from_string(&output.version_id)) {

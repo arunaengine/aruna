@@ -6,10 +6,10 @@
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::calls::{IoCall, IoError, IoResult, Next};
 use crate::errors::StorageError;
 use crate::events::Event;
+use crate::id::NodeId;
 use crate::keyspaces::REPLICATION_OBLIGATION_KEYSPACE;
 use crate::operation::{Operation, TransactionMode};
 use crate::rows::read_row;
@@ -177,10 +177,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::UserId;
     use crate::calls::ChildOutcome;
     use crate::structs::identity::realm::RealmId;
     use crate::task::TaskKey;
+    use crate::user::id::UserId;
 
     fn live_operation() -> LiveVersionOperation {
         let realm = RealmId::from_bytes([9u8; 32]);

@@ -13,7 +13,6 @@ use crate::routes::git::location::StorageLocationRequest;
 use crate::routes::plugin_installs::{refuse_plugin_account, refuse_plugin_role};
 use crate::routes::storage::objects::object_page;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
@@ -24,6 +23,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::usage::usage_group_key;
 use aruna_core::types::RoleId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::AuthorizeEitherOperation;
 use aruna_operations::device_node::realm_documents::install_group_docs;
@@ -1048,7 +1048,7 @@ pub async fn delete_group(
     let token =
         forwarded_bearer(bearer.as_ref().map(|bearer| bearer.as_str())).map_err(map_api_error)?;
     let ctx = state.get_ctx();
-    let delete = aruna_operations::groups::deletion::DeleteGroupOperation::new(
+    let delete = aruna_operations::groups::deletion::coordinator::DeleteGroupOperation::new(
         ctx.node_and_realm(),
         auth,
         token,
@@ -1164,7 +1164,7 @@ pub async fn get_deletion_blockers(
     }
     let group_id = parse_group_id(&group_id)?;
     let ctx = state.get_ctx();
-    let check = aruna_operations::groups::deletion::CheckGroupOperation::new(
+    let check = aruna_operations::groups::deletion::check::CheckGroupOperation::new(
         ctx.node_and_realm(),
         auth,
         group_id,

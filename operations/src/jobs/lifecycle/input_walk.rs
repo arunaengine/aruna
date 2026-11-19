@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
@@ -17,6 +16,7 @@ use aruna_core::structs::storage::link::LinkTarget;
 use aruna_core::structs::storage::read_grant::READ_OPERATION;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::submission_rules::{input_reference, source_error};

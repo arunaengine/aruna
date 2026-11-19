@@ -4,9 +4,9 @@
 
 use std::collections::HashSet;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, VALIDATION_STATUS_KEYSPACE};
 use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataRawRevision, MetadataValidationViolation,
@@ -1146,7 +1146,7 @@ fn profile_from_iri(iri: &str) -> Option<Ulid> {
         return None;
     }
     let id = Ulid::from_string(value).ok()?;
-    aruna_core::MetaResourceId::from_bytes(id.to_bytes()).ok()?;
+    aruna_core::structured_id::MetaResourceId::from_bytes(id.to_bytes()).ok()?;
     Some(id)
 }
 
@@ -1263,7 +1263,7 @@ mod tests {
     use crate::metadata::profile::rules::crate_is_profile;
     use aruna_core::effects::Effect;
     use aruna_core::metadata::CRATE_PROFILE_IRI;
-    use aruna_core::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
+    use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
     use craqle::{EncodedTerm, ShaclMessage};
 
     fn result(component: &str, severity: &str, path: Option<&str>) -> ShaclValidationResult {

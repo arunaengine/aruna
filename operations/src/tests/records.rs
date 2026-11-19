@@ -4,9 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::compute::ExecutionTargetId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
     CancelAuthority, CollisionPolicy, ComputeResources, EffectiveResources, ExecutionOutputRecord,
     ExecutionReceipt, ExecutionSpec, ExecutionUpdate, JobAdmissionRecord, JobCancelRecord,
@@ -17,6 +16,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::execution::job::{CapturedInput, InputContent, InputSelection};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use aruna_core::document::DocumentTarget;

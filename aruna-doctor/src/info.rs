@@ -378,7 +378,7 @@ mod tests {
         let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
-        let bootstrap_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let bootstrap_user = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: aruna_core::structs::identity::auth::Actor {

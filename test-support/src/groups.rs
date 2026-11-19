@@ -4,7 +4,6 @@
 
 use std::time::SystemTime;
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -22,6 +21,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use tempfile::{TempDir, tempdir};
@@ -54,7 +54,7 @@ pub fn context(path: &std::path::Path) -> DriverContext {
 }
 
 /// The node id of seed `seed`.
-pub fn node(seed: u8) -> aruna_core::NodeId {
+pub fn node(seed: u8) -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 

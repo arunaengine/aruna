@@ -21,9 +21,9 @@ use ulid::Ulid;
 use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluator, PolicyLoadOperation};
 use crate::auth::error::PolicyEnforcementError;
 use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::metadata::repository::StorageReadError;
 use crate::metadata::updated_page::{UpdatedPageError, UpdatedPageOperation, UpdatedRecordsPage};
 use crate::storage_read::parse_storage_scan;
+use aruna_core::errors::StorageReadError;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Registry rows evaluated per rebuild batch, and index rows per scan batch.
@@ -1020,6 +1020,7 @@ mod tests {
     use crate::metadata::repository::create_outbox_entries;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::auth::Actor;
@@ -1027,7 +1028,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::time::unix_timestamp_millis;
-    use aruna_core::{NodeId, UserId};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use std::collections::{HashMap, HashSet};
 

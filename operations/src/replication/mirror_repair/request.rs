@@ -4,10 +4,10 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
 use aruna_core::structs::SyncRelationship;
@@ -126,11 +126,11 @@ impl Operation for MirrorRequestOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
+    use aruna_core::user::id::UserId;
     use std::time::SystemTime;
     use ulid::Ulid;
 

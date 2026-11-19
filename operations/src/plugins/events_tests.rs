@@ -10,8 +10,7 @@ use aruna_core::plugin_runs::ForwardRow;
 use aruna_core::time::unix_timestamp_millis;
 
 use crate::plugins::calls::*;
-#[allow(unused_imports)]
-pub(crate) use crate::plugins::flow_support::events::decide;
+use crate::plugins::flow_support::events::decide;
 use crate::plugins::forward::Backoff;
 use aruna_core::plugin_runs::Decisions;
 use aruna_core::plugin_runs::Outcome;

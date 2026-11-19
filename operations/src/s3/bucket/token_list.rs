@@ -135,13 +135,13 @@ impl Operation for ListTokensOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::credential_encryption::EncryptedS3Secret;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::abe::AbeParameters;
     use aruna_core::structs::storage::abe_access::{GrantContext, KeyIssuer, KeyRequest, KeyScope};
     use aruna_core::structs::storage::encryption::BucketKeyRef;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
     use aruna_test_support::s3::test_storage;

@@ -2,30 +2,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod drain;
+pub mod drain;
 mod ensure;
-mod kick;
-mod record;
-mod remove;
+pub mod kick;
+pub mod record;
+pub mod remove;
 pub mod request;
 mod scan;
 mod settle;
-mod status;
+pub mod status;
 #[cfg(test)]
 mod tests;
-
-pub use drain::{DrainRepairsOperation, RestoreTimerOperation};
-pub use kick::KickRepairOperation;
-pub use record::MirrorRecordOperation;
-pub use remove::RemoveMirrorOperation;
-pub use status::StoreStatusOperation;
 
 use crate::replication::sync_relationship::SyncRelationshipError;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::rows::{read_row, values};
 use aruna_core::structs::SyncRelationship;

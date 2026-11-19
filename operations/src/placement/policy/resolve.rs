@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::POLICY_CACHE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
@@ -19,8 +19,7 @@ use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use tracing::{debug, warn};
 
-use crate::distribution::inventory::outside_answer;
-use aruna_core::rows::StagedCall;
+use aruna_core::rows::{StagedCall, outside_answer};
 
 use super::cache::{
     CacheLookup, MAX_CACHE_ENTRIES, PolicyCacheEntry, PolicyCacheStats, cache_key, lookup,

@@ -93,8 +93,8 @@ mod tests {
     use super::{DeleteDraftError, DeleteDraftOperation};
     use crate::device::publish_queue::{PublishEntry, PublishState, publish_entry};
     use crate::tests::device::context;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use ulid::Ulid;
 

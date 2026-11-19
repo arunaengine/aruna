@@ -10,11 +10,11 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::extract;
 use crate::error::ServerError;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
@@ -37,7 +37,7 @@ struct Fixture {
     _dir: TempDir,
 }
 
-fn node(seed: u8) -> aruna_core::NodeId {
+fn node(seed: u8) -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 

@@ -3,23 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod create;
-mod get;
-mod list;
-mod purge;
-mod refresh;
-mod revoke;
-mod touch;
+pub mod create;
+pub mod get;
+pub mod list;
+pub mod purge;
+pub mod refresh;
+pub mod revoke;
+pub mod touch;
 
-pub use create::{CreateS3Config, CreateS3Operation};
-pub use get::GetS3Operation;
-pub use list::ListSessionsOperation;
-pub use purge::{PurgeSessionsOperation, PurgeSessionsResult};
-pub use refresh::{RefreshS3Config, RefreshS3Operation};
-pub use revoke::{RevokeS3Config, RevokeS3Operation};
-pub use touch::{TouchS3Config, TouchS3Operation};
-
-use aruna_core::UserId;
 use aruna_core::calls::IoError;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{
@@ -30,6 +21,7 @@ use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_li
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -246,6 +238,11 @@ fn build_session(
 
 #[cfg(test)]
 mod tests {
+    use super::create::{CreateS3Config, CreateS3Operation};
+    use super::get::GetS3Operation;
+    use super::purge::PurgeSessionsOperation;
+    use super::refresh::{RefreshS3Config, RefreshS3Operation};
+    use super::touch::{TouchS3Config, TouchS3Operation};
     use super::*;
     use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
     use crate::s3::access::list::{ListUserInput, ListUserOperation};

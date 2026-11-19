@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::federation::MAX_NAME_LEN;
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
 use crate::types::RoleId;
+use crate::user::id::UserId;
 use core::fmt;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
@@ -353,8 +353,8 @@ mod tests {
         AuthContext, NodeCapabilities, PathRestriction, Permission, SessionKind, TokenClaims,
         oidc_subject_key,
     };
-    use crate::UserId;
     use crate::structs::identity::realm::RealmId;
+    use crate::user::id::UserId;
     use ulid::Ulid;
 
     #[test]
@@ -516,9 +516,9 @@ mod tests {
 
 #[cfg(test)]
 mod test {
-    use crate::UserId;
     use crate::structs::identity::auth::{Permission, Role};
     use crate::structs::identity::realm::RealmId;
+    use crate::user::id::UserId;
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
 

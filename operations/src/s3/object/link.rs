@@ -8,11 +8,11 @@ use aruna_core::stream::ByteStream;
 use std::ops::Range;
 use std::time::{Duration, UNIX_EPOCH};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::native_reference::{DelegatedBody, DelegatedReadEffect, NativeRange};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -708,7 +708,7 @@ mod tests {
         let visitor = delegation(&caller(AuthContext::anonymous(realm_id)), target, now);
         assert_eq!(visitor.credential_expiry, now + MAX_VALID_SECS);
         let member = AuthContext {
-            user_id: aruna_core::UserId::new(Ulid::from_parts(7, 7), realm_id),
+            user_id: aruna_core::user::id::UserId::new(Ulid::from_parts(7, 7), realm_id),
             ..AuthContext::anonymous(realm_id)
         };
         assert_eq!(

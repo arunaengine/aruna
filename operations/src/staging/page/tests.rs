@@ -5,8 +5,7 @@
 use super::*;
 use crate::connectors::descriptor::build_source_binding;
 use crate::s3::purge_fence::PurgeFenceError;
-use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES};
-use aruna_core::UserId;
+use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES, PageEntry};
 use aruna_core::calls::CallRun;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -31,6 +30,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};

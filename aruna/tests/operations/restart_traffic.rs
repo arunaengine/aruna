@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_clock::testing::poll_until;
-use aruna_core::StructuredId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
@@ -706,9 +706,8 @@ fn incident_target(
     ),
     BoxError,
 > {
-    use aruna_core::MetaResourceId;
     use aruna_core::document::DocumentTarget;
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
+    use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle};
 
     let placement = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: strategy.strategy_id,
@@ -792,10 +791,10 @@ async fn stop_peers(mut nodes: Vec<TestNode>) -> Result<(TestNode, TempDir, Temp
 async fn seed_outbox(
     node: &TestNode,
     realm_id: RealmId,
-    local: aruna_core::NodeId,
+    local: aruna_core::id::NodeId,
     target: &aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::placement::record::PlacementRef,
-    holders: &[aruna_core::NodeId],
+    holders: &[aruna_core::id::NodeId],
     record_count: usize,
 ) -> Result<Vec<Vec<u8>>, BoxError> {
     for chunk_start in (0..record_count).step_by(1_024) {
@@ -832,10 +831,10 @@ async fn seed_outbox(
 
 fn incident_record(
     realm_id: RealmId,
-    local: aruna_core::NodeId,
+    local: aruna_core::id::NodeId,
     target: &aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::placement::record::PlacementRef,
-    holders: &[aruna_core::NodeId],
+    holders: &[aruna_core::id::NodeId],
     index: usize,
 ) -> Result<aruna_core::document::DocumentOutboxRecord, BoxError> {
     use aruna_core::document::{
@@ -880,9 +879,9 @@ fn incident_record(
 }
 
 fn incident_delete(
-    local: aruna_core::NodeId,
+    local: aruna_core::id::NodeId,
     placement: aruna_core::structs::placement::record::PlacementRef,
-    holders: &[aruna_core::NodeId],
+    holders: &[aruna_core::id::NodeId],
     index: usize,
 ) -> Result<aruna_core::document::DocumentOutboxRecord, BoxError> {
     use aruna_core::document::{
@@ -921,7 +920,7 @@ fn incident_registry(
     realm_id: RealmId,
     target: &aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::placement::record::PlacementRef,
-    holders: &[aruna_core::NodeId],
+    holders: &[aruna_core::id::NodeId],
     index: usize,
 ) -> Result<aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord, BoxError> {
     use aruna_core::document::DocumentTarget;

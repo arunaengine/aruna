@@ -10,8 +10,8 @@ use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     CONTENT_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };

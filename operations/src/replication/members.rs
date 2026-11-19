@@ -9,9 +9,9 @@
 use aruna_core::structs::storage::replication_queue::MemberTarget;
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -738,7 +738,7 @@ mod tests {
             let bucket = BucketInfo {
                 group_id: Ulid::from_parts(2, 2),
                 created_at: std::time::SystemTime::UNIX_EPOCH,
-                created_by: aruna_core::UserId::nil(snapshot.statements[0].statement.realm_id),
+                created_by: aruna_core::user::id::UserId::nil(snapshot.statements[0].statement.realm_id),
                 cors_configuration: None,
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),

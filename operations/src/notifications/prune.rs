@@ -502,12 +502,12 @@ impl Operation for RestorePruneOperation {
 mod tests {
     use super::*;
     use crate::tests::notifications::{context, record, temp_storage, user};
-    use aruna_core::UserId;
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_core::storage_entries::{inbox_update_entry, inbox_write_entries};
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::handle::StorageHandle;
     use aruna_tasks::InboundTaskHandler;

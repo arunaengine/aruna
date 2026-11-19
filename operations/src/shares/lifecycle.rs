@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, SubOperationEvent};
@@ -13,6 +12,7 @@ use aruna_core::rows;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::share::{ShareAction, ShareEvent, ShareLink, ShareToken};
 use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

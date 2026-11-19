@@ -22,7 +22,7 @@ use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::id_mapping::PersistentIdError;
 use crate::metadata::persistent_id::MappingReadOperation;
 use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::metadata::repository::StorageReadError;
+use aruna_core::errors::StorageReadError;
 use aruna_core::metadata::api::IdentifierMatch;
 
 /// Index rows one page of the reverse index holds.

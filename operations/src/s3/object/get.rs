@@ -3,11 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
-use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
+use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::held::{
     HeldElsewhere, kept_location, kept_reads, kept_source_location, kept_source_reads,
 };
-use crate::distribution::inventory::outside_answer;
 use crate::s3::object::lookup::{
     ExpectedNode, LookupError, check_copy_values, copy_check_call, location_from_value,
     summary_call, summary_from_value,
@@ -18,7 +17,7 @@ use crate::s3::object::source::choice::{Candidate, choose_source};
 use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
-use aruna_core::rows::StagedCall;
+use aruna_core::rows::{StagedCall, outside_answer};
 use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -29,6 +28,7 @@ use aruna_core::errors::{
     BlobError, ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, SubOperationEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
@@ -65,7 +65,7 @@ use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::replication_queue::live_obligation_entry;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, warn};

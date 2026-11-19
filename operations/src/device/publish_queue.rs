@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::device::retry::RetryView;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
@@ -13,6 +12,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{read_row, values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -353,11 +353,11 @@ mod pure_tests {
         publish_entry, publish_key,
     };
     use crate::tests::device::record;
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataDot, MetadataQuadOp};
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use craqle::VectorClock;
     use ulid::Ulid;
 

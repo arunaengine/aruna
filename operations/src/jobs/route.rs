@@ -184,7 +184,6 @@ impl From<aruna_core::calls::IoError> for JobRouteError {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::jobs::{JobKind, JobResponse, JobStatusView};
     use aruna_core::metadata::AuthToken;
     use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
@@ -194,6 +193,7 @@ mod pure_tests {
         PlacementScope,
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     // A result that is not the config read is refused.

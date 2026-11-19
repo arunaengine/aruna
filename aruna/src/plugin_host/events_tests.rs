@@ -4,7 +4,7 @@
 
 use crate::plugin_host::worker::tests::worker;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::protocol::MetadataTransportMessage;
@@ -37,8 +37,8 @@ use aruna_operations::plugins::runs::list_runs;
 use aruna_operations::replication::drain::ProcessBatchOperation;
 use aruna_operations::replication::page::deliver::MetadataPages;
 use aruna_operations::replication::queue::QueueBlobOperation;
-use aruna_operations::replication::sync_relationship::StoreRelationshipOperation;
 use aruna_operations::replication::sync_relationship::SyncRelationshipDirection::Outgoing;
+use aruna_operations::replication::sync_relationship::store::StoreRelationshipOperation;
 use aruna_test_support::plugins::artifacts::{echoed_sync, install_artifact, installed};
 use aruna_test_support::plugins::flows::events::{dataset, ran, sync_at};
 use aruna_test_support::plugins::flows::matcher::{config, forwarded, journal};

@@ -296,7 +296,7 @@ mod tests {
         let realm_id = *net_handle.realm_id();
         let actor = Actor {
             node_id: net_handle.node_id(),
-            user_id: aruna_core::UserId::nil(realm_id),
+            user_id: aruna_core::user::id::UserId::nil(realm_id),
             realm_id,
         };
         let config = |seed: u8| {

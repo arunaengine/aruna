@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobState,
     PhysicalExecutionState, SubmissionId,
 };
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::{family_audit, family_report};

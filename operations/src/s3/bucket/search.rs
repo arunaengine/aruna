@@ -4,9 +4,9 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BUCKET_CREATION_KEYSPACE, BUCKET_METADATA_KEYSPACE, DISTRIBUTION_KEYSPACE, GROUP_KEYSPACE,
     S3_BUCKET_KEYSPACE,
@@ -347,7 +347,6 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
 
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BUCKET_METADATA_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
@@ -359,6 +358,7 @@ mod tests {
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
     use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::user::id::UserId;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;

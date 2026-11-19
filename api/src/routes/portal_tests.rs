@@ -6,7 +6,7 @@ use super::*;
 use crate::auth::RealmAuth;
 use crate::auth::extract;
 use crate::tests::realms::{admin_state, state_auth};
-use aruna_core::UserId;
+use aruna_core::user::id::UserId;
 use axum::http::StatusCode;
 use ulid::Ulid;
 

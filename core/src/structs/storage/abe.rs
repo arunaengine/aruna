@@ -4,8 +4,8 @@
 
 use super::blob::ArchiveKey;
 use super::encryption::{BucketKeyRef, generate_key, public_key_of};
-use crate::NodeId;
 use crate::compute::{SecretBytes, SharedSecret};
+use crate::id::NodeId;
 use crate::key_seal::{SealedSecret, SeedRng, open_sealed, seal_to};
 use crate::structs::identity::realm::RealmId;
 use aruna_kpabe::frame_context;
@@ -433,7 +433,7 @@ pub enum AbeEffect {
         resolved: super::blob::ResolvedBackend,
         bucket: String,
         key: String,
-        created_by: crate::UserId,
+        created_by: crate::user::id::UserId,
         blob: crate::stream::BackendStream<Result<bytes::Bytes, crate::stream::StreamError>>,
         size: Option<u64>,
     },

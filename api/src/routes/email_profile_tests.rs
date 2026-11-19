@@ -5,7 +5,7 @@
 use super::*;
 use crate::auth::UnrestrictedAuth;
 use crate::tests::realms::{admin_state, state_auth};
-use aruna_core::UserId;
+use aruna_core::user::id::UserId;
 
 const PASSWORD: &str = "canary-route-77";
 

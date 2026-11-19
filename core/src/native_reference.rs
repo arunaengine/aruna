@@ -9,9 +9,9 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::calls::IoError;
 use crate::errors::StagingSourceError;
+use crate::id::NodeId;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use crate::structs::execution::source_connector::SourceConnectorKind;

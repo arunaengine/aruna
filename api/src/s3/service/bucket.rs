@@ -20,14 +20,14 @@ use aruna_drivers::driver::drive;
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::replication::mirror_repair::kick::KickRepairOperation;
+use aruna_operations::replication::mirror_repair::record::MirrorRecordOperation;
+use aruna_operations::replication::mirror_repair::remove::RemoveMirrorOperation;
 use aruna_operations::replication::mirror_repair::request::MirrorRequestOperation;
-use aruna_operations::replication::mirror_repair::{
-    KickRepairOperation, MirrorRecordOperation, RemoveMirrorOperation,
-};
-use aruna_operations::replication::sync_relationship::{
-    DeleteRelationshipOperation, ListRelationshipsOperation, StoreRelationshipOperation,
-    SyncRelationshipDirection,
-};
+use aruna_operations::replication::sync_relationship::SyncRelationshipDirection;
+use aruna_operations::replication::sync_relationship::delete::DeleteRelationshipOperation;
+use aruna_operations::replication::sync_relationship::list::ListRelationshipsOperation;
+use aruna_operations::replication::sync_relationship::store::StoreRelationshipOperation;
 use s3s::dto::{
     DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
     ReplicationRule, ReplicationRuleStatus,

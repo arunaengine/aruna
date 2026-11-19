@@ -26,7 +26,7 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_net::dht::storage::StoredEntry;
 use aruna_operations::jobs::lifecycle::witness_arm::WitnessDeadline;
-use aruna_operations::placement::policy::PolicyCacheEntry;
+use aruna_operations::placement::policy::cache::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde::ser::{SerializeStruct, Serializer};

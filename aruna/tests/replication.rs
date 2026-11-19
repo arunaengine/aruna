@@ -11,7 +11,6 @@ use aruna_api::routes::sync::{
     ApiReferenceHandling, ApiSyncMode, CreateSyncRequest, SyncDetailResponse,
     SyncRelationshipResponse, SyncSourceRequest, SyncTargetRequest,
 };
-use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -38,6 +37,7 @@ use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, SyncMirrorRe
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_kpabe::envelope::Envelope;
 use aruna_kpabe::scheme::UserKey;

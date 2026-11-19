@@ -4,7 +4,6 @@
 
 use super::validation::{GroupBackendError, check_import_root, validate_backend_input};
 use super::{RecordReadError, record_writes};
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -18,6 +17,7 @@ use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -238,7 +238,7 @@ mod pure_tests {
     fn input() -> CreateBackendInput {
         CreateBackendInput {
             group_id: Ulid::from_bytes([1u8; 16]),
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             name: "tenant".to_string(),
             kind: GroupBackendKind::S3,
             public_config: HashMap::from([

@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -11,6 +10,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
@@ -318,13 +318,13 @@ impl Operation for ReserveSecretOperation {
 mod tests {
     use super::{ReserveSecretError, ReserveSecretInput, ReserveSecretOperation};
     use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::identity::realm::{
         QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use byteview::ByteView;

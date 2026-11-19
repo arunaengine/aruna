@@ -38,7 +38,7 @@ pub struct ReadPolicyConfig {
     /// Id and digest: an id-only read could accept changed bytes under a known
     /// id, which policy immutability forbids.
     pub policy_ref: PlacementPolicyRef,
-    pub local_node_id: aruna_core::NodeId,
+    pub local_node_id: aruna_core::id::NodeId,
 }
 
 /// Where a verified policy came from, so a caller can tell a holder-local read
@@ -81,7 +81,7 @@ struct PendingAuthority {
     document: PlacementPolicyDocument,
     policy: VerifiedPolicy,
     source: PolicySource,
-    remaining: Vec<aruna_core::NodeId>,
+    remaining: Vec<aruna_core::id::NodeId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,7 +90,7 @@ enum ReadPolicyState {
     /// Holders this fetch was sent to; a holder that answers with another
     /// definition is dropped and the remainder is asked again.
     Fetch {
-        asked: Vec<aruna_core::NodeId>,
+        asked: Vec<aruna_core::id::NodeId>,
     },
     /// A group-owned candidate is authenticated only once its owner's roles
     /// are in hand; without them the read fails closed.
@@ -216,7 +216,7 @@ impl ReadPolicyOperation {
         &mut self,
         document: PlacementPolicyDocument,
         source: PolicySource,
-        remaining: Vec<aruna_core::NodeId>,
+        remaining: Vec<aruna_core::id::NodeId>,
     ) -> ReadTurn {
         let (document, policy) = match self.check_document(document) {
             Ok(checked) => checked,
@@ -265,7 +265,7 @@ impl ReadPolicyOperation {
     }
 
     /// A refused candidate ends the read only when no holder is left to ask.
-    fn refuse(&mut self, error: ReadPolicyError, remaining: Vec<aruna_core::NodeId>) -> ReadTurn {
+    fn refuse(&mut self, error: ReadPolicyError, remaining: Vec<aruna_core::id::NodeId>) -> ReadTurn {
         if remaining.is_empty() {
             return Err(error);
         }
@@ -315,7 +315,7 @@ impl ReadPolicyOperation {
         self.emit_fetch(holders)
     }
 
-    fn emit_fetch(&mut self, holders: Vec<aruna_core::NodeId>) -> ReadTurn {
+    fn emit_fetch(&mut self, holders: Vec<aruna_core::id::NodeId>) -> ReadTurn {
         let asked = holders.clone();
         let holders = HolderList::new(holders)
             .map_err(|error| ReadPolicyError::Unavailable(error.to_string()))?;
@@ -333,8 +333,8 @@ impl ReadPolicyOperation {
     /// single corrupt or stale holder cannot deny a resolvable policy.
     fn accept_fetched(
         &mut self,
-        asked: Vec<aruna_core::NodeId>,
-        publisher: aruna_core::NodeId,
+        asked: Vec<aruna_core::id::NodeId>,
+        publisher: aruna_core::id::NodeId,
         document: PlacementPolicyDocument,
     ) -> ReadTurn {
         if !asked.contains(&publisher) {
@@ -465,14 +465,14 @@ fn fetch_child(fetch: &PolicyFetchEffect) -> Box<dyn SubOperation> {
 mod pure_tests {
     use super::*;
     use crate::tests::policy::{admin_user, fetch_requests, realm_view, signed_document};
-    use aruna_core::NodeId;
-    use aruna_core::UserId;
     use aruna_core::effects::Effect;
+    use aruna_core::id::NodeId;
     use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_core::structs::placement::policy::document::PolicyPublicationClaim;
     use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector};
     use aruna_core::structs::placement::record::LabelMatch;
     use aruna_core::types::Effects;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

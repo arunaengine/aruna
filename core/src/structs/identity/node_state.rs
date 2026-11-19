@@ -4,9 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::UserId;
 use crate::onboarding::OnboardingPhase;
 use crate::structs::identity::realm::RealmId;
+use crate::user::id::UserId;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BootOrigin {

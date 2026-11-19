@@ -46,7 +46,7 @@ pub struct VersionReplicationManifest {
     pub group_id: crate::types::GroupId,
     pub kind: ReplicationItemKind,
     pub created_at: std::time::SystemTime,
-    pub created_by: crate::UserId,
+    pub created_by: crate::user::id::UserId,
     pub current_version: bool,
     pub current_version_generation: Option<u64>,
     pub auth_context: AuthContext,
@@ -725,7 +725,6 @@ mod pure_tests {
         MultipartObjectMetadata, ReferenceAdvance, SyncOrigin, VersionReplicationManifest,
         VersionReplicationMessage,
     };
-    use crate::UserId;
     use crate::errors::ConversionError;
     use crate::structs::checksum::HASH_SHA256;
     use crate::structs::checksum::Hasher;
@@ -742,6 +741,7 @@ mod pure_tests {
         MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
     };
     use crate::structs::storage::replication::{ArunaArn, ReplicationItemKind};
+    use crate::user::id::UserId;
     use std::collections::{BTreeMap, HashMap};
     use std::time::SystemTime;
     use ulid::Ulid;

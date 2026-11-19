@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
@@ -14,6 +13,7 @@ use aruna_core::structs::execution::notification_watch::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use crate::notifications::unexpected;
@@ -261,7 +261,7 @@ pub struct CreateWatchOperation {
 impl CreateWatchOperation {
     pub fn new(
         (watch_id, outbox_id): (Ulid, Ulid),
-        local: aruna_core::NodeId,
+        local: aruna_core::id::NodeId,
         owner: UserId,
         (path_prefix, event_mask): (String, WatchEventMask),
         authorization: WatchAuthorizationBinding,

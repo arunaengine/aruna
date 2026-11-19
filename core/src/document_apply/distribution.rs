@@ -13,10 +13,10 @@ use ulid::Ulid;
 use super::reads::{realm_config, reducer_state};
 use super::registry::Row;
 use super::{ApplyError, Step, invalid};
-use crate::NodeId;
 use crate::admin_documents::{AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget};
 use crate::config_authority::AdminEventValidation;
 use crate::document::DocumentTarget;
+use crate::id::NodeId;
 use crate::keyspaces::{
     CATCH_UP_KEYSPACE, DISTRIBUTION_KEYSPACE, DISTRIBUTION_LIFECYCLE_KEYSPACE,
     DISTRIBUTION_PARKED_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE, NODE_STATS_KEYSPACE,

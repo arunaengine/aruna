@@ -380,7 +380,7 @@ async fn reports_main_layout() {
             document_id: id,
             revision: revision.into(),
         };
-        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let actor = aruna_core::user::id::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
         match store.execute(effect, actor).await.expect("layout runs") {
             aruna_core::git::GitEvent::Layout(layout) => layout,
             _ => panic!("unexpected event"),

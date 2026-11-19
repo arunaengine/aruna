@@ -9,7 +9,7 @@ use aruna_drivers::driver::drive;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::ByteStream;
 use aruna_core::member_read::{MemberBody, MemberMethod};
 use aruna_core::structs::identity::auth::AuthContext;

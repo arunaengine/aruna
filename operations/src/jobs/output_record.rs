@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, JobRecordFrame, NetEffect};
 use aruna_core::events::{Event, ExecutionSignEvent, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     AttemptControl, ExecutionClaim, ExecutionOutputRecord, JobError, JobFamilyRecord, JobRecord,
@@ -335,11 +335,11 @@ impl Operation for StoreOutputsOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::UserId;
     use aruna_core::structs::execution::job::{
         AttemptIntent, ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobState,
     };
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_storage::storage::handle::StorageHandle;
     use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;

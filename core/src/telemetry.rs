@@ -8,7 +8,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::DistributedTraceContext;
+use crate::trace_context::DistributedTraceContext;
 use opentelemetry::Context;
 use opentelemetry::global;
 use opentelemetry::propagation::{Extractor, Injector};

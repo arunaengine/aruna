@@ -12,6 +12,7 @@ use super::{ImportOptions, RepositoryDestination, RepositoryRecord};
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::effects::Effect;
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::LINK_CHANGE_KEYSPACE;
 use crate::metadata::ProfileValidationFinding;
 use crate::structs::execution::harvest::RepositoryConnectorKind;
@@ -19,7 +20,7 @@ use crate::structs::execution::job::{ImportRoCrateTarget, JobId, RoCrateLimits};
 use crate::structs::placement::record::PlacementRef;
 use crate::task::{TaskEffect, TaskKey};
 use crate::types::{Key, KeySpace, Value};
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 
 /// Quiet time after a change before a link pushes, so a burst of edits becomes one push.
 pub const LINK_DEBOUNCE_MS: u64 = 10_000;

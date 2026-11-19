@@ -39,7 +39,7 @@ use crate::s3::imports::shared::SharedRule;
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
-use crate::s3::object::put::{Trail, trail_ranges};
+use crate::s3::object::put::trail::{Trail, trail_ranges};
 
 /// Reads these rows in one batch.
 pub(super) fn read_call<'a>(reads: impl IntoIterator<Item = (&'a str, Key)>) -> IoCall {

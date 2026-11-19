@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
@@ -18,9 +18,8 @@ use super::{MirrorPeer, SyncMirrorError, create_peer};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::replication::mirror_repair::request::MirrorRequestOperation;
-use crate::replication::sync_relationship::{
-    StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
-};
+use crate::replication::sync_relationship::store::StoreRelationshipOperation;
+use crate::replication::sync_relationship::{SyncRelationshipDirection, SyncRelationshipError};
 use aruna_core::request_policy::PolicyRequestExtras;
 
 #[derive(Debug, PartialEq)]
@@ -211,9 +210,9 @@ pub(super) fn peer_failure(error: MetadataError) -> SyncMirrorError {
 mod tests {
     use super::super::tests::relationship;
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::user::id::UserId;
     use byteview::ByteView;
     use std::time::SystemTime;
     use ulid::Ulid;

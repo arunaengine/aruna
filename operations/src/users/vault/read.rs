@@ -10,6 +10,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{HolderList, MAX_FETCH_HOLDERS, VaultFetchEffect, VaultQuery};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, VaultFetchEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{USER_KEY_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use aruna_core::operation::{Operation, SubOperation, boxed_suboperation};
 use aruna_core::rows::values;
@@ -19,7 +20,7 @@ use aruna_core::structs::identity::user::vault::{
     retain_newest_keys, user_record_prefix,
 };
 use aruna_core::types::{Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

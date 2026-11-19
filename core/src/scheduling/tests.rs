@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::NodeId;
 use crate::compute::{ExecutorAvailability, NetworkAccess, ResourceEnvelope, StagingMode};
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::policy::PlacementSelector;
 use crate::structs::placement::record::LabelMatch;
@@ -380,7 +380,7 @@ fn excludes_user_nodes() {
     let plan_request = request(Vec::new());
     let mut user = candidate(node(3), "docker");
     user.node_kind = RealmNodeKind::User {
-        owner: crate::UserId::nil(crate::structs::identity::realm::RealmId::from_bytes(
+        owner: crate::user::id::UserId::nil(crate::structs::identity::realm::RealmId::from_bytes(
             [1u8; 32],
         )),
     };

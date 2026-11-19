@@ -834,15 +834,14 @@ mod tests {
         BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, CaptureRun, CloseRun,
         PolicyBulkOperation,
     };
-    use crate::placement::policy::GateOperation;
     use crate::placement::policy::cache::cache_key;
+    use crate::placement::policy::gate::GateOperation;
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::s3::bucket::placement::{PutPlacementInput, PutPlacementOperation};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -869,6 +868,7 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::types::{GroupId, Key, Value};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::NetHandle;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

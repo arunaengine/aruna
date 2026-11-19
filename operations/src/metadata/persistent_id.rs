@@ -6,9 +6,9 @@
 #[path = "persistent_id_forward.rs"]
 pub mod forward;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::rows::read_row;
@@ -223,8 +223,8 @@ impl Operation for PidChangeOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::handle::Handle;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
 
     async fn change(
@@ -306,8 +306,8 @@ mod tests {
         RealmId([3; 32])
     }
 
-    fn user() -> aruna_core::UserId {
-        aruna_core::UserId::local(Ulid::from_bytes([2; 16]), realm())
+    fn user() -> aruna_core::user::id::UserId {
+        aruna_core::user::id::UserId::local(Ulid::from_bytes([2; 16]), realm())
     }
 
     fn record(document_id: Ulid) -> MetadataRegistryRecord {
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(read_mapping(&ctx, id).await.unwrap().unwrap(), mapping);
     }
 
-    fn node() -> aruna_core::NodeId {
+    fn node() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[1; 32]).public()
     }
 
@@ -577,8 +577,8 @@ mod tests {
         // resolved the old holders must not commit its outbox row afterwards.
         let (ctx, _dir) = context();
         let config = activated_config();
-        use aruna_core::StructuredId;
-        let document_id = aruna_core::MetaResourceId::from_parts(
+        use aruna_core::structured_id::StructuredId;
+        let document_id = aruna_core::structured_id::MetaResourceId::from_parts(
             13,
             aruna_core::structured_id::PlacementHandle::new(
                 aruna_core::structs::placement::record::METADATA_HANDLE,

@@ -6,10 +6,10 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::injection::{OutgoingRequest, inject_secret};
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::{BoundScope, PluginInstall};

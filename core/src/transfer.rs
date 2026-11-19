@@ -9,12 +9,12 @@ use thiserror::Error;
 use ulid::Ulid;
 use url::Url;
 
-use crate::UserId;
 use crate::calls::IoError;
 use crate::federation::{FederationError, RealmDescriptor, Signable, Signed, valid_federation_url};
 use crate::handoff::{HANDOFF_SKEW_SECS, descriptor_digest, secret_nonce};
 use crate::structs::identity::realm::RealmId;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 pub const INTENT_DOMAIN: &str = "aruna-import-intent-v1";
 pub const GRANT_DOMAIN: &str = "aruna-export-grant-v1";

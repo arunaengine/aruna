@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -19,16 +18,18 @@ use aruna_core::structs::execution::source_connector::{
 };
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::types::{GroupId, Key};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::connectors::repository::{
-    LIST_CONNECTOR_SIZE, StorageReadError, connector_id_key, parse_secret_read, read_secret_effect,
+    LIST_CONNECTOR_SIZE, connector_id_key, parse_secret_read, read_secret_effect,
     source_connector_key,
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 use crate::groups::fence::{group_write_result, write_group_new};
 use crate::storage_read::decode_row;
+use aruna_core::errors::StorageReadError;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SourceConnectorInput {

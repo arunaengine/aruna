@@ -1604,7 +1604,7 @@ fn output_prefix(output: &TesOutput) -> Result<Option<String>, TesError> {
 
 /// An input url is `s3://bucket/key` on this node, or a versioned object ARN naming the node
 /// that holds the exact version to read.
-fn parse_input_url(url: &str) -> Result<(InputSource, Option<aruna_core::NodeId>), TesError> {
+fn parse_input_url(url: &str) -> Result<(InputSource, Option<aruna_core::id::NodeId>), TesError> {
     if !url.starts_with("arn:") {
         let (bucket, key) = parse_s3_url(url, "input")?;
         let source = InputSource::S3 {

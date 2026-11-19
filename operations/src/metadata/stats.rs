@@ -497,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn counts_realm_groups() {
         let fixture = setup_fixture();
-        let owner = aruna_core::UserId::nil(fixture.realm_id);
+        let owner = aruna_core::user::id::UserId::nil(fixture.realm_id);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
             user_id: owner,
@@ -516,7 +516,7 @@ mod tests {
             group_id: Ulid::generate(),
             realm_id: foreign_realm,
             roles: Default::default(),
-            owner: aruna_core::UserId::nil(foreign_realm),
+            owner: aruna_core::user::id::UserId::nil(foreign_realm),
         };
         write_entries(
             &fixture.storage,

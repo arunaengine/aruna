@@ -6,9 +6,8 @@
 // Redemption makes the same revocation check as a direct authenticated read, then the target
 // checks its own path.
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, SessionRef};
 use aruna_core::structs::identity::realm::{NodeRealm, RealmConfigDocument, RealmId};
@@ -16,6 +15,7 @@ use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::structs::storage::distribution::ticket::{
     SignedTicket, Ticket, TicketError, ticket_expiry,
 };
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 use crate::auth::bearer_token::GrantValidOperation;

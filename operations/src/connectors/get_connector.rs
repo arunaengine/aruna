@@ -12,10 +12,9 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::repository::{
-    StorageReadError, parse_secret_read, read_secret_effect, source_connector_key,
-};
+use crate::connectors::repository::{parse_secret_read, read_secret_effect, source_connector_key};
 use crate::storage_read::decode_row;
+use aruna_core::errors::StorageReadError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetSourceInput {

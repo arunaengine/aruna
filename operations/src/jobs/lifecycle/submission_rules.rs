@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::events::PeerAuthRefusal;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::SubmissionRefusal;
@@ -14,6 +13,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
 use aruna_core::structs::storage::origin::SourcePin;
+use aruna_core::user::id::UserId;
 use serde::Serialize;
 use ulid::Ulid;
 

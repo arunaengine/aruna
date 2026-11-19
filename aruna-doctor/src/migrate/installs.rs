@@ -5,12 +5,12 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentOperation;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
 use aruna_core::plugin_installs::{InstallState, PluginInstall, Prerequisite, Widening};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{GroupId, RoleId};
+use aruna_core::user::id::UserId;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -37,7 +37,7 @@ struct StoredInstall {
     grants: BTreeMap<String, Vec<String>>,
     account: UserId,
     role_id: RoleId,
-    receiver: aruna_core::NodeId,
+    receiver: aruna_core::id::NodeId,
     granted_by: UserId,
     request: String,
     revision: u64,
@@ -60,14 +60,14 @@ struct CoveredInstall(
     BTreeMap<String, Vec<String>>,
     UserId,
     RoleId,
-    aruna_core::NodeId,
+    aruna_core::id::NodeId,
     UserId,
     String,
     u64,
     Option<u64>,
     Option<String>,
     Vec<Prerequisite>,
-    Option<aruna_core::NodeId>,
+    Option<aruna_core::id::NodeId>,
     Option<Widening>,
 );
 
@@ -224,7 +224,7 @@ mod tests {
         grants: BTreeMap<String, Vec<String>>,
         account: UserId,
         role_id: RoleId,
-        receiver: aruna_core::NodeId,
+        receiver: aruna_core::id::NodeId,
         granted_by: UserId,
         request: String,
         revision: u64,

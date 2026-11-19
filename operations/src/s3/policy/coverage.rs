@@ -589,7 +589,6 @@ impl Operation for CoverageScan {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::id::NodeId;
     use aruna_core::structs::identity::realm::RealmId;
@@ -597,6 +596,7 @@ mod pure_tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::user::id::UserId;
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
 

@@ -137,7 +137,7 @@ pub async fn write_version(context: &DriverContext, bucket: &str, key: &str, ver
 /// A plain bucket of `group_id` made by `created_by`, without routing, policies or compression.
 pub fn bucket_info(
     group_id: Ulid,
-    created_by: aruna_core::UserId,
+    created_by: aruna_core::user::id::UserId,
 ) -> aruna_core::structs::storage::blob::BucketInfo {
     aruna_core::structs::storage::blob::BucketInfo {
         group_id,

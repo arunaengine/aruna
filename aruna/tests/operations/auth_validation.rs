@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_clock::unix_timestamp_secs;
-use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::calls::Next;
 use aruna_core::keys::generate_signing_key;
@@ -11,6 +10,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use aruna_operations::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
 };

@@ -430,7 +430,6 @@ mod tests {
     use super::{GroupPoliciesWrite, SetGroupConfig, SetGroupError, SetGroupOperation};
     use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::{AuthorizationError, StorageError};
@@ -441,6 +440,7 @@ mod tests {
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;

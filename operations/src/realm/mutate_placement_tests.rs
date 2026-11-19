@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -21,6 +20,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use tempfile::tempdir;
 
 use super::*;
@@ -32,11 +32,11 @@ use aruna_core::structs::placement::transition::{
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::path_context;
 
-fn node(seed: u8) -> aruna_core::NodeId {
+fn node(seed: u8) -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-fn node_secret(node_id: &aruna_core::NodeId) -> iroh::SecretKey {
+fn node_secret(node_id: &aruna_core::id::NodeId) -> iroh::SecretKey {
     (1..=8u8)
         .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]))
         .find(|secret| secret.public() == *node_id)
@@ -609,7 +609,7 @@ fn mutation_schedules_revalidation() {
 async fn seed_placement_config(
     context: &DriverContext,
     actor: &Actor,
-    nodes: &[aruna_core::NodeId],
+    nodes: &[aruna_core::id::NodeId],
     replica: Option<u32>,
 ) -> RealmConfigDocument {
     let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
@@ -644,7 +644,7 @@ async fn seed_placement_config(
     document
 }
 
-fn draining_entry(node_id: aruna_core::NodeId) -> NodePlacementEntry {
+fn draining_entry(node_id: aruna_core::id::NodeId) -> NodePlacementEntry {
     NodePlacementEntry {
         node_id,
         location: String::new(),
@@ -675,7 +675,7 @@ fn draining_change_rejected() {
     }
 }
 
-fn placed_entry(node_id: aruna_core::NodeId) -> NodePlacementEntry {
+fn placed_entry(node_id: aruna_core::id::NodeId) -> NodePlacementEntry {
     NodePlacementEntry {
         node_id,
         location: "eu-west".to_string(),
@@ -693,7 +693,7 @@ fn placed_document(entry: NodePlacementEntry) -> RealmConfigDocument {
 }
 
 fn set_attributes(
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     location: Option<&str>,
     labels: Option<BTreeMap<String, String>>,
 ) -> RealmPlacementMutation {
@@ -1149,7 +1149,7 @@ fn rejects_plan_mismatch() {
     ));
 }
 
-fn issuer(realm_id: RealmId, node_id: aruna_core::NodeId) -> Actor {
+fn issuer(realm_id: RealmId, node_id: aruna_core::id::NodeId) -> Actor {
     Actor {
         node_id,
         user_id: UserId::nil(realm_id),

@@ -1178,7 +1178,6 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
 
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::{ConversionError, StorageError};
     use aruna_core::events::{Event, StorageEvent};
@@ -1191,6 +1190,7 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::worker::FjallStorage;
     use std::sync::Arc;
@@ -1440,10 +1440,9 @@ mod tests {
     // being unbound after its offer is gone. The cleanup on this node still deletes the bucket.
     #[tokio::test]
     async fn guards_folder_pull() {
-        use crate::device::sync::folders::finish_unbind;
-        use crate::staging::offered_directory::{
-            OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
-        };
+        use crate::device::sync::folders::unbind::finish_unbind;
+        use crate::staging::offer::run::{offer_directory, withdraw_offer};
+        use crate::staging::offered_directory::{OfferDirectoryInput, WithdrawOfferInput};
         use crate::tests::device::store_folder;
         use aruna_core::structs::synced_folder::folder_bucket;
         use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};

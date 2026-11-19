@@ -21,12 +21,12 @@ use std::ops::Range;
 use ulid::Ulid;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, JobId, JobRecord};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::JOB_PRUNE_PAGE;

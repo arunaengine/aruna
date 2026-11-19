@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 
 use super::*;

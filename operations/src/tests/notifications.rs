@@ -5,8 +5,8 @@
 
 #[cfg(test)]
 use crate::notifications::inbox::UpsertInboxOperation;
-use aruna_core::NodeId;
-use aruna_core::UserId;
+use aruna_core::id::NodeId;
+use aruna_core::user::id::UserId;
 #[cfg(test)]
 use aruna_core::document::DocumentTarget;
 use aruna_core::structs::execution::notification::{
@@ -85,7 +85,7 @@ pub async fn store_setting(storage: &StorageHandle, target: &DocumentTarget, byt
 }
 
 /// Three management nodes, in config order.
-pub fn managers() -> [aruna_core::NodeId; 3] {
+pub fn managers() -> [aruna_core::id::NodeId; 3] {
     [61u8, 62, 63].map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
 }
 
@@ -93,7 +93,7 @@ pub fn managers() -> [aruna_core::NodeId; 3] {
 /// Creates a watch on this node as its holder, with the owner's READ check and replication.
 pub async fn create_holder_watch(
     context: &DriverContext,
-    local_node_id: aruna_core::NodeId,
+    local_node_id: aruna_core::id::NodeId,
     owner: UserId,
     path_prefix: String,
     event_mask: aruna_core::structs::execution::notification_watch::WatchEventMask,

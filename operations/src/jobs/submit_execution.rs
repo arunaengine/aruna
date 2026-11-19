@@ -4,7 +4,6 @@
 
 use std::collections::HashSet;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
@@ -18,6 +17,7 @@ use aruna_core::structs::placement::record::{
     DEFAULT_SHARD_COUNT, FIRST_GRANTABLE_HANDLE, shard_for_subject,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::user::id::UserId;
 use tracing::warn;
 
 use super::submit::{SubmitJobOperation, SubmitJobSpec};

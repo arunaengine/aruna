@@ -39,9 +39,8 @@ use aruna_operations::jobs::records::pages::ServePageOperation;
 use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use aruna_operations::metadata::after_sync::AfterSyncOperation;
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
-use aruna_operations::metadata::serve::{
-    ServeNode, ServeRequestOperation, ServedReply, needs_view,
-};
+use aruna_operations::metadata::serve::forwards::needs_view;
+use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, ServedReply};
 use aruna_operations::node::heartbeat::ReceiveHeartbeatOperation;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 use aruna_operations::notifications::email::RefreshMailOperation;
@@ -1072,7 +1071,6 @@ async fn run_maintenance(context: &DriverContext, source: &'static str, attempt:
 mod tests {
     use super::*;
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::replication_protocol::{
@@ -1083,6 +1081,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
+    use aruna_core::user::id::UserId;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage::worker::FjallStorage;
     use std::collections::HashMap;

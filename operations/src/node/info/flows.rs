@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute::quota::{
@@ -13,6 +12,7 @@ use aruna_core::compute::quota::{
 };
 use aruna_core::events::Event;
 use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat, RunningJobs};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::COMPUTE_DEPARTURE_KEYSPACE;
 use aruna_core::node_facts::NodeFacts;
 use aruna_core::node_state::{
@@ -38,10 +38,8 @@ use crate::node::info::inputs::{
 };
 use crate::node::info::publish::{PublishInfoError, PublishInfoOperation};
 use crate::node::info::write::{InfoChange, InfoWriteError, InfoWriteOperation};
-use crate::placement::policy::reconcile::SubjectSync;
-use crate::placement::policy::{
-    SubjectScanError, SubjectScanMode, SubjectScanResult, SubjectSyncOperation, SubjectTrigger,
-};
+use crate::placement::policy::reconcile::{SubjectSync, SubjectSyncOperation, SubjectTrigger};
+use crate::placement::policy::subject::{SubjectScanError, SubjectScanMode, SubjectScanResult};
 
 /// The runner's clock: the flow's start for its snapshots, the latest time for its revision.
 #[derive(Debug, Default, PartialEq)]

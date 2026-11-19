@@ -22,7 +22,7 @@ pub mod rebuild;
 pub mod refill;
 pub mod resolve;
 pub mod roots;
-mod route_query;
+pub mod route_query;
 pub mod routing;
 pub mod source_plan;
 pub mod split;

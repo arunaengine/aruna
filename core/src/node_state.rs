@@ -4,9 +4,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::NodeId;
 use crate::calls::{IoCall, IoError, IoResult, Next};
 use crate::compute::quota::ComputeDepartureReport;
+use crate::id::NodeId;
 use crate::keyspaces::{COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE};
 use crate::operation::Operation;
 use crate::rows::values;

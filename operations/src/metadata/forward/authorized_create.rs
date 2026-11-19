@@ -5,8 +5,8 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
@@ -89,7 +89,7 @@ fn read_config(result: IoResult) -> Result<RealmConfigDocument, CreateAuthorized
 /// failed queue write only warns and never affects the create.
 fn emitted(
     realm_id: RealmId,
-    user: aruna_core::UserId,
+    user: aruna_core::user::id::UserId,
     created: CreateDocumentResult,
 ) -> CreateTurn {
     let record = created.record;

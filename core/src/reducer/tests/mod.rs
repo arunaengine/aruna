@@ -17,6 +17,7 @@ use super::{
 };
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation};
 use crate::auth::REVOCATION_GRACE_SECS;
+use crate::id::NodeId;
 use crate::structs::identity::realm::{
     GroupQuotaOverride, MetadataReplicationConfig, QuotaConfig, RealmConfigDocument,
     RealmDiscoveryConfig, RealmNodeKind, UserCapOverride,
@@ -33,8 +34,8 @@ use crate::structs::placement::transition::{
 };
 use crate::structs::storage::node_info::{CLASS_LABEL_PREFIX, KIND_LABEL_KEY};
 use crate::structured_id::PlacementHandle;
+use crate::user::id::UserId;
 use crate::user::validation::UserAttributeError;
-use crate::{NodeId, UserId};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 

@@ -447,7 +447,6 @@ pub(crate) fn seed_placement_events(
 mod test {
     use aruna_core::keys::generate_signing_key;
 
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
@@ -466,6 +465,7 @@ mod test {
         BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
     };
     use aruna_core::types::{Key, KeySpace, Value};
+    use aruna_core::user::id::UserId;
     use aruna_net::NetHandle;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;

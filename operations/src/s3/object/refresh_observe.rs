@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{
@@ -13,8 +14,6 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, BucketInfo, VersionKey};
 use thiserror::Error;
-
-use crate::connectors::{ResolveBindingInput, ResolveBindingOperation};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ObserveError {

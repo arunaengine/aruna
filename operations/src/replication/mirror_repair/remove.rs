@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation::Operation;
 use aruna_core::structs::SyncRelationship;
@@ -11,10 +11,9 @@ use aruna_core::structs::SyncRelationship;
 use super::ensure::{creator_token, peer_failure};
 use super::{MirrorPeer, SyncMirrorError, delete_peer};
 use crate::replication::mirror_repair::request::MirrorRequestOperation;
-use crate::replication::sync_relationship::{
-    DeleteRelationshipOperation, RemoveOutgoingOperation, SyncRelationshipDirection,
-    SyncRelationshipError,
-};
+use crate::replication::sync_relationship::delete::DeleteRelationshipOperation;
+use crate::replication::sync_relationship::remove::RemoveOutgoingOperation;
+use crate::replication::sync_relationship::{SyncRelationshipDirection, SyncRelationshipError};
 use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Removes this node's records of `relationship`: the outgoing one on the source, keeping a

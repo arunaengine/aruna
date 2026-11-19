@@ -614,7 +614,7 @@ mod tests {
     fn actor(realm_id: RealmId) -> aruna_core::structs::identity::auth::Actor {
         aruna_core::structs::identity::auth::Actor {
             node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([9u8; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([9u8; 16]), realm_id),
             realm_id,
         }
     }

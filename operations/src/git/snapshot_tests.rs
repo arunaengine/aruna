@@ -67,7 +67,7 @@ fn events(last: Ulid) -> (MetadataEventRecord, MetadataRegistryRecord) {
     let event = MetadataEventRecord {
         event_id: OLDER,
         record: record.clone(),
-        user_id: aruna_core::UserId::local(Ulid::from_parts(1, 3), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 3), realm_id),
         node_id,
         payload: MetadataEventPayload::RoCrate {
             jsonld: jsonld.to_string(),

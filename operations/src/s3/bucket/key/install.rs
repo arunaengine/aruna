@@ -10,6 +10,7 @@ use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::encryption::{
@@ -17,7 +18,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::task::TaskEffect;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use std::time::Duration;
 use thiserror::Error;
 use ulid::Ulid;
@@ -637,7 +638,6 @@ mod tests {
         use crate::s3::bucket::create::CreateBucketOperation;
         use crate::s3::bucket::encryption::{EnableEncryptionOperation, EnableInput};
         use aruna_blob::blob::BlobHandler;
-        use aruna_core::UserId;
         use aruna_core::effects::StorageEffect;
         use aruna_core::node_vault::NodeVaultKey;
         use aruna_core::structs::identity::realm::RealmId;
@@ -645,6 +645,7 @@ mod tests {
         use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys, EncryptionMode};
         use aruna_core::structs::storage::format::Compression;
         use aruna_core::structs::storage::holders::KeyLookup;
+        use aruna_core::user::id::UserId;
         use aruna_drivers::driver::drive;
         use std::collections::{BTreeMap, HashMap};
 

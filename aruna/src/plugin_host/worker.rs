@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{EVENTS_QUEUED, PluginRun, RunTrigger};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};

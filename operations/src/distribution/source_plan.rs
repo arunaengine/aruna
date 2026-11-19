@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
 use aruna_core::errors::SourceResolutionError;
@@ -23,13 +22,14 @@ use aruna_core::structs::storage::distribution::on_use::{KeptKind, PullPlan};
 use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionView};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::types::{GroupId, Value};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
 use super::held::{HeldElsewhere, admitted};
-use crate::connectors::{ResolveBindingInput, ResolveBindingOperation};
+use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use aruna_core::structs::storage::blob::strong_validator;
 
 /// One reference a read served from its source.

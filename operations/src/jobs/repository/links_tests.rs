@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::keyspaces::{
     SHARD_MANIFEST_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE, WRITE_FENCE_KEYSPACE,
@@ -12,6 +11,7 @@ use aruna_core::repository::{LinkFailure, LinkRemote, RepositoryRecord};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::user::id::UserId;
 
 const NOW_MS: u64 = 1_700_000_000_000;
 

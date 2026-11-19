@@ -12,7 +12,6 @@ use crate::job_calls::{
 };
 use crate::metadata_calls::route_metadata_update;
 use crate::metadata_calls::{create_with_id, route_metadata_delete};
-use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::job_request::{SubmissionScope, SubmitJobError, submission_of};
@@ -31,7 +30,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::record::band_start;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -99,7 +98,7 @@ const JOB_BUDGET: JobClassBudget = JobClassBudget {
 fn derived_owner(
     realm: &Topology,
     job_id: aruna_core::structs::execution::job::JobId,
-) -> TestResult<aruna_core::NodeId> {
+) -> TestResult<aruna_core::id::NodeId> {
     Ok(realm.config.job_owner(job_id)?)
 }
 
@@ -210,7 +209,7 @@ async fn record_routes_owner() -> TestResult<()> {
 async fn submit_external_job(
     context: &aruna_drivers::driver::DriverContext,
     spec: aruna_core::structs::execution::job::ExecutionSpec,
-    created_by: aruna_core::UserId,
+    created_by: aruna_core::user::id::UserId,
     idempotency_key: Option<String>,
     workspace_mode: WorkspaceMode,
     workspace_bucket: Option<String>,
@@ -391,7 +390,7 @@ async fn origin_scoped_dedup() -> TestResult<()> {
 }
 
 /// Stores upload `[seed; 16]` of `owner` on `node`, which an import submission claims.
-async fn seed_upload(node: &TestNode, owner: aruna_core::UserId, seed: u8) -> TestResult<()> {
+async fn seed_upload(node: &TestNode, owner: aruna_core::user::id::UserId, seed: u8) -> TestResult<()> {
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     let location = BackendLocation {
         backend: BackendRef::node_default(),

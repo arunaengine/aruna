@@ -17,8 +17,8 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
 use aruna_core::holder_choice::{HolderCandidate, HolderChoiceOperation, pick};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::api::IdentifierMatch;
 use aruna_core::metadata::protocol::{
@@ -995,7 +995,7 @@ mod tests {
         let mapping = PersistentIdMapping::requested(
             id,
             false,
-            aruna_core::UserId::local(
+            aruna_core::user::id::UserId::local(
                 Ulid::from_bytes([4; 16]),
                 aruna_core::structs::identity::realm::RealmId([5; 32]),
             ),
@@ -1079,7 +1079,7 @@ mod tests {
                 .to_bytes(),
         );
         let node_id = iroh::SecretKey::from_bytes(&[8; 32]).public();
-        let user_id = aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id);
+        let user_id = aruna_core::user::id::UserId::local(Ulid::from_bytes([4; 16]), realm_id);
         let actor = Actor {
             node_id,
             user_id,

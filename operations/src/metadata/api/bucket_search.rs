@@ -5,10 +5,10 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::realm::RealmId;
@@ -185,9 +185,9 @@ mod call_tests {
     //! Drives the bucket search through its cursor, fanout and retired node answers.
 
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::NetEffect;
     use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::user::id::UserId;
 
     fn realm() -> RealmId {
         RealmId::from_bytes([1; 32])

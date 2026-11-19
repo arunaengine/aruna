@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use aruna_blob::egress::EgressGuard;
 use aruna_clock::unix_timestamp_secs;
-use aruna_core::MetaResourceId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::{
     ARUNA_DATA_PREFIX, ArunaArn, VersionedObjectArn, W3idIdentifier,
 };
+use aruna_core::structured_id::MetaResourceId;
 use axum::Router;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};

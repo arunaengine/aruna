@@ -18,7 +18,7 @@ use super::witness_arm::{
     ChangeDeadlineOperation, DEADLINE_KEY_BYTES, DeadlineChange, WitnessDeadline,
     deadline_index_key, deadline_key,
 };
-pub use super::witness_round::{RoundOutcome, WitnessNode, WitnessRoundOperation};
+use super::witness_round::{RoundOutcome, WitnessNode, WitnessRoundOperation};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::store_call::RowRead;
 

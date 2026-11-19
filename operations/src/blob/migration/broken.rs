@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BROKEN_VERSION_KEYSPACE, CHECK_QUEUE_KEYSPACE, STORAGE_CHECK_KEYSPACE,
 };
@@ -18,7 +19,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::broken::{BrokenVersion, StorageCheck};
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 
 use super::check::{CheckOutcome, CheckVersionError, CheckVersionOperation};
 use super::drain::{BUCKET_PAGE, MIGRATION_CONTINUE, MIGRATION_PAGE};

@@ -8,7 +8,6 @@ use crate::auth::OwnerAuth;
 use crate::auth::extract;
 use crate::routes::device::buckets::{CreateBucketRequest, create_device_bucket};
 use crate::routes::device::dto::FolderStateName;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -18,6 +17,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::device::sync::repository::{action_entry, base_entry, folder_entry};

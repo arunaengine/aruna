@@ -426,7 +426,6 @@ pub(crate) mod tests {
     use crate::jobs::JOB_PRUNE_PAGE;
     use crate::jobs::JOB_RETENTION_MS;
     use crate::jobs::store::job_calls::ClaimOutcome;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::handle::Handle;
     use aruna_core::id::NodeId;
@@ -443,6 +442,7 @@ pub(crate) mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::TaskEvent;
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::test_context;
     use aruna_storage::scan::iter_prefix_page;

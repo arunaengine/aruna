@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::auth::credential_hash;
 use crate::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError, credential_aad,
@@ -11,6 +10,7 @@ use crate::errors::ConversionError;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::storage::blob::UserAccess;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;

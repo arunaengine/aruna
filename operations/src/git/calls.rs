@@ -4,7 +4,6 @@
 
 use std::time::Duration;
 
-use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
@@ -12,12 +11,12 @@ use aruna_core::git::{GitAnswer, GitCall, GitEffect, GitEvent, GitRequest, PushP
 use aruna_core::git_state::{Ancestry, Projection, ProjectionInputs};
 use aruna_core::metadata::MetadataEvent;
 use aruna_core::operation::{Operation, SubOperation, boxed_suboperation};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use ulid::Ulid;
 
 use super::GitError;
 use super::objects::Blob;
-pub(super) use crate::metadata::deletion_guard::metadata_call;
 
 fn store_call(call: GitCall) -> IoCall {
     IoCall::from(Effect::Git(Box::new(call)))

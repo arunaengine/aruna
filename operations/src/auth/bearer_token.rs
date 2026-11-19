@@ -4,7 +4,6 @@
 
 use crate::auth::error::ArunaBearerError;
 use crate::document_repository::read_row;
-use aruna_core::UserId;
 use aruna_core::auth::{
     REALMS_LIST_KEY, REVOCATION_GRACE_SECS, bearer_token_hash, valid_token_lifetime,
 };
@@ -20,6 +19,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 use base64::Engine;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;

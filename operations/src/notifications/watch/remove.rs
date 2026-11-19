@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::types::Key;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use crate::notifications::checks::{peer_config, verify_recipient_holder};

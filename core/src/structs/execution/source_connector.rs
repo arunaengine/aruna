@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::compute::SecretBytes;
 use crate::errors::ConversionError;
 use crate::node_vault::{VaultEntry, VaultPurpose};
 use crate::structs::execution::source_access::SOURCE_WEIGHT;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -226,8 +226,8 @@ impl SourceConnectorSecret {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UserId;
     use crate::structs::identity::realm::RealmId;
+    use crate::user::id::UserId;
 
     fn test_user_id(seed: u8) -> UserId {
         UserId::local(Ulid::from_bytes([seed; 16]), RealmId([seed; 32]))

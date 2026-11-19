@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use aruna_core::NodeId;
 use aruna_core::heartbeat::seen_recently;
+use aruna_core::id::NodeId;
 
 /// Peers remembered before stale entries are swept. A realm configuration holds
 /// far fewer, so the sweep only ever answers an unexpected peer set.
@@ -43,8 +43,8 @@ impl PeerContacts {
 #[cfg(test)]
 mod pure_tests {
     use super::PeerContacts;
-    use aruna_core::NodeId;
     use aruna_core::heartbeat::{PEER_CONTACT_WINDOW, seen_recently};
+    use aruna_core::id::NodeId;
     use std::collections::BTreeMap;
 
     fn peer(seed: u8) -> NodeId {

@@ -502,7 +502,7 @@ pub(crate) mod tests {
                 establishing_event_id: event_id,
                 last_event_id: event_id,
             },
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 3), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 3), realm_id),
             node_id,
             payload: MetadataEventPayload::Scaffold {
                 name: "raw".to_string(),

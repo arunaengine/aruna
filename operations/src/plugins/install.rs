@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugin_installs::{
@@ -19,7 +20,7 @@ use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_plugin_types::artifact::ArtifactDigest;
 use aruna_plugin_types::manifest::Manifest;
 use aruna_plugin_types::permission::{Grant, Permission};

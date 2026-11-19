@@ -32,10 +32,11 @@ use aruna_operations::connectors::list_connectors::{
 use aruna_operations::connectors::replace_connector::{
     ReplaceSourceError, ReplaceSourceInput, ReplaceSourceOperation,
 };
-use aruna_operations::connectors::resolver::{resolve_inline_access, validate_source_path};
+use aruna_operations::connectors::resolver::{
+    ResolveConnectorInput, ResolveConnectorOperation, resolve_inline_access, validate_source_path,
+};
 use aruna_operations::connectors::secret_config::{HasConfigError, HasConfigOperation};
 use aruna_operations::connectors::validation::validate_connector_input;
-use aruna_operations::connectors::{ResolveConnectorInput, ResolveConnectorOperation};
 use aruna_operations::staging::check_source::CheckSourceOperation;
 use aruna_operations::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation,

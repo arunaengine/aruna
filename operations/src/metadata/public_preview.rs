@@ -23,7 +23,8 @@ use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};
+use crate::replication::locations::LocationSummaryError;
+use crate::replication::locations::local::{LocalSummary, LocationSummaryOperation};
 use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_core::replication_protocol::LocationSummaryRequest;
 use aruna_core::request_policy::PolicyRequestExtras;
@@ -561,7 +562,6 @@ mod tests {
         };
         assert_eq!(done, Ok(Next::Done(expected)));
     }
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -576,6 +576,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{BucketInfo, HashIndex};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX;
+    use aruna_core::user::id::UserId;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;

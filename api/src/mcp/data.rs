@@ -25,7 +25,7 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
 use aruna_operations::metadata::api::search_types::BucketSearchRequest;
-use aruna_operations::placement::policy::GateOperation;
+use aruna_operations::placement::policy::gate::GateOperation;
 use aruna_operations::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput};

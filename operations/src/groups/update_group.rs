@@ -446,7 +446,6 @@ fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentState) {
 #[cfg(test)]
 mod pure_tests {
     use super::{GroupUpdate, UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation};
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
@@ -461,6 +460,7 @@ mod pure_tests {
     use aruna_core::structs::identity::group::Group;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::GroupId;
+    use aruna_core::user::id::UserId;
     use byteview::ByteView;
     use ulid::Ulid;
 

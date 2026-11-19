@@ -4,8 +4,8 @@
 
 use super::LocationSummaryError;
 use crate::replication::version_replication::map_sync_key;
-use aruna_core::NodeId;
 use aruna_core::calls::{IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::PrefixPages;

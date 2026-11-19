@@ -3,11 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document_apply::ApplyError;
 use aruna_core::errors::StorageError;
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;

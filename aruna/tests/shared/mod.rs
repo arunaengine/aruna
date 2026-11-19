@@ -30,7 +30,6 @@ use aruna_blob::blob::BlobHandler;
 use aruna_blob::blob::registry::BackendRegistry;
 use aruna_clock::testing::poll_until;
 use aruna_compute::registry::ExecutorRegistry;
-use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metrics::NodeMetrics;
@@ -45,13 +44,15 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::node_facts;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::node::info::flows::SeedInfoOperation;
-use aruna_operations::placement::policy::{SubjectScanMode, SubjectSyncOperation, SubjectTrigger};
+use aruna_operations::placement::policy::reconcile::{SubjectSyncOperation, SubjectTrigger};
+use aruna_operations::placement::policy::subject::SubjectScanMode;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };

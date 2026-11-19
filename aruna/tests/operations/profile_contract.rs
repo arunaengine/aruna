@@ -4,8 +4,6 @@
 
 use std::sync::{Arc, LazyLock};
 
-use aruna_core::StructuredId;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -25,6 +23,8 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structured_id::StructuredId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, mint_local_document,
@@ -50,7 +50,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-fn local_node(context: &DriverContext) -> Option<aruna_core::NodeId> {
+fn local_node(context: &DriverContext) -> Option<aruna_core::id::NodeId> {
     context.net_handle.as_ref().map(|net| net.node_id())
 }
 
@@ -1718,7 +1718,7 @@ async fn build_context(
     storage.install_metadata_indexes(metadata_dir.path());
     let actor = Actor {
         node_id,
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
     };
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);

@@ -6,7 +6,7 @@ pub mod after_sync;
 pub mod api;
 pub mod audit;
 pub mod audit_entry;
-pub(crate) mod builtin;
+pub mod builtin;
 pub(crate) mod checkpoint;
 pub(crate) mod checkpoint_window;
 pub mod create_document;
@@ -59,8 +59,6 @@ pub mod update_entry;
 pub(crate) mod updated_page;
 pub mod visibility_index;
 pub(crate) mod visible_scope;
-
-pub use builtin::builtin_shapes;
 
 #[cfg(test)]
 mod store_tests;

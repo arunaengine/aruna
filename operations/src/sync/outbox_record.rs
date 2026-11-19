@@ -4,10 +4,10 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::AdminDocumentOperation;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskKey};

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::lookup::map_guard_error;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::distribution::search::IndexProgress;
 use aruna_core::structs::storage::distribution::{DistributionError, DistributionRevision};

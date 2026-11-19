@@ -8,6 +8,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, VaultSignEvent};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, values};
@@ -18,8 +19,8 @@ use aruna_core::structs::identity::user::vault::{
 };
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use aruna_core::vault_format::key_fingerprint;
-use aruna_core::{NodeId, UserId};
 use thiserror::Error;
 use ulid::Ulid;
 

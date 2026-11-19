@@ -4,17 +4,16 @@
 
 use crate::auth::enforcement::PolicyEvaluator;
 use crate::auth::permission_rules::PermissionRules;
-use crate::connectors::resolver::NATIVE_SET_ID;
+use crate::connectors::resolver::{NATIVE_SET_ID, ResolveBindingInput, resolve_binding_effect};
 use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
-use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::groups::backends::RecordReadError;
 use crate::groups::storage_routing::load_group_inputs;
-use crate::placement::policy::{
-    GateContext, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision, write_gate,
+use crate::placement::policy::gate::{
+    GateContext, PolicyGateError, PolicyGateOutcome, gate_decision, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::replication::error::ReplicationError;
 use crate::s3::object::put::abe::keyed;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::StorageReadError;
@@ -73,6 +72,7 @@ use aruna_core::structs::storage::routing::{NodeRouting, StorageRoutingRule, res
 use aruna_core::structs::{ReferenceHandling, SyncMode, SyncRelationship, sync_state_key};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
@@ -2927,7 +2927,6 @@ mod tests {
         ReplicationFailure, ReplicationVersion, SourceAuthorization, SyncTransferContext,
         target_key,
     };
-    use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
     use aruna_core::errors::BlobError;
@@ -2969,6 +2968,7 @@ mod tests {
     };
     use aruna_core::structs::storage::routing::GroupRoutingInputs;
     use aruna_core::types::{Key, Value};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::worker::FjallStorage;
     use bytes::Bytes;

@@ -5,11 +5,10 @@
 use super::LocationSummaryError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::realm::peer_trust::ensure_realm_peer;
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
@@ -37,6 +36,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -646,7 +646,6 @@ impl Operation for LocationSummaryOperation {
 mod pure_tests {
     use super::{LocalSummary, LocationSummaryError, LocationSummaryOperation, SummaryState, Turn};
     use crate::tests::locations::{node_id, realm_id, request};
-    use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect};
     use aruna_core::events::{BlobEvent, Event};
@@ -668,6 +667,7 @@ mod pure_tests {
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::types::Value;
+    use aruna_core::user::id::UserId;
     use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -1237,7 +1237,7 @@ mod pure_tests {
         assert!(operation.abort().is_empty());
     }
 
-    fn peer_realm(peer: aruna_core::NodeId) -> Vec<u8> {
+    fn peer_realm(peer: aruna_core::id::NodeId) -> Vec<u8> {
         let mut realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
         realm.ensure_node(peer, RealmNodeKind::Server);
         postcard::to_allocvec(&realm).unwrap()

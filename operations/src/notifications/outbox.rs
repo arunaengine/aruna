@@ -6,10 +6,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::notification::{
@@ -499,11 +499,11 @@ mod call_tests {
     use super::*;
     use crate::tests::locations::node_id;
     use crate::tests::notifications::{record, user};
-    use aruna_core::UserId;
     use aruna_core::storage_entries::outbox_write_entry;
     use aruna_core::structs::execution::notification::NotificationClass;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     const NOW_MS: u64 = 1_700_000_000_000;

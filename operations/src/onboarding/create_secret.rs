@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -11,6 +10,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
@@ -247,7 +247,6 @@ pub fn secret_record_key(enrollment_id: Ulid) -> ByteView {
 #[cfg(test)]
 mod tests {
     use super::{CreateSecretError, CreateSecretInput, CreateSecretOperation};
-    use aruna_core::UserId;
     use aruna_core::calls::CallRun;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::StorageError;
@@ -257,6 +256,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use byteview::ByteView;

@@ -10,12 +10,12 @@ use crate::routes::access::groups::{PaginationParams, ensure_group_admin, load_g
 use crate::routes::info::{GroupQuotaStatus, distinct_buckets, load_realm_usage};
 use crate::server::state::ServerState;
 use aruna_clock::{unix_timestamp_millis, unix_timestamp_secs};
-use aruna_core::UserId;
 use aruna_core::jobs::RunningJobView;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::groups::admin_check::{AdminCheckOperation, realm_groups_path};

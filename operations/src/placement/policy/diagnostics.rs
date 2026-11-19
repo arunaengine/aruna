@@ -259,7 +259,6 @@ mod pure_tests {
     use super::{
         DiagnosticsError, DiagnosticsInput, DiagnosticsReport, PolicyDiagnosticsOperation,
     };
-    use aruna_core::UserId;
     use aruna_core::calls::{IoResult, Next};
     use aruna_core::events::{Event, SubOperationEvent};
     use aruna_core::id::NodeId;
@@ -273,6 +272,7 @@ mod pure_tests {
     };
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::types::Key;
+    use aruna_core::user::id::UserId;
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;

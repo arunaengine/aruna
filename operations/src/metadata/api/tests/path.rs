@@ -6,7 +6,7 @@ use super::*;
 use crate::metadata::api::path_types::{
     merge_path_views, reduce_path_candidates, select_path_holders,
 };
-use aruna_core::StructuredId;
+use aruna_core::structured_id::StructuredId;
 
 #[test]
 fn user_result_opaque() {

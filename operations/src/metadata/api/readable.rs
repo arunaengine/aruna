@@ -225,7 +225,7 @@ impl Operation for PathPermissionOperation {
 #[cfg(test)]
 mod call_tests {
     use super::*;
-    use aruna_core::UserId;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn record(public: bool) -> MetadataRegistryRecord {

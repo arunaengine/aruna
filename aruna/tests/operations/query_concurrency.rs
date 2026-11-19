@@ -60,7 +60,7 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
     storage.install_metadata_indexes(metadata_dir.path());
     // Policy loading fails closed without realm config and group documents.
     let group_id = Ulid::generate();
-    let owner = aruna_core::UserId::nil(REALM);
+    let owner = aruna_core::user::id::UserId::nil(REALM);
     let actor = Actor {
         node_id,
         user_id: owner,
@@ -644,7 +644,7 @@ async fn local_order_by() -> Result<(), BoxError> {
 async fn lazy_matches_eager() -> Result<(), BoxError> {
     let harness = build_harness(None).await?;
     let group_id = harness.group_id;
-    let member = aruna_core::UserId::local(Ulid::generate(), REALM);
+    let member = aruna_core::user::id::UserId::local(Ulid::generate(), REALM);
     let actor = Actor {
         node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         user_id: member,
@@ -717,7 +717,7 @@ async fn lazy_matches_eager() -> Result<(), BoxError> {
         session: None,
     };
     let outsider_auth = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), REALM),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), REALM),
         realm_id: REALM,
         path_restrictions: None,
         session: None,

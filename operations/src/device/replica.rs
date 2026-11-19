@@ -447,8 +447,8 @@ pub fn mark_edited(replica: &mut ReplicaRecord, local_clock: VectorClock) {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
 
     fn replica() -> ReplicaRecord {
         ReplicaRecord::new(

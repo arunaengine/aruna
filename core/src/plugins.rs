@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::compute::SecretBytes;
 use crate::secrets::{Delivery, ResponseExposure, SecretKind, SecretSettings};
+use crate::user::id::UserId;
 
 /// Largest artifact a realm admin may publish; nodes copy and fetch it in chunks.
 pub const MAX_ARTIFACT: usize = 64 << 20;

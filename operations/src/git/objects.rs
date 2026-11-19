@@ -4,9 +4,9 @@
 
 use std::time::{Duration, UNIX_EPOCH};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::git::{GitEffect, GitEvent, GitPack, LOCAL_OBJECTS, MAX_PACK_BYTES, StoredObject};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
@@ -27,7 +27,7 @@ use super::records::{InsertRowOperation, LoadRowOperation, SyncedOperation};
 use super::{GitError, records};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -63,7 +63,7 @@ pub struct EnsureBucketOperation {
     name: String,
     group_id: GroupId,
     created_at_ms: u64,
-    creator: aruna_core::UserId,
+    creator: aruna_core::user::id::UserId,
     step: BucketStep,
 }
 
@@ -495,7 +495,7 @@ pub fn describe_pack(pack: &Bytes) -> Result<GitPack, GitError> {
 /// Notes a published pack that was made from this node's cache as imported there, so the next
 /// projection does not index objects the cache already holds. A failure only costs that import.
 pub fn mark_imported(
-    (document_id, actor): (Ulid, aruna_core::UserId),
+    (document_id, actor): (Ulid, aruna_core::user::id::UserId),
     pack: &GitPack,
 ) -> MarkImportedOperation {
     MarkImportedOperation {
@@ -508,7 +508,7 @@ pub fn mark_imported(
 #[derive(Debug, PartialEq)]
 pub struct MarkImportedOperation {
     document_id: Ulid,
-    actor: aruna_core::UserId,
+    actor: aruna_core::user::id::UserId,
     digest: String,
 }
 

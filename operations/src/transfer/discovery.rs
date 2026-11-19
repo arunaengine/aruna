@@ -16,11 +16,11 @@ use crate::s3::imports::shared::{
     claim_file,
 };
 use crate::s3::imports::{ImportRuleError, ReadEarlierOperation, validate_folder};
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE,
@@ -106,7 +106,7 @@ pub fn check_rules(rules: &[DiscoveryRule]) -> Result<(), ImportRuleError> {
         let nested = rules.iter().enumerate().find(|(other, them)| {
             *other != index
                 && rule.storage_folder().is_some()
-                && crate::s3::imports::folders_overlap(&rule.folder, &them.folder)
+                && crate::s3::imports::folders::folders_overlap(&rule.folder, &them.folder)
         });
         if let Some((_, them)) = nested {
             return Err(ImportRuleError::Invalid(format!(
@@ -780,7 +780,7 @@ mod tests {
         let refused = load(&restricted).await;
         assert!(matches!(refused, Err(ImportRuleError::Forbidden)));
         let mut stranger = auth;
-        stranger.user_id = aruna_core::UserId::local(Ulid::from_parts(9, 9), realm);
+        stranger.user_id = aruna_core::user::id::UserId::local(Ulid::from_parts(9, 9), realm);
         let refused = load(&stranger).await;
         assert!(matches!(refused, Err(ImportRuleError::Forbidden)));
     }
@@ -795,7 +795,7 @@ mod tests {
     fn restricted_token_refused() {
         let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let auth = AuthContext {
-            user_id: aruna_core::UserId::nil(realm),
+            user_id: aruna_core::user::id::UserId::nil(realm),
             realm_id: realm,
             path_restrictions: Some(Vec::new()),
             session: None,

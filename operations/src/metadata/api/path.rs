@@ -30,8 +30,8 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer, read_answer};
 use aruna_core::metadata::protocol::encode_message;
 
-use aruna_core::StructuredId;
 use aruna_core::metadata::protocol::metadata_request;
+use aruna_core::structured_id::StructuredId;
 
 pub(super) fn select_forward_peers(
     config: &RealmConfigDocument,
@@ -760,7 +760,7 @@ mod call_tests {
     #[test]
     fn foreign_origin_forwards() {
         let auth = AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::from_parts(8, 8), realm()),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(8, 8), realm()),
             realm_id: realm(),
             path_restrictions: None,
             session: None,

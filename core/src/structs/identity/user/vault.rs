@@ -5,13 +5,14 @@
 
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::{VAULT_RETIRED_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use crate::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
 use crate::types::{Key, KeySpace, Value};
+use crate::user::id::UserId;
 use crate::vault_format::key_fingerprint;
-use crate::{NodeId, UserId};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

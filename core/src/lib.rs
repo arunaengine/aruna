@@ -107,15 +107,3 @@ pub mod vault_format;
 
 #[cfg(test)]
 mod tests;
-
-pub use document::{
-    DocumentApplyDecision, DocumentChange, DocumentChangeKind, DocumentEffect, DocumentEvent,
-    DocumentEvictedDocument, DocumentNetEvent, DocumentSyncRevision, DocumentTarget,
-};
-pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
-pub use keyspaces::*;
-pub use structured_id::{
-    BucketId, ClockHealthError, IdEnvironment, JobId, MetaResourceId, PlacementHandle, StructuredId,
-};
-pub use trace_context::DistributedTraceContext;
-pub use user::id::UserId;

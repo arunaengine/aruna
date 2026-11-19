@@ -4,9 +4,8 @@
 
 use ulid::Ulid;
 
-use crate::NodeId;
-use crate::UserId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentEvent, DocumentTarget};
+use crate::id::NodeId;
 use crate::repository::RepositoryLink;
 use crate::structs::execution::notification_watch::{
     INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP, MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest,
@@ -25,6 +24,7 @@ use crate::structs::{
     PersistentIdKind, PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
     persistent_id_change,
 };
+use crate::user::id::UserId;
 
 /// Validates a replicated node-usage snapshot against its target: the payload
 /// must decode, embed its target's node, and derive a key attributing to it.

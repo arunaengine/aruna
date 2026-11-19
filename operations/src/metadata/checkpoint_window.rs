@@ -4,9 +4,9 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{EVENT_SIZE_KEYSPACE, METADATA_CHECKPOINT_KEYSPACE};
 use aruna_core::metadata::{EVENT_LIMIT, EventSize};
 use aruna_core::operation::Operation;

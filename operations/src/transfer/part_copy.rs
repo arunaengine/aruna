@@ -2,10 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::placement::policy::{
-    GateContext, GateContextError, GateOperation, PolicyGateError, PolicyGateOutcome,
-    ReadPolicyError, gate_decision, union_refs, write_gate,
+use crate::placement::policy::gate::{
+    GateContext, GateContextError, GateOperation, PolicyGateError, PolicyGateOutcome, gate_decision,
+    union_refs, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::s3::fence_store::FenceCheckOperation;
 use crate::s3::multipart::part_upload::{
     UploadPartError, UploadPartInput, UploadPartOperation, UploadPartResult,
@@ -17,6 +18,7 @@ use crate::transfer::copy::{
 };
 use crate::transfer::read::{ReadSourceOperation, TokenRead};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
@@ -27,7 +29,7 @@ use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
@@ -456,7 +458,7 @@ mod test {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    fn test_node_id() -> aruna_core::NodeId {
+    fn test_node_id() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[7; 32]).public()
     }
 
@@ -552,7 +554,7 @@ mod test {
         context: &DriverContext,
         realm_id: RealmId,
         group_id: GroupId,
-        node_id: aruna_core::NodeId,
+        node_id: aruna_core::id::NodeId,
         bucket: &str,
         key: &str,
         data: &'static [u8],

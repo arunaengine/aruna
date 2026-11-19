@@ -2,11 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::id::NodeId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
-
-use crate::NodeId;
 
 /// The order of one register write: the counter, then the writing node, then the write id.
 /// A write made after seeing another always has a higher counter, so no clock is needed.

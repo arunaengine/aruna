@@ -6,11 +6,11 @@ use std::future::Future;
 use std::ops::Range;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
     ShardManifest, ShardManifestEntry, ShardTransportMessage, manifest_entry_digest,
 };
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use irokle::Storage as _;

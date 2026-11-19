@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
 };
@@ -26,6 +25,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{GroupId, Key, KeySpace};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashSet;
 use thiserror::Error;
@@ -697,13 +697,15 @@ pub mod test {
 
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
     use crate::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation, RoleAddition};
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    };
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
@@ -712,14 +714,14 @@ pub mod test {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::RoleId;
-    use aruna_core::{DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    fn node(seed: u8) -> aruna_core::NodeId {
+    fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
@@ -1136,7 +1138,7 @@ pub mod test {
             mutated_group.clone(),
             mutated_auth_doc.clone(),
             true,
-            Vec::<aruna_core::UserId>::new(),
+            Vec::<aruna_core::user::id::UserId>::new(),
         )));
         let Ok(Next::Then { output, calls }) = checked.next(IoResult::Child(written)) else {
             panic!("expected the change with the drain wake");

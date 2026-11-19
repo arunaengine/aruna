@@ -5,10 +5,10 @@
 use super::hidden_token;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{
     AuthToken, MergeError, MergeJob, MergeOutput, MetadataEffect, MetadataError, MetadataEvent,
     MetadataQueryResults, QUERY_MAX_ROWS, SolutionRow,

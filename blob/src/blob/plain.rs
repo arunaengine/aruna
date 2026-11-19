@@ -7,7 +7,6 @@ use super::backend::{key_fits, split_bucket};
 use super::io::{backend_version, compose_chunk};
 use crate::s3::NativeMultipart;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -21,6 +20,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, ResolvedBackend,
 };
 use aruna_core::structs::storage::format::{Compression, StoredFormat, StoredLayout};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use futures::StreamExt;
 use opendal::{ErrorKind, Operator};
