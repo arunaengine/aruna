@@ -53,11 +53,11 @@ mod tests {
     // its key, not refused because this member holds no copy.
     #[tokio::test]
     async fn routes_range_holder() {
-        use crate::distribution::test_record::{binding, record, secret, store_record};
+        use crate::distribution::test_record::{binding, record, secret};
         use crate::distribution::test_store::{context, open};
         let (_dir, handle) = open();
         let (snapshot, bytes) = record(true);
-        store_record(&handle, snapshot.set_id(), bytes).await;
+        aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
         let bucket = aruna_core::structs::storage::blob::BucketInfo {
             group_id: Ulid::from_bytes([90; 16]),
             created_at: std::time::SystemTime::UNIX_EPOCH,

@@ -449,12 +449,12 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
     use aruna_core::structs::storage::distribution::accounting::{
         RangeCounters, SAMPLE_SIZE, SampleEntry, sample_count_key,
     };
-    use aruna_operations::distribution::test_record::{binding, searched, store_record};
+    use aruna_operations::distribution::test_record::{binding, searched};
     use aruna_operations::distribution::test_store::{begin, commit, install, range};
     let handle = &ctx.driver.storage_handle;
     let (snapshot, bytes) = searched();
     let set_id = snapshot.set_id();
-    store_record(handle, set_id, bytes).await;
+    aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), bytes).await;
     let found = GetBucketOperation::new(spec.bucket.clone());
     let mut bucket = aruna_drivers::driver::drive(found, &ctx.driver)
         .await

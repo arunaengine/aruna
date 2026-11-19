@@ -869,7 +869,7 @@ async fn page_maintains_inventory() {
     // Member 1 of the test set coordinates the keys "a" and "b".
     let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
     let set_id = snapshot.set_id();
-    crate::distribution::test_record::store_record(handle, set_id, record_bytes).await;
+    aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), record_bytes).await;
     bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -924,7 +924,7 @@ async fn page_maintains_inventory() {
 #[tokio::test]
 async fn page_needs_coordinator() {
     use crate::distribution::guard::GuardError;
-    use crate::distribution::test_record::{binding, record as set_record, store_record};
+    use crate::distribution::test_record::{binding, record as set_record};
     use crate::distribution::test_store::{has_row, install, range};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
@@ -940,7 +940,7 @@ async fn page_needs_coordinator() {
     // Member 1 coordinates "a"; member 2 coordinates "x".
     let (snapshot, record_bytes) = set_record(true);
     let set_id = snapshot.set_id();
-    store_record(handle, set_id, record_bytes).await;
+    aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), record_bytes).await;
     bound.distribution = Some(binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -1074,7 +1074,7 @@ async fn distributed_sizes_measured() {
     let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
     let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
     let set_id = snapshot.set_id();
-    crate::distribution::test_record::store_record(handle, set_id, record_bytes).await;
+    aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), record_bytes).await;
     bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -1204,7 +1204,7 @@ async fn page_exchanges_measured() {
     let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
     let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
     let set_id = snapshot.set_id();
-    crate::distribution::test_record::store_record(handle, set_id, record_bytes).await;
+    aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), record_bytes).await;
     bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),

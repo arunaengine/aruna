@@ -22,7 +22,7 @@ use super::super::tests::{
     Fixture, input, search_local_objects, seed_materialized, setup, write_value,
 };
 use super::*;
-use crate::distribution::test_record::{binding, record, store_record};
+use crate::distribution::test_record::{binding, record};
 use aruna_core::key_index::{IndexedKey, KeyChange};
 use aruna_drivers::driver::drive;
 use aruna_storage::key_index::RangeIndexes;
@@ -49,7 +49,7 @@ async fn distributed_with(
 ) -> Distributed {
     let fixture = setup().await;
     let (snapshot, bytes) = record(true);
-    store_record(&fixture.context.storage_handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(&fixture.context.storage_handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
     let binding = binding(&snapshot, 1, 5);
     let bucket = BucketInfo {
         group_id: fixture.visible_group,

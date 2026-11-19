@@ -150,7 +150,7 @@ mod tests {
     #[tokio::test]
     async fn reads_held_counters() {
         // The charged rows of the held ranges come with their accounts, read in one snapshot.
-        use crate::distribution::test_record::{binding, record, store_record};
+        use crate::distribution::test_record::{binding, record};
         use crate::distribution::test_store::{context, open};
         use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
         use aruna_core::structs::storage::blob::BucketInfo;
@@ -158,7 +158,7 @@ mod tests {
         let context = context(&handle);
         let (snapshot, bytes) = record(true);
         let set_id = snapshot.set_id();
-        store_record(&handle, set_id, bytes).await;
+        aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), bytes).await;
         let info = BucketInfo {
             group_id: snapshot.config.owner_group,
             created_at: std::time::SystemTime::UNIX_EPOCH,
@@ -214,10 +214,10 @@ mod tests {
         accounts: Vec<(Ulid, Charge)>,
         counters: Vec<(Vec<u8>, RangeCounters)>,
     ) -> DistributionSnapshot {
-        use crate::distribution::test_record::{binding, store_record};
+        use crate::distribution::test_record::binding;
         use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
         let set_id = snapshot.set_id();
-        store_record(handle, set_id, bytes).await;
+        aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), bytes).await;
         let info = BucketInfo {
             group_id: snapshot.config.owner_group,
             created_at: std::time::SystemTime::UNIX_EPOCH,

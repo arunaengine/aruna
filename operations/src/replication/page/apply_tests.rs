@@ -33,9 +33,7 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use super::*;
-use crate::distribution::test_record::{
-    binding, member, realm, replicated, secret, store_record, with_settings,
-};
+use crate::distribution::test_record::{binding, member, realm, replicated, secret, with_settings};
 use crate::distribution::test_store::{context, install, open};
 use aruna_core::replication_protocol::VersionReplicationManifest;
 use aruna_drivers::driver::drive;
@@ -51,7 +49,7 @@ struct Member {
 async fn member_two(policies: bool) -> Member {
     let (dir, handle) = open();
     let (snapshot, bytes) = replicated(true, 1);
-    store_record(&handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
     install(&handle, snapshot.set_id(), &snapshot.config.ranges).await;
     let mut bucket = BucketInfo {
         group_id: snapshot.config.owner_group,
@@ -314,7 +312,7 @@ async fn feeds_searched_sets() {
         ..DistributionSettings::default()
     };
     let (snapshot, bytes) = with_settings(true, 1, settings);
-    store_record(&member.handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(&member.handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
     let second = record("b", 2, 1, &member.publication);
     let answer = apply(&member, page(&member, vec![second]), 1).await;
     assert!(matches!(answer, PageAnswer::Applied { applied: 1, .. }));
