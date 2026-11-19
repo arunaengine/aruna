@@ -124,7 +124,8 @@ fn changes_queue_checks() {
     assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
 }
 
-// Changes whose checks cannot be queued stay, and the due checks still run.
+// Changes whose checks cannot be queued stay, the due checks still run, and the run ends with
+// the error so the shell runs it again.
 #[test]
 fn failed_changes_stay() {
     let mut changes = QueueChangesOperation::new();
@@ -139,6 +140,8 @@ fn failed_changes_stay() {
     let failed = child::<(), _>(Err(LinkError::NoRevision));
     let page = operation.next(failed);
     assert_eq!(page, Ok(Next::Call(queue_pages().call())));
+    let ended = operation.next(queue_page(Vec::new()));
+    assert_eq!(ended, Err(LinkError::NoRevision));
 }
 
 #[test]
@@ -516,8 +519,9 @@ fn timer_arms_earliest() {
         (id_key(link().link_id), queued(NOW_MS + 9_000)),
         (id_key(Ulid::nil()), queued(NOW_MS + 2_000)),
     ];
+    assert_eq!(operation.next(queue_page(rows)), Ok(Next::Call(change_probe())));
     let expected: IoCall = schedule_drain(Duration::from_millis(2_000)).into();
-    assert_eq!(operation.next(queue_page(rows)), Ok(Next::Call(expected)));
+    assert_eq!(operation.next(queue_page(Vec::new())), Ok(Next::Call(expected)));
     let armed = crate::jobs::repository::test_support::event(Event::Task(TaskEvent::Error {
         key: None,
         message: "late".into(),
@@ -525,11 +529,34 @@ fn timer_arms_earliest() {
     assert_eq!(operation.next(armed), Ok(Next::Done(())));
 }
 
+fn change_probe() -> IoCall {
+    IoCall::Page {
+        space: LINK_CHANGE_KEYSPACE.to_string(),
+        prefix: ByteView::from(Vec::new()),
+        after: None,
+        limit: 1,
+    }
+}
+
 #[test]
 fn empty_queue_idle() {
     let mut operation = LinkTimerOperation::new();
     operation.first().unwrap();
+    assert_eq!(operation.next(queue_page(Vec::new())), Ok(Next::Call(change_probe())));
     assert_eq!(operation.next(queue_page(Vec::new())), Ok(Next::Done(())));
+}
+
+// Change rows left behind, as after a failed queueing or a restart, arm the drain at once.
+#[test]
+fn changes_arm_drain() {
+    let mut operation = LinkTimerOperation::new();
+    operation.stamp(NOW_MS);
+    operation.first().unwrap();
+    operation.next(queue_page(Vec::new())).unwrap();
+    let (_, key, value) = link_change_entry(link().document_id, NOW_MS);
+    let armed = operation.next(queue_page(vec![(key, value)]));
+    let expected: IoCall = schedule_drain(Duration::ZERO).into();
+    assert_eq!(armed, Ok(Next::Call(expected)));
 }
 
 // A retry moves an unchanged check; a change queued while the check ran keeps its earlier due
