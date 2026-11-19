@@ -1901,7 +1901,7 @@ impl AdvanceReference {
         if update.is_noop() {
             return self.committed();
         }
-        let call = update.start_calls().into_call();
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.usage = Some(update);
         self.read(AdvanceStep::UpdateUsage, call)
     }

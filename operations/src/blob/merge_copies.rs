@@ -560,7 +560,7 @@ impl UnifyStageOperation {
             let bytes = i128::from(keep.stored_size());
             if let Some(stored) = StoredDelta::of_copy(keep, 1, bytes) {
                 let mut update = UsageCounterUpdate::for_stored(stored);
-                let call = update.start_calls().into_call();
+                let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
                 return self.call(StageStep::Usage(Box::new(update)), call);
             }
         }

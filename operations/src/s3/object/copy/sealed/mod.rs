@@ -769,7 +769,9 @@ impl SealedCopyOperation {
             return self.copied();
         }
         self.step = Step::Usage;
-        Ok(Next::Call(update.start_calls().into_call()))
+        Ok(Next::Call(
+            update.start_calls(self.ids.mint(self.now_ms)).into_call(),
+        ))
     }
 
     fn usage_step(&mut self, result: IoResult) -> Turn {

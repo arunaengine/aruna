@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -77,6 +78,7 @@ enum MintState {
 /// head, and outputs whether it did. A caller folds these calls into its own transaction.
 #[derive(Debug, PartialEq)]
 pub(crate) struct MintSuccessorOperation {
+    ids: IdMint,
     now_ms: u64,
     refresh: ReferenceRefresh,
     observation: SourceMetadata,
@@ -94,6 +96,7 @@ impl MintSuccessorOperation {
         predecessor: BlobVersion,
     ) -> Self {
         Self {
+            ids: IdMint::default(),
             now_ms: 0,
             refresh,
             observation,
@@ -257,7 +260,7 @@ impl MintSuccessorOperation {
     fn rows_written(&mut self) -> MintTurn {
         match self.usage.as_mut().filter(|usage| !usage.is_noop()) {
             Some(usage) => {
-                let call = usage.start_calls().into_call();
+                let call = usage.start_calls(self.ids.mint(self.now_ms)).into_call();
                 self.state = MintState::UpdateUsage;
                 Ok(Next::Call(call))
             }
@@ -312,6 +315,10 @@ impl Operation for MintSuccessorOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

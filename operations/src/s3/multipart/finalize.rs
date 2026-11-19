@@ -642,7 +642,7 @@ impl CompleteUploadOperation {
     fn start_usage_update(&mut self) -> Turn {
         let update = self.usage_update.as_mut();
         let update = update.ok_or(CompleteUploadError::CompleteUploadFailed)?;
-        let call = update.start_calls().into_call();
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.call(CompleteUploadState::UpdateUsage, call)
     }
 

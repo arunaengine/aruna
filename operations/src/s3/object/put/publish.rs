@@ -486,7 +486,7 @@ impl PutObjectOperation {
     fn start_usage_update(&mut self) -> Turn {
         let update = self.usage_update.as_mut();
         let update = update.ok_or(PutObjectError::PutObjectFailed)?;
-        let call = update.start_calls().into_call();
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.call(PutObjectState::UpdateUsage, call)
     }
 

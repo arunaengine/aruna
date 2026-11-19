@@ -1312,7 +1312,7 @@ impl MigrateVersionOperation {
         let Some(usage) = usage else {
             return self.finish(MigrateOutcome::Migrated);
         };
-        let call = usage.start_calls().into_call();
+        let call = usage.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.call(MigrateState::UpdateUsage, call)
     }
 

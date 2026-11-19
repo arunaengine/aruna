@@ -190,7 +190,7 @@ pub async fn stage_usage(
     txn_id: TxnId,
     update: &mut UsageCounterUpdate,
 ) -> Result<(), UsageUpdateError> {
-    let mut next = Some(update.start_calls());
+    let mut next = Some(update.start_calls(ulid::Ulid::from_parts(1, 1)));
     while let Some(call) = next {
         let answer = run_staged(handle, txn_id, call).await?;
         next = update.step_calls(answer)?;

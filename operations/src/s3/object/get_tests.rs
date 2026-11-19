@@ -1852,7 +1852,10 @@ fn successor_charges_size() {
         },
     )
     .in_bucket(&operation.input.bucket, RowChange::AddedVersion);
-    let _ = expected.start_calls();
+    // The advance mints its successor id, then the generation of the usage markers.
+    let mut ids = aruna_core::id_mint::IdMint::default();
+    ids.mint(0);
+    let _ = expected.start_calls(ids.mint(0));
     assert_eq!(advance.usage, Some(expected));
 }
 
