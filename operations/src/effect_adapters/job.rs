@@ -237,7 +237,10 @@ async fn fill_gzip(mut work: GzipWork) -> JobEvent {
             None => work.cursor.finish(),
         }
     };
-    JobEvent::GzipFilled { work, result }
+    JobEvent::GzipFilled {
+        work: Box::new(work),
+        result,
+    }
 }
 
 #[cfg(test)]

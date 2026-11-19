@@ -637,7 +637,7 @@ pub enum JobEvent {
     /// The bytes read, `None` when the stream held more than the limit.
     CollectedUpTo(Result<Option<Vec<u8>>, String>),
     GzipFilled {
-        work: GzipWork,
+        work: Box<GzipWork>,
         result: Result<(), GzipBroken>,
     },
     Stream(ByteStream),
