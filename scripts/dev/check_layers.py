@@ -37,7 +37,14 @@ ANY_CRATE = "*"
 # Internal normal dependencies the target table (target-architecture.md section 2) allows.
 CRATE_TARGETS = {
     "aruna": ANY_CRATE,
-    "aruna-api": ("aruna-core", "aruna-clock", "aruna-operations", "aruna-drivers", "aruna-wire"),
+    "aruna-api": (
+        "aruna-core",
+        "aruna-clock",
+        "aruna-operations",
+        "aruna-drivers",
+        "aruna-wire",
+        "aruna-test-support",
+    ),
     "aruna-doctor": (
         "aruna-core",
         "aruna-clock",

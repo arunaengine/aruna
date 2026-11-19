@@ -146,7 +146,7 @@ pub(crate) mod tests {
     use aruna_core::structs::PersistentIdRevision;
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::secondary_id::SecondaryIdKind;
+    use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 
     pub(crate) fn mapping(document_id: Ulid) -> PersistentIdMapping {
         PersistentIdMapping::requested(

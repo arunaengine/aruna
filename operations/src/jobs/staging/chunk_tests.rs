@@ -54,7 +54,7 @@ where
 }
 
 fn stream() -> ByteStream {
-    BackendStream::new(futures_util::stream::empty::<Result<Bytes, StreamError>>())
+    BackendStream::empty()
 }
 
 fn read_answer(metadata: SourceMetadata) -> IoResult {
