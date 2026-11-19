@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::metadata::{EVENT_LIMIT, RAW_BYTES_LIMIT};
-use aruna_core::operation::{HoldScope, Operation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{NodeId, UserId};
@@ -83,11 +83,6 @@ impl CheckpointOperation {
 impl Operation for CheckpointOperation {
     type Output = ();
     type Error = CheckpointError;
-
-    /// The checkpoint's update runs as a child, which takes no hold of its own.
-    fn hold_scope(&self) -> Option<HoldScope> {
-        Some(HoldScope::DocumentWrite(self.record.document_id))
-    }
 
     fn first(&mut self) -> CheckpointTurn {
         let Some(node_id) = self.local_node else {
@@ -171,6 +166,13 @@ mod call_tests {
             vec![node(1)],
         ))));
         assert_eq!(checkpoint.next(done), Ok(Next::Done(())));
+    }
+
+    // Its update child holds the document; a hold here too would wait on itself forever.
+    #[test]
+    fn leaves_hold_to_update() {
+        let checkpoint = CheckpointOperation::new(Some(node(1)), record(vec![node(1)]));
+        assert_eq!(checkpoint.hold_scope(), None);
     }
 
     #[test]
