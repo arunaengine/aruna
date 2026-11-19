@@ -14,7 +14,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
-use super::write::device_edit_error;
+use super::super::write::device_edit_error;
 use crate::device::edit::{DeviceEditError, accepts_edits, apply_local_edit};
 use crate::device::publish_queue::token_issued_at;
 use crate::device::replica::{ReplicaRecord, read_answer, replica_read};
@@ -295,5 +295,5 @@ impl Operation for RouteUpdateOperation {
 }
 
 #[cfg(test)]
-#[path = "routed_update_tests.rs"]
+#[path = "update_tests.rs"]
 mod call_tests;

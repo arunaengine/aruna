@@ -19,7 +19,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::write::batch_refusal;
+use super::super::write::batch_refusal;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{peer_call, peer_reply};
 use crate::forward::replay::routed_record_matches;
@@ -298,5 +298,5 @@ impl Operation for ApplyBatchOperation {
 }
 
 #[cfg(test)]
-#[path = "routed_write_tests.rs"]
+#[path = "write_tests.rs"]
 mod call_tests;

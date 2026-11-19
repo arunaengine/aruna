@@ -46,7 +46,7 @@ use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, CreateDocumentResult,
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
-use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
+use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::notifications::watch::origin::EmitEventOperation;

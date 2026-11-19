@@ -16,7 +16,7 @@ use aruna_core::structs::storage::dataset_description::{DatasetSummaryRequest, D
 use std::time::Duration;
 use ulid::Ulid;
 
-use super::routed_export::RoutedExportOperation;
+use super::routed::export::RoutedExportOperation;
 
 pub(super) const METADATA_READ_DEADLINE: Duration = Duration::from_secs(12);
 

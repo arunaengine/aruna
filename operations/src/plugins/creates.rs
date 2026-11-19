@@ -30,7 +30,7 @@ use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::forward::authorized_create::CreateAuthorizedError;
 use crate::metadata::forward::authorized_create::PinnedCreateOperation;
 use crate::metadata::forward::pinned::PinnedCreate;
-use crate::metadata::forward::routed_read::RoutedReadOperation;
+use crate::metadata::forward::routed::read::RoutedReadOperation;
 use crate::metadata::update_document::UpdateDocumentError;
 
 /// How the key row of a create was found.

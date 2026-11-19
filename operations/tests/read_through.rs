@@ -4,7 +4,7 @@
 
 use crate::topology;
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
+use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
 
 use std::time::Duration;
 

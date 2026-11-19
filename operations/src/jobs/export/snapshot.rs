@@ -22,7 +22,7 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use crate::metadata::forward::routed_export::RoutedExportOperation;
+use crate::metadata::forward::routed::export::RoutedExportOperation;
 use crate::metadata::pid_read::ReadPidOperation;
 
 fn unexpected_view() -> ExportFailure {

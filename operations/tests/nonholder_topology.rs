@@ -52,7 +52,7 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentOperation, CreateDocumentPayload, mint_forward_document, mint_local_document,
     resolve_metadata_id,
 };
-use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
+use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
 use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;

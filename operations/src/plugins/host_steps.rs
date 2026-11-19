@@ -58,8 +58,8 @@ use crate::metadata::api::list_types::{ListVisibleRequest, ListVisibleResult, Me
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::forward::authorized_create::CreateAuthorizedError;
 use crate::metadata::forward::pinned::{PinnedCreate, PinnedMintOperation};
-use crate::metadata::forward::routed_export::RoutedExportOperation;
-use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
+use crate::metadata::forward::routed::export::RoutedExportOperation;
+use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,

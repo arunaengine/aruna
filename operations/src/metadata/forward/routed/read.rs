@@ -14,9 +14,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
-use super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
-use super::read::METADATA_READ_DEADLINE;
-use super::routed_export::owner_reads;
+use super::super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
+use super::super::read::METADATA_READ_DEADLINE;
+use super::export::owner_reads;
 use crate::device::replica::{ReplicaRecord, read_answer as replica_answer, replica_read};
 use crate::device::selection::keep_read;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -295,5 +295,5 @@ impl Operation for RoutedReadOperation {
 }
 
 #[cfg(test)]
-#[path = "routed_read_tests.rs"]
+#[path = "read_tests.rs"]
 mod call_tests;
