@@ -428,14 +428,14 @@ async fn set_coverage(
     set_id: Ulid,
 ) -> ServerResult<(ReferenceCoverageResponse, Vec<DataLinkDocument>)> {
     let preview = set_preview_distributed(
-        state.get_ctx().as_ref(),
         (state.get_realm_id(), state.get_node_id()),
         Some(auth),
         bearer_token_string(bearer),
         (set_id, PREVIEW_DATASETS),
-    )
-    .await
-    .map_err(map_api_error)?;
+    );
+    let preview = drive(preview, state.get_ctx().as_ref())
+        .await
+        .map_err(map_api_error)?;
     let freshness = match (
         preview.pending_materializations,
         preview.failed_materializations,

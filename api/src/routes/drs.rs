@@ -1075,16 +1075,12 @@ async fn drs_part_of(
     resolved: &ResolvedObject,
 ) -> Option<DrsPartOf> {
     let found = aruna_operations::metadata::api::links::part_of(
-        state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        auth,
-        bearer,
+        (state.get_realm_id(), state.get_node_id()),
+        (auth, bearer),
         &resolved.bucket,
         &resolved.key,
-    )
-    .await
-    .ok()?;
+    );
+    let found = drive(found, state.get_ctx().as_ref()).await.ok()?;
     Some(DrsPartOf {
         datasets: found
             .datasets
