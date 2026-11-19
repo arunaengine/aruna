@@ -307,7 +307,9 @@ mod tests {
     fn config(family: &Family, holders: Vec<NodeId>) -> PublishRecordConfig {
         let envelope = family.sign(
             &family.holder,
-            aruna_core::structs::execution::job::family::JobFamilyRecord::Spec(Box::new(family.spec())),
+            aruna_core::structs::execution::job::family::JobFamilyRecord::Spec(Box::new(
+                family.spec(),
+            )),
         );
         let key = envelope.key();
         PublishRecordConfig {

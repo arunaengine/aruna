@@ -9,7 +9,9 @@ use aruna_core::id::NodeId;
 use aruna_core::node_state::{DrainState, DrainStateError, DrainStateOperation};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::identity::JobState;
-use aruna_core::structs::execution::job::input::{ExecutionSpec, InputMode, InputSource, JobPayload};
+use aruna_core::structs::execution::job::input::{
+    ExecutionSpec, InputMode, InputSource, JobPayload,
+};
 use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::user::id::UserId;

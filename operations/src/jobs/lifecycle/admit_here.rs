@@ -15,8 +15,8 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::{
-    ExecutionClaim, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobRecordKind, JobRetryPolicy,
-    LogicalJobSpec, LogicalJobState, SubmissionClaim, SubmissionId,
+    ExecutionClaim, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobRecordKind,
+    JobRetryPolicy, LogicalJobSpec, LogicalJobState, SubmissionClaim, SubmissionId,
 };
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::record_keys::{family_prefix, kind_prefix};
@@ -107,7 +107,9 @@ impl ObservedStateOperation {
     }
 }
 
-fn state_of(cache: Option<aruna_core::structs::execution::job::family::JobProjection>) -> LogicalJobState {
+fn state_of(
+    cache: Option<aruna_core::structs::execution::job::family::JobProjection>,
+) -> LogicalJobState {
     cache.map_or(LogicalJobState::Indeterminate, |projection| {
         projection.state
     })

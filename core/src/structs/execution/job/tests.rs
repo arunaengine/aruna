@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::family::JobRecordBody;
 use super::family::{
     CancelAuthority, EffectiveResources, ExecutionOutputRecord, ExecutionReceipt, ExecutionRole,
     ExecutionUpdate, HolderView, JOB_BUDGET_DOMAIN, JOB_CANCEL_DOMAIN, JOB_CLAIM_DOMAIN,

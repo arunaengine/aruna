@@ -173,7 +173,8 @@ async fn finds_pinned_files() {
 #[tokio::test]
 async fn plans_until_ended() {
     let (_directory, context) = setup().await;
-    let job = aruna_core::structs::execution::job::identity::JobId::from_bytes([0xE5; 16]).as_ulid();
+    let job =
+        aruna_core::structs::execution::job::identity::JobId::from_bytes([0xE5; 16]).as_ulid();
     let id = Ulid::from_parts(10, 1);
     let unversioned = file("raw/gone/x", Ulid::from_parts(21, 1));
     let versioned = file("raw/gone/a", Ulid::from_parts(20, 1));

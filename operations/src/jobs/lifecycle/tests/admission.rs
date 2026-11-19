@@ -6,7 +6,9 @@ use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ADMISSION_QUOTA_KEYSPACE, FAMILY_OUTBOX_KEYSPACE};
-use aruna_core::structs::execution::job::family::{JobFamilyRecord, LogicalJobSpec, SubmissionClaim};
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, LogicalJobSpec, SubmissionClaim,
+};
 use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::execution::job::input::{
     CapturedInput, InputMode, InputSelection, InputSource,

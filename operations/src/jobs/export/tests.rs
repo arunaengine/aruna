@@ -1828,11 +1828,13 @@ pub(super) fn op_spec() -> ExportRoCrateSpec {
 
 pub(super) fn selected_spec() -> ExportRoCrateSpec {
     let mut spec = op_spec();
-    spec.selection = Some(aruna_core::structs::execution::job::input::ExportSelection {
-        files: vec!["a".to_string()],
-        audience: RealmId::from_bytes([9; 32]),
-        intent_digest: String::new(),
-    });
+    spec.selection = Some(
+        aruna_core::structs::execution::job::input::ExportSelection {
+            files: vec!["a".to_string()],
+            audience: RealmId::from_bytes([9; 32]),
+            intent_digest: String::new(),
+        },
+    );
     spec
 }
 

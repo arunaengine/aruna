@@ -1104,7 +1104,9 @@ mod tests {
 
         let pending = PendingRecord {
             envelope: envelope.clone(),
-            need: PendingNeed::Evidence(aruna_core::structs::execution::job::family::JobRecordKind::Spec),
+            need: PendingNeed::Evidence(
+                aruna_core::structs::execution::job::family::JobRecordKind::Spec,
+            ),
             first_seen_ms: 12,
             attempts: 2,
         };
@@ -1191,7 +1193,9 @@ mod tests {
             job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes(
                 Ulid::from_bytes([5u8; 16]).to_bytes(),
             ),
-            logical_job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([5u8; 16]),
+            logical_job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes(
+                [5u8; 16],
+            ),
             resources: aruna_core::structs::execution::job::family::EffectiveResources {
                 cpu_cores: 2,
                 ram_bytes: 1024,

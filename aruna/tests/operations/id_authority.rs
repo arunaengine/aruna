@@ -688,7 +688,10 @@ async fn mint_routed(
     realm: &Topology,
     node: &TestNode,
     document_id: Ulid,
-) -> TestResult<(aruna_core::structs::persistent_id::PersistentIdMapping, bool)> {
+) -> TestResult<(
+    aruna_core::structs::persistent_id::PersistentIdMapping,
+    bool,
+)> {
     let minted = std::cell::RefCell::new(None);
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "no routed mint reached the authority",

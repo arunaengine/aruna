@@ -441,8 +441,9 @@ mod tests {
     fn checked(binding: Ulid, upload: Option<&RoCrateUploadRecord>, job: bool) -> IoResult {
         let upload = upload.map(|upload| postcard::to_allocvec(upload).unwrap());
         let job_id = aruna_core::structs::execution::job::identity::JobId::from_bytes([7; 16]);
-        let dedup =
-            job.then(|| aruna_core::structs::execution::job::local::encode_dedup_value(job_id, [0; 32]));
+        let dedup = job.then(|| {
+            aruna_core::structs::execution::job::local::encode_dedup_value(job_id, [0; 32])
+        });
         stored(vec![Some(binding.to_bytes().to_vec()), upload, dedup])
     }
 
@@ -494,9 +495,8 @@ mod tests {
         assert_eq!((writes.len(), retired.expires_at_ms), (3, 0));
         let mut operation = RecordOperation::new(binding(stale(old)));
         operation.first().unwrap();
-        upload.claimed_by = Some(aruna_core::structs::execution::job::identity::JobId::from_bytes(
-            [7; 16],
-        ));
+        upload.claimed_by =
+            Some(aruna_core::structs::execution::job::identity::JobId::from_bytes([7; 16]));
         assert_eq!(
             operation.next(checked(old, Some(&upload), false)),
             Ok(Next::Done(RecordOutcome::Bound(old)))

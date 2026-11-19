@@ -8,7 +8,9 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::LaunchDecline;
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::execution::job::family::{JobFamilyRecord, JobRecordEnvelope, LaunchIntent};
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordEnvelope, LaunchIntent,
+};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use ulid::Ulid;
 

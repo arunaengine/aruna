@@ -8,7 +8,9 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::JobFamilyId;
 use aruna_core::structs::execution::job::identity::{JobId, JobState};
-use aruna_core::structs::execution::job::input::{JobPayload, SessionReportDetail, SessionReportRow};
+use aruna_core::structs::execution::job::input::{
+    JobPayload, SessionReportDetail, SessionReportRow,
+};
 use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::Value;

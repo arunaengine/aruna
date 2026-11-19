@@ -23,7 +23,9 @@ use aruna_core::structs::storage::distribution::accounting::{
     Charge, RangeAccount, RangeCounters, SAMPLE_SIZE, SampleEntry, generation_key, needs_refill,
     sample_prefix,
 };
-use aruna_core::structs::storage::distribution::snapshot::{DistributionSnapshot, DistributionView};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView,
+};
 use aruna_core::structs::storage::distribution::statement::{Statement, StatementClaim};
 use aruna_core::structs::storage::distribution::{DistributionMember, KeyRange};
 use aruna_core::types::{Key, Value};

@@ -1140,7 +1140,9 @@ fn decode_report_row(
             serde_json::to_value(row)
         }
         JobKind::Execution => {
-            use aruna_core::structs::execution::job::input::{SessionReportDetail, SessionReportRow};
+            use aruna_core::structs::execution::job::input::{
+                SessionReportDetail, SessionReportRow,
+            };
 
             let row: SessionReportRow = postcard::from_bytes(value)
                 .map_err(|error| ServerError::InternalError(error.into()))?;

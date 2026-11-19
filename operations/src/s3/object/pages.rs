@@ -20,7 +20,9 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::snapshot::DistributionView;
-use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionMember, KeyRange};
+use aruna_core::structs::storage::distribution::{
+    DistributionBinding, DistributionMember, KeyRange,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;

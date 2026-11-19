@@ -16,7 +16,9 @@ use aruna_core::keyspaces::{
     REPLICATION_OBLIGATION_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::identity::JobId;
-use aruna_core::structs::execution::job::input::{JobPayload, StagingJobCheckpoint, StagingJobPhase};
+use aruna_core::structs::execution::job::input::{
+    JobPayload, StagingJobCheckpoint, StagingJobPhase,
+};
 use aruna_core::structs::execution::job::local::{JobClaim, JobRecord};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::{

@@ -19,4 +19,3 @@ pub mod secondary_id;
 pub mod sync_quarantine;
 pub mod sync_relationship;
 pub mod synced_folder;
-

@@ -701,7 +701,9 @@ async fn write_family(
         projection: Some(aruna_core::structs::execution::job::family::JobProjection {
             submission_id: family.submission_id,
             request_digest: family.request_digest,
-            canonical_job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([9u8; 16]),
+            canonical_job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes(
+                [9u8; 16],
+            ),
             aliases: Vec::new(),
             state,
             canonical_execution_id: None,
