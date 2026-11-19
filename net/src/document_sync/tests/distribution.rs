@@ -256,8 +256,12 @@ async fn membership_gaps_defer() {
             revision: created().revision(),
         }],
     };
-    state.apply_operation(&actor(OTHER), ensure).unwrap();
-    state.apply_operation(&actor(OTHER), removed).unwrap();
+    state
+        .apply_operation(&actor(OTHER), ensure, ulid::Ulid::generate())
+        .unwrap();
+    state
+        .apply_operation(&actor(OTHER), removed, ulid::Ulid::generate())
+        .unwrap();
     batch_write_to(&storage, vec![reducer_state_entry(&state).unwrap()])
         .await
         .unwrap();
@@ -473,7 +477,9 @@ async fn cutoff_is_exact() {
             revision: cutoff.revision(),
         }],
     };
-    state.apply_operation(&actor(OTHER), removed).unwrap();
+    state
+        .apply_operation(&actor(OTHER), removed, ulid::Ulid::generate())
+        .unwrap();
     batch_write_to(&storage, vec![reducer_state_entry(&state).unwrap()])
         .await
         .unwrap();

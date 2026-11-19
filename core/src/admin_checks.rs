@@ -776,16 +776,28 @@ mod tests {
             value,
         };
         let mut state = AdminDocumentState::new(AdminDocumentTarget::User { user_id });
-        let owner = state.apply_operation(&actor, set(SERVICE_GROUP_ATTRIBUTE, group.to_string()));
+        let owner = state.apply_operation(
+            &actor,
+            set(SERVICE_GROUP_ATTRIBUTE, group.to_string()),
+            ulid::Ulid::generate(),
+        );
         assert_eq!(service_owner(&owner.unwrap(), None, None), Some(group));
         let owned = state.clone();
-        let marker = state.apply_operation(&actor, set(INSTALL_ATTRIBUTE, "a".into()));
+        let marker = state.apply_operation(
+            &actor,
+            set(INSTALL_ATTRIBUTE, "a".into()),
+            ulid::Ulid::generate(),
+        );
         assert_eq!(
             service_owner(&marker.unwrap(), Some(&owned), None),
             Some(group)
         );
         let marked = state.clone();
-        let again = state.apply_operation(&actor, set(INSTALL_ATTRIBUTE, "b".into()));
+        let again = state.apply_operation(
+            &actor,
+            set(INSTALL_ATTRIBUTE, "b".into()),
+            ulid::Ulid::generate(),
+        );
         assert_eq!(service_owner(&again.unwrap(), Some(&marked), None), None);
     }
 }

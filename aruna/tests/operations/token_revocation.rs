@@ -301,6 +301,7 @@ async fn seed_sync_topic(
                 .ok_or("realm config has no placement entry")?
                 .clone(),
         },
+        ulid::Ulid::generate(),
     )?;
 
     match nodes[1]

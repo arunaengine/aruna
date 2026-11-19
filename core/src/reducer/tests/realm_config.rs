@@ -875,18 +875,18 @@ fn merge_coordinator_pins() {
     let pin = |node_id| AdminDocumentOperation::MergeCoordinatorSet { node_id };
     let mut first = base.clone();
     first
-        .apply_operation(&actor(node(1)), pin(node(1)))
+        .apply_operation(&actor(node(1)), pin(node(1)), ulid::Ulid::generate())
         .unwrap();
     assert_eq!(first.materialized_merge_coordinator(), Some(node(1)));
     let mut handed = first.clone();
     handed
-        .apply_operation(&actor(node(1)), pin(node(2)))
+        .apply_operation(&actor(node(1)), pin(node(2)), ulid::Ulid::generate())
         .unwrap();
     assert_eq!(handed.materialized_merge_coordinator(), Some(node(2)));
 
     let mut second = base.clone();
     let rival = second
-        .apply_operation(&actor(node(3)), pin(node(3)))
+        .apply_operation(&actor(node(3)), pin(node(3)), ulid::Ulid::generate())
         .unwrap();
     first.apply(&rival).unwrap();
     assert_eq!(first.materialized_merge_coordinator(), None);
@@ -919,14 +919,26 @@ fn vault_entry_writes() {
             realm_id: realm_id(),
         });
     state
-        .apply_operation(&actor(node(1)), vault_set(2, Some(1)))
+        .apply_operation(
+            &actor(node(1)),
+            vault_set(2, Some(1)),
+            ulid::Ulid::generate(),
+        )
         .unwrap();
     let mut other = state.clone();
     other
-        .apply_operation(&actor(node(2)), vault_set(1, Some(1)))
+        .apply_operation(
+            &actor(node(2)),
+            vault_set(1, Some(1)),
+            ulid::Ulid::generate(),
+        )
         .unwrap();
     let rival = state
-        .apply_operation(&actor(node(1)), vault_set(2, Some(2)))
+        .apply_operation(
+            &actor(node(1)),
+            vault_set(2, Some(2)),
+            ulid::Ulid::generate(),
+        )
         .unwrap();
     other.apply(&rival).unwrap();
     let ids = |id: u8, revision: u8| (Ulid::from_bytes([id; 16]), Ulid::from_bytes([revision; 16]));
@@ -934,7 +946,7 @@ fn vault_entry_writes() {
     assert!(other.conflicts.is_empty());
 
     other
-        .apply_operation(&actor(node(2)), vault_set(2, None))
+        .apply_operation(&actor(node(2)), vault_set(2, None), ulid::Ulid::generate())
         .unwrap();
     assert_eq!(vault_revisions(&other), vec![ids(1, 1)]);
     let path = crate::reducer::vault_entry_path(&crate::realm_vault::RealmVaultEntry::new(
@@ -956,7 +968,7 @@ fn vault_entry_writes() {
         _ => unreachable!(),
     };
     assert_eq!(
-        other.apply_operation(&actor(node(2)), mismatched),
+        other.apply_operation(&actor(node(2)), mismatched, ulid::Ulid::generate()),
         Err(AdminDocumentError::InvalidVaultRecord)
     );
 }
@@ -969,11 +981,19 @@ fn vault_conflict_absent() {
     });
     let mut first = base.clone();
     let one = first
-        .apply_operation(&actor(node(1)), vault_set(5, Some(1)))
+        .apply_operation(
+            &actor(node(1)),
+            vault_set(5, Some(1)),
+            ulid::Ulid::generate(),
+        )
         .unwrap();
     let mut second = base.clone();
     let two = second
-        .apply_operation(&actor(node(2)), vault_set(5, Some(2)))
+        .apply_operation(
+            &actor(node(2)),
+            vault_set(5, Some(2)),
+            ulid::Ulid::generate(),
+        )
         .unwrap();
     first.apply(&two).unwrap();
     second.apply(&one).unwrap();
@@ -983,7 +1003,7 @@ fn vault_conflict_absent() {
     }
     let mut deleted = base.clone();
     let tombstone = deleted
-        .apply_operation(&actor(node(3)), vault_set(5, None))
+        .apply_operation(&actor(node(3)), vault_set(5, None), ulid::Ulid::generate())
         .unwrap();
     first.apply(&tombstone).unwrap();
     assert!(first.materialized_realm_vault().is_empty());
@@ -1013,7 +1033,11 @@ fn email_conflict_off() {
     });
     let mut first = base.clone();
     let one = first
-        .apply_operation(&actor(node(1)), email_set(Some("one.example.org")))
+        .apply_operation(
+            &actor(node(1)),
+            email_set(Some("one.example.org")),
+            ulid::Ulid::generate(),
+        )
         .unwrap();
     assert_eq!(
         first.materialized_realm_email().map(|profile| profile.host),
@@ -1021,7 +1045,11 @@ fn email_conflict_off() {
     );
     let mut second = base.clone();
     let two = second
-        .apply_operation(&actor(node(2)), email_set(Some("two.example.org")))
+        .apply_operation(
+            &actor(node(2)),
+            email_set(Some("two.example.org")),
+            ulid::Ulid::generate(),
+        )
         .unwrap();
     first.apply(&two).unwrap();
     second.apply(&one).unwrap();
@@ -1030,16 +1058,24 @@ fn email_conflict_off() {
         assert_eq!(state.realm_email_candidates().len(), 2);
     }
     first
-        .apply_operation(&actor(node(1)), email_set(Some("three.example.org")))
+        .apply_operation(
+            &actor(node(1)),
+            email_set(Some("three.example.org")),
+            ulid::Ulid::generate(),
+        )
         .unwrap();
     assert_eq!(first.realm_email_candidates().len(), 1);
     first
-        .apply_operation(&actor(node(1)), email_set(None))
+        .apply_operation(&actor(node(1)), email_set(None), ulid::Ulid::generate())
         .unwrap();
     assert_eq!(first.materialized_realm_email(), None);
     assert!(first.realm_email_candidates().is_empty());
     assert_eq!(
-        first.apply_operation(&actor(node(1)), email_set(Some(" "))),
+        first.apply_operation(
+            &actor(node(1)),
+            email_set(Some(" ")),
+            ulid::Ulid::generate()
+        ),
         Err(AdminDocumentError::InvalidEmailProfile)
     );
 }
@@ -1093,13 +1129,21 @@ fn secret_conflict_absent() {
     let mut second = base.clone();
     let mut one = Vec::new();
     for operation in named_secret(1) {
-        one.push(first.apply_operation(&actor(node(1)), operation).unwrap());
+        one.push(
+            first
+                .apply_operation(&actor(node(1)), operation, ulid::Ulid::generate())
+                .unwrap(),
+        );
     }
     assert_eq!(first.materialized_realm_secrets().len(), 1);
     assert_eq!(first.materialized_realm_vault().len(), 1);
     let mut two = Vec::new();
     for operation in named_secret(2) {
-        two.push(second.apply_operation(&actor(node(2)), operation).unwrap());
+        two.push(
+            second
+                .apply_operation(&actor(node(2)), operation, ulid::Ulid::generate())
+                .unwrap(),
+        );
     }
     for event in &two {
         first.apply(event).unwrap();
@@ -1133,11 +1177,17 @@ fn node_history_kept() {
         node_id: node(5),
         cutoffs: Vec::new(),
     };
-    state.apply_operation(&actor(node(1)), ensure()).unwrap();
+    state
+        .apply_operation(&actor(node(1)), ensure(), ulid::Ulid::generate())
+        .unwrap();
     let member = state.clock.clone();
-    state.apply_operation(&actor(node(1)), remove()).unwrap();
+    state
+        .apply_operation(&actor(node(1)), remove(), ulid::Ulid::generate())
+        .unwrap();
     let gap = state.clock.clone();
-    state.apply_operation(&actor(node(2)), ensure()).unwrap();
+    state
+        .apply_operation(&actor(node(2)), ensure(), ulid::Ulid::generate())
+        .unwrap();
     let again = state.clock.clone();
     let device = AdminDocumentOperation::ConfigNodeEnsured {
         node_id: node(6),
@@ -1145,7 +1195,9 @@ fn node_history_kept() {
             owner: UserId::local(Ulid::from_bytes([9; 16]), realm_id()),
         },
     };
-    state.apply_operation(&actor(node(1)), device).unwrap();
+    state
+        .apply_operation(&actor(node(1)), device, ulid::Ulid::generate())
+        .unwrap();
 
     let intervals = state.node_intervals();
     assert_eq!(

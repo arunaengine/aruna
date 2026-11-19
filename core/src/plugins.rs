@@ -235,8 +235,12 @@ mod tests {
             AdminDocumentState::new(target.clone()),
             AdminDocumentState::new(target),
         );
-        let from_a = a.apply_operation(&manager(3), set(left)).unwrap();
-        let from_b = b.apply_operation(&manager(4), set(right)).unwrap();
+        let from_a = a
+            .apply_operation(&manager(3), set(left), ulid::Ulid::generate())
+            .unwrap();
+        let from_b = b
+            .apply_operation(&manager(4), set(right), ulid::Ulid::generate())
+            .unwrap();
         a.apply(&from_b).unwrap();
         b.apply(&from_a).unwrap();
         [a.materialized_plugins(), b.materialized_plugins()]

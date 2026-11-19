@@ -1638,7 +1638,7 @@ mod pure_tests {
             },
         ] {
             state
-                .apply_operation(&actor(1), operation)
+                .apply_operation(&actor(1), operation, ulid::Ulid::generate())
                 .expect("applies");
         }
 
@@ -1661,6 +1661,7 @@ mod pure_tests {
             .apply_operation(
                 &actor(1),
                 AdminDocumentOperation::ConfigTransitionStarted { plan: plan.clone() },
+                ulid::Ulid::generate(),
             )
             .expect("applies");
 
@@ -1678,6 +1679,7 @@ mod pure_tests {
                             reported_by: *holder,
                             frontier: vec![seed],
                         },
+                        ulid::Ulid::generate(),
                     )
                     .expect("applies");
             }
@@ -1696,6 +1698,7 @@ mod pure_tests {
                             bucket: bucket.bucket,
                             reported_by: *holder,
                         },
+                        ulid::Ulid::generate(),
                     )
                     .expect("applies");
             }
@@ -1741,6 +1744,7 @@ mod pure_tests {
                             strategy_id,
                             proof,
                         },
+                        ulid::Ulid::generate(),
                     )
                     .expect("applies");
             }
