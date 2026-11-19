@@ -85,7 +85,7 @@ fn upgraded(value: &[u8]) -> Option<JobRecord> {
     if let Ok(staging) = session_refs::decode::<StagingJob>(value, &[]) {
         return Some(staging.into());
     }
-    for layout in [session_refs::NO_LOGIN, session_refs::NO_NAME] {
+    for layout in [super::compute::LOGIN_JOBS, super::compute::NAME_JOBS] {
         let record = session_refs::decode::<JobRecord>(value, layout)
             .or_else(|_| session_refs::decode::<StagingJob>(value, layout).map(Into::into))
             .or_else(|_| session_refs::decode::<LegacyJob>(value, layout).map(Into::into));
@@ -816,8 +816,9 @@ mod tests {
 
     #[test]
     fn rewrites_old_sessions() {
-        // Sessions stored without the display name, or without the linked login, gain empty
-        // fields; the plan digest and the dedup row follow the rewritten payload.
+        // Sessions stored without the display name, or without the linked login, in records of
+        // those releases without the local admission, gain empty fields; the plan digest and the
+        // dedup row follow the rewritten payload.
         use aruna_core::keyspaces::DEDUP_INDEX_KEYSPACE;
         use aruna_core::structs::execution::job::{encode_dedup_value, parse_dedup_value};
         use aruna_core::structs::identity::auth::{SessionKind, SessionRef};
@@ -843,7 +844,7 @@ mod tests {
             let old_payload = splice(&payload, &full, &full[..kept]);
             let old_digest = *blake3::hash(&old_payload).as_bytes();
             record.plan_digest = Some(old_digest);
-            let stored = splice(&record.to_bytes().unwrap(), &full, &full[..kept]);
+            let stored = splice(&unadmitted(&record), &full, &full[..kept]);
             jobs.push((job_record_key(job_id).to_vec(), stored));
             dedup.push((vec![seed], encode_dedup_value(job_id, old_digest)));
             record.plan_digest = Some(record.payload.plan_digest());

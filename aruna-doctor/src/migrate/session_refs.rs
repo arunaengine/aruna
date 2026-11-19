@@ -12,15 +12,11 @@ use std::fmt;
 use std::marker::PhantomData;
 
 /// The serde name of `SessionRef`, whose older layouts lack trailing fields.
-const SESSION_REF: &str = "SessionRef";
+pub(super) const SESSION_REF: &str = "SessionRef";
 
 /// Stored field counts by serde struct name, or by the comma-joined field names of a struct
 /// variant, which has no serde name; a listed struct lacks its later fields.
 pub(super) type Layout = &'static [(&'static str, usize)];
-
-/// Session references before the linked login, and before the display name too.
-pub(super) const NO_LOGIN: Layout = &[(SESSION_REF, 3)];
-pub(super) const NO_NAME: Layout = &[(SESSION_REF, 2)];
 
 /// Decodes `bytes` as `T` with every struct `layout` names stored with only its first fields.
 /// All bytes must be used.

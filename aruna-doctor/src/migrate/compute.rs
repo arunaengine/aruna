@@ -5,7 +5,7 @@
 
 use super::families::exact;
 use super::removals::outbox_record;
-use super::session_refs::{self, Layout};
+use super::session_refs::{self, Layout, SESSION_REF};
 use crate::explorer::ExplorerError;
 use aruna_core::NodeId;
 use aruna_core::compute::quota::{
@@ -32,14 +32,25 @@ use std::collections::BTreeMap;
 use ulid::Ulid;
 
 /// Structs that gained trailing fields since alpha.206, such as the backend name or a job's local
-/// admission, with the field count alpha.206 stored.
-const UNNAMED: Layout = &[
-    ("ExecutionSpec", 16),
-    ("AttemptIntent", 5),
-    ("LaunchRecord", 7),
-    ("JobReservationRecord", 7),
-    ("JobRecord", 28),
-];
+/// admission, with the field count alpha.206 stored, after any `$older` entries.
+macro_rules! alpha_206 {
+    ($($older:expr),*) => {
+        &[
+            $($older,)*
+            ("ExecutionSpec", 16),
+            ("AttemptIntent", 5),
+            ("LaunchRecord", 7),
+            ("JobReservationRecord", 7),
+            ("JobRecord", 28),
+        ]
+    };
+}
+
+const UNNAMED: Layout = alpha_206!();
+/// Job rows whose sessions predate the linked login, or the display name too; those releases
+/// stored the rest of a job as alpha.206 did.
+pub(super) const LOGIN_JOBS: Layout = alpha_206!((SESSION_REF, 3));
+pub(super) const NAME_JOBS: Layout = alpha_206!((SESSION_REF, 2));
 
 /// Submission, request digest and job of an alpha.206 spec, launch or receipt, read with the
 /// `Tail` its keyspace stores after the envelope.
