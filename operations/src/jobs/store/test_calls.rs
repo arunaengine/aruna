@@ -635,6 +635,7 @@ pub async fn submit_execution_job(
         active_cap,
         serving: context.node_and_realm(),
         now_ms: aruna_core::time::unix_timestamp_millis(),
+        local_admission: None,
     };
     drive(SubmitExecutionOperation::new(submission), context).await
 }

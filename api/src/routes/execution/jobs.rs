@@ -862,6 +862,7 @@ pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
             ServerError::Conflict(error.to_string())
         }
         LocalExecutionError::Unsupported(_)
+        | LocalExecutionError::Refused(_)
         | LocalExecutionError::InputNotLocal { .. }
         | LocalExecutionError::InputRefused { .. } => {
             ServerError::BadRequestMessage(error.to_string())

@@ -31,8 +31,10 @@ use aruna_operations::jobs::lifecycle::ids::SubmissionScope;
 use aruna_operations::jobs::lifecycle::submit_external::{
     ExternalSubmission, SubmitExternalOperation,
 };
-use aruna_operations::jobs::local_run::{LocalExecutionConfig, LocalExecutionError};
-use aruna_operations::jobs::node_inputs::{ingress_node, local_run};
+use aruna_operations::jobs::local_run::{
+    LocalExecutionConfig, LocalExecutionError, LocalRunOperation,
+};
+use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::jobs::submit::SubmitJobError;
@@ -159,6 +161,7 @@ impl JobRequestError {
                 Self::Conflict(error.to_string())
             }
             LocalExecutionError::Unsupported(_)
+            | LocalExecutionError::Refused(_)
             | LocalExecutionError::InputNotLocal { .. }
             | LocalExecutionError::InputRefused { .. } => {
                 Self::BadRequestMessage(error.to_string())
@@ -361,7 +364,7 @@ async fn local_submit(
         retention_ms: state.rocrate_limits().artifact_retention_ms,
     };
     let result = drive(
-        local_run(config, &context.compute_limits(), context.node_and_realm()),
+        LocalRunOperation::new(config, context.node_and_realm()),
         context.as_ref(),
     )
     .await

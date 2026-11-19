@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::compute::offer::{BackendLimit, BackendLimits};
+use aruna_core::compute::offer::BackendLimits;
 use aruna_core::effects::LaunchFrame;
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::structs::execution::job::JobFamilyRecord;
@@ -16,7 +16,6 @@ use ulid::Ulid;
 use crate::jobs::lifecycle::launch_admit::LaunchNode;
 use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::lifecycle::witness::WitnessNode;
-use crate::jobs::local_run::{LocalExecutionConfig, LocalRunOperation};
 
 /// This node as the submission operations see it at `now_ms`; `None` without a network.
 pub fn ingress_node(
@@ -71,21 +70,4 @@ pub fn witness_node(
         fresh,
         limits,
     })
-}
-
-/// A run on this node: the limits of the backend it would select (the named one, else the first
-/// of the constrained kind, else the first one), and the realm it serves.
-pub fn local_run(
-    config: LocalExecutionConfig,
-    limits: &BackendLimits,
-    serving: Option<(NodeId, RealmId)>,
-) -> LocalRunOperation {
-    let constraint = config.spec.executor_constraint.as_deref();
-    let fits = |limit: &&BackendLimit| constraint.is_none_or(|kind| limit.kind == kind);
-    let selected = match config.spec.backend.as_deref() {
-        Some(name) => limits.get(name).filter(fits),
-        None => limits.values().find(fits),
-    };
-    let selected = selected.map(|limit| limit.limits);
-    LocalRunOperation::new(config, selected, serving)
 }

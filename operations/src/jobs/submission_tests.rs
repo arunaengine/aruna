@@ -67,6 +67,7 @@ fn submission(serving: Option<(NodeId, RealmId)>) -> ExecutionSubmission {
         active_cap: None,
         serving,
         now_ms: 1,
+        local_admission: None,
     }
 }
 
