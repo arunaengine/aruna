@@ -202,7 +202,7 @@ pub async fn export_node(realm_id: RealmId, metadata: bool) -> BaoNode {
     .unwrap();
     let path = tempdir.path().join("metadata");
     if metadata {
-        crate::metadata::install_indexes(&storage, &path);
+        storage.install_metadata_indexes(&path);
     }
     let graph_handle = metadata.then(|| {
         aruna_graph::GraphHandle::open(&path, net.node_id(), None, None, Default::default())

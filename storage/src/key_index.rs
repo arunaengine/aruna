@@ -107,6 +107,9 @@ struct OpenIndex {
     writer: Arc<Mutex<Option<IndexWriter>>>,
 }
 
+/// The directory below the metadata storage path that holds the range search indexes.
+pub const RANGE_INDEX_DIR: &str = "range-indexes";
+
 /// The range indexes of this node below one root directory:
 /// `{root}/{set id}/{range id}/{generation}`.
 pub struct RangeIndexes {

@@ -593,7 +593,7 @@ mod tests {
                 .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
         )
         .unwrap();
-        crate::metadata::install_indexes(&storage, dir.path().join("metadata"));
+        storage.install_metadata_indexes(dir.path().join("metadata"));
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,

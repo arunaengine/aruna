@@ -50,7 +50,7 @@ async fn spawn_probe_node(with_drains: bool) -> Result<ProbeNode, BoxError> {
         None,
         aruna_graph::GraphOptions::default(),
     )?;
-    aruna_operations::metadata::install_indexes(&storage, temp_dir.path().join("metadata"));
+    storage.install_metadata_indexes(temp_dir.path().join("metadata"));
     let task_handle = with_drains.then(TaskHandle::new);
     let context = Arc::new(DriverContext {
         storage_handle: storage,

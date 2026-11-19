@@ -112,7 +112,7 @@ async fn setup_fixture() -> Fixture {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    aruna_operations::metadata::install_indexes(&storage, root.path().join("metadata"));
+    storage.install_metadata_indexes(root.path().join("metadata"));
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),

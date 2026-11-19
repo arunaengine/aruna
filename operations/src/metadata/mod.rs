@@ -22,7 +22,6 @@ pub mod global_entries;
 pub(crate) mod graph_deleted;
 pub mod id_mapping;
 pub mod identifier_lookup;
-mod index_dir;
 pub mod iri_index;
 pub mod list_documents;
 pub(crate) mod live_records;
@@ -111,7 +110,6 @@ impl MetadataPhaseSource {
 }
 
 pub use builtin::builtin_shapes;
-pub use index_dir::{RANGE_INDEX_DIR, install_indexes};
 pub use message_kind::transport_message_kind;
 pub use protocol::{
     MetadataPathWinner, MetadataReadError, PersistentIdOutcome, PersistentIdRequest,

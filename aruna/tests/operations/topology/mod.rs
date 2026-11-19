@@ -1031,7 +1031,7 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
         Some(net.document_sync_database()),
         aruna_graph::GraphOptions::default(),
     )?;
-    aruna_operations::metadata::install_indexes(&storage, temp_dir.path().join("metadata"));
+    storage.install_metadata_indexes(temp_dir.path().join("metadata"));
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
@@ -1573,7 +1573,7 @@ pub async fn spawn_node_with(
         Some(net.document_sync_database()),
         aruna_graph::GraphOptions::default(),
     )?;
-    aruna_operations::metadata::install_indexes(&storage, dir.join("metadata"));
+    storage.install_metadata_indexes(dir.join("metadata"));
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
@@ -1950,7 +1950,7 @@ pub async fn spawn_replica_with(
     let task_handle = TaskHandle::new();
     let graph_handle = match metadata {
         true => {
-            aruna_operations::metadata::install_indexes(&storage, temp_dir.path().join("metadata"));
+            storage.install_metadata_indexes(temp_dir.path().join("metadata"));
             Some(aruna_graph::GraphHandle::open(
                 temp_dir.path().join("metadata"),
                 net.node_id(),

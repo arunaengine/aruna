@@ -1291,6 +1291,8 @@ pub enum MergeJob {
         partition: String,
         rows: Vec<SolutionRow>,
     },
+    /// The two side queries of the bounded join `query`, when it is one.
+    Plan { query: String },
     /// The rows of both sides of the bounded join `query` plans, joined.
     Join {
         query: String,
@@ -1304,6 +1306,8 @@ pub enum MergeJob {
 pub enum MergeOutput {
     Rows(MetadataQueryResults),
     Tied(usize),
+    /// The side queries of a bounded join, or `None` for every other query.
+    Sides(Option<[String; 2]>),
 }
 
 /// Why a merge produced nothing.

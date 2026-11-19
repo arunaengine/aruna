@@ -147,7 +147,7 @@ async fn policy_mints_nothing() {
             .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
     )
     .expect("metadata handle opens");
-    install_indexes(&storage, dir.path().join("metadata"));
+    storage.install_metadata_indexes(dir.path().join("metadata"));
     let handle = graph_context(storage, graph);
     let graph_iri = "urn:fixture:aruna:policy:restored";
     let policy = |public| MetadataGraphPolicy {

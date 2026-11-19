@@ -174,7 +174,7 @@ fn build_context(
             .with_search_storage(aruna_graph::MetadataSearchStorage::Disk)
             .with_sync_all(true),
     )?;
-    aruna_operations::metadata::install_indexes(&storage_handle, metadata_path);
+    storage_handle.install_metadata_indexes(metadata_path);
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(actor.node_id, RealmNodeKind::Server);

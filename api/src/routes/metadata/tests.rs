@@ -3230,7 +3230,7 @@ pub(crate) async fn setup_state() -> TestState {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     let task_handle = TaskHandle::new();
     let mut context = test_context(storage_handle);
     context.graph_handle = Some(graph_handle);
@@ -3317,7 +3317,7 @@ pub(crate) async fn setup_network_state() -> TestState {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     let task_handle = TaskHandle::new();
     let mut context = test_context(storage_handle);
     context.net_handle = Some(net.clone());

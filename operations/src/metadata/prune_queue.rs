@@ -837,7 +837,7 @@ mod tests {
             aruna_graph::GraphOptions::default(),
         )
         .expect("metadata handle opens");
-        crate::metadata::install_indexes(&storage, metadata_dir.path());
+        storage.install_metadata_indexes(metadata_dir.path());
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
@@ -905,7 +905,7 @@ mod tests {
             aruna_graph::GraphOptions::default(),
         )
         .expect("metadata handle opens");
-        crate::metadata::install_indexes(&storage, metadata_dir.path());
+        storage.install_metadata_indexes(metadata_dir.path());
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,

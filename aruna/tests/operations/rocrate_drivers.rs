@@ -1411,7 +1411,7 @@ async fn build_fixture(gated: bool) -> Result<Fixture, Box<dyn std::error::Error
         None,
         aruna_graph::GraphOptions::default(),
     )?;
-    aruna_operations::metadata::install_indexes(&storage, &metadata_path);
+    storage.install_metadata_indexes(&metadata_path);
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),

@@ -38,7 +38,7 @@ async fn user_node() -> (tempfile::TempDir, Arc<ServerState>, AuthContext) {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    aruna_operations::metadata::install_indexes(&storage, dir.path().join("metadata"));
+    storage.install_metadata_indexes(dir.path().join("metadata"));
     let state = Arc::new(
         ServerState::new(
             Arc::new(DriverContext {

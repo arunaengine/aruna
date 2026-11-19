@@ -1002,7 +1002,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         None,
         aruna_graph::GraphOptions::default(),
     )?;
-    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), RealmId([5u8; 32])),
@@ -1041,7 +1041,7 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
         None,
         aruna_graph::GraphOptions::default(),
     )?;
-    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),

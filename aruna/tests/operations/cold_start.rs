@@ -47,7 +47,7 @@ fn open_handle(
         None,
         GraphOptions::default().with_search_storage(MetadataSearchStorage::Memory),
     )?;
-    aruna_operations::metadata::install_indexes(&storage, metadata_dir);
+    storage.install_metadata_indexes(metadata_dir);
     Ok(DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,

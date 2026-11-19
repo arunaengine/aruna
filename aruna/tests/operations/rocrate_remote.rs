@@ -304,7 +304,7 @@ async fn build_node(
             None,
             Default::default(),
         )?;
-        aruna_operations::metadata::install_indexes(&storage, &metadata_path);
+        storage.install_metadata_indexes(&metadata_path);
         Some(graph)
     } else {
         None

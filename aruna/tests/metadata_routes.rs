@@ -832,7 +832,7 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    aruna_operations::metadata::install_indexes(&storage_handle, node_dir.path().join("metadata"));
+    storage_handle.install_metadata_indexes(node_dir.path().join("metadata"));
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: Some(net.clone()),

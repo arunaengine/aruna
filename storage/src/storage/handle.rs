@@ -178,6 +178,13 @@ impl StorageHandle {
         self.range_indexes.get_or_init(|| Arc::new(indexes)).clone()
     }
 
+    /// Installs the range indexes below the metadata storage `path`; only a metadata node keeps
+    /// them.
+    pub fn install_metadata_indexes(&self, path: impl AsRef<std::path::Path>) {
+        let root = path.as_ref().join(crate::key_index::RANGE_INDEX_DIR);
+        self.install_range_indexes(RangeIndexes::new(root));
+    }
+
     /// The range key indexes; `None` on a node that keeps none.
     pub fn range_indexes(&self) -> Option<Arc<RangeIndexes>> {
         self.range_indexes.get().cloned()

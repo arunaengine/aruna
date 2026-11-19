@@ -147,10 +147,7 @@ async fn rejoin_peer(
             return Err(error.into());
         }
     };
-    aruna_operations::metadata::install_indexes(
-        &context_storage,
-        directory.path().join("metadata"),
-    );
+    context_storage.install_metadata_indexes(directory.path().join("metadata"));
     let context = Arc::new(DriverContext {
         storage_handle: context_storage,
         net_handle: Some(peer.clone()),

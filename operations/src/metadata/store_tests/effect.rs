@@ -21,7 +21,7 @@ pub(super) fn memory_handle(storage: StorageHandle) -> (TempDir, DriverContext) 
             .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
     )
     .expect("metadata handle opens");
-    install_indexes(&storage, metadata_dir.path());
+    storage.install_metadata_indexes(metadata_dir.path());
     (metadata_dir, graph_context(storage, graph_handle))
 }
 

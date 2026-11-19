@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use aruna_core::audit::{
@@ -23,7 +22,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataAuditRecord;
 use aruna_core::types::{GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
 use tracing::trace;
 use ulid::Ulid;
 
@@ -37,17 +35,11 @@ pub const AUDIT_PAGE_SIZE: usize = 50;
 const AUDIT_CURSOR_VERSION: u8 = 1;
 const AUDIT_CURSOR_BYTES: usize = 256;
 const AUDIT_CURSOR_CHARS: usize = 384;
-const AUDIT_INBOUND_LIMIT: usize = 16;
-const AUDIT_OUTBOUND_LIMIT: usize = 16;
 pub const AUDIT_DEADLINE_SECS: u64 = 30;
 const AUDIT_FANOUT_CONCURRENCY: usize = 8;
 const AUDIT_PEER_DEADLINE: Duration = Duration::from_secs(3);
 /// The longest the peers of a fan-out are waited for when the caller gives no wait.
 const AUDIT_FANOUT_DEADLINE: Duration = Duration::from_secs(30);
-pub(super) static AUDIT_INBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_INBOUND_LIMIT)));
-pub(super) static AUDIT_OUTBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_OUTBOUND_LIMIT)));
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListAuditRequest {
@@ -581,16 +573,15 @@ impl Operation for ListAuditOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIT_CURSOR_CHARS, AUDIT_DEADLINE_SECS, AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT,
-        AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AUDIT_PAGE_LIMIT, AuditAggregate,
-        AuditPageEntry, AuditPageResponse, Effect, Event, GroupEvent, GroupForm, GroupResult,
-        IoCall, IoResult, Key, ListAuditError, ListAuditOperation, LocalPageOperation,
-        MAX_AUDIT_PEERS, METADATA_AUDIT_KEYSPACE, MetadataTransportMessage, NetEffect, Next,
-        Operation, StorageEvent, Value, audit_scope, decode_cursor, encode_cursor, encode_message,
+        AUDIT_CURSOR_CHARS, AUDIT_DEADLINE_SECS, AUDIT_PAGE_LIMIT, AuditAggregate, AuditPageEntry,
+        AuditPageResponse, Effect, Event, GroupEvent, GroupForm, GroupResult, IoCall, IoResult,
+        Key, ListAuditError, ListAuditOperation, LocalPageOperation, MAX_AUDIT_PEERS,
+        METADATA_AUDIT_KEYSPACE, MetadataTransportMessage, NetEffect, Next, Operation,
+        StorageEvent, Value, audit_scope, decode_cursor, encode_cursor, encode_message,
         select_peers,
     };
     use crate::driver::DriverContext;
-    use crate::metadata::audit_entry::{admin_refusal, audit_member, outbound_admission};
+    use crate::metadata::audit_entry::{admin_refusal, audit_member};
     use crate::metadata::protocol::MetadataReadError;
     use crate::metadata::repository::{audit_entry, metadata_audit_key};
     use aruna_core::UserId;
@@ -986,46 +977,6 @@ mod tests {
         assert!(result.partial);
         assert!(result.next_cursor.is_none());
         assert_eq!(result.missing_nodes, vec![node]);
-    }
-
-    #[test]
-    fn outbound_saturates() {
-        let permits: Vec<_> = (0..AUDIT_OUTBOUND_LIMIT)
-            .map(|_| {
-                AUDIT_OUTBOUND_ADMISSION
-                    .clone()
-                    .try_acquire_owned()
-                    .unwrap()
-            })
-            .collect();
-        assert!(outbound_admission().is_none());
-        drop(permits);
-        assert!(outbound_admission().is_some());
-    }
-
-    #[test]
-    fn admissions_independent() {
-        let outbound: Vec<_> = (0..AUDIT_OUTBOUND_LIMIT)
-            .map(|_| {
-                AUDIT_OUTBOUND_ADMISSION
-                    .clone()
-                    .try_acquire_owned()
-                    .unwrap()
-            })
-            .collect();
-        assert!(AUDIT_INBOUND_ADMISSION.clone().try_acquire_owned().is_ok());
-        let inbound: Vec<_> = (0..AUDIT_INBOUND_LIMIT)
-            .map(|_| AUDIT_INBOUND_ADMISSION.clone().try_acquire_owned().unwrap())
-            .collect();
-        assert!(
-            AUDIT_OUTBOUND_ADMISSION
-                .clone()
-                .try_acquire_owned()
-                .is_err()
-        );
-        assert!(AUDIT_INBOUND_ADMISSION.clone().try_acquire_owned().is_err());
-        drop(inbound);
-        drop(outbound);
     }
 
     #[test]

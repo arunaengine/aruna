@@ -415,7 +415,7 @@ async fn usage_counts_documents() {
         aruna_graph::GraphOptions::default(),
     )
     .unwrap();
-    aruna_operations::metadata::install_indexes(&storage_handle, metadata_dir.path());
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     let realm_signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
     let driver_ctx = Arc::new(DriverContext {

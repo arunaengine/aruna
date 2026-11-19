@@ -35,7 +35,6 @@ use aruna_operations::jobs::protocol::{JobAnswer, JobRequestOperation};
 use aruna_operations::jobs::records::pages::ServePageOperation;
 use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use aruna_operations::metadata::after_sync::AfterSyncOperation;
-use aruna_operations::metadata::audit_entry::inbound_admission;
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
 use aruna_operations::metadata::protocol::{
     INBOUND_FRAME_BYTES, MetadataReadError, MetadataTransportMessage,
@@ -67,6 +66,8 @@ use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, war
 use ulid::Ulid;
 
 const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Peer audit pages this node serves at once.
+const AUDIT_INBOUND_LIMIT: usize = 16;
 const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const MAINTENANCE_JITTER_SECS: u64 = 15;
 
@@ -77,6 +78,8 @@ struct OperationsInboundHandler {
     rocrate_limits: RoCrateLimits,
     /// The payload bytes of the metadata requests in flight on this node.
     frame_budget: Arc<Semaphore>,
+    /// The peer audit pages this node serves at once; one more answers unavailable.
+    audit_slots: Arc<Semaphore>,
     jobs_runtime: Arc<JobsRuntime>,
 }
 
@@ -112,6 +115,7 @@ impl OperationsInboundHandler {
             document_sync_reconcile,
             rocrate_limits,
             frame_budget: Arc::new(Semaphore::new(INBOUND_FRAME_BYTES)),
+            audit_slots: Arc::new(Semaphore::new(AUDIT_INBOUND_LIMIT)),
             jobs_runtime,
         }
     }
@@ -150,7 +154,7 @@ impl OperationsInboundHandler {
         }
         let served = serve_metadata_stream(
             &self.context,
-            &self.frame_budget,
+            (&self.frame_budget, &self.audit_slots),
             stream,
             node_id,
             self.rocrate_limits.metadata_bytes,
@@ -164,7 +168,7 @@ impl OperationsInboundHandler {
 #[tracing::instrument(
     name = "metadata.remote.inbound",
     level = "debug",
-    skip(context, budget, stream),
+    skip(context, limits, stream),
     fields(
         peer = ?peer,
         request = field::Empty,
@@ -178,7 +182,7 @@ impl OperationsInboundHandler {
 )]
 async fn serve_metadata_stream(
     context: &Arc<DriverContext>,
-    budget: &Arc<Semaphore>,
+    (budget, audit_slots): (&Arc<Semaphore>, &Arc<Semaphore>),
     mut stream: BiStream,
     peer: NodeId,
     metadata_bytes: u64,
@@ -192,7 +196,7 @@ async fn serve_metadata_stream(
     let process_started = Instant::now();
     let audit = request.audit;
     // An audit page is served only within the inbound audit slots.
-    let admission = audit.map(|_| inbound_admission());
+    let admission = audit.map(|_| audit_slots.clone().try_acquire_owned().ok());
     let (response, response_body) = match admission {
         Some(None) => {
             let result = Err(MetadataReadError::Unavailable);
@@ -1285,7 +1289,7 @@ mod tests {
                 aruna_graph::GraphOptions::default(),
             )
             .unwrap();
-            aruna_operations::metadata::install_indexes(&storage, dir.path().join("metadata"));
+            storage.install_metadata_indexes(dir.path().join("metadata"));
             let context = Arc::new(DriverContext {
                 storage_handle: storage,
                 net_handle: Some(net.clone()),
