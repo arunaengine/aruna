@@ -305,9 +305,7 @@ mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
     use aruna_core::UserId;
-    use aruna_core::document::DocumentTarget;
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
     use aruna_drivers::driver::{DriverContext, drive};
     use ulid::Ulid;
@@ -325,22 +323,7 @@ mod tests {
     }
 
     async fn seed(ctx: &DriverContext, actor: &Actor, document: &RealmConfigDocument) {
-        let target = DocumentTarget::RealmConfig {
-            realm_id: actor.realm_id,
-        };
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: target.storage_keyspace().to_string(),
-                key: target.storage_key(),
-                value: document.to_bytes(actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::tests::realm::seed_config(ctx, actor, document).await;
     }
 
     fn realm_with_device(realm_id: RealmId, actor: &Actor, owner: UserId) -> RealmConfigDocument {

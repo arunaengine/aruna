@@ -134,7 +134,7 @@ pub async fn write_version(context: &DriverContext, bucket: &str, key: &str, ver
 }
 
 /// A plain bucket of `group_id` made by `created_by`, without routing, policies or compression.
-pub(crate) fn bucket_info(
+pub fn bucket_info(
     group_id: Ulid,
     created_by: aruna_core::UserId,
 ) -> aruna_core::structs::storage::blob::BucketInfo {
@@ -152,7 +152,7 @@ pub(crate) fn bucket_info(
 }
 
 /// The blob cleanup works that the write calls among `calls` store.
-pub(crate) fn cleanup_works(
+pub fn cleanup_works(
     calls: &[aruna_core::calls::IoCall],
 ) -> Vec<aruna_core::structs::storage::blob::BlobCleanupWork> {
     let rows = calls.iter().filter_map(|call| match call {

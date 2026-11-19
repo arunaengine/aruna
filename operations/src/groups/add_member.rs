@@ -552,17 +552,12 @@ pub mod test {
     };
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::{
         AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
     };
     use aruna_core::storage_entries::reducer_conflict_key;
-    use aruna_core::structs::execution::notification::{
-        NotificationOutboxRecord, NotificationRecord,
-    };
+    use aruna_core::structs::execution::notification::NotificationRecord;
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -606,19 +601,12 @@ pub mod test {
         add_seed: u8,
         remove_seed: u8,
     ) -> AdminConflict {
-        AdminConflict {
-            path: assignment_path(role_id, user_id),
-            values: vec![
-                AdminConflictValue {
-                    value: Some(user_id.to_string()),
-                    dot: dot(add_seed),
-                },
-                AdminConflictValue {
-                    value: None,
-                    dot: dot(remove_seed),
-                },
-            ],
-        }
+        crate::tests::groups::assignment_conflict(
+            assignment_path(role_id, user_id),
+            user_id,
+            add_seed,
+            remove_seed,
+        )
     }
 
     fn assignment_conflict_state(
@@ -1158,36 +1146,7 @@ pub mod test {
     }
 
     async fn setup_group(context: &DriverContext) -> (Actor, Group, GroupAuthorizationDocument) {
-        let realm_id = RealmId([0u8; 32]);
-        let actor = Actor {
-            node_id: node(1),
-            user_id: UserId::local(Ulid::generate(), realm_id),
-            realm_id,
-        };
-        drive(
-            CreateRealmOperation::new(CreateRealmConfig {
-                actor: actor.clone(),
-                realm_description: "Test realm".to_string(),
-                oidc_providers: Vec::new(),
-                node_location: None,
-                node_weight: None,
-                node_labels: Default::default(),
-            }),
-            context,
-        )
-        .await
-        .unwrap();
-        let (group, auth_doc) = drive(
-            CreateGroupOperation::new(CreateGroupConfig {
-                actor: actor.clone(),
-                display_name: "Test group".to_string(),
-                owner_cap: None,
-            }),
-            context,
-        )
-        .await
-        .unwrap();
-        (actor, group, auth_doc)
+        crate::tests::groups::setup_group(context).await
     }
 
     fn named_role_ids(auth_doc: &GroupAuthorizationDocument, name: &str) -> HashSet<RoleId> {
@@ -1199,27 +1158,7 @@ pub mod test {
     }
 
     async fn read_notification_outbox(context: &DriverContext) -> Vec<NotificationRecord> {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
-                prefix: None,
-                start: None,
-                limit: 1024,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult { values, .. }) => values
-                .into_iter()
-                .map(|(_, value)| {
-                    postcard::from_bytes::<NotificationOutboxRecord>(&value)
-                        .unwrap()
-                        .record
-                })
-                .collect(),
-            other => panic!("unexpected storage event: {other:?}"),
-        }
+        crate::tests::groups::read_notification_outbox(context).await
     }
 
     fn seeded_user_role(group_id: Ulid, role_id: Ulid) -> GroupAuthorizationDocument {

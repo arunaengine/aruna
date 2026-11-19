@@ -675,7 +675,7 @@ pub fn test_spec() -> aruna_core::structs::execution::job::StagingJobSpec {
 }
 
 /// Source metadata of `length` bytes with an optional `etag` and nothing else.
-pub(crate) fn sized_source(
+pub fn sized_source(
     length: u64,
     etag: Option<String>,
 ) -> aruna_core::structs::execution::source_access::SourceMetadata {

@@ -460,76 +460,22 @@ pub mod test {
     use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_storage::storage;
-    use aruna_tasks::TaskHandle;
-    use tempfile::{TempDir, tempdir};
+    use aruna_net::NetHandle;
+    use tempfile::TempDir;
     use ulid::Ulid;
 
     use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
-    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::remove_role::{
         RemoveGroupConfig, RemoveGroupError, RemoveGroupOperation, RoleRemoval,
     };
-    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_drivers::driver::{DriverContext, drive};
 
     async fn test_context() -> (DriverContext, NetHandle, TempDir) {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
-        let net_handle = NetHandle::new(
-            NetConfig {
-                bind_addr: "127.0.0.1:0".parse().unwrap(),
-                discovery_method: DiscoveryMethod::None,
-                relay_method: RelayMethod::None,
-                ..NetConfig::default()
-            },
-            storage_handle.clone(),
-        )
-        .await
-        .unwrap();
-        let task_handle = TaskHandle::new();
-
-        let context = DriverContext {
-            storage_handle,
-            net_handle: Some(net_handle.clone()),
-            graph_handle: None,
-            task_handle: Some(task_handle),
-            compute_handle: None,
-            outbound_handle: None,
-            blob_handle: None,
-        };
-        (context, net_handle, random_path)
+        crate::tests::groups::net_context().await
     }
 
     async fn setup_group(context: &DriverContext) -> (Actor, Group, GroupAuthorizationDocument) {
-        let realm_id = RealmId([0u8; 32]);
-        let user_id = UserId::local(Ulid::generate(), realm_id);
-        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let actor = Actor {
-            node_id,
-            user_id,
-            realm_id,
-        };
-
-        let realm_operation = CreateRealmOperation::new(CreateRealmConfig {
-            actor: actor.clone(),
-            realm_description: "Test realm".to_string(),
-            oidc_providers: Vec::new(),
-            node_location: None,
-            node_weight: None,
-            node_labels: Default::default(),
-        });
-        drive(realm_operation, context).await.unwrap();
-
-        let group_operation = CreateGroupOperation::new(CreateGroupConfig {
-            actor: actor.clone(),
-            display_name: "Test group".to_string(),
-            owner_cap: None,
-        });
-        let (group, auth_doc) = drive(group_operation, context).await.unwrap();
-        (actor, group, auth_doc)
+        crate::tests::groups::setup_group(context).await
     }
 
     fn auth_context(actor: &Actor) -> AuthContext {
