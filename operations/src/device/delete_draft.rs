@@ -94,7 +94,6 @@ mod tests {
     use crate::device::publish_queue::{PublishEntry, PublishState, publish_entry};
     use crate::tests::device::context;
     use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_drivers::driver::{DriverContext, drive};
     use ulid::Ulid;
@@ -113,15 +112,7 @@ mod tests {
 
     async fn store(context: &DriverContext, entry: &PublishEntry) {
         let (key_space, key, value) = publish_entry(entry).unwrap();
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            })
-            .await;
+        crate::testing::write_value(&context.storage_handle, &key_space, key, value).await;
     }
 
     // The entry and its fence row are deleted in the transaction; a draft in flight stays.

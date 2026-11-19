@@ -343,13 +343,7 @@ pub(super) fn group_results(result: IoResult) -> Result<Vec<GroupResult>, GitErr
 
 /// The outcome of one [`child_member`]; `None` when it did not finish.
 pub(super) fn member_outcome<T: 'static, E: 'static>(member: GroupResult) -> Option<Result<T, E>> {
-    let GroupResult::Done(event) = member else {
-        return None;
-    };
-    match *event {
-        Event::Child(outcome) => outcome.take(),
-        _ => None,
-    }
+    member.child_outcome()
 }
 
 /// One store effect whose event `read` turns into the output.

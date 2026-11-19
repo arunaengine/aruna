@@ -132,3 +132,37 @@ pub async fn write_version(context: &DriverContext, bucket: &str, key: &str, ver
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await;
 }
+
+/// A plain bucket of `group_id` made by `created_by`, without routing, policies or compression.
+pub fn bucket_info(
+    group_id: Ulid,
+    created_by: aruna_core::UserId,
+) -> aruna_core::structs::storage::blob::BucketInfo {
+    aruna_core::structs::storage::blob::BucketInfo {
+        group_id,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: aruna_core::structs::storage::format::Compression::Off,
+        distribution: None,
+    }
+}
+
+/// The blob cleanup works that the write calls among `calls` store.
+pub fn cleanup_works(
+    calls: &[aruna_core::calls::IoCall],
+) -> Vec<aruna_core::structs::storage::blob::BlobCleanupWork> {
+    let rows = calls.iter().filter_map(|call| match call {
+        aruna_core::calls::IoCall::Write(rows) => Some(rows),
+        _ => None,
+    });
+    rows.flatten()
+        .map(|(space, _, value)| {
+            assert_eq!(space, aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE);
+            aruna_core::structs::storage::blob::BlobCleanupWork::from_bytes(value.as_ref()).unwrap()
+        })
+        .collect()
+}

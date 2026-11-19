@@ -8,16 +8,14 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::keyspaces::{
-    DOCUMENT_STATE_KEYSPACE, EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    PENDING_PROJECTION_KEYSPACE,
+    EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, overlay_placement};
 use aruna_core::rows::{PrefixPages, done, values};
 use aruna_core::storage_entries::{
-    conflict_write_entries, pending_projection_target, reducer_state_entry, reducer_state_key,
-    stale_conflict_deletes,
+    conflict_write_entries, pending_projection_target, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -1195,18 +1193,8 @@ impl Operation for PlacementWrite {
     }
 
     fn first(&mut self) -> PlacementTurn {
-        let document = self.document_ref();
-        let target = self.admin_target();
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                document.storage_keyspace().to_string(),
-                document.storage_key(),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        let reads = crate::realm::document_reads(self.document_ref(), &self.admin_target());
+        Ok(Next::Call(reads))
     }
 
     fn next(&mut self, result: IoResult) -> PlacementTurn {

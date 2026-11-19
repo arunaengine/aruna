@@ -309,12 +309,7 @@ mod tests {
     }
 
     fn read(values: Vec<Option<Vec<u8>>>) -> IoResult {
-        IoResult::Values(
-            values
-                .into_iter()
-                .map(|value| value.map(Into::into))
-                .collect(),
-        )
+        crate::tests::calls::values_of(values)
     }
 
     fn page(rows: Vec<(Key, Value)>) -> IoResult {

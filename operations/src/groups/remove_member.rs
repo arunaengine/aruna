@@ -11,12 +11,12 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
-use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::done;
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
@@ -398,23 +398,8 @@ impl Operation for MemberRemoval {
     }
 
     fn first(&mut self) -> Result<Next<GroupAuthorizationDocument>, RemoveFromError> {
-        let target = AdminDocumentTarget::Group {
-            group_id: self.input.group_id,
-        };
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                AUTH_KEYSPACE.to_string(),
-                ByteView::from(self.input.group_id.to_bytes()),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-            (
-                REALM_CONFIG_KEYSPACE.to_string(),
-                ByteView::from(*self.input.actor.realm_id.as_bytes()),
-            ),
-        ])))
+        let reads = crate::groups::member_reads(self.input.group_id, self.input.actor.realm_id);
+        Ok(Next::Call(reads))
     }
 
     fn next(
@@ -544,89 +529,31 @@ pub mod test {
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::operation::{Operation, TransactionMode};
-    use aruna_core::structs::execution::notification::{
-        NotificationOutboxRecord, NotificationRecord,
-    };
+    use aruna_core::structs::execution::notification::NotificationRecord;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::RoleId;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_storage::storage;
-    use aruna_tasks::TaskHandle;
-    use tempfile::{TempDir, tempdir};
+    use aruna_net::NetHandle;
+    use tempfile::TempDir;
     use ulid::Ulid;
 
     use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
-    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::remove_member::{
         MemberRemoval, RemoveFromError, RemoveFromInput, RemoveFromOperation,
     };
-    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_drivers::driver::{DriverContext, drive};
 
     async fn test_context() -> (DriverContext, NetHandle, TempDir) {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
-        let net_handle = NetHandle::new(
-            NetConfig {
-                bind_addr: "127.0.0.1:0".parse().unwrap(),
-                discovery_method: DiscoveryMethod::None,
-                relay_method: RelayMethod::None,
-                ..NetConfig::default()
-            },
-            storage_handle.clone(),
-        )
-        .await
-        .unwrap();
-        let task_handle = TaskHandle::new();
-
-        let context = DriverContext {
-            storage_handle,
-            net_handle: Some(net_handle.clone()),
-            graph_handle: None,
-            task_handle: Some(task_handle),
-            compute_handle: None,
-            outbound_handle: None,
-            blob_handle: None,
-        };
-        (context, net_handle, random_path)
+        crate::tests::groups::net_context().await
     }
 
     async fn setup_group(context: &DriverContext) -> (Actor, Group, GroupAuthorizationDocument) {
-        let realm_id = RealmId([0u8; 32]);
-        let user_id = UserId::local(Ulid::generate(), realm_id);
-        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let actor = Actor {
-            node_id,
-            user_id,
-            realm_id,
-        };
-
-        let realm_operation = CreateRealmOperation::new(CreateRealmConfig {
-            actor: actor.clone(),
-            realm_description: "Test realm".to_string(),
-            oidc_providers: Vec::new(),
-            node_location: None,
-            node_weight: None,
-            node_labels: Default::default(),
-        });
-        drive(realm_operation, context).await.unwrap();
-
-        let group_operation = CreateGroupOperation::new(CreateGroupConfig {
-            actor: actor.clone(),
-            display_name: "Test group".to_string(),
-            owner_cap: None,
-        });
-        let (group, auth_doc) = drive(group_operation, context).await.unwrap();
-        (actor, group, auth_doc)
+        crate::tests::groups::setup_group(context).await
     }
 
     fn named_role_ids(auth_doc: &GroupAuthorizationDocument, name: &str) -> HashSet<RoleId> {
@@ -887,27 +814,7 @@ pub mod test {
     }
 
     async fn read_notification_outbox(context: &DriverContext) -> Vec<NotificationRecord> {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
-                prefix: None,
-                start: None,
-                limit: 1024,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult { values, .. }) => values
-                .into_iter()
-                .map(|(_, value)| {
-                    postcard::from_bytes::<NotificationOutboxRecord>(&value)
-                        .unwrap()
-                        .record
-                })
-                .collect(),
-            other => panic!("unexpected storage event: {other:?}"),
-        }
+        crate::tests::groups::read_notification_outbox(context).await
     }
 
     #[tokio::test]

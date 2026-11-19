@@ -650,7 +650,7 @@ mod tests {
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::job::{InputMode, InputSource};
     use aruna_core::structs::storage::blob::BackendRef;
-    use aruna_core::structs::storage::format::{Compression, StoredFormat};
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::MultipartChecksumType;
 
     const GROUP: Ulid = Ulid::from_parts(2, 2);
@@ -703,17 +703,7 @@ mod tests {
     }
 
     fn info() -> BucketInfo {
-        BucketInfo {
-            group_id: GROUP,
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: user(),
-            cors_configuration: None,
-            storage_routing: Vec::new(),
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-            compression: Compression::Off,
-            distribution: None,
-        }
+        crate::tests::s3::bucket_info(GROUP, user())
     }
 
     fn child<T, E>(result: Result<T, E>) -> IoResult

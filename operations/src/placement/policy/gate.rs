@@ -460,18 +460,7 @@ mod pure_tests {
     }
 
     fn policy(seed: u8, location: &str) -> VerifiedPolicy {
-        let policy = PlacementPolicy::new(
-            Ulid::from_bytes([seed; 16]),
-            "residency".to_string(),
-            vec![PlacementSelector {
-                node_id: None,
-                location: Some(location.to_string()),
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
-        )
-        .expect("policy is valid");
-        VerifiedPolicy::verify(policy).expect("policy verifies")
+        crate::tests::policy::residency(seed, location)
     }
 
     /// The same rule under one group's ownership.

@@ -338,7 +338,6 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::key_audit::AuditOutcome;
     use aruna_core::structs::storage::transition::{TransitionKind, TransitionTarget};
-    use std::time::SystemTime;
 
     const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
 
@@ -347,17 +346,7 @@ mod tests {
     }
 
     fn info() -> BucketInfo {
-        BucketInfo {
-            group_id: Ulid::from_bytes([3; 16]),
-            created_at: SystemTime::UNIX_EPOCH,
-            created_by: user(1),
-            cors_configuration: None,
-            storage_routing: Vec::new(),
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-            compression: Compression::Off,
-            distribution: None,
-        }
+        crate::tests::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
     }
 
     fn operation() -> KeyStatusOperation {
@@ -379,12 +368,7 @@ mod tests {
     }
 
     fn batch(values: Vec<Option<Vec<u8>>>) -> IoResult {
-        IoResult::Values(
-            values
-                .into_iter()
-                .map(|value| value.map(Value::from))
-                .collect(),
-        )
+        crate::tests::calls::values_of(values)
     }
 
     fn authority(rows: Vec<(Key, Option<Value>)>) -> IoResult {

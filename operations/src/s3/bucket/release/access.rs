@@ -177,24 +177,13 @@ mod tests {
     use aruna_core::structs::identity::auth::Permission;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
-    use aruna_core::structs::storage::format::Compression;
     use aruna_core::types::{Key, Value};
     use ulid::Ulid;
 
     const GROUP: Ulid = Ulid::from_parts(2, 2);
 
     fn info() -> BucketInfo {
-        BucketInfo {
-            group_id: GROUP,
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: user(),
-            cors_configuration: None,
-            storage_routing: Vec::new(),
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-            compression: Compression::Off,
-            distribution: None,
-        }
+        crate::tests::s3::bucket_info(GROUP, user())
     }
 
     fn auth() -> AuthContext {

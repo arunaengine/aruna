@@ -487,19 +487,7 @@ mod tests {
     }
 
     async fn write(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                value: value.into(),
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
+        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     async fn read(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {

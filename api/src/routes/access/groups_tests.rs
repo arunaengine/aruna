@@ -125,12 +125,7 @@ async fn store_user(state: &ServerState, user_id: UserId, name: &str) {
 }
 
 fn member_auth(user_id: UserId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id: user_id.realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, user_id.realm_id)
 }
 
 async fn setup_state() -> (Arc<ServerState>, TempDir) {

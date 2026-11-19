@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+#[path = "tests_distribution.rs"]
+pub(crate) mod distribution;
 #[path = "tests_effects.rs"]
 pub(crate) mod effects;
 #[path = "tests_reducer.rs"]

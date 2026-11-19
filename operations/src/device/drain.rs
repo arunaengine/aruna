@@ -617,7 +617,6 @@ mod tests {
     use crate::tests::device::{context, read_value};
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_drivers::driver::{DriverContext, drive};
     use std::sync::Arc;
@@ -636,15 +635,7 @@ mod tests {
 
     async fn store(context: &Arc<DriverContext>, entry: &PublishEntry) {
         let (key_space, key, value) = publish_entry(entry).unwrap();
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            })
-            .await;
+        crate::testing::write_value(&context.storage_handle, &key_space, key, value).await;
     }
 
     async fn claim_state(

@@ -626,3 +626,32 @@ pub async fn settle_attempt<T>(
         other => Some(other),
     }
 }
+
+/// Submits an execution job served by this context's node, at the current time.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_execution_job(
+    context: &DriverContext,
+    spec: aruna_core::structs::execution::job::ExecutionSpec,
+    created_by: aruna_core::UserId,
+    owner_node_id: aruna_core::id::NodeId,
+    idempotency_key: Option<String>,
+    workspace_mode: aruna_core::structs::execution::job::WorkspaceMode,
+    workspace_bucket: Option<String>,
+    retention_ms: u64,
+    active_cap: Option<u32>,
+) -> Result<crate::jobs::submit::SubmitJobResult, crate::jobs::submit::SubmitJobError> {
+    use crate::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
+    let submission = ExecutionSubmission {
+        spec,
+        created_by,
+        owner_node_id,
+        idempotency_key,
+        workspace_mode,
+        workspace_bucket,
+        retention_ms,
+        active_cap,
+        serving: context.node_and_realm(),
+        now_ms: aruna_core::time::unix_timestamp_millis(),
+    };
+    drive(SubmitExecutionOperation::new(submission), context).await
+}

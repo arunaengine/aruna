@@ -189,22 +189,11 @@ mod pure_tests {
     }
 
     fn auth_context(realm_id: RealmId, user_id: UserId) -> AuthContext {
-        AuthContext {
-            user_id,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(user_id, realm_id)
     }
 
     fn user(realm_id: RealmId, seed: u8, name: &str) -> User {
-        User {
-            user_id: UserId::local(Ulid::from_bytes([seed; 16]), realm_id),
-            name: name.to_string(),
-            subject_ids: Vec::new(),
-            alias_user_ids: Default::default(),
-            attributes: Default::default(),
-        }
+        crate::tests::realm::named_user(realm_id, seed, name)
     }
 
     fn input(realm_id: RealmId, limit: usize, start_after: Option<String>) -> ListUsersInput {

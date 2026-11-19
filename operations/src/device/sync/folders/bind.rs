@@ -33,12 +33,7 @@ use super::{BindFolderInput, FolderChange, FolderError, RealmBucketInput, Update
 type RemoteError = ReconcileFolderError;
 
 fn owner_auth(user_id: aruna_core::UserId, realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, realm_id)
 }
 
 fn remote_call(node: NodeId, message: &MetadataTransportMessage) -> Result<IoCall, RemoteError> {

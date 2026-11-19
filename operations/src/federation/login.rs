@@ -172,16 +172,7 @@ pub enum FederatedLoginError {
     UnexpectedEvent,
 }
 
-impl From<IoError> for FederatedLoginError {
-    fn from(error: IoError) -> Self {
-        match error {
-            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
-            IoError::Storage(error) => Self::Storage(error),
-            IoError::Unexpected { .. } | IoError::Codec(_) => Self::UnexpectedEvent,
-            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
-        }
-    }
-}
+super::io_failure!(FederatedLoginError);
 
 #[derive(Debug, PartialEq)]
 enum LoginPhase {

@@ -26,6 +26,28 @@ use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use byteview::ByteView;
 
+/// Reads the group authorization, its admin reducer state and the realm config.
+pub(crate) fn member_reads(
+    group_id: aruna_core::types::GroupId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
+) -> aruna_core::calls::IoCall {
+    let target = aruna_core::admin_documents::AdminDocumentTarget::Group { group_id };
+    aruna_core::calls::IoCall::Read(vec![
+        (
+            aruna_core::keyspaces::AUTH_KEYSPACE.to_string(),
+            ByteView::from(group_id.to_bytes()),
+        ),
+        (
+            aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE.to_string(),
+            aruna_core::storage_entries::reducer_state_key(&target),
+        ),
+        (
+            aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+            ByteView::from(*realm_id.as_bytes()),
+        ),
+    ])
+}
+
 /// Presence refreshes, node-info heartbeats, placement timers and synced realm config write while
 /// a group change is in flight; a caller must not see their SSI conflict as a failure.
 pub(crate) const CONFLICT_RETRIES: u8 = 5;

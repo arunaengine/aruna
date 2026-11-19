@@ -810,7 +810,6 @@ mod pure_tests {
     mod tokens {
         use super::*;
         use aruna_core::structs::storage::encryption::EncryptionMode;
-        use aruna_core::structs::storage::format::Compression;
 
         const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
 
@@ -819,17 +818,7 @@ mod pure_tests {
         }
 
         fn info() -> BucketInfo {
-            BucketInfo {
-                group_id: Ulid::from_bytes([3; 16]),
-                created_at: SystemTime::UNIX_EPOCH,
-                created_by: user(1),
-                cors_configuration: None,
-                storage_routing: Vec::new(),
-                placement_policies: Vec::new(),
-                placement_policy_generation: 0,
-                compression: Compression::Off,
-                distribution: None,
-            }
+            crate::tests::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
         }
 
         fn sealed() -> BucketEncryption {

@@ -1066,20 +1066,5 @@ fn test_signing_key() -> SigningKey {
 }
 
 fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenClaims {
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
-    TokenClaims {
-        sub: user_id.to_string(),
-        iss: realm_id.to_string(),
-        iat: now,
-        exp: now + 600,
-        jti: Ulid::generate().to_string(),
-        sid: None,
-        session_kind: None,
-        restrictions: None,
-        issuer_pubkey: None,
-        delegation_signature: None,
-        name: None,
-        via: None,
-        auth_time: None,
-    }
+    aruna_operations::testing::token_claims(realm_id, user_id)
 }

@@ -386,10 +386,8 @@ impl Operation for ServeSecretOperation {
         let config = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         };
-        Ok(Next::Call(IoCall::Read(vec![(
-            config.storage_keyspace().to_string(),
-            config.storage_key(),
-        )])))
+        let (space, key) = (config.storage_keyspace(), config.storage_key());
+        Ok(Next::Call(aruna_core::rows::read_row(space, key)))
     }
 
     fn next(&mut self, result: IoResult) -> ServeTurn {

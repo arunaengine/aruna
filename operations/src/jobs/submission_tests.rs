@@ -13,7 +13,6 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::tempdir;
@@ -24,40 +23,13 @@ use super::job_cancel::CancelJobOutcome;
 use super::job_reads::tests::{cancel_owned_job, read_owned_job, read_owned_report};
 use super::job_reports::{JobReportLookup, ReportQuery};
 use super::store::row_calls::preserve_artifact_tombstone;
-use super::submit::{SubmitJobError, SubmitJobResult};
+use super::submit::SubmitJobError;
 use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation, validate_execution};
 use super::submit_local::DedupLookupOperation;
-use crate::jobs::store::test_calls::insert_job;
 use crate::jobs::store::test_calls::read_job_record;
+use crate::jobs::store::test_calls::{insert_job, submit_execution_job};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
-
-#[allow(clippy::too_many_arguments)]
-async fn submit_execution_job(
-    context: &DriverContext,
-    spec: ExecutionSpec,
-    created_by: UserId,
-    owner_node_id: NodeId,
-    idempotency_key: Option<String>,
-    workspace_mode: WorkspaceMode,
-    workspace_bucket: Option<String>,
-    retention_ms: u64,
-    active_cap: Option<u32>,
-) -> Result<SubmitJobResult, SubmitJobError> {
-    let submission = ExecutionSubmission {
-        spec,
-        created_by,
-        owner_node_id,
-        idempotency_key,
-        workspace_mode,
-        workspace_bucket,
-        retention_ms,
-        active_cap,
-        serving: context.node_and_realm(),
-        now_ms: unix_timestamp_millis(),
-    };
-    drive(SubmitExecutionOperation::new(submission), context).await
-}
 
 fn node_id() -> NodeId {
     iroh::SecretKey::from_bytes(&[7u8; 32]).public()

@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::records::HeadAliasContext;
 use crate::distribution::guard::{GuardError, authority_reads, write_authority};
 use crate::placement::policy::foreign_owner;
@@ -18,7 +17,7 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{read_row, values};
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::policy::attachment::{
     BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun, PolicyIntent,
     PolicyIntentKey, PolicyIntentOutcome, PolicyRefMode, PolicyStatus,
@@ -370,12 +369,8 @@ impl PolicyBulkOperation {
     }
 
     fn authorize(&mut self, state: BulkState, path: String) -> BulkTurn {
-        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: self.config.auth_context.clone(),
-            path,
-            required_permission: Permission::WRITE,
-        });
-        self.call(state, IoCall::child(check))
+        let check = super::write_check(self.config.auth_context.clone(), path);
+        self.call(state, check)
     }
 
     /// A failed check counts as a denial.
