@@ -1202,6 +1202,7 @@ mod tests {
             created_at_ms: 21,
             subject_generation: 3,
             subject_digest: [9u8; 32],
+            config_clock: Default::default(),
         };
         let decoded = decode_entry(
             JOB_RESERVATION_KEYSPACE,

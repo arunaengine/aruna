@@ -785,6 +785,7 @@ mod tests {
             plan_digest: [8u8; 32],
             spec_digest,
             created_at_ms,
+            config_clock: Default::default(),
         };
         signed(JobFamilyRecord::Launch(Box::new(launch)))
     }
@@ -821,6 +822,7 @@ mod tests {
             subject_generation: 1,
             subject_digest: [12u8; 32],
             accepted_at_ms: 3_000,
+            config_clock: Default::default(),
         };
         signed(JobFamilyRecord::Receipt(Box::new(receipt)))
     }

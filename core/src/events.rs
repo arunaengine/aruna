@@ -861,6 +861,9 @@ pub enum LaunchDecline {
     /// The launch window passed on the target's clock, so no target accepts this launch any
     /// more. A new launch may still be accepted.
     Expired,
+    /// None of the target's membership intervals the launch cites is still open, so the launch
+    /// belongs to an interval that ended.
+    WrongInterval,
 }
 
 /// Reply to a [`crate::effects::JobControlEffect`]: the owner's response, or an

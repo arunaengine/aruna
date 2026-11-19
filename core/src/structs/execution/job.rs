@@ -40,6 +40,7 @@ mod input;
 mod key_wait;
 mod launch;
 mod local;
+mod membership;
 mod pages;
 pub mod record_keys;
 pub mod record_rows;
@@ -51,6 +52,7 @@ pub use input::*;
 pub use key_wait::*;
 pub use launch::*;
 pub use local::*;
+pub use membership::*;
 pub use pages::*;
 pub use rows::*;
 

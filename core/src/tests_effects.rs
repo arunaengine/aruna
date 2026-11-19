@@ -70,6 +70,7 @@ pub(crate) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
         plan_digest: [6u8; 32],
         spec_digest: [7u8; 32],
         created_at_ms: 1,
+        config_clock: Default::default(),
     }));
     JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
 }
@@ -97,6 +98,7 @@ pub(crate) fn sized_receipt(kind_bytes: usize) -> JobRecordEnvelope {
         subject_generation: 5,
         subject_digest: [8u8; 32],
         accepted_at_ms: 1,
+        config_clock: Default::default(),
     }));
     JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
 }

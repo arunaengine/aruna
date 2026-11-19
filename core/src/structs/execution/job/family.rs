@@ -295,6 +295,8 @@ pub struct LaunchIntent {
     pub plan_digest: [u8; 32],
     pub spec_digest: [u8; 32],
     pub created_at_ms: u64,
+    /// The scheduler's realm config clock when it created the launch.
+    pub config_clock: crate::admin_documents::AdminDocumentClock,
 }
 
 /// How long after its creation a target may still accept a launch, counted on the target's clock.
@@ -326,6 +328,8 @@ pub struct ExecutionReceipt {
     pub subject_generation: u64,
     pub subject_digest: [u8; 32],
     pub accepted_at_ms: u64,
+    /// The executor's realm config clock when it accepted, which names its membership interval.
+    pub config_clock: crate::admin_documents::AdminDocumentClock,
 }
 
 /// State of one physical execution. Terminal here means terminal for this

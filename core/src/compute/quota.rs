@@ -139,7 +139,7 @@ pub struct ComputeReservationSnapshot {
 
 /// One durable local reservation of exact capacity, keyed by ExecutionId. This
 /// node writes it before starting work and releases it on a terminal state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobReservationRecord {
     pub execution_id: Ulid,
     /// Mutable row of this exact physical execution.
@@ -152,6 +152,8 @@ pub struct JobReservationRecord {
     /// when this node no longer advertises exactly this subject.
     pub subject_generation: u64,
     pub subject_digest: [u8; 32],
+    /// The realm config clock of the receipt this row was written with.
+    pub config_clock: crate::admin_documents::AdminDocumentClock,
 }
 
 /// What a departing node could not resolve before leaving. Recorded durably so

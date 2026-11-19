@@ -659,6 +659,7 @@ fn sample_launch() -> LaunchIntent {
         plan_digest: [12u8; 32],
         spec_digest: spec_digest(),
         created_at_ms: 1_700_000_000_000,
+        config_clock: Default::default(),
     }
 }
 
@@ -678,6 +679,7 @@ fn sample_receipt() -> ExecutionReceipt {
         subject_generation: 2,
         subject_digest: [15u8; 32],
         accepted_at_ms: 1_700_000_000_000,
+        config_clock: Default::default(),
     }
 }
 
@@ -2129,4 +2131,138 @@ fn launch_window_target() {
     let passed = created + LAUNCH_WINDOW_MS + 1;
     assert!(!launch.expired(target_clock(passed)));
     assert!(launch.expired(target_clock(passed + 5 * 60 * 1000)));
+}
+
+/// The node that writes every realm config event of the membership tests.
+fn config_origin() -> NodeId {
+    node_id(20)
+}
+
+fn config_dot(seq: u64) -> crate::admin_documents::AdminDocumentDot {
+    crate::admin_documents::AdminDocumentDot {
+        event_id: Ulid::from_bytes([seq as u8; 16]),
+        origin_node_id: config_origin(),
+        origin_seq: seq,
+    }
+}
+
+fn config_clock(seq: u64) -> crate::admin_documents::AdminDocumentClock {
+    crate::admin_documents::AdminDocumentClock::default().with_observed(config_origin(), seq)
+}
+
+fn interval(node: NodeId, added: u64, removed: &[u64]) -> crate::admin_documents::NodeInterval {
+    crate::admin_documents::NodeInterval {
+        node_id: node,
+        added: config_dot(added),
+        removed: removed.iter().map(|seq| config_dot(*seq)).collect(),
+    }
+}
+
+#[test]
+fn membership_follows_removals() {
+    // A removal closes the interval the cited clock names; until this node applied it, or while
+    // its clock does not cover the cited one, the node has not left.
+    let node = node_id(9);
+    let removed = [interval(node, 1, &[3])];
+    let applied = [interval(node, 1, &[])];
+    let at = |cited, intervals: &[_], local| {
+        membership(node, &config_clock(cited), intervals, &config_clock(local))
+    };
+    assert_eq!(at(2, &removed, 3), Membership::Left);
+    assert_eq!(at(2, &applied, 2), Membership::Open);
+    assert_eq!(at(2, &removed, 1), Membership::Unknown);
+    assert_eq!(at(0, &removed, 3), Membership::Absent);
+}
+
+#[test]
+fn membership_names_intervals() {
+    // A promotion adds a second open interval; a cited clock that saw both adds is left only
+    // once both closed. After a re-add, old work stays left and new work stays open.
+    let node = node_id(9);
+    let promoted = [interval(node, 1, &[3]), interval(node, 2, &[])];
+    let at = |cited, intervals: &[_]| {
+        membership(node, &config_clock(cited), intervals, &config_clock(5))
+    };
+    assert_eq!(at(2, &promoted), Membership::Open);
+    assert_eq!(at(1, &promoted), Membership::Left);
+    let closed = [interval(node, 1, &[4]), interval(node, 2, &[4])];
+    assert_eq!(at(2, &closed), Membership::Left);
+    let readded = [interval(node, 1, &[3]), interval(node, 5, &[])];
+    assert_eq!(at(2, &readded), Membership::Left);
+    assert_eq!(at(5, &readded), Membership::Open);
+}
+
+/// The sample launch and receipt, both citing realm config clock 2.
+fn cited_records() -> Vec<JobRecordEnvelope> {
+    let launch = LaunchIntent {
+        config_clock: config_clock(2),
+        ..sample_launch()
+    };
+    let receipt = ExecutionReceipt {
+        launch_digest: launch.digest().expect("launch digests"),
+        config_clock: config_clock(2),
+        ..sample_receipt()
+    };
+    vec![
+        envelope(JobFamilyRecord::Launch(Box::new(launch)), 1),
+        envelope(JobFamilyRecord::Receipt(Box::new(receipt)), 9),
+        envelope(JobFamilyRecord::Update(Box::new(sample_update())), 9),
+    ]
+}
+
+#[test]
+fn removal_closes_work() {
+    // The executor left: its open execution is not run and so is the family; nothing is
+    // published, every holder derives it from the records it holds.
+    let left = [interval(node_id(9), 1, &[3])];
+    let records = cited_records();
+
+    let derived = not_run(&records, &left, &config_clock(3));
+    assert_eq!(
+        derived.executions.into_iter().collect::<Vec<_>>(),
+        vec![Ulid::from_bytes([13u8; 16])]
+    );
+    assert!(derived.launches.is_empty(), "the launch has its receipt");
+    assert!(derived.family);
+    assert!(
+        !not_run(&records, &left, &config_clock(1)).family,
+        "clock not covered"
+    );
+    let open = [interval(node_id(9), 1, &[])];
+    assert!(
+        !not_run(&records, &open, &config_clock(3)).family,
+        "removal not applied"
+    );
+}
+
+#[test]
+fn outcomes_stay_decided() {
+    // A success stays the outcome, a stopped execution is closed anyway, and an open launch
+    // to a target that is still a member keeps the family undecided.
+    let left = [interval(node_id(9), 1, &[3]), interval(node_id(5), 1, &[])];
+    let mut succeeded = cited_records();
+    succeeded.push(envelope(
+        JobFamilyRecord::Update(Box::new(success_update())),
+        9,
+    ));
+    assert!(!not_run(&succeeded, &left, &config_clock(3)).family);
+
+    let mut stopped = cited_records();
+    stopped.push(envelope(JobFamilyRecord::Stop(Box::new(sample_stop())), 9));
+    let derived = not_run(&stopped, &left, &config_clock(3));
+    assert!(derived.executions.is_empty() && !derived.family);
+
+    let mut pending = cited_records();
+    let other = LaunchIntent {
+        launch_id: Ulid::from_bytes([21u8; 16]),
+        scheduler_seq: 1,
+        target: ExecutionTargetId {
+            node_id: node_id(5),
+            executor_kind: "docker".to_string(),
+        },
+        config_clock: config_clock(2),
+        ..sample_launch()
+    };
+    pending.push(envelope(JobFamilyRecord::Launch(Box::new(other)), 1));
+    assert!(!not_run(&pending, &left, &config_clock(3)).family);
 }
