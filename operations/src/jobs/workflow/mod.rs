@@ -18,6 +18,7 @@ pub mod recovery;
 pub mod run_crate;
 pub mod session;
 pub mod settle;
+pub mod stop_record;
 mod storage_audit;
 pub mod supervise;
 pub mod workspace;
