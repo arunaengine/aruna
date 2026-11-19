@@ -23,12 +23,12 @@ use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
 use crate::structs::placement::policy::document::PlacementPolicyDocument;
 use crate::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef};
 use crate::structs::placement::record::PlacementRef;
+use crate::structs::storage::distribution::DistributionRevision;
 use crate::structs::storage::distribution::capacity::RangeSize;
-use crate::structs::storage::distribution::request::PublishRefusal;
+use crate::structs::storage::distribution::request::{DistributionRequest, PublishRefusal};
+use crate::structs::storage::distribution::snapshot::SignedSnapshot;
 use crate::structs::storage::distribution::source_root::HandedImport;
-use crate::structs::storage::distribution::{
-    DistributionRequest, DistributionRevision, SignedSnapshot, SignedStatement,
-};
+use crate::structs::storage::distribution::statement::SignedStatement;
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::NodeInfoDocument;
 use crate::structs::{

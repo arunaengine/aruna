@@ -28,10 +28,14 @@ use aruna_core::structs::storage::distribution::accounting::{
 };
 use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
 use aruna_core::structs::storage::distribution::lifecycle::MAX_CURSOR_BYTES;
-use aruna_core::structs::storage::distribution::snapshot::OpenTransfer;
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, OpenTransfer,
+};
+use aruna_core::structs::storage::distribution::statement::{
+    Statement, StatementClaim, StatementKind,
+};
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionMember, DistributionSnapshot, DistributionView, KeyRange,
-    MemberState, MetadataCoverage, Statement, StatementClaim, StatementKind,
+    DistributionBinding, DistributionMember, KeyRange, MemberState, MetadataCoverage,
 };
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
@@ -1671,8 +1675,9 @@ mod tests {
         // A join replaced this node's member 3 before its bucket was released.
         use crate::distribution::test_record::{realm, replicated, secret};
         use crate::distribution::test_store::{context, get, open};
-        use aruna_core::structs::storage::distribution::snapshot::Tombstone;
-        use aruna_core::structs::storage::distribution::{DistributionView, SignedSnapshot};
+        use aruna_core::structs::storage::distribution::snapshot::{
+            DistributionView, SignedSnapshot, Tombstone,
+        };
         let (mut snapshot, _) = replicated(true, 1);
         let set_id = snapshot.set_id();
         snapshot.tombstones.push(Tombstone {
@@ -1750,8 +1755,9 @@ mod tests {
         use crate::distribution::test_store::{context, get, open};
         use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
         use aruna_core::structs::storage::distribution::fence::RangeFence;
-        use aruna_core::structs::storage::distribution::{
-            DistributionView, SignedSnapshot, TransferRole,
+        use aruna_core::structs::storage::distribution::request::TransferRole;
+        use aruna_core::structs::storage::distribution::snapshot::{
+            DistributionView, SignedSnapshot,
         };
         let (mut snapshot, _) = replicated(true, 1);
         let set_id = snapshot.set_id();

@@ -23,9 +23,10 @@ use aruna_core::structs::storage::distribution::capacity::{
     MemberNeed, MemberReservation, RangeSize, member_need,
 };
 use aruna_core::structs::storage::distribution::snapshot::RangeFill;
-use aruna_core::structs::storage::distribution::{
-    DataStrategy, KeyRange, MetadataCoverage, SignedStatement, Statement, StatementClaim,
+use aruna_core::structs::storage::distribution::statement::{
+    SignedStatement, Statement, StatementClaim,
 };
+use aruna_core::structs::storage::distribution::{DataStrategy, KeyRange, MetadataCoverage};
 use aruna_core::structs::storage::usage::{
     BucketCounters, USAGE_REBUILD_KEY, UsageCounters, global_shard_keys, usage_bucket_key,
 };

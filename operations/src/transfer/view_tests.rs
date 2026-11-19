@@ -4,11 +4,12 @@
 
 use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::structs::storage::distribution::DistributionConfig;
 use aruna_core::structs::storage::distribution::fence::RangeFence;
 use aruna_core::structs::storage::distribution::presets::shard_layout;
-use aruna_core::structs::storage::distribution::{
-    DistributionConfig, DistributionRequest, SetRoot, SignedSnapshot, next_snapshot,
-};
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::SignedSnapshot;
+use aruna_core::structs::storage::distribution::statement::SetRoot;
 
 use super::*;
 

@@ -1780,7 +1780,8 @@ async fn bucket_rows_sum() {
 
 #[test]
 fn marker_carries_hint() {
-    use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::storage::distribution::hint::SetHint;
     use aruna_core::structs::storage::format::Compression;
 
     let marker = |binding: Option<DistributionBinding>, record: Option<Vec<u8>>| {

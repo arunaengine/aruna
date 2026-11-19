@@ -29,8 +29,9 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
     HashIndex, ManagedCopyKey, VersionKey, object_permission_path,
 };
+use aruna_core::structs::storage::distribution::MemberState;
 use aruna_core::structs::storage::distribution::inventory::{IndexEntry, Position, index_key};
-use aruna_core::structs::storage::distribution::{DistributionView, MemberState};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };

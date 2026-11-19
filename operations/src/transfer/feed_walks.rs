@@ -22,7 +22,6 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::execution::table::search_terms;
 use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
-use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, RangeAccount, RangeSlot, account_key, slot_seek,
 };
@@ -30,6 +29,7 @@ use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, Position, range_interval,
 };
 use aruna_core::structs::storage::distribution::search::{IndexProgress, IndexState, decode_feed};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;

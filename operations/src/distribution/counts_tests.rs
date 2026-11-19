@@ -89,7 +89,7 @@ async fn counts_owner_group() {
 #[tokio::test]
 async fn reads_deleting_record() {
     use crate::distribution::test_record::{realm, secret};
-    use aruna_core::structs::storage::distribution::{DistributionView, SignedSnapshot};
+    use aruna_core::structs::storage::distribution::snapshot::{DistributionView, SignedSnapshot};
     let (_temp, storage_handle) = crate::distribution::test_store::open();
     let context = DriverContext {
         storage_handle,

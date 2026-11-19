@@ -6,7 +6,7 @@
 use super::*;
 use crate::auth::RealmAuth;
 use crate::tests::distributed::{BUCKET, Node, PEER, distribute, node_id, node_state};
-use aruna_core::structs::storage::distribution::DistributionSnapshot;
+use aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot;
 
 fn bearer() -> Extension<Option<ValidatedBearer>> {
     Extension(Some(ValidatedBearer::new_for_test("caller-token")))

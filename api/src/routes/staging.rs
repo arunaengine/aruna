@@ -33,7 +33,7 @@ use aruna_core::structs::execution::table::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_core::structs::storage::distribution::ReadRoute;
+use aruna_core::structs::storage::distribution::route::ReadRoute;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::auth::request_authorization::rules_operation;
 use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};

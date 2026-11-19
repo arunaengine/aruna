@@ -4,7 +4,7 @@
 
 use aruna_core::events::{MetadataAnswer, PeerRequestError};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::distribution::Statement;
+use aruna_core::structs::storage::distribution::statement::Statement;
 use aruna_core::types::Value;
 use std::time::Duration;
 

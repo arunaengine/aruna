@@ -8,10 +8,11 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::{
-    DataStrategy, DistributionBinding, DistributionMember, DistributionSnapshot, KeyRange,
-    MemberState, MetadataCoverage, PublicationEpoch,
+    DataStrategy, DistributionBinding, DistributionMember, KeyRange, MemberState, MetadataCoverage,
+    PublicationEpoch,
 };
 use crate::id::NodeId;
+use crate::structs::storage::distribution::snapshot::DistributionSnapshot;
 
 /// What a coordinator's publication to one member asserts besides the version it carries.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -198,8 +199,9 @@ mod tests {
     use super::*;
     use crate::structs::storage::distribution::presets::{add_edges, shard_layout};
     use crate::structs::storage::distribution::snapshot::{Deletion, Lifecycle};
+    use crate::structs::storage::distribution::statement::SetRoot;
     use crate::structs::storage::distribution::{
-        DistributionConfig, DistributionRevision, DistributionSettings, SetPhase, SetRoot,
+        DistributionConfig, DistributionRevision, DistributionSettings, SetPhase,
     };
 
     fn node(seed: u8) -> NodeId {

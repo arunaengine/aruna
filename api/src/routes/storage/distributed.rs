@@ -9,10 +9,9 @@ use std::sync::Arc;
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_core::structs::storage::distribution::request::PublishRefusal;
+use aruna_core::structs::storage::distribution::request::{PublishRefusal, TransferRole};
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionSettings, MemberState, MetadataCoverage, RangeBehaviour, SetPhase,
-    TransferRole,
 };
 use aruna_operations::transfer::create::{
     CreateError, CreateInput, CreationReport, LayoutKind, admit_pending, create_set,

@@ -6,10 +6,10 @@ use ulid::Ulid;
 
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::distribution::presets::shard_layout;
-use crate::structs::storage::distribution::{
-    DistributionConfig, DistributionRequest, DistributionSettings, DistributionSnapshot, SetRoot,
-    Statement, next_snapshot,
-};
+use crate::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use crate::structs::storage::distribution::snapshot::DistributionSnapshot;
+use crate::structs::storage::distribution::statement::{SetRoot, Statement};
+use crate::structs::storage::distribution::{DistributionConfig, DistributionSettings};
 
 fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])

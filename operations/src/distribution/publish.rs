@@ -28,11 +28,12 @@ use aruna_core::storage_entries::{reducer_state_entry, reducer_state_key};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::group_admin_path;
-use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
-use aruna_core::structs::storage::distribution::{
-    DistributionError, DistributionRequest, DistributionRevision, DistributionSnapshot,
-    DistributionView, SetPhase, SignedSnapshot, next_snapshot, publisher_key,
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot, SnapshotClaim,
 };
+use aruna_core::structs::storage::distribution::validate::DistributionError;
+use aruna_core::structs::storage::distribution::{DistributionRevision, SetPhase, publisher_key};
 use aruna_core::structs::storage::usage::dirty_share_key;
 use aruna_core::user::id::UserId;
 use serde::{Deserialize, Serialize};

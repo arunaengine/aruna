@@ -836,7 +836,8 @@ async fn replay_charges_once() {
 
 #[test]
 fn guards_carry_hint() {
-    use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::storage::distribution::hint::SetHint;
 
     let mut bound = bucket();
     bound.distribution = Some(DistributionBinding {

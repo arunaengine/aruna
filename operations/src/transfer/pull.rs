@@ -28,9 +28,8 @@ use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo};
 use aruna_core::structs::storage::distribution::on_use::{
     CACHE_CAPACITY_BYTES, FillClaim, KeptKind, PullPlan, claim_key,
 };
-use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionView, MemberState, RangeBehaviour,
-};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
+use aruna_core::structs::storage::distribution::{DataStrategy, MemberState, RangeBehaviour};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::types::Key;
 use bytes::Bytes;

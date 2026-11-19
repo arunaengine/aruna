@@ -18,7 +18,8 @@ use aruna_core::structs::execution::table::{query_terms, search_tokens};
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::inventory::Position;
 use aruna_core::structs::storage::distribution::search::IndexState;
-use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionView, KeyRange};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
+use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
 use aruna_core::types::Key;
 use ulid::Ulid;
 

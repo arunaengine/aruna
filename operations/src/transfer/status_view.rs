@@ -16,10 +16,13 @@ use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::distribution::bootstrap::{BootstrapCursor, bootstrap_key};
 use aruna_core::structs::storage::distribution::fence::LocalFence;
-use aruna_core::structs::storage::distribution::snapshot::RangeFill;
+use aruna_core::structs::storage::distribution::request::TransferRole;
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, RangeFill,
+};
 use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionRevision, DistributionSettings, DistributionSnapshot,
-    DistributionView, MemberState, MetadataCoverage, SetPhase, TransferRole,
+    DataStrategy, DistributionRevision, DistributionSettings, MemberState, MetadataCoverage,
+    SetPhase,
 };
 use aruna_core::types::{GroupId, Value};
 use thiserror::Error;

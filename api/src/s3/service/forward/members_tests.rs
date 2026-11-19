@@ -18,7 +18,7 @@ use crate::tests::members::{BUCKET, Members, members};
 async fn snapshot_of(
     service: &crate::s3::service::ArunaS3Service,
     binding: &aruna_core::structs::storage::distribution::DistributionBinding,
-) -> aruna_core::structs::storage::distribution::DistributionSnapshot {
+) -> aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot {
     let view = aruna_operations::distribution::routing::bound_view(binding);
     let view = aruna_drivers::driver::drive(view, service.state.as_ref());
     view.await.unwrap().head.snapshot

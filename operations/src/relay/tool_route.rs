@@ -13,7 +13,7 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::distribution::ReadRoute;
+use aruna_core::structs::storage::distribution::route::ReadRoute;
 use thiserror::Error;
 
 use super::tool::{Holder, RouteError, add_holder, pick_node, search_done};

@@ -7,9 +7,8 @@ use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::distribution::presets::replica_layout;
 use aruna_core::structs::storage::distribution::snapshot::install;
-use aruna_core::structs::storage::distribution::{
-    DistributionConfig, DistributionSettings, SetRoot, Statement, StatementKind,
-};
+use aruna_core::structs::storage::distribution::statement::{SetRoot, Statement, StatementKind};
+use aruna_core::structs::storage::distribution::{DistributionConfig, DistributionSettings};
 use aruna_core::types::Value;
 
 const PUBLISHER: u8 = 1;

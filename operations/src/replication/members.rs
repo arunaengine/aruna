@@ -19,9 +19,9 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionSnapshot, DistributionView, KeyRange, Publication,
-};
+use aruna_core::structs::storage::distribution::delivery::Publication;
+use aruna_core::structs::storage::distribution::snapshot::{DistributionSnapshot, DistributionView};
+use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;

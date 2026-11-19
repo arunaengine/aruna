@@ -17,10 +17,11 @@ use aruna_core::rows::SettleMarkerOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::bootstrap::{BootstrapCursor, bootstrap_key};
-use aruna_core::structs::storage::distribution::snapshot::{DistributionView, RangeFill};
-use aruna_core::structs::storage::distribution::{
-    DistributionMember, DistributionSnapshot, KeyRange, Statement, StatementClaim,
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, RangeFill,
 };
+use aruna_core::structs::storage::distribution::statement::{Statement, StatementClaim};
+use aruna_core::structs::storage::distribution::{DistributionMember, KeyRange};
 use aruna_core::types::{Key, Value};
 use tracing::{debug, warn};
 use ulid::Ulid;

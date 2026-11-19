@@ -31,8 +31,8 @@ use crate::structs::storage::distribution::parking::{
     Authority, MAX_PARKED, ParkDecision, ParkedEntry, RetryDecision, park, publisher_authority,
     retry, snapshot_of,
 };
-use crate::structs::storage::distribution::snapshot::forked;
-use crate::structs::storage::distribution::{PublisherCutoff, SignedSnapshot, publisher_key};
+use crate::structs::storage::distribution::snapshot::{SignedSnapshot, forked};
+use crate::structs::storage::distribution::{PublisherCutoff, publisher_key};
 use crate::structs::storage::usage::dirty_share_key;
 use crate::types::{Key, KeySpace, Value};
 

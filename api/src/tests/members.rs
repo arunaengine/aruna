@@ -19,9 +19,13 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::capacity::with_unopened;
 use aruna_core::structs::storage::distribution::presets::shard_layout;
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot,
+};
+use aruna_core::structs::storage::distribution::statement::SetRoot;
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionConfig, DistributionRequest, DistributionSettings,
-    DistributionSnapshot, DistributionView, SetRoot, SignedSnapshot, next_snapshot,
+    DistributionBinding, DistributionConfig, DistributionSettings,
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::node_info::{

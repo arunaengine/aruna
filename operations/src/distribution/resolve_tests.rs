@@ -4,9 +4,8 @@
 
 use super::{probe_targets, range_holders};
 use crate::distribution::test_record::{member, replicated, secret};
-use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionSnapshot, MemberState, MetadataCoverage,
-};
+use aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot;
+use aruna_core::structs::storage::distribution::{DataStrategy, MemberState, MetadataCoverage};
 use aruna_drivers::driver::drive;
 
 /// The two shards split at "m", each replicated on the other member, every member ready.

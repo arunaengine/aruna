@@ -7,11 +7,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::fence::LocalFence;
-use super::{
-    DistributionMember, DistributionSnapshot, KeyRange, MemberState, MetadataCoverage,
-    OriginalEpoch,
-};
+use super::{DistributionMember, KeyRange, MemberState, MetadataCoverage, OriginalEpoch};
 use crate::id::NodeId;
+use crate::structs::storage::distribution::snapshot::DistributionSnapshot;
 
 /// Where one write goes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -245,9 +243,10 @@ impl DistributionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{RouteError, WriteRoute};
-    use crate::structs::storage::distribution::snapshot::{Deletion, OpenTransfer};
-    use crate::structs::storage::distribution::{
-        DistributionSnapshot, OriginalEpoch, TransferRole,
+    use crate::structs::storage::distribution::OriginalEpoch;
+    use crate::structs::storage::distribution::request::TransferRole;
+    use crate::structs::storage::distribution::snapshot::{
+        Deletion, DistributionSnapshot, OpenTransfer,
     };
     use ulid::Ulid;
 

@@ -5,11 +5,11 @@
 
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::DISTRIBUTION_FENCE_KEYSPACE;
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
+use aruna_core::structs::storage::distribution::route::{ReadRoute, WriteRoute};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::distribution::upload::UploadTag;
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionView, ReadRoute, WriteRoute,
-};
 use ulid::Ulid;
 
 use super::route_query::RouteOperation;

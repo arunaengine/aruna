@@ -822,7 +822,7 @@ pub enum NetEffect {
     /// Signs a distribution snapshot; only a snapshot naming this node as publisher.
     SnapshotSign(Box<crate::structs::storage::distribution::snapshot::SnapshotClaim>),
     /// Signs a member statement; only a claim naming this node as signer.
-    StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
+    StatementSign(Box<crate::structs::storage::distribution::statement::StatementClaim>),
     /// Signs one job record of an execution; only a claim naming this node as publisher.
     ExecutionSign(Box<crate::structs::execution::job::ExecutionClaim>),
     /// Sends one notification request frame to a holder and reads its answer frame.

@@ -52,7 +52,8 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
 };
 use aruna_core::structs::storage::bucket_metadata::strip_release_keys;
-use aruna_core::structs::storage::distribution::{OriginalEpoch, Publication};
+use aruna_core::structs::storage::distribution::OriginalEpoch;
+use aruna_core::structs::storage::distribution::delivery::Publication;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::multipart::{

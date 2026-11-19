@@ -12,9 +12,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE};
 use aruna_core::structs::storage::distribution::fence::LocalFence;
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionView, OriginalEpoch, ReadRoute, RouteError, WriteRoute,
-};
+use aruna_core::structs::storage::distribution::route::{ReadRoute, RouteError, WriteRoute};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::types::{Key, TxnId, Value};
 use thiserror::Error;
 use ulid::Ulid;

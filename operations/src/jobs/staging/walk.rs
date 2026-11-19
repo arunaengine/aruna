@@ -26,9 +26,9 @@ use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionView, WriteRoute,
-};
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::route::WriteRoute;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use ulid::Ulid;

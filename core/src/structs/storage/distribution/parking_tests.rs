@@ -7,9 +7,11 @@ use crate::admin_documents::{AdminDocumentClock, AdminDocumentTarget};
 use crate::structs::identity::auth::Actor;
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::storage::distribution::presets::replica_layout;
+use crate::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use crate::structs::storage::distribution::snapshot::DistributionSnapshot;
+use crate::structs::storage::distribution::statement::SetRoot;
 use crate::structs::storage::distribution::{
-    DistributionConfig, DistributionRequest, DistributionRevision, DistributionSettings,
-    DistributionSnapshot, SetRoot, next_snapshot,
+    DistributionConfig, DistributionRevision, DistributionSettings,
 };
 use crate::user::id::UserId;
 use ulid::Ulid;

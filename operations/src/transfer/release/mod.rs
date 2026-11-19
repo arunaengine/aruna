@@ -20,8 +20,9 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::bucket_metadata::{
     RELEASE_TAG, ReleasePointer, ReleaseRef, release_prefix,
 };
+use aruna_core::structs::storage::distribution::KeyRange;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
-use aruna_core::structs::storage::distribution::{DistributionView, KeyRange};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::OriginVersion;
 use aruna_core::structs::storage::release::{

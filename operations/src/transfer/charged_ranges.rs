@@ -9,10 +9,11 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, RangeAccount, RangeCounters, account_key, generation_key, pending_key,
 };
-use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionSnapshot};
+use aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot;
 use aruna_core::types::Value;
 use thiserror::Error;
 use ulid::Ulid;

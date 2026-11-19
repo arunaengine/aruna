@@ -9,7 +9,7 @@ use aruna_core::errors::{
 };
 use aruna_core::managed_copy::ManagedCopyError;
 use aruna_core::structs::storage::abe::AbeError;
-use aruna_core::structs::storage::distribution::RouteError;
+use aruna_core::structs::storage::distribution::route::RouteError;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::routing::RoutingError;
 use aruna_operations::distribution::guard::GuardError;

@@ -5,10 +5,11 @@
 use super::*;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::structs::storage::distribution::presets::replica_layout;
-use crate::structs::storage::distribution::{
-    DistributionConfig, DistributionError, DistributionRequest, DistributionSettings,
-    DistributionSnapshot, SetRoot, SignedSnapshot, next_snapshot,
-};
+use crate::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use crate::structs::storage::distribution::snapshot::{DistributionSnapshot, SignedSnapshot};
+use crate::structs::storage::distribution::statement::SetRoot;
+use crate::structs::storage::distribution::validate::DistributionError;
+use crate::structs::storage::distribution::{DistributionConfig, DistributionSettings};
 
 fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])

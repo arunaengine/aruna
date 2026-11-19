@@ -5,11 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::PublisherCutoff;
 use super::snapshot::{Installed, install};
-use super::{DistributionError, DistributionView, PublisherCutoff, SignedSnapshot};
 use crate::admin_documents::{AdminDocumentEvent, AdminDocumentOperation};
 use crate::id::NodeId;
 use crate::structs::identity::realm::{RealmConfigDocument, RealmId};
+use crate::structs::storage::distribution::snapshot::{DistributionView, SignedSnapshot};
+use crate::structs::storage::distribution::validate::DistributionError;
 
 /// At most this many publisher and set pairs wait for their publisher's membership.
 pub const MAX_PARKED: usize = 256;

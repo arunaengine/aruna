@@ -114,7 +114,7 @@ pub enum AdminDocumentError {
     #[error("job family placement strategy cannot be removed")]
     JobFamilyRemoved,
     #[error(transparent)]
-    Distribution(#[from] crate::structs::storage::distribution::DistributionError),
+    Distribution(#[from] crate::structs::storage::distribution::validate::DistributionError),
     #[error("publisher cutoffs repeat a set or exceed their bound")]
     InvalidCutoffs,
     #[error("node place is empty, or its name or coordinates are invalid")]

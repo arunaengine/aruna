@@ -10,7 +10,7 @@ use super::*;
 use crate::distribution::test_record::{authority_rows, binding, member, replicated, secret};
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
-use aruna_core::structs::storage::distribution::Publication;
+use aruna_core::structs::storage::distribution::delivery::Publication;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::structs::storage::routing::GroupRoutingInputs;

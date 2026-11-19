@@ -16,7 +16,7 @@ use aruna_core::outbound::RangeEntry;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::storage::distribution::ReadRoute;
+use aruna_core::structs::storage::distribution::route::ReadRoute;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::group_backend::valid_bucket;
 use serde::{Deserialize, Serialize};

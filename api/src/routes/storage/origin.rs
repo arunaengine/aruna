@@ -10,8 +10,8 @@ use aruna_core::structs::execution::source_access::{DigestOrigin, DigestScope};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::identity::content_id;
-use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
+use aruna_core::structs::storage::distribution::route::ReadRoute;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, UploadClient, VersionOrigin,

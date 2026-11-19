@@ -19,7 +19,8 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::storage::distribution::{DistributionSnapshot, OriginalEpoch};
+use aruna_core::structs::storage::distribution::OriginalEpoch;
+use aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot;
 use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
 use aruna_core::types::{Key, Value};
 use aruna_storage::storage::handle::StorageHandle;

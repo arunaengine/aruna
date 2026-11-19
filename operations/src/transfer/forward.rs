@@ -20,9 +20,9 @@ use aruna_core::structs::identity::realm::{NodeRealm, RealmConfigDocument, Realm
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::distribution::capacity::RangeSize;
 use aruna_core::structs::storage::distribution::request::PublishRefusal;
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionMember, DistributionSnapshot, SignedSnapshot, SignedStatement,
-};
+use aruna_core::structs::storage::distribution::snapshot::{DistributionSnapshot, SignedSnapshot};
+use aruna_core::structs::storage::distribution::statement::SignedStatement;
+use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionMember};
 use aruna_core::structs::storage::format::Compression;
 use tracing::warn;
 use ulid::Ulid;
@@ -43,7 +43,7 @@ use aruna_core::request_policy::PolicyRequestExtras;
 
 impl From<PublishError> for PublishRefusal {
     fn from(error: PublishError) -> Self {
-        use aruna_core::structs::storage::distribution::DistributionError;
+        use aruna_core::structs::storage::distribution::validate::DistributionError;
         match error {
             PublishError::Unauthorized => Self::Forbidden,
             PublishError::Distribution(DistributionError::Replayed(_)) => Self::Replayed,

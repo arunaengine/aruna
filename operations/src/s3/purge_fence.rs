@@ -113,8 +113,8 @@ mod tests {
     use super::*;
     use crate::distribution::guard::write_authority;
     use crate::distribution::test_record::{binding, record};
-    use aruna_core::structs::storage::distribution::RouteError;
     use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
+    use aruna_core::structs::storage::distribution::route::RouteError;
     use ulid::Ulid;
 
     fn answer(record: Vec<u8>, fence: Option<Vec<u8>>) -> Vec<Option<Value>> {

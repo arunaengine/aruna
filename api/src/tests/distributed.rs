@@ -23,9 +23,13 @@ use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubject
 use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::distribution::presets::{replica_layout, shard_layout};
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot,
+};
+use aruna_core::structs::storage::distribution::statement::{SetRoot, Statement};
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionConfig, DistributionRequest, DistributionSettings,
-    DistributionSnapshot, DistributionView, SetRoot, SignedSnapshot, Statement, next_snapshot,
+    DistributionBinding, DistributionConfig, DistributionSettings,
 };
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,

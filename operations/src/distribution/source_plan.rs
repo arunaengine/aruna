@@ -18,8 +18,9 @@ use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, Source
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobVersion, BlobVersionState, BucketInfo, HiddenBlobKey, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::on_use::{KeptKind, PullPlan};
-use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionView};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::types::{GroupId, Value};
 use aruna_core::user::id::UserId;

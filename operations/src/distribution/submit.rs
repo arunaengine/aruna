@@ -13,9 +13,9 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::distribution::{
-    DistributionRequest, DistributionRevision, SignedStatement, StatementClaim,
-};
+use aruna_core::structs::storage::distribution::DistributionRevision;
+use aruna_core::structs::storage::distribution::request::DistributionRequest;
+use aruna_core::structs::storage::distribution::statement::{SignedStatement, StatementClaim};
 use aruna_core::types::Key;
 use tracing::warn;
 use ulid::Ulid;

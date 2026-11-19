@@ -209,7 +209,7 @@ impl NetHandle {
     /// Signs a member statement when it names this node; see the `StatementSign` effect.
     pub fn sign_statement(
         &self,
-        claim: aruna_core::structs::storage::distribution::StatementClaim,
+        claim: aruna_core::structs::storage::distribution::statement::StatementClaim,
     ) -> aruna_core::events::StatementSignEvent {
         effect_handlers::sign_statement(self.inner.endpoint.secret_key(), claim)
     }

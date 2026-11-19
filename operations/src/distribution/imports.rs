@@ -15,8 +15,8 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::distribution::snapshot::{DistributionSnapshot, DistributionView};
 use aruna_core::structs::storage::distribution::source_root::{HandedImport, SourceRoot};
-use aruna_core::structs::storage::distribution::{DistributionSnapshot, DistributionView};
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

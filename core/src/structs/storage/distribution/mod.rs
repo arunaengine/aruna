@@ -34,14 +34,6 @@ pub mod ticket;
 pub mod upload;
 pub mod validate;
 
-pub use delivery::{AdmissionError, Delivery, Publication};
-pub use hint::{HintIndex, SetHint};
-pub use request::{DistributionRequest, TransferRole, next_snapshot};
-pub use route::{ReadRoute, RouteError, WriteRoute};
-pub use snapshot::{DistributionSnapshot, DistributionView, SignedSnapshot};
-pub use statement::{SetRoot, SignedStatement, Statement, StatementClaim, StatementKind};
-pub use validate::DistributionError;
-
 /// At most this many key ranges per set (scale rules).
 pub const MAX_RANGES: usize = 4096;
 /// At most this many members per set.

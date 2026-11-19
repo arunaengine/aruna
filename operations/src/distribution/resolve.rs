@@ -19,12 +19,12 @@ use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::distribution::inventory::{
     IndexEntry, Position, content_prefix, index_key,
 };
-use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionSnapshot, DistributionView, MemberState, MetadataCoverage, SetHint,
-};
+use aruna_core::structs::storage::distribution::snapshot::{DistributionSnapshot, DistributionView};
+use aruna_core::structs::storage::distribution::{DataStrategy, MemberState, MetadataCoverage};
 use aruna_core::types::Key;
 use thiserror::Error;
 use ulid::Ulid;

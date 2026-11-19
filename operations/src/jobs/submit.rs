@@ -20,7 +20,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::storage::backend_import::{BackendImport, import_key};
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::distribution::DistributionView;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
 use aruna_core::user::id::UserId;

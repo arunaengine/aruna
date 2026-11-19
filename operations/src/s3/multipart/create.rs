@@ -1054,7 +1054,7 @@ mod pure_tests {
             turn,
             Err(CreateMultipartError::Distribution(
                 crate::distribution::guard::GuardError::Route(
-                    aruna_core::structs::storage::distribution::RouteError::Moving(_)
+                    aruna_core::structs::storage::distribution::route::RouteError::Moving(_)
                 )
             ))
         ));
