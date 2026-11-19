@@ -1171,3 +1171,161 @@ pub struct UploadSource {
     pub query: MarkerQuery,
 }
 
+impl MarkerSource for UploadSource {
+    type Part = UploadsPart;
+
+    fn prefix(&self) -> Option<&str> {
+        self.query.prefix.as_deref()
+    }
+
+    fn key_marker(&self) -> Option<&str> {
+        self.query.key_marker.as_deref()
+    }
+
+    fn id_marker(&self) -> Option<&str> {
+        self.query.id_marker.as_deref()
+    }
+
+    fn binding(&self) -> &DistributionBinding {
+        &self.from.binding
+    }
+
+    fn needs_fence(&self) -> bool {
+        false
+    }
+
+    fn is_local(&self, _: &DistributionSnapshot, _: Option<&LocalFence>, range: &KeyRange) -> bool {
+        range.coordinator == self.from.binding.member_id
+    }
+
+    fn call(
+        &self,
+        (snapshot, range, local): (&DistributionSnapshot, &KeyRange, bool),
+        (key, id): (Option<String>, Option<String>),
+        remaining: usize,
+    ) -> Result<IoCall, MergeError> {
+        let (query, from) = (&self.query, &self.from);
+        let set_id = from.binding.set_id;
+        if local {
+            let id = (id.as_deref().map(Ulid::from_string).transpose())
+                .map_err(|_| MergeError::Token)?;
+            return Ok(IoCall::child(LocalUploadsOperation {
+                input: Some(InventoryUploadsInput {
+                    set_id,
+                    bucket: query.bucket.clone(),
+                    prefix: query.prefix.clone(),
+                    delimiter: query.delimiter.clone(),
+                    key_marker: key,
+                    upload_id_marker: id,
+                    max_uploads: remaining,
+                    lower: range.lower.clone(),
+                    upper: range.upper.clone(),
+                }),
+                binding: from.binding.clone(),
+                step: LocalUploadsStep::List,
+            }));
+        }
+        let incomplete = || MergeError::Incomplete {
+            set_id,
+            range_id: range.range_id,
+        };
+        let coordinator = snapshot.member(range.coordinator).ok_or_else(incomplete)?;
+        let target = MemberTarget {
+            set_id,
+            range_id: range.range_id,
+            node_id: coordinator.node_id,
+        };
+        let names = ("uploads", "max-uploads", "upload-id-marker");
+        let base = query.base(names, (key, id), remaining);
+        let request = listing_request(
+            "ListMultipartUploads",
+            &query.bucket,
+            range_query(&base, range),
+        );
+        let call = MemberCallOperation::write(from.ids, from.caller.clone(), target, request);
+        let text = MemberTextOperation::of_call(call);
+        Ok(IoCall::child(RemoteUploadsOperation {
+            text: Some(text),
+            set_id,
+            range_id: range.range_id,
+        }))
+    }
+
+    fn take(&self, local: bool, result: IoResult) -> Result<MarkerPart<UploadsPart>, MergeError> {
+        if local {
+            let (listed, tags) = result.child::<LocalUploads, MergeError>()??;
+            let keys = (listed.uploads.iter())
+                .map(|upload| upload.key.clone())
+                .collect();
+            let next = listed.is_truncated.then(|| {
+                (
+                    listed.next_key_marker.clone().unwrap_or_default(),
+                    listed.next_upload_marker.map(|id| id.to_string()),
+                )
+            });
+            let prefixes = listed.common_prefixes.clone();
+            return Ok(MarkerPart {
+                part: UploadsPart::Local(listed, tags),
+                keys,
+                prefixes,
+                next,
+            });
+        }
+        let body = result.child::<String, MergeError>()??;
+        let uploads: Vec<RemoteUpload> = (xml_elements(&body, "Upload").into_iter())
+            .filter_map(|entry| {
+                Some(RemoteUpload {
+                    key: xml_field(entry, "Key")?,
+                    upload_id: xml_field(entry, "UploadId"),
+                    initiated: xml_field(entry, "Initiated"),
+                    initiator: xml_field(entry, "ID"),
+                })
+            })
+            .collect();
+        let keys = uploads.iter().map(|upload| upload.key.clone()).collect();
+        let (prefixes, next) = listed_rest(&body, "NextUploadIdMarker");
+        Ok(MarkerPart {
+            part: UploadsPart::Remote(uploads),
+            keys,
+            prefixes,
+            next,
+        })
+    }
+}
+
+/// A range's uploads at its coordinator; a silent coordinator leaves the listing incomplete.
+#[derive(Debug, PartialEq)]
+struct RemoteUploadsOperation {
+    text: Option<MemberTextOperation>,
+    set_id: Ulid,
+    range_id: Ulid,
+}
+
+impl Operation for RemoteUploadsOperation {
+    type Output = String;
+    type Error = MergeError;
+
+    fn first(&mut self) -> Result<Next<String>, MergeError> {
+        let text = self.text.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(text)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<String>, MergeError> {
+        match result.child::<String, MemberRefusal>()? {
+            Ok(body) => Ok(Next::Done(body)),
+            // A broken answer of a member that did answer is its own failure.
+            Err(MemberRefusal::Broken(reason)) => {
+                Err(MergeError::Member(MemberRefusal::Broken(reason)))
+            }
+            Err(refusal) if refusal.unreachable() => Err(MergeError::Incomplete {
+                set_id: self.set_id,
+                range_id: self.range_id,
+            }),
+            Err(refusal) => Err(MergeError::Member(refusal)),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "member_merge_tests.rs"]
+mod tests;
