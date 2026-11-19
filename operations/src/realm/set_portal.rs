@@ -17,7 +17,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, validate_portal_features};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::types::{Key, Value};
+use aruna_core::types::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
 use tracing::warn;
@@ -319,6 +319,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::types::Key;
     use aruna_drivers::driver::{DriverContext, drive};
     use tempfile::tempdir;
     use ulid::Ulid;

@@ -1029,6 +1029,12 @@ impl RequeueParkedOperation {
     }
 }
 
+impl Default for RequeueParkedOperation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Operation for RequeueParkedOperation {
     type Output = usize;
     type Error = MetadataMaterializationError;
@@ -2436,6 +2442,12 @@ impl JobsExistOperation {
     fn remove(&mut self, deletes: Vec<(String, ByteView)>) -> MaterializationTurn<bool> {
         self.stage = ExistStage::Removed;
         Ok(Next::Call(IoCall::Delete(deletes)))
+    }
+}
+
+impl Default for JobsExistOperation {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

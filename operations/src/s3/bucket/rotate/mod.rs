@@ -216,10 +216,7 @@ impl ChangeEncryptionOperation {
 
     fn read_bucket(&mut self, values: Vec<Option<Value>>) -> ChangeTurn {
         let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
-        let state = match parse_authority(keyed(&values), realm_id, group_id) {
-            Ok(state) => state,
-            Err(error) => return Err(error.into()),
-        };
+        let state = parse_authority(keyed(&values), realm_id, group_id)?;
         if !state.admins.contains(&self.input.caller) {
             return Err(ChangeError::NotAdmin);
         }
@@ -283,10 +280,7 @@ impl ChangeEncryptionOperation {
             Ok(_) => {}
             Err(error) => return Err(error.into()),
         }
-        let record = match BucketKeyRecord::from_bytes(record.as_ref()) {
-            Ok(record) => record,
-            Err(error) => return Err(error.into()),
-        };
+        let record = BucketKeyRecord::from_bytes(record.as_ref())?;
         let (mode, ..) = self.wanted();
         let key = record.key;
         let leaves_vault = mode == EncryptionMode::NodeManaged && record.vault_entry.is_none();

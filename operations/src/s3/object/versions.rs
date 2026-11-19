@@ -234,10 +234,7 @@ impl ListVersionsOperation {
             Some(prefix) => BlobHeadKey::object_prefix(&self.input.bucket, prefix),
             None => BlobHeadKey::bucket_prefix(&self.input.bucket),
         };
-        let prefix = match prefix {
-            Ok(prefix) => prefix,
-            Err(err) => return Err(err.into()),
-        };
+        let prefix = prefix?;
 
         let delimiter = self
             .input
@@ -258,10 +255,7 @@ impl ListVersionsOperation {
 
         let start = match key_marker {
             Some(key_marker) => {
-                let start_key = match BlobHeadKey::object_prefix(&self.input.bucket, key_marker) {
-                    Ok(start_key) => start_key,
-                    Err(err) => return Err(err.into()),
-                };
+                let start_key = BlobHeadKey::object_prefix(&self.input.bucket, key_marker)?;
                 if start_key.as_slice() > prefix.as_slice() && !start_key.starts_with(&prefix) {
                     self.scan_prefix = prefix;
                     return self.finish();
@@ -322,14 +316,8 @@ impl ListVersionsOperation {
 
         let round_len = values.len();
         for (key, value) in values {
-            let head = match BlobHeadKey::from_bytes(key.as_ref()) {
-                Ok(head) => head,
-                Err(err) => return Err(err.into()),
-            };
-            let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
-                Ok(pointer) => pointer,
-                Err(err) => return Err(err.into()),
-            };
+            let head = BlobHeadKey::from_bytes(key.as_ref())?;
+            let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
             self.pending_heads.push_back((head.key, pointer.version_id));
         }
 
@@ -357,19 +345,18 @@ impl ListVersionsOperation {
                 return self.issue_head_round();
             };
 
-            self.last_head_key = match BlobHeadKey::object_prefix(&self.input.bucket, &key) {
-                Ok(bytes) => Some(bytes),
-                Err(err) => return Err(err.into()),
+            self.last_head_key = {
+                let bytes = BlobHeadKey::object_prefix(&self.input.bucket, &key)?;
+                Some(bytes)
             };
 
             match common_prefix_of(&key, self.prefix_str(), self.input.delimiter.as_deref()) {
                 Some(group) => {
                     let already_emitted = self.prefixes.already_emitted(&group);
-                    self.cursor_group_prefix =
-                        match BlobHeadKey::object_prefix(&self.input.bucket, &group) {
-                            Ok(bytes) => Some(bytes),
-                            Err(err) => return Err(err.into()),
-                        };
+                    self.cursor_group_prefix = {
+                        let bytes = BlobHeadKey::object_prefix(&self.input.bucket, &group)?;
+                        Some(bytes)
+                    };
                     if already_emitted {
                         continue;
                     }
@@ -393,10 +380,7 @@ impl ListVersionsOperation {
     }
 
     fn issue_version_iter(&mut self, key: &str) -> VersionsTurn {
-        let prefix = match VersionKey::object_prefix(&self.input.bucket, key) {
-            Ok(prefix) => prefix,
-            Err(err) => return Err(err.into()),
-        };
+        let prefix = VersionKey::object_prefix(&self.input.bucket, key)?;
         self.state = ListVersionsState::ReadVersionsKey;
         Ok(Next::Call(IoCall::Page {
             space: BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -427,14 +411,8 @@ impl ListVersionsOperation {
         }
 
         for (version_key, value) in values {
-            let version_key = match VersionKey::from_bytes(version_key.as_ref()) {
-                Ok(version_key) => version_key,
-                Err(err) => return Err(err.into()),
-            };
-            let version = match BlobVersion::from_bytes(value.as_ref()) {
-                Ok(version) => version,
-                Err(err) => return Err(err.into()),
-            };
+            let version_key = VersionKey::from_bytes(version_key.as_ref())?;
+            let version = BlobVersion::from_bytes(value.as_ref())?;
             self.version_window
                 .push_back((version_key.version_id, version));
         }
@@ -519,10 +497,7 @@ impl ListVersionsOperation {
                         VersionKey::new(self.input.bucket.clone(), key.clone(), version_id),
                         backend,
                     );
-                    let bytes = match copy_key.to_bytes() {
-                        Ok(bytes) => bytes,
-                        Err(error) => return Err(error.into()),
-                    };
+                    let bytes = copy_key.to_bytes()?;
                     location_reads.push((MANAGED_COPY_KEYSPACE.to_string(), bytes.into()));
                     Some((copy_key, version.placement_policies.clone()))
                 }
@@ -606,10 +581,7 @@ impl ListVersionsOperation {
                     let Some(value) = value else {
                         continue;
                     };
-                    let location = match BackendLocation::from_bytes(value.as_ref()) {
-                        Ok(location) => location,
-                        Err(err) => return Err(err.into()),
-                    };
+                    let location = BackendLocation::from_bytes(value.as_ref())?;
                     // A governed head this node cannot answer for is still
                     // listed, but without describing bytes it may not serve.
                     let described = governed.is_none_or(|(copy_key, refs)| {

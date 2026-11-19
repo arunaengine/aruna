@@ -16,7 +16,6 @@ use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH,
 };
-use aruna_core::rows::values;
 #[cfg(test)]
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::storage_entries::{
@@ -25,7 +24,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, ReplicaQuota};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::types::{Key, Value};
+use aruna_core::types::Value;
 use thiserror::Error;
 use tracing::warn;
 
@@ -407,6 +406,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         GroupQuotaOverride, RealmConfigDocument, RealmId, RealmNodeKind, UserCapOverride,
     };
+    use aruna_core::types::Key;
     use aruna_drivers::driver::{DriverContext, drive};
     use tempfile::tempdir;
     use ulid::Ulid;

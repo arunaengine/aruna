@@ -874,7 +874,7 @@ async fn file_keys(
         Some(prefix),
         INTENT_PAGE,
     );
-    let intents = drive(scan, &context)
+    let intents = drive(scan, context)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     // More pending writes than one page leave the path unresolved, as before.
@@ -893,7 +893,7 @@ async fn file_keys(
         Some(prefix),
         INTENT_PAGE,
     );
-    let intents = drive(scan, &context)
+    let intents = drive(scan, context)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     // More pending writes than one page leave the path unresolved, as before.

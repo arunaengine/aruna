@@ -318,10 +318,7 @@ impl MigrateVersionOperation {
         let Some(value) = value else {
             return self.skip();
         };
-        let version = match BlobVersion::from_bytes(value.as_ref()) {
-            Ok(version) => version,
-            Err(error) => return Err(error.into()),
-        };
+        let version = BlobVersion::from_bytes(value.as_ref())?;
         if let Some(routing) = self.routing.as_ref() {
             match place(routing, &self.version_key) {
                 Ok((resolved, plain)) => (self.resolved, self.plain) = (Some(resolved), plain),
@@ -344,10 +341,7 @@ impl MigrateVersionOperation {
         let Some(value) = value else {
             return self.skip();
         };
-        let old = match BackendLocation::from_bytes(value.as_ref()) {
-            Ok(old) => old,
-            Err(error) => return Err(error.into()),
-        };
+        let old = BackendLocation::from_bytes(value.as_ref())?;
         self.renaming = match (self.routing.as_ref(), self.plain.as_ref()) {
             (Some(routing), Some(plain)) => {
                 renames(routing, &self.earlier, plain, &old, &self.version_key)
@@ -396,13 +390,13 @@ impl MigrateVersionOperation {
         }
         // Only the record of this version's write names its bytes.
         let id = self.version_key.version_id;
-        match row.map(|row| ImportedObject::from_bytes(&row)).transpose() {
-            Ok(row) => {
-                self.source_etag = row
-                    .filter(|row| row.version_id == id)
-                    .and_then(|row| row.etag)
-            }
-            Err(error) => return Err(error.into()),
+        {
+            let row = row
+                .map(|row| ImportedObject::from_bytes(&row))
+                .transpose()?;
+            self.source_etag = row
+                .filter(|row| row.version_id == id)
+                .and_then(|row| row.etag)
         }
         self.find_target()
     }
@@ -498,13 +492,9 @@ impl MigrateVersionOperation {
     /// A new name the rule records for another key or version is taken, so the rename asks
     /// the provider nothing.
     fn check_name(&mut self, value: Option<Value>) -> Turn {
-        let row = match value
+        let row = value
             .map(|value| ImportedObject::from_bytes(&value))
-            .transpose()
-        {
-            Ok(row) => row,
-            Err(error) => return Err(error.into()),
-        };
+            .transpose()?;
         let (Some(plain), Some(routing)) = (self.plain.as_ref(), self.routing.as_ref()) else {
             return Err(MigrateVersionError::NotFinished);
         };
@@ -977,9 +967,9 @@ impl MigrateVersionOperation {
         };
         // Rules of other buckets count too: they may read the same linked folder.
         for (_, value) in values {
-            match BackendImport::from_bytes(value.as_ref()) {
-                Ok(rule) => routing.imports.push(rule),
-                Err(error) => return Err(error.into()),
+            {
+                let rule = BackendImport::from_bytes(value.as_ref())?;
+                routing.imports.push(rule)
             }
         }
         if next.is_some() {
@@ -1024,9 +1014,9 @@ impl MigrateVersionOperation {
             Some(Err(error)) => return Err(error.into()),
             None => None,
         };
-        let encrypting = match BucketEncryption::from_row(settings.as_deref()) {
-            Ok(settings) => settings.is_encrypted(),
-            Err(error) => return Err(error.into()),
+        let encrypting = {
+            let settings = BucketEncryption::from_row(settings.as_deref())?;
+            settings.is_encrypted()
         };
         if current != Some(self.target) || encrypting {
             return self.skip();
@@ -1082,10 +1072,7 @@ impl MigrateVersionOperation {
     /// serve; the placement the gate admitted stays the same, since the backend does not change.
     /// A copy that cannot serve yet fails, so a retry pass moves it after revalidation.
     fn handle_copy(&mut self, value: Option<Value>) -> Turn {
-        let copy = match check_serveable(value.as_ref().map(|value| value.as_ref())) {
-            Ok(copy) => copy,
-            Err(error) => return Err(error.into()),
-        };
+        let copy = check_serveable(value.as_ref().map(|value| value.as_ref()))?;
         if !(self.old.as_ref()).is_some_and(|old| copy.location.same_object(old)) {
             return Err(ManagedCopyError::Mismatched.into());
         }
@@ -1094,10 +1081,7 @@ impl MigrateVersionOperation {
     }
 
     fn read_target(&mut self) -> Turn {
-        let key = match self.target_key() {
-            Ok(key) => key,
-            Err(error) => return Err(error),
-        };
+        let key = self.target_key()?;
         let claim =
             (self.adopt_claim.clone()).map(|claim| (DELETE_CLAIM_KEYSPACE.to_string(), claim));
         let target = (BLOB_LOCATIONS_KEYSPACE.to_string(), key.to_bytes().into());

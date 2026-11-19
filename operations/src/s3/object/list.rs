@@ -250,14 +250,9 @@ impl ListBucketOperation {
             Some(key_prefix) => BlobHeadKey::object_prefix(&self.input.bucket, key_prefix),
             None => BlobHeadKey::bucket_prefix(&self.input.bucket),
         };
-        let prefix = match prefix {
-            Ok(prefix) => prefix,
-            Err(err) => return Err(err.into()),
-        };
+        let prefix = prefix?;
         let iter_start_key = if let Some(token) = self.input.continuation_token.clone() {
-            if let Err(error) = self.resume_scan_state(&token) {
-                return Err(error);
-            }
+            self.resume_scan_state(&token)?;
             Some(token.last_key)
         } else {
             match self
@@ -267,10 +262,8 @@ impl ListBucketOperation {
                 .filter(|start_after| !start_after.is_empty())
             {
                 Some(start_after) => {
-                    match BlobHeadKey::object_prefix(&self.input.bucket, start_after) {
-                        Ok(key) => Some(key),
-                        Err(err) => return Err(err.into()),
-                    }
+                    let key = BlobHeadKey::object_prefix(&self.input.bucket, start_after)?;
+                    Some(key)
                 }
                 None => None,
             }
@@ -284,9 +277,7 @@ impl ListBucketOperation {
 
         self.scan_prefix = prefix;
         self.last_consumed_key = iter_start_key;
-        if let Err(error) = self.apply_bounds() {
-            return Err(error);
-        }
+        self.apply_bounds()?;
         self.issue_scan_round()
     }
 
@@ -437,14 +428,8 @@ impl ListBucketOperation {
                 continue;
             }
 
-            let head = match BlobHeadKey::from_bytes(key.as_ref()) {
-                Ok(head) => head,
-                Err(err) => return Err(err.into()),
-            };
-            let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
-                Ok(pointer) => pointer,
-                Err(err) => return Err(err.into()),
-            };
+            let head = BlobHeadKey::from_bytes(key.as_ref())?;
+            let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
             candidates.push((head, pointer.version_id, key.to_vec()));
         }
 
@@ -466,10 +451,7 @@ impl ListBucketOperation {
                     .map(|key| (BLOB_VERSIONS_KEYSPACE.to_string(), key.into()))
             })
             .collect::<Result<Vec<_>, _>>();
-        let reads = match reads {
-            Ok(reads) => reads,
-            Err(err) => return Err(err.into()),
-        };
+        let reads = reads?;
 
         self.round_candidates = candidates;
         self.state = ListBucketState::ReadVersions;
@@ -485,10 +467,10 @@ impl ListBucketOperation {
         let max_keys = self.max_keys();
         for ((head, version_id, key_bytes), value) in candidates.into_iter().zip(values) {
             let version = match value {
-                Some(value) => match BlobVersion::from_bytes(value.as_ref()) {
-                    Ok(version) => Some(version),
-                    Err(err) => return Err(err.into()),
-                },
+                Some(value) => {
+                    let version = BlobVersion::from_bytes(value.as_ref())?;
+                    Some(version)
+                }
                 None => None,
             };
             // A missing version is an inconsistency; treat it like a delete
@@ -504,18 +486,14 @@ impl ListBucketOperation {
                     if already_emitted {
                         // The group is already represented; advance past this key.
                         self.prefixes.set_resume(None);
-                        if let Err(err) = self.enter_cursor_group(&group, &key_bytes) {
-                            return Err(err);
-                        }
+                        self.enter_cursor_group(&group, &key_bytes)?;
                     } else if live {
                         if self.emitted() >= max_keys {
                             return self.truncate_scan();
                         }
                         self.prefixes.set_resume(None);
                         self.prefixes.push(group.clone());
-                        if let Err(err) = self.enter_cursor_group(&group, &key_bytes) {
-                            return Err(err);
-                        }
+                        self.enter_cursor_group(&group, &key_bytes)?;
                     } else {
                         // No live sibling yet: emit nothing and do not seek
                         // past, so a later live key can surface the prefix.
@@ -595,10 +573,7 @@ impl ListBucketOperation {
                                 VersionKey::new(&head.bucket, &head.key, version_id),
                                 backend,
                             );
-                            let bytes = match copy_key.to_bytes() {
-                                Ok(bytes) => bytes,
-                                Err(error) => return Err(error.into()),
-                            };
+                            let bytes = copy_key.to_bytes()?;
                             self.location_reads
                                 .push((MANAGED_COPY_KEYSPACE.to_string(), bytes.into()));
                             Some((copy_key, version.placement_policies.clone()))
@@ -658,10 +633,7 @@ impl ListBucketOperation {
                     let Some(value) = value else {
                         continue;
                     };
-                    let location = match BackendLocation::from_bytes(value.as_ref()) {
-                        Ok(location) => location,
-                        Err(err) => return Err(err.into()),
-                    };
+                    let location = BackendLocation::from_bytes(value.as_ref())?;
                     // A governed head this node cannot answer for is still
                     // listed, but without describing bytes it may not serve.
                     let described = governed.is_none_or(|(copy_key, refs)| {

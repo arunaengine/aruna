@@ -903,6 +903,24 @@ async fn pid_request(
     drive(route, ctx).await
 }
 
+/// The holder that should serve `document_id`, or `None` to serve it here: this node holds
+/// no registry record of it, no holder is a fresh candidate, or this node was chosen. Of two
+/// random fresh holders, the one with more free download slots wins; it never chooses again.
+async fn choose_holder(
+    context: &DriverContext,
+    local_node_id: NodeId,
+    document_id: Ulid,
+    now_ms: u64,
+) -> Option<HolderCandidate> {
+    let record = drive(DocumentRecordOperation::new(document_id), context)
+        .await
+        .ok()??;
+    let choice = HolderChoiceOperation::new(&record.holder_node_ids, now_ms);
+    let candidates = drive(choice, context).await.unwrap_or_default();
+    pick(candidates, Ulid::generate().random())
+        .filter(|chosen| chosen.node_id != local_node_id && chosen.urls.api.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,22 +1355,4 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{rest}");
         }
     }
-}
-
-/// The holder that should serve `document_id`, or `None` to serve it here: this node holds
-/// no registry record of it, no holder is a fresh candidate, or this node was chosen. Of two
-/// random fresh holders, the one with more free download slots wins; it never chooses again.
-async fn choose_holder(
-    context: &DriverContext,
-    local_node_id: NodeId,
-    document_id: Ulid,
-    now_ms: u64,
-) -> Option<HolderCandidate> {
-    let record = drive(DocumentRecordOperation::new(document_id), context)
-        .await
-        .ok()??;
-    let choice = HolderChoiceOperation::new(&record.holder_node_ids, now_ms);
-    let candidates = drive(choice, context).await.unwrap_or_default();
-    pick(candidates, Ulid::generate().random())
-        .filter(|chosen| chosen.node_id != local_node_id && chosen.urls.api.is_some())
 }

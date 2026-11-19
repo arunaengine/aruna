@@ -596,12 +596,12 @@ impl ProjectEventsOperation {
             return Ok(Flow::Continue);
         };
         let realm_id = current.event.record.realm_id;
-        if !self.realm_configs.contains_key(&realm_id) {
+        if let std::collections::btree_map::Entry::Vacant(e) = self.realm_configs.entry(realm_id) {
             let Some(result) = answer else {
                 return Ok(Flow::Call(IoCall::child(GetConfigOperation::new(realm_id))));
             };
             let config = optional_config(result.child::<RealmConfigDocument, GetConfigError>()?)?;
-            self.realm_configs.insert(realm_id, config);
+            e.insert(config);
         }
         let kind = self
             .config_for(&realm_id)
