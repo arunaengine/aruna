@@ -5,14 +5,14 @@
 use std::sync::Arc;
 
 use aruna_core::errors::StorageError;
-use aruna_core::plugins::{MAX_ARTIFACT, PublishedPlugin};
+use aruna_core::plugins::{MAX_ARTIFACT, MemoryPermit, PublishedPlugin};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::plugins::artifacts::ArtifactError;
-use aruna_operations::plugins::copies::{MemoryPermit, reserve};
+use aruna_operations::plugins::copies::ReserveMemory;
 use aruna_operations::plugins::publish::{
     CheckPublish, EntryError, FinishPublish, PublishError, PublishStep,
 };
@@ -187,7 +187,9 @@ pub(crate) async fn read_upload(
             "artifact uploads use this node's memory; retry later".into(),
         )
     };
-    let memory = reserve(declared.unwrap_or(MAX_ARTIFACT)).ok_or_else(busy)?;
+    let reserve = ReserveMemory::new(declared.unwrap_or(MAX_ARTIFACT) as u64);
+    let reserved = drive(reserve, state.get_ctx().as_ref()).await;
+    let memory = reserved.ok().flatten().ok_or_else(busy)?;
     let limit = declared.unwrap_or(MAX_ARTIFACT);
     let body = axum::body::to_bytes(request.into_body(), limit)
         .await

@@ -3,13 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::plugin_installs::InstallGuard;
+use aruna_core::plugin_installs::{InstallGuard, PluginInstall};
+use aruna_core::plugins::{PluginEffect, PluginEvent};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
@@ -75,35 +78,62 @@ impl Operation for PluginAccounts {
     }
 }
 
-/// When this node first saw each unnamed account; a restart starts the grace again.
-static SEEN: LazyLock<Mutex<HashMap<UserId, u64>>> = LazyLock::new(Default::default);
-
-/// The accounts no record names that have stayed unnamed for the grace period.
-fn due_accounts(
+/// The accounts no record names, and the ones a record names, which forget when they were
+/// first seen unnamed.
+fn split_accounts(
     config: &RealmConfigDocument,
     accounts: Vec<(Ulid, User)>,
-    now_ms: u64,
-) -> VecDeque<(Ulid, UserId)> {
-    let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut due = VecDeque::new();
+) -> (Vec<(Ulid, UserId)>, Vec<UserId>) {
+    let (mut unnamed, mut named) = (Vec::new(), Vec::new());
     for (install_id, user) in accounts {
-        let named = (config.installs.iter())
-            .any(|install| install.install_id == install_id && install.account == user.user_id);
-        if named {
-            seen.remove(&user.user_id);
-            continue;
-        }
-        let first = *seen.entry(user.user_id).or_insert(now_ms);
-        if now_ms.saturating_sub(first) >= ORPHAN_GRACE_MS {
-            due.push_back((install_id, user.user_id));
+        let names = |install: &&PluginInstall| {
+            install.install_id == install_id && install.account == user.user_id
+        };
+        match config.installs.iter().any(|install| names(&install)) {
+            true => named.push(user.user_id),
+            false => unnamed.push((install_id, user.user_id)),
         }
     }
-    due
+    (unnamed, named)
+}
+
+/// The call that asks the plugin host when each unnamed account was first seen.
+fn first_seen(unnamed: &[(Ulid, UserId)], named: Vec<UserId>, now_ms: u64) -> IoCall {
+    let unnamed = unnamed.iter().map(|(_, account)| *account).collect();
+    let effect = Effect::Plugin(PluginEffect::FirstSeen {
+        named,
+        unnamed,
+        now_ms,
+    });
+    IoCall::Effect(Box::new(effect))
+}
+
+/// The unnamed accounts that have stayed unnamed for the grace period, from when the plugin
+/// host first saw each; a restart starts the grace again.
+fn due_accounts(
+    unnamed: Vec<(Ulid, UserId)>,
+    result: IoResult,
+    now_ms: u64,
+) -> Result<VecDeque<(Ulid, UserId)>, IoError> {
+    let expected = "Event::Plugin(PluginEvent::Seen)";
+    let IoResult::Event(event) = result else {
+        let got = result.label();
+        return Err(IoError::Unexpected { expected, got });
+    };
+    let Event::Plugin(PluginEvent::Seen(seen)) = *event else {
+        let got = event.label();
+        return Err(IoError::Unexpected { expected, got });
+    };
+    Ok((unnamed.into_iter().zip(seen))
+        .filter(|(_, first)| now_ms.saturating_sub(*first) >= ORPHAN_GRACE_MS)
+        .map(|(account, _)| account)
+        .collect())
 }
 
 #[derive(Debug, PartialEq)]
 enum SweepPhase {
     Accounts,
+    Seen(Vec<(Ulid, UserId)>),
     Admin(VecDeque<(Ulid, UserId)>),
     Status(UserId, VecDeque<(Ulid, UserId)>),
 }
@@ -176,7 +206,13 @@ impl Operation for SweepOrphans {
         match std::mem::replace(&mut self.phase, SweepPhase::Accounts) {
             SweepPhase::Accounts => {
                 let accounts = result.child::<Vec<(Ulid, User)>, StoreError>()??;
-                let due = due_accounts(&self.config, accounts, self.now_ms);
+                let (unnamed, named) = split_accounts(&self.config, accounts);
+                let seen = first_seen(&unnamed, named, self.now_ms);
+                self.phase = SweepPhase::Seen(unnamed);
+                Ok(Next::Call(seen))
+            }
+            SweepPhase::Seen(unnamed) => {
+                let due = due_accounts(unnamed, result, self.now_ms)?;
                 if due.is_empty() {
                     return Ok(Next::Done(0));
                 }
@@ -272,12 +308,31 @@ mod tests {
         VecDeque::from([(install.install_id, install.account)])
     }
 
+    fn seen(times: Vec<u64>) -> IoResult {
+        IoResult::Event(Box::new(Event::Plugin(PluginEvent::Seen(times))))
+    }
+
     #[test]
     fn sweep_without_accounts() {
         let mut sweep = orphan_sweep();
         assert!(fixtures::is_child(&sweep.first()));
         let none = child_result(Ok::<_, StoreError>(Vec::<(Ulid, User)>::new()));
-        assert_eq!(sweep.next(none), Ok(Next::Done(0)));
+        let asked = sweep.next(none);
+        assert!(matches!(asked, Ok(Next::Call(IoCall::Effect(_)))));
+        assert_eq!(sweep.next(seen(Vec::new())), Ok(Next::Done(0)));
+    }
+
+    #[test]
+    fn sweep_waits_grace() {
+        // An account first seen unnamed now waits the grace period before it is swept.
+        let install = fixtures::install();
+        let mut sweep = orphan_sweep();
+        sweep.phase = SweepPhase::Seen(vec![(install.install_id, install.account)]);
+        assert_eq!(sweep.next(seen(vec![5_000])), Ok(Next::Done(0)));
+        let mut late = orphan_sweep();
+        late.now_ms = ORPHAN_GRACE_MS + 5_000;
+        late.phase = SweepPhase::Seen(vec![(install.install_id, install.account)]);
+        assert!(fixtures::is_child(&late.next(seen(vec![5_000]))));
     }
 
     #[test]

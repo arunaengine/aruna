@@ -11,6 +11,7 @@ use super::*;
 use crate::jobs::repository::test_support::registry_record;
 use crate::metadata::api::list_types::ListedMetadataDocument;
 use crate::plugins::fixtures::{self, config_result, is_child, node};
+use crate::plugins::rate::tests::rate_answer;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::submit::CopyRequest;
@@ -97,7 +98,15 @@ fn fresh() -> IoResult {
 fn admit_passes_install() {
     let mut admit = AdmitCall::new(&scope(), None);
     assert!(is_child(&admit.first()));
-    assert_eq!(admit.next(checked_install()), Ok(Next::Done(install())));
+    // The checked call is counted against the install's rate before it may run.
+    let counted = admit.next(checked_install());
+    assert!(matches!(counted, Ok(Next::Call(IoCall::Effect(_)))));
+    assert_eq!(admit.next(rate_answer(true)), Ok(Next::Done(install())));
+    let mut fast = AdmitCall::new(&scope(), None);
+    fast.first().unwrap();
+    fast.next(checked_install()).unwrap();
+    let limited = fast.next(rate_answer(false));
+    assert!(matches!(limited, Err(CallError(error)) if error.kind == ErrorKind::Limit));
     let mut refused = AdmitCall::new(&scope(), None);
     refused.first().unwrap();
     let answer = child_result(Err::<PluginInstall, _>(refusal()));
@@ -109,14 +118,16 @@ fn granted_restricts_account() {
     let target = format!("{}/doc", meta_root());
     let mut call = GrantedCall::target(&scope(), Permission::MetadataRead, &target);
     assert!(is_child(&call.first()));
-    let Ok(Next::Done(access)) = call.next(checked_install()) else {
+    call.next(checked_install()).unwrap();
+    let Ok(Next::Done(access)) = call.next(rate_answer(true)) else {
         panic!("a covered target is granted");
     };
     assert!(access.auth.path_restrictions.is_some());
     let other = "/elsewhere";
     let mut call = GrantedCall::target(&scope(), Permission::MetadataRead, other);
     call.first().unwrap();
-    assert!(call.next(checked_install()).is_err());
+    call.next(checked_install()).unwrap();
+    assert!(call.next(rate_answer(true)).is_err());
 }
 
 #[test]

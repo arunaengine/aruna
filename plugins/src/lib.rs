@@ -7,6 +7,7 @@
 pub mod authored;
 #[cfg(feature = "build")]
 mod bundle;
+pub mod host_state;
 #[cfg(feature = "build")]
 pub mod package;
 

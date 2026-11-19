@@ -8,14 +8,14 @@ use std::collections::{BTreeSet, VecDeque};
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::plugins::{ArtifactBytes, Chunk, PublishedPlugin};
+use aruna_core::plugins::{ArtifactBytes, Chunk, MemoryPermit, PublishedPlugin};
 use aruna_core::realm_vault::FetchScope;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use super::copies::{Assembled, MemoryPermit, reserve};
+use super::copies::{Assembled, reserve_call, reserved};
 use super::copy_rows::{
     CopyTotal, KeepChunk, ReadChunk, ReadLocal, SweepCopies, chunk_count, chunk_fits,
 };
@@ -106,6 +106,8 @@ pub struct FetchArtifact {
     plugin: PublishedPlugin,
     peers: VecDeque<NodeId>,
     asked: Option<NodeId>,
+    /// The first chunk of a peer, waiting for its memory.
+    reserving: Option<(NodeId, Chunk)>,
     arriving: Option<Arriving>,
     last: String,
     local_read: bool,
@@ -126,6 +128,7 @@ impl FetchArtifact {
                 .filter(|node| Some(*node) != local)
                 .collect(),
             asked: None,
+            reserving: None,
             arriving: None,
             last: "the realm has no other management node".to_string(),
             local_read: false,
@@ -171,16 +174,33 @@ impl FetchArtifact {
             return self.peer_failed(node, MetadataReadError::Forbidden);
         }
         if self.arriving.is_none() {
-            let Some(memory) = reserve(chunk.total as usize) else {
-                return self.peer_failed(node, MetadataReadError::Unavailable);
-            };
-            self.arriving = Some(Arriving {
-                node,
-                total: chunk.total,
-                bytes: Vec::with_capacity(chunk.total as usize),
-                memory,
-            });
+            let reserve = reserve_call(chunk.total);
+            self.reserving = Some((node, chunk));
+            return Ok(Next::Call(reserve));
         }
+        self.append(node, chunk)
+    }
+
+    /// Holds the first chunk's memory, or leaves the peer when the node's budget is spent.
+    fn reserved_first(&mut self, result: IoResult) -> Result<Next<FetchedArtifact>, ArtifactError> {
+        let (node, chunk) = self.reserving.take().ok_or(IoError::Unfinished)?;
+        let Some(memory) = reserved(result)? else {
+            return self.peer_failed(node, MetadataReadError::Unavailable);
+        };
+        self.arriving = Some(Arriving {
+            node,
+            total: chunk.total,
+            bytes: Vec::with_capacity(chunk.total as usize),
+            memory,
+        });
+        self.append(node, chunk)
+    }
+
+    fn append(
+        &mut self,
+        node: NodeId,
+        chunk: Chunk,
+    ) -> Result<Next<FetchedArtifact>, ArtifactError> {
         let arriving = self.arriving.as_mut().ok_or(IoError::Unfinished)?;
         arriving.bytes.extend(chunk.bytes.0);
         if index + 1 < chunk_count(arriving.total) {
@@ -221,6 +241,9 @@ impl Operation for FetchArtifact {
                 return Ok(Next::Done(FetchedArtifact { copy, fresh }));
             }
             return self.next_peer();
+        }
+        if self.reserving.is_some() {
+            return self.reserved_first(result);
         }
         let node = self.asked.ok_or(IoError::Unfinished)?;
         match peer_answer(node, result)? {

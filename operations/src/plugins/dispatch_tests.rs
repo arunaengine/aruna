@@ -220,6 +220,7 @@ mod operations {
     use super::*;
     use crate::plugins::bound::NodeCheckFailure;
     use crate::plugins::fixtures::{self, config_result, is_child};
+    use crate::plugins::rate::tests::rate_answer;
     use crate::plugins::rows::tests::child_result;
     use crate::users::service_account::check::ServiceCheckError;
     use aruna_core::plugin_installs::SecretBinding;
@@ -337,7 +338,10 @@ mod operations {
         let mut hook = VerifyHook::new(place, install.install_id, hook_request(), 5_000);
         hook.first().unwrap();
         let config = fixtures::config(&install, webhook("header"));
-        assert!(is_child(&hook.next(config_result(config))));
+        // The request is counted against the install's webhook rate before its secret is asked.
+        let counted = hook.next(config_result(config));
+        assert!(matches!(counted, Ok(Next::Call(IoCall::Effect(_)))));
+        assert!(is_child(&hook.next(rate_answer(true))));
         let gone = ReleaseFailure(ReleaseError::Unavailable("no".into()));
         let answer = hook.next(child_result(Err::<Released, _>(gone)));
         assert!(matches!(answer, Err(HookError::Unavailable(_))));
