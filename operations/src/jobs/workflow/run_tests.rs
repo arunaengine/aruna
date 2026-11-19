@@ -24,7 +24,10 @@ fn wiring() -> RunWiring {
 
 fn resolve() -> ResolveBackendOperation {
     let mut resolve = ResolveBackendOperation::new(&spec(), job());
-    let select = ComputeEffect::Select { constraint: None };
+    let select = ComputeEffect::Select {
+        backend: None,
+        constraint: None,
+    };
     assert_eq!(resolve.first(), Ok(Next::Call(compute_call(select))));
     resolve
 }
@@ -48,6 +51,9 @@ fn reservation(subject_generation: u64) -> JobReservationRecord {
         created_at_ms: 1,
         subject_generation,
         subject_digest: [4; 32],
+        backend: "docker".to_string(),
+        config_generation: 1,
+        config_digest: [0; 32],
     }
 }
 
@@ -98,6 +104,7 @@ fn unfenced_receipt_named() {
     let expected = ResolvedBackend {
         facts: facts(),
         receipted: Some(control().execution_id),
+        config_generation: 1,
     };
     assert_eq!(
         reading_held().next(held(vec![reservation(0)])),
@@ -127,6 +134,7 @@ fn fenced_at() -> ResolveBackendOperation {
     let mut resolve = ResolveBackendOperation::new(&spec(), job());
     resolve.receipted = Some(control().execution_id);
     resolve.stored = (2, [4; 32]);
+    resolve.config = (1, [0; 32]);
     resolve.current_generation = 3;
     resolve.step = ResolveStep::Fenced;
     resolve
@@ -138,6 +146,7 @@ fn fence_answers_judged() {
     let expected = ResolvedBackend {
         facts: facts(),
         receipted: Some(control().execution_id),
+        config_generation: 1,
     };
     let fits = compute(ComputeAnswer::Fenced(Ok(facts())));
     assert_eq!(fenced_at().next(fits), Ok(Next::Done(expected)));
@@ -151,6 +160,27 @@ fn fence_answers_judged() {
     let refused = compute(ComputeAnswer::Fenced(Err(lost())));
     let message = format!("no eligible executor for job: {}", lost());
     assert_eq!(fenced_at().next(refused), Err(JobError::permanent(message)));
+    // A backend whose config changed since the receipt may change back or be replaced.
+    let changed = BackendFacts {
+        config_digest: [7; 32],
+        ..facts()
+    };
+    let changed = compute(ComputeAnswer::Fenced(Ok(changed)));
+    let message =
+        "compute backend docker changed its config since the receipt (stored generation 1)";
+    assert_eq!(fenced_at().next(changed), Err(JobError::retryable(message)));
+}
+
+// The backend admission named is a local gap when it is gone, never a verdict on the job.
+#[test]
+fn named_backend_missing() {
+    let mut named = spec();
+    named.backend = Some("lab".to_string());
+    let mut resolve = ResolveBackendOperation::new(&named, job());
+    resolve.first().unwrap();
+    let message = "compute backend lab is not available here";
+    let none = compute(ComputeAnswer::Selected(None));
+    assert_eq!(resolve.next(none), Err(JobError::retryable(message)));
 }
 
 fn settle() -> SettleScope {
@@ -251,7 +281,7 @@ fn resolving_image() -> ExecutionRunOperation {
         Ok(Next::Call(IoCall::child(write)))
     );
     let image = ComputeEffect::ResolveImage {
-        kind: facts().kind,
+        backend: facts().name,
         image: spec().image,
     };
     assert_eq!(run.next(stored()), Ok(Next::Call(compute_call(image))));
@@ -262,7 +292,7 @@ fn resolving_image() -> ExecutionRunOperation {
 fn granting() -> ExecutionRunOperation {
     let mut run = resolving_image();
     let granted = ComputeEffect::Granted {
-        kind: facts().kind,
+        backend: facts().name,
         spec: Box::new(task()),
     };
     assert_eq!(

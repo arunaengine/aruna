@@ -39,8 +39,24 @@ fn in_bucket() -> JobRecord {
     job
 }
 
+fn select_backend() -> Next<PreparedTask> {
+    let select = ComputeEffect::Select {
+        backend: None,
+        constraint: None,
+    };
+    Next::Call(compute_call(select))
+}
+
 fn read_endpoint() -> Next<PreparedTask> {
-    Next::Call(compute_call(ComputeEffect::Endpoint))
+    let backend = "docker".to_string();
+    Next::Call(compute_call(ComputeEffect::Endpoint { backend }))
+}
+
+/// A preparation past its backend selection, about to read the endpoints.
+fn begun(prepare: &mut PrepareAttemptOperation) {
+    assert_eq!(prepare.first(), Ok(select_backend()));
+    let selected = compute(ComputeAnswer::Selected(Some(facts())));
+    assert_eq!(prepare.next(selected), Ok(read_endpoint()));
 }
 
 fn address(endpoint: Option<&str>, session_endpoint: Option<&str>) -> IoResult {
@@ -65,7 +81,7 @@ fn credential() -> WorkspaceCredential {
 
 /// A preparation that has read the node's endpoints and loaded no inputs.
 fn loaded_with(mut prepare: PrepareAttemptOperation, endpoint: IoResult) -> PrepareNext {
-    assert_eq!(prepare.first(), Ok(read_endpoint()));
+    begun(&mut prepare);
     assert!(is_child(&prepare.next(endpoint)));
     prepare.next(loaded())
 }
@@ -90,10 +106,10 @@ fn recovery_skips_authorization() {
     first.first().unwrap();
     assert_eq!(
         first.next(child(Ok::<(), JobError>(()))),
-        Ok(read_endpoint())
+        Ok(select_backend())
     );
     let mut recovery = prepare_of(spec(), in_bucket(), BUCKET, false);
-    assert_eq!(recovery.first(), Ok(read_endpoint()));
+    assert_eq!(recovery.first(), Ok(select_backend()));
 }
 
 // A run bound to one executor reads what that backend can do.
@@ -102,10 +118,12 @@ fn constrained_backend_read() {
     let mut constrained = spec();
     constrained.executor_constraint = Some("docker".to_string());
     let mut prepare = prepare_of(constrained, record(), "", false);
-    let kind = ExecutorKind::Docker;
-    let read = compute_call(ComputeEffect::Facts { kind });
+    let read = compute_call(ComputeEffect::Select {
+        backend: None,
+        constraint: Some(ExecutorKind::Docker),
+    });
     assert_eq!(prepare.first(), Ok(Next::Call(read)));
-    let answer = compute(ComputeAnswer::Facts(facts()));
+    let answer = compute(ComputeAnswer::Selected(Some(facts())));
     assert_eq!(prepare.next(answer), Ok(read_endpoint()));
     assert_eq!(prepare.facts, Some(facts()));
 }
@@ -114,7 +132,7 @@ fn constrained_backend_read() {
 #[test]
 fn plain_run_prepared() {
     let mut prepare = prepare_of(spec(), record(), "", false);
-    prepare.first().unwrap();
+    begun(&mut prepare);
     let job = Arc::new(record());
     let load = LoadInputsOperation::new(run(), &spec(), job, &BTreeSet::new());
     assert_eq!(
@@ -152,7 +170,7 @@ fn session_needs_workspace() {
 #[test]
 fn session_credential_bound() {
     let mut prepare = prepare_of(session_spec(), record(), BUCKET, false);
-    prepare.first().unwrap();
+    begun(&mut prepare);
     prepare
         .next(address(Some("http://s3"), Some("http://session")))
         .unwrap();
@@ -179,7 +197,7 @@ fn batch_workspace_conditional() {
     let with_session = |session| {
         let mut prepare = prepare_of(spec(), in_bucket(), BUCKET, false);
         prepare.facts = Some(BackendFacts { session, ..facts() });
-        prepare.first().unwrap();
+        begun(&mut prepare);
         prepare.next(address(Some("http://s3"), None)).unwrap();
         prepare.next(loaded())
     };
@@ -192,12 +210,12 @@ fn batch_workspace_conditional() {
 fn failures_end_preparation() {
     let error = JobError::retryable("slow");
     let mut unloaded = prepare_of(spec(), record(), "", false);
-    unloaded.first().unwrap();
+    begun(&mut unloaded);
     unloaded.next(address(None, None)).unwrap();
     let failed = child(Err::<Vec<TaskInput>, _>(error.clone()));
     assert_eq!(unloaded.next(failed), Err(error.clone()));
     let mut unminted = prepare_of(session_spec(), record(), BUCKET, false);
-    unminted.first().unwrap();
+    begun(&mut unminted);
     unminted.next(address(Some("http://s3"), None)).unwrap();
     unminted.next(loaded()).unwrap();
     let failed = child(Err::<WorkspaceCredential, _>(error.clone()));

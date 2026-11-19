@@ -46,6 +46,7 @@ fn spec(prefixes: &[&str]) -> ExecutionSpec {
         env: Default::default(),
         resources: Default::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: vec![output],
         workspace_outputs: Vec::new(),

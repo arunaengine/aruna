@@ -8,6 +8,7 @@ use std::sync::Arc;
 use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::compute::effect::{BackendFacts, ComputeAnswer};
+use aruna_core::compute::identity::home_digest;
 use aruna_core::compute::{
     ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, ExecutorKind, FenceContext, NOBODY,
     ReconcileEvidence, StagingMode,
@@ -62,6 +63,7 @@ pub(super) fn spec() -> ExecutionSpec {
         env: Default::default(),
         resources: Default::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -115,12 +117,18 @@ pub(super) fn intent() -> AttemptIntent {
         executor_kind: "docker".to_string(),
         pinned_image: PINNED.to_string(),
         attempt_epoch: EPOCH,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: home_digest("docker", None),
     }
 }
 
 pub(super) fn facts() -> BackendFacts {
     BackendFacts {
+        name: "docker".to_string(),
         kind: ExecutorKind::Docker,
+        home_digest: home_digest("docker", None),
+        config_digest: [0; 32],
         s3_mount: false,
         session: false,
         local_site: false,
@@ -141,7 +149,7 @@ pub(super) fn scope_of(spec: ExecutionSpec) -> Arc<AttemptScope> {
     Arc::new(AttemptScope {
         job_id: job(),
         token: token(),
-        kind: ExecutorKind::Docker,
+        backend: "docker".to_string(),
         fence: fence(),
         spec: Arc::new(spec),
         bucket: BUCKET.to_string(),

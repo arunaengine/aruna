@@ -8,8 +8,7 @@ use std::sync::Arc;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect, ComputeRequest};
 use aruna_core::compute::{
-    AttemptPhase, AttemptRef, AttemptStatus, BackendError, ExecutorKind, FenceContext,
-    ReconcileEvidence,
+    AttemptPhase, AttemptRef, AttemptStatus, BackendError, FenceContext, ReconcileEvidence,
 };
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
@@ -96,8 +95,8 @@ impl AdoptAttemptOperation {
         };
         // The executor persisted in the intent: a fresh selection could ask the wrong backend
         // and park a live attempt as absent.
-        let kind = ExecutorKind::from_wire(&intent.executor_kind);
-        let call = compute_call(ComputeEffect::Facts { kind });
+        let backend = intent.backend.clone();
+        let call = compute_call(ComputeEffect::Facts { backend });
         let held = Box::new((record, control, intent, token));
         self.call(AdoptStep::Facts(held), call)
     }
@@ -118,7 +117,7 @@ impl AdoptAttemptOperation {
         let scope = AttemptScope {
             job_id: self.job_id,
             token,
-            kind: ExecutorKind::from_wire(&intent.executor_kind),
+            backend: intent.backend.clone(),
             fence: FenceContext {
                 attempt,
                 attempt_epoch: intent.attempt_epoch,
@@ -163,13 +162,16 @@ impl Operation for AdoptAttemptOperation {
                     Ok(Next::Done(Adoption::Done))
                 }
             },
+            // A backend that moved to another home cannot observe the attempt either.
             AdoptStep::Facts(held) => match compute_answer(result)? {
-                ComputeAnswer::Facts(facts) => Ok(self.scope_of(*held, facts.run_as)),
+                ComputeAnswer::Facts(facts) if facts.home_digest == held.2.home_digest => {
+                    Ok(self.scope_of(*held, facts.run_as))
+                }
                 // A node without this backend cannot observe the attempt, so charging would
                 // terminalize a healthy container: it goes back with an expired lease.
                 _ => {
                     let (_, _, intent, token) = *held;
-                    warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; handing back");
+                    warn!(job_id = %job_id, backend = %intent.backend, "Reconcile backend unavailable; handing back");
                     let handoff = handoff_external_attempt(job_id, token, self.now_ms);
                     self.call(AdoptStep::HandedBack, IoCall::child(handoff))
                 }

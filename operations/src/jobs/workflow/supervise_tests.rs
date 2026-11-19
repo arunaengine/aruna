@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::compute::AttemptPhase;
 use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
-use aruna_core::compute::{AttemptPhase, ExecutorKind};
 use aruna_core::structs::execution::job::ExecutionSpec;
 
 use super::super::fixtures::{
@@ -82,7 +82,7 @@ fn in_session() -> SuperviseOperation {
     let mut supervise = supervise(notebook());
     supervise.first().unwrap();
     let facts = ComputeEffect::Facts {
-        kind: ExecutorKind::Docker,
+        backend: "docker".to_string(),
     };
     assert_eq!(
         supervise.next(anchor(700)),

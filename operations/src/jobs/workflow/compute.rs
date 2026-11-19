@@ -4,9 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect, ComputeRequest};
-use aruna_core::compute::{
-    AttemptPhase, ExecutorKind, FenceContext, ReconcileEvidence, ResumePoint,
-};
+use aruna_core::compute::{AttemptPhase, FenceContext, ReconcileEvidence, ResumePoint};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 
@@ -15,14 +13,10 @@ pub(super) fn compute_call(effect: ComputeEffect) -> IoCall {
     IoCall::Effect(Box::new(Effect::Compute(Box::new(effect))))
 }
 
-/// The call that asks the backend of `kind` about a fenced attempt.
-pub(super) fn attempt_call(
-    kind: &ExecutorKind,
-    fence: &FenceContext,
-    request: ComputeRequest,
-) -> IoCall {
+/// The call that asks backend `backend` about a fenced attempt.
+pub(super) fn attempt_call(backend: &str, fence: &FenceContext, request: ComputeRequest) -> IoCall {
     compute_call(ComputeEffect::Attempt {
-        kind: kind.clone(),
+        backend: backend.to_string(),
         fence: fence.clone(),
         request,
     })

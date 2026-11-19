@@ -248,6 +248,9 @@ fn expiry_follows_intent() {
         executor_kind: "docker".to_string(),
         pinned_image: "alpine".to_string(),
         attempt_epoch: 1,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     });
     let mut attempted = at_lookup(&spec, &record);
     let error = attempted

@@ -29,10 +29,12 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::effect::{BackendFacts, ComputeAnswer, ComputeEffect, ComputeRequest};
 use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::compute::{
-    AttemptRef, AttemptStatus, BackendError, ExecutorKind, FenceContext, GrantedResources, TaskSpec,
+    AttemptRef, AttemptStatus, BackendError, ExecutorKind, FenceContext, GrantedResources,
+    NetworkAccess, TaskSpec,
 };
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
+use aruna_core::scheduling::hosts_session;
 use aruna_core::structs::execution::job::{
     AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, LaunchRecord,
     PhysicalExecutionState, recorded_env,
@@ -56,6 +58,7 @@ use supervise::SuperviseOperation;
 use super::key_locks::ParkLockedOperation;
 use super::lifecycle::LifecycleError;
 use super::lifecycle::held::HeldReservations;
+use super::lifecycle::ids::session_of;
 use super::lifecycle::updates::PublishProgressOperation;
 use super::store::attempt_intent::AttemptCommit;
 use super::store::job_calls::{
@@ -75,6 +78,8 @@ pub(crate) const DEFAULT_WALLTIME: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct ResolvedBackend {
     pub facts: BackendFacts,
     pub receipted: Option<Ulid>,
+    /// Backend config generation the receipt was accepted under; 0 without a receipt.
+    pub config_generation: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -92,30 +97,52 @@ type ResolveNext = Result<Next<ResolvedBackend>, JobError>;
 /// without a receipt keeps the unfenced selection.
 #[derive(Debug, PartialEq)]
 pub struct ResolveBackendOperation {
+    /// The backend admission accepted, when it named one.
+    backend: Option<String>,
     constraint: Option<ExecutorKind>,
+    /// A session run, with the network it asks for.
+    session: Option<NetworkAccess>,
     job_id: JobId,
     receipted: Option<Ulid>,
     stored: (u64, [u8; 32]),
+    /// Generation and digest of the backend config the receipt was accepted under.
+    config: (u64, [u8; 32]),
     current_generation: u64,
     step: ResolveStep,
 }
 
 impl ResolveBackendOperation {
     pub fn new(spec: &ExecutionSpec, job_id: JobId) -> Self {
+        let network = match spec.tags.get(prepare::NETWORK_TAG_KEY).map(String::as_str) {
+            Some("open") => NetworkAccess::Open,
+            _ => NetworkAccess::Isolated,
+        };
         Self {
+            backend: spec.backend.clone(),
             constraint: (spec.executor_constraint.as_deref()).map(ExecutorKind::from_wire),
+            session: session_of(spec).map(|_| network),
             job_id,
             receipted: None,
             stored: (0, [0; 32]),
+            config: (0, [0; 32]),
             current_generation: 0,
             step: ResolveStep::Select,
         }
     }
 
+    /// The backend, unless the run is a session it cannot host. Planning and admission screen
+    /// sessions too; this runs after the stored fences, so a changed config stays retryable.
     fn resolved(&self, facts: BackendFacts) -> ResolveNext {
+        let hosts = |network| hosts_session(&facts.kind.as_wire(), facts.session, network);
+        if self.session.is_some_and(|network| !hosts(network)) {
+            let name = &facts.name;
+            let message = format!("compute backend {name} cannot host sessions");
+            return Err(JobError::permanent(message));
+        }
         Ok(Next::Done(ResolvedBackend {
             facts,
             receipted: self.receipted,
+            config_generation: self.config.0,
         }))
     }
 }
@@ -125,8 +152,9 @@ impl Operation for ResolveBackendOperation {
     type Error = JobError;
 
     fn first(&mut self) -> ResolveNext {
-        let constraint = self.constraint.clone();
+        let (backend, constraint) = (self.backend.clone(), self.constraint.clone());
         Ok(Next::Call(compute_call(ComputeEffect::Select {
+            backend,
             constraint,
         })))
     }
@@ -140,9 +168,13 @@ impl Operation for ResolveBackendOperation {
                     let held = HeldReservations::of_job(self.job_id);
                     Ok(Next::Call(IoCall::child(held)))
                 }
-                ComputeAnswer::Selected(None) => {
-                    Err(JobError::permanent("no eligible executor for job"))
-                }
+                // Admission accepted this exact backend; losing it is a local change.
+                ComputeAnswer::Selected(None) => match &self.backend {
+                    Some(name) => Err(JobError::retryable(format!(
+                        "compute backend {name} is not available here"
+                    ))),
+                    None => Err(JobError::permanent("no eligible executor for job")),
+                },
                 _ => Err(JobError::retryable("no compute backend configured")),
             },
             ResolveStep::Held(facts) => {
@@ -153,6 +185,7 @@ impl Operation for ResolveBackendOperation {
                     return self.resolved(*facts);
                 };
                 self.receipted = Some(reservation.execution_id);
+                self.config = (reservation.config_generation, reservation.config_digest);
                 if reservation.subject_generation == 0 {
                     return self.resolved(*facts);
                 }
@@ -170,13 +203,20 @@ impl Operation for ResolveBackendOperation {
                 self.current_generation = subject.generation;
                 let (generation, digest) = self.stored;
                 Ok(Next::Call(compute_call(ComputeEffect::Fenced {
-                    kind: facts.kind,
+                    backend: facts.name,
                     subject: Box::new(subject),
                     generation,
                     digest,
                 })))
             }
             ResolveStep::Fenced => match compute_answer(result)? {
+                ComputeAnswer::Fenced(Ok(facts)) if facts.config_digest != self.config.1 => {
+                    let (name, stored) = (&facts.name, self.config.0);
+                    warn!(job_id = %self.job_id, backend = %name, stored_generation = stored, "Receipted execution refused: the backend config changed since its receipt");
+                    Err(JobError::retryable(format!(
+                        "compute backend {name} changed its config since the receipt (stored generation {stored})"
+                    )))
+                }
                 ComputeAnswer::Fenced(Ok(facts)) => self.resolved(facts),
                 ComputeAnswer::Fenced(Err(BackendError::Fenced)) => {
                     let (stored, current) = (self.stored.0, self.current_generation);
@@ -238,6 +278,8 @@ pub struct ExecutionRunOperation {
     wiring: RunWiring,
     facts: Option<BackendFacts>,
     receipted: Option<Ulid>,
+    /// Backend config generation the receipt was accepted under.
+    receipted_generation: u64,
     scope: Option<Arc<AttemptScope>>,
     now_ms: u64,
     step: RunStep,
@@ -263,6 +305,7 @@ impl ExecutionRunOperation {
             wiring,
             facts: None,
             receipted: None,
+            receipted_generation: 0,
             scope: None,
             now_ms: 0,
             step: RunStep::Last,
@@ -372,9 +415,9 @@ impl ExecutionRunOperation {
 
     fn resolve_image(&mut self, prepared: PreparedTask) -> RunNext {
         let spec = self.execution()?;
-        let kind = self.selected()?.kind.clone();
+        let backend = self.selected()?.name.clone();
         let image = spec.image.clone();
-        let call = compute_call(ComputeEffect::ResolveImage { kind, image });
+        let call = compute_call(ComputeEffect::ResolveImage { backend, image });
         self.call(RunStep::Image(Box::new(prepared)), call)
     }
 
@@ -392,10 +435,10 @@ impl ExecutionRunOperation {
     fn granted_call(&mut self, prepared: PreparedTask, image: String) -> RunNext {
         let spec = self.execution()?;
         let facts = self.selected()?;
-        let (kind, run_as) = (facts.kind.clone(), facts.run_as);
+        let (backend, run_as) = (facts.name.clone(), facts.run_as);
         let task = build_task_spec(&spec, &self.attempt(), &image, prepared, run_as);
         let call = compute_call(ComputeEffect::Granted {
-            kind,
+            backend,
             spec: Box::new(task),
         });
         self.call(RunStep::Granted(Box::new(image)), call)
@@ -427,6 +470,7 @@ impl ExecutionRunOperation {
         let kind = facts.kind.as_wire();
         let launch = LaunchRecord {
             node_id,
+            backend: facts.name.clone(),
             executor_kind: kind.clone(),
             location,
             resources,
@@ -441,6 +485,9 @@ impl ExecutionRunOperation {
             executor_kind: kind,
             pinned_image: image.clone(),
             attempt_epoch: 0,
+            backend: facts.name.clone(),
+            config_generation: self.receipted_generation,
+            home_digest: facts.home_digest,
         };
         let write = record_attempt_intent(
             self.job_id(),
@@ -465,7 +512,7 @@ impl ExecutionRunOperation {
         let scope = AttemptScope {
             job_id: self.job_id(),
             token: self.claim()?,
-            kind: facts.kind.clone(),
+            backend: facts.name.clone(),
             fence: FenceContext {
                 attempt: self.attempt(),
                 attempt_epoch: commit.control.attempt_epoch,
@@ -541,6 +588,7 @@ impl Operation for ExecutionRunOperation {
             RunStep::Resolve => match result.child::<ResolvedBackend, JobError>()? {
                 Ok(resolved) => {
                     self.receipted = resolved.receipted;
+                    self.receipted_generation = resolved.config_generation;
                     self.backend_ready(resolved.facts)
                 }
                 Err(error) => self.pre_submit(error, false),

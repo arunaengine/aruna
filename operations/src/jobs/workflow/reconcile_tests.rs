@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::compute::effect::BackendFacts;
 use aruna_core::compute::{AdoptableEvidence, ResumePoint, TombstoneEvidence};
 
 use super::super::fixtures::{
@@ -98,10 +99,10 @@ fn intentless_attempt_released() {
 #[test]
 fn adopted_attempt_scoped() {
     let mut adopt = adopt();
-    let kind = ExecutorKind::Docker;
+    let backend = "docker".to_string();
     assert_eq!(
         adopt.next(adopted(with_intent())),
-        Ok(Next::Call(compute_call(ComputeEffect::Facts { kind })))
+        Ok(Next::Call(compute_call(ComputeEffect::Facts { backend })))
     );
     let mut expected = AttemptScope::clone(&scope());
     expected.fence.attempt = AttemptRef::new(job().to_string().to_lowercase(), 1);
@@ -127,6 +128,22 @@ fn missing_backend_handoff() {
     );
     let failed = child(Err::<ReleaseOutcome, _>(JobMutationError::NotFound));
     assert_eq!(adopt.next(failed), Ok(Next::Done(Adoption::Done)));
+}
+
+// A backend of that name that moved to another home cannot observe the attempt either.
+#[test]
+fn moved_backend_handoff() {
+    let mut adopt = adopt();
+    adopt.next(adopted(with_intent())).unwrap();
+    let moved = BackendFacts {
+        home_digest: [9; 32],
+        ..facts()
+    };
+    let handoff = handoff_external_attempt(job(), token(), NOW);
+    assert_eq!(
+        adopt.next(compute(ComputeAnswer::Facts(moved))),
+        Ok(Next::Call(IoCall::child(handoff)))
+    );
 }
 
 fn settle_of(job: JobRecord) -> SettleAdoptedOperation {
