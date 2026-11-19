@@ -959,6 +959,7 @@ dependencies = [
  "wasmtime-wasi-io",
  "wit-component",
  "wit-parser",
+ "zeroize",
 ]
 
 [[package]]

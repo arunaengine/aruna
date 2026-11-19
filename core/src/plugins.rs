@@ -193,6 +193,16 @@ pub enum PluginEffect {
         unnamed: Vec<UserId>,
         now_ms: u64,
     },
+    /// The newest value write id run `run_id` holds the fields of for `slot`; answers `Held`.
+    HeldValue { run_id: Ulid, slot: String },
+    /// Keeps `fields` as value `value_id` of the run's `slot` when given; answers `Fields` with
+    /// the fields the run holds for that value.
+    HoldValue {
+        run_id: Ulid,
+        slot: String,
+        value_id: Ulid,
+        fields: Option<SecretBytes>,
+    },
 }
 
 /// The answer of a [`PluginEffect`].
@@ -204,6 +214,8 @@ pub enum PluginEvent {
     Reserved(Option<MemoryPermit>),
     /// When each asked unnamed account was first seen, in the asked order.
     Seen(Vec<u64>),
+    Held(Option<Ulid>),
+    Fields(Option<SecretBytes>),
 }
 
 /// Memory reserved for one artifact upload or assembly, given back when dropped.

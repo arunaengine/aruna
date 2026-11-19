@@ -1,12 +1,14 @@
 //! The plugin host's node-wide state, kept for the life of the node process: the host call and
-//! webhook rates per install, the memory budget of artifact copies, and when each account no
-//! install names was first seen. Operations reach it through the runner's plugin effect.
+//! webhook rates per install, the memory budget of artifact copies, when each account no install
+//! names was first seen, and the secrets each run holds. Operations reach it through effects.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, PoisonError};
+
+use zeroize::Zeroizing;
 
 /// Host calls per second one install makes on average, and at most at once.
 pub const CALL_RATE: f64 = 50.0;
@@ -30,6 +32,10 @@ static HOOK_BUCKETS: Buckets = LazyLock::new(Default::default);
 static RESERVED: AtomicU32 = AtomicU32::new(0);
 /// When this node first saw each unnamed account; a restart starts the grace again.
 static SEEN: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Default::default);
+/// The secret fields each running run holds, by run and slot, per value write id.
+static HELD: LazyLock<Mutex<HashMap<(u128, String), Held>>> = LazyLock::new(Default::default);
+
+type Held = BTreeMap<u128, Zeroizing<Vec<u8>>>;
 
 /// Takes one host call of install `install` at `now_ms`; `false` when it is over its rate.
 pub fn take_call(install: u128, now_ms: u64) -> bool {
@@ -92,9 +98,53 @@ pub fn first_seen(named: &[String], unnamed: &[String], now_ms: u64) -> Vec<u64>
         .collect()
 }
 
+/// The newest value write id whose fields run `run` holds for `slot`.
+pub fn held_value(run: u128, slot: &str) -> Option<u128> {
+    let held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+    let values = held.get(&(run, slot.to_string()))?;
+    values.keys().next_back().copied()
+}
+
+/// Keeps `fields` as value `value` of the run's `slot` when given, and answers the fields the
+/// run holds for that value; `None` when it holds none.
+pub fn hold_value(
+    run: u128,
+    slot: &str,
+    value: u128,
+    fields: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+    let values = held.entry((run, slot.to_string())).or_default();
+    if let Some(fields) = fields {
+        values.insert(value, Zeroizing::new(fields));
+    }
+    values.get(&value).map(|fields| fields.to_vec())
+}
+
+/// Forgets every secret run `run` holds, once it ended.
+pub fn forget_run(run: u128) {
+    let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+    held.retain(|(holder, _), _| *holder != run);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn holds_per_run() {
+        let (run, other) = (91 << 64 | 1, 91 << 64 | 2);
+        assert_eq!(held_value(run, "token"), None);
+        assert_eq!(hold_value(run, "token", 4, None), None);
+        assert_eq!(hold_value(run, "token", 4, Some(vec![1])), Some(vec![1]));
+        assert_eq!(hold_value(run, "token", 7, Some(vec![2])), Some(vec![2]));
+        assert_eq!(held_value(run, "token"), Some(7));
+        // An older value stays held, so a call that checked it still finds its fields.
+        assert_eq!(hold_value(run, "token", 4, None), Some(vec![1]));
+        assert_eq!(held_value(other, "token"), None);
+        forget_run(run);
+        assert_eq!(held_value(run, "token"), None);
+    }
 
     #[test]
     fn refills_steadily() {
