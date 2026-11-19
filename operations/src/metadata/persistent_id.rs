@@ -671,10 +671,11 @@ mod tests {
             read.next(IoResult::Values(vec![None])),
             Ok(Next::Done(None))
         );
-        let bytes = aruna_core::types::Value::from(requested(id).to_bytes().unwrap());
+        let mapping = requested(id);
+        let bytes = aruna_core::types::Value::from(mapping.to_bytes().unwrap());
         assert_eq!(
             read.next(IoResult::Values(vec![Some(bytes)])),
-            Ok(Next::Done(Some(requested(id))))
+            Ok(Next::Done(Some(mapping)))
         );
     }
 
@@ -686,10 +687,12 @@ mod tests {
             minted_at_ms: 1,
         };
         let change = PidChange::Transition(transition);
+        // Each mapping gets a fresh revision id, so one mapping is built and compared.
+        let mapping = requested(id);
         let mut pid = PidChangeOperation::new((realm(), None), id, change.clone());
         assert!(matches!(pid.first(), Ok(Next::Call(IoCall::Child(_)))));
         let outcome = PidOutcome {
-            mapping: requested(id),
+            mapping: mapping.clone(),
             applied: true,
             committed: true,
         };
@@ -699,7 +702,7 @@ mod tests {
         assert_eq!(
             done,
             Ok(Next::Then {
-                output: (requested(id), true),
+                output: (mapping.clone(), true),
                 calls: vec![IoCall::from(schedule_drain_effect())],
             })
         );
@@ -707,14 +710,14 @@ mod tests {
         let mut replay = PidChangeOperation::new((realm(), None), id, change);
         replay.first().unwrap();
         let outcome = PidOutcome {
-            mapping: requested(id),
+            mapping: mapping.clone(),
             applied: false,
             committed: false,
         };
         let done = replay.next(IoResult::Child(ChildOutcome::new(
             Ok::<_, PersistentIdError>(outcome),
         )));
-        assert_eq!(done, Ok(Next::Done((requested(id), false))));
+        assert_eq!(done, Ok(Next::Done((mapping, false))));
     }
 
     #[test]

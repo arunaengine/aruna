@@ -14,8 +14,9 @@ fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
+// A structured document id carries a placement handle, and handle zero is reserved.
 fn record(document: u64, path: &str) -> MetadataRegistryRecord {
-    let document_id = Ulid::from_parts(document, 3);
+    let document_id = Ulid::from_parts(document, (1 << 60) | 3);
     MetadataRegistryRecord {
         realm_id: realm(),
         group_id: group(),
