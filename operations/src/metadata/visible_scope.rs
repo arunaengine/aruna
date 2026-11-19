@@ -21,8 +21,8 @@ use tracing::{debug_span, field};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::access::{ReadAccess, ReadAccessOperation};
 use crate::metadata::call_results::page_rows;
-use crate::metadata::read_timing::ReadTiming;
 use crate::metadata::registry_cache::cache_answer;
+use crate::metadata::span_timing::ReadTiming;
 
 type Turn<T> = Result<Next<T>, MetadataError>;
 

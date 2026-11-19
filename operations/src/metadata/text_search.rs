@@ -18,9 +18,9 @@ use tracing::{debug_span, field};
 use ulid::Ulid;
 
 use crate::metadata::iri_index::{MetadataIriError, ReferenceLookupOperation, ReferenceMatches};
-use crate::metadata::read_timing::ReadTiming;
 use crate::metadata::registry_cache::{Registry, RegistryReadOperation, cache_answer};
 use crate::metadata::search_cursor::{compare_hits, tie_order};
+use crate::metadata::span_timing::ReadTiming;
 use crate::metadata::visible_scope::ReadScopeOperation;
 
 type Turn = Result<Next<Vec<MetadataSearchHit>>, MetadataError>;

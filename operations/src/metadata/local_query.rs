@@ -19,8 +19,8 @@ use tracing::{debug_span, field};
 
 use crate::metadata::api::fanout_types::pattern_contains_service;
 use crate::metadata::query_cache::{LocalScopeKind, ScopeDigest, graphs_digest, local_key};
-use crate::metadata::read_timing::ReadTiming;
 use crate::metadata::registry_cache::{Registry, RegistryReadOperation, cache_answer};
+use crate::metadata::span_timing::ReadTiming;
 use crate::metadata::visible_scope::ReadScopeOperation;
 
 /// The longest SPARQL text a metadata query may have.
