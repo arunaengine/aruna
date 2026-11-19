@@ -18,6 +18,7 @@ pub mod kind;
 pub mod remote;
 use kind::descriptor;
 pub mod link;
+use link::LinkTarget;
 pub mod rules;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

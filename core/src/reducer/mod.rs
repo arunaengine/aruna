@@ -49,7 +49,9 @@ pub mod revocation;
 mod snapshot;
 mod targets;
 
-use paths::{event_observes_dot, operation_paths, role_definition_value};
+use paths::{
+    GROUP_DELETED_PATH, USER_NAME_PATH, event_observes_dot, operation_paths, role_definition_value,
+};
 use placement::{candidate_map_value, transition_plan_value, transition_proof_value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

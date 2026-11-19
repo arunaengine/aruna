@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::identity::JobId;
 use super::*;
 use crate::structs::storage::encryption::BucketKeyRef;
 

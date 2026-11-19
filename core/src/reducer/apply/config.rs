@@ -3,6 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::reducer::paths::{
+    CONFIG_COMPUTE_PATH, CONFIG_DESCRIPTION_PATH, CONFIG_EMAIL_PATH, CONFIG_FEDERATION_PATH,
+    CONFIG_MERGE_PATH, CONFIG_POLICIES_PATH, CONFIG_PORTAL_PATH, CONFIG_QUOTA_PATH,
+    CONFIG_REPLICAS_PATH, compute_value, federation_value, node_kind_value, node_name_path,
+    node_place_path, oidc_provider_value, plugin_entry_path, plugin_install_path, policies_value,
+    portal_value, publisher_cutoffs_path, quota_value, replicas_value, secret_info_path,
+    vault_entry_path,
+};
 
 impl AdminDocumentState {
     pub(super) fn apply_config(

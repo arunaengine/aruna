@@ -16,7 +16,7 @@ use super::family::{
     verify_update_chain,
 };
 use super::identity::{
-    JobExecutionClass, JobState, LEASE_INDEX_PREFIX, PRUNE_INDEX_PREFIX, RECORD_KEY_PREFIX,
+    JobExecutionClass, JobId, JobState, LEASE_INDEX_PREFIX, PRUNE_INDEX_PREFIX, RECORD_KEY_PREFIX,
     RETENTION_MS,
 };
 use super::input::{
