@@ -593,11 +593,26 @@ pub enum TopicPeerError {
 
 /// Reply to a [`crate::effects::MetadataRequestEffect`]: the encoded answer or why there is none,
 /// and how long the request took, so one deadline can span the requests to several peers.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct MetadataAnswer {
     pub peer: NodeId,
     pub elapsed: Duration,
     pub result: Result<Vec<u8>, PeerRequestError>,
+}
+
+/// Shows the reply size only: a reply frame can carry an opened secret.
+impl std::fmt::Debug for MetadataAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut shown = f.debug_struct("MetadataAnswer");
+        shown
+            .field("peer", &self.peer)
+            .field("elapsed", &self.elapsed);
+        match &self.result {
+            Ok(frame) => shown.field("frame_bytes", &frame.len()),
+            Err(error) => shown.field("error", error),
+        };
+        shown.finish()
+    }
 }
 
 /// Why a forwarded token gives a peer no caller.
@@ -1155,6 +1170,16 @@ mod tests {
 
     fn frame(objects: usize, key_bytes: usize) -> JobRecordFrame {
         JobRecordFrame::new(sized_envelope(objects, key_bytes)).expect("bounded record")
+    }
+
+    #[test]
+    fn answer_debug_hidden() {
+        let answer = MetadataAnswer {
+            peer: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            elapsed: Duration::from_secs(1),
+            result: Ok(vec![201; 32]),
+        };
+        assert!(!format!("{answer:?}").contains("201, 201"));
     }
 
     #[test]

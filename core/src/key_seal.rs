@@ -24,10 +24,18 @@ pub enum KeySealError {
 }
 
 /// An HPKE result: the encapsulated ephemeral key and the AES-GCM ciphertext.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SealedSecret {
     pub enc: [u8; 32],
     pub ciphertext: Vec<u8>,
+}
+
+impl std::fmt::Debug for SealedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedSecret")
+            .field("ciphertext_len", &self.ciphertext.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Seals `plain` to `public` with a fresh ephemeral key from the system RNG.
@@ -140,6 +148,17 @@ mod tests {
             aad: field("aad"),
             plain: field("plaintext"),
         }
+    }
+
+    #[test]
+    fn sealed_debug_hidden() {
+        let sealed = SealedSecret {
+            enc: [201; 32],
+            ciphertext: vec![202; 32],
+        };
+        let shown = format!("{sealed:?}");
+        assert!(!shown.contains("201"));
+        assert!(!shown.contains("202"));
     }
 
     #[test]
