@@ -23,7 +23,8 @@ use super::calls::{StoreReadOperation, git_call, git_event, store_read};
 use super::changes::{EntityChange, entity_changes};
 use super::push::record_made;
 use super::snapshot::{read_view, refresh};
-use super::{GitError, GitNode, repository};
+use super::{GitError, repository};
+use aruna_core::git::GitNode;
 
 type Document = MetadataRegistryRecord;
 type Opened = (Document, Projection);

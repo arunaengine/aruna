@@ -4,6 +4,7 @@
 
 mod access;
 mod calls;
+pub mod capture_drain;
 pub mod changes;
 pub mod cleanup;
 mod dataset;
@@ -80,17 +81,4 @@ pub struct MergeConflict {
     /// Files both sides changed that no metadata merge resolves.
     pub files: Vec<String>,
     pub properties: Vec<PropertyConflict>,
-}
-
-/// What the Git operations need to know about this node; the input reads it from its context.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct GitNode {
-    pub ids: NodeRealm,
-    pub routing: NodeRouting,
-}
-
-impl GitNode {
-    pub(crate) fn node(&self) -> Option<NodeId> {
-        self.ids.map(|(node_id, _)| node_id)
-    }
 }

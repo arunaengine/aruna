@@ -446,11 +446,7 @@ fn started(started: bool) -> IoResult {
     })))
 }
 
-/// The link queue drain is armed to run now, after the finished jobs queued their changes.
-fn armed(turn: MaterializationTurn<MetadataDrainResult>) -> IoResult {
-    let drain = IoCall::from(schedule_drain(Duration::ZERO));
-    same_call(turn, Ok(Next::Call(drain)));
-    let key = TaskKey::DrainLinkQueue;
+fn scheduled(key: TaskKey) -> IoResult {
     let after = Duration::ZERO;
     IoResult::Event(Box::new(Event::Task(TaskEvent::TimerScheduled {
         key,
@@ -458,10 +454,25 @@ fn armed(turn: MaterializationTurn<MetadataDrainResult>) -> IoResult {
     })))
 }
 
+/// The link queue and Git capture drains are armed to run now, after the finished jobs queued
+/// their changes and capture marks.
+fn armed(
+    batch: &mut MaterializationBatchOperation,
+    turn: MaterializationTurn<MetadataDrainResult>,
+) -> IoResult {
+    let link_drain = IoCall::from(schedule_drain(Duration::ZERO));
+    same_call(turn, Ok(Next::Call(link_drain)));
+    let captures = batch.next(scheduled(TaskKey::DrainLinkQueue));
+    let capture_drain = IoCall::from(schedule_capture_drain());
+    same_call(captures, Ok(Next::Call(capture_drain)));
+    scheduled(TaskKey::DrainCaptures)
+}
+
 #[test]
 fn batch_syncs_graphs() {
     let mut batch = syncing(&event().record.graph_iri);
-    let armed = armed(batch.next(started(true)));
+    let turn = batch.next(started(true));
+    let armed = armed(&mut batch, turn);
     let result = drain_result(batch.next(armed));
     assert_eq!(result.processed, 1);
     assert_eq!(result.next_due_after, None);
@@ -474,7 +485,8 @@ fn busy_slot_waits() {
     let mut batch = syncing(&graph_iri);
     let inline = IoCall::child(GraphSyncOperation::new(graph_iri, vec![node(2)]));
     same_call(batch.next(started(false)), Ok(Next::Call(inline)));
-    let armed = armed(batch.next(child(Ok::<(), MetadataError>(()))));
+    let turn = batch.next(child(Ok::<(), MetadataError>(())));
+    let armed = armed(&mut batch, turn);
     let result = drain_result(batch.next(armed));
     assert_eq!(result.processed, 1);
 }

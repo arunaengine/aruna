@@ -31,9 +31,10 @@ use super::calls::{
 };
 use super::generate::{checkpoint, generate};
 use super::project::{inputs, project, recent};
-use super::{GitError, GitNode, document, pending, publish, records, repository};
+use super::{GitError, document, pending, publish, records, repository};
 use crate::metadata::raw_events::RawReadError;
 use crate::metadata::revision_read::RawDisplayOperation;
+use aruna_core::git::GitNode;
 use aruna_core::metadata::api::MetadataRawView;
 
 type Document = MetadataRegistryRecord;

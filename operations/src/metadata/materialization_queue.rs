@@ -38,13 +38,12 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
-use crate::git::snapshot::capture;
-use crate::git::{GitError, GitNode};
 use crate::metadata::checkpoint::{CheckpointError, CheckpointOperation};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::topic_sync::GraphSyncOperation;
 use crate::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
+use aruna_core::git::{GitNode, schedule_capture_drain};
 
 use super::data_links::{DataLinkError, LinkRows};
 use super::iri_index::{MetadataIriError, ProjectRowsOperation};
@@ -280,6 +279,7 @@ enum BatchStage {
     /// A sync that found no free background slot and runs in this pass instead.
     SyncInline(String),
     Timer,
+    Captures,
 }
 
 /// One drain pass: materializes the due jobs one document group at a time, `concurrency`
@@ -305,7 +305,8 @@ pub struct MaterializationBatchOperation {
 }
 
 impl MaterializationBatchOperation {
-    /// `link_timer` arms the repository link drain after finished jobs, on a node with tasks.
+    /// `link_timer` arms the repository link and Git capture drains after finished jobs, on a
+    /// node with tasks.
     pub fn new(node: GitNode, concurrency: usize, link_timer: bool) -> Self {
         Self {
             node,
@@ -436,7 +437,8 @@ impl MaterializationBatchOperation {
         Ok(Next::Call(IoCall::background(graph_sync)))
     }
 
-    // Finished jobs may queue link pushes, and the link drain stops once its queue is empty.
+    // Finished jobs may queue link pushes and Git snapshots, and both drains stop once their
+    // rows are gone.
     fn timer(&mut self) -> MaterializationTurn<MetadataDrainResult> {
         if let Some(error) = self.first_error.take() {
             return Err(error);
@@ -553,6 +555,19 @@ impl Operation for MaterializationBatchOperation {
                     }
                     Ok(_) => {}
                     Err(error) => warn!(%error, "Failed to arm the repository link queue"),
+                }
+                self.stage = BatchStage::Captures;
+                Ok(Next::Call(IoCall::from(schedule_capture_drain())))
+            }
+            // The capture marks stay until the drain took the snapshots, so a missed arming
+            // only waits for the next one or the restart.
+            BatchStage::Captures => {
+                match result.event() {
+                    Ok(Event::Task(TaskEvent::Error { message, .. })) => {
+                        warn!(%message, "Failed to arm the Git capture drain")
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "Failed to arm the Git capture drain"),
                 }
                 self.summary()
             }
@@ -712,11 +727,8 @@ fn plan_rows(
                     MATERIALIZATION_JOB_KEYSPACE.to_string(),
                     ByteView::from(job.job_key),
                 ));
+                // The capture mark stays until the Git capture drain took the snapshot.
                 if let Some(document_job_key) = job.document_job_key {
-                    plan.deletes.push((
-                        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
-                        ByteView::from(document_job_key.clone()),
-                    ));
                     plan.deletes.push((
                         DOCUMENT_JOB_KEYSPACE.to_string(),
                         ByteView::from(document_job_key),
@@ -1812,13 +1824,12 @@ enum JobStage {
     Raw,
     Apply(Box<RawEventPlan>),
     Mark(Box<MaterializedCreateEvent>),
-    Capture(Box<MaterializedCreateEvent>),
     Checkpoint(Box<MaterializedCreateEvent>),
     Project(Box<MaterializedCreateEvent>),
 }
 
-/// Applies one job's event to the graph store, publishes its Git snapshot and projects its
-/// IRI and data link rows, all left for the finish transaction to store. An event that
+/// Applies one job's event to the graph store, marks its Git snapshot for the capture drain and
+/// projects its IRI and data link rows, all left for the finish transaction to store. An event that
 /// fails is rescheduled or parked; a terminal failure finishes with a failed status.
 #[derive(Debug, PartialEq)]
 struct MaterializationJobOperation {
@@ -2073,7 +2084,8 @@ impl MaterializationJobOperation {
         self.finish(ProcessedMaterializationJob::deferred(finished, elapsed))
     }
 
-    // Refreshes keep off the raw view from here until the finish batch stores this graph.
+    // Refreshes keep off the raw view from here until the Git capture drain, after the finish
+    // batch stored this graph, takes its snapshot.
     fn mark(
         &mut self,
         materialized: MaterializedCreateEvent,
@@ -2161,24 +2173,6 @@ impl Operation for MaterializationJobOperation {
             JobStage::Mark(materialized) => {
                 if let Err(error) = result.done() {
                     return self.defer(&MetadataMaterializationError::from(error));
-                }
-                let event = self.event()?;
-                let snapshot = capture(
-                    &self.node,
-                    &event.record,
-                    materialized.raw_revision.as_ref(),
-                );
-                self.stage = JobStage::Capture(materialized);
-                Ok(Next::Call(IoCall::child(snapshot)))
-            }
-            JobStage::Capture(materialized) => {
-                let failed = match result.child::<(), GitError>() {
-                    Ok(Ok(())) => None,
-                    Ok(Err(error)) => Some(error.to_string()),
-                    Err(error) => Some(error.to_string()),
-                };
-                if let Some(message) = failed {
-                    return self.defer(&MetadataMaterializationError::UnexpectedEvent(message));
                 }
                 let event = self.event()?;
                 let checkpoint = CheckpointOperation::new(self.node.node(), event.record.clone());

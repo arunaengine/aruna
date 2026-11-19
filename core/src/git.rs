@@ -2,12 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
+use crate::effects::Effect;
 use crate::git_state::{Ancestry, Projection, ProjectionInputs};
 use crate::keyspaces::GIT_RECORD_KEYSPACE;
 use crate::operation::SubOperation;
-use crate::structs::identity::realm::RealmId;
+use crate::structs::identity::realm::{NodeRealm, RealmId};
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::dataset_location::DatasetLocation;
+use crate::structs::storage::routing::NodeRouting;
+use crate::task::{TaskEffect, TaskKey};
 use crate::types::{GroupId, Key, KeySpace, Value};
 use crate::{NodeId, UserId};
 use bytes::Bytes;
@@ -842,6 +847,27 @@ pub fn record_change(record: &GitRecord) -> crate::document::DocumentChange {
         kind: crate::document::DocumentChangeKind::Upsert,
         placement: record.placement,
     }
+}
+
+/// What the Git operations need to know about this node; the input reads it from its context.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GitNode {
+    pub ids: NodeRealm,
+    pub routing: NodeRouting,
+}
+
+impl GitNode {
+    pub fn node(&self) -> Option<NodeId> {
+        self.ids.map(|(node_id, _)| node_id)
+    }
+}
+
+/// Arms the Git capture drain to run now.
+pub fn schedule_capture_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainCaptures,
+        after: Duration::ZERO,
+    })
 }
 
 #[cfg(test)]

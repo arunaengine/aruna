@@ -1834,7 +1834,8 @@ async fn finish_stores_merge() {
         "the newer status stays"
     );
     assert!(storage_key_exists(&storage, RAW_REVISION_KEYSPACE, raw_state_key.to_vec()).await);
-    assert!(!capture_pending(&storage, document_id).await.unwrap());
+    // The mark stays until the Git capture drain took the snapshot.
+    assert!(capture_pending(&storage, document_id).await.unwrap());
 }
 
 fn crate_render(names: &[&str]) -> String {
