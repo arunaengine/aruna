@@ -59,7 +59,7 @@
     "pure_async_refs": 3,
     "runner_refs": 0,
     "silent_skips": 9,
-    "state_clones": 2,
+    "state_clones": 0,
     "test_sleeps": 64,
     "trigger_arms": 24,
     "upward_refs": 220

@@ -272,7 +272,7 @@ impl Operation for DeliveryOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Turn {
-        match self.state.clone() {
+        match std::mem::take(&mut self.state) {
             DeliveryState::Setting => {
                 let failed = match result.child::<Option<Vec<u8>>, SettingError>()? {
                     Ok(None) => return Ok(Next::Done(Delivery::Skip)),
@@ -296,7 +296,8 @@ impl Operation for DeliveryOperation {
                 stored_backoff(result)?;
                 self.wait(until_ms, reason)
             }
-            DeliveryState::Open { .. } => {
+            open @ DeliveryState::Open { .. } => {
+                self.state = open;
                 let node = self.asked_node().ok_or(IoError::Unfinished)?;
                 let answer = match result {
                     IoResult::Child(_) => {
