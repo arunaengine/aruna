@@ -280,6 +280,11 @@ pub const DEPARTURE_KEY: &[u8] = b"departure";
 pub const OPERATOR_DRAIN_KEY: &[u8] = b"operator_drain";
 /// The row that holds the start fence up: after a start, until the node caught up.
 pub const START_FENCE_KEY: &[u8] = b"start_fence";
+/// The wall time at which this node last caught up with the realm config.
+pub const LAST_CONTACT_KEY: &[u8] = b"last_contact";
+/// Written first in a discard and deleted with the first contact refresh after no reservation is
+/// left. While it exists every start discards again.
+pub const DISCARD_KEY: &[u8] = b"discard";
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DrainStateError {

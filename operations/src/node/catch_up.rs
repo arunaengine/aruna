@@ -12,6 +12,7 @@ use aruna_core::effects::{CatchUpEffect, Effect, NetEffect};
 use aruna_core::events::{CatchUpEvent, Event, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::COMPUTE_DEPARTURE_KEYSPACE;
+use aruna_core::node_state::LAST_CONTACT_KEY;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -22,8 +23,6 @@ use tracing::{debug, warn};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::fence::LiftFenceOperation;
 
-/// The node-local row holding the wall time at which this node last caught up.
-pub const LAST_CONTACT_KEY: &[u8] = b"last_contact";
 /// Spacing of the passes after the node caught up; each one refreshes the last contact.
 pub const CATCH_UP_REFRESH: Duration = Duration::from_secs(300);
 /// Spacing of the passes while the node has not caught up yet.

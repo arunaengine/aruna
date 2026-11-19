@@ -825,6 +825,9 @@ fn external_attempt_transition(from: JobState, to: JobState) -> bool {
             | (Preparing, AwaitingKey)
             | (AwaitingKey, Queued)
             | (AwaitingKey, Cancelled)
+            // A discard ends executions that never submitted an attempt as errors.
+            | (Queued, Failed)
+            | (AwaitingKey, Failed)
     )
 }
 

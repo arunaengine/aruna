@@ -119,6 +119,17 @@ fn illegal_transitions() {
     }
 }
 
+// An execution that never submitted an attempt can end as an error; an in-process job not.
+#[test]
+fn discard_ends_unsubmitted() {
+    for from in [JobState::Queued, JobState::AwaitingKey] {
+        let class = JobExecutionClass::ExternalAttempt;
+        assert!(validate_transition(class, from, JobState::Failed).is_ok());
+        let class = JobExecutionClass::InProcess;
+        assert!(validate_transition(class, from, JobState::Failed).is_err());
+    }
+}
+
 #[test]
 fn internal_rejects_external() {
     // External-only states must be rejected for an in-process job. Parking on
