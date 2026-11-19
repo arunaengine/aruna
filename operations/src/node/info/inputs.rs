@@ -34,12 +34,12 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::jobs::backend_record::{BackendRecordError, BackendRecordOperation};
 use crate::jobs::demand::{DemandError, DemandSnapshotOperation};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
 use crate::metadata::repository::FILL_PAGE_SIZE;
-use crate::node::backend_record::{BackendRecordError, BackendRecordOperation};
 use crate::node::info::write::revision_generation;
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::usage::{LoadCountersError, LoadCountersOperation};

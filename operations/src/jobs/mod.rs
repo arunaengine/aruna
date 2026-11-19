@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 pub mod backend_import;
+pub mod backend_record;
 pub(crate) mod blob_request;
 pub mod command;
 pub mod copy;
