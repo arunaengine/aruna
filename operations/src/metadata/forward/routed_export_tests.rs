@@ -23,15 +23,6 @@ fn owner() -> UserId {
     UserId::local(Ulid::from_bytes([7; 16]), realm())
 }
 
-fn caller(user_id: UserId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    }
-}
-
 fn export() -> ExportMetadataResult {
     let document_id = Ulid::from_parts(3, 3);
     let record = MetadataRegistryRecord {
@@ -59,7 +50,12 @@ fn export() -> ExportMetadataResult {
 fn answered(user_id: UserId) -> RoutedExportOperation {
     let request = ExportMetadataRequest {
         document_id: Ulid::from_parts(3, 3),
-        auth: Some(caller(user_id)),
+        auth: Some(AuthContext {
+            user_id,
+            realm_id: realm(),
+            path_restrictions: None,
+            session: None,
+        }),
         view: RoCrateExportView::Full,
         limit: None,
         offset: None,
