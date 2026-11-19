@@ -390,16 +390,10 @@ pub async fn reserve_output_commits(
     destinations: &[(NodeId, String, String)],
     hints: &BTreeMap<(NodeId, String), SetHint>,
 ) -> Result<AttemptControl, JobMutationError> {
-    drive(
-        job_calls::reserve_output_commits(
-            job_id,
-            destinations.to_vec(),
-            hints.clone(),
-            aruna_core::time::unix_timestamp_millis(),
-        ),
-        context,
-    )
-    .await
+    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let destinations = destinations.to_vec();
+    let call = job_calls::reserve_output_commits(job_id, destinations, hints.clone(), now_ms);
+    drive(call, context).await
 }
 
 pub async fn set_cancel_requested(
