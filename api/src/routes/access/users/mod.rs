@@ -292,7 +292,7 @@ fn preferences_from_attributes(attributes: &HashMap<String, String>) -> UserPref
     }
 }
 
-const TOKEN_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
+pub const TOKEN_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
 
 async fn issue_user_session(
     state: &Arc<ServerState>,
@@ -1109,7 +1109,7 @@ request policies are evaluated as well and may deny a read the role grant alone 
     ),
     security(("bearer_auth" = []))
 )]
-async fn list_users(
+pub async fn list_users(
     State(state): State<Arc<ServerState>>,
     RealmAuth(auth): RealmAuth,
     Query(query): Query<ListUsersQuery>,
@@ -1411,7 +1411,7 @@ complete document. Realm request policies may deny either read.
     ),
     security(("bearer_auth" = []))
 )]
-async fn get_user(
+pub async fn get_user(
     State(state): State<Arc<ServerState>>,
     TokenAuth(auth): TokenAuth,
     Path(user_id): Path<String>,
@@ -1526,7 +1526,7 @@ path and additionally passes the realm request policies.
     ),
     security(("bearer_auth" = []))
 )]
-async fn update_user(
+pub async fn update_user(
     State(state): State<Arc<ServerState>>,
     RealmAuth(auth): RealmAuth,
     Path(user_id): Path<String>,
