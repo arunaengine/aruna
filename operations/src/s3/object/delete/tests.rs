@@ -1467,9 +1467,8 @@ async fn offered_history(
     context: &DriverContext,
     withdraw: bool,
 ) -> (crate::staging::offered_directory::OfferDirectoryInput, Ulid) {
-    use crate::staging::offered_directory::{
-        OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
-    };
+    use crate::staging::offer::run::{offer_directory, withdraw_offer};
+    use crate::staging::offered_directory::{OfferDirectoryInput, WithdrawOfferInput};
 
     let root = tempdir().unwrap();
     let file = root.path().join("data.bin");

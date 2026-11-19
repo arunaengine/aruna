@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::cron::parse_schedule;
-use super::{ImportRuleError, folders_overlap, validate_folder};
+use super::{ImportRuleError, validate_folder};
 use crate::distribution::inventory::outside_answer;
 use crate::groups::backends::{backend_key, record_writes};
 use crate::groups::fence::group_fence_key;
 use crate::s3::bucket::storage_move::{check_movable, move_reads, move_record, move_rows};
+use crate::s3::imports::folders::folders_overlap;
 use crate::s3::object::put::abe::keyed;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};

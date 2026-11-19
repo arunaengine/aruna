@@ -5,7 +5,7 @@
 use super::*;
 use crate::connectors::descriptor::build_source_binding;
 use crate::s3::purge_fence::PurgeFenceError;
-use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES};
+use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES, PageEntry};
 use aruna_core::calls::CallRun;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

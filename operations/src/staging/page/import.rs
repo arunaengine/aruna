@@ -23,9 +23,7 @@ use aruna_core::structs::sync_relationship_prefix;
 use std::collections::BTreeSet;
 use ulid::Ulid;
 
-pub use crate::staging::page::rows::{
-    PageEntry, PageImportError, PageImportInput, PageImportResult,
-};
+use crate::staging::page::rows::{PageImportError, PageImportInput, PageImportResult};
 
 /// What the pending call of a page answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

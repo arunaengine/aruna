@@ -66,9 +66,9 @@ use aruna_operations::blob::reclaim_sweep::{
 };
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
 use aruna_operations::device::publish_queue::DrainOutcome;
+use aruna_operations::device::sync::outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER};
 use aruna_operations::device::sync::{
-    RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
-    UPLOAD_DEFER_AFTER,
+    RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER,
 };
 use aruna_operations::device_node::sync_note::{NoteSyncOperation, SyncNote};
 use aruna_operations::document_repository::GetConfigOperation;
@@ -1163,7 +1163,7 @@ impl OperationsTaskHandler {
                 self.refresh_device_replicas().await;
             }),
             TaskKey::DrainUploadOutbox => Box::pin(async move {
-                let drain = aruna_operations::device::sync::drain_sync_outbox(
+                let drain = aruna_operations::device::sync::outbox::drain_sync_outbox(
                     self.context.node_and_realm(),
                 );
                 let outcome = drive(drain, &self.context).await;

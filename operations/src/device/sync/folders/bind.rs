@@ -21,7 +21,8 @@ use ulid::Ulid;
 use crate::device::sync_status::ArmTimerOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::transport::{no_peer_transport, peer_answer, peer_call};
-use crate::staging::offered_directory::{OfferedDirectoryError, check_root};
+use crate::staging::offer::run::check_root;
+use crate::staging::offered_directory::OfferedDirectoryError;
 use aruna_core::metadata::protocol::{MetadataTransportMessage, transport_message_kind};
 
 use super::super::ReconcileFolderError;

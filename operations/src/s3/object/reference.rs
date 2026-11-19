@@ -1447,7 +1447,8 @@ mod tests {
     async fn reference_releases_observation() {
         // A reference written over a head observation takes its place, so the
         // observation stops being charged and a recount agrees.
-        use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+        use crate::staging::offer::run::offer_directory;
+        use crate::staging::offered_directory::OfferDirectoryInput;
         use aruna_core::structs::execution::staging::PortableSourceDescriptor;
 
         let test_context = setup_driver_context().await;

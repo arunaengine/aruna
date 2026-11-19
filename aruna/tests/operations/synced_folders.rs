@@ -31,10 +31,15 @@ use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
+use aruna_operations::device::sync::folders::bind::{
+    bind_folder as reserve_folder, create_realm_bucket, finish_binding,
+};
+use aruna_operations::device::sync::folders::reads::{
+    list_entries, list_folders, list_transfers, read_bound,
+};
+use aruna_operations::device::sync::folders::unbind::unbind_folder;
 use aruna_operations::device::sync::folders::{
-    BindFolderInput, FolderError, RealmBucketInput, bind_folder as reserve_folder,
-    create_realm_bucket, finish_binding, list_entries, list_folders, list_transfers, read_bound,
-    set_folder_state, unbind_folder,
+    BindFolderInput, FolderError, RealmBucketInput, set_folder_state,
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
@@ -47,9 +52,8 @@ use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::staging::offer::list::ListOffersOperation;
-use aruna_operations::staging::offered_directory::{
-    OfferDirectoryInput, OfferedDirectoryError, offer_directory,
-};
+use aruna_operations::staging::offer::run::offer_directory;
+use aruna_operations::staging::offered_directory::{OfferDirectoryInput, OfferedDirectoryError};
 use aruna_operations::transfer::origin::ReadOriginOperation;
 use futures_util::StreamExt;
 use topology::{TestResult, Topology, wait_for_convergence, wait_until};

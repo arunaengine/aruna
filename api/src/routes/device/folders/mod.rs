@@ -28,10 +28,13 @@ use aruna_core::types::Key;
 use aruna_operations::device::sync::actions::{
     ActionError, ApplyActionInput, ExpectedEntry, apply_action,
 };
+use aruna_operations::device::sync::folders::bind::{bind_folder, finish_binding, request_sync};
+use aruna_operations::device::sync::folders::reads::{
+    folder_counters, list_actions, list_entries, list_folders, read_bound, read_entry,
+};
+use aruna_operations::device::sync::folders::unbind::unbind_folder;
 use aruna_operations::device::sync::folders::{
-    BindFolderInput, FolderError, bind_folder, finish_binding, folder_counters, list_actions,
-    list_entries, list_folders, read_bound, read_entry, request_sync, set_folder_state,
-    set_propagate_deletes, unbind_folder,
+    BindFolderInput, FolderError, set_folder_state, set_propagate_deletes,
 };
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 

@@ -26,7 +26,7 @@ use ulid::Ulid;
 use crate::device::sync_status::ArmTimerOperation;
 
 use super::download::{Blob, FetchError, FetchRemoteOperation};
-use super::folders::{FolderError, list_entries, read_bound};
+use super::folders::FolderError;
 use super::materialize::{
     MaterializeEntryOperation, MaterializeError, MaterializeInput, MaterializeOutcome,
 };
@@ -34,6 +34,7 @@ use super::remove::RemoveEntryOperation;
 use super::repository::{
     SyncUpload, UploadState, action_entry, base_entry, base_key, upload_entry,
 };
+use crate::device::sync::folders::reads::{list_entries, read_bound};
 
 /// The identity of the bytes the owner acted on. A replace applies to exactly
 /// these bytes or to nothing.

@@ -30,9 +30,8 @@ use crate::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation, BulkDeleteOutcome,
 };
 use crate::s3::object::versions::{ListVersionsError, ListVersionsInput, ListVersionsOperation};
-use crate::staging::offered_directory::{
-    OfferedDirectoryError, WithdrawOfferInput, withdraw_offer,
-};
+use crate::staging::offer::run::withdraw_offer;
+use crate::staging::offered_directory::{OfferedDirectoryError, WithdrawOfferInput};
 use aruna_core::structs::storage::listing::{
     ListUploadsResult, ListVersionsItem, ListVersionsResult,
 };

@@ -35,8 +35,9 @@ use ulid::Ulid;
 
 use crate::device::sync_status::ArmTimerOperation;
 use crate::replication::managed_read::LocalUserOperation;
+use crate::staging::offer::run::offer_directory;
 use crate::staging::offered_directory::{
-    OfferDirectoryInput, OfferDirectoryResult, OfferedDirectoryError, offer_directory,
+    OfferDirectoryInput, OfferDirectoryResult, OfferedDirectoryError,
 };
 
 use download::ApplyDownloadsOperation;
@@ -44,8 +45,6 @@ use folders::bind::RequestVersionsOperation;
 use folders::{FolderError, read_bound, store_progress};
 use reconcile::{ReconcileError, ReconcileFolderOperation, ReconcileInput, ReconcilePlan};
 use repository::SYNC_PAGE_SIZE;
-
-pub use outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER, drain_sync_outbox};
 
 /// Delay before the next pass when every folder is settled.
 pub const RECONCILE_IDLE_AFTER: Duration = Duration::from_secs(30);

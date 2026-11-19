@@ -1225,9 +1225,8 @@ async fn mint_books_bytes() {
 /// Leaves an offered directory observation as the head of an ordinary bucket:
 /// the offer is withdrawn, then its delete marker is deleted.
 async fn promote_observation(h: &Harness, bucket: &str, group_id: Ulid) {
-    use aruna_operations::staging::offered_directory::{
-        OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
-    };
+    use aruna_operations::staging::offer::run::{offer_directory, withdraw_offer};
+    use aruna_operations::staging::offered_directory::{OfferDirectoryInput, WithdrawOfferInput};
 
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("data.bin"), b"offered").unwrap();

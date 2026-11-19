@@ -16,11 +16,6 @@ use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
-pub(crate) use super::offer::run::check_root;
-pub use super::offer::run::{
-    OfferDirectoryOperation, WithdrawOfferOperation, offer_directory, withdraw_offer,
-};
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfferDirectoryInput {
     pub bucket: String,
@@ -143,6 +138,7 @@ mod tests {
     use crate::s3::bucket::write_guard::BucketGuardOperation;
     use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
     use crate::staging::offer::list::ListOffersOperation;
+    use crate::staging::offer::run::{offer_directory, withdraw_offer};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USAGE_STATS_KEYSPACE};

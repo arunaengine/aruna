@@ -1987,7 +1987,8 @@ async fn read_reference_version(ctx: &DriverContext, version_id: Ulid) -> Source
 // observation it supersedes, and a recount agrees.
 #[tokio::test]
 async fn offered_drift_replaces() {
-    use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+    use crate::staging::offer::run::offer_directory;
+    use crate::staging::offered_directory::OfferDirectoryInput;
 
     let fixture = aruna_test_support::staging::setup_driver_context().await;
     let context = &fixture.driver_context;
