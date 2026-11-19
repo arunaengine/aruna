@@ -465,7 +465,7 @@ async fn capture_outputs(
     driver.compute_handle = Some(Arc::new(registry));
     let realm_id = driver.serving_realm(record.created_by.realm_id);
     let capture = CaptureOutputsOperation::new(CaptureScope {
-        kind: backend.kind(),
+        backend: "docker".to_string(),
         fence: fence.clone(),
         spec: Arc::new(spec.clone()),
         record: Arc::new(record.clone()),
