@@ -15,6 +15,7 @@ pub mod audit;
 pub mod family;
 pub mod pages;
 pub mod project;
+pub mod prune;
 pub mod reduce;
 pub mod transport;
 pub mod verify;
