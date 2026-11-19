@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::tests::hash_lookup;
 use super::*;
 use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::permission_rules::PermissionRulesConfig;
@@ -10,9 +11,7 @@ use crate::jobs::export::archive::failure_outcome;
 use crate::jobs::export::consent::UnheldBucketOperation;
 use crate::jobs::export::resolve::CandidateSource;
 use crate::jobs::export::resolve::ExportCandidate;
-use crate::jobs::export::sources::{
-    AliasState, HashCandidatesOperation, HashFound, ResolveEntriesOperation, alias_allowed,
-};
+use crate::jobs::export::sources::{AliasState, ResolveEntriesOperation, alias_allowed};
 use crate::replication::bao_read::BaoReadOutput;
 use crate::replication::plaintext::HolderCheckOperation;
 use crate::tests::export::{
@@ -48,7 +47,6 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
-use aruna_drivers::jobs::context::JobContext;
 use futures_util::StreamExt;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -754,21 +752,6 @@ async fn consent_resolves_hashes() {
     let allowed = drive(holder, node.driver.as_ref()).await;
     assert!(matches!(allowed, Ok(false)));
     node.net.shutdown().await;
-}
-
-async fn hash_lookup(
-    ctx: &JobContext,
-    spec: &ExportRoCrateSpec,
-    hash: [u8; 32],
-) -> Result<HashFound, ExportFailure> {
-    let lookup = HashCandidatesOperation::new(
-        scope_of(ctx, spec),
-        hash,
-        None,
-        Vec::new(),
-        AliasState::default(),
-    );
-    drive(lookup, ctx.driver.as_ref()).await
 }
 
 async fn unheld_bucket(

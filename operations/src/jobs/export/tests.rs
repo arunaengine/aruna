@@ -1798,7 +1798,7 @@ fn context_trick_resolves() {
     );
 }
 
-async fn hash_lookup(
+pub(super) async fn hash_lookup(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     hash: [u8; 32],

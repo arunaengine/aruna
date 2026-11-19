@@ -6,21 +6,11 @@ use std::sync::OnceLock;
 
 use super::*;
 use crate::jobs::repository::test_support::{
-    child, credential_key, job_id, job_scope, link, link_bytes, local_scope, scope,
+    child, credential_key, job_id, job_scope, link, link_bytes, local_scope, scope, target,
 };
 use aruna_core::repository::{LinkFailure, RepositoryCredential};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use serde::Serialize;
-
-fn target() -> LinkTarget {
-    LinkTarget {
-        link_id: link().link_id,
-        published_id: None,
-        parent_id: None,
-        revision_id: None,
-        files: Vec::new(),
-    }
-}
 
 fn destination() -> RepositoryDestination {
     RepositoryDestination {

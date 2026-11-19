@@ -50,6 +50,16 @@ enum Phase {
 
 type Step = Result<Next<bool>, LifecycleError>;
 
+/// The page of outbox entries after `after`.
+fn scan(after: Option<Key>, limit: usize) -> Step {
+    Ok(Next::Call(IoCall::Page {
+        space: FAMILY_OUTBOX_KEYSPACE.to_string(),
+        prefix: Key::from(Vec::new()),
+        after,
+        limit,
+    }))
+}
+
 impl DrainOutboxOperation {
     /// One pass of `local`, a node of realm `realm_id`.
     pub fn new(realm_id: RealmId, local: NodeId) -> Self {
@@ -65,15 +75,6 @@ impl DrainOutboxOperation {
 
     fn cursor_key() -> Key {
         Key::from(OUTBOX_CURSOR_KEY.to_vec())
-    }
-
-    fn scan(&mut self, after: Option<Key>, limit: usize) -> Step {
-        Ok(Next::Call(IoCall::Page {
-            space: FAMILY_OUTBOX_KEYSPACE.to_string(),
-            prefix: Key::from(Vec::new()),
-            after,
-            limit,
-        }))
     }
 
     /// Reads the record of the next entry with a valid key, or writes the cursor at the end.
@@ -204,7 +205,7 @@ impl Operation for DrainOutboxOperation {
             Phase::Cursor => {
                 let cursor = single(result)?;
                 self.phase = Phase::Scan;
-                self.scan(cursor, OUTBOX_DRAIN_BATCH)
+                scan(cursor, OUTBOX_DRAIN_BATCH)
             }
             Phase::Scan => {
                 let IoResult::Page { rows, next } = result else {
@@ -230,7 +231,7 @@ impl Operation for DrainOutboxOperation {
             Phase::WriteCursor => match result {
                 IoResult::Done => {
                     self.phase = Phase::Rescan;
-                    self.scan(None, 1)
+                    scan(None, 1)
                 }
                 _ => Err(unfit("cursor write")),
             },

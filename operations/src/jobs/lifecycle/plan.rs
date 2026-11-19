@@ -290,14 +290,7 @@ impl Operation for BuildPlanOperation {
 }
 
 fn row_values(result: IoResult) -> Result<Vec<Option<Value>>, PlanBuildError> {
-    match result {
-        IoResult::Values(values) => Ok(values),
-        other => Err(IoError::Unexpected {
-            expected: "IoResult::Values",
-            got: other.label(),
-        }
-        .into()),
-    }
+    result.values().map_err(Into::into)
 }
 
 /// The submitter's write check on the group path of `node`.

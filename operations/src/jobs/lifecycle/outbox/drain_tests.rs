@@ -46,15 +46,6 @@ fn cursor_read() -> Step {
     )])))
 }
 
-fn scan(after: Option<Key>, limit: usize) -> Step {
-    Ok(Next::Call(IoCall::Page {
-        space: FAMILY_OUTBOX_KEYSPACE.to_string(),
-        prefix: Key::from(Vec::new()),
-        after,
-        limit,
-    }))
-}
-
 fn page(keys: Vec<Key>, next: Option<Key>) -> IoResult {
     IoResult::Page {
         rows: keys

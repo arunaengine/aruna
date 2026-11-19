@@ -702,14 +702,7 @@ impl Operation for OpenLocalOperation {
 }
 
 fn rows(result: IoResult) -> Result<Vec<Option<Value>>, ResolveError> {
-    match result {
-        IoResult::Values(values) => Ok(values),
-        other => Err(IoError::Unexpected {
-            expected: "IoResult::Values",
-            got: other.label(),
-        }
-        .into()),
-    }
+    result.values().map_err(Into::into)
 }
 
 #[cfg(test)]

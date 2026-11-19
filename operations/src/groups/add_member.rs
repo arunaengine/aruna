@@ -601,12 +601,8 @@ pub mod test {
         add_seed: u8,
         remove_seed: u8,
     ) -> AdminConflict {
-        crate::tests::groups::assignment_conflict(
-            assignment_path(role_id, user_id),
-            user_id,
-            add_seed,
-            remove_seed,
-        )
+        let path = assignment_path(role_id, user_id);
+        crate::tests::groups::assignment_conflict(path, user_id, add_seed, remove_seed)
     }
 
     fn assignment_conflict_state(
