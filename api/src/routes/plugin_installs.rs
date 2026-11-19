@@ -122,6 +122,21 @@ pub struct InstallSummary {
     pub secrets: Vec<SecretLine>,
     /// What the admin should know before approving, such as a shared secret's use rule.
     pub warnings: Vec<String>,
+    /// The container tasks the plugin may start on the install's receiver.
+    #[serde(default)]
+    pub tasks: Vec<TaskLine>,
+}
+
+/// One container task of the summary: the pinned image and its ceilings.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TaskLine {
+    pub name: String,
+    pub image: String,
+    pub cpu: u32,
+    pub memory_bytes: u64,
+    pub time_secs: u64,
+    /// With an open network the container can send anything it reads anywhere.
+    pub open_network: bool,
 }
 
 /// One secret slot of the summary: its kind and the secret it uses.
@@ -172,6 +187,16 @@ impl From<Summary> for InstallSummary {
                 })
                 .collect(),
             warnings: summary.warnings,
+            tasks: (summary.tasks.into_iter())
+                .map(|line| TaskLine {
+                    name: line.name,
+                    image: line.image,
+                    cpu: line.cpu,
+                    memory_bytes: line.memory_bytes,
+                    time_secs: line.time_secs,
+                    open_network: line.open_network,
+                })
+                .collect(),
         }
     }
 }

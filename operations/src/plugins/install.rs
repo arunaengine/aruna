@@ -23,6 +23,7 @@ use aruna_core::{NodeId, UserId};
 use aruna_plugin_types::artifact::ArtifactDigest;
 use aruna_plugin_types::manifest::Manifest;
 use aruna_plugin_types::permission::{Grant, Permission};
+use aruna_plugin_types::recipe::Network;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -998,6 +999,18 @@ pub struct SecretLine {
     pub value: bool,
 }
 
+/// One container task: the pinned image and its ceilings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLine {
+    pub name: String,
+    pub image: String,
+    pub cpu: u32,
+    pub memory_bytes: u64,
+    pub time_secs: u64,
+    /// With an open network the container can send anything it reads anywhere.
+    pub open_network: bool,
+}
+
 /// What an admin approves: the version, the permissions and connections, and the triggers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
@@ -1012,6 +1025,8 @@ pub struct Summary {
     pub triggers: Vec<String>,
     pub secrets: Vec<SecretLine>,
     pub warnings: Vec<String>,
+    /// The container tasks the plugin may start on the install's receiver.
+    pub tasks: Vec<TaskLine>,
 }
 
 /// The summary of a checked install request, before anything is written.
@@ -1118,6 +1133,16 @@ fn summary_of(
                     .then(|| format!("a realm admin adds the use rule of `{binding}` for `{slot}`"))
             })
             .collect(),
+        tasks: (manifest.recipes.iter())
+            .map(|(name, recipe)| TaskLine {
+                name: name.clone(),
+                image: recipe.image.clone(),
+                cpu: recipe.cpu,
+                memory_bytes: recipe.memory,
+                time_secs: recipe.time,
+                open_network: recipe.network == Network::Open,
+            })
+            .collect(),
     }
 }
 
@@ -1142,6 +1167,7 @@ fn bare_summary(install: &PluginInstall) -> Summary {
         triggers: Vec::new(),
         secrets: Vec::new(),
         warnings: Vec::new(),
+        tasks: Vec::new(),
     }
 }
 

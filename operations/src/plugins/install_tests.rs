@@ -486,6 +486,20 @@ fn summary_scope() -> InstallScope {
 }
 
 #[test]
+fn summary_lists_tasks() {
+    let image = format!("harbor.example/map@sha256:{}", "a".repeat(64));
+    let recipe = json!({"image": image, "cpu": 2, "memory": 1024, "time": 60, "network": "open"});
+    let manifest = json!({"name": "p", "version": "0.1.0",
+        "permissions": {"required": ["jobs.run"]}, "recipes": {"map": recipe}});
+    let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+    let none = (&BTreeMap::new(), &BTreeMap::new());
+    let tasks = summary_of(&manifest, "sha256:ab", &summary_scope(), none).tasks;
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].open_network);
+    assert_eq!((tasks[0].cpu, tasks[0].time_secs), (2, 60));
+}
+
+#[test]
 fn summary_warnings() {
     let warned = |triggers: Value, binding: Option<&str>| {
         let manifest = serde_json::json!({"name": "p", "version": "0.1.0", "triggers": triggers});
