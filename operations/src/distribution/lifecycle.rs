@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
     RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::rows::read_row;
+use aruna_core::rows::{SettleMarkerOperation, read_row};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -266,7 +266,7 @@ impl Operation for TendLifecycleOperation {
             PassStep::Set => self.set_worked(result.child::<Worked, PurgeError>()?),
             PassStep::Settle => {
                 let (.., set_id) = self.current.take().ok_or(IoError::Unfinished)?;
-                if let Err(error) = result.child::<(), PurgeError>()? {
+                if let Err(error) = result.child::<(), IoError>()? {
                     warn!(%set_id, %error, "A settled lifecycle row stays until the next pass");
                 }
                 self.next_set()
@@ -280,56 +280,6 @@ fn marker(key: &[u8]) -> (String, Key) {
         DISTRIBUTION_LIFECYCLE_KEYSPACE.to_string(),
         key.to_vec().into(),
     )
-}
-
-/// Deletes a set's marker row only while it still holds `seen`: a record installed since the
-/// pass read it wrote a newer revision, and its work is looked at again.
-#[derive(Debug, PartialEq)]
-pub(crate) struct SettleMarkerOperation {
-    key_space: String,
-    key: Vec<u8>,
-    seen: Vec<u8>,
-    deleting: bool,
-}
-
-impl SettleMarkerOperation {
-    pub(crate) fn new(key_space: &str, key: Vec<u8>, seen: Vec<u8>) -> Self {
-        Self {
-            key_space: key_space.to_string(),
-            key,
-            seen,
-            deleting: false,
-        }
-    }
-
-    fn row(&self) -> (String, Key) {
-        (self.key_space.clone(), self.key.clone().into())
-    }
-}
-
-impl Operation for SettleMarkerOperation {
-    type Output = ();
-    type Error = PurgeError;
-
-    fn transaction(&self) -> TransactionMode {
-        TransactionMode::Write
-    }
-
-    fn first(&mut self) -> Result<Next<()>, PurgeError> {
-        Ok(Next::Call(IoCall::Read(vec![self.row()])))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<()>, PurgeError> {
-        if self.deleting {
-            result.done()?;
-            return Ok(Next::Done(()));
-        }
-        if result.value()?.as_deref() != Some(self.seen.as_slice()) {
-            return Ok(Next::Done(()));
-        }
-        self.deleting = true;
-        Ok(Next::Call(IoCall::Delete(vec![self.row()])))
-    }
 }
 
 /// What working on one set left: its state, the purge budget, and changed transfer sweeps.

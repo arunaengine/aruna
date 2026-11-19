@@ -13,6 +13,7 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, StatementSignEvent};
 use aruna_core::keyspaces::{BOOTSTRAP_KEYSPACE, CATCH_UP_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::rows::SettleMarkerOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::bootstrap::{BootstrapCursor, bootstrap_key};
@@ -30,8 +31,6 @@ use super::bootstrap::{
 };
 use super::members::{ReadRecordOperation, RecordError};
 use super::queue::BlobQueueError;
-use crate::distribution::lifecycle::SettleMarkerOperation;
-use crate::distribution::purge_steps::PurgeError;
 use crate::distribution::submit::SubmitOperation;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::storage::distribution::request::PublishRefusal;
@@ -237,7 +236,7 @@ impl Operation for ProcessBootstrapOperation {
                 self.next_set()
             }
             DrainStep::Settled => {
-                (result.child::<(), PurgeError>()?).map_err(failed)?;
+                (result.child::<(), IoError>()?).map_err(failed)?;
                 self.next_set()
             }
         }
