@@ -6,7 +6,8 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::rows::{done, page};
 use aruna_core::structs::execution::job::{
-    KeyWait, LocalCrate, RunLink, parse_schedule_key, parse_wait_key, run_crate_key,
+    KeyWait, LocalCrate, RunLink, decode_job_record, parse_schedule_key, parse_wait_key,
+    run_crate_key,
 };
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 
@@ -36,13 +37,7 @@ fn decoded<T, E: std::fmt::Display>(
 /// Reads a job record; a malformed row is retained for offline recovery and reads as absent.
 pub fn read_job_record(job_id: JobId) -> RowRead<Option<JobRecord>> {
     RowRead::new(JOB_KEYSPACE, job_record_key(job_id), move |row| {
-        Ok(row.and_then(|row| match JobRecord::from_bytes(&row) {
-            Ok(record) => Some(record),
-            Err(error) => {
-                warn!(job_id = %job_id, error = %error, "Malformed job record retained");
-                None
-            }
-        }))
+        Ok(decode_job_record(job_id, row))
     })
 }
 

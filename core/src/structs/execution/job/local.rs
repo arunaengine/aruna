@@ -814,6 +814,17 @@ pub fn job_record_key(job_id: JobId) -> Key {
     ByteView::from(bytes)
 }
 
+/// The job record a row holds; a malformed row is retained for recovery and reads as absent.
+pub fn decode_job_record(job_id: JobId, row: Option<crate::types::Value>) -> Option<JobRecord> {
+    row.and_then(|row| match JobRecord::from_bytes(&row) {
+        Ok(record) => Some(record),
+        Err(error) => {
+            tracing::warn!(job_id = %job_id, error = %error, "Malformed job record retained");
+            None
+        }
+    })
+}
+
 /// Side-row key holding the run-crate obligation status for an execution job.
 pub fn run_crate_key(job_id: JobId) -> Key {
     ByteView::from(job_id.to_bytes().to_vec())
