@@ -200,7 +200,7 @@ fn sign_aruna_token(
     user_id: UserId,
     restrictions: Option<Vec<PathRestriction>>,
 ) -> String {
-    let now = aruna_api::routes::access::users::now_timestamp();
+    let now = aruna_core::time::unix_timestamp_secs();
     let claims = TokenClaims {
         sub: user_id.to_string(),
         iss: node.realm_id.to_string(),
@@ -421,7 +421,7 @@ async fn register_via_oidc(
     name: &str,
     onboarding_secret: Option<String>,
 ) -> (RegisterUserResponse, String) {
-    let login = Some(aruna_api::routes::access::users::now_timestamp());
+    let login = Some(aruna_core::time::unix_timestamp_secs());
     let oidc_token = sign_oidc_token(issuer, kid, signing_key, subject, Some(name), login);
     let register = reqwest::Client::new()
         .post(format!("{}/api/v1/access/users/register", node.base_url))
@@ -1117,7 +1117,7 @@ async fn burned_secret_recovers() {
             enrollment_id: decoded.enrollment_id,
             secret_hash: decoded.secret_hash(),
             node_id: UserId::local(Ulid::generate(), node.realm_id).to_string(),
-            now: aruna_api::routes::access::users::now_timestamp(),
+            now: aruna_core::time::unix_timestamp_secs(),
         }),
         node.context.as_ref(),
     )
@@ -1549,7 +1549,7 @@ async fn foreign_realm_unimplemented() {
     }
     let token = drive(
         CreateTokenOperation::new(CreateTokenConfig {
-            time: aruna_api::routes::access::users::now_timestamp(),
+            time: aruna_core::time::unix_timestamp_secs(),
             expiry: None,
             user_id: foreign_user_id,
             realm_id: foreign_realm_id,
@@ -1804,7 +1804,7 @@ async fn provider_login_time() {
     .await;
 
     // The token keeps the provider's login time, or none, never the exchange time.
-    let old_login = aruna_api::routes::access::users::now_timestamp() - 3600;
+    let old_login = aruna_core::time::unix_timestamp_secs() - 3600;
     for auth_time in [Some(old_login), None] {
         let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", None, auth_time);
         let response = reqwest::Client::new()

@@ -359,6 +359,7 @@ dependencies = [
  "irokle",
  "jsonwebtoken",
  "keyring-core",
+ "md5",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

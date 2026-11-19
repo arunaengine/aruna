@@ -7,10 +7,7 @@ use aruna_api::auth::ValidatedBearer;
 use aruna_api::error::ServerError;
 use aruna_api::metadata::*;
 use aruna_api::routes::metadata::documents::*;
-use aruna_api::routes::metadata::query::*;
-use aruna_api::routes::metadata::references::*;
 use aruna_api::routes::metadata::rocrate::*;
-use aruna_api::routes::metadata::validation::*;
 use aruna_api::server::state::ServerState;
 use aruna_api::tests::metadata_fixtures::{
     create_test_document, drain_metadata_background, state_realm_nodes, test_realm_id, write_doc,
@@ -36,7 +33,6 @@ use ulid::Ulid;
 use aruna::inbound::initialize_incoming_fixture;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::identity::auth::{NodeCapabilities, TokenClaims};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -44,8 +40,7 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::structs::placement::record::METADATA_HANDLE;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_graph::GraphHandle;
+use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
