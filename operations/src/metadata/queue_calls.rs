@@ -408,9 +408,8 @@ fn group_answer(outcome: MaterializationGroupOutcome) -> IoResult {
     })
 }
 
-#[test]
-fn batch_syncs_graphs() {
-    let graph_iri = event().record.graph_iri;
+// Walks a drain of one completed job to the background start of its graph sync.
+fn syncing(graph_iri: &str) -> MaterializationBatchOperation {
     let mut batch = MaterializationBatchOperation::new(GitNode::default(), 2, true);
     batch.stamp(100);
     batch.first().unwrap();
@@ -422,7 +421,7 @@ fn batch_syncs_graphs() {
     assert_eq!((group.members.len(), group.limit), (1, 2));
     let mut completed = CompletedMaterializationJob::without_rows(job_key(), sidecar_key(), None);
     completed.sync = Some(CompletedMaterializationSync {
-        graph_iri: graph_iri.clone(),
+        graph_iri: graph_iri.to_string(),
         peers: vec![node(2)],
     });
     let outcome = MaterializationGroupOutcome {
@@ -436,15 +435,37 @@ fn batch_syncs_graphs() {
         deletes: vec![global_row(job_key())],
     };
     assert!(is_child(&batch.next(child(Ok::<_, Error>(plan)))));
-    let sync = GraphSyncOperation::new(graph_iri, vec![node(2)]);
+    let sync = GraphSyncOperation::new(graph_iri.to_string(), vec![node(2)]);
     let call = IoCall::background(sync);
     same_call(batch.next(child(Ok::<(), Error>(()))), Ok(Next::Call(call)));
-    let started = TaskEvent::BackgroundStarted { started: true };
-    let timer = batch.next(IoResult::Event(Box::new(Event::Task(started))));
-    assert!(is_child(&timer));
+    batch
+}
+
+fn started(started: bool) -> IoResult {
+    IoResult::Event(Box::new(Event::Task(TaskEvent::BackgroundStarted {
+        started,
+    })))
+}
+
+#[test]
+fn batch_syncs_graphs() {
+    let mut batch = syncing(&event().record.graph_iri);
+    assert!(is_child(&batch.next(started(true))));
     let result = drain_result(batch.next(child(Ok::<(), LinkError>(()))));
     assert_eq!(result.processed, 1);
     assert_eq!(result.next_due_after, None);
+}
+
+#[test]
+fn busy_slot_syncs_inline() {
+    // Without a free background slot the drain waits for the sync instead of dropping it.
+    let graph_iri = event().record.graph_iri;
+    let mut batch = syncing(&graph_iri);
+    let inline = IoCall::child(GraphSyncOperation::new(graph_iri, vec![node(2)]));
+    same_call(batch.next(started(false)), Ok(Next::Call(inline)));
+    assert!(is_child(&batch.next(child(Ok::<(), MetadataError>(())))));
+    let result = drain_result(batch.next(child(Ok::<(), LinkError>(()))));
+    assert_eq!(result.processed, 1);
 }
 
 #[test]
