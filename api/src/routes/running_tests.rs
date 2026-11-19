@@ -11,10 +11,10 @@ use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::execution::job::JobProgress;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
+use aruna_drivers::testing::test_context;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::testing::test_context;
 use std::sync::Arc;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -69,7 +69,7 @@ async fn fixture() -> Fixture {
         NodeCapabilities::management_node(realm_key).unwrap(),
         false,
         None,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_drivers::jobs::runtime::JobsRuntime::new(),
     )
     .await;
     Fixture {

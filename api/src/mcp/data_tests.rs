@@ -451,7 +451,7 @@ mod distributed {
             restrictions: None,
             mirror_guards: Vec::new(),
         };
-        aruna_operations::driver::drive(
+        aruna_drivers::driver::drive(
             WriteReferenceOperation::new(
                 write,
                 std::time::SystemTime::now(),
@@ -677,7 +677,7 @@ async fn external_reference(node: &crate::tests::distributed::Node, key: &str) {
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    aruna_operations::driver::drive(
+    aruna_drivers::driver::drive(
         WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
         &node.state.get_ctx(),
     )

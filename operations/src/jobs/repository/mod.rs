@@ -17,7 +17,7 @@ use ulid::Ulid;
 
 use crate::harvest::read_connector::ConnectorView;
 
-use super::executor::ProgressReporter;
+use aruna_core::jobs::ProgressReporter;
 
 pub mod check;
 pub mod connector;
@@ -40,6 +40,25 @@ pub struct JobScope {
     pub(crate) claim_token: Ulid,
     pub(crate) stop: JobStop,
     pub(crate) progress: ProgressReporter,
+}
+
+impl JobScope {
+    /// The run of `job_id` under `claim_token`, ended early by `stop`.
+    pub fn new(
+        job_id: JobId,
+        owner_node: NodeId,
+        claim_token: Ulid,
+        stop: JobStop,
+        progress: ProgressReporter,
+    ) -> Self {
+        Self {
+            job_id,
+            owner_node,
+            claim_token,
+            stop,
+            progress,
+        }
+    }
 }
 
 impl std::fmt::Debug for JobScope {

@@ -8,7 +8,7 @@ use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_operations::testing::test_context;
+use aruna_drivers::testing::test_context;
 use std::sync::Arc;
 use tempfile::TempDir;
 use ulid::Ulid;

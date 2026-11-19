@@ -14,8 +14,8 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::plugins::account::PluginAccount;
 use aruna_operations::plugins::grants::GrantError;
 use aruna_operations::plugins::install::{
@@ -623,7 +623,7 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_operations::testing::test_context;
+    use aruna_drivers::testing::test_context;
 
     #[tokio::test]
     async fn secret_changes_unrestricted() {

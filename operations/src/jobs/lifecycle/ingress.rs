@@ -4,7 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::driver::drive;
     use crate::jobs::lifecycle::ids::store_workspace;
     use crate::jobs::lifecycle::input_walk::RangeHolderOperation;
     use crate::jobs::lifecycle::submission_rules::{
@@ -28,6 +27,7 @@ mod tests {
     use aruna_core::structs::storage::dataset_description::DatasetDescription;
     use aruna_core::structs::storage::dataset_description::DescriptionError;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_drivers::driver::drive;
     use ulid::Ulid;
 
     use crate::tests::records::{node, payload};

@@ -17,6 +17,7 @@ use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, UploadClient, VersionOrigin,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
+use aruna_drivers::driver::{drive, drive_until};
 use aruna_operations::blob::migration::misplaced::AccessRule;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::resolve::{
@@ -24,7 +25,6 @@ use aruna_operations::distribution::resolve::{
 };
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
-use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::s3::bucket::sources::{BucketSourcesOperation, FileSource};
 use aruna_operations::s3::object::origin::{
     BucketRunsOperation, OriginError, OriginView, ReadOriginOperation,

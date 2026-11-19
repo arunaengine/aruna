@@ -18,9 +18,9 @@ use aruna_core::metadata::{
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{MetaResourceId, StructuredId};
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::git::linked::unreadable_file;
 use aruna_operations::metadata::api::MetadataApiError;

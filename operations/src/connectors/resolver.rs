@@ -577,9 +577,9 @@ mod tests {
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
     use crate::connectors::descriptor::build_source_binding;
     use crate::connectors::repository::delete_connector_effect;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::collections::HashMap;
     use tempfile::tempdir;

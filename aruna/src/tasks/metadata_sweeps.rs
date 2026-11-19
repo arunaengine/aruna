@@ -9,7 +9,7 @@ use std::time::Duration;
 use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::registry_cache::WarmCachesOperation;
 use aruna_operations::metadata::timestamp_sweep::{SWEEP_SCAN_LIMIT, TimestampSweepOperation};
 use aruna_operations::metadata::visibility_index::{

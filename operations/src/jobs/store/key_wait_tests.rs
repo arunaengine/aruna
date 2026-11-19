@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::DriverContext;
 use crate::jobs::store::job_calls::{CancelRequestOutcome, ClaimOutcome};
 use crate::jobs::store::park_wake::{AwaitOutcome, ParkJobOperation, SatisfyWaitOperation};
 use crate::jobs::store::row_calls::{WAKE_PAGE, park_mutation};
@@ -14,6 +13,7 @@ use crate::jobs::store::test_calls::{
 use aruna_core::structs::execution::job::KeyWait;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
+use aruna_drivers::driver::DriverContext;
 use aruna_storage::scan::iter_prefix_page;
 use aruna_storage::{FjallStorage, StorageHandle};
 
@@ -74,7 +74,7 @@ async fn park(context: &DriverContext, job_id: JobId, token: Ulid, waits: Vec<Ke
 #[tokio::test]
 async fn park_keeps_attempts() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (job_id, token) = claimed_job(&context, 5).await;
     park(&context, job_id, token, vec![wait("a", 8), wait("b", 9)]).await;
 
@@ -97,7 +97,7 @@ async fn park_keeps_attempts() {
 #[tokio::test]
 async fn waits_for_keys() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (job_id, token) = claimed_job(&context, 5).await;
     let (first, second) = (wait("a", 8), wait("b", 9));
     park(&context, job_id, token, vec![first.clone(), second.clone()]).await;
@@ -131,7 +131,7 @@ async fn waits_for_keys() {
 #[tokio::test]
 async fn wake_pages_bounded() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let shared = wait("a", 8);
     let count = WAKE_PAGE + 3;
     for seed in 0..count {
@@ -150,7 +150,7 @@ async fn wake_pages_bounded() {
 #[tokio::test]
 async fn cancel_parked_job() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (job_id, token) = claimed_job(&context, 5).await;
     let key = wait("a", 8);
     park(&context, job_id, token, vec![key.clone()]).await;
@@ -174,7 +174,7 @@ async fn cancel_parked_job() {
 #[tokio::test]
 async fn cancel_requeues_ran() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (job_id, token) = claimed_job(&context, 5).await;
     mutate_job(&context, job_id, |record| {
         record.has_run = true;
@@ -198,7 +198,7 @@ async fn cancel_requeues_ran() {
 #[tokio::test]
 async fn cancellation_beats_parking() {
     let (_dir, storage) = temp_storage();
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     let (job_id, token) = claimed_job(&context, 5).await;
     set_cancel_requested(&context, job_id, 2_500).await.unwrap();
     let outcome = park_job(&context, job_id, token, 3_000, vec![wait("a", 8)]).await;

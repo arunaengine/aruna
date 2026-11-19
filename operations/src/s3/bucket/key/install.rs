@@ -362,8 +362,6 @@ impl Operation for InstallKeyOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::DriverContext;
-    use crate::driver::drive;
     use crate::jobs::key_wake::WakeUnlockedOperation;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::compute::SecretBytes;
@@ -373,6 +371,8 @@ mod tests {
     use aruna_core::structs::execution::job::RoCrateLimits;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::{BucketKeyError, public_key_of};
+    use aruna_drivers::driver::DriverContext;
+    use aruna_drivers::driver::drive;
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -643,7 +643,6 @@ mod tests {
         DriverContext,
         crate::s3::bucket::encryption::EnableResult,
     ) {
-        use crate::driver::drive;
         use crate::s3::bucket::create::CreateBucketOperation;
         use crate::s3::bucket::encryption::{EnableEncryptionOperation, EnableInput};
         use aruna_blob::blob::BlobHandler;
@@ -655,13 +654,14 @@ mod tests {
         use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys, EncryptionMode};
         use aruna_core::structs::storage::format::Compression;
         use aruna_core::structs::storage::holders::KeyLookup;
+        use aruna_drivers::driver::drive;
         use std::collections::{BTreeMap, HashMap};
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         let storage = aruna_storage::FjallStorage::open(root).unwrap();
         storage.open_vault(NodeVaultKey::random());
-        let net = aruna_net::NetHandle::new(crate::testing::local_net(), storage.clone())
+        let net = aruna_net::NetHandle::new(aruna_drivers::testing::local_net(), storage.clone())
             .await
             .unwrap();
         let config = BackendConfig {
@@ -804,7 +804,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            !crate::driver::drive(
+            !aruna_drivers::driver::drive(
                 crate::jobs::key_locks::KeyUnlockedOperation::new(key.key),
                 &context
             )
@@ -883,7 +883,7 @@ mod tests {
     async fn unlock_resumes_rewrite() {
         use crate::blob::migration::queue::{ProcessTransitionsOperation, RECHECK};
         use crate::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
-        use crate::testing::{RecordingTaskHandler, freeze_clock};
+        use crate::testing::RecordingTaskHandler;
         use crate::tests::records::read_row;
         use aruna_core::handle::Handle;
         use aruna_core::keyspaces::{
@@ -897,6 +897,7 @@ mod tests {
             EncryptionTransition, TransitionKind, TransitionState, TransitionTarget,
         };
         use aruna_core::task::{TaskEffect, TaskKey};
+        use aruna_drivers::testing::freeze_clock;
 
         let (_dir, mut context, enabled) = enabled_context().await;
         let key = enabled.key.key;
@@ -966,7 +967,7 @@ mod tests {
             })
             .await;
         assert_eq!(
-            crate::driver::drive(
+            aruna_drivers::driver::drive(
                 ProcessTransitionsOperation::new(context.node_and_realm()),
                 &context
             )
@@ -1036,7 +1037,7 @@ mod tests {
         );
         assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
         assert!(duration < RECHECK);
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             ProcessTransitionsOperation::new(context.node_and_realm()),
             &context,
         )

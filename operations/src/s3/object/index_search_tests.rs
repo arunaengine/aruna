@@ -23,8 +23,8 @@ use super::super::tests::{
 };
 use super::*;
 use crate::distribution::test_record::{binding, record, store_record};
-use crate::driver::drive;
 use aruna_core::key_index::{IndexedKey, KeyChange};
+use aruna_drivers::driver::drive;
 use aruna_storage::key_index::RangeIndexes;
 
 struct Distributed {

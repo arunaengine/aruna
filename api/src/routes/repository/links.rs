@@ -10,8 +10,8 @@ use aruna_core::repository::{
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::drive;
 use aruna_operations::harvest::read_connector::{
     ConnectorView, GetRepositoryOperation, ReadConnectorError,
 };

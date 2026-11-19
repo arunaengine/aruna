@@ -1,37 +1,48 @@
-//! Reads what the job operations need to know about this node from the driver context.
+//! Builds what the job operations need to know about this node from the facts its caller read:
+//! the node and realm it serves, the fresh heartbeats and the limits of its executor backends.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_compute::ExecutorRegistry;
-use aruna_core::compute::{ExecutorKind, ResourceEnvelope};
+use std::collections::BTreeMap;
+
+use aruna_core::NodeId;
+use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::LaunchFrame;
-use aruna_core::structs::execution::job::{JobFamilyRecord, LaunchIntent};
+use aruna_core::heartbeat::HeldHeartbeat;
+use aruna_core::structs::execution::job::JobFamilyRecord;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
 use crate::jobs::lifecycle::launch_admit::LaunchNode;
 use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::lifecycle::witness::WitnessNode;
 use crate::jobs::local_run::{LocalExecutionConfig, LocalRunOperation};
 
 /// This node as the submission operations see it; `None` without a network.
-pub fn ingress_node(context: &DriverContext) -> Option<IngressNode> {
-    let (local, realm_id) = context.node_and_realm()?;
+pub fn ingress_node(
+    serving: Option<(NodeId, RealmId)>,
+    fresh: BTreeMap<NodeId, HeldHeartbeat>,
+) -> Option<IngressNode> {
+    let (local, realm_id) = serving?;
     Some(IngressNode {
         local,
         realm_id,
         now_ms: unix_timestamp_millis(),
-        fresh: context.fresh_heartbeats(),
+        fresh,
     })
 }
 
 /// This node as an offered launch sees it; `None` without a network, which leaves the offer
-/// undecided.
-pub fn launch_node(context: &DriverContext, launch: &LaunchFrame) -> Option<LaunchNode> {
-    let (local, realm_id) = context.node_and_realm()?;
+/// undecided. `limits` holds each local backend's limits by its wire kind.
+pub fn launch_node(
+    serving: Option<(NodeId, RealmId)>,
+    limits: &BTreeMap<String, ResourceEnvelope>,
+    launch: &LaunchFrame,
+) -> Option<LaunchNode> {
+    let (local, realm_id) = serving?;
     let limits = match &launch.envelope().record {
-        JobFamilyRecord::Launch(intent) => offered_limits(context, intent),
+        JobFamilyRecord::Launch(intent) => limits.get(&intent.target.executor_kind).copied(),
         _ => None,
     };
     Some(LaunchNode {
@@ -43,32 +54,31 @@ pub fn launch_node(context: &DriverContext, launch: &LaunchFrame) -> Option<Laun
     })
 }
 
-/// This node's own advertisement for the offered executor kind.
-fn offered_limits(context: &DriverContext, intent: &LaunchIntent) -> Option<ResourceEnvelope> {
-    let registry: &ExecutorRegistry = context.compute_handle.as_ref()?;
-    let backend = registry.get(&ExecutorKind::from_wire(&intent.target.executor_kind))?;
-    Some(backend.capabilities().limits)
-}
-
 /// This node as witness rounds see it; `None` without a network.
-pub fn witness_node(context: &DriverContext) -> Option<WitnessNode> {
-    let (local, realm_id) = context.node_and_realm()?;
-    let registry: Option<&ExecutorRegistry> = context.compute_handle.as_deref();
+pub fn witness_node(
+    serving: Option<(NodeId, RealmId)>,
+    fresh: BTreeMap<NodeId, HeldHeartbeat>,
+    limits: BTreeMap<String, ResourceEnvelope>,
+) -> Option<WitnessNode> {
+    let (local, realm_id) = serving?;
     Some(WitnessNode {
         local,
         realm_id,
-        fresh: context.fresh_heartbeats(),
-        limits: registry.map(ExecutorRegistry::limits).unwrap_or_default(),
+        fresh,
+        limits,
     })
 }
 
-/// A run on this node: the ceilings of the backend it would select, and the realm it serves.
-pub fn local_run(config: LocalExecutionConfig, context: &DriverContext) -> LocalRunOperation {
-    let limits = context.compute_handle.as_ref().and_then(|registry| {
-        let constraint = config.spec.executor_constraint.as_deref();
-        let constraint = constraint.map(ExecutorKind::from_wire);
-        let backend = registry.select(constraint.as_ref())?;
-        Some(backend.capabilities().limits)
-    });
-    LocalRunOperation::new(config, limits, context.node_and_realm())
+/// A run on this node: the limits of the backend it would select (the constrained kind, or the
+/// first one), and the realm it serves.
+pub fn local_run(
+    config: LocalExecutionConfig,
+    limits: &BTreeMap<String, ResourceEnvelope>,
+    serving: Option<(NodeId, RealmId)>,
+) -> LocalRunOperation {
+    let selected = match config.spec.executor_constraint.as_deref() {
+        Some(kind) => limits.get(kind).copied(),
+        None => limits.values().next().copied(),
+    };
+    LocalRunOperation::new(config, selected, serving)
 }

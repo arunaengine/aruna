@@ -4,7 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::driver::{DriverContext, drive};
     use crate::notifications::watch::check::WatchCheckOperation;
     use crate::notifications::watch::paths::WatchAuthorization;
     use aruna_core::effects::StorageEffect;
@@ -23,6 +22,7 @@ mod tests {
     };
     use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::{FjallStorage, StorageHandle};
     use ulid::Ulid;
 

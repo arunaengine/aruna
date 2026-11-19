@@ -530,7 +530,7 @@ pub(crate) fn is_file(value: &JsonValue) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     async fn restricted_files(
         context: &DriverContext,

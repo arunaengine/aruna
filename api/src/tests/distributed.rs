@@ -30,9 +30,9 @@ use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
 };
 use aruna_core::{NodeId, UserId};
+use aruna_drivers::driver::DriverContext;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::distribution::inventory::open_ranges;
-use aruna_operations::driver::DriverContext;
 use aruna_storage::FjallStorage;
 use axum::Router;
 use axum::http::{StatusCode, Uri};
@@ -207,7 +207,7 @@ pub(crate) async fn hidden_link(node: &Node, key: &str) {
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    aruna_operations::driver::drive(
+    aruna_drivers::driver::drive(
         WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
         &node.state.get_ctx(),
     )

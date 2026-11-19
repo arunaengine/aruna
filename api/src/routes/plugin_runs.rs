@@ -12,7 +12,7 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRec
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::plugins::decide::event_delivery;
 use aruna_operations::plugins::dispatch::{StartError, StartRun};
 use aruna_operations::plugins::finished::{drop_completion, retry_run, waits_for};
@@ -649,7 +649,7 @@ pub async fn list_work(
 /// One work as the routes show it: its state from the summary or the job record, and the run
 /// its held end waits for.
 async fn work_view(
-    ctx: &aruna_operations::driver::DriverContext,
+    ctx: &aruna_drivers::driver::DriverContext,
     install_id: Ulid,
     row: WorkRow,
 ) -> Result<WorkView, String> {
@@ -838,7 +838,7 @@ pub async fn resolve(
 
 /// The audit row of an admin action on install `install_id`'s run `run_id`.
 async fn run_audit(
-    ctx: &aruna_operations::driver::DriverContext,
+    ctx: &aruna_drivers::driver::DriverContext,
     served: &Served,
     (run_id, action): (Ulid, AdminAuditAction),
 ) -> Result<AdminAuditRecord, Response> {
@@ -1112,9 +1112,9 @@ mod tests {
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_operations::driver::drive;
+    use aruna_drivers::driver::drive;
+    use aruna_drivers::testing::test_context;
     use aruna_operations::plugins::runs::{admit, save_run};
-    use aruna_operations::testing::test_context;
 
     fn waiting_run(install_id: Ulid, group_id: GroupId) -> PluginRun {
         PluginRun {
@@ -1302,7 +1302,7 @@ mod tests {
         };
         use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
         use aruna_core::structured_id::{BucketId, PlacementHandle};
-        use aruna_operations::driver::drive;
+        use aruna_drivers::driver::drive;
         use aruna_operations::plugins::work::{
             Identity, WorkChange, WorkRow, reserve, update_work,
         };

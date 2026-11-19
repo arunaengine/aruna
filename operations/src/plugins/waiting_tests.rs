@@ -3,13 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
 use crate::plugins::calls::*;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_SEEN_KEYSPACE};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{ForwardRow, GapRow, RECEIVER_GAP, RunTrigger, WAITING_EXPIRY_MS};
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::drive;
 
 use super::*;
 use crate::plugins::decide::{SeenRow, seen_key};

@@ -418,7 +418,6 @@ fn apply_reducer_policies(
 mod tests {
     use super::{GroupPoliciesWrite, SetGroupConfig, SetGroupError, SetGroupOperation};
     use crate::document_repository::{GetGroupConfig, GetGroupOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
@@ -431,6 +430,7 @@ mod tests {
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;

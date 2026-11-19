@@ -125,7 +125,7 @@ pub async fn search_records(
         query,
         state.rocrate_limits().metadata_bytes,
     );
-    aruna_operations::driver::drive(search, context.as_ref())
+    aruna_drivers::driver::drive(search, context.as_ref())
         .await
         .map(Json)
         .map_err(|error| match error {
@@ -312,7 +312,7 @@ pub async fn import_record(
                 reference,
                 state.rocrate_limits().metadata_bytes,
             );
-            aruna_operations::driver::drive(resolve, context.as_ref())
+            aruna_drivers::driver::drive(resolve, context.as_ref())
                 .await
                 .map_err(|error| match error {
                     TransferError::Permanent(message) => ServerError::BadRequestReason(message),

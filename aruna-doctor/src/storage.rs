@@ -214,8 +214,8 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_drivers::driver::{DriverContext, drive, node_routing};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::driver::{DriverContext, drive, node_routing};
     use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
     use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
@@ -315,7 +315,7 @@ mod tests {
                 config.node_capabilities.clone(),
                 false,
                 None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
+                aruna_drivers::jobs::runtime::JobsRuntime::new(),
             )
             .await;
 

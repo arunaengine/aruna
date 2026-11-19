@@ -13,8 +13,8 @@ use aruna_core::structs::{
     AssistantProviderStatus,
 };
 use aruna_core::time::unix_timestamp_secs;
+use aruna_drivers::driver::drive;
 use aruna_operations::assistant::provider::CreateProviderOperation;
-use aruna_operations::driver::drive;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

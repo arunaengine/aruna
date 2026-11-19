@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::Actor;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;

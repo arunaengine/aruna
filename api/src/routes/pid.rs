@@ -31,9 +31,9 @@ use aruna_core::structs::{
     PersistentIdStatus,
 };
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::driver::drive;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::identifier_fanout::lookup_identifier_distributed;
@@ -1024,7 +1024,7 @@ mod tests {
         tempfile::TempDir,
         Arc<ServerState>,
         Ulid,
-        Arc<aruna_operations::driver::DriverContext>,
+        Arc<aruna_drivers::driver::DriverContext>,
         Actor,
     ) {
         seeded_pid(true, true).await
@@ -1038,7 +1038,7 @@ mod tests {
         tempfile::TempDir,
         Arc<ServerState>,
         Ulid,
-        Arc<aruna_operations::driver::DriverContext>,
+        Arc<aruna_drivers::driver::DriverContext>,
         Actor,
     ) {
         use crate::tests::routes::{
@@ -1051,7 +1051,7 @@ mod tests {
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::persistent_id_key;
         use aruna_core::structs::placement::record::PlacementRef;
-        use aruna_operations::testing::test_context;
+        use aruna_drivers::testing::test_context;
 
         let (dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes(

@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::storage::data::link::{set_versions_key, truncated_key};
 use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::StorageHandle;
 use tempfile::tempdir;
 

@@ -35,7 +35,6 @@ const TERMS: &str = "https://w3id.org/aruna/terms/";
 const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket";
 const LINK_PROPERTY: &str = "https://w3id.org/aruna/terms/link";
 
-use super::super::executor::JobRunOutcome;
 use super::super::records::pages::ServingNode;
 use super::super::store::mutation_error::JobMutationError;
 use super::super::store::row_calls::{
@@ -61,6 +60,7 @@ use crate::s3::object::head::{
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageReadError;
+use aruna_core::jobs::JobRunOutcome;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmConfigDocument;

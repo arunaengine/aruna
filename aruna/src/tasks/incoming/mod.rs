@@ -48,6 +48,9 @@ impl Drop for OutboxBarrier {
     }
 }
 
+use aruna_drivers::driver::{DriverContext, drive, drive_retry};
+use aruna_drivers::jobs::context::PayloadHandler;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::blob::cleanup::{
     BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, CleanupNode, ProcessCleanupOperation,
     SweepUploadsOperation,
@@ -67,10 +70,8 @@ use aruna_operations::device::sync::{
 };
 use aruna_operations::device::sync_note::{NoteSyncOperation, SyncNote};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::{DriverContext, drive, drive_retry};
 use aruna_operations::forward::realm::RelayAdminOperation;
 use aruna_operations::jobs::JOB_PRUNE_PAGE;
-use aruna_operations::jobs::context::PayloadHandler;
 use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
 use aruna_operations::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use aruna_operations::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
@@ -81,7 +82,6 @@ use aruna_operations::jobs::node_inputs::witness_node;
 use aruna_operations::jobs::prune::{
     JobPruneOutcome, PruneDueOperation, PruneJobsOperation, PruneTimerOperation,
 };
-use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::job_calls;
 use aruna_operations::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use aruna_operations::metadata::data_links::RetryUnverifiedOperation;
@@ -97,14 +97,14 @@ use aruna_operations::metadata::projection::{
 
 /// Replays the whole event log into the registry projection, one page at a time.
 async fn replay_event_log(
-    context: &aruna_operations::driver::DriverContext,
+    context: &aruna_drivers::driver::DriverContext,
 ) -> Result<usize, aruna_operations::metadata::projection::MetadataProjectionError> {
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let mut after = None;
     let mut projected = 0usize;
     loop {
         let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
-        let (count, next) = aruna_operations::driver::drive(page, context).await?;
+        let (count, next) = aruna_drivers::driver::drive(page, context).await?;
         projected = projected.saturating_add(count);
         match next {
             Some(next) => after = Some(next),
@@ -119,10 +119,10 @@ use aruna_operations::metadata::prune_queue::{
 
 /// Arms the graph prune drain for its next due job at start.
 async fn restore_graph_prune(
-    context: &aruna_operations::driver::DriverContext,
+    context: &aruna_drivers::driver::DriverContext,
     task_handle: &aruna_tasks::TaskHandle,
 ) {
-    match aruna_operations::driver::drive(GraphPruneTimerOperation::new(), context).await {
+    match aruna_drivers::driver::drive(GraphPruneTimerOperation::new(), context).await {
         Ok(None) => {}
         Ok(Some(after)) => {
             let wake =
@@ -144,7 +144,7 @@ async fn restore_graph_prune(
 use crate::tasks::task_persistence::restore_task_timers;
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
-use aruna_operations::driver::node_facts;
+use aruna_drivers::driver::node_facts;
 use aruna_operations::node::info::flows::ObservePlacementOperation;
 use aruna_operations::notifications::email::RefreshMailOperation;
 use aruna_operations::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
@@ -943,7 +943,7 @@ impl OperationsTaskHandler {
                     .expect("migration cursor mutex poisoned")
                     .clone();
                 let run = aruna_operations::blob::migration::drain::ProcessMigrationsOperation::new(
-                    aruna_operations::driver::node_routing(&self.context),
+                    aruna_drivers::driver::node_routing(&self.context),
                     self.context.node_and_realm(),
                     start,
                 );
@@ -1055,7 +1055,7 @@ impl OperationsTaskHandler {
             TaskKey::MaintainRanges => Box::pin(async move {
                 use aruna_operations::distribution::sharding::{maintain_ranges, maintain_retry};
                 let context = &self.context;
-                let mut after = match aruna_operations::driver::drive(
+                let mut after = match aruna_drivers::driver::drive(
                     maintain_ranges(
                         context.node_and_realm(),
                         &context.fresh_heartbeats(),
@@ -1074,8 +1074,7 @@ impl OperationsTaskHandler {
                                     context.node_and_realm(),
                                     unix_timestamp_millis(),
                                 );
-                            if let Err(error) =
-                                aruna_operations::driver::drive(started, context).await
+                            if let Err(error) = aruna_drivers::driver::drive(started, context).await
                             {
                                 warn!(%error, "Handed over imports could not start");
                             }
@@ -1090,7 +1089,7 @@ impl OperationsTaskHandler {
                 // Version links metadata could not verify in a set are retried a page per pass.
                 let resume = (UNVERIFIED_CURSOR.lock().ok()).and_then(|cursor| cursor.clone());
                 let retry = RetryUnverifiedOperation::new(context.node_and_realm(), resume);
-                match aruna_operations::driver::drive(retry, context).await {
+                match aruna_drivers::driver::drive(retry, context).await {
                     Ok(next) => {
                         if next.is_some() {
                             after = std::time::Duration::ZERO;
@@ -1116,7 +1115,7 @@ impl OperationsTaskHandler {
                     now,
                     self.context.node_and_realm(),
                 );
-                if let Ok(Some(after)) = aruna_operations::driver::drive(run, &self.context).await {
+                if let Ok(Some(after)) = aruna_drivers::driver::drive(run, &self.context).await {
                     self.reschedule_timer(TaskKey::RunBackendImports, after)
                         .await;
                 }

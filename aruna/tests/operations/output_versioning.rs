@@ -42,8 +42,8 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::jobs::workflow::credential::RunIdentity;
 use aruna_operations::jobs::workflow::inputs::LoadInputsOperation;
@@ -94,7 +94,7 @@ async fn setup() -> Harness {
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let config = NetConfig {
         realm_id,
-        ..aruna_operations::testing::local_net()
+        ..aruna_drivers::testing::local_net()
     };
     let net_handle = NetHandle::new(config, storage_handle.clone())
         .await

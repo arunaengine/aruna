@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
 use crate::auth::request_authorization::BucketAccessOperation;
-use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::rename::tests::{
     BUCKET, access, get, group, head_key, object, realm, setup, store_job,
 };
@@ -11,6 +10,7 @@ use crate::tests::records::node;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::LINKED_JOB_KEYSPACE;
+use aruna_drivers::driver::{DriverContext, drive};
 use ulid::Ulid;
 
 /// Stores a running remap job of the bucket that started at `started_ms`.

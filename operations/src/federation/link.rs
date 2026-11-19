@@ -425,8 +425,6 @@ impl Operation for UnlinkLoginOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive_retry;
-    use crate::driver::{DriverContext, drive};
     use crate::users::update_user::{UserWrite, UserWritten};
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::effects::StorageEffect;
@@ -440,6 +438,8 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::time::unix_timestamp_secs;
     use aruna_core::types::{Key, KeySpace, Value};
+    use aruna_drivers::driver::drive_retry;
+    use aruna_drivers::driver::{DriverContext, drive};
     use ed25519_dalek::SigningKey;
     use tempfile::{TempDir, tempdir};
     use url::Url;

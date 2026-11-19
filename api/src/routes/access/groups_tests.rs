@@ -37,10 +37,10 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::driver::drive;
+use aruna_drivers::testing::test_context;
 use aruna_operations::groups::list_groups::ListGroupOperation;
-use aruna_operations::testing::test_context;
 use aruna_storage::storage;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -227,7 +227,7 @@ async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
             NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );

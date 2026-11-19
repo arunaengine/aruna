@@ -2,7 +2,6 @@
 //! read fails closed without its registration.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
-use crate::driver::{DriverContext, drive};
 use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -26,6 +25,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use std::collections::HashMap;
@@ -42,7 +42,7 @@ async fn full_context() -> (TempDir, DriverContext) {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).expect("blob root");
     let storage_handle = storage::FjallStorage::open(temp_root).expect("storage opens");
-    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .expect("net handle");
     let blob_handle = BlobHandler::new(

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::plugins::calls::*;
 use crate::plugins::runs::tests::opened;
 use aruna_core::NodeId;
@@ -12,6 +11,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
+use aruna_drivers::driver::{DriverContext, drive};
 use std::collections::BTreeSet;
 use ulid::Ulid;
 

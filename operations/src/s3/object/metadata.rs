@@ -273,7 +273,6 @@ mod tests {
     use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
     use aruna_storage::StorageHandle;
 
-    use crate::driver::DriverContext;
     use crate::s3::object::metadata_drain::{
         DrainRefreshOperation, RefreshReferenceOperation, RefreshRunError, SettleJob,
     };
@@ -284,20 +283,21 @@ mod tests {
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_drivers::driver::DriverContext;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
     async fn process_batch(
         context: &DriverContext,
     ) -> Result<super::super::metadata_drain::ReferenceDrainResult, ReferenceRefreshError> {
-        crate::driver::drive(DrainRefreshOperation::new(), context).await
+        aruna_drivers::driver::drive(DrainRefreshOperation::new(), context).await
     }
 
     async fn refresh_with_context(
         context: &DriverContext,
         refresh: ReferenceRefresh,
     ) -> Result<(), RefreshRunError> {
-        crate::driver::drive(RefreshReferenceOperation::new(refresh), context).await
+        aruna_drivers::driver::drive(RefreshReferenceOperation::new(refresh), context).await
     }
 
     async fn jobs_exist(storage: &StorageHandle) -> bool {
@@ -620,7 +620,7 @@ mod tests {
         let original_metadata = source_metadata(10, "original");
         write_reference_version(&test, original_metadata.clone(), last_refresh, 0).await;
 
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             QueueRefreshOperation::new(refresh(
                 &test,
                 source_metadata(20, "older"),
@@ -646,7 +646,7 @@ mod tests {
         let original = source_metadata(10, "original");
         write_reference_version(&test, original.clone(), last_refresh, 0).await;
 
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             QueueRefreshOperation::new(refresh(&test, source_metadata(20, "newer"), refreshed_at)),
             &test.context,
         )
@@ -811,7 +811,7 @@ mod tests {
         let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let mut request = refresh(&test, source_metadata(1, "unused"), refreshed_at);
         request.metadata = None;
-        crate::driver::drive(QueueRefreshOperation::new(request), &test.context)
+        aruna_drivers::driver::drive(QueueRefreshOperation::new(request), &test.context)
             .await
             .expect("queue succeeds");
 
@@ -835,7 +835,7 @@ mod tests {
         for (observation, expected_refresh) in
             [(unknown, SystemTime::UNIX_EPOCH), (listed, refreshed_at)]
         {
-            crate::driver::drive(
+            aruna_drivers::driver::drive(
                 QueueRefreshOperation::new(refresh(&test, observation, refreshed_at)),
                 &test.context,
             )
@@ -856,7 +856,7 @@ mod tests {
         let original = source_metadata(10, "original");
         write_reference_version(&test, original.clone(), SystemTime::UNIX_EPOCH, 7).await;
 
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             QueueRefreshOperation::new(refresh(&test, original.clone(), refreshed_at)),
             &test.context,
         )
@@ -877,13 +877,13 @@ mod tests {
         let original = source_metadata(1, "original");
         write_reference_version(&test, original.clone(), last_refresh, 0).await;
 
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             QueueRefreshOperation::new(refresh(&test, original.clone(), newer)),
             &test.context,
         )
         .await
         .expect("newer queue succeeds");
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             QueueRefreshOperation::new(refresh(&test, original.clone(), older)),
             &test.context,
         )
@@ -907,7 +907,7 @@ mod tests {
         let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         for refreshed_at in [older, newer] {
-            crate::driver::drive(
+            aruna_drivers::driver::drive(
                 QueueRefreshOperation::new(refresh(&test, original.clone(), refreshed_at)),
                 &test.context,
             )
@@ -923,7 +923,9 @@ mod tests {
         let key = job_key(&older_job.refresh).unwrap();
 
         let settle = SettleJob::new(key.to_vec(), older_job.clone(), None);
-        crate::driver::drive(settle, &test.context).await.unwrap();
+        aruna_drivers::driver::drive(settle, &test.context)
+            .await
+            .unwrap();
 
         assert_eq!(read_jobs(storage).await, queued);
         assert_eq!(queued[0].refresh.refreshed_at, newer);
@@ -944,7 +946,7 @@ mod tests {
         let writes = job_entries(&future_job).expect("future job serializes");
         write_rows(&test.context.storage_handle, writes).await;
 
-        crate::driver::drive(QueueRefreshOperation::new(refresh), &test.context)
+        aruna_drivers::driver::drive(QueueRefreshOperation::new(refresh), &test.context)
             .await
             .expect("duplicate queue succeeds");
 
@@ -996,7 +998,7 @@ mod tests {
     async fn corrupt_precedes_valid() {
         let test = setup_state();
         write_corrupt_job(&test.context.storage_handle, "000-corrupt-refresh-job").await;
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             QueueRefreshOperation::new(refresh(
                 &test,
                 source_metadata(20, "valid"),

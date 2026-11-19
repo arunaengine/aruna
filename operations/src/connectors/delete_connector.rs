@@ -180,7 +180,6 @@ mod tests {
     use crate::connectors::replace_connector::{ReplaceSourceInput, ReplaceSourceOperation};
     use crate::connectors::repository::{parse_connector_read, read_connector_effect};
     use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::tests::connectors::{
         create_connector, defers_pending, reference_rows, source_metadata, vault_context,
         write_reference,
@@ -194,6 +193,7 @@ mod tests {
     };
     use aruna_core::structs::execution::staging::StagingStrategy;
     use aruna_core::structs::storage::blob::BlobVersion;
+    use aruna_drivers::driver::{DriverContext, drive};
     use std::collections::HashMap;
     use std::time::SystemTime;
 

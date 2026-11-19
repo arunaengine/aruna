@@ -395,8 +395,8 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::driver::DriverContext;
     use crate::s3::bucket::local_search::{LocalBucketSearch, extras_valid};
+    use aruna_drivers::driver::DriverContext;
 
     fn scan_input(query: &str, limit: usize) -> SearchBucketsInput {
         let realm_id = RealmId::from_bytes([9u8; 32]);
@@ -742,7 +742,7 @@ mod tests {
             .await;
         }
 
-        let hits = crate::driver::drive(
+        let hits = aruna_drivers::driver::drive(
             LocalBucketSearch::new(SearchBucketsInput {
                 auth: AuthContext {
                     user_id: outsider,
@@ -794,7 +794,7 @@ mod tests {
             )
             .await;
         }
-        let databases = crate::driver::drive(
+        let databases = aruna_drivers::driver::drive(
             LocalBucketSearch::new(SearchBucketsInput {
                 auth: AuthContext {
                     user_id: owner,
@@ -841,9 +841,12 @@ mod tests {
             start_after: None,
             database: false,
         };
-        let cut = crate::driver::drive(LocalBucketSearch::with_budget(input.clone(), 1), &context)
-            .await
-            .unwrap();
+        let cut = aruna_drivers::driver::drive(
+            LocalBucketSearch::with_budget(input.clone(), 1),
+            &context,
+        )
+        .await
+        .unwrap();
         assert!(cut.hits.is_empty());
         let sealed = cut.scanned_to.expect("the scan was cut");
         assert!(!sealed.windows(12).any(|window| window == b"data-private"));
@@ -851,7 +854,7 @@ mod tests {
             start_after: Some(sealed.clone().into()),
             ..input.clone()
         };
-        let rest = crate::driver::drive(LocalBucketSearch::new(resumed), &context)
+        let rest = aruna_drivers::driver::drive(LocalBucketSearch::new(resumed), &context)
             .await
             .unwrap();
         let names: Vec<_> = rest.hits.iter().map(|hit| hit.bucket.as_str()).collect();
@@ -863,7 +866,7 @@ mod tests {
             ..input
         };
         // A position this node cannot open retires its scan instead of failing every page.
-        let retired = crate::driver::drive(LocalBucketSearch::new(forged), &context)
+        let retired = aruna_drivers::driver::drive(LocalBucketSearch::new(forged), &context)
             .await
             .unwrap();
         assert!(retired.retired && retired.hits.is_empty() && retired.scanned_to.is_none());

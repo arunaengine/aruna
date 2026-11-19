@@ -11,7 +11,8 @@ use futures_util::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
 use crate::driver::DriverContext;
-use crate::jobs::executor::{JobRunOutcome, ProgressReporter, RangeTurns};
+use crate::jobs::executor::RangeTurns;
+use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 
 pub struct JobContext {
     pub driver: Arc<DriverContext>,
@@ -27,19 +28,6 @@ pub struct JobContext {
     pub range_turns: RangeTurns,
     /// Runs the payload kinds that other domains own, as the node wiring registered them.
     pub handlers: Vec<Arc<dyn PayloadHandler>>,
-}
-
-impl JobContext {
-    /// This job as the repository and harvest operations see it.
-    pub fn job_scope(&self) -> crate::jobs::repository::JobScope {
-        crate::jobs::repository::JobScope {
-            job_id: self.job_id,
-            owner_node: self.owner_node_id,
-            claim_token: self.claim_token,
-            stop: aruna_blob::remote::job_stop(self.cancel.clone(), self.shutdown.clone()),
-            progress: self.progress.clone(),
-        }
-    }
 }
 
 /// Runs and keeps the jobs of a payload kind that `jobs` does not own. The node wiring

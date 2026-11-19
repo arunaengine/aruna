@@ -28,7 +28,7 @@ mod tests {
         scope: WatchScope,
     ) -> Result<(Vec<WatchSubscription>, Option<Vec<u8>>), WatchSubscriptionError> {
         let list = ListWatchesOperation::new(scope);
-        let page = crate::driver::drive(list, &context(storage)).await?;
+        let page = aruna_drivers::driver::drive(list, &context(storage)).await?;
         Ok((page.subscriptions, page.next))
     }
 

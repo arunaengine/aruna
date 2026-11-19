@@ -21,7 +21,6 @@ use super::publish::{RepositoryStepOperation, WriteRowsOperation};
 use super::snapshot::SnapshotOperation;
 use super::sources::{AliasState, ResolveEntriesOperation, Resolved, policy_call};
 use super::{ExportCheckpoint, ExportFailure, ExportPhase, ExportScope, ProbedEntry};
-use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::import::{hidden_delete, job_call, reported, stops_of};
 use crate::jobs::key_locks::AskWaitsOperation;
 use crate::jobs::repository::links::LinkError;
@@ -30,6 +29,7 @@ use crate::jobs::run_rows::{
     ReadStateOperation, SettledRowsOperation, StateReadError, job_state_key, state_row,
 };
 use crate::jobs::store::mutation_error::JobMutationError;
+use aruna_core::jobs::JobRunOutcome;
 
 /// A runner failure of the export job; its checkpoint stays for the next attempt.
 #[derive(Debug, PartialEq, thiserror::Error)]

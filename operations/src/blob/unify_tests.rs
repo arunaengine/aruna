@@ -5,7 +5,6 @@ use super::*;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::BucketAccessOperation;
 use crate::blob::release::{ReleaseFile, ReleaseRenamedOperation};
-use crate::driver::{DriverContext, drive, node_routing};
 use crate::s3::bucket::rename::tests::{BUCKET, access, group, put, realm, rule, setup, store_job};
 use crate::tests::records::node;
 use aruna_core::effects::StorageEffect;
@@ -22,6 +21,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
 use aruna_core::structs::storage::linked_job::LinkedTask;
+use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_storage::scan::iter_prefix_page;
 use std::time::SystemTime;
 

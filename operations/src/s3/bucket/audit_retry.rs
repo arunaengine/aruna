@@ -344,9 +344,9 @@ impl Operation for ResumeAuditOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, next_event_id};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -463,7 +463,8 @@ mod tests {
             let persist = aruna_storage::task_timers::persist_task_effect(&storage_handle, &arm);
             persist.await.unwrap();
             let (fired, store) = (Arc::clone(&context), StoreAuditOperation::new(key.clone()));
-            let run = tokio::spawn(async move { crate::driver::drive(store, &fired).await });
+            let run =
+                tokio::spawn(async move { aruna_drivers::driver::drive(store, &fired).await });
             if steps < 16 {
                 for _ in 0..steps {
                     tokio::task::yield_now().await;

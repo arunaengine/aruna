@@ -14,7 +14,6 @@ use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::types::GroupId;
 use aruna_tasks::TaskHandle;
 
-use crate::driver::{DriverContext, drive, node_facts};
 use crate::jobs::demand::{DemandSnapshotOperation, merge_view};
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::node::info::flows::DepartureStateOperation;
@@ -63,6 +62,7 @@ use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::types::Key;
 use aruna_core::types::Value;
+use aruna_drivers::driver::{DriverContext, drive, node_facts};
 use aruna_storage::FjallStorage;
 use tempfile::tempdir;
 use ulid::Ulid;

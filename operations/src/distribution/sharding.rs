@@ -709,9 +709,9 @@ mod tests {
     use crate::distribution::test_store::{
         account, apply, context, counters, exact, install, open, write,
     };
-    use crate::driver::drive;
     use aruna_core::structs::storage::distribution::KeyRange;
     use aruna_core::structs::storage::distribution::accounting::{Charge, generation_key};
+    use aruna_drivers::driver::drive;
     use ulid::Ulid;
 
     fn range(lower: &str, upper: Option<&str>) -> KeyRange {

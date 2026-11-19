@@ -23,13 +23,13 @@ use aruna_core::types::{Effects, Value};
 use std::collections::BTreeMap;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message};
 use crate::placement::policy::cache::{PolicyCacheEntry, cache_key};
 use crate::placement::policy::tests::{node, realm_authorization};
 use crate::placement::policy::{
     PolicySetError, PolicySource, ReadPolicyError, Resolutions, ResolvedPolicy,
 };
+use aruna_drivers::driver::DriverContext;
 
 /// The holders a holder fetch sub-operation asks, in order, and the request it sends them. Every
 /// holder is answered with a failure, so the walk visits all of them.

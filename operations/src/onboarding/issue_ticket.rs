@@ -175,7 +175,6 @@ impl Operation for IssueSyncOperation {
 #[cfg(test)]
 mod tests {
     use super::{IssueSyncInput, IssueSyncOperation, TICKET_TTL_SECS};
-    use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::document::DocumentTarget;
@@ -184,6 +183,7 @@ mod tests {
     use aruna_core::keyspaces::USER_KEYSPACE;
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;

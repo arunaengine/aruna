@@ -4,7 +4,6 @@
 
 use super::*;
 use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
 use crate::secrets::tests::{create, name, token};
 use crate::testing::path_context;
 use aruna_core::UserId;
@@ -12,6 +11,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::secrets::SecretFields;
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+use aruna_drivers::driver::{DriverContext, drive};
 use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
 

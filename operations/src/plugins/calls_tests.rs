@@ -58,8 +58,8 @@ use super::waiting::RecheckWaiting;
 use super::work::WorkRow;
 use super::work_calls::{JobOutputs, JobRow};
 use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::node_kind;
+use aruna_drivers::driver::{DriverContext, drive};
 
 fn local_of(ctx: &DriverContext) -> Option<NodeId> {
     ctx.net_handle.as_ref().map(|net| net.node_id())

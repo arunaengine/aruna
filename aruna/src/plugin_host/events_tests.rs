@@ -23,7 +23,7 @@ use aruna_core::structs::storage::replication_queue::ReplicateScopeInput;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 use aruna_core::structs::storage::replication_queue::ReplicationMode;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::plugins::calls::decide_batch;
 use aruna_operations::plugins::calls::match_journal;
 use aruna_operations::plugins::calls::plan_replays;

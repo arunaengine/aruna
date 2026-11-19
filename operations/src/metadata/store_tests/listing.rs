@@ -6,12 +6,12 @@ use super::auth::auth_storage;
 use super::effect::memory_handle;
 use super::lifecycle::registry_record;
 use super::*;
-use crate::driver::drive;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::list::GroupRecordsOperation;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
 use aruna_core::metadata::GraphLifecycleRecord;
+use aruna_drivers::driver::drive;
 use byteview::ByteView;
 
 async fn store_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {

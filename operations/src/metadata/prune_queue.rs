@@ -725,7 +725,6 @@ pub fn jobs_queued() -> DuePruneOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::metadata::registry_cache::{Registry, RegistryReadOperation};
     use crate::testing::{process_graph_tombstones, process_prune_batch, prune_jobs_exist};
     use aruna_core::effects::StorageEffect;
@@ -734,6 +733,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::FjallStorage;
     use aruna_storage::StorageHandle;
     use aruna_tasks::TaskHandle;

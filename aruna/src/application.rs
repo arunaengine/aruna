@@ -1208,8 +1208,8 @@ mod tests {
             https: None,
             monitoring: None,
             task_handle: aruna_tasks::TaskHandle::new(),
-            jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),
-            driver_ctx: std::sync::Arc::new(aruna_operations::driver::DriverContext::storage_only(
+            jobs_runtime: aruna_drivers::jobs::runtime::JobsRuntime::new(),
+            driver_ctx: std::sync::Arc::new(aruna_drivers::driver::DriverContext::storage_only(
                 storage_handle.clone(),
             )),
             net_handle: None,

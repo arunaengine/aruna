@@ -669,7 +669,6 @@ fn source_metadata_matches(left: &SourceMetadata, right: &SourceMetadata) -> boo
 mod tests {
     use super::*;
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
-    use crate::driver::{DriverContext, drive};
     use crate::node::usage_rebuild::RebuildStatsOperation;
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
@@ -695,6 +694,7 @@ mod tests {
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
     use aruna_core::structs::storage::usage::{UsageCounters, global_group_key, usage_group_key};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use axum::{Router, routing::get};
     use std::collections::HashMap;

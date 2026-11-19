@@ -140,7 +140,7 @@ pub async fn get_source_health(
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
     let context = state.get_ctx();
-    let sources = aruna_operations::driver::drive(
+    let sources = aruna_drivers::driver::drive(
         SourceHealthOperation::new(info.group_id, (&bucket, &params.key), params.version_id),
         context.as_ref(),
     )

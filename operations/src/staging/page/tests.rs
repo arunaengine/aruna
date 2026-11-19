@@ -676,9 +676,9 @@ async fn flush_keeps_page() {
 #[tokio::test]
 async fn bare_size_unchanged() {
     use crate::connectors::repository::source_connector_key;
-    use crate::driver::drive;
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
+    use aruna_drivers::driver::drive;
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -755,11 +755,11 @@ async fn bare_size_unchanged() {
 // registered head, so usage and connector rows are counted once.
 #[tokio::test]
 async fn replay_charges_once() {
-    use crate::driver::drive;
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::IterStart;
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
+    use aruna_drivers::driver::drive;
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -851,11 +851,11 @@ fn guards_carry_hint() {
 #[tokio::test]
 async fn page_maintains_inventory() {
     use crate::distribution::test_store::{counters, has_row, install, range};
-    use crate::driver::drive;
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::storage::distribution::accounting::generation_key;
     use aruna_core::structs::storage::distribution::inventory::head_position;
+    use aruna_drivers::driver::drive;
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -923,10 +923,10 @@ async fn page_needs_coordinator() {
     use crate::distribution::guard::GuardError;
     use crate::distribution::test_record::{binding, record as set_record, store_record};
     use crate::distribution::test_store::{has_row, install, range};
-    use crate::driver::drive;
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::storage::distribution::inventory::head_position;
+    use aruna_drivers::driver::drive;
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -991,7 +991,7 @@ async fn keyspace_bytes(handle: &aruna_storage::StorageHandle) -> HashMap<&'stat
 }
 
 /// A public bakrep-like S3 connector stored for the test group.
-async fn bakrep_connector(context: &crate::driver::DriverContext) -> SourceConnector {
+async fn bakrep_connector(context: &aruna_drivers::driver::DriverContext) -> SourceConnector {
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
     let input = SourceConnectorInput {
         group_id: bucket().group_id,
@@ -1010,7 +1010,7 @@ async fn bakrep_connector(context: &crate::driver::DriverContext) -> SourceConne
         secret_config: HashMap::new(),
     };
     let operation = SourceConnectorOperation::new(input);
-    crate::driver::drive(operation, context)
+    aruna_drivers::driver::drive(operation, context)
         .await
         .unwrap()
         .connector
@@ -1058,9 +1058,9 @@ fn print_sizes(
 #[tokio::test]
 async fn distributed_sizes_measured() {
     use crate::distribution::test_store::{install, range};
-    use crate::driver::drive;
     use crate::tests::staging::{create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_drivers::driver::drive;
 
     const ENTRIES: usize = 100;
     let test = setup_driver_context().await;
@@ -1103,8 +1103,8 @@ async fn distributed_sizes_measured() {
 // for the entry size work, not a size contract. Run with `--nocapture` to read it.
 #[tokio::test]
 async fn entry_sizes_measured() {
-    use crate::driver::drive;
     use crate::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_drivers::driver::drive;
 
     const ENTRIES: usize = 100;
     let test = setup_driver_context().await;

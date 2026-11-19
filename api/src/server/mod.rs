@@ -224,7 +224,7 @@ mod tests {
                 .to_bytes(),
         );
         let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
-        let driver_ctx = Arc::new(aruna_operations::driver::DriverContext {
+        let driver_ctx = Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
@@ -241,7 +241,7 @@ mod tests {
                 NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
+                aruna_drivers::jobs::runtime::JobsRuntime::new(),
             )
             .await
             .with_rate_limits(ApiRateLimits::for_test(2)),
@@ -287,7 +287,7 @@ mod tests {
                 .to_bytes(),
         );
         let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
-        let driver_ctx = Arc::new(aruna_operations::driver::DriverContext {
+        let driver_ctx = Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
@@ -304,7 +304,7 @@ mod tests {
                 NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
+                aruna_drivers::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

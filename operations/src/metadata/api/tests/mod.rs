@@ -5,8 +5,8 @@
 use super::list::{GroupRecordsOperation, ListVisibleOperation, PendingRecordsOperation};
 use super::list_types::check_policy_limit;
 use super::*;
-use crate::driver::DriverContext;
 use crate::metadata::local_query::QUERY_MAX_BYTES;
+use aruna_drivers::driver::DriverContext;
 
 use super::distributed_types::{
     MetadataQueryForm, aggregate_query_results, query_form, query_select_limit,
@@ -29,9 +29,9 @@ use super::preflight_types::{
 };
 use super::readable::PathPermissionOperation;
 use super::search_types::SearchQueryRequest;
-use crate::driver::drive;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
+use aruna_drivers::driver::drive;
 
 use std::collections::BTreeMap;
 

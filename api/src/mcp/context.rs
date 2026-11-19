@@ -8,9 +8,9 @@ use super::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission, Role};
 use aruna_core::structs::identity::group::Group;
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::driver::drive;
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::metadata::stats::GroupPurposeOperation;
 use aruna_operations::realm::read_authorization::ReadAuthorizationOperation;

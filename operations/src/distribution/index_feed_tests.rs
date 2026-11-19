@@ -271,7 +271,7 @@ async fn drops_gone_ranges() {
 #[tokio::test]
 async fn split_reindexes_children() {
     use crate::distribution::split::{SplitConfig, SplitOperation};
-    use crate::driver::drive;
+    use aruna_drivers::driver::drive;
 
     let fixture = fixture().await;
     let handle = &fixture.handle;

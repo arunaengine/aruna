@@ -8,7 +8,6 @@ use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::distribution::held::{kept_location, kept_reads, kept_source_location};
 use crate::distribution::test_record::{binding, replicated, secret, store_record};
 use crate::distribution::test_store::{context, open};
-use crate::driver::drive;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -22,6 +21,7 @@ use aruna_core::structs::storage::distribution::on_use::{Attachment, CacheEntry}
 use aruna_core::structs::storage::format::{Compression, StoredFormat};
 use aruna_core::types::Key;
 use aruna_core::types::Value;
+use aruna_drivers::driver::drive;
 use std::time::SystemTime;
 
 fn held(size: u64) -> HeldElsewhere {

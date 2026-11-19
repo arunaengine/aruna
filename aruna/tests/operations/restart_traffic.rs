@@ -11,7 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::GroupId;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::realm::announce_presence::{
@@ -558,7 +558,7 @@ async fn finish_outage(
     );
     // Each restored peer runs its own restore, as every configured node does.
     for peer in &nodes[1..] {
-        aruna_operations::driver::drive(
+        aruna_drivers::driver::drive(
             aruna_operations::shard::restore::RestoreTopicsOperation::new(
                 peer.net.node_id(),
                 realm_id,
@@ -567,7 +567,7 @@ async fn finish_outage(
         )
         .await
         .expect("shard topics restore");
-        aruna_operations::driver::drive(
+        aruna_drivers::driver::drive(
             aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(
                 realm_id,
                 peer.net.node_id(),

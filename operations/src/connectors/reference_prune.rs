@@ -325,7 +325,6 @@ impl Operation for PrunePageOperation {
 mod tests {
     use super::*;
     use crate::connectors::repository::{connector_reference_key, connector_reference_write};
-    use crate::driver::{DriverContext, drive};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -333,6 +332,7 @@ mod tests {
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
     use aruna_core::structs::storage::blob::VersionKey;
+    use aruna_drivers::driver::{DriverContext, drive};
     use std::collections::HashMap;
     use std::time::SystemTime;
 

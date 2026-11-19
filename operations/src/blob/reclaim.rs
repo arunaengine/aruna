@@ -399,7 +399,6 @@ mod tests {
         BackendStatusOperation, RECLAIM_TICK_LIMIT, ReclaimOutcome, ReclaimSweepError,
         ReclaimSweepOperation,
     };
-    use crate::driver::{DriverContext, drive};
     use crate::testing::path_context;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -412,6 +411,7 @@ mod tests {
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
     use aruna_core::types::Value;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::scan::iter_prefix_page;
     use std::collections::HashMap;
     use tempfile::tempdir;
@@ -421,7 +421,7 @@ mod tests {
         now: SystemTime,
         start_after: Option<aruna_core::types::Key>,
     ) -> Result<ReclaimOutcome, ReclaimSweepError> {
-        let catalog = crate::driver::node_routing(context).catalog;
+        let catalog = aruna_drivers::driver::node_routing(context).catalog;
         drive(
             ReclaimSweepOperation::new(catalog, now, start_after),
             context,
@@ -914,9 +914,9 @@ mod tests {
             UsageCounters::from_bytes(&counters).unwrap(),
             UsageCounters::default()
         );
-        let outcome = crate::driver::drive(
+        let outcome = aruna_drivers::driver::drive(
             crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
-                routing: crate::driver::node_routing(&after),
+                routing: aruna_drivers::driver::node_routing(&after),
                 has_blob: (&after).blob_handle.is_some(),
             }),
             &after,

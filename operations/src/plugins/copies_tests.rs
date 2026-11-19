@@ -6,13 +6,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::driver::{DriverContext, drive};
 use crate::plugins::artifacts::ArtifactError;
 use crate::plugins::calls::*;
 use crate::plugins::copy_rows::tests::stale_progress;
 use crate::plugins::copy_rows::{CHUNK, GRACE, MAX_UNSETTLED, chunk_count, chunk_of};
 use crate::plugins::rows::{Scan, scan_rows};
-use crate::testing::test_context;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
@@ -20,6 +18,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PLUGIN_ARTIFACT_KEYSPACE;
 use aruna_core::plugins::{ArtifactBytes, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::test_context;
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::{TempDir, tempdir};

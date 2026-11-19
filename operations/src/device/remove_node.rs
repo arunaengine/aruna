@@ -304,12 +304,12 @@ impl Operation for RemoveNodeOperation {
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+    use aruna_drivers::driver::{DriverContext, drive};
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

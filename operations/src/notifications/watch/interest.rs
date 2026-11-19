@@ -575,7 +575,6 @@ mod call_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::notifications::watch::digest::dirty_marker_write;
     use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
     use aruna_core::UserId;
@@ -593,6 +592,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};

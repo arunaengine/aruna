@@ -98,8 +98,8 @@ impl Operation for ListSourceOperation {
 mod tests {
     use super::*;
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
-    use crate::driver::{DriverContext, drive};
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::collections::HashMap;
     use tempfile::tempdir;

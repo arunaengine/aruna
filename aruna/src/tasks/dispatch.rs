@@ -11,9 +11,9 @@ use aruna_core::structs::execution::job::{JobError, JobPayload, JobResultPayload
 use aruna_core::time::unix_timestamp_millis;
 
 use super::job_host::{run_backend_import, run_hosted, run_staging_job, run_storage_purge};
-use aruna_operations::driver::drive;
-use aruna_operations::jobs::context::JobContext;
-use aruna_operations::jobs::executor::JobRunOutcome;
+use aruna_core::jobs::JobRunOutcome;
+use aruna_drivers::driver::drive;
+use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::persistent_id::{MintPidOperation, RegisterIdentifiersOperation};
 use aruna_operations::notifications::email_job::EmailJobOperation;
 use aruna_operations::notifications::settings::{BACKOFF_START_MS, DeliveryOutcome};
@@ -47,7 +47,7 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             let write = aruna_operations::jobs::workflow::run_crate::WriteCrateOperation::new(
                 *for_job, serving,
             );
-            let result = Box::pin(aruna_operations::driver::drive(write, &ctx.driver)).await;
+            let result = Box::pin(aruna_drivers::driver::drive(write, &ctx.driver)).await;
             aruna_operations::jobs::workflow::run_crate::crate_outcome(result)
         }
         JobPayload::TerminalCleanup {
@@ -61,7 +61,7 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
                 attempt.clone(),
                 access_key,
             );
-            let result = Box::pin(aruna_operations::driver::drive(cleanup, &ctx.driver)).await;
+            let result = Box::pin(aruna_drivers::driver::drive(cleanup, &ctx.driver)).await;
             aruna_operations::jobs::workflow::cleanup::cleanup_outcome(result)
         }
         JobPayload::Staging(spec) => Box::pin(run_staging_job(ctx, spec)).await,
@@ -72,10 +72,10 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             Box::pin(crate::tasks::rocrate_jobs::run_rocrate_import(ctx, spec)).await
         }
         JobPayload::Harvest(spec) => aruna_operations::jobs::harvest::harvest_outcome(
-            Box::pin(aruna_operations::driver::drive(
+            Box::pin(aruna_drivers::driver::drive(
                 aruna_operations::jobs::harvest::HarvestJobOperation::new(
                     ctx.driver.node_scope(),
-                    ctx.job_scope(),
+                    crate::tasks::job_host::job_scope(ctx),
                     spec.clone(),
                 ),
                 &ctx.driver,

@@ -16,7 +16,7 @@ use aruna_core::MetaResourceId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::read::query_metadata as run_query_metadata;
 use aruna_operations::metadata::api::read_types::{ApiQueryMode, MetadataQueryRequest};
@@ -41,8 +41,8 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::record::METADATA_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
+use aruna_drivers::driver::DriverContext;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -851,7 +851,7 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
             NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );

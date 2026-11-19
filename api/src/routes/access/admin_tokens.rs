@@ -13,8 +13,8 @@ use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::NEVER_EXPIRES_SECS;
 use aruna_core::time::unix_timestamp_secs;
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::revoke_token::RevokeTokenError;
-use aruna_operations::driver::drive;
 use aruna_operations::s3::access::tokens::TokenCursor;
 use aruna_operations::s3::access::tokens::list::{GroupTokensConfig, ListTokensOperation};
 use aruna_operations::s3::access::tokens::revoke::{

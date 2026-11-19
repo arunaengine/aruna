@@ -4,7 +4,6 @@
 
 use super::auth::{auth_storage, node_id_seed};
 use super::*;
-use crate::driver::drive;
 use crate::metadata::deletion_guard::DeletionGuardOperation;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
@@ -13,6 +12,7 @@ use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::metadata::MetadataCrateRequest;
 use aruna_core::metadata::MetadataGraphPolicy;
 use aruna_core::metadata::MetadataRequestDurability;
+use aruna_drivers::driver::drive;
 use byteview::ByteView;
 pub(super) fn registry_record(document_path: &str) -> MetadataRegistryRecord {
     let document_id = Ulid::generate();

@@ -662,7 +662,6 @@ impl Operation for DeliverWakesOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::jobs::store::job_calls::ClaimOutcome;
     use crate::jobs::store::test_calls::insert_job;
     use crate::jobs::store::test_calls::park_job;
@@ -674,6 +673,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::HashIndex;
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::scan::iter_prefix_page;
     use std::future::Future;
     use ulid::Ulid;

@@ -15,7 +15,7 @@ use aruna_core::link::fresh_local;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::{AuthContext, oidc_subject_key};
 use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::users::merge::handoff::{HandoffConfig, HandoffOperation};
 use aruna_operations::users::merge::{MergeError, MergeUsersConfig, MergeUsersOperation};
 use aruna_operations::users::update_user::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
@@ -386,7 +386,7 @@ mod tests {
     use crate::tests::routes::{test_state, test_storage};
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_operations::testing::test_context;
+    use aruna_drivers::testing::test_context;
     use ulid::Ulid;
 
     fn code(error: ServerError) -> (StatusCode, String) {

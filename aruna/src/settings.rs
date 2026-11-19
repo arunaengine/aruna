@@ -19,9 +19,9 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig, BlobTimeoutConf
 use aruna_core::structs::storage::node_info::{
     CLASS_LABEL_PREFIX, KIND_LABEL_KEY, LOCATION_LABEL_KEY,
 };
+use aruna_drivers::driver::HangLimits;
 use aruna_graph::MetadataSearchStorage;
 use aruna_net::IrohRuntimeConfig;
-use aruna_operations::driver::HangLimits;
 use aruna_storage::{CACHE_BYTES, FjallPersistPolicy};
 
 use crate::config::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};

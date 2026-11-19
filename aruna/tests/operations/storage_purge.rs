@@ -16,6 +16,7 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE,
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE,
@@ -44,11 +45,10 @@ use aruna_core::structs::storage::storage_purge::{
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_drivers::driver::{DriverContext, drive, node_routing};
+use aruna_drivers::jobs::context::JobContext;
 use aruna_net::NetHandle;
 use aruna_operations::blob::pause::{PausePurgeOperation, PausedOperation};
-use aruna_operations::driver::{DriverContext, drive, node_routing};
-use aruna_operations::jobs::context::JobContext;
-use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
@@ -97,12 +97,9 @@ async fn setup_context() -> TestContext {
     // Creating an upload asks the blob adapter whether the backend has a provider upload.
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let net_handle = NetHandle::new(
-        aruna_operations::testing::local_net(),
-        storage_handle.clone(),
-    )
-    .await
-    .unwrap();
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
+        .await
+        .unwrap();
     let blob_handle = BlobHandler::new(
         BackendConfig {
             backend_type: Backend::FileSystem,
@@ -1001,7 +998,7 @@ async fn aborted_purge_releases() {
     let versions: Vec<_> = list_linked(&context).await;
     let found = drive(
         aruna_operations::blob::purge::StorageFilesOperation::new(
-            aruna_operations::driver::node_routing(&context.driver),
+            aruna_drivers::driver::node_routing(&context.driver),
             ("bucket", context.group_id),
             &versions,
             None,
@@ -1060,7 +1057,7 @@ async fn cancelled_queue_releases() {
     // A purge cancelled while queued ends at once; the files it planned before are released
     // by the cleanup queue, because the job ended.
     use crate::job_calls::cancel_owned_job;
-    use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_drivers::jobs::runtime::JobsRuntime;
     let context = setup_context().await;
     seed_linked(&context, "linked/a.txt", Ulid::generate()).await;
     let spec = files_spec(&context);
@@ -1078,7 +1075,7 @@ async fn cancelled_queue_releases() {
     let versions = list_linked(&context).await;
     let found = drive(
         aruna_operations::blob::purge::StorageFilesOperation::new(
-            aruna_operations::driver::node_routing(&context.driver),
+            aruna_drivers::driver::node_routing(&context.driver),
             ("bucket", context.group_id),
             &versions,
             None,
@@ -1128,7 +1125,7 @@ async fn cancelled_queue_releases() {
     let outcome = drive(
         aruna_operations::blob::cleanup::ProcessCleanupOperation::new(
             aruna_operations::blob::cleanup::CleanupNode {
-                routing: aruna_operations::driver::node_routing(&context.driver),
+                routing: aruna_drivers::driver::node_routing(&context.driver),
                 has_blob: context.driver.blob_handle.is_some(),
             },
         ),
@@ -1244,7 +1241,7 @@ async fn purge_releases_copies() {
     let copy = seed_copy(&context, ("linked/a.txt", version_id), &location).await;
     let spec = files_spec(&context);
     let totals = aruna_operations::blob::purge::ScopeTotalsOperation::new(
-        aruna_operations::driver::node_routing(&context.driver),
+        aruna_drivers::driver::node_routing(&context.driver),
         &spec.scope,
         aruna_operations::blob::migration::misplaced::AnyKey,
     );

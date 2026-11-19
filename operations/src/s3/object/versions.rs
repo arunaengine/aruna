@@ -706,7 +706,7 @@ impl Operation for ListVersionsOperation {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::drive;
+    use aruna_drivers::driver::drive;
 
     fn limited_rounds(
         mut operation: ListVersionsOperation,
@@ -744,7 +744,6 @@ mod test {
         ));
     }
 
-    use crate::testing::test_context;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::checksum::HASH_MD5;
@@ -756,6 +755,7 @@ mod test {
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_drivers::testing::test_context;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::{Duration, UNIX_EPOCH};

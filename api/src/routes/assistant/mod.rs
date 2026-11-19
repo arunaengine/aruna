@@ -29,11 +29,11 @@ use aruna_core::structs::{
     AssistantProviderStatus, CENTRAL_PROVIDER_ID,
 };
 use aruna_core::time::unix_timestamp_secs;
+use aruna_drivers::driver::drive;
 use aruna_operations::assistant::provider::{
     CreateProviderOperation, DeleteProviderOperation, GetProviderOperation, ListProviderOperation,
     ProviderStoreError, UpdateProviderOperation,
 };
-use aruna_operations::driver::drive;
 use axum::Json;
 use axum::body::to_bytes;
 use axum::extract::Request;

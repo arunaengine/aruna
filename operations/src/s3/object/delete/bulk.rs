@@ -112,7 +112,6 @@ impl Operation for BulkDeleteOperation {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::calls::ChildOutcome;
@@ -120,6 +119,7 @@ mod test {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig};
     use aruna_core::structs::storage::routing::RoutingSnapshot;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::NetHandle;
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -132,9 +132,10 @@ mod test {
         std::fs::create_dir_all(&blob_root).unwrap();
 
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-        let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
-            .await
-            .unwrap();
+        let net_handle =
+            NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
+                .await
+                .unwrap();
         let blob_handle = BlobHandler::new(
             BackendConfig {
                 backend_type: Backend::FileSystem,

@@ -176,10 +176,10 @@ impl Operation for AfterSyncOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::DriverContext;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
     use aruna_core::task::PersistedTaskTimer;
+    use aruna_drivers::driver::DriverContext;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -226,7 +226,7 @@ mod tests {
             metadata_graph_tombstones: Vec::new(),
         };
 
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             AfterSyncOperation::new(None, result.clone(), false),
             &context,
         )
@@ -237,7 +237,7 @@ mod tests {
                 .await
                 .is_none()
         );
-        crate::driver::drive(AfterSyncOperation::new(None, result, true), &context)
+        aruna_drivers::driver::drive(AfterSyncOperation::new(None, result, true), &context)
             .await
             .unwrap();
         let timer = read_timer(&storage, &TaskKey::DrainProjectionQueue)

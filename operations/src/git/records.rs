@@ -352,9 +352,9 @@ impl Operation for RemoveRowOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
+    use aruna_drivers::driver::{DriverContext, drive};
     use ulid::Ulid;
 
     #[tokio::test]
@@ -399,9 +399,9 @@ mod tests {
             .await
             .expect("an open fence admits the write");
         // The departing holder reported the bucket drained at this write's generation.
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 1),
-            &crate::driver::DriverContext::storage_only(context.storage_handle.clone()),
+            &aruna_drivers::driver::DriverContext::storage_only(context.storage_handle.clone()),
         )
         .await
         .expect("close");

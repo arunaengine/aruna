@@ -14,8 +14,8 @@ use aruna_core::structs::identity::auth::{
 };
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::time::unix_timestamp_secs;
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::create_token::CreateTokenError;
-use aruna_operations::driver::drive;
 use aruna_operations::session::{
     CreateSessionConfig, CreateSessionError, ListSessionOperation, MakeRoomOperation,
     RevokeSessionError, RevokeSessionOperation, bound_session_expiry,

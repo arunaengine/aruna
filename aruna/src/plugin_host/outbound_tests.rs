@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use std::sync::{Arc, Mutex};
 
 use aruna_core::egress::EgressPolicy;
@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use ulid::Ulid;
 
 use crate::plugin_host::worker::tests::worker_on;
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::plugins::runs::{admit, read_run};
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::leaks;

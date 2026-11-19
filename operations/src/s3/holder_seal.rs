@@ -162,7 +162,6 @@ impl Operation for SealPublishedOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::encryption::{EnableEncryptionOperation, EnableInput};
     use crate::s3::bucket::key::install::{InstallInput, InstallKeyOperation};
@@ -180,6 +179,7 @@ mod tests {
     };
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::types::Key;
+    use aruna_drivers::driver::{DriverContext, drive};
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -207,7 +207,7 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         let storage = aruna_storage::FjallStorage::open(root).unwrap();
         storage.open_vault(NodeVaultKey::random());
-        let net = aruna_net::NetHandle::new(crate::testing::local_net(), storage.clone())
+        let net = aruna_net::NetHandle::new(aruna_drivers::testing::local_net(), storage.clone())
             .await
             .unwrap();
         let config = BackendConfig {

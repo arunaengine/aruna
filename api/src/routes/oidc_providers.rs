@@ -8,7 +8,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::realm::set_provider::{
     ProviderChange, SetProviderConfig, SetProviderError, SetProviderOperation,
 };
@@ -212,9 +212,9 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_drivers::testing::test_context;
     use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::testing::test_context;
     use tempfile::TempDir;
     use ulid::Ulid;
 

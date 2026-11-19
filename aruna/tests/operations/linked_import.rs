@@ -12,6 +12,7 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     GROUP_KEYSPACE, IMPORT_INTENT_KEYSPACE, REALM_CONFIG_KEYSPACE,
@@ -39,18 +40,17 @@ use aruna_core::structs::storage::group_backend::{
 use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_drivers::driver::{DriverContext, drive, node_routing};
+use aruna_drivers::jobs::context::JobContext;
 use aruna_net::NetHandle;
 use aruna_operations::auth::request_authorization::BucketAccessOperation;
 use aruna_operations::blob::cleanup::{CleanupNode, ProcessCleanupOperation};
 use aruna_operations::blob::migration::misplaced::AnyKey;
 use aruna_operations::blob::purge::{ScopeTotalsOperation, StorageFilesOperation};
 use aruna_operations::blob::unify::{PreviewPageOperation, PreviewQuery, Unified, UnifyOperation};
-use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_operations::jobs::context::JobContext;
-use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
@@ -156,12 +156,9 @@ async fn setup_pattern(pattern: &str) -> TestContext {
     let root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::FjallStorage::open(&root).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(
-        aruna_operations::testing::local_net(),
-        storage_handle.clone(),
-    )
-    .await
-    .unwrap();
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
+        .await
+        .unwrap();
     std::fs::create_dir_all(format!("{root}/blobs")).unwrap();
     let node = NodeBackend::new(
         BackendConfig {

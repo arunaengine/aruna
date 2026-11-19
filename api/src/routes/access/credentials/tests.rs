@@ -17,7 +17,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
 use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_operations::testing::test_context;
+use aruna_drivers::testing::test_context;
 use std::sync::Arc;
 use tempfile::TempDir;
 use ulid::Ulid;

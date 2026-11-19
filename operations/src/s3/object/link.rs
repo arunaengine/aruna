@@ -557,10 +557,10 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
 
     use super::*;
-    use crate::driver::drive;
-    use crate::testing::test_context;
     use crate::testing_access::seed_access;
     use crate::tests::s3::test_storage;
+    use aruna_drivers::driver::drive;
+    use aruna_drivers::testing::test_context;
 
     #[tokio::test]
     async fn head_asks_target() {

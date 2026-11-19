@@ -566,12 +566,12 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::driver::{DriverContext, drive};
-    use crate::testing::test_context;
     use crate::tests::records::node;
     use crate::tests::s3::test_storage;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::PeerRequestError;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::test_context;
 
     fn submission() -> SubmissionId {
         SubmissionId([3; 32])

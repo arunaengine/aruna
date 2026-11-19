@@ -19,7 +19,6 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::DRAIN_BATCH_SIZE;
-use super::executor::JobRunOutcome;
 use super::key_locks::KeyUnlockedOperation;
 use super::store::job_calls::{
     ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, defer_job, exhaust_job,
@@ -29,6 +28,7 @@ use super::store::mutation_error::JobMutationError;
 use super::store::park_wake::AwaitOutcome;
 use super::store::row_calls::{park_job, read_job_record, satisfy_key_wait};
 use super::store::store_call::StoreCall;
+use aruna_core::jobs::JobRunOutcome;
 
 const WRITE_MAX_ATTEMPTS: u32 = 5;
 /// How long a deferred job waits before it may run again.

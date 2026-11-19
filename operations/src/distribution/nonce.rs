@@ -151,7 +151,7 @@ impl Operation for PruneNoncesOperation {
 mod tests {
     use super::*;
     use crate::distribution::test_store::{context, get, open};
-    use crate::driver::{DriverContext, drive};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     async fn spend(
         context: &DriverContext,

@@ -11,8 +11,8 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{UserAccess, group_permission_path, never_expiry};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::drive;
 use aruna_operations::abe::{KeyAction, KeyResult};
-use aruna_operations::driver::drive;
 use aruna_operations::s3::access::create::{
     CreateUserConfig, CreateUserError, CreateUserOperation,
 };
@@ -925,7 +925,7 @@ pub(crate) async fn authorize_credential_issuance(
         // A member whose roles reach only part of the group data may still take
         // a credential: authorization uses the derived roots, while probing the
         // bare directory would ask a `/**` grant to match the directory itself.
-        let rules = aruna_operations::driver::drive(
+        let rules = aruna_drivers::driver::drive(
             aruna_operations::auth::request_authorization::rules_operation(
                 &effective_auth,
                 &group_root,

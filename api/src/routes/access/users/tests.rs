@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -31,7 +31,7 @@ async fn federated_profile_synthesized() {
     use axum::Extension;
     use axum::response::IntoResponse;
     let (_dir, storage) = crate::tests::routes::test_storage();
-    let context = Arc::new(aruna_operations::testing::test_context(storage));
+    let context = Arc::new(aruna_drivers::testing::test_context(storage));
     let signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
     let node_id = iroh::SecretKey::generate().public();

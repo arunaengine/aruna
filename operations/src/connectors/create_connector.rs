@@ -307,8 +307,8 @@ impl Operation for SourceConnectorOperation {
 mod tests {
     use super::*;
     use crate::connectors::repository::{parse_connector_read, read_connector_effect};
-    use crate::driver::{DriverContext, drive};
     use aruna_core::handle::Handle;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use tempfile::tempdir;
 

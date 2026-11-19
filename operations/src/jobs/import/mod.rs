@@ -44,7 +44,6 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document};
-use super::executor::JobRunOutcome;
 use super::metadata_class::MetadataFailure;
 use super::repository::JobScope;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -54,6 +53,7 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::put::PutObjectError;
 use crate::staging::read_source::ReadSourceError;
+use aruna_core::jobs::JobRunOutcome;
 use aruna_core::repository::remote::NodeScope;
 
 /// What every operation of one import run knows about it.

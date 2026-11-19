@@ -16,7 +16,7 @@ use aruna_core::jobs::ByteStream;
 use aruna_core::member_read::{TrailerSeal, TrailerValue, framed_stream};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::storage::distribution::delegation::BodyTrailer;
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 
 /// Seals a trailer with the key of the node whose context it holds.
 struct ContextSeal(std::sync::Arc<DriverContext>);

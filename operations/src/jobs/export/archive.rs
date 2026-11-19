@@ -25,10 +25,10 @@ use super::{
     PART_HTTPS_IRI, PATH_HTTP_IRI, ProbedEntry, REPORT_PATH, SCHEMA_ABOUT_IRI, SCHEMA_CONTENT_IRI,
     SCHEMA_ENCODING_IRI, SCHEMA_NAME_IRI, SCHEMA_PART_IRI, SCHEMA_SUBJECT_IRI, SUBJECT_HTTPS_IRI,
 };
-use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::rocrate_jsonld::{
     JsonLdKeywords, MEDIA_HTTPS_IRI, RDF_TYPE_IRI, SCHEMA_MEDIA_IRI, is_file_type,
 };
+use aruna_core::jobs::JobRunOutcome;
 
 pub(super) fn plan_export(
     spec: &ExportRoCrateSpec,

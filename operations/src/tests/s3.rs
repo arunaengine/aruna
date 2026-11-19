@@ -20,9 +20,9 @@ use axum::routing::get;
 use tokio::net::TcpListener;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
 use aruna_core::structs::storage::multipart::MultipartUpload;
+use aruna_drivers::driver::DriverContext;
 use aruna_storage::storage::{FjallStorage, StorageHandle};
 use tempfile::{TempDir, tempdir};
 
@@ -50,7 +50,7 @@ pub async fn full_context() -> (TempDir, DriverContext) {
     std::fs::create_dir_all(&blob_root).unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::with_egress(

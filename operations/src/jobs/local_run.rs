@@ -410,7 +410,6 @@ fn missing_input(bucket: &str, key: &str) -> LocalExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::jobs::submit::SubmitJobError;
     use crate::tests::records::payload;
     use aruna_core::calls::ChildOutcome;
@@ -439,6 +438,7 @@ mod tests {
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::node_info::NodeUrls;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
@@ -448,7 +448,9 @@ mod tests {
         ctx: &DriverContext,
         config: LocalExecutionConfig,
     ) -> Result<SubmitJobResult, LocalExecutionError> {
-        drive(crate::jobs::node_inputs::local_run(config, ctx), ctx).await
+        let limits = ctx.compute_limits();
+        let run = crate::jobs::node_inputs::local_run(config, &limits, ctx.node_and_realm());
+        drive(run, ctx).await
     }
 
     const REALM: RealmId = RealmId([3u8; 32]);
@@ -770,12 +772,12 @@ mod tests {
         let local = node(1);
         let config = realm_config(local, RealmNodeKind::User { owner: owner(2) });
         write_config(&ctx, &config, local).await;
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::node::info::flows::OperatorDrainOperation::new(
                 REALM,
                 local,
                 true,
-                crate::driver::node_facts(&ctx),
+                aruna_drivers::driver::node_facts(&ctx),
             ),
             &ctx,
         )
@@ -944,7 +946,7 @@ mod tests {
                 api: None,
                 s3: None,
             },
-            crate::driver::node_facts(&ctx),
+            aruna_drivers::driver::node_facts(&ctx),
             false,
         );
         drive(seed, &ctx).await.unwrap();

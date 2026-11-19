@@ -518,9 +518,7 @@ impl Operation for DrainTimerOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::jobs::JOB_LEASE_MS;
-    use crate::jobs::context::ExternalReconciler;
     use crate::jobs::store::test_calls::insert_job;
     use crate::jobs::store::test_calls::read_job_record;
     use aruna_core::UserId;
@@ -535,6 +533,8 @@ mod tests {
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_core::task::TaskEvent;
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::jobs::context::ExternalReconciler;
     use aruna_storage::FjallStorage;
     use aruna_storage::scan::iter_prefix_page;
     use aruna_tasks::TaskHandle;
@@ -781,7 +781,7 @@ mod tests {
     async fn claims_within_capacity() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         for seq in 1..=3u128 {
             insert_job(&context, &queued_record(job_id(seq as u64), 1))
                 .await
@@ -806,7 +806,7 @@ mod tests {
         // index must not claim and release the external row it cannot run.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let external = job_id(1);
         let mut record = queued_record(external, 1);
         record.execution_class = JobExecutionClass::ExternalAttempt;
@@ -854,7 +854,7 @@ mod tests {
         // back off instead of re-arming the drain at zero.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = job_id(1);
         insert_job(&context, &queued_record(job_id, 1))
             .await
@@ -881,7 +881,7 @@ mod tests {
         // immutable owner may run a JobId, and the dead row must not pin the timer.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let foreign = job_id(1);
         insert_job(&context, &queued_record(foreign, 1))
             .await
@@ -905,7 +905,7 @@ mod tests {
     async fn expired_lease_requeued() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([4u8; 16]);
         let mut record = queued_record(job_id, 1);
         record.state = JobState::Running;
@@ -935,7 +935,7 @@ mod tests {
     async fn external_lease_reconciled() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([0xE1; 16]);
         let mut record = queued_record(job_id, 1);
         record.execution_class = JobExecutionClass::ExternalAttempt;
@@ -982,7 +982,7 @@ mod tests {
     async fn future_lease_kept() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([5u8; 16]);
         let mut record = queued_record(job_id, 1);
         record.state = JobState::Running;
@@ -1004,7 +1004,7 @@ mod tests {
     async fn restore_shortens_timer() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let mut context = crate::testing::test_context(storage.clone());
+        let mut context = aruna_drivers::testing::test_context(storage.clone());
         let task_handle = TaskHandle::new();
         context.task_handle = Some(task_handle.clone());
         let due_far_out = unix_timestamp_millis() + 7_200_000;
@@ -1049,7 +1049,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let orphan = JobId::from_bytes([9u8; 16]);
         match storage
             .send_storage_effect(StorageEffect::Write {

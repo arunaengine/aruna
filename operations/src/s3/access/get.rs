@@ -59,13 +59,13 @@ impl Operation for GetAccessOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::DriverContext;
-    use crate::driver::drive;
     use crate::s3::access::get::{GetAccessError, GetAccessOperation, UserAccess};
     use aruna_core::calls::{IoResult, Next};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
     use aruna_core::operation::Operation;
+    use aruna_drivers::driver::DriverContext;
+    use aruna_drivers::driver::drive;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;

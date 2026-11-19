@@ -10,10 +10,10 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BackendLocation, VersionKey};
 use aruna_core::structs::storage::broken::BrokenReason;
 use aruna_core::structs::storage::format::Compression;
+use aruna_drivers::driver::drive;
 use aruna_operations::blob::migration::broken::{
     CleanBrokenOperation, ListBrokenOperation, ReadCheckOperation,
 };
-use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::compression::PutCompressionOperation;
 use aruna_operations::s3::bucket::storage_check::StartCheckOperation;
 use aruna_operations::s3::bucket::storage_move::StartMoveOperation;

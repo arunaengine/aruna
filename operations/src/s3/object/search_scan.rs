@@ -845,7 +845,6 @@ fn storage_event_error(event: Event) -> SearchObjectsError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::NodeId;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
@@ -853,6 +852,7 @@ mod tests {
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::types::GroupId;
+    use aruna_drivers::driver::{DriverContext, drive};
 
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, UNIX_EPOCH};

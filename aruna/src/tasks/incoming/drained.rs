@@ -7,7 +7,7 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use tracing::{info, warn};
 
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::groups::backends::remove::{
     DisabledScanOperation, HoldingScanOperation, RemoveBackendOperation,
 };

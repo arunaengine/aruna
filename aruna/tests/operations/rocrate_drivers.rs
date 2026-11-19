@@ -23,6 +23,7 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE, GROUP_KEYSPACE,
     ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -45,13 +46,12 @@ use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::jobs::context::JobContext;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::connectors::create_connector::{
     SourceConnectorInput, SourceConnectorOperation,
 };
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::context::JobContext;
-use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
@@ -1340,7 +1340,7 @@ async fn cancel_mid_write() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(hidden_count(&fixture, upload_id).await?, 0);
     assert!(
-        aruna_operations::driver::drive(
+        aruna_drivers::driver::drive(
             aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
             &fixture.context
         )

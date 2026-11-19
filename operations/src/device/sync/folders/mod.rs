@@ -259,7 +259,6 @@ mod tests {
     use super::bind::ReserveBindingOperation;
     use super::unbind::{ClearRowsOperation, DeleteLocalOperation};
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
     use crate::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
     use crate::staging::offered_directory::{WithdrawOfferInput, withdraw_offer};
@@ -267,6 +266,7 @@ mod tests {
     use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, UPLOAD_KEYSPACE};
     use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
     use aruna_core::structs::{EntrySide, EntryState, SyncBase, SyncedBytes};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     fn realm() -> RealmId {
         RealmId::from_bytes([7u8; 32])

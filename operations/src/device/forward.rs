@@ -949,10 +949,10 @@ impl Operation for DeviceBatchOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
+    use aruna_drivers::driver::{DriverContext, drive};
     use std::sync::Arc;
 
     fn node(seed: u8) -> NodeId {

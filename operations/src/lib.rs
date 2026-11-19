@@ -1,4 +1,4 @@
-//! Domain state machines and their adapters over the operation runner.
+//! Domain state machines; the drivers crate runs them.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -15,8 +15,6 @@ pub mod connectors;
 pub mod device;
 pub mod distribution;
 pub mod document_repository;
-pub mod driver;
-pub mod effect_adapters;
 pub(crate) mod endpoint_screening;
 pub mod federation;
 pub mod forward;
@@ -35,7 +33,6 @@ pub mod plugins;
 pub mod queue_backoff;
 pub mod realm;
 pub mod realm_vault;
-pub mod recorder;
 pub mod relay;
 pub mod replication;
 pub mod s3;

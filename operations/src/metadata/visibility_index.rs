@@ -1018,7 +1018,6 @@ impl Operation for RebuildIndexOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::metadata::repository::create_outbox_entries;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
@@ -1030,6 +1029,7 @@ mod tests {
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::time::unix_timestamp_millis;
     use aruna_core::{NodeId, UserId};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::collections::{HashMap, HashSet};
 

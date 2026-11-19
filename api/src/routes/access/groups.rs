@@ -23,11 +23,11 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::usage::usage_group_key;
 use aruna_core::types::RoleId;
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::AuthorizeEitherOperation;
 use aruna_operations::device::realm_documents::install_group_docs;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
-use aruna_operations::driver::drive;
 use aruna_operations::git::GitError;
 use aruna_operations::git::location::{check_default, group_default};
 use aruna_operations::groups::add_member::{AddUserError, AddUserInput, AddUserOperation};
@@ -489,16 +489,19 @@ pub async fn create_group(
         let local = ctx.node_and_realm().map(|(node_id, _)| node_id);
         let forward =
             ForwardGroupOperation::new(realm_id, local, auth_token, name, Ulid::generate());
-        let forwarded = aruna_operations::driver::drive(forward, &ctx)
-            .await
-            .map_err(|err| match err {
-                ForwardGroupError::Conflict(reason) => ServerError::Conflict(reason),
-                ForwardGroupError::Unauthorized => map_api_error(MetadataApiError::Unauthorized),
-                ForwardGroupError::Forbidden => map_api_error(MetadataApiError::Forbidden),
-                ForwardGroupError::Unavailable => {
-                    map_api_error(MetadataApiError::ServiceUnavailable)
-                }
-            })?;
+        let forwarded =
+            aruna_drivers::driver::drive(forward, &ctx)
+                .await
+                .map_err(|err| match err {
+                    ForwardGroupError::Conflict(reason) => ServerError::Conflict(reason),
+                    ForwardGroupError::Unauthorized => {
+                        map_api_error(MetadataApiError::Unauthorized)
+                    }
+                    ForwardGroupError::Forbidden => map_api_error(MetadataApiError::Forbidden),
+                    ForwardGroupError::Unavailable => {
+                        map_api_error(MetadataApiError::ServiceUnavailable)
+                    }
+                })?;
         request_span.record("group_id", field::display(forwarded.0.group_id));
         // Cached here so the new group answers on the next read instead of
         // after the device's next realm-document fetch.
@@ -1052,7 +1055,7 @@ pub async fn delete_group(
         group_id,
         Ulid::generate(),
     );
-    aruna_operations::driver::drive(delete, &ctx)
+    aruna_drivers::driver::drive(delete, &ctx)
         .await
         .map_err(|error| {
             use aruna_core::structs::identity::group_delete::GroupDeletionError;
@@ -1166,14 +1169,13 @@ pub async fn get_deletion_blockers(
         auth,
         group_id,
     );
-    let replies =
-        aruna_operations::driver::drive(check, &ctx)
-            .await
-            .map_err(|error| match error {
-                GroupDeletionError::Unauthorized => ServerError::Forbidden,
-                GroupDeletionError::NotFound => ServerError::NotFound,
-                error => ServerError::ServiceUnavailableReason(error.to_string()),
-            })?;
+    let replies = aruna_drivers::driver::drive(check, &ctx)
+        .await
+        .map_err(|error| match error {
+            GroupDeletionError::Unauthorized => ServerError::Forbidden,
+            GroupDeletionError::NotFound => ServerError::NotFound,
+            error => ServerError::ServiceUnavailableReason(error.to_string()),
+        })?;
     let nodes = replies
         .into_iter()
         .map(|(node, result)| {
@@ -1365,7 +1367,7 @@ pub(crate) async fn run_group_usage(
     response.realm.distinct_buckets =
         crate::routes::info::distinct_buckets(state, Some(group_id), response.realm.buckets).await;
     let count = GroupPurposeOperation::new(state.get_realm_id(), group_id);
-    match aruna_operations::driver::drive(count, state.get_ctx().as_ref()).await {
+    match aruna_drivers::driver::drive(count, state.get_ctx().as_ref()).await {
         Ok(Some(counts)) => {
             response.dataset_count = Some(counts.dataset_count);
             response.profile_count = Some(counts.profile_count);

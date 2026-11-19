@@ -10,7 +10,7 @@ use super::versions::{
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::git::GitError;
 use aruna_operations::git::merge::{self, Merged};
 use aruna_operations::git::versions::{self, Named, WriteOptions};

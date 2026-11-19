@@ -13,7 +13,7 @@ use crate::metadata::{
     map_references_response,
 };
 use crate::server::state::ServerState;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::metadata::api::preflight::fanout::references_preflight as run_references_preflight;
 use aruna_operations::metadata::api::preflight_types::{
     MetadataIndexState, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,

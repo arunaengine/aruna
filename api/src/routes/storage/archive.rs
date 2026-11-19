@@ -37,8 +37,8 @@ use crate::routes::shares::rfc3339;
 use crate::routes::storage::objects::{bearer_access, page_node};
 use crate::server::state::ServerState;
 use aruna_core::time::unix_timestamp_secs;
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::bearer_token::GrantValidOperation;
-use aruna_operations::driver::drive;
 
 /// Seconds an archive link works at most.
 const LINK_SECS: u64 = 60;

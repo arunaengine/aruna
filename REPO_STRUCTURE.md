@@ -35,7 +35,7 @@ They start an operation in the same way as an HTTP request does.
 | Inputs | `aruna` | the node binary: settings, wiring, startup, shutdown |
 | Inputs | `aruna-doctor`, `cli` | operator tool on a stopped node; user client |
 | Operations | `operations` | use-case state machines by domain |
-| Drivers | `operations/src/driver.rs`, `operations/src/effect_adapters/` | the drive loop and effect routing; they move to their own crate `aruna-drivers` at the end of the migration |
+| Drivers | `drivers` (`aruna-drivers`) | the drive loop, effect routing to the backends and the job runtime |
 | Backends | `storage`, `net`, `blob`, `tasks`, `compute`, `plugins` | Fjall, Iroh and document sync, blob backends, timers, executors, the WASM host |
 | Foundations | `core`, `kpabe` | domain types, record formats, keyspaces, effects, events, the `Operation` trait, pure helpers |
 
@@ -48,7 +48,7 @@ domain. Do not add new async services there.
 ## Call flows
 
 - **External request.** The `api` handler checks the input and builds the
-  operation. `aruna_operations::driver::drive` calls `start`, sends each effect
+  operation. `aruna_drivers::driver::drive` calls `start`, sends each effect
   to its backend, calls `step` with the answering event and ends with
   `finalize`. The handler maps the result to a response.
 - **Timer.** `tasks` fires a timer key. Today the timer map in
@@ -109,7 +109,7 @@ the same change.
 - routes: `api/src/routes/{execution,access,storage}/`; other route domains
   stay flat under `api/src/routes/`;
 - persisted records: `core/src/structs/{placement,identity,storage,execution}/`;
-- effect adapters: `operations/src/effect_adapters/`;
+- effect adapters: `drivers/src/effect_adapters/`;
 - test helpers: in a `src/tests/` folder beside the domain when the helper
   family qualifies under the folder threshold, otherwise a hoisted sibling file
   declared with an explicit `#[path]` (`aruna/src/bootstrap_tests.rs`);

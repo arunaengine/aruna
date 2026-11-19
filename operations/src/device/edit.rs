@@ -531,8 +531,6 @@ mod tests {
         MAX_PUBLISH_ENTRIES, PublishEntry, PublishKind, PublishState, publish_entry,
     };
     use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
-    use crate::driver::DriverContext;
-    use crate::driver::drive;
     use crate::tests::device::record;
     use aruna_core::UserId;
     use aruna_core::calls::IoResult;
@@ -544,6 +542,8 @@ mod tests {
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_drivers::driver::DriverContext;
+    use aruna_drivers::driver::drive;
     use craqle::VectorClock;
     use std::sync::Arc;
     use ulid::Ulid;
@@ -702,7 +702,7 @@ mod tests {
                 .is_ok()
         );
         let update = |public: Option<bool>| {
-            crate::driver::drive(
+            aruna_drivers::driver::drive(
                 RouteUpdateOperation::new(
                     (
                         actor.clone(),

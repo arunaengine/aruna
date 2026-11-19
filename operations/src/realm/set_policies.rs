@@ -357,7 +357,6 @@ mod tests {
         COMMIT_ATTEMPTS, PoliciesWrite, SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
     };
     use crate::document_repository::GetConfigOperation;
-    use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
@@ -372,6 +371,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;

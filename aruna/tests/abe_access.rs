@@ -19,11 +19,11 @@ use aruna_core::structs::storage::abe_access::{
 };
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
 use aruna_operations::abe::{
     KeyAction, KeyError, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
 };
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::abe_copies::CompleteCopiesOperation;
 use aruna_operations::s3::abe_rekey::{RekeyOperation, RekeyProgress};
 use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
@@ -40,7 +40,7 @@ use ulid::Ulid;
 const BUCKET: &str = "abe-access";
 
 async fn create_bearer_token(
-    context: &aruna_operations::driver::DriverContext,
+    context: &aruna_drivers::driver::DriverContext,
     user_id: UserId,
     realm_id: aruna_core::structs::identity::realm::RealmId,
     capabilities: aruna_core::structs::identity::auth::NodeCapabilities,

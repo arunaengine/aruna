@@ -51,6 +51,7 @@ SMALL_DOMAINS = {
     "core/src/structs/storage/data": "grouped shared-prefix domain",
     "core/src/structured_id": "grouped shared-prefix domain",
     "core/src/user": "grouped shared-prefix domain",
+    "drivers/src/jobs": "coherent ownership scope",
     "operations/src/assistant": "coherent ownership scope",
     "operations/src/blob/migration": "grouped shared-prefix domain",
     "operations/src/blob/rewrite": "grouped shared-prefix domain",

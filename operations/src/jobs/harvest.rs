@@ -48,7 +48,6 @@ use crate::harvest::repository::{
     write_source_effect,
 };
 use crate::harvest::target_path::{HARVEST_PATH_BYTES, normalize_target_prefix};
-use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
@@ -59,6 +58,7 @@ use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperat
 use crate::metadata::forward::routed::write::RouteDeleteOperation;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
 use crate::metadata::update_document::UpdateDocumentMutation;
+use aruna_core::jobs::JobRunOutcome;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 /// Operationally generous at a typical page size, and small enough that a

@@ -6,16 +6,13 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::metrics::WatchMetricReason;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::notification_watch::WatchSubscription;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use thiserror::Error;
-use tokio::sync::broadcast;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::driver::DriverContext;
 use crate::notifications::holder::HolderAnswer;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::user_call::{UserAnswer, WatchDispatchError};
@@ -151,30 +148,6 @@ impl Operation for InboxHolderOperation {
             Err(error) => Err(NotificationDispatchError::Internal(error.to_string())),
         }
     }
-}
-
-/// Receiver half of the inbox wake channel, so the REST layer never names the net handle's
-/// channel type directly.
-pub type InboxWakeReceiver = broadcast::Receiver<UserId>;
-
-pub fn record_watch_denial(context: &DriverContext, reason: WatchMetricReason) {
-    if let Some(net_handle) = context.net_handle.as_ref() {
-        net_handle
-            .notification_watch_metrics()
-            .record_creation_denial(reason);
-    }
-}
-
-/// Subscribes to local inbox-delivery wakes. `Unavailable` when the node runs
-/// without a net handle, matching the other dispatch paths.
-pub fn subscribe_inbox_wakes(
-    context: &DriverContext,
-) -> Result<InboxWakeReceiver, NotificationDispatchError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(NotificationDispatchError::Unavailable)?;
-    Ok(net_handle.subscribe_notification_wakes())
 }
 
 #[cfg(test)]

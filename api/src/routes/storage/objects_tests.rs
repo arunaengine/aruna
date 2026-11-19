@@ -359,7 +359,7 @@ async fn link(node: &Node, key: &str, target: aruna_core::structs::storage::link
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    aruna_operations::driver::drive(
+    aruna_drivers::driver::drive(
         WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
         &node.state.get_ctx(),
     )

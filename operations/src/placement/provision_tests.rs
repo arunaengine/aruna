@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::placement::provision::AllocateBindingOperation;
 use crate::tests::calls::{child, runs_child};
 use aruna_core::UserId;
@@ -13,6 +12,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::record::{FIRST_GRANTABLE_HANDLE, HandleRange};
 use aruna_core::structured_id::PlacementHandle;
+use aruna_drivers::driver::{DriverContext, drive};
 use tempfile::tempdir;
 
 fn node(seed: u8) -> NodeId {

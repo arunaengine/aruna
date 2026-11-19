@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::types::GroupId;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::testing::materialization_jobs_exist;
 use tokio::time::{Instant, sleep, timeout};

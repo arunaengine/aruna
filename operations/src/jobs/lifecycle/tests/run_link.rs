@@ -54,7 +54,7 @@ async fn run_link_lasts() {
         .await
         .unwrap()
         .unwrap();
-    crate::driver::drive(delete_rows(prune_delete_entries(&record)), &ctx)
+    aruna_drivers::driver::drive(delete_rows(prune_delete_entries(&record)), &ctx)
         .await
         .unwrap();
     assert!(

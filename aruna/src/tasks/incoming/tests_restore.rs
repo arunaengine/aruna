@@ -370,7 +370,7 @@ async fn drain_reconcile_wakes() {
     let net = NetHandle::new(
         NetConfig {
             realm_id,
-            ..aruna_operations::testing::local_net()
+            ..aruna_drivers::testing::local_net()
         },
         storage.clone(),
     )
@@ -449,7 +449,7 @@ async fn drain_reconcile_summary() {
     let net = NetHandle::new(
         NetConfig {
             realm_id,
-            ..aruna_operations::testing::local_net()
+            ..aruna_drivers::testing::local_net()
         },
         storage.clone(),
     )
@@ -557,7 +557,7 @@ async fn drain_reconcile_config() {
     let net = NetHandle::new(
         NetConfig {
             realm_id,
-            ..aruna_operations::testing::local_net()
+            ..aruna_drivers::testing::local_net()
         },
         storage.clone(),
     )

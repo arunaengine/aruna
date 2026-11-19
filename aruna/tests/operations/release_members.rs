@@ -27,7 +27,7 @@ use aruna_core::structs::storage::release::{CRATE_CHUNK, CrateChunk, HolderAnswe
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::lifecycle::remote_inputs::{RemoteInputsOperation, ResolveCaller};
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;

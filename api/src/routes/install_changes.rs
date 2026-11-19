@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::plugins::lifecycle::{SetGrants, SetPaused, UpdateInstall};
 use axum::Json;
 use axum::extract::{Path, State};

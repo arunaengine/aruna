@@ -17,10 +17,10 @@ use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, StaticRealmEndpoint,
 };
 use aruna_core::time::unix_timestamp_secs as now_timestamp;
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::drive;
 use aruna_operations::onboarding::consume_secret::ConsumeSecretError;
 use aruna_operations::onboarding::create_secret::{
     CreateSecretError, CreateSecretInput, CreateSecretOperation,
@@ -803,7 +803,7 @@ pub async fn bootstrap_onboarding(
         _ => return Err(ServerError::Forbidden),
     };
 
-    let finalized = aruna_operations::driver::drive(
+    let finalized = aruna_drivers::driver::drive(
         FinalizeBootstrapOperation::new(BootstrapFinalizeInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: onboarding_secret.secret_hash(),

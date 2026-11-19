@@ -7,9 +7,9 @@ use crate::shared;
 use aruna_core::structs::storage::blob::HashIndex;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_drivers::driver::drive;
+use aruna_drivers::driver::node_facts;
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
-use aruna_operations::driver::drive;
-use aruna_operations::driver::node_facts;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
@@ -30,7 +30,7 @@ fn fixture_bytes() -> Vec<u8> {
 }
 
 async fn iter_hash_index(
-    context: &aruna_operations::driver::DriverContext,
+    context: &aruna_drivers::driver::DriverContext,
     hash: [u8; 32],
 ) -> TestResult<Vec<HashIndex>> {
     drive(ResolvePathsOperation::new(hash), context)
@@ -423,7 +423,7 @@ async fn remote_version_downloads() -> TestResult<()> {
             node_facts(joiner.context.as_ref()),
             true,
         );
-        aruna_operations::driver::drive(publish, joiner.context.as_ref())
+        aruna_drivers::driver::drive(publish, joiner.context.as_ref())
             .await
             .map_err(std::io::Error::other)?;
 

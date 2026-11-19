@@ -16,7 +16,7 @@ use aruna_core::repository::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange};
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::metadata::create_document::{
@@ -437,7 +437,7 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
         endpoint: None,
     };
     let lookup = IdentifierLookupOperation::new(fixture.actor.realm_id, Some(auth), query);
-    let found = Box::pin(aruna_operations::driver::drive(lookup, &fixture.context)).await?;
+    let found = Box::pin(aruna_drivers::driver::drive(lookup, &fixture.context)).await?;
     assert_eq!(
         found
             .iter()

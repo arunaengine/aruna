@@ -239,12 +239,12 @@ impl Operation for ListUploadsOperation {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::drive;
-    use crate::testing::test_context;
     use crate::tests::s3::seed_upload;
     use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_drivers::driver::drive;
+    use aruna_drivers::testing::test_context;
     use aruna_storage::storage;
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;

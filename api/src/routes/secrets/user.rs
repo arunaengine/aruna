@@ -10,7 +10,7 @@ use aruna_core::realm_vault::RealmSealKey;
 use aruna_core::secret_registers::SecretOwner;
 use aruna_core::secrets::SecretFields;
 use aruna_core::structs::identity::auth::NodeCapabilities;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::secrets::SecretChange;
 use aruna_operations::secrets::owner::{OwnerSecretError, ReadbackOperation, open_value};
 use axum::Json;

@@ -11,8 +11,8 @@ use super::{
 use crate::lookup::actor;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::AuthorizeDocumentOperation;
-use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, RoCrateExportView};
 use aruna_operations::metadata::api::read::query_metadata;
@@ -439,7 +439,7 @@ impl McpServer {
         if record.is_none() {
             metadata_probe(self, &auth, "replace_dataset", extras).await?;
         }
-        let updated = aruna_operations::driver::drive(
+        let updated = aruna_drivers::driver::drive(
             RouteUpdateOperation::new(
                 (
                     actor(&self.state, &auth),
@@ -1045,13 +1045,13 @@ mod authorization_tests {
         Actor, NodeCapabilities, PathRestriction, Permission,
     };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_drivers::driver::drive;
+    use aruna_drivers::testing::test_context;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::driver::drive;
     use aruna_operations::metadata::create_document::CreateDocumentPayload;
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
-    use aruna_operations::testing::test_context;
     use aruna_tasks::TaskHandle;
     use ed25519_dalek::SigningKey;
     use rmcp::handler::server::tool::Extension;

@@ -278,13 +278,13 @@ impl Operation for RootsCheckOperation {
 mod tests {
     use super::*;
     use crate::distribution::test_store::{context, get, open};
-    use crate::driver::{DriverContext, drive};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::{StagingSourceError, StorageError};
     use aruna_core::events::StorageEvent;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::distribution::source_root::{SourceRoot, root_key};
+    use aruna_drivers::driver::{DriverContext, drive};
     use std::collections::BTreeMap;
 
     fn entry(bucket: &str) -> RootEntry {

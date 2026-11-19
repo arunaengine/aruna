@@ -16,10 +16,10 @@ use aruna_outbound::{OutboundHandle, TransferError, UploadBody};
 use ulid::Ulid;
 
 use super::plugin_work::{PROGRESS_TICK, key_wait, permanent, refused};
-use aruna_operations::driver::{drive, node_routing};
+use aruna_core::jobs::JobRunOutcome;
+use aruna_drivers::driver::{drive, node_routing};
+use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_operations::jobs::context::JobContext;
-use aruna_operations::jobs::executor::JobRunOutcome;
 use aruna_operations::placement::policy::GateOperation;
 use aruna_operations::plugins::copy_steps::read_locked;
 use aruna_operations::plugins::transfer_steps::{

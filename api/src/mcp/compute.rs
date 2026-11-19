@@ -19,7 +19,7 @@ use aruna_core::compute::session::{EndReason, SessionAnswer, SessionRequest};
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{CONTENT_TYPE_KEY, key_content_type};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget,
     InputMode, SessionMountSpec, SubmitExecutionCommand, WorkspaceMode, WorkspaceSpec,

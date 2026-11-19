@@ -25,7 +25,7 @@ use aruna_core::structs::{
     MintPersistentSpec, PersistentIdMapping, PersistentIdRevision, PersistentIdStatus,
     persistent_id_key,
 };
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::metadata::PersistentIdResolution;

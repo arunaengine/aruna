@@ -22,9 +22,9 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::driver::drive;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::driver::drive;
 use aruna_operations::notifications::inbox::UpsertInboxOperation;
 use aruna_operations::notifications::routing::route_watch_event;
 use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
@@ -71,7 +71,7 @@ async fn build_state(realm_id: RealmId, node_id: NodeId) -> (TempDir, Arc<Server
         NodeCapabilities::user_node(realm_id).expect("capabilities"),
         false,
         None,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_drivers::jobs::runtime::JobsRuntime::new(),
     )
     .await;
     (dir, Arc::new(state))
@@ -114,7 +114,7 @@ async fn build_network_state(
         NodeCapabilities::user_node(realm_id).expect("capabilities"),
         false,
         None,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_drivers::jobs::runtime::JobsRuntime::new(),
     )
     .await;
     (dir, Arc::new(state), net)

@@ -974,7 +974,7 @@ mod tests {
     use aruna_storage::storage::EffectReceiver;
     use aruna_storage::{FjallStorage, StorageHandle};
 
-    use crate::driver::{DriverContext, drive};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     type Rows = Vec<(String, Key, Value)>;
 

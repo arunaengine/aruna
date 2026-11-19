@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::drive;
 use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::plugins::account::{EnsureAccount, EnsureRole};
 use crate::plugins::calls::*;
@@ -13,6 +12,7 @@ pub(crate) use crate::plugins::test_support::{Fixture, REALM_KEY};
 use aruna_core::effects::StorageEffect;
 use aruna_core::structs::identity::auth::{Permission as Access, Role};
 use aruna_core::structs::identity::user::User;
+use aruna_drivers::driver::drive;
 use aruna_storage::StorageHandle;
 use serde_json::json;
 use std::collections::HashMap;

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 
 #[tokio::test]
 async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {

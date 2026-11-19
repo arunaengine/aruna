@@ -1,5 +1,5 @@
-//! Groups the shared test helper modules of the operations tests. The export, job, notification,
-//! S3, shard and staging fixtures are public under `test-hooks` for the node crate's tests.
+//! Groups the shared test helper modules of the operations tests. The export, notification, S3,
+//! shard and staging fixtures are public under `test-hooks` for the node crate's tests.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -12,7 +12,6 @@ pub(crate) mod device;
 pub mod export;
 #[cfg(test)]
 pub(crate) mod import;
-pub mod jobs;
 pub mod locations;
 #[cfg(test)]
 pub(crate) mod metadata;

@@ -11,11 +11,11 @@ use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_tasks::TaskHandle;
 use tracing::warn;
 
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::device::drain::{DrainOutcome, publish_pending};
 use aruna_operations::device::sync::folders::{finish_binding, finish_unbind, list_folders};
 use aruna_operations::device::sync::reconcile::ReconcilePlan;
 use aruna_operations::device::sync::{ReconcileFolderError, folder_gate, folder_pass, sync_timers};
-use aruna_operations::driver::{DriverContext, drive};
 
 /// Reconciles one folder under its gate.
 pub async fn reconcile_folder(

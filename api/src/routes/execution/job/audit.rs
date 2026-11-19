@@ -10,7 +10,7 @@ use crate::jobs::family_report;
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::jobs::lifecycle::family_reads::{
     AuditEndpointsOperation, FamilyLogOperation,
 };

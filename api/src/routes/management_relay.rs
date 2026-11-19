@@ -9,7 +9,7 @@ use aruna_core::NodeId;
 use aruna_core::member_read::MemberMethod;
 use aruna_core::structs::SESSION_HEADER;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::relay::call::{
     NodeCall, RawHeader, RelayFailure, RelayReply, StartCallOperation,
 };

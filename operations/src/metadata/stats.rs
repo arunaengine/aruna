@@ -221,8 +221,8 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     const REALM_SEED: [u8; 32] = [7u8; 32];
 

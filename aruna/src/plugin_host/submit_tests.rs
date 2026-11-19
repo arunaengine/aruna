@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::plugins::flow_support::submit::fetcher;
 use aruna_operations::plugins::flow_support::submit::send;
 use aruna_operations::plugins::flow_support::submit::stored_object;

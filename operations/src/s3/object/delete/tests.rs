@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_blob::blob::BlobHandler;
@@ -25,6 +24,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use futures_util::StreamExt;
@@ -635,7 +635,7 @@ async fn creates_tombstone() {
     std::fs::create_dir_all(&blob_root).unwrap();
 
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -788,7 +788,7 @@ async fn deletes_version() {
     std::fs::create_dir_all(&blob_root).unwrap();
 
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -1173,7 +1173,7 @@ impl aruna_core::operation::Operation for ApplyUsage {
 
 /// Commits one counter update, as the publication of the seeded versions would.
 async fn apply_usage(storage: &storage::StorageHandle, update: UsageCounterUpdate) {
-    let context = crate::testing::test_context(storage.clone());
+    let context = aruna_drivers::testing::test_context(storage.clone());
     drive(ApplyUsage(update), &context).await.unwrap();
 }
 
@@ -1638,7 +1638,7 @@ async fn bucket_rows_sum() {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(

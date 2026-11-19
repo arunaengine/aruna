@@ -332,7 +332,7 @@ async fn workspace_credential_writes() -> TestResult<()> {
     use aruna_core::structs::execution::job::{
         ComputeResources, ExecutionSpec, JobId, JobPayload, JobRecord, WorkspaceMode,
     };
-    use aruna_operations::driver::drive;
+    use aruna_drivers::driver::drive;
     use aruna_operations::jobs::workflow::credential::{MintCredentialOperation, RunIdentity};
 
     let seed = spawn_complete_seed().await?;

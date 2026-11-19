@@ -438,7 +438,7 @@ fn raw_event(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     /// Prepares `event` as a materialization does, keeping the state in `cache` afterwards.
     pub(crate) async fn prepare_raw_event(

@@ -796,7 +796,6 @@ impl Operation for RecheckImportOperation {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::RealmDescriptor;
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
@@ -806,6 +805,7 @@ pub(crate) mod tests {
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::transfer::MAX_TRANSFER_SECS;
+    use aruna_drivers::driver::{DriverContext, drive};
     use ed25519_dalek::SigningKey;
     use std::time::SystemTime;
     use tempfile::{TempDir, tempdir};
@@ -1496,7 +1496,7 @@ pub(crate) mod tests {
         let (first, second) = (Ulid::from_bytes([9; 16]), Ulid::from_bytes([10; 16]));
         let live = upload(u64::MAX);
         let storage = &context.storage_handle;
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::jobs::import::upload_store::WriteUploadOperation::new(live.clone()),
             &context,
         )

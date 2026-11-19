@@ -27,7 +27,6 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::TempDir;
 
-use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::launch_checks::LocalCapabilityOperation;
 use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::node_inputs::launch_node;
@@ -35,6 +34,7 @@ use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation
 use crate::jobs::records::verify::FamilyView;
 use crate::metadata::protocol::MetadataTransportMessage;
 use aruna_core::effects::LaunchFrame;
+use aruna_drivers::driver::{DriverContext, drive};
 
 pub const REALM: RealmId = RealmId([3u8; 32]);
 
@@ -428,7 +428,7 @@ pub async fn local_capability(
 ) -> Result<aruna_core::compute::ExecutorCapability, aruna_core::events::LaunchDecline> {
     let operation =
         LocalCapabilityOperation::new(config.clone(), local, intent.clone(), spec.clone());
-    crate::driver::drive(operation, context)
+    aruna_drivers::driver::drive(operation, context)
         .await
         .unwrap_or(Err(aruna_core::events::LaunchDecline::Draining))
 }
@@ -452,7 +452,7 @@ pub async fn serve_launch_offer(
     peer: NodeId,
     launch: LaunchFrame,
 ) -> MetadataTransportMessage {
-    let node = launch_node(context, &launch);
+    let node = launch_node(context.node_and_realm(), &context.compute_limits(), &launch);
     let serve = ServeLaunchOperation::new(peer, launch, node);
     drive(serve, context)
         .await

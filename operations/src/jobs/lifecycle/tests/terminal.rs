@@ -14,7 +14,6 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use super::resources;
-use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
 use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::jobs::lifecycle::updates::{PublishStateOperation, PublishTerminalOperation};
@@ -25,6 +24,7 @@ use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::store::test_calls::record_attempt_intent;
 use crate::jobs::store::test_calls::reserve_output_commits;
 use crate::tests::records::{Family, REALM, context};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
 
 const TOKEN: Ulid = Ulid(0x7E12);
@@ -195,7 +195,7 @@ async fn publishes_terminal_success() {
         ctx.node_and_realm(),
         aruna_core::time::unix_timestamp_millis(),
     );
-    let output_digest = crate::driver::drive(store, &ctx)
+    let output_digest = aruna_drivers::driver::drive(store, &ctx)
         .await
         .expect("outputs stored");
     let mut terminal = record;
@@ -271,12 +271,12 @@ async fn bumps_dashboard_once() {
         ctx.node_and_realm(),
         5_000,
     );
-    assert!(crate::driver::drive(publish, &ctx).await.unwrap());
+    assert!(aruna_drivers::driver::drive(publish, &ctx).await.unwrap());
     assert_eq!(*changes.borrow_and_update(), before + 1);
 }
 
 async fn publish_terminal(
-    ctx: &crate::driver::DriverContext,
+    ctx: &aruna_drivers::driver::DriverContext,
     record: &aruna_core::structs::execution::job::JobRecord,
 ) -> bool {
     let publish = PublishTerminalOperation::new(
@@ -284,5 +284,7 @@ async fn publish_terminal(
         ctx.node_and_realm(),
         aruna_core::time::unix_timestamp_millis(),
     );
-    crate::driver::drive(publish, ctx).await.unwrap_or(false)
+    aruna_drivers::driver::drive(publish, ctx)
+        .await
+        .unwrap_or(false)
 }

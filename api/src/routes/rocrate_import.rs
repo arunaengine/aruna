@@ -17,7 +17,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_operations::driver::{drive, drive_until};
+use aruna_drivers::driver::{drive, drive_until};
 use aruna_operations::federation::import::ReadImportOperation;
 use aruna_operations::jobs::import::upload::{
     CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation,
@@ -615,7 +615,7 @@ async fn fast_source_check(
             crate::metadata::ensure_metadata_scope(state, auth, *group_id, Permission::READ).await
         }
         ImportRoCrateSource::Upload { upload_id } => {
-            let record = aruna_operations::driver::drive(
+            let record = aruna_drivers::driver::drive(
                 aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(*upload_id),
                 &state.get_ctx(),
             )

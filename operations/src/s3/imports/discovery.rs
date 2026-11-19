@@ -717,7 +717,7 @@ fn named(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
+    use aruna_drivers::driver::drive;
 
     fn import_rule() -> BackendImport {
         BackendImport {
@@ -741,10 +741,10 @@ mod tests {
 
     #[tokio::test]
     async fn checks_bucket_access() {
-        use crate::testing::test_context;
         use crate::tests::s3::test_storage;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::storage::blob::object_permission_path;
+        use aruna_drivers::testing::test_context;
         let (_directory, storage) = test_storage();
         let context = test_context(storage);
         let rule = import_rule();

@@ -135,8 +135,6 @@ impl Operation for ListTokensOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
-    use crate::testing::test_context;
     use crate::tests::s3::test_storage;
     use aruna_core::UserId;
     use aruna_core::credential_encryption::EncryptedS3Secret;
@@ -145,6 +143,8 @@ mod tests {
     use aruna_core::structs::storage::abe::AbeParameters;
     use aruna_core::structs::storage::abe_access::{GrantContext, KeyIssuer, KeyRequest, KeyScope};
     use aruna_core::structs::storage::encryption::BucketKeyRef;
+    use aruna_drivers::driver::drive;
+    use aruna_drivers::testing::test_context;
     use std::time::Duration;
 
     #[tokio::test]

@@ -254,7 +254,6 @@ fn build_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
     use crate::s3::access::list::{ListUserInput, ListUserOperation};
     use aruna_core::effects::StorageEffect;
@@ -262,6 +261,7 @@ mod tests {
     use aruna_core::keyspaces::{SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::s3_session::SESSION_MAX_TTL;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::FjallStorage;
     use std::time::Duration;
     use tempfile::TempDir;

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aruna_core::document::DocumentEvent;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::{SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage};
-use aruna_operations::driver::{drive, drive_retry};
+use aruna_drivers::driver::{drive, drive_retry};
 use aruna_operations::sync::sync_quarantine::{
     AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
     QuarantineAdminError, QuarantinePageRequest, ReadQuarantineOperation,

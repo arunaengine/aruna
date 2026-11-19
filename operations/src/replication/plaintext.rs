@@ -331,13 +331,13 @@ fn decode_requester(value: Option<&[u8]>) -> Result<Option<UserId>, PlaintextErr
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
     use aruna_core::structs::storage::encryption::{EncryptionMode, GrantState};
+    use aruna_drivers::driver::{DriverContext, drive};
     use std::time::SystemTime;
 
     pub(crate) fn user(seed: u8) -> UserId {
@@ -427,7 +427,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn plaintext_needs_holder() {
         let (_dir, storage) = crate::tests::s3::test_storage();
-        let context = crate::testing::test_context(storage);
+        let context = aruna_drivers::testing::test_context(storage);
         bucket(&context).await;
         let realm = RealmId::from_bytes([3; 32]);
         let encrypted = EncryptionCheckOperation::new("sealed", false);
@@ -509,7 +509,7 @@ pub(crate) mod tests {
     async fn foreign_explicit_holds() {
         // An explicit grant makes a user of another realm a holder; the creator's ULID does not.
         let (_dir, storage) = crate::tests::s3::test_storage();
-        let context = crate::testing::test_context(storage);
+        let context = aruna_drivers::testing::test_context(storage);
         bucket(&context).await;
         let local = RealmId::from_bytes([3; 32]);
         let foreign =

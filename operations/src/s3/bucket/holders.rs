@@ -101,9 +101,9 @@ impl Operation for LookupKeysOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::test_context;
     use crate::tests::s3::test_storage;
     use aruna_core::calls::ChildOutcome;
+    use aruna_drivers::testing::test_context;
     use ulid::Ulid;
 
     fn user(seed: u8) -> UserId {
@@ -167,7 +167,9 @@ mod tests {
         let context = test_context(storage);
         let user = user(7);
         let lookup = LookupKeysOperation::new(user.realm_id, node(), [user]);
-        let lookups = crate::driver::drive(lookup, &context).await.unwrap();
+        let lookups = aruna_drivers::driver::drive(lookup, &context)
+            .await
+            .unwrap();
         assert_eq!(lookups.get(&user), Some(&KeyLookup::Unavailable));
     }
 }

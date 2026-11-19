@@ -1576,9 +1576,9 @@ impl Operation for UnbindOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::storage::distribution::OriginalEpoch;
+    use aruna_drivers::driver::drive;
     use std::sync::Arc;
 
     #[test]
@@ -1854,7 +1854,7 @@ mod tests {
     async fn settling_keeps_newer() {
         // A marker rewritten by a newer record after the pass read it stays.
         let (_dir, storage_handle) = crate::distribution::test_store::open();
-        let context = crate::driver::DriverContext {
+        let context = aruna_drivers::driver::DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,

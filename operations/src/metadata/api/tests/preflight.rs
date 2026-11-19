@@ -13,7 +13,7 @@ use super::super::preflight::{
 };
 use super::super::preflight_types::preflight_fingerprint;
 use super::super::realm_search::resume_cursor;
-use crate::driver::drive;
+use aruna_drivers::driver::drive;
 
 // Documents not materialized yet have no postings, so their absence is never reported current.
 #[test]

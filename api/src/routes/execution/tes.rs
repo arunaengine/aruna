@@ -25,7 +25,7 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use aruna_operations::jobs::local_run::LocalExecutionConfig;
 use aruna_operations::jobs::route::JobRouteError;
@@ -712,7 +712,11 @@ pub async fn create_task(
         };
         let context = state.get_ctx();
         return match drive(
-            aruna_operations::jobs::node_inputs::local_run(config, &context),
+            aruna_operations::jobs::node_inputs::local_run(
+                config,
+                &context.compute_limits(),
+                context.node_and_realm(),
+            ),
             context.as_ref(),
         )
         .await

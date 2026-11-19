@@ -293,8 +293,8 @@ mod tests {
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
@@ -363,7 +363,7 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         });
-        let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
+        let jobs_runtime = aruna_drivers::jobs::runtime::JobsRuntime::new();
         let shutdown = aruna_tasks::shutdown::Shutdown::new();
         initialize_net_holder(
             context.clone(),
@@ -413,7 +413,7 @@ mod tests {
                 capabilities,
                 false,
                 None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
+                aruna_drivers::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

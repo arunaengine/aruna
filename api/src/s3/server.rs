@@ -36,7 +36,7 @@ use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels, method_label}
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketCorsConfiguration;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::serve::Listener;
 use futures_core::future::BoxFuture;

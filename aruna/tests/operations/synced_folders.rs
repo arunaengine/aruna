@@ -34,7 +34,7 @@ use aruna_operations::device::sync::folders::{
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
-use aruna_operations::driver::{DriverContext, drive, node_routing};
+use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_operations::metadata::protocol::MetadataTransportMessage;
 use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, needs_view};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;

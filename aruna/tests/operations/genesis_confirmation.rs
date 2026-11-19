@@ -26,7 +26,7 @@ use crate::convergence::wait_for_convergence;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use crate::topology::{TestNode, spawn_replica};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::placement::process_placements::PlacementReconcileOutcome;
 use aruna_operations::placement::process_placements::ReconcilePlacementsOperation;
 
@@ -522,7 +522,7 @@ async fn run_restore_pass(node: &TestNode, realm_id: RealmId) -> ShardRestorePas
         ShardRestoreCursor::default(),
         RecoveryStop::default(),
     );
-    let (pass, _) = aruna_operations::driver::drive(restore, &node.context)
+    let (pass, _) = aruna_drivers::driver::drive(restore, &node.context)
         .await
         .expect("restore pass runs");
     pass

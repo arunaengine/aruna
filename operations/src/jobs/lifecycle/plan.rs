@@ -560,8 +560,6 @@ pub(crate) fn network_access(spec: &LogicalJobSpec) -> NetworkAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::DriverContext;
-    use crate::driver::drive;
     use crate::tests::records::{Family, REALM, context, node};
     use aruna_core::compute::{ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
     use aruna_core::effects::StorageEffect;
@@ -572,6 +570,8 @@ mod tests {
     use aruna_core::structs::storage::node_info::{
         AdvertisementEpoch, NodeUrls, NodeUtilization, node_info_key,
     };
+    use aruna_drivers::driver::DriverContext;
+    use aruna_drivers::driver::drive;
 
     /// A realm of `members` servers, each advertising eight backends, which is
     /// more advertisements than one planning page screens.

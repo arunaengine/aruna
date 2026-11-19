@@ -3,11 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
 use crate::plugins::calls::*;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::plugin_runs::{RUN_RETENTION_MS, RunTrigger};
 use aruna_core::structs::identity::admin_audit::AdminAuditAction;
+use aruna_drivers::driver::drive;
 use serde_json::json;
 
 use super::*;

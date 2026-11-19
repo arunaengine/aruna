@@ -434,7 +434,6 @@ impl From<IoError> for CreateGroupError {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{DriverContext, drive};
     use crate::groups::create_group::{
         CreateGroupConfig, CreateGroupError, CreateGroupOperation, GroupCreate,
     };
@@ -453,6 +452,7 @@ mod test {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::{Key, KeySpace, Value};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;

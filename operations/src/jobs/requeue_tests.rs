@@ -118,7 +118,7 @@ async fn panicked_import_kept() {
     upload.blake3 = blake3;
     upload.size = size;
     upload.claimed_by = Some(job_id);
-    crate::driver::drive(
+    aruna_drivers::driver::drive(
         crate::jobs::import::upload_store::WriteUploadOperation::new(upload.clone()),
         &driver,
     )
@@ -162,7 +162,7 @@ async fn panicked_import_kept() {
     let (rows, _) = list_job_entries(&driver, job_id, None, 10).await.unwrap();
     assert!(rows.is_empty(), "panic must not write a failure report");
     assert_eq!(
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::jobs::import::upload_store::ReadUploadOperation::new(upload.upload_id),
             &driver
         )

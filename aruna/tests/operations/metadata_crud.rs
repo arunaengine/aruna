@@ -29,8 +29,8 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     mint_local_document,
@@ -465,7 +465,7 @@ async fn queue_recovers_create() -> Result<(), Box<dyn std::error::Error>> {
     start_task_queues(
         test.context.clone(),
         task_handle.clone(),
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_drivers::jobs::runtime::JobsRuntime::new(),
         &shutdown,
     )
     .await;
@@ -992,11 +992,8 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
     let metadata_dir = tempfile::tempdir()?;
     let storage_handle =
         FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
-    let net_handle = NetHandle::new(
-        aruna_operations::testing::local_net(),
-        storage_handle.clone(),
-    )
-    .await?;
+    let net_handle =
+        NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone()).await?;
     let node_id = net_handle.node_id();
     let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),

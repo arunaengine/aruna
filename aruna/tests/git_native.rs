@@ -21,7 +21,7 @@ type ServerTask = tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSet
 
 /// Serves one node's REST API with native Git hosting from `root`.
 async fn git_server(
-    context: Arc<aruna_operations::driver::DriverContext>,
+    context: Arc<aruna_drivers::driver::DriverContext>,
     realm_id: aruna_core::structs::identity::realm::RealmId,
     node_id: iroh::PublicKey,
     capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
@@ -40,7 +40,7 @@ async fn git_server(
             capabilities,
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );

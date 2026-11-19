@@ -270,14 +270,13 @@ impl Operation for OutboxTimerOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
     use crate::sync::outbox_record::{
         OUTBOX_DRAIN_SIZE, admin_outbox_prefix, outbox_key, outbox_prefix, revocation_index_entry,
     };
     use crate::sync::outbox_record::{
         new_identified_record, new_outbox_record, write_outbox_effect,
     };
-    use crate::testing::{read_outbox_record, read_outbox_records, test_context};
+    use crate::testing::{read_outbox_record, read_outbox_records};
     use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
@@ -290,6 +289,8 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::Value;
+    use aruna_drivers::driver::drive;
+    use aruna_drivers::testing::test_context;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use ulid::Ulid;

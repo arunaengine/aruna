@@ -11,7 +11,7 @@ use aruna_core::keyspaces::PLUGIN_WAITING_KEYSPACE;
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::plugins::cleanup::sweep_events;
 use aruna_operations::plugins::flow_support::cleanup::count;
 use aruna_operations::plugins::flow_support::matcher::config;

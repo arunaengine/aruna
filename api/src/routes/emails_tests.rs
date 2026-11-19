@@ -18,18 +18,14 @@ use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
-use aruna_operations::testing::test_context;
+use aruna_drivers::testing::test_context;
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 use ulid::Ulid;
 
 /// Stores the realm config with this node as its only manager, and an email profile when
 /// `email` is set.
-async fn store_config(
-    context: &aruna_operations::driver::DriverContext,
-    actor: &Actor,
-    email: bool,
-) {
+async fn store_config(context: &aruna_drivers::driver::DriverContext, actor: &Actor, email: bool) {
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.ensure_node(actor.node_id, RealmNodeKind::Management);
     config.email = email.then(|| RealmEmailProfile {
@@ -90,7 +86,7 @@ async fn management_state() -> (TempDir, Arc<ServerState>, Actor, AuthContext) {
     (dir, state, actor, auth)
 }
 
-async fn seed_user(context: &aruna_operations::driver::DriverContext, actor: &Actor) {
+async fn seed_user(context: &aruna_drivers::driver::DriverContext, actor: &Actor) {
     let user = User {
         user_id: actor.user_id,
         name: "Ada".to_string(),

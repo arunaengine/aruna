@@ -247,7 +247,6 @@ pub fn secret_record_key(enrollment_id: Ulid) -> ByteView {
 #[cfg(test)]
 mod tests {
     use super::{CreateSecretError, CreateSecretInput, CreateSecretOperation};
-    use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::StorageError;
@@ -257,6 +256,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use byteview::ByteView;
     use tempfile::tempdir;

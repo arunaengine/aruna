@@ -7,11 +7,9 @@ use std::time::Duration;
 pub mod backend_import;
 pub(crate) mod blob_request;
 pub mod command;
-pub mod context;
 pub mod copy;
 pub mod demand;
 pub mod drain;
-pub mod executor;
 pub mod export;
 pub mod handed_imports;
 pub mod harvest;
@@ -44,7 +42,6 @@ mod rocrate_jsonld;
 pub mod route;
 pub(crate) mod run_rows;
 pub mod runs;
-pub mod runtime;
 pub mod runtime_steps;
 pub mod session;
 pub mod staging;
@@ -60,11 +57,6 @@ pub mod workflow;
 pub const JOB_LEASE_MS: u64 = 60_000;
 /// Heartbeat interval (renew + progress flush); must stay well under the lease.
 pub const JOB_HEARTBEAT_MS: u64 = 20_000;
-/// Maximum in-process jobs executing locally at once; excess stays queued.
-pub const JOB_CONCURRENCY_CAP: usize = 8;
-/// External-attempt supervision slots. Supervising a remote container is IO-trivial,
-/// so it gets its own bounded budget and never starves in-process jobs (or vice versa).
-pub const EXTERNAL_CONCURRENCY_CAP: usize = 64;
 /// Attempts before a retryable failure becomes terminal `Failed`.
 pub const JOB_MAX_ATTEMPTS: u32 = 5;
 /// Default terminal-state retention before pruning.

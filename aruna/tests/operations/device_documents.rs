@@ -15,12 +15,12 @@ use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::time::unix_timestamp_secs;
+use aruna_drivers::driver::drive;
+use aruna_drivers::driver::node_facts;
 use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
 use aruna_operations::device::realm_documents::{fetch_realm_documents, realm_removed};
-use aruna_operations::driver::drive;
-use aruna_operations::driver::node_facts;
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::sync::replicate_documents::{

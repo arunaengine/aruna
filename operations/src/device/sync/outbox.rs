@@ -670,11 +670,11 @@ mod tests {
     use crate::device::drain::DrainOutcome;
     use crate::device::sync::repository::requeued;
     use crate::device::sync::repository::{base_key, upload_entry};
-    use crate::driver::{DriverContext, drive};
     use crate::tests::device::{context, read_value, store_folder, write_rows};
     use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::{FolderState, SyncBase, SyncedFolder};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     fn node_id() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[1u8; 32]).public()

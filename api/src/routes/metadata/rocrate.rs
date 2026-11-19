@@ -22,8 +22,8 @@ use crate::routes::repository::links::{
 use crate::server::state::ServerState;
 use aruna_core::structs::execution::job::ExportRoCrateSpec;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::drive;
 use aruna_operations::jobs::repository::{Action, TransferError, seal_token};
 use aruna_operations::metadata::api::export::ExportOperation;
 use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
@@ -576,7 +576,7 @@ pub async fn replace_metadata_rocrate(
         .map(str::parse::<ulid::Ulid>)
         .transpose()
         .map_err(|_| ServerError::BadRequestMessage("expected_revision is not a ULID".into()))?;
-    let updated = aruna_operations::driver::drive(
+    let updated = aruna_drivers::driver::drive(
         RouteUpdateOperation::new(
             (
                 actor(&state, &auth),
@@ -689,7 +689,7 @@ pub async fn add_data_entity(
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
-    let updated = aruna_operations::driver::drive(
+    let updated = aruna_drivers::driver::drive(
         RouteUpdateOperation::new(
             (
                 actor(&state, &auth),
@@ -795,7 +795,7 @@ pub async fn remove_data_entity(
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
-    let updated = aruna_operations::driver::drive(
+    let updated = aruna_drivers::driver::drive(
         RouteUpdateOperation::new(
             (
                 actor(&state, &auth),
@@ -901,7 +901,7 @@ pub async fn add_contextual_entity(
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
-    let updated = aruna_operations::driver::drive(
+    let updated = aruna_drivers::driver::drive(
         RouteUpdateOperation::new(
             (
                 actor(&state, &auth),

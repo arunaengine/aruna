@@ -29,12 +29,12 @@ use ulid::Ulid;
 use super::*;
 use crate::distribution::test_record::{binding, realm, replicated, secret, store_record};
 use crate::distribution::test_store::{context, install, open};
-use crate::driver::{DriverContext, drive};
 use crate::replication::drain::ProcessBatchOperation;
 use crate::replication::page::apply::tests::source;
 use aruna_core::structs::storage::replication_queue::{
     LiveObligationRecord, live_obligation_entry,
 };
+use aruna_drivers::driver::{DriverContext, drive};
 
 struct Node {
     _dir: TempDir,
@@ -235,7 +235,7 @@ async fn drain_batch(
 ) -> Result<crate::replication::drain::BlobDrainResult, BlobQueueError> {
     let drain = ProcessBatchOperation::new(
         sender.clone(),
-        crate::driver::node_routing(context),
+        aruna_drivers::driver::node_routing(context),
         context.node_and_realm(),
     );
     drive(drain, context).await

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::jobs::staging::pure_tests::{child_answer, test_run};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
@@ -13,6 +12,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_drivers::driver::{DriverContext, drive};
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -111,7 +111,7 @@ async fn manifest_read_authorized() {
     let tempdir = tempfile::tempdir().unwrap();
     let storage_handle =
         aruna_storage::storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-    let context = crate::testing::test_context(storage_handle.clone());
+    let context = aruna_drivers::testing::test_context(storage_handle.clone());
     let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
     let claim_token = Ulid::from_bytes([6; 16]);
     let job_id = JobId::from_bytes([7; 16]);

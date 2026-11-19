@@ -464,8 +464,8 @@ impl Operation for CopyLagOperation {
 mod tests {
     use super::*;
     use crate::distribution::test_record::{binding, member, replicated};
-    use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
+    use aruna_drivers::driver::{DriverContext, drive};
 
     #[test]
     fn publishes_while_coordinating() {

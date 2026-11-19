@@ -13,7 +13,6 @@ use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{
@@ -24,6 +23,7 @@ use crate::tests::records::context as fixture;
 use crate::tests::records::{Family, REALM, actor, node, secret};
 use aruna_core::structs::execution::job::record_keys::record_key;
 use aruna_core::structs::execution::job::record_rows::{PendingNeed, to_bytes};
+use aruna_drivers::driver::{DriverContext, drive};
 
 /// Rows past the 256-record prefix the append used to read.
 const OVERFLOW: u16 = 260;

@@ -5,10 +5,10 @@
 
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_drivers::driver::drive;
 use aruna_operations::distribution::versions::{
     InventoryVersionsInput, InventoryVersionsOperation,
 };
-use aruna_operations::driver::drive;
 use aruna_operations::s3::object::member_merge::{
     MarkerQuery, MergedMarkersOperation, RemoteVersion, VersionSource, VersionsPart,
 };

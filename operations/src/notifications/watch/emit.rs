@@ -4,7 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::driver::{DriverContext, drive};
     use crate::notifications::watch::origin::EmitEventOperation;
     use aruna_core::NodeId;
     use aruna_core::UserId;
@@ -22,6 +21,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};

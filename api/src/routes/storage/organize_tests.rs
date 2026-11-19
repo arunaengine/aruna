@@ -240,7 +240,7 @@ async fn hides_unmapped_failures() {
     let context = test.state.get_ctx();
     let group = Ulid::from_string(&ids.0).unwrap();
     let import = Ulid::from_string(&ids.1).unwrap();
-    let rule = aruna_operations::driver::drive(
+    let rule = aruna_drivers::driver::drive(
         aruna_operations::s3::imports::ReadImportOperation::new(group, import),
         &context,
     )

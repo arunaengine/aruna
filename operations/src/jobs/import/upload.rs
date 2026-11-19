@@ -459,7 +459,7 @@ pub(crate) mod tests {
     async fn reclaims_expired_upload() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let owner = UserId::nil(realm_id);
         let upload_id = Ulid::from_bytes([2u8; 16]);
@@ -488,14 +488,14 @@ pub(crate) mod tests {
             expires_at_ms: 10,
             claimed_by: None,
         };
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
             &context,
         )
         .await
         .map_err(|error| error.0)
         .unwrap();
-        crate::driver::drive_retry(
+        aruna_drivers::driver::drive_retry(
             || crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 9),
             &context,
             &upload_id.to_bytes(),
@@ -503,7 +503,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let reclaimed = crate::driver::drive_retry(
+        let reclaimed = aruna_drivers::driver::drive_retry(
             || crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 11),
             &context,
             &upload_id.to_bytes(),
@@ -513,7 +513,7 @@ pub(crate) mod tests {
 
         assert_eq!(reclaimed.claimed_by, Some(job_id));
         assert!(matches!(
-            crate::driver::drive_retry(
+            aruna_drivers::driver::drive_retry(
                 || crate::jobs::import::upload::ClaimUploadOperation::new(
                     upload_id,
                     owner,
@@ -563,10 +563,10 @@ pub(crate) mod tests {
     async fn reads_missing_upload() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let upload_id = Ulid::from_bytes([2u8; 16]);
         assert!(
-            crate::driver::drive(
+            aruna_drivers::driver::drive(
                 crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
                 &context
             )
@@ -576,7 +576,7 @@ pub(crate) mod tests {
             .is_none()
         );
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::jobs::import::upload_store::WriteUploadOperation::new(
                 upload_record(owner, upload_id, 10).clone(),
             ),
@@ -586,7 +586,7 @@ pub(crate) mod tests {
         .map_err(|error| error.0)
         .unwrap();
         assert_eq!(
-            crate::driver::drive(
+            aruna_drivers::driver::drive(
                 crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
                 &context
             )
@@ -603,13 +603,13 @@ pub(crate) mod tests {
     async fn claim_rejects_owner() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let owner = UserId::nil(realm_id);
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let job_id = JobId::from_bytes([3u8; 16]);
         assert!(matches!(
-            crate::driver::drive_retry(
+            aruna_drivers::driver::drive_retry(
                 || crate::jobs::import::upload::ClaimUploadOperation::new(
                     upload_id, owner, job_id, 5
                 ),
@@ -619,7 +619,7 @@ pub(crate) mod tests {
             .await,
             Err(UploadClaimError::NotFound)
         ));
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::jobs::import::upload_store::WriteUploadOperation::new(
                 upload_record(owner, upload_id, 100).clone(),
             ),
@@ -630,7 +630,7 @@ pub(crate) mod tests {
         .unwrap();
         let intruder = UserId::new(Ulid::from_bytes([7u8; 16]), realm_id);
         assert!(matches!(
-            crate::driver::drive_retry(
+            aruna_drivers::driver::drive_retry(
                 || crate::jobs::import::upload::ClaimUploadOperation::new(
                     upload_id, intruder, job_id, 5
                 ),
@@ -646,11 +646,11 @@ pub(crate) mod tests {
     async fn claim_rejects_expired() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let job_id = JobId::from_bytes([3u8; 16]);
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::jobs::import::upload_store::WriteUploadOperation::new(
                 upload_record(owner, upload_id, 10).clone(),
             ),
@@ -660,7 +660,7 @@ pub(crate) mod tests {
         .map_err(|error| error.0)
         .unwrap();
         assert!(matches!(
-            crate::driver::drive_retry(
+            aruna_drivers::driver::drive_retry(
                 || crate::jobs::import::upload::ClaimUploadOperation::new(
                     upload_id, owner, job_id, 10
                 ),
@@ -677,18 +677,18 @@ pub(crate) mod tests {
         // Cleanup deletes only when the claiming job matches; an absent upload is a no-op.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::testing::test_context(storage.clone());
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let job_id = JobId::from_bytes([3u8; 16]);
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, job_id),
             &context,
         )
         .await
         .map_err(|error| error.0)
         .unwrap();
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::jobs::import::upload_store::WriteUploadOperation::new(
                 upload_record(owner, upload_id, 100).clone(),
             ),
@@ -697,7 +697,7 @@ pub(crate) mod tests {
         .await
         .map_err(|error| error.0)
         .unwrap();
-        crate::driver::drive_retry(
+        aruna_drivers::driver::drive_retry(
             || crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 5),
             &context,
             &upload_id.to_bytes(),
@@ -706,7 +706,7 @@ pub(crate) mod tests {
         .unwrap();
         let intruder = JobId::from_bytes([8u8; 16]);
         assert!(
-            crate::driver::drive(
+            aruna_drivers::driver::drive(
                 crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, intruder),
                 &context
             )
@@ -714,7 +714,7 @@ pub(crate) mod tests {
             .map_err(|error| error.0)
             .is_err()
         );
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, job_id),
             &context,
         )
@@ -722,7 +722,7 @@ pub(crate) mod tests {
         .map_err(|error| error.0)
         .unwrap();
         assert!(
-            crate::driver::drive(
+            aruna_drivers::driver::drive(
                 crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
                 &context
             )

@@ -13,11 +13,11 @@ use aruna_core::NodeId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_graph::{GraphHandle, GraphOptions};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::distribution::sharding::begin_range_rebuilds;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
@@ -35,8 +35,8 @@ use crate::settings::Settings;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
 
 /// How much event recording keeps in memory when `EVENT_RECORDING` is enabled.
-const RECORD_LIMITS: aruna_operations::recorder::RecordLimits =
-    aruna_operations::recorder::RecordLimits {
+const RECORD_LIMITS: aruna_drivers::recorder::RecordLimits =
+    aruna_drivers::recorder::RecordLimits {
         total_bytes: 64 << 20,
         entry_bytes: 16 << 10,
     };
@@ -249,9 +249,9 @@ pub(crate) async fn acquire(
     // resource, established before identity and enrollment I/O.
     let settings = crate::settings::read_settings()?;
     if settings.event_recording {
-        aruna_operations::recorder::enable(RECORD_LIMITS);
+        aruna_drivers::recorder::enable(RECORD_LIMITS);
     }
-    aruna_operations::driver::set_hang_limits(settings.hang_limits);
+    aruna_drivers::driver::set_hang_limits(settings.hang_limits);
     let storage_handle = open_storage(&settings)?;
     // The node runtime always exists here; a missing one is a concrete startup
     // error, never a scheduler-less handle that only looks started.
@@ -412,7 +412,7 @@ async fn fill(
             config.node_id,
             now,
         );
-        aruna_operations::driver::drive(install, &context).await?;
+        aruna_drivers::driver::drive(install, &context).await?;
         stopped(stop)?;
     }
     let net_handle = NetHandle::new(
@@ -694,8 +694,8 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{UsageCounters, global_shard_keys};
+    use aruna_drivers::testing::test_context;
     use aruna_operations::node::counter_check::CounterCheckError;
-    use aruna_operations::testing::test_context;
     use aruna_storage::StorageHandle;
     use tempfile::tempdir;
 

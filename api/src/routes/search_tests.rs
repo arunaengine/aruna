@@ -28,7 +28,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use axum::extract::Path;
@@ -215,7 +215,7 @@ async fn setup() -> Fixture {
             NodeCapabilities::user_node(realm).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );

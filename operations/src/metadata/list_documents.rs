@@ -104,8 +104,8 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::driver::{DriverContext, drive};
     use aruna_core::storage_entries::graph_lifecycle_entry;
+    use aruna_drivers::driver::{DriverContext, drive};
 
     fn write_registry_effect(
         record: &MetadataRegistryRecord,

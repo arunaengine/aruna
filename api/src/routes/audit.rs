@@ -10,7 +10,7 @@ use crate::metadata::map_api_error;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use aruna_operations::metadata::audit::{AUDIT_DEADLINE_SECS, ListAuditError, ListAuditRequest};
 use aruna_operations::metadata::audit_entry::{AuditListOperation, outbound_admission};

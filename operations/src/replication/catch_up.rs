@@ -896,8 +896,8 @@ impl Operation for HandStatementOperation {
 mod tests {
     use super::*;
     use crate::distribution::test_store::{context, get, open};
-    use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
+    use aruna_drivers::driver::{DriverContext, drive};
 
     /// Member 1 coordinates both shards; member 2 keeps a copy of each and catches up.
     fn catching_up() -> DistributionSnapshot {

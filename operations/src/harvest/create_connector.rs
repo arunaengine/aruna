@@ -230,11 +230,11 @@ impl Operation for CreateConnectorOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::harvest::repository::{parse_connector_read, read_connector_effect};
     use aruna_core::calls::IoCall;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use tempfile::tempdir;
 

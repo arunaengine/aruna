@@ -134,11 +134,11 @@ impl Operation for EnqueueDraftOperation {
 mod tests {
     use super::{EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation};
     use crate::device::publish_queue::{MAX_PUBLISH_ENTRIES, PublishEntry, publish_entry};
-    use crate::driver::{DriverContext, drive};
     use crate::tests::device::context;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_drivers::driver::{DriverContext, drive};
     use ulid::Ulid;
 
     fn owner() -> UserId {

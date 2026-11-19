@@ -9,10 +9,10 @@ use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission, TokenClaims};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
-use aruna_operations::driver::drive;
 use axum::Extension;
 use axum::extract::{FromRequestParts, Request};
 use axum::middleware::Next;
@@ -744,13 +744,13 @@ mod test {
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, TokenClaims};
     use aruna_core::structs::identity::realm::OidcProviderConfig;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::auth::error::AuthorizeError;
     use aruna_operations::auth::revoke_token::{
         RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
     };
-    use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
     use aruna_storage::storage;
@@ -818,7 +818,7 @@ mod test {
             NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1084,7 +1084,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
         let token = drive(
@@ -1540,7 +1540,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1585,7 +1585,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1623,7 +1623,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1726,7 +1726,7 @@ mod test {
             capabilities.clone(),
             true,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1845,7 +1845,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1939,7 +1939,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -1984,7 +1984,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -2021,7 +2021,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -2123,7 +2123,7 @@ mod test {
             capabilities,
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -2187,7 +2187,7 @@ mod test {
             capabilities.clone(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await;
 
@@ -2219,7 +2219,7 @@ mod test {
     /// A user node with a fresh store; the routes below refuse before they read it.
     async fn extractor_state() -> (tempfile::TempDir, std::sync::Arc<ServerState>) {
         use crate::tests::routes::{test_state, test_storage};
-        use aruna_operations::testing::test_context;
+        use aruna_drivers::testing::test_context;
         let (dir, storage) = test_storage();
         let realm_key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
         let realm_id = RealmId::from_bytes(realm_key.verifying_key().to_bytes());

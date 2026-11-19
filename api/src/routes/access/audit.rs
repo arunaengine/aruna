@@ -11,7 +11,7 @@ use aruna_core::structs::identity::admin_audit::{
 };
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::placement::policy::document::policy_authority_path;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::users::admin_audit::{AuditPageInput, AuditPageOperation};
 use axum::Json;
 use axum::extract::{Query, State};

@@ -359,7 +359,7 @@ impl OperationsTaskHandler {
         if batch.records.iter().any(|(_, record)| matches!(&record.event,
             DocumentOutboxEvent::AdminOperation { event, .. }
                 if matches!(event.op, aruna_core::admin_documents::AdminDocumentOperation::GroupDeleted { .. })))
-            && let Err(error) = aruna_operations::driver::drive(
+            && let Err(error) = aruna_drivers::driver::drive(
                 aruna_operations::groups::deletion::coordinator::SyncDecisionOperation,
                 self.context.as_ref(),
             )

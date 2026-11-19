@@ -109,7 +109,7 @@ impl Operation for ReleaseNameOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive, drive_retry};
+    use aruna_drivers::driver::{DriverContext, drive, drive_retry};
     use aruna_storage::storage::FjallStorage;
 
     fn context(dir: &tempfile::TempDir) -> DriverContext {

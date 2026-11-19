@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
 use aruna_core::plugin_runs::{GapReason, SourceKind, gap_key, reported_key};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::drive;
 
 use super::*;
 #[allow(unused_imports)]

@@ -27,9 +27,9 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::drive;
 use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::drive;
 use aruna_operations::federation::totals::DataTotalsOperation;
 use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
@@ -2063,7 +2063,7 @@ pub(crate) async fn distinct_buckets(
     buckets: u64,
 ) -> Option<u64> {
     let count = aruna_operations::distribution::counts::SetCountsOperation::new(group);
-    match aruna_operations::driver::drive(count, &state.get_ctx()).await {
+    match aruna_drivers::driver::drive(count, &state.get_ctx()).await {
         Ok(counts) => counts.distinct(buckets),
         Err(error) => {
             warn!(error = %error, "distributed bucket counts unavailable for usage response");

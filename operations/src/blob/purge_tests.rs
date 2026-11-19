@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
 use crate::blob::migration::misplaced::AnyKey;
-use crate::driver::{DriverContext, drive, node_routing};
 use crate::s3::bucket::rename::tests::{BUCKET, group, put, realm, rule, setup};
 use crate::tests::records::node;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::storage::blob::{BackendRef, BlobHeadKey, CurrentVersionPointer};
 use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
+use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use std::time::SystemTime;
 
 fn file(path: &str, ulid: Ulid) -> BackendLocation {
@@ -248,9 +248,9 @@ async fn plans_until_ended() {
     crate::jobs::store::test_calls::insert_job(&context, &record)
         .await
         .unwrap();
-    crate::driver::drive(
+    aruna_drivers::driver::drive(
         crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
-            routing: crate::driver::node_routing(&context),
+            routing: aruna_drivers::driver::node_routing(&context),
             has_blob: (&context).blob_handle.is_some(),
         }),
         &context,
@@ -287,9 +287,9 @@ async fn plans_until_ended() {
         txn_id: None,
     };
     context.storage_handle.send_storage_effect(delete).await;
-    crate::driver::drive(
+    aruna_drivers::driver::drive(
         crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
-            routing: crate::driver::node_routing(&context),
+            routing: aruna_drivers::driver::node_routing(&context),
             has_blob: (&context).blob_handle.is_some(),
         }),
         &context,
@@ -307,7 +307,7 @@ async fn pauses_purges() {
     let (_directory, context) = setup().await;
     let job = Ulid::from_parts(50, 1);
     use crate::blob::pause::{PausePurgeOperation, PausedOperation};
-    use crate::driver::drive;
+    use aruna_drivers::driver::drive;
     let paused = || drive(PausedOperation::new(job), &context);
     assert!(!paused().await.unwrap());
     drive(PausePurgeOperation::new(job, true), &context)

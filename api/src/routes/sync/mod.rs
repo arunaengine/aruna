@@ -20,8 +20,8 @@ use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
 };
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::{drive, drive_retry};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::{drive, drive_retry};
 use aruna_operations::metadata::mirror_request::MirrorRequestOperation;
 use aruna_operations::replication::parking::AwaitingJobsOperation;
 use aruna_operations::replication::plaintext::{

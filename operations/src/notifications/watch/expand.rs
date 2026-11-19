@@ -4,7 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::driver::{DriverContext, drive, drive_retry};
     use crate::notifications::protocol::WATCH_PAGE_LIMIT;
     use crate::notifications::protocol::valid_retry;
     use crate::notifications::protocol::{
@@ -32,6 +31,7 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::structs::storage::blob::object_permission_path;
+    use aruna_drivers::driver::{DriverContext, drive, drive_retry};
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use ulid::Ulid;

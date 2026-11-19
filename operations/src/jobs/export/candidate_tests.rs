@@ -6,10 +6,6 @@ use super::*;
 use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::permission_rules::PermissionRulesConfig;
 use crate::auth::permission_rules::PermissionRulesOperation;
-use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::jobs::context::JobContext;
-use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::export::archive::failure_outcome;
 use crate::jobs::export::consent::UnheldBucketOperation;
 use crate::jobs::export::resolve::CandidateSource;
@@ -31,6 +27,7 @@ use aruna_core::events::BlobEvent;
 use aruna_core::events::Event;
 use aruna_core::events::StorageEvent;
 use aruna_core::id::NodeId;
+use aruna_core::jobs::JobRunOutcome;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
@@ -49,6 +46,9 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::driver::drive;
+use aruna_drivers::jobs::context::JobContext;
 use futures_util::StreamExt;
 use serde_json::json;
 use std::collections::BTreeMap;

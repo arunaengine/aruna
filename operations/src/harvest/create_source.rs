@@ -215,13 +215,13 @@ impl Operation for CreateSourceOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
     use crate::harvest::repository::{parse_source_read, read_source_effect};
     use crate::harvest::target_path::{DIGEST_SEGMENT_BYTES, HARVEST_PATH_BYTES};
     use aruna_core::events::{Event, SubOperationEvent};
     use aruna_core::handle::Handle;
     use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::collections::HashMap;
     use tempfile::tempdir;

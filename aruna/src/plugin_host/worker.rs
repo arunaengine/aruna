@@ -17,7 +17,7 @@ use tracing::warn;
 
 use super::broker::RunBroker;
 use super::{read_config, ready_artifact};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::plugins::attempt::{
     AttemptStart, BeginAttempt, ClaimRuns, ClaimedRuns, FinishRun, invocation, revocation,
 };

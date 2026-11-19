@@ -425,7 +425,6 @@ pub(crate) fn should_seed_role(state: &AdminDocumentState, role_id: RoleId) -> b
 pub mod test {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-    use crate::driver::{DriverContext, drive};
     use crate::realm::assign_role::{
         AssignRolesError, AssignRolesInput, AssignRolesOperation, RoleWrite,
     };
@@ -448,6 +447,7 @@ pub mod test {
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_core::types::RoleId;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;

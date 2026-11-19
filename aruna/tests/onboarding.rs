@@ -15,8 +15,8 @@ use aruna_core::placement::build_view;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::node_state::PersistedNodeIdentity;
 use aruna_core::structs::identity::user::User;
+use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::drive;
 use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
 use byteview::ByteView;
 use shared::{
@@ -25,7 +25,7 @@ use shared::{
 };
 
 async fn read_user(
-    context: &aruna_operations::driver::DriverContext,
+    context: &aruna_drivers::driver::DriverContext,
     user_id: UserId,
 ) -> Option<User> {
     match context

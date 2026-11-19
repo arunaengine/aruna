@@ -20,7 +20,7 @@ use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
 use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::forward::routing::HolderWriteError;
 use aruna_operations::placement::policy::GateOperation;
 use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
@@ -785,7 +785,7 @@ pub async fn create_placement_policy(
     let ctx = state.get_ctx();
     let local = ctx.node_and_realm().map(|(node_id, _)| node_id);
     let create = CreateRoutedOperation::new(config, forwarded_auth_token(bearer_token)?, local);
-    let document = aruna_operations::driver::drive(create, &ctx)
+    let document = aruna_drivers::driver::drive(create, &ctx)
         .await
         .map_err(map_create_error)?;
     Ok(Json(policy_response(&document)?))

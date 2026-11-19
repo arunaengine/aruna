@@ -14,7 +14,7 @@ use aruna_core::structs::execution::job::UploadForm;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::api::export_types::RoCrateExportView;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::plugins::check::RunScope;

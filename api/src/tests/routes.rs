@@ -14,8 +14,8 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_core::{NodeId, UserId};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_storage::storage::{FjallStorage, StorageHandle};
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};

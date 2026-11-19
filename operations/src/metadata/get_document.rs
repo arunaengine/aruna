@@ -156,7 +156,6 @@ impl Operation for GetDocumentOperation {
 
 #[cfg(test)]
 mod tests {
-    use crate::driver::{DriverContext, drive};
     use crate::metadata::record_reads::RecordMaterializedOperation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;
@@ -165,6 +164,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;

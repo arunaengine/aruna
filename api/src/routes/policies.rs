@@ -13,9 +13,9 @@ use aruna_core::request_policy::{
     RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::driver::drive;
 use aruna_operations::groups::set_policies::{SetGroupConfig, SetGroupError, SetGroupOperation};
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,

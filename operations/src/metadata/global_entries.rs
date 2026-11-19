@@ -380,7 +380,11 @@ mod tests {
         );
     }
 
-    async fn seed(context: &crate::driver::DriverContext, bucket: &str, bound: bool) -> Ulid {
+    async fn seed(
+        context: &aruna_drivers::driver::DriverContext,
+        bucket: &str,
+        bound: bool,
+    ) -> Ulid {
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::{
             BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -452,7 +456,7 @@ mod tests {
     #[tokio::test]
     async fn bound_entries_globalized() {
         let dir = tempfile::tempdir().unwrap();
-        let context = crate::driver::DriverContext {
+        let context = aruna_drivers::driver::DriverContext {
             storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
                 .unwrap(),
             net_handle: None,
@@ -470,7 +474,9 @@ mod tests {
             {"@id": "s3://plain/a.txt", "contentUrl": "s3://plain/a.txt"}
         ]});
         let normalize = super::NormalizeEntriesOperation::new(realm, node(3), crate_value);
-        let (crate_value, rewritten) = crate::driver::drive(normalize, &context).await.unwrap();
+        let (crate_value, rewritten) = aruna_drivers::driver::drive(normalize, &context)
+            .await
+            .unwrap();
         assert_eq!(rewritten, 1);
         let global = aruna_core::structs::storage::global_id::GlobalId::Version {
             realm_id: realm,

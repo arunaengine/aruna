@@ -664,7 +664,6 @@ fn newly_materialized_members(
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
-    use crate::driver::{DriverContext, drive};
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
     use crate::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation, RoleAddition};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
@@ -691,6 +690,7 @@ pub mod test {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::RoleId;
     use aruna_core::{DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use tempfile::{TempDir, tempdir};

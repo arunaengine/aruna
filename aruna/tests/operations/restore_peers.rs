@@ -9,6 +9,7 @@ use aruna_operations::shard::recovery::RecoveryError;
 use aruna_operations::shard::recovery::RecoveryStop;
 use aruna_operations::shard::restore_plan::ShardRestoreCursor;
 use aruna_operations::tests::shard::flat_config;
+use irokle::TopicId;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,8 +22,8 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::record::{PlacementOverride, PlacementStrategy};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::recovery_run::{
     PresencePhaseOperation, RECOVERY_RETRY_BASE, RECOVERY_RETRY_MAX, RecoveryConfig,
     RecoveryOperation,
@@ -55,7 +56,7 @@ async fn make_node(realm_id: RealmId, seed: u8) -> RecoveryNode {
             secret_key: Some(iroh::SecretKey::from_bytes(&[seed; 32])),
             realm_id,
             sync_storage_path: Some(dir.path().join("document-sync")),
-            ..aruna_operations::testing::local_net()
+            ..aruna_drivers::testing::local_net()
         },
         storage.clone(),
     )

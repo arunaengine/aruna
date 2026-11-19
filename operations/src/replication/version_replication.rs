@@ -2914,7 +2914,6 @@ mod tests {
         ReplicationFailure, ReplicationVersion, SourceAuthorization, SyncTransferContext,
         target_key,
     };
-    use crate::driver::{DriverContext, drive};
     use crate::replication::protocol::{VersionReplicationMessage, VersionReplicationRequest};
     use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
@@ -2957,6 +2956,7 @@ mod tests {
     };
     use aruna_core::structs::storage::routing::GroupRoutingInputs;
     use aruna_core::types::{Key, Value};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::FjallStorage;
     use bytes::Bytes;
     use futures_util::stream;

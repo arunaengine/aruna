@@ -809,7 +809,7 @@ async fn deferred_head_paginates() {
     let net = NetHandle::new(
         NetConfig {
             realm_id,
-            ..aruna_operations::testing::local_net()
+            ..aruna_drivers::testing::local_net()
         },
         storage.clone(),
     )
@@ -1056,7 +1056,7 @@ async fn draining_a_topics() {
     let net = NetHandle::new(
         NetConfig {
             realm_id,
-            ..aruna_operations::testing::local_net()
+            ..aruna_drivers::testing::local_net()
         },
         storage.clone(),
     )
@@ -1321,7 +1321,7 @@ async fn pull_reaches_holder() {
     let ex_holder = NetHandle::new(
         NetConfig {
             realm_id,
-            ..aruna_operations::testing::local_net()
+            ..aruna_drivers::testing::local_net()
         },
         ex_storage.clone(),
     )
@@ -1333,7 +1333,7 @@ async fn pull_reaches_holder() {
     let net = NetHandle::new(
         NetConfig {
             realm_id,
-            ..aruna_operations::testing::local_net()
+            ..aruna_drivers::testing::local_net()
         },
         storage.clone(),
     )

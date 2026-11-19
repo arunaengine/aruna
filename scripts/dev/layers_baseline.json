@@ -41,7 +41,7 @@
     ],
     "aruna-operations": [
       "aruna-blob",
-      "aruna-compute",
+      "aruna-drivers",
       "aruna-graph",
       "aruna-net",
       "aruna-outbound",

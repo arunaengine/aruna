@@ -560,13 +560,13 @@ pub mod test {
     use ulid::Ulid;
 
     use crate::document_repository::{GetGroupConfig, GetGroupOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::remove_member::{
         MemberRemoval, RemoveFromError, RemoveFromInput, RemoveFromOperation,
     };
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     async fn test_context() -> (DriverContext, NetHandle, TempDir) {
         let random_path = tempdir().unwrap();

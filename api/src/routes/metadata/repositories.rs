@@ -9,7 +9,7 @@ use std::sync::Arc;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group_delete::GroupWriteError;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::harvest::create_connector::{
     CreateConnectorError, CreateConnectorInput, CreateConnectorOperation, INVENIO_COMMUNITY,
 };

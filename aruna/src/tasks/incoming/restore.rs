@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::tasks::runner::{claim_producer, spawn_job};
-use aruna_operations::driver::node_routing;
+use aruna_drivers::driver::node_routing;
 use aruna_operations::federation::registration::PublishRegistrationOperation;
 use std::time::SystemTime;
 
@@ -700,7 +700,14 @@ impl OperationsTaskHandler {
     pub(super) async fn drain_witness_queue(&self) {
         let now_ms = unix_timestamp_millis();
         let context = self.context.as_ref();
-        let drain = WitnessDrainOperation::new(witness_node(context), now_ms);
+        let drain = WitnessDrainOperation::new(
+            witness_node(
+                context.node_and_realm(),
+                context.fresh_heartbeats(),
+                context.compute_limits(),
+            ),
+            now_ms,
+        );
         let remaining = drive(drain, context).await.unwrap_or_else(|error| {
             warn!(error = %error, "Witness deadline scan failed");
             true

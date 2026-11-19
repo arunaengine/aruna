@@ -10,7 +10,7 @@ use aruna_core::plugin_runs::MAX_ATTEMPTS;
 use aruna_core::plugin_runs::RUNS_PARALLEL;
 use aruna_core::plugin_runs::RunState;
 use aruna_core::plugin_runs::RunTrigger;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::plugins::attempt::invocation;
 use aruna_operations::plugins::calls::*;
 use aruna_operations::plugins::grants::short_path;

@@ -15,7 +15,7 @@ use aruna_core::handoff::LoginHandoff;
 use aruna_core::link::LinkConfirmation;
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::driver::{drive, drive_retry};
+use aruna_drivers::driver::{drive, drive_retry};
 use aruna_operations::federation::link::{
     ConfirmLinkConfig, ConfirmLinkOperation, LinkLoginConfig, LinkLoginError, LinkLoginOperation,
     UnlinkLoginConfig, UnlinkLoginOperation,

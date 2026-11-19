@@ -18,12 +18,12 @@ use crate::tests::routes::{seed_group_docs, seed_realm_auth, test_state, test_st
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
+use aruna_drivers::testing::test_context;
 use aruna_operations::metadata::api::read_types::ApiQueryMode;
 use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use aruna_operations::testing::installed_graph_handle;
-use aruna_operations::testing::test_context;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -54,8 +54,8 @@ use aruna_core::structs::storage::blob::{
     VersionKey,
 };
 use aruna_core::task::{PersistedTaskTimer, TaskKey};
+use aruna_drivers::driver::DriverContext;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::repository::write_document_lifecycle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
@@ -3411,7 +3411,7 @@ async fn setup_closed_storage() -> Arc<ServerState> {
             NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     )
@@ -3672,7 +3672,7 @@ async fn lookup_hides_private() {
     );
     let caller = (None, Some(test.auth.clone()));
     let add = PidRouteOperation::new(node, document_id, request, caller);
-    let (_, changed) = aruna_operations::driver::drive(add, ctx.as_ref())
+    let (_, changed) = aruna_drivers::driver::drive(add, ctx.as_ref())
         .await
         .and_then(outcome_mapping)
         .unwrap();

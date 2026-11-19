@@ -5,7 +5,6 @@
 use super::ensure::EnsureMirrorOperation;
 use super::settle::{RollbackClaim, SettleReconcileOperation};
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::sync::sync_relationship::{
     CreateRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
     SyncRelationshipDirection,
@@ -31,6 +30,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::sync_relationship_key;
 use aruna_core::structs::{ReferenceHandling, SyncMode, SyncState, SyncStatusSnapshot};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::FjallStorage;
 use std::time::SystemTime;
 use ulid::Ulid;

@@ -887,7 +887,6 @@ impl Operation for DeleteUnclaimedOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
@@ -900,6 +899,7 @@ mod tests {
     use aruna_core::structs::storage::blob::BackendLocation;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::FjallStorage;
     use aruna_storage::StorageHandle;
     use byteview::ByteView;

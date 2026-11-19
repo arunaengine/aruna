@@ -18,8 +18,8 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, BucketKeyRecord, EncryptionMode, GrantState, SealedCopy,
 };
 use aruna_core::structs::storage::format::Compression;
+use aruna_drivers::driver::DriverContext;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
 use aruna_storage::FjallStorage;
 use std::collections::HashMap;
 use std::time::SystemTime;
