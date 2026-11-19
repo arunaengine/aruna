@@ -19,7 +19,7 @@ from check_style import CHAR_RE, iter_rust_files, read_source, scan_block
 
 OPERATIONS_SRC = "operations/src"
 BASELINE_PATH = "scripts/dev/layers_baseline.json"
-RUNNER = frozenset({"driver", "effect_adapters", "storage_read"})
+RUNNER = frozenset({"driver", "effect_adapters"})
 # Domain groups of target-architecture.md section 5, lowest first. A module may
 # use its own group and lower groups only.
 GROUPS = (

@@ -89,6 +89,7 @@ pub mod secret_registers;
 pub mod secrets;
 pub mod staging_checkpoint;
 pub mod storage_entries;
+pub mod storage_read;
 pub mod stream;
 pub mod structs;
 pub mod structured_id;

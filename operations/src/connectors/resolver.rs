@@ -31,8 +31,8 @@ use crate::connectors::repository::{
     source_connector_key,
 };
 use crate::connectors::root_record::{parse_root, read_root};
-use crate::storage_read::decode_row;
 use aruna_core::native_reference::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
+use aruna_core::storage_read::decode_row;
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 
 /// Names the distributed bucket whose holders keep the bytes of a record-only version.

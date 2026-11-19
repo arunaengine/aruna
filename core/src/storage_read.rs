@@ -2,21 +2,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::errors::{ConversionError, StorageError, StorageReadError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::types::{Key, Value};
+use crate::errors::{ConversionError, StorageError, StorageReadError};
+use crate::events::{Event, StorageEvent};
+use crate::types::{Key, Value};
 
 /// Decodes a read row, if any.
-pub(crate) fn decode_row<T>(
+pub fn decode_row<T>(
     value: Option<Value>,
     parse: impl FnOnce(&[u8]) -> Result<T, ConversionError>,
 ) -> Result<Option<T>, StorageReadError> {
     (value.as_deref().map(parse).transpose()).map_err(StorageReadError::Conversion)
 }
 
-pub(crate) type StorageScan = (Vec<(Key, Value)>, Option<Key>);
+pub type StorageScan = (Vec<(Key, Value)>, Option<Key>);
 
-pub(crate) fn parse_storage_read<T>(
+pub fn parse_storage_read<T>(
     event: Event,
     parse: impl FnOnce(&[u8]) -> Result<T, ConversionError>,
 ) -> Result<Option<T>, StorageReadError> {
@@ -31,7 +31,7 @@ pub(crate) fn parse_storage_read<T>(
     }
 }
 
-pub(crate) fn parse_storage_iter<T>(
+pub fn parse_storage_iter<T>(
     event: Event,
     parse: impl Fn(&[u8]) -> Result<T, ConversionError>,
 ) -> Result<(Vec<T>, Option<Key>), StorageReadError> {
@@ -53,7 +53,7 @@ pub(crate) fn parse_storage_iter<T>(
     }
 }
 
-pub(crate) fn parse_storage_scan(event: Event) -> Result<StorageScan, StorageReadError> {
+pub fn parse_storage_scan(event: Event) -> Result<StorageScan, StorageReadError> {
     match event {
         Event::Storage(StorageEvent::IterResult {
             values,

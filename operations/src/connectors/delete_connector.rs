@@ -19,8 +19,8 @@ use crate::connectors::repository::{
     connector_id_key, delete_secret_effect, parse_secret_read, read_secret_effect,
     source_connector_key,
 };
-use crate::storage_read::decode_row;
 use aruna_core::errors::StorageReadError;
+use aruna_core::storage_read::decode_row;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteSourceInput {

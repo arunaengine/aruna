@@ -44,7 +44,6 @@ pub mod shares;
 pub mod staging;
 #[cfg(test)]
 pub(crate) mod stepper;
-pub mod storage_read;
 pub mod sync;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod testing;

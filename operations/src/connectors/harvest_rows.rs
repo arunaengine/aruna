@@ -7,13 +7,12 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageReadError};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE};
+use aruna_core::storage_read::parse_storage_read;
 use aruna_core::structs::execution::harvest::RepositoryConnector;
 use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
 use ulid::Ulid;
-
-use crate::storage_read::parse_storage_read;
 
 /// Secret config key of the optional read token an Invenio connector keeps.
 pub const INVENIO_TOKEN: &str = "token";

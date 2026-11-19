@@ -13,8 +13,8 @@ use ulid::Ulid;
 
 use crate::connectors::harvest_rows::{connector_key, connector_prefix, connector_secret_key};
 use crate::harvest::repository::HARVEST_PAGE_SIZE;
-use crate::storage_read::decode_row;
 use aruna_core::errors::StorageReadError;
+use aruna_core::storage_read::decode_row;
 
 /// A stored connector and whether a secret row exists for it; the secret itself stays hidden.
 #[derive(Clone, Debug, PartialEq, Eq)]

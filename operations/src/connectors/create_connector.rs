@@ -28,8 +28,8 @@ use crate::connectors::repository::{
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 use crate::groups::fence::{group_write_result, write_group_new};
-use crate::storage_read::decode_row;
 use aruna_core::errors::StorageReadError;
+use aruna_core::storage_read::decode_row;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SourceConnectorInput {

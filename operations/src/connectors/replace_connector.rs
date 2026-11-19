@@ -25,8 +25,8 @@ use crate::connectors::repository::{
     write_secret_effect,
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
-use crate::storage_read::decode_row;
 use aruna_core::errors::StorageReadError;
+use aruna_core::storage_read::decode_row;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReplaceSourceInput {
