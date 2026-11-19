@@ -3,9 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub use super::charged_ranges::{
-    HeldRange, HeldRanges, HeldRangesOperation, RangeUsage, UsageError, sum_held,
-};
+use super::charged_ranges::HeldRangesOperation;
 
 /// The local distributed bucket's binding, record and the charged rows of every range this
 /// member holds; `None` for an ordinary bucket or a member whose record has not arrived.
@@ -17,7 +15,7 @@ pub fn held_ranges(bucket: &str) -> HeldRangesOperation {
 mod tests {
     use super::*;
     use crate::replication::members::BoundRecordOperation;
-    use crate::transfer::charged_ranges::{charged_rows, sum_rows};
+    use crate::transfer::charged_ranges::{HeldRange, UsageError, charged_rows, sum_held, sum_rows};
     use crate::transfer::replica_shares::{
         BindingShareOperation, GroupShare, ReplicaSharesOperation,
     };

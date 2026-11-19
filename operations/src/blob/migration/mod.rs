@@ -53,7 +53,9 @@ use ulid::Ulid;
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
 use crate::groups::storage_routing::routing_key;
 use crate::s3::object::put::fenced::{Fenced, FencedWrite};
-use crate::s3::object::put::{PlainRecord, intent_rows, owner_call, path_owned, same_name_path};
+use crate::s3::object::put::plain::{
+    PlainRecord, intent_rows, owner_call, path_owned, same_name_path,
+};
 use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::managed_copy::{ManagedCopyError, check_old_copy};
 use aruna_core::structs::storage::cleanup::schedule_cleanup_effect;

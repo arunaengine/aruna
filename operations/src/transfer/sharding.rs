@@ -34,7 +34,6 @@ use super::balance::{BalanceInputs, BalanceOperation, COOL_DOWN, balance_inputs}
 use super::lifecycle::{LifecycleCursors, LifecyclePass, TendLifecycleOperation};
 use super::refresh::{RefreshCursor, RefreshError, RefreshPass, RefreshRangesOperation};
 use crate::distribution::imports::{ContinueImportsOperation, ImportError, KeptStart};
-pub use crate::distribution::rebuild::BeginRebuildsError;
 use crate::distribution::rebuild::{
     BeginRebuildsOperation, RebuildConfig, RebuildError, RebuildOperation, RebuildOutcome, decode,
 };

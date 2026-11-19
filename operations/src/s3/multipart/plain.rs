@@ -4,10 +4,10 @@
 
 use super::*;
 use crate::s3::object::put::fenced::{Fenced, FencedWrite};
-use crate::s3::object::put::{
-    PlainRecord, Trail, TrailScan, intent_keys, intent_rows, owner_call, path_owned,
-    same_name_path, trail_ranges, version_row,
+use crate::s3::object::put::plain::{
+    PlainRecord, intent_keys, intent_rows, owner_call, path_owned, same_name_path, version_row,
 };
+use crate::s3::object::put::trail::{Trail, TrailScan, trail_ranges};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BUCKET_CREATION_KEYSPACE, DELETE_TRAIL_KEYSPACE,
     IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,

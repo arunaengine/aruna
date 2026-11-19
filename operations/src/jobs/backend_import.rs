@@ -44,9 +44,9 @@ use super::page_intents::PathIntents;
 use crate::placement::policy::gate::{GateContext, PolicyGateError};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::imports::shared::{self, SharedRule, claim_file};
-use crate::s3::object::put::{
-    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, RuleScan, intent_keys,
-};
+use crate::s3::object::put::plain::intent_keys;
+use crate::s3::object::put::sharing::RuleScan;
+use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::jobs::JobRunOutcome;
 

@@ -15,7 +15,7 @@ use aruna_core::structs::storage::holders::KeyLookup;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
 
-use crate::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
+use crate::users::vault::read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
 
 /// How long one key directory lookup may wait for the holders of a user's vault.
 const KEY_LOOKUP_DEADLINE: Duration = Duration::from_secs(10);

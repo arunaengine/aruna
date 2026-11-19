@@ -10,10 +10,11 @@ use aruna_clock::unix_timestamp_secs;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{AssistantChatHead, AssistantChatTurn};
 use aruna_drivers::driver::drive;
-use aruna_operations::assistant::{
-    ChatStoreError, DeleteChatOperation, ListChatOperation, ReadChatOperation, WriteChatOperation,
-    WriteTurnOperation,
+use aruna_operations::assistant::ChatStoreError;
+use aruna_operations::assistant::heads::{
+    DeleteChatOperation, ListChatOperation, WriteChatOperation,
 };
+use aruna_operations::assistant::turns::{ReadChatOperation, WriteTurnOperation};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

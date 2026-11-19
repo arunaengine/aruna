@@ -4,16 +4,14 @@
 
 use crate::distribution::guard::write_authority;
 use crate::distribution::guard::{GuardError, WriteAuthority, authority_reads, check_authority};
-use crate::distribution::inventory::{
-    InventoryChange, InventoryError, InventoryUpdate, outside_answer,
-};
+use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::groups::backends::{BackendFenceError, backend_key};
 use crate::placement::policy::gate::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, gate_decision, write_gate,
 };
 use crate::placement::policy::read::ReadPolicyError;
 use crate::s3::object::put::abe::{abe_reads, keyed, parse_abe};
-use crate::s3::object::put::{owner_call, path_owned, same_name_path};
+use crate::s3::object::put::plain::{owner_call, path_owned, same_name_path};
 use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::usage::upload_count;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -26,7 +24,7 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{StagedCall, read_row};
+use aruna_core::rows::{StagedCall, outside_answer, read_row};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::abe::{AbeEffect, AbeEvent, EnvelopePlan, ObjectEnvelope};

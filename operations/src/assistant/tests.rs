@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::heads::{DeleteChatOperation, ListChatOperation, WriteChatOperation};
+use super::turns::{ReadChatOperation, WriteTurnOperation};
 use super::*;
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;

@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::rows::StagedCall;
-pub(crate) use aruna_core::rows::outside_answer;
+use aruna_core::rows::outside_answer;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aruna_core::calls::{IoCall, IoError, IoResult};

@@ -37,7 +37,7 @@ use crate::placement::policy::forward::ApplyPolicyOperation;
 use crate::placement::policy::transport::{PolicyAnswer, ServePolicyOperation};
 use crate::s3::bucket::forward::BucketForwardOperation;
 use crate::transfer::forward::serve_admission;
-use crate::users::vault_route::{ApplyVaultOperation, ServeVaultOperation};
+use crate::users::vault::route::{ApplyVaultOperation, ServeVaultOperation};
 use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage as Message};
 
 /// How a forwarded request's child outcome becomes the reply.

@@ -5,13 +5,12 @@
 mod enumerate;
 pub mod envelope;
 mod epoch;
-mod member;
-mod reissue;
+pub mod member;
+pub mod reissue;
 mod requests;
 mod snapshot;
 
-use crate::distribution::inventory::outside_answer;
-use crate::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
+use crate::users::vault::read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, VaultQuery};
 use aruna_core::errors::BlobError;
@@ -20,7 +19,7 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::*;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{StagedCall, values};
+use aruna_core::rows::{StagedCall, outside_answer, values};
 use aruna_core::structs::execution::notification;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRecords};
@@ -31,8 +30,6 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, EncryptionMode,
 };
 use aruna_core::types::{Key, Value};
-pub use member::MemberKeysOperation;
-pub use reissue::ReissueOperation;
 use snapshot::Snapshot;
 use thiserror::Error;
 use ulid::Ulid;

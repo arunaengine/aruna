@@ -20,9 +20,9 @@ use aruna_core::structs::identity::user::vault::{
 use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::forward::routing::HolderWriteError;
-use aruna_operations::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
-use aruna_operations::users::vault_route::{AppendRoutedOperation, VaultRouteError};
-use aruna_operations::users::vault_write::{AppendVaultConfig, AppendVaultError};
+use aruna_operations::users::vault::read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
+use aruna_operations::users::vault::route::{AppendRoutedOperation, VaultRouteError};
+use aruna_operations::users::vault::write::{AppendVaultConfig, AppendVaultError};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};

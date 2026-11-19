@@ -1219,17 +1219,11 @@ impl Operation for PutObjectOperation {
 
 mod dedup;
 pub(crate) mod fenced;
-mod plain;
+pub(crate) mod plain;
 #[path = "publish.rs"]
 mod publish;
-mod sharing;
-mod trail;
-pub(crate) use sharing::{ReaderScan, RuleScan};
-pub(crate) use trail::{Trail, TrailScan, trail_ranges};
-
-pub(crate) use plain::{
-    PlainRecord, intent_keys, intent_rows, owner_call, path_owned, same_name_path, version_row,
-};
+pub(crate) mod sharing;
+pub(crate) mod trail;
 
 #[path = "abe.rs"]
 pub(crate) mod abe;

@@ -5,8 +5,7 @@
 
 use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
 use crate::distribution::inventory::{
-    AddedVersion, InventoryChange, entry_of, outside_answer, stamp_head, stamp_version,
-    version_written,
+    AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
 use crate::placement::policy::gate::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, drift_reads, gate_decision,
@@ -37,7 +36,7 @@ use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_effe
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::plugin_runs::journaled;
-use aruna_core::rows::{StagedCall, read_row};
+use aruna_core::rows::{StagedCall, outside_answer, read_row};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};

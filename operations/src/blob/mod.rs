@@ -6,7 +6,7 @@ pub mod cleanup;
 pub mod hidden;
 pub mod holders;
 pub mod import_rows;
-pub(crate) mod merge_copies;
+pub mod merge_copies;
 pub mod migration;
 pub mod pause;
 pub(crate) mod pending_reclaim;

@@ -8,7 +8,8 @@ use crate::auth::UnrestrictedAuth;
 use aruna_core::structs::storage::abe_access::{
     GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope, MAX_REQUESTS,
 };
-use aruna_operations::abe::{MemberKeysOperation, ReissueOperation};
+use aruna_operations::abe::member::MemberKeysOperation;
+use aruna_operations::abe::reissue::ReissueOperation;
 use aruna_operations::auth::epoch_due::EpochDueOperation;
 use aruna_operations::transfer::abe_rekey::RekeyOperation;
 use axum::extract::Path;

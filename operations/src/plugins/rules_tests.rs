@@ -9,8 +9,7 @@ use aruna_core::secrets::{Delivery, ResponseExposure};
 use super::*;
 use crate::plugins::calls::*;
 use crate::plugins::rows::tests::child_result;
-#[allow(unused_imports)]
-pub(crate) use crate::plugins::test_support::edit_rules;
+use crate::plugins::test_support::edit_rules;
 use crate::plugins::test_support::{install_as, install_request};
 use aruna_test_support::plugins::Fixture;
 use aruna_test_support::plugins::{ORIGIN, bound, edit_config, secret};

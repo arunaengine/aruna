@@ -2,6 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::acknowledge::AcknowledgeQuarantineOperation;
+use super::list::ListQuarantineOperation;
+use super::prune::PruneQuarantineOperation;
+use super::read::ReadQuarantineOperation;
 use super::*;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentEvent, DocumentSyncRevision, DocumentTarget,

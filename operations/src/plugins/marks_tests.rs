@@ -11,7 +11,7 @@ use super::*;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::values_result;
 use crate::plugins::rows::write_rows;
-use crate::plugins::work::tests::edit_work;
+use crate::plugins::test_support::edit_work;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_core::calls::IoCall;
 use aruna_drivers::driver::DriverContext;

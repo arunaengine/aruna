@@ -942,8 +942,7 @@ impl Operation for KeepReferenceOperation {
 pub(crate) mod test {
     use super::*;
     use crate::s3::object::get::GetObjectOperation;
-    #[allow(unused_imports)]
-    pub(crate) use crate::testing_objects::put_config;
+    use crate::testing_objects::put_config;
     use crate::tests::policy::{seed_gate, subject};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -955,7 +954,7 @@ pub(crate) mod test {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
     use aruna_drivers::driver::{DriverContext, drive, node_routing};
-    pub(crate) use aruna_drivers::testing::seed_bucket;
+    use aruna_drivers::testing::seed_bucket;
     use aruna_test_support::s3::{full_context, spawn_reference_server, write_version};
     use futures_util::StreamExt;
     use std::collections::HashMap;

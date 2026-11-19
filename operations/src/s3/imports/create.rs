@@ -4,7 +4,6 @@
 
 use super::cron::parse_schedule;
 use super::{ImportRuleError, validate_folder};
-use crate::distribution::inventory::outside_answer;
 use crate::groups::backends::{backend_key, record_writes};
 use crate::groups::fence::group_fence_key;
 use crate::s3::bucket::storage_move::{check_movable, move_reads, move_record, move_rows};
@@ -19,7 +18,7 @@ use aruna_core::keyspaces::{
     STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::StagedCall;
+use aruna_core::rows::{StagedCall, outside_answer};
 use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::{BackendImport, valid_pattern};
 use aruna_core::structs::storage::backends::ImportRoot;

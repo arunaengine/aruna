@@ -23,9 +23,9 @@ use aruna_drivers::driver::{DriverContext, drive};
 use aruna_kpabe::envelope::Envelope;
 use aruna_kpabe::policy::{Attribute, Policy};
 use aruna_kpabe::scheme::UserKey;
-use aruna_operations::abe::{
-    KeyAction, KeyError, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
-};
+use aruna_operations::abe::member::MemberKeysOperation;
+use aruna_operations::abe::reissue::ReissueOperation;
+use aruna_operations::abe::{KeyAction, KeyError, KeyOperation, KeyResult};
 use aruna_operations::s3::abe_copies::CompleteCopiesOperation;
 use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
 use aruna_operations::transfer::abe_rekey::{RekeyOperation, RekeyProgress};

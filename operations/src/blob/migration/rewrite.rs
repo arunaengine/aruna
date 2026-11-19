@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::distribution::inventory::outside_answer;
 use crate::s3::object::put::abe::keyed;
 use crate::s3::usage::{QuotaGate, StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -19,7 +18,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::managed_copy::{ManagedCopyError, check_old_copy};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{StagedCall, read_row};
+use aruna_core::rows::{StagedCall, outside_answer, read_row};
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::storage::abe::{ObjectEnvelope, PendingCopy};
 use aruna_core::structs::storage::blob::{

@@ -12,14 +12,11 @@ use byteview::ByteView;
 use thiserror::Error;
 
 pub mod central;
-mod heads;
+pub mod heads;
 pub mod provider;
 #[cfg(test)]
 mod tests;
-mod turns;
-
-pub use heads::{DeleteChatOperation, ListChatOperation, WriteChatOperation};
-pub use turns::{ReadChatOperation, WriteTurnOperation};
+pub mod turns;
 
 pub const CHAT_CAP: &str = "a user may keep at most 20 chats";
 pub const TURN_CAP: &str = "a turn payload may hold at most 256 KiB";

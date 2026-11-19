@@ -19,8 +19,7 @@ use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use tracing::{debug, warn};
 
-use crate::distribution::inventory::outside_answer;
-use aruna_core::rows::StagedCall;
+use aruna_core::rows::{StagedCall, outside_answer};
 
 use super::cache::{
     CacheLookup, MAX_CACHE_ENTRIES, PolicyCacheEntry, PolicyCacheStats, cache_key, lookup,

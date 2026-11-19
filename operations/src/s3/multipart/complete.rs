@@ -386,11 +386,11 @@ pub struct CompleteUploadOperation {
     dedup: Option<BackendLocation>,
     dedup_checked: bool,
     /// The delete trail read for a listed upload's version before its head moves.
-    trail_scan: Option<crate::s3::object::put::TrailScan>,
+    trail_scan: Option<crate::s3::object::put::trail::TrailScan>,
     /// The intent record of the compose in flight.
     written_intent: Vec<Key>,
     /// The rules that read the composed path, as the finalize transaction reads them.
-    readers: crate::s3::object::put::ReaderScan,
+    readers: crate::s3::object::put::sharing::ReaderScan,
     version_origin: Option<VersionOrigin>,
 }
 

@@ -13,8 +13,6 @@ pub(crate) mod device;
 pub(crate) mod export;
 #[cfg(test)]
 pub(crate) mod groups;
-#[cfg(test)]
-pub(crate) mod import;
 pub mod locations;
 #[cfg(test)]
 pub(crate) mod metadata;
