@@ -6,6 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, JobRecordFrame, NetEffect};
 use aruna_core::events::{Event, ExecutionSignEvent, NetEvent};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
@@ -16,7 +17,6 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use tracing::{debug, warn};
-use ulid::Ulid;
 
 use super::LifecycleError;
 use super::admit_forwarded::GroupWriteOperation;
@@ -232,7 +232,7 @@ pub struct PublishCancelOperation {
     auth: AuthContext,
     authority: CancelAuthority,
     serving: ServingNode,
-    cancel_id: Ulid,
+    ids: IdMint,
     now_ms: u64,
     step: PublishStep,
 }
@@ -252,7 +252,7 @@ impl PublishCancelOperation {
             auth: auth.clone(),
             authority,
             serving,
-            cancel_id: Ulid::generate(),
+            ids: IdMint::default(),
             now_ms,
             step: PublishStep::Config,
         }
@@ -337,7 +337,7 @@ impl PublishCancelOperation {
         let (publisher, realm_id) = self.node()?;
         let spec = &self.spec;
         let record = JobCancelRecord {
-            cancel_id: self.cancel_id,
+            cancel_id: self.ids.mint(self.now_ms),
             submission_id: spec.submission_id,
             request_digest: spec.request_digest,
             job_id: spec.job_id,
@@ -390,6 +390,10 @@ impl PublishCancelOperation {
 impl Operation for PublishCancelOperation {
     type Output = ();
     type Error = JobRouteError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> PublishNext {
         let (_, realm_id) = self.node()?;
@@ -652,6 +656,7 @@ mod tests {
     use crate::tests::records::{Family, REALM, node};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::job::JobRecord;
+    use ulid::Ulid;
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
     where
@@ -770,12 +775,20 @@ mod tests {
     #[test]
     fn holder_signs_record() {
         let (family, mut holder) = publish(CancelAuthority::Submitter, node(1));
+        holder.seed(7);
         holder.first().expect("the config is read");
         let next = holder.next(config(&family));
-        assert!(
-            matches!(next, Ok(Next::Call(IoCall::Effect(_)))),
-            "{next:?}"
-        );
+        let Ok(Next::Call(IoCall::Effect(effect))) = &next else {
+            panic!("{next:?}");
+        };
+        let Effect::Net(NetEffect::ExecutionSign(claim)) = effect.as_ref() else {
+            panic!("not a signing effect: {effect:?}");
+        };
+        let JobFamilyRecord::Cancel(record) = &claim.record else {
+            panic!("not a cancel record");
+        };
+        assert_eq!(record.cancel_id, Ulid::from_parts(5, 7));
+        assert_eq!(record.requested_at_ms, 5);
         let (family, mut outsider) = publish(CancelAuthority::Deletion, node(9));
         outsider.first().expect("the config is read");
         assert!(matches!(
