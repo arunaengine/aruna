@@ -22,7 +22,7 @@ use crate::metadata::prune_queue::{
 
 /// Time spent on each part of [`AfterSyncOperation`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) struct MetadataTimings {
+pub struct MetadataTimings {
     pub project: Duration,
     pub prune: Duration,
 }

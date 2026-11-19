@@ -126,7 +126,7 @@ pub fn link() -> RepositoryLink {
 }
 
 /// A session on the endpoint of [`link`] whose calls do not watch a job.
-pub fn session() -> Session {
+pub(crate) fn session() -> Session {
     Session::new(
         InvenioAccess::new(&link().endpoint, Some("token".into()), 1024 * 1024).unwrap(),
         None,

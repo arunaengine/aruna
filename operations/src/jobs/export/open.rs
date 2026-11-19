@@ -51,7 +51,7 @@ enum OpenStep {
 
 /// Opens `candidate`, for its metadata alone or for its bytes.
 #[derive(Debug, PartialEq)]
-pub(super) struct OpenCandidateOperation {
+pub struct OpenCandidateOperation {
     scope: SourceScope,
     candidate: ExportCandidate,
     metadata_only: bool,
@@ -65,7 +65,7 @@ fn status(status: OpenStatus) -> Next<CandidateOpen> {
 }
 
 impl OpenCandidateOperation {
-    pub(super) fn new(scope: SourceScope, candidate: ExportCandidate, metadata_only: bool) -> Self {
+    pub fn new(scope: SourceScope, candidate: ExportCandidate, metadata_only: bool) -> Self {
         Self {
             scope,
             candidate,

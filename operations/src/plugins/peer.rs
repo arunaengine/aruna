@@ -49,7 +49,7 @@ enum PeerAsk {
 
 /// Which answer a plugin request gets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PeerAnswer {
+pub enum PeerAnswer {
     Stored,
     Fetched,
     Clock,
@@ -60,7 +60,7 @@ pub(crate) enum PeerAnswer {
 
 impl PeerAnswer {
     /// The answer of a node that cannot serve the request now.
-    pub(crate) fn unavailable(self) -> MetadataTransportMessage {
+    pub fn unavailable(self) -> MetadataTransportMessage {
         use MetadataReadError::Unavailable;
         match self {
             Self::Stored => MetadataTransportMessage::ArtifactStored {

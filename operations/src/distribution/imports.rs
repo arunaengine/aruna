@@ -668,7 +668,7 @@ impl Operation for FetchImportsOperation {
 
 /// Kept imports of a range this node now coordinates, ready to run as its own jobs.
 #[derive(Debug, PartialEq)]
-pub(crate) struct KeptStart {
+pub struct KeptStart {
     pub(crate) key: Vec<u8>,
     pub(crate) kept: Kept,
     pub(crate) bucket: BucketInfo,

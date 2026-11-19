@@ -35,7 +35,7 @@ enum Step {
 /// deletes malformed rows and the other jobs of a graph, then answers the jobs due at `now_ms`.
 /// At `limit` due jobs it stops and reports that more may be due.
 #[derive(Debug, PartialEq)]
-pub(crate) struct DuePruneOperation {
+pub struct DuePruneOperation {
     now_ms: u64,
     limit: usize,
     pages: PrefixPages,

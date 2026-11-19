@@ -574,6 +574,7 @@ async fn retained_backend_removed() {
     }
 }
 
+#[cfg(test)]
 async fn seen(fixture: &Fixture, auth: &AuthContext, group_id: Ulid) -> Vec<String> {
     let names = ["a", "b)x"].map(String::from).to_vec();
     drive(
