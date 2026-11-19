@@ -11,15 +11,8 @@ use aruna_net::NetHandle;
 use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
 
-use super::protocol::METADATA_IO_TIMEOUT;
-
 mod effects;
-pub(crate) mod frames;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
-mod ingress;
-mod transport;
-
-const METADATA_CHUNK_SIZE: usize = 64 * 1024;
 
 /// The directory below the metadata storage path that holds the range search indexes.
 const RANGE_INDEX_DIR: &str = "range-indexes";
@@ -33,8 +26,6 @@ pub struct MetadataHandle {
 pub struct MetadataHandleOptions {}
 
 struct MetadataInner {
-    net_handle: Option<NetHandle>,
-    inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
     #[cfg(feature = "test-hooks")]
     repair_hold: AtomicBool,
 }
@@ -50,7 +41,7 @@ impl MetadataHandle {
     pub fn new(
         path: impl AsRef<Path>,
         storage_handle: StorageHandle,
-        net_handle: Option<NetHandle>,
+        _net_handle: Option<NetHandle>,
         _options: MetadataHandleOptions,
     ) -> Self {
         // Range indexes sit beside the metadata store, so only a node with metadata keeps them.
@@ -58,10 +49,6 @@ impl MetadataHandle {
             .install_range_indexes(RangeIndexes::new(path.as_ref().join(RANGE_INDEX_DIR)));
         Self {
             inner: Arc::new(MetadataInner {
-                net_handle,
-                inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
-                    super::protocol::INBOUND_FRAME_BYTES,
-                )),
                 #[cfg(feature = "test-hooks")]
                 repair_hold: AtomicBool::new(false),
             }),

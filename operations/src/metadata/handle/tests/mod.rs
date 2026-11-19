@@ -50,4 +50,3 @@ mod auth;
 mod effect;
 mod lifecycle;
 mod listing;
-mod sync;
