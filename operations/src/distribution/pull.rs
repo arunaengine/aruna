@@ -17,6 +17,7 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::heartbeat::HeartbeatEffect;
 use aruna_core::holder_choice::{HolderCandidate, HolderChoiceError, HolderChoiceOperation, pick};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE, FILL_CLAIM_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
@@ -32,7 +33,6 @@ use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionView, MemberState, RangeBehaviour,
 };
 use aruna_core::structs::storage::encryption::BucketEncryption;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -120,6 +120,8 @@ struct PullMemberOperation {
     member_id: Option<Ulid>,
     member: Option<Member>,
     replicas: usize,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 type MemberTurn = Result<Next<Member>, GetObjectError>;
@@ -127,6 +129,8 @@ type MemberTurn = Result<Next<Member>, GetObjectError>;
 impl PullMemberOperation {
     fn new(request: PullRequest) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             request,
             step: MemberStep::Bucket,
             member_id: None,
@@ -140,7 +144,7 @@ impl PullMemberOperation {
     }
 
     fn choice(&self, holders: &[NodeId]) -> IoCall {
-        let choice = HolderChoiceOperation::new(holders, unix_timestamp_millis());
+        let choice = HolderChoiceOperation::new(holders, self.now_ms);
         IoCall::child(choice)
     }
 
@@ -192,13 +196,13 @@ impl PullMemberOperation {
 
     fn spread(&mut self, candidates: Vec<HolderCandidate>) -> MemberTurn {
         let replicas = self.replicas;
-        let chosen = pick(candidates, Ulid::generate().random());
+        let chosen = pick(candidates, self.mint.mint(self.now_ms).random());
         let holders = &mut self.member()?.holders;
         let at = chosen.and_then(|chosen| holders.iter().position(|id| *id == chosen.node_id));
         match at {
             Some(at) => holders[..=at].rotate_right(1),
             None => {
-                let spread = (Ulid::generate().random() % replicas as u128) as usize;
+                let spread = (self.mint.mint(self.now_ms).random() % replicas as u128) as usize;
                 holders[..replicas].rotate_left(spread);
             }
         }
@@ -216,6 +220,14 @@ impl PullMemberOperation {
 impl Operation for PullMemberOperation {
     type Output = Member;
     type Error = GetObjectError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> MemberTurn {
         let key = self.request.bucket.as_bytes().to_vec();
@@ -282,6 +294,7 @@ struct FromHoldersOperation {
     failures: HolderFailures,
     /// A failed holder is being noted before the next one is asked.
     avoiding: bool,
+    now_ms: u64,
 }
 
 type HolderTurn = Result<Next<Blob>, GetObjectError>;
@@ -290,6 +303,7 @@ impl FromHoldersOperation {
     fn new(request: &PullRequest, holders: &[NodeId], range: Option<Range<u64>>) -> Self {
         let held = &request.held;
         Self {
+            now_ms: 0,
             request: BaoReadRequest {
                 auth_context: request.auth.clone(),
                 realm_id: request.auth.realm_id,
@@ -324,6 +338,10 @@ impl Operation for FromHoldersOperation {
     type Output = Blob;
     type Error = GetObjectError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> HolderTurn {
         self.ask_next()
     }
@@ -347,7 +365,7 @@ impl Operation for FromHoldersOperation {
             return self.ask_next();
         }
         self.avoiding = true;
-        let now_ms = unix_timestamp_millis();
+        let now_ms = self.now_ms;
         let avoid = HeartbeatEffect::Avoid { holder, now_ms };
         let effect = Effect::Net(NetEffect::Heartbeat(Box::new(avoid)));
         Ok(Next::Call(IoCall::from(effect)))
@@ -568,6 +586,8 @@ pub struct FillOperation {
     claim: Vec<u8>,
     step: FillStep,
     location: Option<BackendLocation>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 type FillTurn = Result<Next<Option<BackendLocation>>, IoError>;
@@ -577,6 +597,8 @@ impl FillOperation {
         let held = &request.held;
         let claim = claim_key(kind, held.set_id, held.version_id, held.identity);
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             request,
             kind,
             member,
@@ -642,7 +664,7 @@ impl FillOperation {
                     location: location.clone(),
                     claim_key: self.claim.clone(),
                     capacity: CACHE_CAPACITY_BYTES,
-                    order: Ulid::generate(),
+                    order: self.mint.mint(self.now_ms),
                     member_id: self.member.member_id,
                 };
                 self.location = Some(location);
@@ -664,14 +686,22 @@ impl Operation for FillOperation {
     type Output = Option<BackendLocation>;
     type Error = IoError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> FillTurn {
         // A copy the cache can never hold is not fetched at all.
         if !admitted(self.kind, self.held().size) {
             return Ok(Next::Done(None));
         }
         let claimed = FillClaim {
-            claim_id: Ulid::generate(),
-            claimed_at_ms: unix_timestamp_millis(),
+            claim_id: self.mint.mint(self.now_ms),
+            claimed_at_ms: self.now_ms,
         };
         let claim = ClaimFillOperation::new(self.claim.clone(), claimed);
         Ok(Next::Call(IoCall::child(claim)))

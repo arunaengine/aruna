@@ -5,7 +5,7 @@
 
 // Only the publisher accepts them (D33). Nothing is queued.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -450,6 +450,7 @@ pub(crate) struct AdmitMemberOperation {
     sizes: Vec<RangeSize>,
     step: AdmitStep,
     refused: Option<SyncRefusal>,
+    now_ms: u64,
 }
 
 type Admitting = Result<Next<SignedStatement>, SyncRefusal>;
@@ -463,6 +464,7 @@ impl AdmitMemberOperation {
         sizes: Vec<RangeSize>,
     ) -> Self {
         Self {
+            now_ms: 0,
             ids,
             capacity,
             auth,
@@ -517,7 +519,7 @@ impl AdmitMemberOperation {
         let snapshot = &self.signed.snapshot;
         let info = BucketInfo {
             group_id: snapshot.config.owner_group,
-            created_at: SystemTime::now(),
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
             created_by: self.auth.user_id,
             cors_configuration: None,
             storage_routing: Vec::new(),
@@ -599,6 +601,10 @@ impl AdmitMemberOperation {
 impl Operation for AdmitMemberOperation {
     type Output = SignedStatement;
     type Error = SyncRefusal;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Admitting {
         let (_, realm_id) = self.node()?;

@@ -5,10 +5,11 @@
 
 // Every pass is bounded and resumes.
 
+use aruna_core::id_mint::IdMint;
 use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -65,8 +66,8 @@ pub(crate) struct MaintainCursors {
     accounts: Option<Vec<u8>>,
     refresh: Option<RefreshCursor>,
     lifecycle: LifecycleCursors,
-    /// When this node last proposed a balancing transfer.
-    balanced_at: Option<Instant>,
+    /// When this node last proposed a balancing transfer, in Unix milliseconds.
+    balanced_at: Option<u64>,
 }
 
 /// One finished pass: when the next should run, and where it goes on.
@@ -147,6 +148,7 @@ pub struct MaintainRangesOperation {
     after: Duration,
     refresh_began: Option<Vec<u8>>,
     imports: Vec<KeptStart>,
+    now_ms: u64,
 }
 
 type Maintaining = Result<Next<MaintainPass>, IoError>;
@@ -154,6 +156,7 @@ type Maintaining = Result<Next<MaintainPass>, IoError>;
 impl MaintainRangesOperation {
     fn new(ids: NodeRealm, cursors: MaintainCursors, inputs: BalanceInputs) -> Self {
         Self {
+            now_ms: 0,
             ids,
             cursors,
             inputs,
@@ -255,7 +258,8 @@ impl MaintainRangesOperation {
     }
 
     fn next_balance(&mut self) -> Maintaining {
-        let cooling = (self.cursors.balanced_at).is_some_and(|at| at.elapsed() < COOL_DOWN);
+        let cooled = |at: u64| self.now_ms.saturating_sub(at) >= COOL_DOWN.as_millis() as u64;
+        let cooling = (self.cursors.balanced_at).is_some_and(|at| !cooled(at));
         match self.balancing.pop_front() {
             Some(snapshot) if !cooling => {
                 let (local, realm_id) = self.node()?;
@@ -281,7 +285,8 @@ impl MaintainRangesOperation {
         let (local, realm_id) = self.node()?;
         let cursor = self.cursors.refresh.take().unwrap_or_default();
         self.refresh_began = cursor.record.clone();
-        let pass = RefreshRangesOperation::new(realm_id, local, SystemTime::now(), cursor);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+        let pass = RefreshRangesOperation::new(realm_id, local, now, cursor);
         self.step = MaintainStep::Refresh;
         Ok(Next::Call(IoCall::child(pass)))
     }
@@ -299,6 +304,10 @@ impl MaintainRangesOperation {
 impl Operation for MaintainRangesOperation {
     type Output = MaintainPass;
     type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Maintaining {
         let Some((local, realm_id)) = self.ids else {
@@ -336,7 +345,7 @@ impl Operation for MaintainRangesOperation {
             }
             MaintainStep::Balance => {
                 if result.child::<bool, IoError>()?? {
-                    self.cursors.balanced_at = Some(Instant::now());
+                    self.cursors.balanced_at = Some(self.now_ms);
                 }
                 self.next_balance()
             }
@@ -406,6 +415,8 @@ pub(super) struct TendRangeOperation {
     step: TendStep,
     objects: i128,
     split_key: Option<String>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 type Tending = Result<Next<Tended>, IoError>;
@@ -419,6 +430,8 @@ impl TendRangeOperation {
         account: RangeAccount,
     ) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             realm_id,
             local,
             snapshot,
@@ -437,7 +450,7 @@ impl TendRangeOperation {
     /// A finished accounting transition moves the charged rows a replica share reads.
     fn republish(&mut self, then: Tended) -> Tending {
         let group = self.snapshot.config.owner_group;
-        let mark = MarkDirtyOperation::new([group], Ulid::generate());
+        let mark = MarkDirtyOperation::new([group], self.mint.mint(self.now_ms));
         self.step = TendStep::Republish(then);
         Ok(Next::Call(IoCall::child(mark)))
     }
@@ -568,6 +581,14 @@ impl TendRangeOperation {
 impl Operation for TendRangeOperation {
     type Output = Tended;
     type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Tending {
         match (&self.account.charge, self.account.rebuild.is_some()) {

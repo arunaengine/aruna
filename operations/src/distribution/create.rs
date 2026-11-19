@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -115,9 +116,16 @@ pub struct CreationReport {
 }
 
 /// Plans the members and ranges of a new set; every member gets a fresh id.
-pub fn plan_layout(set_id: Ulid, input: &CreateInput) -> Result<Layout, DistributionError> {
-    let assign = |nodes: &[NodeId]| -> Vec<(Ulid, NodeId)> {
-        nodes.iter().map(|node| (Ulid::generate(), *node)).collect()
+pub fn plan_layout(
+    set_id: Ulid,
+    input: &CreateInput,
+    (mint, now_ms): (&mut IdMint, u64),
+) -> Result<Layout, DistributionError> {
+    let mut assign = |nodes: &[NodeId]| -> Vec<(Ulid, NodeId)> {
+        nodes
+            .iter()
+            .map(|node| (mint.mint(now_ms), *node))
+            .collect()
     };
     let nodes = assign(&input.nodes);
     let mut layout = match &input.layout {
@@ -150,12 +158,16 @@ enum CreateStep {
 /// Creates the set with this node as its publisher, then admits every member it can.
 #[derive(Debug, PartialEq)]
 pub struct CreateSetOperation {
+    /// The run's entropy, which also makes the set's nonce.
+    entropy: u128,
     here: Here,
     auth: AuthContext,
     bearer: Option<AuthToken>,
     input: Option<CreateInput>,
     set_id: Option<Ulid>,
     step: CreateStep,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 /// The creation of a set on this node; see [`CreateSetOperation`].
@@ -166,6 +178,9 @@ pub fn create_set(
     input: CreateInput,
 ) -> CreateSetOperation {
     CreateSetOperation {
+        now_ms: 0,
+        mint: IdMint::default(),
+        entropy: 0,
         here,
         auth: auth.clone(),
         bearer,
@@ -192,10 +207,10 @@ impl CreateSetOperation {
         let root = SetRoot {
             publisher,
             owner_group: input.owner_group,
-            nonce: rand::random(),
+            nonce: self.entropy.to_be_bytes(),
         };
         let set_id = root.set_id();
-        let layout = plan_layout(set_id, &input)?;
+        let layout = plan_layout(set_id, &input, (&mut self.mint, self.now_ms))?;
         let request = DistributionRequest::Create {
             root,
             config: DistributionConfig {
@@ -207,7 +222,7 @@ impl CreateSetOperation {
                 settings: input.settings,
             },
         };
-        let ids = (set_id, Ulid::generate());
+        let ids = (set_id, self.mint.mint(self.now_ms));
         let auth = Some(self.auth.clone());
         let publish = PublishLocalOperation::new(self.here.ids, ids, request, auth);
         self.set_id = Some(set_id);
@@ -221,6 +236,15 @@ type Creating = Result<Next<CreationReport>, CreateError>;
 impl Operation for CreateSetOperation {
     type Output = CreationReport;
     type Error = CreateError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+        self.entropy = entropy;
+    }
 
     fn first(&mut self) -> Creating {
         let (_, realm_id) = self.here.ids.ok_or_else(no_transport)?;
