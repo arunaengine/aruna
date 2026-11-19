@@ -151,8 +151,11 @@ async fn run<O: Runnable<K>, K>(
     unlocked: Option<&Sealed>,
     race: Race,
 ) -> Result<O::Output, O::Error> {
+    // Each run gets its own entropy, as the runner gives it, so two copies mint distinct ids.
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(7);
     let mut operation = operation.into_machine();
-    operation.seed(7);
+    let entropy = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    operation.seed(u128::from(entropy));
     let mut effects: Vec<Effect> = operation.start().into_iter().collect();
     while !operation.is_complete() {
         let effect = effects.remove(0);
