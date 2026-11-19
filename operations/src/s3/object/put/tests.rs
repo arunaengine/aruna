@@ -126,16 +126,7 @@ pub(super) fn asked(turn: &Turn) -> &Effect {
 
 /// The cleanup rows among `calls`, in order.
 pub(super) fn cleanup_works(calls: &[IoCall]) -> Vec<BlobCleanupWork> {
-    let rows = calls.iter().filter_map(|call| match call {
-        IoCall::Write(rows) => Some(rows),
-        _ => None,
-    });
-    rows.flatten()
-        .map(|(space, _, value)| {
-            assert_eq!(space, BLOB_CLEANUP_KEYSPACE);
-            BlobCleanupWork::from_bytes(value.as_ref()).unwrap()
-        })
-        .collect()
+    crate::tests::s3::cleanup_works(calls)
 }
 
 /// `calls` delete the written blob through a rollback child, and nothing else.
@@ -2384,7 +2375,7 @@ mod decisions {
     use super::*;
     use crate::placement::policy::PolicyCacheStats;
     use aruna_core::structs::placement::policy::{
-        PlacementDecision, PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
+        PlacementDecision, PlacementSubject, VerifiedPolicy,
     };
     use std::collections::BTreeMap;
 
@@ -2400,18 +2391,7 @@ mod decisions {
 
     /// A rule that admits exactly one location.
     fn policy(location: &str) -> VerifiedPolicy {
-        let policy = PlacementPolicy::new(
-            Ulid::from_bytes([1u8; 16]),
-            "residency".to_string(),
-            vec![PlacementSelector {
-                node_id: None,
-                location: Some(location.to_string()),
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
-        )
-        .expect("policy is valid");
-        VerifiedPolicy::verify(policy).expect("policy verifies")
+        crate::tests::policy::residency(1, location)
     }
 
     fn gate(location: &str) -> GateContext {

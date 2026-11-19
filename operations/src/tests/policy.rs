@@ -211,3 +211,20 @@ pub async fn seed_gate(
             .await;
     }
 }
+
+/// A verified residency policy for `location`, with an id from `seed`.
+pub(crate) fn residency(seed: u8, location: &str) -> VerifiedPolicy {
+    let selector = aruna_core::structs::placement::policy::PlacementSelector {
+        node_id: None,
+        location: Some(location.to_string()),
+        labels: Vec::new(),
+        executor_kind: None,
+    };
+    let policy = aruna_core::structs::placement::policy::PlacementPolicy::new(
+        Ulid::from_bytes([seed; 16]),
+        "residency".to_string(),
+        vec![selector],
+    )
+    .expect("policy is valid");
+    VerifiedPolicy::verify(policy).expect("policy verifies")
+}

@@ -673,3 +673,18 @@ pub fn test_spec() -> aruna_core::structs::execution::job::StagingJobSpec {
         mirrors: Vec::new(),
     }
 }
+
+/// Source metadata of `length` bytes with an optional `etag` and nothing else.
+pub(crate) fn sized_source(
+    length: u64,
+    etag: Option<String>,
+) -> aruna_core::structs::execution::source_access::SourceMetadata {
+    aruna_core::structs::execution::source_access::SourceMetadata {
+        content_length: length,
+        content_type: None,
+        etag,
+        last_modified: None,
+        source_version: None,
+        digests: Default::default(),
+    }
+}

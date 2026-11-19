@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 
-fn answer(peer: NodeId, result: Result<Vec<u8>, PeerRequestError>) -> IoResult {
+/// A metadata answer from `peer` with `result`.
+pub(crate) fn answer(peer: NodeId, result: Result<Vec<u8>, PeerRequestError>) -> IoResult {
     let answer = MetadataAnswer {
         peer,
         elapsed: Duration::ZERO,

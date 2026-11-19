@@ -87,17 +87,7 @@ fn input(mode: EncryptionMode, lookups: BTreeMap<UserId, KeyLookup>) -> EnableIn
 }
 
 fn bucket() -> BucketInfo {
-    BucketInfo {
-        group_id: Ulid::from_bytes([3; 16]),
-        created_at: SystemTime::UNIX_EPOCH,
-        created_by: user(1),
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Off,
-        distribution: None,
-    }
+    crate::tests::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
 }
 
 /// Runs the operation up to the generated key, with no uploads and no stored settings.

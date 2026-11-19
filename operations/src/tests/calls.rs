@@ -99,3 +99,24 @@ pub(crate) fn bucket_realm(
     config.snapshot_candidate_map();
     config
 }
+
+/// A read answer with `values` in order.
+pub(crate) fn values_of(values: Vec<Option<Vec<u8>>>) -> IoResult {
+    IoResult::Values(
+        values
+            .into_iter()
+            .map(|value| value.map(Into::into))
+            .collect(),
+    )
+}
+
+/// The peer and timeout of the metadata request a turn sends.
+pub(crate) fn asked<T: Debug, E: Debug>(turn: Result<Next<T>, E>) -> (NodeId, std::time::Duration) {
+    let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+        panic!("expected a peer request");
+    };
+    let Effect::Net(NetEffect::MetadataRequest(request)) = *effect else {
+        panic!("expected a metadata request");
+    };
+    (request.peer, request.timeout)
+}

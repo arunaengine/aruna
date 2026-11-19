@@ -7,7 +7,6 @@ use std::time::SystemTime;
 use super::*;
 use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
-use aruna_core::structs::storage::format::Compression;
 use ulid::Ulid;
 
 fn realm() -> RealmId {
@@ -23,17 +22,7 @@ fn auth() -> AuthContext {
 }
 
 fn info() -> BucketInfo {
-    BucketInfo {
-        group_id: Ulid::from_parts(3, 3),
-        created_at: SystemTime::UNIX_EPOCH,
-        created_by: UserId::nil(realm()),
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Off,
-        distribution: None,
-    }
+    crate::tests::s3::bucket_info(Ulid::from_parts(3, 3), UserId::nil(realm()))
 }
 
 fn bucket_target(operation: MetadataStorageOperation) -> ReferenceTarget {

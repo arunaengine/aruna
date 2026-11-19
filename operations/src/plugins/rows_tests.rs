@@ -79,12 +79,7 @@ fn modes_and_conflicts() {
 
 /// The answer to a read, from plain bytes.
 pub(crate) fn values_result(values: Vec<Option<Vec<u8>>>) -> IoResult {
-    IoResult::Values(
-        values
-            .into_iter()
-            .map(|value| value.map(Into::into))
-            .collect(),
-    )
+    crate::tests::calls::values_of(values)
 }
 
 /// The answer to a page, from plain bytes.

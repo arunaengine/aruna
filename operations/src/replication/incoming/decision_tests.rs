@@ -5,9 +5,7 @@
 use super::pure_tests::{make_manifest, make_reference_manifest};
 use super::*;
 use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
-use aruna_core::structs::placement::policy::{
-    PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
-};
+use aruna_core::structs::placement::policy::{PlacementSubject, VerifiedPolicy};
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use std::collections::BTreeMap;
 
@@ -16,18 +14,7 @@ fn realm() -> RealmId {
 }
 
 fn policy(location: &str) -> VerifiedPolicy {
-    let policy = PlacementPolicy::new(
-        Ulid::from_bytes([1u8; 16]),
-        "residency".to_string(),
-        vec![PlacementSelector {
-            node_id: None,
-            location: Some(location.to_string()),
-            labels: Vec::new(),
-            executor_kind: None,
-        }],
-    )
-    .expect("policy is valid");
-    VerifiedPolicy::verify(policy).expect("policy verifies")
+    crate::tests::policy::residency(1, location)
 }
 
 fn gate(location: &str) -> GateContext {

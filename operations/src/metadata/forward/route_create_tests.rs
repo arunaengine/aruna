@@ -77,13 +77,7 @@ fn forwarding(holders: &[NodeId]) -> RouteCreateOperation {
 }
 
 fn answered(peer: NodeId, result: Result<Vec<u8>, PeerRequestError>) -> IoResult {
-    IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
-        MetadataAnswer {
-            peer,
-            elapsed: Duration::ZERO,
-            result,
-        },
-    )))))
+    crate::tests::peers::answer(peer, result)
 }
 
 fn reply(message: MetadataTransportMessage) -> Result<Vec<u8>, PeerRequestError> {

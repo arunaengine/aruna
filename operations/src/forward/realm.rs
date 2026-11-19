@@ -435,16 +435,7 @@ mod tests {
     }
 
     fn asked(turn: Result<Next<()>, ForwardError>) -> (NodeId, Duration) {
-        let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
-            panic!("expected a peer request");
-        };
-        let aruna_core::effects::Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(
-            request,
-        )) = *effect
-        else {
-            panic!("expected a metadata request");
-        };
-        (request.peer, request.timeout)
+        crate::tests::calls::asked(turn)
     }
 
     #[test]

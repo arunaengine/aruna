@@ -251,26 +251,13 @@ pub fn plan_eviction(
 mod pure_tests {
     use super::*;
     use crate::tests::policy::signed_document;
-    use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector};
-    use ulid::Ulid;
 
     fn realm() -> RealmId {
         RealmId::from_bytes([3u8; 32])
     }
 
     fn policy(seed: u8, location: &str) -> VerifiedPolicy {
-        let policy = PlacementPolicy::new(
-            Ulid::from_bytes([seed; 16]),
-            "residency".to_string(),
-            vec![PlacementSelector {
-                node_id: None,
-                location: Some(location.to_string()),
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
-        )
-        .expect("policy is valid");
-        VerifiedPolicy::verify(policy).expect("policy verifies")
+        crate::tests::policy::residency(seed, location)
     }
 
     fn document(policy: &VerifiedPolicy) -> PlacementPolicyDocument {

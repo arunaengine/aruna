@@ -2,12 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::Duration;
-
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
+use aruna_core::events::PeerRequestError;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -99,13 +97,7 @@ pub(crate) fn is_effect<T, E>(next: &Result<Next<T>, E>) -> bool {
 }
 
 fn answer_of(peer: NodeId, result: Result<Vec<u8>, PeerRequestError>) -> IoResult {
-    IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
-        MetadataAnswer {
-            peer,
-            elapsed: Duration::ZERO,
-            result,
-        },
-    )))))
+    crate::tests::peers::answer(peer, result)
 }
 
 /// `peer` answering with `message`.

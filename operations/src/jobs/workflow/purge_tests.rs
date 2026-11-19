@@ -9,7 +9,6 @@ use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::execution::job::JobErrorKind;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
-use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::multipart::MultipartUploadStatus;
 use aruna_core::types::Value;
 
@@ -61,17 +60,7 @@ fn file_scope() -> StoragePurgeScope {
 }
 
 fn info(group_id: Ulid) -> BucketInfo {
-    BucketInfo {
-        group_id,
-        created_at: SystemTime::UNIX_EPOCH,
-        created_by: Default::default(),
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Off,
-        distribution: None,
-    }
+    crate::tests::s3::bucket_info(group_id, Default::default())
 }
 
 fn run_at(scope: StoragePurgeScope, phase: PurgePhase) -> PurgeRun {

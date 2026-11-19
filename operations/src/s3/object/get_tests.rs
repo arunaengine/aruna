@@ -1438,14 +1438,7 @@ async fn drift_creates_successor() {
 }
 
 fn observation(content_length: u64) -> SourceMetadata {
-    SourceMetadata {
-        content_length,
-        content_type: None,
-        etag: Some(format!("etag-{content_length}")),
-        last_modified: None,
-        source_version: None,
-        digests: Default::default(),
-    }
+    crate::tests::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
 }
 
 fn reference_source() -> VersionSourceBinding {
