@@ -7,9 +7,10 @@ use std::any::Any;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use aruna_compute::session::Session;
 use aruna_core::compute::AttemptPhase;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
@@ -496,6 +497,7 @@ async fn heartbeat_loop(
 /// container running and hands the attempt back for adoption.
 struct ExecutionHost {
     cancel: CancellationToken,
+    session: Mutex<Option<Arc<Session>>>,
 }
 
 impl JobHost for ExecutionHost {
@@ -518,11 +520,25 @@ impl JobHost for ExecutionHost {
     ) -> BoxFuture<'a, Box<dyn Any + Send>> {
         Box::pin(std::future::ready(Box::new(()) as Box<dyn Any + Send>))
     }
+
+    fn keep_session(&self, session: Arc<Session>) {
+        *self.session.lock().unwrap_or_else(PoisonError::into_inner) = Some(session);
+    }
+
+    fn kept_session(&self, job_id: &str) -> Option<Arc<Session>> {
+        let session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+        (session.as_ref())
+            .filter(|session| session.job_id() == job_id)
+            .cloned()
+    }
 }
 
 /// The host of an execution run with this cancel signal.
 pub(crate) fn execution_host(cancel: CancellationToken) -> Arc<dyn JobHost> {
-    Arc::new(ExecutionHost { cancel })
+    Arc::new(ExecutionHost {
+        cancel,
+        session: Mutex::new(None),
+    })
 }
 
 /// What this node gives every execution run.
@@ -553,7 +569,8 @@ where
         stop.clone(),
     ));
     tokio::pin!(heartbeat);
-    let work = with_job_host(execution_host(cancel), drive(operation, context));
+    let host = execution_host(cancel);
+    let work = with_job_host(host.clone(), drive(operation, context));
     let work = Box::pin(work);
     tokio::select! {
         result = work => {
@@ -561,7 +578,22 @@ where
             let _ = (&mut heartbeat).await;
             Some(result)
         }
-        _ = &mut heartbeat => None,
+        _ = &mut heartbeat => {
+            abandon_session(context, job_id, host).await;
+            None
+        }
+    }
+}
+
+/// This node no longer owns the attempt, so the session its run opened stops here even though
+/// nothing else delivered an end for it. A session another run registered stays.
+async fn abandon_session(context: &DriverContext, job_id: JobId, host: Arc<dyn JobHost>) {
+    if host.kept_session(&job_id.to_string()).is_none() {
+        return;
+    }
+    let abandon = drive(AbandonSessionOperation::new(job_id), context);
+    if let Err(error) = with_job_host(host, abandon).await {
+        warn!(job_id = %job_id, %error, "Abandoned session did not close");
     }
 }
 
@@ -593,22 +625,11 @@ async fn execution_heartbeat(
 }
 
 /// Ends the bookkeeping of a run driven under its lease.
-async fn finish_run<E: std::fmt::Display>(
-    context: &DriverContext,
-    job_id: JobId,
-    finished: Option<Result<(), E>>,
-) {
+fn finish_run<E: std::fmt::Display>(job_id: JobId, finished: Option<Result<(), E>>) {
     match finished {
         Some(Ok(())) => {}
         Some(Err(error)) => warn!(job_id = %job_id, %error, "Execution run failed"),
-        // This node no longer owns the attempt, so its session stops here even though nothing
-        // else delivered an end for it.
-        None => {
-            info!(job_id = %job_id, "Execution supervisor superseded; abandoning");
-            if let Err(error) = drive(AbandonSessionOperation::new(job_id), context).await {
-                warn!(job_id = %job_id, %error, "Abandoned session did not close");
-            }
-        }
+        None => info!(job_id = %job_id, "Execution supervisor superseded; abandoned"),
     }
 }
 
@@ -625,7 +646,7 @@ pub async fn run_execution_job(
     };
     let run = ExecutionRunOperation::new(record, run_wiring(&context));
     let finished = under_lease(&context, (job_id, token), cancel, run).await;
-    finish_run(&context, job_id, finished).await;
+    finish_run(job_id, finished);
 }
 
 /// Supervises an adopted attempt.
@@ -639,7 +660,7 @@ pub(crate) async fn resume_attempt(
     let ids = (scope.job_id, scope.token);
     let resume = ResumeAttemptOperation::new(scope, record, phase);
     let finished = under_lease(&context, ids, cancel, resume).await;
-    finish_run(&context, ids.0, finished).await;
+    finish_run(ids.0, finished);
 }
 
 /// The reconcile seam of the node: a lost external attempt is adopted by name and resolved by

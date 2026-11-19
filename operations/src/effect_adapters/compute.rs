@@ -20,7 +20,7 @@ use futures_util::StreamExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::job::{JobHost, current_host};
+use super::job::{JobHost, current_host, run_session};
 use crate::driver::DriverContext;
 
 fn facts(backend: &Arc<dyn ExecutorBackend>) -> BackendFacts {
@@ -127,7 +127,7 @@ fn output_body(output: TaskOutput, until_stop: bool) -> OutputBody {
 /// Waits for the stop of a session that a client ended, that went idle, or whose kernel exited;
 /// any other end leaves the attempt wait in charge.
 async fn session_stopped(registry: &ExecutorRegistry, job: Option<String>) -> EndReason {
-    let session = job.and_then(|job| registry.sessions().get(&job));
+    let session = job.and_then(|job| run_session(registry, &job));
     if let Some(session) = session {
         let reason = session.finished().await;
         if matches!(
@@ -155,9 +155,10 @@ fn open_session(
         idle_after_ms: open.idle_after_ms,
         credential_expires_ms: open.credential_expires_ms,
     };
-    registry
-        .sessions()
-        .open(config, backend.clone(), fence.clone());
+    let session = (registry.sessions()).open(config, backend.clone(), fence.clone());
+    if let Some(host) = current_host() {
+        host.keep_session(session);
+    }
 }
 
 async fn attempt_call(
