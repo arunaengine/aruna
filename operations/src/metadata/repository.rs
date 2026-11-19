@@ -215,14 +215,6 @@ pub(crate) fn parse_lifecycle_read(
     })
 }
 
-pub(crate) fn parse_registry_iter(
-    event: Event,
-) -> Result<(Vec<MetadataRegistryRecord>, Option<Key>), StorageReadError> {
-    parse_storage_iter(event, |bytes| {
-        postcard::from_bytes(bytes).map_err(ConversionError::from)
-    })
-}
-
 /// Wakes the materialization drain at once.
 /// Wakes the projection drain after `after`.
 pub(crate) fn schedule_projection(after: Duration) -> Effect {

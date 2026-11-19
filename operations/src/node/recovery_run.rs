@@ -59,14 +59,14 @@ fn phase_failed(error: RecoveryError) -> PhaseOutcome {
 /// Announces this node's realm presence. A user device reads the DHT to locate realm nodes but
 /// never announces itself as one; without a presence record nothing routes work to it.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PresencePhaseOperation {
+pub struct PresencePhaseOperation {
     realm_id: RealmId,
     node_id: NodeId,
     announcing: bool,
 }
 
 impl PresencePhaseOperation {
-    pub(crate) fn new(realm_id: RealmId, node_id: NodeId) -> Self {
+    pub fn new(realm_id: RealmId, node_id: NodeId) -> Self {
         Self {
             realm_id,
             node_id,

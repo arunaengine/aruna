@@ -21,7 +21,7 @@ use crate::distribution::imports::{Kept, KeptStart};
 /// Handed over imports could not start, or their row could not follow.
 #[derive(Debug, Error, PartialEq)]
 #[error("{0}")]
-pub(crate) struct StartKeptError(String);
+pub struct StartKeptError(String);
 
 impl From<IoError> for StartKeptError {
     fn from(error: IoError) -> Self {

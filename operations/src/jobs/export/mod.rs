@@ -271,8 +271,8 @@ impl ExportScope {
 /// What looking up and opening the sources of an export needs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceScope {
-    spec: Arc<ExportRoCrateSpec>,
-    owner_node: NodeId,
+    pub spec: Arc<ExportRoCrateSpec>,
+    pub owner_node: NodeId,
 }
 
 impl From<IoError> for ExportFailure {

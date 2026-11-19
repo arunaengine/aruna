@@ -47,7 +47,7 @@ const INDEX_PAGE_SIZE: usize = 128;
 /// Keeps the storage cause intact so callers can tell an overloaded backend
 /// apart from a genuine index or document problem.
 #[derive(Debug, Error, PartialEq)]
-pub(crate) enum MetadataIriError {
+pub enum MetadataIriError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]

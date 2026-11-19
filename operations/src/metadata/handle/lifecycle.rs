@@ -38,7 +38,7 @@ pub(crate) async fn prune_if_deleted(
 
 impl MetadataHandle {
     /// Applies document sync updates from peers; returns how many graphs changed.
-    pub(crate) async fn reconcile_document_sync(
+    pub async fn reconcile_document_sync(
         &self,
         context: &DriverContext,
     ) -> Result<usize, MetadataError> {
@@ -50,7 +50,7 @@ impl MetadataHandle {
     }
 
     /// Removes the local copy of every deleted graph; returns how many were removed.
-    pub(crate) async fn prune_deleted_graphs(
+    pub async fn prune_deleted_graphs(
         &self,
         context: &DriverContext,
     ) -> Result<usize, MetadataError> {

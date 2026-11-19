@@ -467,7 +467,7 @@ impl Operation for AcceptLaunchOperation {
 /// This node as a launch offer sees it. The limits are its advertisement for the offered
 /// executor kind; `None` means that kind is not offered here.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct LaunchNode {
+pub struct LaunchNode {
     pub(crate) local: NodeId,
     pub(crate) realm_id: RealmId,
     pub(crate) now_ms: u64,

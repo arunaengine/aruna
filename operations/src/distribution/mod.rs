@@ -17,7 +17,7 @@ pub mod forward;
 pub mod guard;
 pub mod handoff;
 pub mod held;
-pub(crate) mod imports;
+pub mod imports;
 #[cfg(test)]
 mod index_feed_tests;
 pub mod inventory;
@@ -44,8 +44,8 @@ mod status_view;
 pub mod submit;
 #[cfg(test)]
 pub(crate) mod test_record;
-#[cfg(test)]
-pub(crate) mod test_store;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_store;
 pub mod ticket;
 pub mod uploads;
 pub mod usage;

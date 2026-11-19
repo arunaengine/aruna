@@ -467,7 +467,7 @@ fn launch_unavailable() -> LaunchNext {
 }
 
 impl ServeLaunchOperation {
-    pub(crate) fn new(peer: NodeId, launch: LaunchFrame, node: Option<LaunchNode>) -> Self {
+    pub fn new(peer: NodeId, launch: LaunchFrame, node: Option<LaunchNode>) -> Self {
         Self {
             peer,
             offer: node.map(|node| (launch, node)),

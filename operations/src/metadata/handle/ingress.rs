@@ -1113,7 +1113,7 @@ impl MetadataHandle {
 
     /// Reads one request frame from an inbound metadata stream under the shared frame budget
     /// and names it on the current span. Returns the deadline an audit request keeps.
-    pub(crate) async fn read_request(
+    pub async fn read_request(
         &self,
         stream: &mut BiStream,
     ) -> Result<InboundRequest, MetadataError> {
@@ -1131,7 +1131,7 @@ impl MetadataHandle {
     }
 
     /// Answers one metadata request from `peer`; requests of other domains are rejected.
-    pub(crate) async fn answer_request(
+    pub async fn answer_request(
         &self,
         context: &Arc<DriverContext>,
         peer: NodeId,
@@ -1399,18 +1399,18 @@ impl MetadataHandle {
 }
 
 /// One request read from an inbound metadata stream.
-pub(crate) struct InboundRequest {
-    pub(crate) message: MetadataTransportMessage,
+pub struct InboundRequest {
+    pub message: MetadataTransportMessage,
     /// Held until the answer is written, so frames in flight stay within the budget.
-    pub(crate) budget: tokio::sync::OwnedSemaphorePermit,
-    pub(crate) audit_deadline: tokio::time::Instant,
-    pub(crate) audit: bool,
+    pub budget: tokio::sync::OwnedSemaphorePermit,
+    pub audit_deadline: tokio::time::Instant,
+    pub audit: bool,
 }
 
 impl MetadataHandle {
     /// Drains the request, writes the answer and closes the stream. An audit request keeps
     /// the audit deadline for every step.
-    pub(crate) async fn write_answer(
+    pub async fn write_answer(
         mut stream: BiStream,
         audit_deadline: Option<tokio::time::Instant>,
         response: &MetadataTransportMessage,

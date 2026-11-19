@@ -328,7 +328,7 @@ enum HashStep {
 /// Adds the local objects with content `hash` the caller may read and, unless the export goes
 /// into another realm, the nodes that hold that content.
 #[derive(Debug, PartialEq)]
-pub(super) struct HashCandidatesOperation {
+pub struct HashCandidatesOperation {
     scope: SourceScope,
     hash: [u8; 32],
     resolved_version: Option<Ulid>,
@@ -350,7 +350,7 @@ fn lost_cache() -> ExportFailure {
 }
 
 impl HashCandidatesOperation {
-    pub(super) fn new(
+    pub fn new(
         scope: SourceScope,
         hash: [u8; 32],
         resolved_version: Option<Ulid>,
@@ -827,7 +827,7 @@ enum ResolveStep {
 
 /// Resolves every entity in order, stopping with the job and counting each in its progress.
 #[derive(Debug, PartialEq)]
-pub(super) struct ResolveEntriesOperation {
+pub struct ResolveEntriesOperation {
     scope: SourceScope,
     entities: Vec<ExportEntity>,
     aliases: AliasState,
@@ -838,11 +838,7 @@ pub(super) struct ResolveEntriesOperation {
 type ResolveTurn = Result<Next<Resolved>, ExportFailure>;
 
 impl ResolveEntriesOperation {
-    pub(super) fn new(
-        scope: SourceScope,
-        entities: Vec<ExportEntity>,
-        aliases: AliasState,
-    ) -> Self {
+    pub fn new(scope: SourceScope, entities: Vec<ExportEntity>, aliases: AliasState) -> Self {
         Self {
             scope,
             entities,

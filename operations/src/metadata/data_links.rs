@@ -42,7 +42,7 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const SCHEMA_BASES: [&str; 2] = ["http://schema.org/", "https://schema.org/"];
 
 #[derive(Debug, Error, PartialEq)]
-pub(crate) enum DataLinkError {
+pub enum DataLinkError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]

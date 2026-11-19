@@ -61,18 +61,21 @@ pub async fn buckets(fixture: &Fixture, seed: u8, names: &[&str]) {
     write(&fixture.context, AUTH_KEYSPACE, key, bytes).await;
 }
 
+#[cfg(test)]
 fn keyspaces(fixture: &Fixture) -> usize {
     std::fs::read_dir(fixture.dir.path().join("keyspaces"))
         .unwrap()
         .count()
 }
 
+#[cfg(test)]
 fn stranger(fixture: &Fixture) -> AuthContext {
     let mut auth = fixture.auth.clone();
     auth.user_id = UserId::local(Ulid::from_bytes([8; 16]), auth.realm_id);
     auth
 }
 
+#[cfg(test)]
 fn blocked(names: &[&str], more: bool, hidden: u64) -> Result<(), GroupDeletionError> {
     Err(GroupDeletionError::NotEmpty {
         kinds: vec!["S3 buckets".into()],

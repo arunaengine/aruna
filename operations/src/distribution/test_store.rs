@@ -24,13 +24,13 @@ use super::inventory::{
 };
 use crate::s3::usage::{UsageCounterUpdate, UsageUpdateError};
 
-pub(crate) fn open() -> (TempDir, StorageHandle) {
+pub fn open() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("tempdir must be created");
     let handle = FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage");
     (dir, handle)
 }
 
-pub(crate) fn range(seed: u8, lower: &str, upper: Option<&str>) -> KeyRange {
+pub fn range(seed: u8, lower: &str, upper: Option<&str>) -> KeyRange {
     KeyRange {
         range_id: Ulid::from_bytes([seed; 16]),
         lower: lower.to_string(),
@@ -42,14 +42,14 @@ pub(crate) fn range(seed: u8, lower: &str, upper: Option<&str>) -> KeyRange {
     }
 }
 
-pub(crate) async fn send(handle: &StorageHandle, effect: Effect) -> Event {
+pub async fn send(handle: &StorageHandle, effect: Effect) -> Event {
     let Effect::Storage(effect) = effect else {
         panic!("only storage effects are expected: {effect:?}");
     };
     handle.send_storage_effect(effect).await
 }
 
-pub(crate) async fn begin(handle: &StorageHandle) -> TxnId {
+pub async fn begin(handle: &StorageHandle) -> TxnId {
     match handle
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -60,7 +60,7 @@ pub(crate) async fn begin(handle: &StorageHandle) -> TxnId {
 }
 
 /// True when the commit succeeded, false on a conflict.
-pub(crate) async fn commit(handle: &StorageHandle, txn_id: TxnId) -> bool {
+pub async fn commit(handle: &StorageHandle, txn_id: TxnId) -> bool {
     match handle
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
@@ -71,7 +71,7 @@ pub(crate) async fn commit(handle: &StorageHandle, txn_id: TxnId) -> bool {
     }
 }
 
-pub(crate) async fn install(handle: &StorageHandle, set_id: Ulid, ranges: &[KeyRange]) {
+pub async fn install(handle: &StorageHandle, set_id: Ulid, ranges: &[KeyRange]) {
     let writes = open_ranges(set_id, ranges).expect("ranges encode");
     let event = handle
         .send_storage_effect(StorageEffect::BatchWrite {
@@ -171,7 +171,7 @@ async fn run_staged(
 }
 
 /// Runs `update` to the end inside the open transaction `txn_id`.
-pub(crate) async fn stage(
+pub async fn stage(
     handle: &StorageHandle,
     txn_id: TxnId,
     update: &mut InventoryUpdate,
@@ -185,7 +185,7 @@ pub(crate) async fn stage(
 }
 
 /// Runs a counter update to the end inside the open transaction `txn_id`.
-pub(crate) async fn stage_usage(
+pub async fn stage_usage(
     handle: &StorageHandle,
     txn_id: TxnId,
     update: &mut UsageCounterUpdate,
@@ -199,7 +199,7 @@ pub(crate) async fn stage_usage(
 }
 
 /// Stages and commits `update` in its own transaction.
-pub(crate) async fn apply(
+pub async fn apply(
     handle: &StorageHandle,
     update: InventoryUpdate,
 ) -> Result<bool, InventoryError> {
@@ -209,7 +209,7 @@ pub(crate) async fn apply(
     Ok(commit(handle, txn_id).await)
 }
 
-pub(crate) async fn get(handle: &StorageHandle, key_space: &str, key: Vec<u8>) -> Option<Vec<u8>> {
+pub async fn get(handle: &StorageHandle, key_space: &str, key: Vec<u8>) -> Option<Vec<u8>> {
     let event = handle
         .send_storage_effect(StorageEffect::Read {
             key_space: key_space.to_string(),
@@ -223,7 +223,7 @@ pub(crate) async fn get(handle: &StorageHandle, key_space: &str, key: Vec<u8>) -
     }
 }
 
-pub(crate) async fn counters(handle: &StorageHandle, key: Vec<u8>) -> RangeCounters {
+pub async fn counters(handle: &StorageHandle, key: Vec<u8>) -> RangeCounters {
     get(handle, RANGE_COUNTER_KEYSPACE, key)
         .await
         .map_or_else(RangeCounters::default, |value| {
@@ -231,11 +231,11 @@ pub(crate) async fn counters(handle: &StorageHandle, key: Vec<u8>) -> RangeCount
         })
 }
 
-pub(crate) async fn has_row(handle: &StorageHandle, position: Vec<u8>) -> bool {
+pub async fn has_row(handle: &StorageHandle, position: Vec<u8>) -> bool {
     get(handle, INVENTORY_KEYSPACE, position).await.is_some()
 }
 
-pub(crate) fn context(handle: &StorageHandle) -> crate::driver::DriverContext {
+pub fn context(handle: &StorageHandle) -> crate::driver::DriverContext {
     crate::driver::DriverContext {
         storage_handle: handle.clone(),
         net_handle: None,
@@ -248,11 +248,7 @@ pub(crate) fn context(handle: &StorageHandle) -> crate::driver::DriverContext {
     }
 }
 
-pub(crate) async fn account(
-    handle: &StorageHandle,
-    set_id: Ulid,
-    range_id: Ulid,
-) -> Option<RangeAccount> {
+pub async fn account(handle: &StorageHandle, set_id: Ulid, range_id: Ulid) -> Option<RangeAccount> {
     get(
         handle,
         RANGE_ACCOUNT_KEYSPACE,
@@ -263,12 +259,12 @@ pub(crate) async fn account(
 }
 
 /// A write of a new current version `seed` of `size` bytes at generation 1.
-pub(crate) fn write(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryUpdate {
+pub fn write(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryUpdate {
     InventoryUpdate::new(write_change(set_id, key, seed, size))
 }
 
 /// The change [`write`] applies.
-pub(crate) fn write_change(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryChange {
+pub fn write_change(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryChange {
     let version_id = Ulid::from_bytes([seed; 16]);
     let entry = VersionEntry {
         marker: false,
@@ -295,7 +291,7 @@ pub(crate) fn write_change(set_id: Ulid, key: &str, seed: u8, size: u64) -> Inve
 }
 
 /// Removes a key's head and the versions `seeds`.
-pub(crate) fn purge(set_id: Ulid, key: &str, seeds: &[u8]) -> InventoryUpdate {
+pub fn purge(set_id: Ulid, key: &str, seeds: &[u8]) -> InventoryUpdate {
     let mut change = InventoryChange::new(set_id, key);
     change.removed = seeds
         .iter()
@@ -306,7 +302,7 @@ pub(crate) fn purge(set_id: Ulid, key: &str, seeds: &[u8]) -> InventoryUpdate {
 }
 
 /// Counters of `objects` current versions holding `bytes`, one version each, at epoch 1.
-pub(crate) fn exact(objects: i128, bytes: i128) -> RangeCounters {
+pub fn exact(objects: i128, bytes: i128) -> RangeCounters {
     RangeCounters {
         objects,
         current_bytes: bytes,
@@ -318,7 +314,7 @@ pub(crate) fn exact(objects: i128, bytes: i128) -> RangeCounters {
 }
 
 /// Writes `count` sample entries of range `range_seed` with priorities from 1 upwards.
-pub(crate) async fn crowd_sample(handle: &StorageHandle, set_id: Ulid, range_seed: u8, count: u64) {
+pub async fn crowd_sample(handle: &StorageHandle, set_id: Ulid, range_seed: u8, count: u64) {
     use aruna_core::keyspaces::KEY_SAMPLE_KEYSPACE;
     use aruna_core::structs::storage::distribution::accounting::SampleEntry;
 
@@ -350,13 +346,13 @@ pub(crate) async fn crowd_sample(handle: &StorageHandle, set_id: Ulid, range_see
 }
 
 /// A range index feeder for tests: its passes keep their cursors, as the node's loop does.
-pub(crate) struct Feeder {
+pub struct Feeder {
     limits: crate::distribution::feed_walks::FeedLimits,
     cursors: crate::distribution::feed_walks::FeedCursors,
 }
 
 impl Feeder {
-    pub(crate) fn new(limits: crate::distribution::feed_walks::FeedLimits) -> Self {
+    pub fn new(limits: crate::distribution::feed_walks::FeedLimits) -> Self {
         Self {
             limits,
             cursors: Default::default(),
@@ -364,7 +360,7 @@ impl Feeder {
     }
 
     /// One bounded pass over each walk; true when it changed an index or a row.
-    pub(crate) async fn pass(&mut self, context: &crate::driver::DriverContext) -> bool {
+    pub async fn pass(&mut self, context: &crate::driver::DriverContext) -> bool {
         use crate::distribution::feed_walks::FeedPassOperation;
         let cursors = std::mem::take(&mut self.cursors);
         let pass = FeedPassOperation::new(self.limits, cursors);

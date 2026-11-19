@@ -102,7 +102,7 @@ pub(crate) type Turn = Arc<tokio::sync::Mutex<()>>;
 impl RangeTurns {
     /// The turns of `ranges`, keyed by set and range, in key order. Holding every lock in this
     /// order is what lets jobs share ranges; the turns end when the guards drop.
-    pub(crate) fn turn_locks(&self, ranges: &BTreeSet<(Ulid, Ulid)>) -> Vec<Turn> {
+    pub fn turn_locks(&self, ranges: &BTreeSet<(Ulid, Ulid)>) -> Vec<Turn> {
         let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         // A turn nobody holds or waits for is dropped.
         map.retain(|_, turn| Arc::strong_count(turn) > 1);

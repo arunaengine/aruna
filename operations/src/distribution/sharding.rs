@@ -71,7 +71,7 @@ pub(crate) struct MaintainCursors {
 
 /// One finished pass: when the next should run, and where it goes on.
 #[derive(Debug, PartialEq)]
-pub(crate) struct MaintainPass {
+pub struct MaintainPass {
     after: Duration,
     cursors: MaintainCursors,
     imports: Vec<KeptStart>,
@@ -80,7 +80,7 @@ pub(crate) struct MaintainPass {
 impl MaintainPass {
     /// Keeps the cursors for the next pass; returns when it should run and the handed imports
     /// to start now.
-    pub(crate) fn finish(self) -> (Duration, Vec<KeptStart>) {
+    pub fn finish(self) -> (Duration, Vec<KeptStart>) {
         if let Ok(mut kept) = CURSORS.lock() {
             *kept = Some(self.cursors);
         }
@@ -130,7 +130,7 @@ enum MaintainStep {
 
 /// See [`maintain_ranges`].
 #[derive(Debug, PartialEq)]
-pub(crate) struct MaintainRangesOperation {
+pub struct MaintainRangesOperation {
     ids: NodeRealm,
     cursors: MaintainCursors,
     inputs: BalanceInputs,
