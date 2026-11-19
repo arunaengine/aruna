@@ -206,8 +206,12 @@ impl DrainOutboxOperation {
     /// Hands the publish's calls on, or moves to the next entry once it ended.
     fn after_publish(&mut self, step: Result<Next<PublishOutcome>, LifecycleError>) -> Step {
         match step {
-            // A publish ends its entry without calls made after a commit.
-            Ok(Next::Done(_) | Next::Then { .. }) => self.next_entry(),
+            Ok(Next::Done(_)) => self.next_entry(),
+            Ok(Next::Then { .. }) => Err(LifecycleError::UnexpectedEvent {
+                state: "drain".to_string(),
+                expected: "a publish outcome",
+                got: "an outcome with calls after a commit",
+            }),
             Ok(Next::Call(call)) => Ok(Next::Call(call)),
             Ok(Next::Wait) => Ok(Next::Wait),
             Err(error) => {
