@@ -59,10 +59,9 @@ enum UpdateStage {
     Forward,
 }
 
-/// Updates one document. On a device a selected or read document is edited locally and
-/// queued; a holder sees the change set when the intake drain forwards it. Otherwise this node
-/// updates its own copy when it holds the document, and hands the change to the other holders
-/// when it does not or its history is full. A known record pins the holders to its frozen set.
+/// Updates one document. A device edits a selected or read document locally and queues it for
+/// the intake drain; a holder updates its own copy, and hands the change to the other holders
+/// when it holds none or its history is full. A known record pins the holders to its frozen set.
 #[derive(Debug, PartialEq)]
 pub struct RouteUpdateOperation {
     actor: Actor,

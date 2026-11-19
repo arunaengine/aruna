@@ -43,9 +43,8 @@ enum ListStage {
 }
 
 /// Gathers the group's audit trail from every eligible realm node within `wait` and merges the
-/// pages. This node reads its own keyspace when the realm still authorizes it; the other nodes
-/// are asked over the metadata control transport. Membership and its digest are eventual
-/// candidates, which each peer revalidates.
+/// pages: its own keyspace while the realm authorizes it, the others over the control transport.
+/// Membership and its digest are eventual candidates, which each peer revalidates.
 #[derive(Debug, PartialEq)]
 pub struct AuditListOperation {
     realm_id: RealmId,

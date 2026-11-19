@@ -66,9 +66,8 @@ enum BaseStage {
 }
 
 /// Refuses a revision-checked change this holder cannot plan yet: a base other than its newest
-/// event is a conflict, and one its graph has not applied (a status short of it, a received
-/// event not handed on yet, or a queued materialization job) is retryable. The transactional
-/// revision check still runs later.
+/// event conflicts; one its graph has not applied (status short of it, event not handed on, job
+/// queued) is retryable. The transactional revision check still runs later.
 #[derive(Debug, PartialEq)]
 pub struct ReadyBaseOperation {
     document_id: Ulid,

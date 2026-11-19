@@ -46,10 +46,9 @@ enum ReadStage {
     Kept(MetadataRegistryRecord),
 }
 
-/// Reads one registry record on its holders, this node's own copy among them, all at once
-/// under one deadline. A device answers from its pinned replica, so a selected document stays
-/// readable while the realm is out of reach; an unselected replica answers only when the realm
-/// is unavailable, and the owner's own online read is kept for offline use.
+/// Reads one registry record on its holders, this node's copy among them, at once under one
+/// deadline. A device answers from its pinned replica; an unselected replica answers only while
+/// the realm is out of reach, and the owner's online read is kept for offline use.
 #[derive(Debug, PartialEq)]
 pub struct RoutedReadOperation {
     local_node: Option<NodeId>,

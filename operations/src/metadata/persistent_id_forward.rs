@@ -664,10 +664,9 @@ enum ServeStage {
     Answer,
 }
 
-/// Applies a PID transition or answers a landing resolution or status read forwarded to this
-/// node as the document's authority. Transitions carry the caller's authority, so the WRITE
-/// check of the origin's handler runs here again; a mint is attributed only to the token's own
-/// subject.
+/// Applies a PID transition, or answers a landing resolution or status read, forwarded to this
+/// node as the document's authority. A transition runs the origin's WRITE check again with the
+/// caller's authority, and a mint is attributed only to the token's own subject.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ServePidOperation {
     peer: NodeId,

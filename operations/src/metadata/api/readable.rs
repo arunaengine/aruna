@@ -19,10 +19,9 @@ use crate::auth::enforcement::{policy_reads, read_policies};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::errors::AuthorizationError;
 
-/// Whether the caller may read `record`. A public record needs only the realm and group
-/// policies; a private one needs the caller's read permission on its path and the policies too.
-/// Every denial reads as not found, so read-by-id is no existence oracle. Its reads are one
-/// batch, so a parent in a transaction can run it embedded.
+/// Whether the caller may read `record`: the realm and group policies, and for a private record
+/// the caller's read permission on its path. Every denial reads as not found, so read-by-id is
+/// no existence oracle; its reads are one batch, so a transaction can run it embedded.
 #[derive(Debug, PartialEq)]
 pub struct RecordReadableOperation {
     realm_id: RealmId,

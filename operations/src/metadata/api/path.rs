@@ -291,9 +291,8 @@ enum LookupStage {
 }
 
 /// Resolves a group path to its winning document under one deadline. Without a local node, or
-/// for a local lookup, this node's claims decide. A node outside the sync set forwards the
-/// resolution to ranked peers; a sync node asks the holders of every shard the path may sit on,
-/// itself included, and merges their claims.
+/// for a local lookup, this node's claims decide; a node outside the sync set forwards to ranked
+/// peers, and a sync node merges the claims of every shard's holders, itself included.
 #[derive(Debug, PartialEq)]
 pub struct LookupPathOperation {
     realm_id: RealmId,
