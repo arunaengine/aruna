@@ -38,6 +38,7 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
+use aruna_core::structs::storage::listing::ListVersionsItem;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskKey;
@@ -53,9 +54,7 @@ use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation, H
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_operations::s3::object::versions::{
-    ListVersionsInput, ListVersionsItem, ListVersionsOperation,
-};
+use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::testing::fresh_job_id;
 use aruna_storage::storage;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};

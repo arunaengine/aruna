@@ -25,6 +25,7 @@ pub mod holders;
 pub mod key_audit;
 pub mod link;
 pub mod linked_job;
+pub mod listing;
 pub mod metadata_registry;
 pub mod multipart;
 pub mod node_info;

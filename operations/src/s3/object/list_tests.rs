@@ -1153,11 +1153,12 @@ async fn markers_skipped() {
 
 #[tokio::test]
 async fn pending_archives_listed() {
-    use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+    use crate::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
     use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
     use aruna_core::structs::storage::blob::ArchiveKey;
     use aruna_core::structs::storage::encryption::BucketKeyRef;
     use aruna_core::structs::storage::format::PithosLayout;
+    use aruna_core::structs::storage::listing::ListVersionsItem;
 
     let (_temp_handle, storage_handle) = test_storage();
     let driver_ctx = test_context(storage_handle.clone());

@@ -26,8 +26,8 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::s3::object::versions::{ListVersionsItem, ListVersionsResult};
 use aruna_core::structs::storage::blob::common_prefix_of;
+use aruna_core::structs::storage::listing::{ListVersionsItem, ListVersionsResult};
 
 /// Interval reads one page issues at most before it ends truncated.
 const MAX_ROUNDS: usize = 64;

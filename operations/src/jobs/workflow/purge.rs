@@ -38,22 +38,20 @@ use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::release::BucketScope;
 use crate::s3::fence_store::AcquireFenceOperation;
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
-use crate::s3::multipart::uploads::{
-    ListUploadsError, ListUploadsInput, ListUploadsOperation, ListUploadsResult,
-};
+use crate::s3::multipart::uploads::{ListUploadsError, ListUploadsInput, ListUploadsOperation};
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation, BulkDeleteOutcome,
 };
 use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
-use crate::s3::object::versions::{
-    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
-    ListVersionsResult,
-};
+use crate::s3::object::versions::{ListVersionsError, ListVersionsInput, ListVersionsOperation};
 use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::storage::listing::{
+    ListUploadsResult, ListVersionsItem, ListVersionsResult,
+};
 
 const PURGE_BATCH_SIZE: usize = 1_000;
 /// How often a paused purge looks whether it was resumed.

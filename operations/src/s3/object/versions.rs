@@ -12,13 +12,13 @@ use aruna_core::keyspaces::{
     NODE_SUBJECT_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::storage::listing::{ListVersionsItem, ListVersionsResult};
 use aruna_core::types::{Key, Value};
 use std::collections::VecDeque;
 use std::time::SystemTime;
@@ -92,35 +92,6 @@ pub struct ListVersionsInput {
     pub key_marker: Option<String>,
     pub version_id_marker: Option<Ulid>,
     pub max_keys: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ListVersionsItem {
-    Version {
-        key: String,
-        version_id: Ulid,
-        is_latest: bool,
-        location: Option<BackendLocation>,
-        source_metadata: Option<SourceMetadata>,
-        created_at: SystemTime,
-        /// A link's binding, so a listing shows it only to callers who may read its target.
-        link: Option<aruna_core::structs::execution::staging::VersionSourceBinding>,
-    },
-    DeleteMarker {
-        key: String,
-        version_id: Ulid,
-        is_latest: bool,
-        created_at: SystemTime,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListVersionsResult {
-    pub items: Vec<ListVersionsItem>,
-    pub common_prefixes: Vec<String>,
-    pub is_truncated: bool,
-    pub next_key_marker: Option<String>,
-    pub next_version_marker: Option<Ulid>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -679,6 +650,7 @@ impl Operation for ListVersionsOperation {
 #[cfg(test)]
 mod test {
     use super::*;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_drivers::driver::drive;
 
     fn limited_rounds(
