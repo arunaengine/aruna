@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
     RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, RangeAccount, RangeCounters, RangeSlot, Rebuild, SAMPLE_SIZE, SampleEntry, account_key,
     generation_key, pending_key, sample_count_key, sample_prefix, slot_key,
@@ -282,12 +282,12 @@ impl Operation for SplitOperation {
                 IoCall::Write(self.plan(sample)?)
             }
             State::Write => {
-                done(result)?;
+                result.done()?;
                 self.state = State::Delete;
                 IoCall::Delete(std::mem::take(&mut self.deletes))
             }
             State::Delete => {
-                done(result)?;
+                result.done()?;
                 self.state = State::Count;
                 IoCall::AddCounters {
                     space: RANGE_COUNTER_KEYSPACE.to_string(),
@@ -295,7 +295,7 @@ impl Operation for SplitOperation {
                 }
             }
             State::Count => {
-                done(result)?;
+                result.done()?;
                 return Ok(Next::Done(()));
             }
         };

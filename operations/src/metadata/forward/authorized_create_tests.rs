@@ -118,7 +118,7 @@ fn routed_create_emits() {
         panic!("expected the record with its watch event");
     };
     assert_eq!(output, record(document_id));
-    assert!(matches!(calls.as_slice(), [IoCall::Child(_)]));
+    assert!(matches!(calls.as_slice(), [IoCall::Write(_), IoCall::Effect(_)]));
 }
 
 #[test]

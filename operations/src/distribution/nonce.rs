@@ -6,7 +6,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::DELEGATION_NONCE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, done, read_row, values};
+use aruna_core::rows::{PrefixPages, read_row, values};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -70,7 +70,7 @@ impl Operation for SpendNonceOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, NonceError> {
         if self.written {
-            done(result)?;
+            result.done()?;
             let prune = IoCall::child(PruneNoncesOperation::new(self.now));
             return Ok(Next::Then {
                 output: (),
@@ -127,7 +127,7 @@ impl Operation for PruneNoncesOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, NonceError> {
         if self.deleting {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         let expired = |key: &[u8]| {

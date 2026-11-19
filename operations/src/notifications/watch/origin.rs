@@ -12,9 +12,7 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
-use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind, watch_path_matches,
-};
+use aruna_core::structs::execution::notification_watch::{WatchEvent, watch_path_matches};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::GroupId;
 use tracing::warn;
@@ -274,18 +272,14 @@ impl EmitEventOperation {
         document_path: &str,
         event_id: Ulid,
     ) -> Self {
-        Self::new(WatchEvent {
-            event_id,
+        Self::new(WatchEvent::metadata_created(
             realm_id,
-            kind: WatchEventKind::MetadataCreated,
-            path: format!("meta/{group_id}/{document_path}"),
             actor,
-            occurred_at_ms: event_id.timestamp_ms(),
-            detail: WatchEventDetail::MetadataCreated {
-                group_id,
-                document_id,
-            },
-        })
+            group_id,
+            document_id,
+            document_path,
+            event_id,
+        ))
     }
 }
 

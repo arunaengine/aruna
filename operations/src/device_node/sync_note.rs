@@ -8,7 +8,6 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::SYNC_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::done;
 use aruna_core::types::Key;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -117,7 +116,7 @@ impl Operation for NoteSyncOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, NoteError> {
         if self.read {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         self.read = true;

@@ -8,7 +8,6 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{DEADLINE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::page;
 use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::execution::job::{JobFamilyId, SubmissionId};
 use aruna_core::types::{Key, Value};
@@ -177,7 +176,7 @@ impl Operation for WitnessDrainOperation {
     fn next(&mut self, result: IoResult) -> DrainNext {
         match std::mem::replace(&mut self.step, DrainStep::Scan) {
             DrainStep::Scan => {
-                let (mut rows, next) = page(result)?;
+                let (mut rows, next) = result.page()?;
                 rows.reverse();
                 self.rows = rows;
                 self.remaining = next.is_some();

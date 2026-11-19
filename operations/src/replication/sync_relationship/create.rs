@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, read_row, values};
+use aruna_core::rows::{PrefixPages, read_row, values};
 use aruna_core::structs::{SyncRelationship, SyncState};
 use aruna_core::types::Value;
 use byteview::ByteView;
@@ -129,7 +129,7 @@ impl Operation for CreateRelationshipOperation {
                 self.claim(value)
             }
             Phase::Writing => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.relationship.clone()))
             }
         }

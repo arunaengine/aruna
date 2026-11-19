@@ -151,12 +151,12 @@ impl Operation for ListSharesOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ShareStoreError> {
         if !self.reading {
-            let (values, next) = rows::page(result)?;
+            let (values, next) = result.page()?;
             self.next = next;
             return Ok(Next::Call(self.index_page(values)?));
         }
         // An index row whose record is gone is skipped.
-        for value in rows::all_values(result)?.into_iter().flatten() {
+        for value in result.values()?.into_iter().flatten() {
             let link = ShareLink::from_bytes(&value)?;
             if link.created_by != self.owner {
                 return Err(ShareStoreError::UnexpectedEvent);
@@ -229,7 +229,7 @@ impl Operation for LogShareOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ShareStoreError> {
         if self.written {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         let uses = result.value()?;
@@ -271,7 +271,7 @@ impl Operation for ReadUsesOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ShareStoreError> {
-        let values = rows::all_values(result)?;
+        let values = result.values()?;
         if values.len() != self.ids.len() {
             return Err(ShareStoreError::UnexpectedEvent);
         }
@@ -333,7 +333,7 @@ impl Operation for ShareEventsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ShareStoreError> {
-        let (values, next) = rows::page(result)?;
+        let (values, next) = result.page()?;
         Ok(Next::Done(self.page(values, next.is_some())?))
     }
 }

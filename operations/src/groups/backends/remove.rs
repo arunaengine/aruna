@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork, BlobLocationKey};
 use aruna_core::structs::storage::group_backend::{
     BUCKET_DELETING, GroupStorage, GroupStorageSecret,
@@ -246,7 +246,7 @@ impl Operation for RemoveBackendOperation {
                 self.handle_record(value)
             }
             RemoveState::DeleteRecords => {
-                done(result)?;
+                result.done()?;
                 self.state = RemoveState::DeleteSecret;
                 // The runner puts the vault delete into this operation's transaction.
                 let entry = GroupStorageSecret::vault_entry(self.backend_id);

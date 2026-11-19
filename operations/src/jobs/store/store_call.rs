@@ -8,7 +8,7 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::types::{Key, KeySpace, Value};
 use ulid::Ulid;
 
@@ -235,7 +235,7 @@ impl Operation for RowBatch {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, JobMutationError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }

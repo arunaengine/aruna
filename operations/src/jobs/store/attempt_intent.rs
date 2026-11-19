@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 
 use super::mutation::{read_record, record_read};
 use super::*;
@@ -160,14 +160,14 @@ impl Operation for RecordIntentOperation {
                 Ok(Next::Done(AttemptCommit { record, control }))
             }
             IntentStep::Write => {
-                done(result)?;
+                result.done()?;
                 self.step = IntentStep::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             IntentStep::Delete => {
-                done(result)?;
+                result.done()?;
                 let (record, control) = self
                     .commit
                     .take()

@@ -12,7 +12,7 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{reducer_state_entry, sync_revision_entry};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -315,7 +315,7 @@ impl Operation for ServiceWrite {
                 self.handle_config(value)
             }
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 if self.fence.is_empty() {
                     return self.committed();
                 }

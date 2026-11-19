@@ -10,7 +10,6 @@ use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
-use aruna_core::rows;
 use aruna_core::structs::execution::harvest::{RepositoryConnector, RepositoryConnectorKind};
 use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::types::GroupId;
@@ -231,7 +230,7 @@ impl Operation for CreateConnectorOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, CreateConnectorError> {
-        crate::groups::fence::group_write_result(rows::event(result)?)?;
+        crate::groups::fence::group_write_result(result.event()?)?;
         let result = self.result.take().ok_or(CreateConnectorError::Failed)?;
         Ok(Next::Done(result))
     }

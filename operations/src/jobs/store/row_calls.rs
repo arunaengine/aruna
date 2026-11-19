@@ -4,7 +4,6 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, page};
 use aruna_core::structs::execution::job::{
     KeyWait, LocalCrate, RunLink, decode_job_record, parse_schedule_key, parse_wait_key,
     run_crate_key,
@@ -262,7 +261,7 @@ impl<T: Send + std::fmt::Debug> Operation for PageRead<T> {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<T>, JobMutationError> {
-        let (rows, next) = page(result)?;
+        let (rows, next) = result.page()?;
         (self.decode)(rows, next).map(Next::Done)
     }
 }
@@ -382,7 +381,7 @@ impl Operation for StagingDeletesOperation {
     }
 
     fn next(&mut self, result: IoResult) -> StagingNext {
-        let (rows, next) = page(result)?;
+        let (rows, next) = result.page()?;
         self.more |= next.is_some();
         let space = STAGING_SPACES[self.space];
         let deletes = rows.into_iter().map(|(key, _)| (space.to_string(), key));
@@ -423,10 +422,10 @@ impl Operation for FirstScheduleOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, JobMutationError> {
         if self.deleting {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(None));
         }
-        let (rows, _) = page(result)?;
+        let (rows, _) = result.page()?;
         let Some((key, _)) = rows.into_iter().next() else {
             return Ok(Next::Done(None));
         };
@@ -550,11 +549,11 @@ impl Operation for WakePageOperation {
     fn next(&mut self, result: IoResult) -> WakeNext {
         match self.step {
             WakeStep::Page => {
-                let (rows, _) = page(result)?;
+                let (rows, _) = result.page()?;
                 self.full = rows.len() == WAKE_PAGE;
                 self.rows = rows.into_iter().rev().map(|(key, _)| key).collect();
             }
-            WakeStep::Delete => done(result)?,
+            WakeStep::Delete => result.done()?,
             WakeStep::Satisfy => {
                 if result.child::<bool, JobMutationError>()?? {
                     self.woken += 1;

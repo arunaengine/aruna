@@ -13,13 +13,16 @@ use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{
     ImportReportDetail, ImportReportRow, ImportRoCrateSource, ReasonCode,
 };
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, schedule_watch_drain, watch_event_entry,
+};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::data::identity::normalized_id;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::release::MembershipQuery;
-use tracing::info;
+use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::plan::{federated_call, federated_result, metadata_permission_call};
@@ -48,7 +51,6 @@ use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperat
 use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::update_document::UpdateDocumentError;
-use crate::notifications::watch::origin::EmitEventOperation;
 use crate::s3::bucket::release::BucketScope;
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{
@@ -287,19 +289,32 @@ impl Operation for CreateDatasetOperation {
                 }
                 self.step = CreateStep::Emit;
                 let auth = &spec.auth_context;
-                Ok(Next::Call(IoCall::child(
-                    EmitEventOperation::metadata_created(
-                        auth.realm_id,
-                        auth.user_id,
-                        created.record.group_id,
-                        created.record.document_id,
-                        &created.record.document_path,
-                        created.event_id,
-                    ),
-                )))
+                let event = WatchEvent::metadata_created(
+                    auth.realm_id,
+                    auth.user_id,
+                    created.record.group_id,
+                    created.record.document_id,
+                    &created.record.document_path,
+                    created.event_id,
+                );
+                match watch_event_entry(&event) {
+                    Ok(entry) => Ok(Next::Call(IoCall::Write(vec![entry]))),
+                    Err(error) => {
+                        warn!(%error, "The import's watch event could not be queued");
+                        Ok(Next::Done(self.checkpoint.clone()))
+                    }
+                }
             }
-            // Failures only warn inside the operation.
-            CreateStep::Emit => Ok(Next::Done(self.checkpoint.clone())),
+            // A failed queue write only warns, as a failed emission did.
+            CreateStep::Emit => {
+                if let Err(error) = result.done() {
+                    warn!(%error, "The import's watch event could not be queued");
+                }
+                Ok(Next::Then {
+                    output: self.checkpoint.clone(),
+                    calls: vec![IoCall::from(schedule_watch_drain())],
+                })
+            }
         }
     }
 }

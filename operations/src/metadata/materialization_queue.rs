@@ -23,7 +23,7 @@ use aruna_core::metadata::{
     MetadataRequestDurability, ProfileValidationStatus, deterministic_materialization_actor,
 };
 use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
-use aruna_core::rows::{all_values, event, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     dead_letter_entry, dead_letter_key, document_job_entry, document_job_key, document_job_prefix,
     event_log_key, materialization_job_entry, materialization_job_key,
@@ -528,7 +528,7 @@ impl Operation for MaterializationBatchOperation {
                 Err(error) => self.finish_failed(error.into()),
             },
             // A sync without a free background slot runs inline, so no materialization skips it.
-            BatchStage::Sync(sync) => match event(result) {
+            BatchStage::Sync(sync) => match result.event() {
                 Ok(Event::Task(TaskEvent::BackgroundStarted { started: true })) => self.sync(),
                 Ok(Event::Task(TaskEvent::BackgroundStarted { started: false })) => {
                     warn!(graph_iri = %sync.graph_iri, "No background slot for the metadata graph sync after materialization; waiting for it");
@@ -671,7 +671,7 @@ impl Operation for PlanFinishOperation {
 
     fn next(&mut self, result: IoResult) -> MaterializationTurn<FinishPlan> {
         match std::mem::replace(&mut self.stage, PlanStage::Read) {
-            PlanStage::Read => self.plan(all_values(result)?),
+            PlanStage::Read => self.plan(result.values()?),
             PlanStage::Queue(mut plan) => {
                 match result.child::<Vec<(String, Key, Value)>, LinkError>() {
                     Ok(Ok(rows)) => plan.writes.extend(rows),
@@ -1416,8 +1416,8 @@ impl Operation for DueJobsOperation {
                 self.next = next;
                 self.scanned(rows)
             }
-            ScanStage::Sidecars(slice) => self.sidecars(slice, all_values(result)?),
-            ScanStage::Live(due) => self.live(due, all_values(result)?),
+            ScanStage::Sidecars(slice) => self.sidecars(slice, result.values()?),
+            ScanStage::Live(due) => self.live(due, result.values()?),
             ScanStage::Prune(full) => {
                 pruned(result)?;
                 self.after_prune(full)
@@ -2244,7 +2244,7 @@ fn graph_call(effect: MetadataEffect) -> Next<ProcessedMaterializationJob> {
 
 /// The graph store's answer to one metadata effect; an error answer is the effect's failure.
 fn graph_event(result: IoResult) -> Result<MetadataEvent, MetadataMaterializationError> {
-    match event(result)? {
+    match result.event()? {
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error.into()),
         Event::Metadata(answer) => Ok(answer),
         other => Err(MetadataMaterializationError::UnexpectedEvent(
@@ -2624,7 +2624,7 @@ impl Operation for PruneJobsOperation {
 
     fn next(&mut self, result: IoResult) -> MaterializationTurn<()> {
         match self.stage {
-            PruneStage::Read => self.delete(all_values(result)?),
+            PruneStage::Read => self.delete(result.values()?),
             PruneStage::Delete => {
                 result.done()?;
                 Ok(Next::Done(()))

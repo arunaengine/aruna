@@ -20,7 +20,7 @@ use aruna_core::keyspaces::{
     SEARCH_INDEX_KEYSPACE, SOURCE_ROOT_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, values};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo, HiddenBlobKey};
 use aruna_core::structs::storage::distribution::DistributionBinding;
@@ -244,7 +244,7 @@ impl Operation for DeleteRowsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, PurgeError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -287,7 +287,7 @@ impl Operation for ClearPrefixOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, PurgeError> {
         if self.deleting {
-            done(result)?;
+            result.done()?;
             return Ok(self.page());
         }
         let (rows, _) = result.page()?;
@@ -366,7 +366,7 @@ impl Operation for DropAttachmentOperation {
             return Ok(Next::Done(()));
         }
         if let Some(location) = self.location.take() {
-            done(result)?;
+            result.done()?;
             self.deleted = true;
             return Ok(Next::Call(IoCall::child(DropCopyOperation::new(location))));
         }
@@ -449,7 +449,7 @@ impl Operation for DropCachedOperation {
         match std::mem::replace(&mut self.state, CachedState::Read) {
             CachedState::Read => self.plan(result),
             CachedState::Delete { totals, entry } => {
-                done(result)?;
+                result.done()?;
                 self.state = CachedState::Write {
                     location: entry.location,
                 };
@@ -457,7 +457,7 @@ impl Operation for DropCachedOperation {
                 Ok(Next::Call(write))
             }
             CachedState::Write { location } => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Then {
                     output: (),
                     calls: vec![IoCall::child(DropCopyOperation::new(location))],
@@ -568,7 +568,7 @@ impl Operation for DebitRowsOperation {
         match self.state {
             DebitState::Read => Ok(Next::Call(self.plan(result.values()?)?)),
             DebitState::Delete => {
-                done(result)?;
+                result.done()?;
                 if self.deltas.is_empty() {
                     return Ok(Next::Done(()));
                 }
@@ -579,14 +579,14 @@ impl Operation for DebitRowsOperation {
                 }))
             }
             DebitState::Count => {
-                done(result)?;
+                result.done()?;
                 self.state = DebitState::Mark;
                 // The share moves without the group counters, so the group is published again.
                 let writes = dirty_rows([self.group_id], self.mint.mint(self.now_ms));
                 Ok(Next::Call(IoCall::Write(writes)))
             }
             DebitState::Mark => {
-                done(result)?;
+                result.done()?;
                 // Scheduling the publish is best effort; the committed markers wait for it.
                 Ok(Next::Then {
                     output: (),
@@ -1033,7 +1033,7 @@ impl Operation for PurgeRangeOperation {
                 self.write_cursor()
             }
             RangeState::Written => {
-                done(result)?;
+                result.done()?;
                 self.turn()
             }
         }
@@ -1219,7 +1219,7 @@ impl Operation for DropResumeOperation {
                 Ok(Next::Call(delete_call(vec![row])))
             }
             ResumeState::Deleted => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }
@@ -1441,13 +1441,13 @@ impl Operation for ClearSetOperation {
                 self.next_drop()
             }
             ClearState::Deleted => {
-                done(result)?;
+                result.done()?;
                 let value = self.cursor.to_bytes().map_err(fault)?;
                 let write = write_call(DISTRIBUTION_PURGE_KEYSPACE, self.key.clone(), value);
                 self.call(ClearState::Written, write)
             }
             ClearState::Written => {
-                done(result)?;
+                result.done()?;
                 self.turn()
             }
             ClearState::Fence => {
@@ -1461,7 +1461,7 @@ impl Operation for ClearSetOperation {
                 self.next_transfer()
             }
             ClearState::Finished => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done((Purged::Done, self.pages)))
             }
         }

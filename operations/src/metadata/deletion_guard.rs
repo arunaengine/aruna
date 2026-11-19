@@ -8,7 +8,6 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::operation::{HoldScope, Operation, boxed_suboperation};
-use aruna_core::rows::event;
 use tracing::{debug_span, field};
 
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
@@ -201,7 +200,7 @@ impl Operation for DeletionGuardOperation {
             },
             // A mark the cache did not take only leaves the next check to read the row again.
             GuardStage::Store(deleted) => self.decided(deleted),
-            GuardStage::Run => match event(result)? {
+            GuardStage::Run => match result.event()? {
                 Event::Metadata(answer) => Ok(Next::Done(answer)),
                 other => Err(MetadataError::Backend(format!(
                     "unexpected metadata event: {}",
@@ -214,7 +213,7 @@ impl Operation for DeletionGuardOperation {
 
 // The graph store's answer to an effect a prune runs itself; an error answer fails the prune.
 fn graph_answer(result: IoResult) -> Result<MetadataEvent, MetadataError> {
-    match event(result)? {
+    match result.event()? {
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error),
         Event::Metadata(answer) => Ok(answer),
         other => Err(MetadataError::Backend(format!(

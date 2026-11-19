@@ -12,7 +12,7 @@ use aruna_core::repository::remote::NodeScope;
 use aruna_core::repository::{
     LinkStatus, RepositoryCredential, RepositoryLink, link_key, link_prefix,
 };
-use aruna_core::rows::{PrefixPages, all_values};
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::types::{Key, Value};
@@ -170,7 +170,7 @@ impl Operation for ListLinksOperation {
             self.links = Some(links);
             return Ok(Next::Call(IoCall::Read(reads)));
         };
-        let queued = all_values(result)?;
+        let queued = result.values()?;
         Ok(Next::Done(
             links
                 .into_iter()

@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::types::{Key, Value};
 use tracing::warn;
 
@@ -98,7 +98,7 @@ impl Operation for ScanRepairsOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<RepairScan>, SyncMirrorError> {
         if std::mem::take(&mut self.dropping) {
-            done(result)?;
+            result.done()?;
             return Ok(self.advance());
         }
         let rows = self.pages.take(result)?;

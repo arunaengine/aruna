@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -70,7 +70,7 @@ impl Operation for DeleteDraftOperation {
         match self.entry.take() {
             None => Ok(Next::Call(self.delete(result)?)),
             Some(entry) => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(*entry))
             }
         }

@@ -7,7 +7,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::GroupId;
 use std::time::{Duration, SystemTime};
@@ -112,7 +112,7 @@ impl Operation for SetDisabledOperation {
             let [value] = values::<1>(result)?;
             return self.handle_record(value);
         };
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(updated))
     }
 }

@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
+use std::time::Duration;
 
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -11,11 +12,14 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::UserId;
+use crate::effects::Effect;
 use crate::errors::ConversionError;
+use crate::keyspaces::WATCH_OUTBOX_KEYSPACE;
 use crate::structs::execution::notification::NotificationKind;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
-use crate::types::{GroupId, Key};
+use crate::task::{TaskEffect, TaskKey};
+use crate::types::{GroupId, Key, KeySpace, Value};
 
 pub const WATCH_USER_CAP: usize = 50;
 pub const MAX_PREFIX_LEN: usize = 1024;
@@ -237,6 +241,30 @@ impl WatchEvent {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// The event of every dataset creation path, so an import or a job notifies exactly like
+    /// `POST /metadata`. `event_id` dates it, keeping a retried create's inbox key stable.
+    pub fn metadata_created(
+        realm_id: RealmId,
+        actor: UserId,
+        group_id: GroupId,
+        document_id: Ulid,
+        document_path: &str,
+        event_id: Ulid,
+    ) -> Self {
+        Self {
+            event_id,
+            realm_id,
+            kind: WatchEventKind::MetadataCreated,
+            path: format!("meta/{group_id}/{document_path}"),
+            actor,
+            occurred_at_ms: event_id.timestamp_ms(),
+            detail: WatchEventDetail::MetadataCreated {
+                group_id,
+                document_id,
+            },
+        }
     }
 
     /// Maps this event to the recipient-facing notification kind. The event's
@@ -682,6 +710,23 @@ impl WatchInterestTable {
         matched.dedup();
         matched
     }
+}
+
+/// The row that asks the notification drain to emit `event`; a retried event keeps its row.
+pub fn watch_event_entry(event: &WatchEvent) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        WATCH_OUTBOX_KEYSPACE.to_string(),
+        Key::from(event.event_id.to_bytes().to_vec()),
+        Value::from(event.to_bytes()?),
+    ))
+}
+
+/// Arms the watch event drain now, so a queued event leaves right after its commit.
+pub fn schedule_watch_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainWatchEvents,
+        after: Duration::ZERO,
+    })
 }
 
 #[cfg(test)]

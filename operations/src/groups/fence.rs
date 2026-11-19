@@ -9,7 +9,6 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::GROUP_DELETE_KEYSPACE;
 use aruna_core::node_vault::VaultEntry;
 use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
-use aruna_core::rows::done;
 use aruna_core::structs::identity::group_delete::{GroupWriteError, check_group_write};
 use aruna_core::types::{GroupId, Key, TxnId, Value};
 
@@ -151,7 +150,7 @@ impl Operation for GroupWriteOperation {
                 _ => Err(GroupWriteError::Unexpected),
             },
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 let Some((entry, secret)) = self.secret.take() else {
                     return Ok(Next::Done(()));
                 };

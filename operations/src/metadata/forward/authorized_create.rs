@@ -10,6 +10,9 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, schedule_watch_drain, watch_event_entry,
+};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -17,6 +20,7 @@ use aruna_core::structured_id::StructuredId;
 use aruna_core::telemetry::record_stage;
 use aruna_core::types::GroupId;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use super::pinned::PinnedCreate;
@@ -34,7 +38,6 @@ use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::forward::holders::create_forward_holders;
 use crate::metadata::forward::replay::create_record_matches;
 use crate::metadata::forward::write::{MetadataWriteError, unexpected_response};
-use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::load_config::config_unavailable;
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::metadata::protocol::MetadataTransportMessage;
@@ -82,15 +85,15 @@ fn read_config(result: IoResult) -> Result<RealmConfigDocument, CreateAuthorized
     })
 }
 
-/// The created record, after the watch event of the create is sent; a failed emission only
-/// warns and never affects the create.
+/// The created record, after the watch event of the create is queued and the drain armed; a
+/// failed queue write only warns and never affects the create.
 fn emitted(
     realm_id: RealmId,
     user: aruna_core::UserId,
     created: CreateDocumentResult,
 ) -> CreateTurn {
     let record = created.record;
-    let emit = EmitEventOperation::metadata_created(
+    let event = WatchEvent::metadata_created(
         realm_id,
         user,
         record.group_id,
@@ -98,9 +101,19 @@ fn emitted(
         &record.document_path,
         created.event_id,
     );
+    let calls = match watch_event_entry(&event) {
+        Ok(entry) => vec![
+            IoCall::Write(vec![entry]),
+            IoCall::from(schedule_watch_drain()),
+        ],
+        Err(error) => {
+            warn!(%error, "The create's watch event could not be queued");
+            Vec::new()
+        }
+    };
     Ok(Next::Then {
         output: record,
-        calls: vec![IoCall::child(emit)],
+        calls,
     })
 }
 

@@ -15,7 +15,6 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::PLAN_EXPLAIN_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 use aruna_core::structs::execution::job::{
@@ -204,7 +203,7 @@ fn appended(result: IoResult) -> Result<bool, IoError> {
 }
 
 fn signed_frame(result: IoResult) -> Result<Option<JobRecordFrame>, IoError> {
-    Ok(match event(result)? {
+    Ok(match result.event()? {
         Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Signed(envelope))) => {
             JobRecordFrame::new(*envelope).ok()
         }
@@ -298,7 +297,7 @@ impl WitnessRoundOperation {
     }
 
     fn silence_read(&mut self, result: IoResult) -> RoundNext {
-        let Event::Net(NetEvent::HeartbeatSilence(silence)) = event(result)? else {
+        let Event::Net(NetEvent::HeartbeatSilence(silence)) = result.event()? else {
             return retry(self.base_ms()?);
         };
         let window_ms = self.facts()?.window_ms;

@@ -284,7 +284,7 @@ pub fn values<const N: usize>(result: IoResult) -> Result<[Option<Vec<u8>>; N], 
 
 /// Checks that a write or delete was answered.
 pub fn done(result: IoResult) -> Result<(), StoreError> {
-    Ok(rows::done(result)?)
+    Ok(result.done()?)
 }
 
 /// An answer the operation did not ask for.

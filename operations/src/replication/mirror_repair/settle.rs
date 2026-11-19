@@ -5,7 +5,6 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::structs::{SyncRelationship, sync_relationship_key};
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
@@ -104,7 +103,7 @@ impl Operation for SettleReconcileOperation {
             Phase::Record => self.check_record(one_value(result)?),
             Phase::Outgoing => self.check_outgoing(one_value(result)?),
             Phase::Claiming => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(RollbackClaim::Claimed))
             }
         }

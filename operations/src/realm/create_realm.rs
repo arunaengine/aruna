@@ -12,7 +12,6 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::reducer_state_entry;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{
@@ -373,7 +372,7 @@ impl Operation for CreateRealmOperation {
 
     /// A failed drain timer leaves the durable outbox retryable.
     fn next(&mut self, result: IoResult) -> Result<Next<CreatedRealm>, CreateRealmError> {
-        done(result)?;
+        result.done()?;
         let (Some(config), Some(auth)) = (self.config_doc.clone(), self.auth_doc.clone()) else {
             return Err(CreateRealmError::ConfigDocMissing);
         };

@@ -91,6 +91,8 @@ pub enum TaskKey {
     PruneConnectorReferences,
     /// Accounts recorded splits, rebuilds split children and splits ranges above thresholds.
     MaintainRanges,
+    /// Emits the watch events producers queued as rows, then deletes the rows.
+    DrainWatchEvents,
 }
 
 impl TaskKey {

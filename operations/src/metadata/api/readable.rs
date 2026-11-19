@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::rows::all_values;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -114,7 +113,7 @@ impl Operation for RecordReadableOperation {
             let elapsed = self.now_ms.saturating_sub(self.started_ms);
             record_stage("permission", Duration::from_millis(elapsed));
         }
-        let mut values = all_values(result)?;
+        let mut values = result.values()?;
         if let Some(check) = self.check.as_ref() {
             let rules = check.reads().map_err(permission_error)?.len();
             let policies = values.split_off(rules.min(values.len()));
@@ -210,7 +209,7 @@ impl Operation for PathPermissionOperation {
         }
         let elapsed = self.now_ms.saturating_sub(self.started_ms);
         record_stage("permission", Duration::from_millis(elapsed));
-        let mut values = all_values(result)?;
+        let mut values = result.values()?;
         let rules = self.check.reads().map_err(path_error)?.len();
         let policies = values.split_off(rules.min(values.len()));
         if !self.check.allowed(values).map_err(path_error)? {

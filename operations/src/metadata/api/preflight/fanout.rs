@@ -13,7 +13,6 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use tracing::Span;
@@ -327,7 +326,7 @@ impl Operation for ReferencesPreflightOperation {
                 Ok(Next::Call(IoCall::Effect(Box::new(sign))))
             }
             PreflightStage::Sign(unsigned) => {
-                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = event(result) else {
+                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = result.event() else {
                     return Err(MetadataApiError::Internal(
                         "net handle unavailable for preflight cursor signing".to_string(),
                     ));

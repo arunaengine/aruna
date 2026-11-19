@@ -6,7 +6,6 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::api::IdentifierMatch;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use ulid::Ulid;
@@ -122,7 +121,7 @@ impl Operation for AddIdentifiersOperation {
                 self.write(merged)
             }
             Step::Write => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done((self.take_merged()?, true)))
             }
         }

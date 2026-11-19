@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     UPLOAD_INVENTORY_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, read_row};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, Cursor, RangeAccount, RangeCounters, Rebuild, account_key,
     generation_key,
@@ -371,16 +371,16 @@ impl Operation for RebuildStepOperation {
                 self.plan_page(rows, truncated)
             }
             StepState::Write => {
-                done(result)?;
+                result.done()?;
                 let deletes = std::mem::take(&mut self.plan.deletes);
                 self.call(StepState::Delete, IoCall::Delete(deletes))
             }
             StepState::Delete => {
-                done(result)?;
+                result.done()?;
                 self.count_plan()
             }
             StepState::Count => {
-                done(result)?;
+                result.done()?;
                 self.finish()
             }
         }

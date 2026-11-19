@@ -9,7 +9,6 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{ASSISTANT_PROVIDER_KEYSPACE, PROVIDER_OWNER_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderSecret, AssistantSecretError,
 };
@@ -178,7 +177,7 @@ impl Operation for CreateProviderOperation {
                 Ok(Next::Call(self.write(&index)?))
             }
             CreateStage::Written => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.provider.clone()))
             }
         }
@@ -274,7 +273,7 @@ impl Operation for ListProviderOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ProviderStoreError> {
         if let Some(provider_ids) = self.provider_ids.take() {
             return Ok(Next::Done(
-                self.collect(&provider_ids, rows::all_values(result)?)?,
+                self.collect(&provider_ids, result.values()?)?,
             ));
         }
         let index = decode_index(result.value()?.as_ref())?;
@@ -341,7 +340,7 @@ impl Operation for UpdateProviderOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<AssistantProvider>, ProviderStoreError> {
         if self.written {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(self.provider.clone()));
         }
         self.check(result.value()?)?;
@@ -459,12 +458,12 @@ impl Operation for DeleteProviderOperation {
                 )])))
             }
             DeleteStage::Deleted(index) => {
-                rows::done(result)?;
+                result.done()?;
                 let (space, key) = owner_row(self.user_id);
                 Ok(Next::Call(IoCall::Write(vec![(space, key, index)])))
             }
             DeleteStage::Written => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }

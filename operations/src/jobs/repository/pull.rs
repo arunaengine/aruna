@@ -9,7 +9,6 @@ use aruna_core::repository::{
     LinkDirection, LinkFailure, LinkPull, LinkRemote, LinkStatus, PULL_CHECK_MS, PullCheck,
     PushOutcome, RepositoryLink, RepositoryPull, RepositoryRecord,
 };
-use aruna_core::rows::event;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobRecord, JobState,
@@ -295,7 +294,7 @@ impl Operation for StartPullOperation {
                 self.read_document()
             }
             PullStep::Document => {
-                let document = parse_registry_read(event(result)?)
+                let document = parse_registry_read(result.event()?)
                     .map_err(|error| LinkError::Unexpected(format!("{error:?}")))?
                     .ok_or(LinkError::NotHolder)?;
                 let pull = self.pull()?;

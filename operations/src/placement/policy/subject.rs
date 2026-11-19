@@ -6,7 +6,7 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, done, values};
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::PlacementSubject;
@@ -314,17 +314,17 @@ impl Operation for SubjectScanOperation {
                 self.handle_record(value)
             }
             ScanState::WriteRecord => {
-                done(result)?;
+                result.done()?;
                 Ok(self.scan_page())
             }
             ScanState::Scan => self.handle_page(result),
             ScanState::Gate => self.finish_gate(result),
             ScanState::Transition => {
-                done(result)?;
+                result.done()?;
                 self.next_copy()
             }
             ScanState::Clear => {
-                done(result)?;
+                result.done()?;
                 Ok(self.complete())
             }
         }

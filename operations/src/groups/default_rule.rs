@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, values};
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
@@ -448,7 +448,7 @@ impl Operation for DefaultWrite {
                 self.buckets_scanned(rows)
             }
             WriteStage::Write => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.routing()))
             }
         }

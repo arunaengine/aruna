@@ -10,7 +10,6 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{VISIBILITY_INDEX_KEYSPACE, VISIBILITY_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{all_values, event};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -266,7 +265,7 @@ fn scan_call(start: IterStart, limit: usize) -> IoCall {
 }
 
 fn scanned(result: IoResult) -> Result<PageRows, VisibilityError> {
-    Ok(parse_storage_scan(event(result)?)?)
+    Ok(parse_storage_scan(result.event()?)?)
 }
 
 fn evaluators_call(records: &[MetadataRegistryRecord]) -> IoCall {
@@ -938,7 +937,7 @@ impl Operation for VisibilityPassOperation {
                 self.load_group(*loads)
             }
             PassStage::Datestamps(visible) => {
-                let values = all_values(result)?;
+                let values = result.values()?;
                 let datestamps = (values.into_iter())
                     .map(datestamp_value)
                     .collect::<Result<Vec<_>, _>>()?;

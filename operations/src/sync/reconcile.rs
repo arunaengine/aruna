@@ -10,7 +10,6 @@ use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::realm::RealmId;
 
 /// Pulls `topics` from `peers` through net, then runs one reconcile pass over them.
@@ -90,7 +89,7 @@ impl Operation for SyncTopicsOperation {
             let reconciled = result.child::<DocumentReconcileResult, ApplyError>()??;
             return Ok(Next::Done(reconciled));
         }
-        match event(result)? {
+        match result.event()? {
             Event::Net(NetEvent::DocumentSync(fetched)) => self.reconcile(fetched),
             Event::Net(NetEvent::Error(error)) => Err(ApplyError::Failed(format!("{error:?}"))),
             other => Err(IoError::Unexpected {

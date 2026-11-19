@@ -12,7 +12,6 @@ use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, REGISTRY_CANDIDATE_LIMIT,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::event;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
@@ -139,7 +138,7 @@ impl Operation for GroupPurposeOperation {
                 if let Event::Metadata(MetadataEvent::Error {
                     error: MetadataError::HandleMissing,
                     ..
-                }) = event(result)?
+                }) = result.event()?
                 {
                     return Ok(Next::Done(None));
                 }

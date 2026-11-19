@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, PURGE_FENCE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, values};
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
@@ -192,14 +192,14 @@ impl Operation for NoteListingOperation {
                 }
             }
             NoteStep::Write => {
-                done(result)?;
+                result.done()?;
                 self.step = NoteStep::Retire;
                 let retired = std::mem::take(&mut self.note.retired).into_iter();
                 let deletes = retired.map(|key| (IMPORT_INTENT_KEYSPACE.to_string(), key));
                 Ok(Next::Call(IoCall::Delete(deletes.collect())))
             }
             NoteStep::Retire => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(true))
             }
         }

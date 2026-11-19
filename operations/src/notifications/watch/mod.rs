@@ -6,6 +6,7 @@
 mod authorization;
 pub mod check;
 pub mod digest;
+pub mod drain;
 #[cfg(test)]
 mod emit;
 #[cfg(test)]

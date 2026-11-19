@@ -12,7 +12,7 @@ use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::keyspaces::INPUT_PAGE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use aruna_core::structs::execution::job::{
@@ -220,7 +220,7 @@ impl Operation for LoadChainOperation {
             },
             Some(ChainStep::Fetch(digest, peer)) => self.fetched(digest, peer, result),
             Some(ChainStep::Keep(page)) => {
-                done(result)?;
+                result.done()?;
                 self.pages.push(*page);
                 self.read_next()
             }
@@ -501,7 +501,7 @@ impl Operation for StoreEntriesOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<PageManifest>>, PageReadError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(self.manifest.take()))
     }
 }

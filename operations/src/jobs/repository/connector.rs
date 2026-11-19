@@ -6,7 +6,6 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::repository::RepositoryCredential;
 use aruna_core::repository::remote::{InvenioAccess, JobStop, NodeScope};
-use aruna_core::rows::event;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
@@ -187,7 +186,7 @@ impl Operation for ConnectOperation {
                 ))
             }
             ConnectStep::Secret(view) => {
-                let secret = parse_secret_read(event(result)?).map_err(|_| {
+                let secret = parse_secret_read(result.event()?).map_err(|_| {
                     TransferError::Retryable("repository connector storage unavailable".into())
                 })?;
                 let token =

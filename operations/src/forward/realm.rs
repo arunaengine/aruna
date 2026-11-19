@@ -20,7 +20,6 @@ use aruna_core::metadata::protocol::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
-use aruna_core::rows::done;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use std::time::Duration;
@@ -268,7 +267,7 @@ impl Operation for ApplyRelayOperation {
 
     fn next(&mut self, result: IoResult) -> RelayTurn {
         if self.writing {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Then {
                 output: MetadataTransportMessage::AdminEventQueued,
                 calls: vec![IoCall::Effect(Box::new(schedule_drain_effect()))],

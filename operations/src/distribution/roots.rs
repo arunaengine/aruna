@@ -13,7 +13,6 @@ use aruna_core::errors::{ConversionError, SourceResolutionError};
 use aruna_core::events::{Event, StagingSourceEvent};
 use aruna_core::keyspaces::SOURCE_ROOT_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::done;
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::storage::distribution::source_root::{RootEntry, checked_key, decode_key};
 use aruna_core::types::{GroupId, Key, Value};
@@ -267,7 +266,7 @@ impl Operation for RootsCheckOperation {
                 other => Err(RootsError::UnexpectedEvent(other.label())),
             },
             State::Mark => {
-                done(result)?;
+                result.done()?;
                 self.probed(None)
             }
         }

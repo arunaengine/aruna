@@ -24,6 +24,7 @@ use crate::notifications::prune::{
 };
 use crate::notifications::serve::{InboxRequest, ServeInboxOperation, WatchEventsOperation};
 use crate::notifications::watch::digest::WATCH_PUBLISH_DEBOUNCE;
+use crate::notifications::watch::drain::WatchDrainOperation;
 use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;
 
@@ -68,6 +69,7 @@ pub enum TimerOperation {
     DrainNotificationOutbox(DrainOutboxOperation),
     PruneNotifications(PruneNotificationsOperation),
     PublishWatchInterest(PublishInterestOperation),
+    DrainWatchEvents(WatchDrainOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -82,6 +84,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::PublishWatchInterest => Some(TimerOperation::PublishWatchInterest(
             PublishInterestOperation::new(input.local_node),
         )),
+        TaskKey::DrainWatchEvents => Some(TimerOperation::DrainWatchEvents(
+            WatchDrainOperation::new(),
+        )),
         _ => None,
     }
 }
@@ -93,6 +98,7 @@ macro_rules! each_timer {
             TimerOperation::DrainNotificationOutbox($operation) => $body,
             TimerOperation::PruneNotifications($operation) => $body,
             TimerOperation::PublishWatchInterest($operation) => $body,
+            TimerOperation::DrainWatchEvents($operation) => $body,
         }
     };
 }
@@ -191,6 +197,13 @@ impl TimerRun for PublishInterestOperation {
                 reason: error.to_string(),
             }),
         }
+    }
+}
+
+impl TimerRun for WatchDrainOperation {
+    /// A finished run waits for the next queued event; a failed one runs again later.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
+        result.map(|()| None).map_err(TimerFailure::from)
     }
 }
 

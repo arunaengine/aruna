@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, values};
+use aruna_core::rows::{PrefixPages, values};
 
 use super::mutation::{read_record, record_read};
 use super::*;
@@ -163,14 +163,14 @@ impl Operation for DeleteRunOperation {
                 self.hide(listed)
             }
             DeleteStep::Hide => {
-                done(result)?;
+                result.done()?;
                 self.step = DeleteStep::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             DeleteStep::Delete => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(RunDelete::Deleted))
             }
         }

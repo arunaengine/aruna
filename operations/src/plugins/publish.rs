@@ -18,7 +18,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::target_placement_ref;
 use aruna_core::plugins::{Chunk, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -680,14 +680,14 @@ impl Operation for PublishEntryOperation {
                 }
             }
             EntryPhase::Write { stale } => {
-                done(result)?;
+                result.done()?;
                 match stale.is_empty() {
                     true => self.finish(),
                     false => Ok(Next::Call(IoCall::Delete(stale))),
                 }
             }
             EntryPhase::DeleteConflicts => {
-                done(result)?;
+                result.done()?;
                 self.finish()
             }
         }

@@ -18,7 +18,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{conflict_write_entries, reducer_state_entry};
 use aruna_core::structs::identity::auth::{Actor, Role};
 use aruna_core::structs::identity::group::{
@@ -377,7 +377,7 @@ impl Operation for GroupCreate {
                 self.write()
             }
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 self.fence_or_finish()
             }
             Stage::Fence => {

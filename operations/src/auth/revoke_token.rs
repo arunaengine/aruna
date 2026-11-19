@@ -17,7 +17,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, REVOCATIONS_PER_ORIGIN, RevocationIndex,
 };
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -370,16 +370,16 @@ impl Revocation {
                 self.finish_capacity()
             }
             Stage::PendingDelete => {
-                done(result)?;
+                result.done()?;
                 self.after_capacity()
             }
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::StaleDelete;
                 Ok(Some(IoCall::Delete(std::mem::take(&mut self.deletes))))
             }
             Stage::Write | Stage::StaleDelete => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Done;
                 Ok(None)
             }

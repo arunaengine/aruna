@@ -6,7 +6,7 @@ use super::epoch::{parse_progress, progress};
 use super::*;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::{NodeId, UserId};
 
@@ -248,7 +248,7 @@ impl Operation for ProgressWrite {
 
     fn next(&mut self, result: IoResult) -> ReissueTurn {
         if self.saving {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(self.next.is_some()));
         }
         let [value] = values::<1>(result)?;

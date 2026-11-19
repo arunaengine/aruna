@@ -16,7 +16,7 @@ use aruna_core::repository::{
     LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS, RemoteState,
     RepositoryLink,
 };
-use aruna_core::rows::{PrefixPages, all_values, done, event};
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -62,7 +62,8 @@ fn registry_read(document_id: Ulid) -> IoCall {
 }
 
 fn registry_row(result: IoResult) -> Result<Option<MetadataRegistryRecord>, LinkError> {
-    parse_registry_read(event(result)?).map_err(|error| LinkError::Unexpected(format!("{error:?}")))
+    parse_registry_read(result.event()?)
+        .map_err(|error| LinkError::Unexpected(format!("{error:?}")))
 }
 
 fn settle_call(link_id: Ulid, queued: &Value, retry_at: Option<u64>) -> IoCall {
@@ -164,7 +165,7 @@ impl Operation for QueueRowsOperation {
                 self.next_document()
             }
             QueueStep::Queued => {
-                let queued = all_values(result)?;
+                let queued = result.values()?;
                 let mut rows = Vec::with_capacity(self.candidates.len());
                 for ((link_id, document_id), existing) in self.candidates.drain(..).zip(queued) {
                     let existing = existing.and_then(|bytes| postcard::from_bytes(&bytes).ok());
@@ -269,7 +270,7 @@ impl Operation for DrainLinksOperation {
                 self.advance()
             }
             DrainStep::Removed => {
-                done(result)?;
+                result.done()?;
                 self.advance()
             }
             DrainStep::Check(link_id, queued) => {
@@ -1009,7 +1010,7 @@ impl Operation for QueueDeletedOperation {
                 Ok(Next::Call(IoCall::Write(rows)))
             }
             DeletedStep::Write => {
-                done(result)?;
+                result.done()?;
                 if !self.scope.has_tasks {
                     return Ok(Next::Done(()));
                 }
@@ -1090,7 +1091,7 @@ impl Operation for LinkTimerOperation {
                 ))
             }
             TimerStep::Arm => {
-                if let Event::Task(TaskEvent::Error { message, .. }) = event(result)? {
+                if let Event::Task(TaskEvent::Error { message, .. }) = result.event()? {
                     warn!(%message, "Failed to arm the repository link queue");
                 }
                 Ok(Next::Done(()))

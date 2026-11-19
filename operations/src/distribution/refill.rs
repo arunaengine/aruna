@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
     INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, Cursor, RangeAccount, RangeCounters, SAMPLE_SIZE, SampleEntry, account_key, refill_key,
     sample_count_key, sample_prefix,
@@ -299,16 +299,16 @@ impl Operation for RefillPageOperation {
             }
             PageStep::Count => self.write(result.value()?),
             PageStep::Write => {
-                done(result)?;
+                result.done()?;
                 let deletes = std::mem::take(&mut self.deletes);
                 self.call(PageStep::Delete, IoCall::Delete(deletes))
             }
             PageStep::Delete => {
-                done(result)?;
+                result.done()?;
                 self.count()
             }
             PageStep::AddCount => {
-                done(result)?;
+                result.done()?;
                 Ok(self.committed())
             }
         }

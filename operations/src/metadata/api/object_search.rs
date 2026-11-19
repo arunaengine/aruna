@@ -13,7 +13,6 @@ use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::event;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use tracing::Span;
 
@@ -450,7 +449,7 @@ impl Operation for ObjectSearchOperation {
                 self.assembled(*answered, results)
             }
             ObjectStage::Sign(signing) => {
-                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = event(result) else {
+                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = result.event() else {
                     return Err(MetadataApiError::Internal(
                         "net handle unavailable for object search cursor signing".to_string(),
                     ));

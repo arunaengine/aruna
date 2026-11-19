@@ -6,7 +6,6 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::rows::done;
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +48,7 @@ impl Operation for WipeDeviceOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<NodeId>, WipeDeviceError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(self.config.node_id))
     }
 

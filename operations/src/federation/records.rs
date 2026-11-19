@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
     DEDUP_INDEX_KEYSPACE, FEDERATION_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::rows::{decode, done, encode, encoded_row, read_row, values};
+use aruna_core::rows::{decode, encode, encoded_row, read_row, values};
 use aruna_core::structs::execution::job::{
     JobRecord, RoCrateUploadRecord, job_record_key, parse_dedup_value,
 };
@@ -290,7 +290,7 @@ impl Operation for RecordOperation {
                 self.confirm(&stale, None, held)
             }
             (Phase::Write, _) => {
-                done(result)?;
+                result.done()?;
                 let unfinished = RecordError::Io(IoError::Unfinished);
                 self.pending.take().map(Next::Done).ok_or(unfinished)
             }

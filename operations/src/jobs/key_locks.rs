@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{page, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::{CapturedInput, JobError, JobId, JobRecord, KeyWait};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{
@@ -89,7 +89,7 @@ impl Operation for AliasPageOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<AliasPage>, KeyCheckError> {
-        let (rows, _) = page(result)?;
+        let (rows, _) = result.page()?;
         let next = (rows.len() == ALIAS_PAGE)
             .then(|| rows.last().map(|(row, _)| row.clone()))
             .flatten();

@@ -6,7 +6,6 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
-use aruna_core::rows::done;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -139,7 +138,7 @@ impl Operation for StoreStatusOperation {
             Phase::Record(previous) => self.check_record(previous, one_value(result)?),
             Phase::Bucket(writes) => self.journal(writes, one_value(result)?),
             Phase::Writing => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(true))
             }
         }

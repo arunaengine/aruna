@@ -10,7 +10,7 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::job_request::UploadClaimError;
 use aruna_core::keyspaces::{ROCRATE_UPLOAD_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
     JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord, upload_key,
@@ -259,7 +259,7 @@ impl Operation for ClaimUploadOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<RoCrateUploadRecord>, UploadClaimError> {
         if let Some(record) = self.claimed.take() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(record));
         }
         let [value] = values::<1>(result)?;

@@ -8,7 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ACCESS_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, read_row};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::Key;
 use std::time::{Duration, SystemTime};
@@ -175,16 +175,16 @@ impl Operation for RevokeUserOperation {
             Stage::Access => self.access_read(result.value()?),
             Stage::Owner => self.index_read(result.value()?),
             Stage::Index => {
-                done(result)?;
+                result.done()?;
                 Ok(self.delete_access())
             }
             Stage::Credential => {
-                done(result)?;
+                result.done()?;
                 Ok(self.scan_tokens())
             }
             Stage::Tokens => self.tokens_read(result),
             Stage::TokensDeleted => {
-                done(result)?;
+                result.done()?;
                 if self.tokens.done() {
                     return self.mark_due();
                 }

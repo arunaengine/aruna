@@ -141,11 +141,11 @@ impl Operation for CreateShareOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<ShareLink>, ShareError> {
         if self.saving {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(self.config.link.clone()));
         }
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) =
-            rows::event(result)?
+            result.event()?
         else {
             return Err(ShareError::UnexpectedEvent("create"));
         };
@@ -314,11 +314,11 @@ impl Operation for OpenShareOperation {
             }
             OpenState::CheckCreator => self.creator_read(result.value()?),
             OpenState::LogOpen => {
-                logged(rows::event(result)?)?;
+                logged(result.event()?)?;
                 (self.opened.take().map(Next::Done)).ok_or(ShareError::NotFinished)
             }
             OpenState::LogWrong => {
-                logged(rows::event(result)?)?;
+                logged(result.event()?)?;
                 Err(ShareError::WrongPassword)
             }
         }
@@ -355,7 +355,7 @@ impl Operation for RevokeShareOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ShareError> {
         if self.saving {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         let link = parse_link(result.value()?, self.id)?;

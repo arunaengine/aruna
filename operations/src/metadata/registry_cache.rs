@@ -14,7 +14,6 @@ use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, REGISTRY_CANDIDATE_LIMIT,
 };
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::rows::event;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, Value};
 use tracing::{debug_span, field};
@@ -33,7 +32,7 @@ fn graph_call(effect: MetadataEffect) -> IoCall {
 
 /// The graph store's answer to a cache effect; an error answer is the effect's failure.
 pub(crate) fn cache_answer(result: IoResult) -> Result<MetadataEvent, MetadataError> {
-    match event(result)? {
+    match result.event()? {
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error),
         Event::Metadata(answer) => Ok(answer),
         other => Err(MetadataError::Backend(format!(

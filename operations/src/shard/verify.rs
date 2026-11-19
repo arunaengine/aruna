@@ -13,7 +13,7 @@ use aruna_core::events::{Event, GroupEvent, GroupResult, ShardNetEvent};
 use aruna_core::keyspaces::SHARD_VERIFICATION_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::rows::{PrefixPages, done, encoded_row, read_row};
+use aruna_core::rows::{PrefixPages, encoded_row, read_row};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::Key;
@@ -338,7 +338,7 @@ impl Operation for MarkVerifiedOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }

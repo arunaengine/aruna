@@ -25,7 +25,7 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::storage_entries::{reducer_state_key, subject_index_key, sync_revision_key};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Role};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -676,11 +676,11 @@ impl MergeUsersOperation {
             (MergeState::ScanGroups, result) => self.accept_groups(result),
             (MergeState::ReadDetails, IoResult::Values(values)) => self.stage_all(values),
             (MergeState::Write, result) => {
-                done(result)?;
+                result.done()?;
                 self.after_write()
             }
             (MergeState::DeleteStale, result) => {
-                done(result)?;
+                result.done()?;
                 Ok(self.read_fence())
             }
             (MergeState::ReadFence, IoResult::Values(values)) => {

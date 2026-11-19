@@ -67,37 +67,10 @@ impl StagedCall {
 
 /// The `N` values of a read of `N` rows, in the order they were asked for.
 pub fn values<const N: usize>(result: IoResult) -> Result<[Option<Value>; N], IoError> {
-    match result {
-        IoResult::Values(values) => <[_; N]>::try_from(values).map_err(|_| IoError::Unexpected {
-            expected: "one value per row read",
-            got: "a read of another length",
-        }),
-        other => Err(unexpected("IoResult::Values", &other)),
-    }
-}
-
-/// The values of a read of any number of rows, in the order they were asked for.
-pub fn all_values(result: IoResult) -> Result<Vec<Option<Value>>, IoError> {
-    match result {
-        IoResult::Values(values) => Ok(values),
-        other => Err(unexpected("IoResult::Values", &other)),
-    }
-}
-
-/// The rows of one page and the key to continue after.
-pub fn page(result: IoResult) -> Result<crate::types::PageRows, IoError> {
-    match result {
-        IoResult::Page { rows, next } => Ok((rows, next)),
-        other => Err(unexpected("IoResult::Page", &other)),
-    }
-}
-
-/// The event that answered an `IoCall::Effect` or an `IoCall::Child`.
-pub fn event(result: IoResult) -> Result<crate::events::Event, IoError> {
-    match result {
-        IoResult::Event(event) => Ok(*event),
-        other => Err(unexpected("IoResult::Event", &other)),
-    }
+    <[_; N]>::try_from(result.values()?).map_err(|_| IoError::Unexpected {
+        expected: "one value per row read",
+        got: "a read of another length",
+    })
 }
 
 /// The decoded value of a one-row read; a missing row is `None`.
@@ -123,14 +96,6 @@ pub fn encoded_row<T: Serialize>(
     value: &T,
 ) -> Result<(KeySpace, Key, Value), IoError> {
     Ok((space.to_string(), key.into(), encode(value)?))
-}
-
-/// Checks that a write, delete or sync finished.
-pub fn done(result: IoResult) -> Result<(), IoError> {
-    match result {
-        IoResult::Done => Ok(()),
-        other => Err(unexpected("IoResult::Done", &other)),
-    }
 }
 
 /// Reads every row below a prefix one page at a time, so an operation handles each page before
@@ -168,7 +133,7 @@ impl PrefixPages {
 
     /// The rows of the page that answered [`Self::call`].
     pub fn take(&mut self, result: IoResult) -> Result<Vec<(Key, Value)>, IoError> {
-        let (rows, next) = page(result)?;
+        let (rows, next) = result.page()?;
         self.done = next.is_none();
         self.after = next;
         Ok(rows)
@@ -177,13 +142,6 @@ impl PrefixPages {
     /// Whether the last page was taken.
     pub fn done(&self) -> bool {
         self.done
-    }
-}
-
-fn unexpected(expected: &'static str, got: &IoResult) -> IoError {
-    IoError::Unexpected {
-        expected,
-        got: got.label(),
     }
 }
 
@@ -211,7 +169,7 @@ mod tests {
             Err(IoError::Unexpected { .. })
         ));
         assert_eq!(
-            done(IoResult::Woke),
+            IoResult::Woke.done(),
             Err(IoError::Unexpected {
                 expected: "IoResult::Done",
                 got: "IoResult::Woke",

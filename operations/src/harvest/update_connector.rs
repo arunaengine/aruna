@@ -195,11 +195,11 @@ impl Operation for UpdateRepositoryOperation {
         match std::mem::replace(&mut self.stage, Stage::Delete) {
             Stage::Read => self.write(rows::values::<3>(result)?),
             Stage::Write(deletes) => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             Stage::Delete => {
-                rows::done(result)?;
+                result.done()?;
                 self.view
                     .take()
                     .map(Next::Done)

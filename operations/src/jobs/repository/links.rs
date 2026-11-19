@@ -18,7 +18,7 @@ use aruna_core::repository::{
     PushOutcome, REVIEW_POLL_MS, RemoteState, RepositoryCredential, RepositoryLink,
     RepositoryRecord, connector_link_key, link_key,
 };
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -583,7 +583,7 @@ impl Operation for SettleCheckOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, LinkError> {
         if self.written {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         let [current] = values::<1>(result)?;

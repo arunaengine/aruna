@@ -10,7 +10,6 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicySignEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -459,7 +458,7 @@ impl Operation for PolicyWrite {
                 }
             }
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 let document = self.document.take().ok_or(CreatePolicyError::NotFinished)?;
                 Ok(Self::committed(document))
             }

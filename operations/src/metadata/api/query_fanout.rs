@@ -14,7 +14,6 @@ use aruna_core::metadata::{
     MetadataQueryResults, QUERY_MAX_ROWS, SolutionRow,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use tracing::Span;
@@ -57,7 +56,7 @@ fn merge_call(job: MergeJob, budget: Duration) -> IoCall {
 
 /// The merged rows or tie count of a [`merge_call`].
 fn merged(result: IoResult) -> Result<MergeOutput, MergeError> {
-    match event(result).map_err(|error| MergeError::Failed(error.to_string()))? {
+    match result.event().map_err(|error| MergeError::Failed(error.to_string()))? {
         Event::Metadata(MetadataEvent::RowsMerged { result }) => result,
         Event::Metadata(MetadataEvent::Error { error, .. }) => {
             Err(MergeError::Failed(error.to_string()))
@@ -594,7 +593,7 @@ impl DistributedQueryOperation {
     }
 
     fn cache_read(&mut self, result: IoResult) -> Result<Next<QueryAnswer>, MetadataApiError> {
-        if let Ok(Event::Metadata(MetadataEvent::QueryCacheEntry { stamp, entry })) = event(result)
+        if let Ok(Event::Metadata(MetadataEvent::QueryCacheEntry { stamp, entry })) = result.event()
         {
             if let Some((results, nodes_queried)) = entry {
                 let stats = MetadataFanoutStats {

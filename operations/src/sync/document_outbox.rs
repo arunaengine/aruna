@@ -12,7 +12,6 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
-use aruna_core::rows::{event, page};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace};
 use byteview::ByteView;
@@ -198,7 +197,7 @@ impl Operation for OutboxTailsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ApplyError> {
-        let values = match event(result)? {
+        let values = match result.event()? {
             Event::Storage(StorageEvent::IterResult { values, .. }) => values,
             Event::Storage(StorageEvent::Error { error }) => {
                 return Err(ApplyError::Storage(error));
@@ -249,12 +248,12 @@ impl Operation for OutboxTimerOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ApplyError> {
         if self.arming {
-            return match event(result)? {
+            return match result.event()? {
                 Event::Task(TaskEvent::Error { message, .. }) => Err(ApplyError::Failed(message)),
                 _ => Ok(Next::Done(())),
             };
         }
-        let (rows, _) = page(result)?;
+        let (rows, _) = result.page()?;
         if rows.is_empty() {
             return Ok(Next::Done(()));
         }

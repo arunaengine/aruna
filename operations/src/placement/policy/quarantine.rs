@@ -7,7 +7,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, done, values};
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
@@ -201,7 +201,7 @@ impl Operation for ResolveQuarantineOperation {
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             ResolveState::Delete => {
-                done(result)?;
+                result.done()?;
                 // A full page resumes strictly after the last deleted key, so removal progresses.
                 let removal = self.removal()?;
                 if removal.done() {

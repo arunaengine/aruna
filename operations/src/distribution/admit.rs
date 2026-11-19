@@ -16,7 +16,6 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, incarnation};
 use aruna_core::structs::storage::distribution::accounting::account_key;
@@ -363,7 +362,7 @@ impl Operation for AdmitOperation {
             }
             AdmitState::Usage => self.check_capacity(outside_answer(result)?.values()?),
             AdmitState::Write => {
-                done(result)?;
+                result.done()?;
                 let claim = self.pending.take().ok_or(AdmitError::NotFinished)?;
                 self.sign(claim)
             }

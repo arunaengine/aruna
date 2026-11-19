@@ -20,7 +20,7 @@ use aruna_core::placement::{
     resolve_shard_holders, try_resolve_holders,
 };
 use aruna_core::reducer::decode_reducer_state;
-use aruna_core::rows::{done, event, page, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -445,7 +445,7 @@ impl Operation for PlacementPageOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
-        Ok(Next::Done(page(result)?))
+        Ok(Next::Done(result.page()?))
     }
 }
 
@@ -591,7 +591,7 @@ impl Operation for PlacementRecordOperation {
                 }
             },
             RecordStage::Forget(placement) => {
-                done(result)?;
+                result.done()?;
                 self.stage = RecordStage::Finish { retry: false };
                 Ok(Next::Call(forget_verification(self.realm_id, &placement)))
             }
@@ -640,7 +640,7 @@ impl Operation for PruneReleasedOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         if self.written {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         let [stored, state] = values::<2>(result)?;
@@ -900,7 +900,7 @@ impl Operation for ReconcilePlacementsOperation {
                 self.prune()
             }
             ReconcileStage::Armed => {
-                event(result)?;
+                result.event()?;
                 self.prune()
             }
             ReconcileStage::Pruned => {
@@ -911,7 +911,7 @@ impl Operation for ReconcilePlacementsOperation {
                 self.deadline()
             }
             ReconcileStage::Deadline => {
-                event(result)?;
+                result.event()?;
                 self.next_page()
             }
             ReconcileStage::Page => {
@@ -938,7 +938,7 @@ impl Operation for ReconcilePlacementsOperation {
                 }
                 self.next_row()
             }
-            ReconcileStage::Retry => Ok(Next::Done(match event(result)? {
+            ReconcileStage::Retry => Ok(Next::Done(match result.event()? {
                 // Without a task handle nothing can run the retry.
                 Event::Task(TaskEvent::Error { key: None, .. }) => {
                     PlacementReconcileOutcome::clean()

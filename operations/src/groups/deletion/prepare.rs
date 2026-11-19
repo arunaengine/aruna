@@ -13,7 +13,6 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::decode_reducer_state;
-use aruna_core::rows::done;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
@@ -70,7 +69,7 @@ impl Operation for PrepareOperation {
             result.child::<(), GroupDeletionError>()??;
             return Ok(Next::Call(IoCall::Sync));
         }
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -312,7 +311,7 @@ impl Operation for PrepareWrite {
                 None => self.write(),
             },
             (Stage::Write, result) => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
             _ => Err(GroupDeletionError::Unavailable(

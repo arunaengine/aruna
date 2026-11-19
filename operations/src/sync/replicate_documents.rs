@@ -11,7 +11,7 @@ use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::placement::{document_class, plan_target_placement};
-use aruna_core::rows::{done, encoded_row, read_row, values};
+use aruna_core::rows::{encoded_row, read_row, values};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::{DocumentClass, PlacementRef};
 use aruna_core::task::TaskEvent;
@@ -338,7 +338,7 @@ impl Operation for ReplicateDocumentsOperation {
                 self.published(published)
             }
             Phase::StorePlacement => {
-                done(result)?;
+                result.done()?;
                 if !self.retry_needed {
                     return self.emit_next_publish();
                 }

@@ -10,7 +10,6 @@ use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{ARTIFACT_TOMBSTONE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::execution::job::{
     JobDeletes, JobId, JobPayload, JobRecord, JobResultPayload, PRUNE_INDEX_PREFIX, cleanup_job_id,
     parse_schedule_key, prune_delete_entries,
@@ -363,7 +362,7 @@ impl Operation for PruneJobsOperation {
                 result.child::<(), JobMutationError>()??;
                 self.delete_artifact(record)
             }
-            PruneStep::Artifact(record) => match event(result)? {
+            PruneStep::Artifact(record) => match result.event()? {
                 Event::Blob(BlobEvent::HiddenDeleted) => self.record_gone(record),
                 Event::Blob(BlobEvent::Error(error)) => Err(PruneError(error.to_string())),
                 other => Err(PruneError(format!(

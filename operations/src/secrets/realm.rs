@@ -300,11 +300,11 @@ impl Operation for RealmSecretOperation {
                 self.write(document, reducer, auth)
             }
             Stage::Write(deletes) => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             Stage::Delete => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Then {
                     output: self.result.take().flatten(),
                     calls: drains(self.notices),

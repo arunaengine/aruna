@@ -14,7 +14,7 @@ use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::holds_placement;
-use aruna_core::rows::{decode, page, read_row, values};
+use aruna_core::rows::{decode, read_row, values};
 use aruna_core::storage_entries::{create_acceptance_key, metadata_document_key};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
@@ -176,7 +176,7 @@ impl Operation for DeletedHereOperation {
             let accepted = (accepted.as_deref().map(decode::<MetadataEventRecord>)).transpose()?;
             return Ok(Next::Done(accepted.is_some()));
         }
-        if !page(result)?.0.is_empty() {
+        if !result.page()?.0.is_empty() {
             return Ok(Next::Done(false));
         }
         self.scanned = true;
@@ -275,7 +275,7 @@ impl Operation for HeldRecordOperation {
         let document_id = self.document_id;
         if self.scanning {
             // A pending committed projection makes an empty registry read inconclusive.
-            let (rows, _) = page(result).map_err(|_| {
+            let (rows, _) = result.page().map_err(|_| {
                 HeldRecordError::Unavailable(
                     "pending metadata projection scan is unavailable".to_string(),
                 )

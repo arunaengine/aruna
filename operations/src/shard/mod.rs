@@ -18,7 +18,6 @@ use aruna_core::document::{ShardManifest, ShardManifestEntry, shard_topic_id};
 use aruna_core::effects::{Effect, NetEffect, ShardNetEffect};
 use aruna_core::events::{Event, NetEvent, ShardNetEvent};
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use thiserror::Error;
@@ -42,7 +41,7 @@ pub(crate) fn shard_call(effect: ShardNetEffect) -> IoCall {
 }
 
 pub(crate) fn shard_answer(result: IoResult) -> Result<ShardNetEvent, IoError> {
-    match event(result)? {
+    match result.event()? {
         Event::Net(NetEvent::Shard(answer)) => Ok(*answer),
         other => Err(IoError::Unexpected {
             expected: "a shard answer",

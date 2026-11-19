@@ -8,7 +8,6 @@ use aruna_core::effects::{Effect, LocalFileEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ActionOutcome, EntrySide, EntryState, PendingMark, ReplaceReason, SyncActionRecord, SyncBase,
@@ -292,7 +291,7 @@ impl Operation for MaterializeEntryOperation {
         match self.outcome.take() {
             None => Ok(Next::Call(self.written(result.event()?)?)),
             Some(outcome) => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(outcome))
             }
         }

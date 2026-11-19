@@ -68,7 +68,7 @@ impl Operation for DeleteRepositoryOperation {
                 }))
             }
             Stage::Links => {
-                if !rows::page(result)?.0.is_empty() {
+                if !result.page()?.0.is_empty() {
                     return Err(UpdateConnectorError::InUse);
                 }
                 self.stage = Stage::Delete;
@@ -84,7 +84,7 @@ impl Operation for DeleteRepositoryOperation {
                 ])))
             }
             Stage::Delete => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }

@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
@@ -200,7 +200,7 @@ impl Operation for FinishUnbindOperation {
                 Ok(Next::Call(IoCall::Delete(vec![row])))
             }
             UnbindStep::Drop => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }
@@ -248,7 +248,7 @@ impl Operation for ClearRowsOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, FolderError> {
         if self.deleting {
-            done(result)?;
+            result.done()?;
             return Ok(self.page());
         }
         let (rows, _) = result.page()?;

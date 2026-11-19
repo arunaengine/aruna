@@ -301,6 +301,8 @@ pub const WEBHOOK_SETTINGS_KEYSPACE: &str = "notification_webhook_settings";
 pub const OWNER_SECRETS_KEYSPACE: &str = "owner_secrets";
 pub const WATCH_SUBSCRIPTIONS_KEYSPACE: &str = "notification_watch_subscriptions";
 pub const WATCH_INTEREST_KEYSPACE: &str = "notification_watch_interest";
+/// Watch events producers queued for the notification drain to emit, by event id.
+pub const WATCH_OUTBOX_KEYSPACE: &str = "notification_watch_outbox";
 /// The newest deletion time of a bucket per recipient, which drops older notices about it.
 pub const NOTIFICATION_CUTOFF_KEYSPACE: &str = "notification_bucket_cutoff";
 
@@ -749,6 +751,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     OWNER_SECRETS_KEYSPACE,
     WATCH_SUBSCRIPTIONS_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,
+    WATCH_OUTBOX_KEYSPACE,
     NOTIFICATION_CUTOFF_KEYSPACE,
     STORAGE_ROUTING_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,

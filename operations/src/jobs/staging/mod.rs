@@ -20,7 +20,7 @@ use aruna_core::keyspaces::{
     STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::execution::job::{
     JobId, ManifestRead, StagingJobCheckpoint, StagingJobPhase, StagingJobSpec,
 };
@@ -216,7 +216,7 @@ impl Operation for SeedCheckpointOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, StagingStoreError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -278,7 +278,7 @@ impl Operation for ClearRowsOperation {
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             ClearStep::Delete => {
-                done(result)?;
+                result.done()?;
                 Ok(self.page())
             }
         }

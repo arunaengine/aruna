@@ -24,7 +24,6 @@ use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::target_placement_ref;
 use aruna_core::reducer::{AdminDocumentError, decode_reducer_state};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -515,14 +514,14 @@ impl Operation for JoinWrite {
                 _ => Err(GroupJoinError::UnexpectedEvent),
             },
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.after_writes()
             }
             Stage::Fence => {

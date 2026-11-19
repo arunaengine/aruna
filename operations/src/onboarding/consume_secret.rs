@@ -7,7 +7,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::types::Value;
 use byteview::ByteView;
 use thiserror::Error;
@@ -173,7 +173,7 @@ impl Operation for ConsumeSecretOperation {
             let [record, state] = values::<2>(result)?;
             return self.claim(record, state);
         };
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(ConsumeSecretOutput {
             record,
             consumed_now: true,

@@ -12,7 +12,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, VaultFetchEvent};
 use aruna_core::keyspaces::{USER_KEY_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use aruna_core::operation::{Operation, SubOperation, boxed_suboperation};
-use aruna_core::rows::{event, page, values};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
     MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, VaultRevision,
@@ -157,7 +157,7 @@ impl ReadVaultOperation {
 
     /// Keeps the newest key records over every page; heads are bounded by one page.
     fn local(&mut self, result: IoResult) -> ReadTurn {
-        let (rows, next) = page(result)?;
+        let (rows, next) = result.page()?;
         let keys = match decode_page(self.reads_heads(), rows)? {
             VaultRecords::Keys(keys) => keys,
             heads => return Ok(Next::Done(heads)),
@@ -226,7 +226,7 @@ impl Operation for ReadVaultOperation {
                 self.route(value)
             }
             Stage::Local => self.local(result),
-            Stage::Fetch => match event(result)? {
+            Stage::Fetch => match result.event()? {
                 Event::Net(NetEvent::VaultFetch(fetched)) => Ok(Next::Done(self.fetched(fetched)?)),
                 other => Err(ReadVaultError::UnexpectedEvent {
                     state: "fetch".to_string(),

@@ -137,7 +137,7 @@ impl Operation for DeleteSourceOperation {
                 Ok(Next::Call(read.into()))
             }
             Stage::Secret => {
-                if parse_secret_read(rows::event(result)?, connector_id)?.is_none() {
+                if parse_secret_read(result.event()?, connector_id)?.is_none() {
                     return Ok(self.delete_records());
                 }
                 let mut scan = ReferenceScan::new(connector_id);
@@ -150,11 +150,11 @@ impl Operation for DeleteSourceOperation {
                 self.scanned(step)
             }
             Stage::Records => {
-                rows::done(result)?;
+                result.done()?;
                 self.stage = Stage::SecretDeleted;
                 Ok(Next::Call(delete_secret_effect(connector_id, None).into()))
             }
-            Stage::SecretDeleted => match rows::event(result)? {
+            Stage::SecretDeleted => match result.event()? {
                 Event::Storage(StorageEvent::DeleteResult { .. }) => {
                     Ok(Next::Done(Some(DeleteSourceResult)))
                 }

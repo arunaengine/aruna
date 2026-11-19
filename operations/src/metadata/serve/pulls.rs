@@ -9,7 +9,6 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::{SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal, SyncVersionPage};
@@ -200,8 +199,8 @@ impl Operation for PullServeOperation {
                 }
                 Err(error) => self.refused(error.refusal()),
             },
-            PullStage::Claim(holder) => self.claimed(event(result)?, *holder),
-            PullStage::Started(total) => match event(result)? {
+            PullStage::Claim(holder) => self.claimed(result.event()?, *holder),
+            PullStage::Started(total) => match result.event()? {
                 Event::Task(TaskEvent::BackgroundStarted { started: true }) => {
                     status(SyncPullStatus::Pending {
                         bytes_done: 0,
@@ -211,7 +210,7 @@ impl Operation for PullServeOperation {
                 // The run never started, so its claim was dropped with it.
                 _ => self.refused(SyncRefusal::Unavailable),
             },
-            PullStage::Registry => match event(result) {
+            PullStage::Registry => match result.event() {
                 Ok(Event::Task(TaskEvent::Pull(PullEvent::Status(Some(running))))) => {
                     status(running)
                 }

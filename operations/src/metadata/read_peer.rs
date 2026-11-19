@@ -8,7 +8,6 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::PeerAuthRefusal;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 
@@ -143,7 +142,7 @@ impl Operation for ReadPeerOperation {
             }
             ReadStage::Contact => {
                 // The read is accepted; a missed contact refresh only dates the peer's liveness.
-                let _ = event(result);
+                let _ = result.event();
                 Ok(Next::Done(self.auth.take()))
             }
         }

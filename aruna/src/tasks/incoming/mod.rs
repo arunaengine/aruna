@@ -929,6 +929,7 @@ impl OperationsTaskHandler {
             TaskKey::DrainNotificationOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::PruneNotifications => Box::pin(self.run_trigger(key)),
             TaskKey::PublishWatchInterest => Box::pin(self.run_trigger(key)),
+            TaskKey::DrainWatchEvents => Box::pin(self.run_trigger(key)),
             TaskKey::DrainJobQueue => Box::pin(async move {
                 self.drain_job_queue().await;
             }),
