@@ -7,8 +7,10 @@ use std::sync::Arc;
 
 use aruna_core::compute::backend::{DeclaredCapabilities, WorkloadSuitability};
 use aruna_core::compute::identity::home_digest;
-use aruna_core::compute::offer::{BackendCaps, ExecutorOffer, config_digest};
-use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind, ResourceEnvelope};
+use aruna_core::compute::offer::{
+    BackendCaps, BackendLimit, BackendLimits, ExecutorOffer, config_digest,
+};
+use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
 
 use crate::executor::ExecutorBackend;
@@ -237,10 +239,17 @@ impl ExecutorRegistry {
             .collect()
     }
 
-    /// What each registered backend advertises, by its name.
-    pub fn limits(&self) -> BTreeMap<String, ResourceEnvelope> {
+    /// What each registered backend advertises, by its name, with its wire kind and config.
+    pub fn limits(&self) -> BackendLimits {
         (self.backends.iter())
-            .map(|(name, entry)| (name.clone(), entry.caps().limits))
+            .map(|(name, entry)| {
+                let limit = BackendLimit {
+                    kind: entry.backend.kind().as_wire(),
+                    limits: entry.caps().limits,
+                    config_digest: self.config_digest(name).unwrap_or_default(),
+                };
+                (name.clone(), limit)
+            })
             .collect()
     }
 

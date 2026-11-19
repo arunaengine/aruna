@@ -18,30 +18,34 @@ use crate::structs::placement::policy::PlacementSubject;
 /// One call to the executor backends of this node.
 #[derive(Debug, PartialEq)]
 pub enum ComputeEffect {
-    /// Picks the backend for a run, optionally of one kind.
-    Select { constraint: Option<ExecutorKind> },
-    /// What the backend of `kind` offers.
-    Facts { kind: ExecutorKind },
-    /// The backend of `kind`, while this node still advertises the exact site a launch was
+    /// Picks the backend for a run: the named one, which must also match the kind constraint,
+    /// else the first backend of that kind in name order.
+    Select {
+        backend: Option<String>,
+        constraint: Option<ExecutorKind>,
+    },
+    /// What backend `backend` offers.
+    Facts { backend: String },
+    /// Backend `backend`, while this node still advertises the exact site a launch was
     /// receipted under.
     Fenced {
-        kind: ExecutorKind,
+        backend: String,
         subject: Box<PlacementSubject>,
         generation: u64,
         digest: [u8; 32],
     },
-    /// The S3 endpoints a container reaches this node under.
-    Endpoint,
+    /// The S3 endpoints the containers of backend `backend` reach this node under.
+    Endpoint { backend: String },
     /// Pins an image; a job stop ends the call.
-    ResolveImage { kind: ExecutorKind, image: String },
+    ResolveImage { backend: String, image: String },
     /// The limits the backend enforces for exactly this task. The task comes back with them.
     Granted {
-        kind: ExecutorKind,
+        backend: String,
         spec: Box<TaskSpec>,
     },
     /// One call about a fenced attempt.
     Attempt {
-        kind: ExecutorKind,
+        backend: String,
         fence: FenceContext,
         request: ComputeRequest,
     },
@@ -94,7 +98,12 @@ pub struct SessionOpen {
 /// What one backend offers a run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendFacts {
+    /// Node-local name of the backend.
+    pub name: String,
     pub kind: ExecutorKind,
+    /// Where the backend's attempts live, and everything placement and admission read of it.
+    pub home_digest: [u8; 32],
+    pub config_digest: [u8; 32],
     pub s3_mount: bool,
     pub session: bool,
     /// The workload runs on the controller host and inherits its execution subject.

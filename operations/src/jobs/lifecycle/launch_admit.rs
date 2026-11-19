@@ -473,6 +473,8 @@ pub struct LaunchNode {
     pub(crate) now_ms: u64,
     pub(crate) execution_id: Ulid,
     pub(crate) limits: Option<ResourceEnvelope>,
+    /// The offered backend's config digest now; `None` without that backend.
+    pub(crate) config_digest: Option<[u8; 32]>,
 }
 
 impl LaunchNode {
@@ -513,6 +515,8 @@ struct PreparedReceipt {
     job_id: JobId,
     subject_generation: u64,
     subject_digest: [u8; 32],
+    config_generation: u64,
+    config_digest: [u8; 32],
     record: JobRecord,
 }
 
@@ -653,6 +657,11 @@ impl AdmitLaunchOperation {
         if !limits.fits(&spec.resources) {
             return Ok(Next::Done(Err(LaunchDecline::Capacity)));
         }
+        // An advertisement that lags the config, as after a restart, is undecided: the holder
+        // retries once it is refreshed, where a refusal would exclude this target for good.
+        if self.node.config_digest != Some(capability.config_digest) {
+            return Err(LaunchUndecided);
+        }
         let read = ReadInfoOperation::new(vec![self.node.local]);
         self.call(
             AdmitStep::Membership(Box::new(capability)),
@@ -694,6 +703,8 @@ impl AdmitLaunchOperation {
             subject_generation: capability.subject.generation,
             subject_digest: capability.subject_digest,
             accepted_at_ms: node.now_ms,
+            config_generation: capability.config_generation,
+            config_digest: capability.config_digest,
         };
         let claim = ExecutionClaim {
             realm_id: node.realm_id,
@@ -704,6 +715,8 @@ impl AdmitLaunchOperation {
             job_id,
             subject_generation: capability.subject.generation,
             subject_digest: capability.subject_digest,
+            config_generation: capability.config_generation,
+            config_digest: capability.config_digest,
             record,
         };
         let effect = Effect::Net(NetEffect::ExecutionSign(Box::new(claim)));
@@ -747,6 +760,8 @@ impl AdmitLaunchOperation {
             resources: spec.resources,
             subject_generation: prepared.subject_generation,
             subject_digest: prepared.subject_digest,
+            config_generation: prepared.config_generation,
+            config_digest: prepared.config_digest,
             record: Box::new(prepared.record),
             now_ms: node.now_ms,
         };
@@ -1002,6 +1017,7 @@ mod tests {
             now_ms: 4_000,
             execution_id: Ulid::from_parts(9, 9),
             limits,
+            config_digest: Some([0; 32]),
         };
         let mut config = family.config.clone();
         config.seed_job_control(family.target.public(), 0);
@@ -1022,7 +1038,12 @@ mod tests {
             executor_kind: None,
             local_to_controller: true,
         };
-        ExecutorCapability::new(family.target_id().executor_kind, subject).expect("subject")
+        ExecutorCapability::new(
+            family.target_id().backend,
+            family.target_id().executor_kind,
+            subject,
+        )
+        .expect("subject")
     }
 
     fn declined(reason: LaunchDecline) -> AdmitNext {

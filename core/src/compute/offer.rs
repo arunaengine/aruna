@@ -80,6 +80,17 @@ pub struct WorkerSite {
     pub labels: BTreeMap<String, String>,
 }
 
+/// What a launch reads of one local backend: its wire kind, its limits and its config digest now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendLimit {
+    pub kind: String,
+    pub limits: ResourceEnvelope,
+    pub config_digest: [u8; 32],
+}
+
+/// Each local backend's limits, by its node-local name.
+pub type BackendLimits = BTreeMap<String, BackendLimit>;
+
 /// One enabled backend's name, wire kind, home digest and capabilities, as plain data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutorOffer {

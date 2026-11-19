@@ -6,7 +6,7 @@ use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
 use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
-use aruna_core::compute::ResourceEnvelope;
+use aruna_core::compute::offer::BackendLimits;
 use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
@@ -193,8 +193,9 @@ impl DriverContext {
         }
     }
 
-    /// The limits of each local executor backend by its wire kind; empty without compute.
-    pub fn compute_limits(&self) -> BTreeMap<String, ResourceEnvelope> {
+    /// The wire kind and limits of each local executor backend by its name; empty without
+    /// compute.
+    pub fn compute_limits(&self) -> BackendLimits {
         (self.compute_handle.as_deref())
             .map(ExecutorRegistry::limits)
             .unwrap_or_default()

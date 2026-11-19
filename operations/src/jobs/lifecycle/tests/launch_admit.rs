@@ -185,6 +185,7 @@ fn admit(family: &Family, launch: &LaunchIntent) -> AdmitLaunchOperation {
         now_ms: 4_000,
         execution_id: Ulid::from_parts(9, 9),
         limits: Some(envelope(4)),
+        config_digest: Some([0; 32]),
     };
     AdmitLaunchOperation::new(frame, node)
 }
