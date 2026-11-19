@@ -508,13 +508,13 @@ pub enum MetadataTransportMessage {
     ForwardVaultChange {
         auth_token: Option<AuthToken>,
         record_id: Ulid,
-        change: Box<crate::users::vault_write::VaultChange>,
+        change: Box<aruna_core::structs::identity::user::vault::VaultChange>,
         created_at_ms: u64,
     },
     ForwardedVaultChange {
         result: Result<
-            crate::users::vault_write::VaultAppended,
-            crate::users::vault_write::VaultRefusal,
+            aruna_core::structs::identity::user::vault::VaultAppended,
+            aruna_core::structs::identity::user::vault::VaultRefusal,
         >,
     },
     /// One user's vault heads or key records asked of a holder.

@@ -15,16 +15,14 @@ use aruna_core::errors::StorageError;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::user::vault::{
-    MAX_PREDECESSORS, MAX_VAULT_BYTES, VaultRecordError, VaultRecords, VaultRevision,
+    MAX_PREDECESSORS, MAX_VAULT_BYTES, VaultAppended, VaultChange, VaultRecordError, VaultRecords,
+    VaultRefusal, VaultRevision,
 };
 use aruna_drivers::driver::drive;
 use aruna_operations::forward::routing::HolderWriteError;
 use aruna_operations::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
 use aruna_operations::users::vault_route::{AppendRoutedOperation, VaultRouteError};
-use aruna_operations::users::vault_write::VaultRefusal;
-use aruna_operations::users::vault_write::{
-    AppendVaultConfig, AppendVaultError, VaultAppended, VaultChange,
-};
+use aruna_operations::users::vault_write::{AppendVaultConfig, AppendVaultError};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
