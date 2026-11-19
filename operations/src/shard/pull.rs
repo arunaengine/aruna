@@ -5,7 +5,7 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{
-    AppliedSync, DocumentNetEvent, DocumentReconcileResult, applied_sync_entry,
+    AppliedStep, AppliedSync, DocumentNetEvent, DocumentReconcileResult, applied_sync_entry,
     schedule_applied_drain,
 };
 use aruna_core::document_apply::ApplyError;
@@ -140,6 +140,7 @@ impl Operation for ApplyPulledOperation {
                         metadata_create_events,
                         metadata_graph_tombstones,
                     },
+                    next: AppliedStep::Usage,
                 };
                 match applied_sync_entry(&applied) {
                     Ok(entry) => Ok(Next::Then {
@@ -292,6 +293,7 @@ mod tests {
                 targets: vec![DocumentTarget::RealmConfig { realm_id: realm() }],
                 ..DocumentReconcileResult::default()
             },
+            next: AppliedStep::Usage,
         };
         let entry = applied_sync_entry(&applied).unwrap();
         let calls = vec![

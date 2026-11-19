@@ -11,7 +11,6 @@ use aruna_operations::jobs::workflow::input_view::{
     MAX_VIEW_KEYS, ReadManifestOperation, ViewEntry, ViewEntryOperation, ViewError, ViewFrom,
     ViewLister, creator, decode_token, encode_token, names_manifest, view_bucket, view_entries,
 };
-use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::visible::is_sealed;
 use percent_encoding::utf8_percent_encode;
 use s3s::dto::{
@@ -270,12 +269,7 @@ impl ArunaS3Service {
             .map(object_range_request)
             .map(|range| range.resolve(entry.captured.bytes))
             .transpose()
-            .map_err(|error| match error {
-                GetObjectError::InvalidRange => {
-                    s3_error!(InvalidRange, "The requested range is not satisfiable")
-                }
-                _ => s3_error!(InvalidArgument, "The range is invalid"),
-            })?;
+            .map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?;
         let range = resolved.as_ref().map(|resolved| resolved.range.clone());
         let read = ViewEntryOperation::read(
             self.view_creator(&record),

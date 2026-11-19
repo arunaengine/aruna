@@ -4,11 +4,10 @@
 
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
+use aruna_core::staging_checkpoint::{LANE_ROWS, parse_lanes};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_drivers::jobs::context::JobContext;
-use aruna_operations::jobs::staging::lanes::LANE_ROWS;
-use aruna_operations::jobs::staging::lanes::parse_lanes;
 use aruna_test_support::staging::spec;
 use ulid::Ulid;
 

@@ -34,9 +34,7 @@ use aruna_core::types::{Key, Value};
 use bytes::Bytes;
 use tracing::warn;
 
-use super::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectInfo, locked,
-};
+use super::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, locked};
 use crate::abe::envelope::EnvelopeOperation;
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::blob::promote::{PromoteError, PromotePendingOperation, Promotion};
@@ -52,6 +50,7 @@ use crate::s3::object::head::{
 };
 use crate::s3::object::lookup::{LookupError, summary_from_value};
 use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_core::structs::storage::object_read::ObjectInfo;
 
 type Turn<T> = Result<Next<T>, GetObjectError>;
 type Read = Result<GetObjectResult, GetObjectError>;
@@ -1267,8 +1266,8 @@ pub(super) fn routed_info(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::object::get::ObjectRangeRequest;
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 
     fn input() -> GetObjectInput {
         let realm_id = RealmId::from_bytes([1; 32]);

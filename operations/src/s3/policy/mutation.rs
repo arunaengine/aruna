@@ -19,7 +19,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::blob::records::HeadAliasContext;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::resolve_set::{
@@ -28,6 +27,7 @@ use crate::placement::policy::resolve_set::{
 use crate::s3::policy::successor::{
     MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
+use aruna_core::blob_records::HeadAliasContext;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicyMutationConfig {

@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::records::HeadAliasContext;
 use crate::connectors::repository::connector_reference_write;
 use crate::distribution::guard::{GuardError, authority_reads, write_epoch};
 use crate::distribution::inventory::{
@@ -15,6 +14,7 @@ use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
+use aruna_core::blob_records::HeadAliasContext;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
@@ -912,9 +912,9 @@ mod pure_tests {
         CapturedDefault, MintState, MintSuccessorOperation, SuccessorError, SuccessorMint,
         SuccessorOutcome, SuccessorPlan, successor_version,
     };
-    use crate::blob::records::HeadAliasContext;
     use crate::s3::purge_fence::PurgeFenceError;
     use aruna_core::UserId;
+    use aruna_core::blob_records::HeadAliasContext;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{

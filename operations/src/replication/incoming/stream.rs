@@ -33,7 +33,6 @@ use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::auth::request_authorization::{AuthorizeOperation, GroupRulesOperation};
-use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::distribution::resolve::{
     MAX_CONTENT_VERSIONS, ResolveError, content_versions, indexed_key,
 };
@@ -43,8 +42,9 @@ use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::{BaoReadError, IncomingBaoOperation, IncomingBaoResult};
 use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::write_guard::{BucketGuardError, BucketGuardOperation};
+use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::replication_protocol::{
     BaoReadRequest, BaoReadTarget, LocationSummaryRequest, VersionReplicationManifest,
     VersionReplicationMessage,

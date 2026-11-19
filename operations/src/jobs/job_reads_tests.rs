@@ -274,12 +274,11 @@ fn record_data_steps() {
 
     let mut read = RecordDataOperation::new(owner(), job_id());
     read.record = Some(Box::new(record_of(probe())));
-    let failed = child(Err::<Option<StagingJobCheckpoint>, _>(StagingStoreError(
-        "broken".to_string(),
-    )));
+    let broken = IoError::Codec("broken".to_string());
+    let failed = child(Err::<Option<StagingJobCheckpoint>, _>(broken.clone()));
     assert_eq!(
         read.next(failed).unwrap_err(),
-        JobReadError("broken".into())
+        JobReadError(broken.to_string())
     );
 }
 

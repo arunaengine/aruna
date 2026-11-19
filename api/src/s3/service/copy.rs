@@ -7,13 +7,13 @@ use crate::s3::auth::map_authorize_error;
 use crate::s3::checksum::{ApplyChecksums, ChecksumSelection, encode_checksums};
 use crate::s3::error::IntoS3Error;
 use crate::s3::util::{location_sse, sse_header, stored_encrypted};
+use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_operations::s3::multipart::part_copy::PartCopyResult;
 use aruna_operations::s3::object::copy::{CopyResultData, CopySourceConditions};
 use s3s::dto::{

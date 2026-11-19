@@ -22,10 +22,10 @@ use ulid::Ulid;
 
 use super::publish::{PublishConfig, PublishError, PublishOperation};
 use crate::forward::transport::{peer_answer, peer_call};
-use crate::replication::queue::schedule_blob_drain;
 use aruna_core::metadata::protocol::{MetadataTransportMessage, transport_message_kind};
 use aruna_core::structs::identity::realm::NodeRealm;
 use aruna_core::structs::storage::distribution::request::PublishRefusal;
+use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
 
 type Revision = Result<DistributionRevision, PublishRefusal>;
 

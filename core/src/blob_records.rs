@@ -1,20 +1,24 @@
-//! Builds the keys and storage effects for blob head, version, location and index rows.
+//! Builds the keys and storage effects for blob head, version, location and index rows, and the
+//! DHT put that announces this node as a blob holder.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::ConversionError;
-use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{
+use std::time::Duration;
+
+use crate::effects::{DhtEffect, Effect, IterStart, NetEffect, StorageEffect};
+use crate::errors::ConversionError;
+use crate::id::{DhtKeyId, NodeId};
+use crate::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE, COPY_OWNER_KEYSPACE,
     PATHS_INDEX_KEYSPACE,
 };
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{
+use crate::structs::execution::job::RoCrateLimits;
+use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::blob::{
     ArchiveKey, BlobHeadKey, BlobVersion, CopyOwner, CurrentVersionPointer, HashIndex, VersionKey,
 };
-use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key, release_marker};
-use aruna_core::types::{Effects, GroupId, Key, Value};
+use crate::structs::storage::bucket_metadata::{ReleasePointer, release_key, release_marker};
+use crate::types::{Effects, GroupId, Key, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
@@ -192,15 +196,30 @@ pub fn build_transition_effects(
     Ok(effects)
 }
 
+/// The DHT put that announces this node as a holder of the blob with hash `blake3`.
+pub fn dht_registration_effect(
+    blake3: &[u8],
+    local_realm_id: RealmId,
+    limits: &RoCrateLimits,
+) -> Result<Effect, ConversionError> {
+    let key = DhtKeyId::from_bytes(blake3.try_into()?);
+    Ok(Effect::Net(NetEffect::Dht(DhtEffect::Put {
+        key,
+        realm_id: local_realm_id,
+        value: Vec::new(),
+        ttl: Duration::from_millis(limits.holder_ttl_ms),
+    })))
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::{
         HeadAliasContext, add_index_effect, build_transition_effects, iter_hash_page,
         iter_index_effect,
     };
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::storage::blob::{CurrentVersionPointer, HashIndex};
+    use crate::effects::{Effect, StorageEffect};
+    use crate::structs::identity::realm::RealmId;
+    use crate::structs::storage::blob::{CurrentVersionPointer, HashIndex};
     use ulid::Ulid;
 
     fn alias_context() -> HeadAliasContext {
@@ -239,7 +258,7 @@ mod pure_tests {
 
         let prefix = prefix.expect("expected prefix");
         let expected =
-            aruna_core::structs::storage::blob::HashIndex::hash_prefix(&[7u8; 32]).unwrap();
+            crate::structs::storage::blob::HashIndex::hash_prefix(&[7u8; 32]).unwrap();
         assert_eq!(prefix.as_ref(), expected.as_slice());
     }
 

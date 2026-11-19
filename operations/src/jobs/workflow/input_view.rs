@@ -28,13 +28,12 @@ use thiserror::Error;
 
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
-};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
 use crate::s3::object::read_access::{SourceReadError, SourceReadOperation};
 use crate::s3::object::visible::SCAN_BUDGET;
 use crate::staging::granted_read::GrantedReadOperation;
 use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Keys one listing page returns at most, as S3 does.

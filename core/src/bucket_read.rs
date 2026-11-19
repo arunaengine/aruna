@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoError, IoResult, Next};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::Operation;
-use aruna_core::rows::read_row;
-use aruna_core::structs::storage::blob::BucketInfo;
+use crate::calls::{IoError, IoResult, Next};
+use crate::errors::{ConversionError, StorageError};
+use crate::keyspaces::S3_BUCKET_KEYSPACE;
+use crate::operation::Operation;
+use crate::rows::read_row;
+use crate::structs::storage::blob::BucketInfo;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,14 +75,14 @@ impl Operation for GetBucketOperation {
 #[cfg(test)]
 mod tests {
     use super::{GetBucketError, GetBucketOperation};
-    use aruna_core::UserId;
-    use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-    use aruna_core::errors::StorageError;
-    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-    use aruna_core::operation::Operation;
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::storage::blob::BucketInfo;
-    use aruna_core::structs::storage::format::Compression;
+    use crate::UserId;
+    use crate::calls::{IoCall, IoError, IoResult, Next};
+    use crate::errors::StorageError;
+    use crate::keyspaces::S3_BUCKET_KEYSPACE;
+    use crate::operation::Operation;
+    use crate::structs::identity::realm::RealmId;
+    use crate::structs::storage::blob::BucketInfo;
+    use crate::structs::storage::format::Compression;
     use ulid::Ulid;
 
     fn fixed_bucket_info() -> BucketInfo {

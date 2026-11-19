@@ -6,7 +6,6 @@ use aruna_core::id_mint::IdMint;
 use std::collections::VecDeque;
 use std::time::SystemTime;
 
-use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::connectors::descriptor::{build_source_binding, build_source_descriptor};
 use crate::connectors::repository::{
     StorageReadError, connector_reference_write, parse_secret_read, read_secret_effect,
@@ -17,14 +16,15 @@ use crate::distribution::guard::{GuardError, authority_reads, write_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
+use crate::s3::object::head_source::{
+    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
+};
 use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
-use crate::staging::head_source::{
-    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
-};
 use aruna_core::UserId;
+use aruna_core::blob_records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

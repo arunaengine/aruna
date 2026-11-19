@@ -12,7 +12,8 @@ use tracing::warn;
 
 use super::access::Repository;
 use super::calls::{git_call, git_event, push_call};
-use super::{GitError, GitNode, pending, repository, snapshot};
+use super::{GitError, pending, repository, snapshot};
+use aruna_core::git::GitNode;
 
 /// What the pending call of serving a request answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -25,12 +25,12 @@ use super::super::{MAX_PAGINATION_DEPTH, MetadataApiError, REGISTRY_CANDIDATE_LI
 use super::{
     MAX_TARGET_VERSIONS, PREFLIGHT_BUDGET, add_location_iris, index_state, visible_prefix,
 };
-use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::iri_index::{
     BacklinkError, BacklinkPage, BacklinksOperation, IriFreshness, iri_freshness, status_rows,
 };
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
+use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_core::metadata::api::{
     MetadataNodeFreshness, MetadataPreflightLocation, MetadataVisibleReference,
     ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,

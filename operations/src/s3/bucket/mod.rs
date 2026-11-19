@@ -13,7 +13,6 @@ pub mod dataset;
 pub mod delete;
 pub mod encryption;
 pub(crate) mod forward;
-pub mod get;
 pub mod holders;
 pub(crate) mod job_pages;
 pub(crate) mod job_progress;

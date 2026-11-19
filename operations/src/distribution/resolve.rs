@@ -31,7 +31,7 @@ use ulid::Ulid;
 
 use crate::distribution::counts::MAX_SETS;
 use crate::distribution::version_key::{MemberAnswer, VersionKeyError, VersionKeyOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::identity::realm::NodeRealm;
 
 /// At most this many candidate sets are looked at for one id.

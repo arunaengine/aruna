@@ -5,13 +5,13 @@
 
 use std::sync::Arc;
 
+use aruna_core::blob_paths::ResolvePathsOperation;
 use aruna_core::metadata::api::{ExportMetadataResult, RoCrateExportView};
 use aruna_core::structs::identity::auth::{AuthContext, Permission, SessionKind, SessionRef};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::share::{ShareLink, ShareTarget, TicketBody};
 use aruna_drivers::driver::{drive, drive_until};
-use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::distribution::resolve::{
     GlobalResolution, content_resolved, resolve_content, resolve_version, resolved,
 };

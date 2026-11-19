@@ -1279,7 +1279,7 @@ pub async fn mint_object_placement(
     let outcome = drive(
         PolicyMutationOperation::new_with_version(
             PolicyMutationConfig {
-                context: aruna_operations::blob::records::HeadAliasContext::new(
+                context: aruna_core::blob_records::HeadAliasContext::new(
                     auth.realm_id,
                     info.group_id,
                     state.get_node_id(),

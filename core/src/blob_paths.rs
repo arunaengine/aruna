@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-use aruna_core::operation::Operation;
-use aruna_core::structs::storage::blob::HashIndex;
+use crate::calls::{IoCall, IoError, IoResult, Next};
+use crate::errors::{ConversionError, StorageError};
+use crate::keyspaces::PATHS_INDEX_KEYSPACE;
+use crate::operation::Operation;
+use crate::structs::storage::blob::HashIndex;
 use thiserror::Error;
 
 pub const MAX_HASH_ALIASES: usize = 1024;
@@ -74,17 +74,11 @@ impl Operation for ResolvePathsOperation {
 #[cfg(test)]
 mod tests {
     use super::{MAX_HASH_ALIASES, ResolvePathsError, ResolvePathsOperation};
-    use crate::blob::records::add_index_effect;
-    use aruna_core::calls::{IoCall, IoResult, Next};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-    use aruna_core::operation::Operation;
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::storage::blob::HashIndex;
-    use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage;
-    use tempfile::tempdir;
+    use crate::calls::{IoCall, IoResult, Next};
+    use crate::keyspaces::PATHS_INDEX_KEYSPACE;
+    use crate::operation::Operation;
+    use crate::structs::identity::realm::RealmId;
+    use crate::structs::storage::blob::HashIndex;
     use ulid::Ulid;
 
     fn alias_key(
@@ -92,7 +86,7 @@ mod tests {
         version_id: Ulid,
         realm_id: RealmId,
         group_id: Ulid,
-        node_id: aruna_core::NodeId,
+        node_id: crate::NodeId,
         bucket: &str,
         key: &str,
     ) -> HashIndex {
@@ -104,7 +98,7 @@ mod tests {
         let mut op = ResolvePathsOperation::new([7u8; 32]);
         assert_eq!(
             op.transaction(),
-            aruna_core::operation::TransactionMode::None
+            crate::operation::TransactionMode::None
         );
         assert!(matches!(
             op.first(),
@@ -179,75 +173,5 @@ mod tests {
             op.next(IoResult::Done),
             Err(ResolvePathsError::Io(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn resolves_empty_hash() {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
-
-        let result = drive(ResolvePathsOperation::new([1u8; 32]), &context)
-            .await
-            .unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[tokio::test]
-    async fn resolves_existing_aliases() {
-        let random_path = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle: storage_handle.clone(),
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
-
-        let hash = [8u8; 32];
-        let alias = HashIndex::new(
-            hash,
-            Ulid::from_bytes([4u8; 16]),
-            RealmId::from_bytes([1u8; 32]),
-            Ulid::from_bytes([2u8; 16]),
-            iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-            "bucket",
-            "path/file.txt",
-        );
-        let effect = add_index_effect(
-            &crate::blob::records::HeadAliasContext::new(
-                alias.realm_id,
-                alias.group_id,
-                alias.node_id,
-                alias.bucket.clone(),
-                alias.key.clone(),
-            ),
-            hash,
-            alias.version_id,
-        )
-        .unwrap();
-        let event = context.storage_handle.send_effect(effect).await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
-
-        let result = drive(ResolvePathsOperation::new(hash), &context)
-            .await
-            .unwrap();
-        assert_eq!(result, vec![alias]);
     }
 }

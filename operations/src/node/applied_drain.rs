@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::document::AppliedSync;
+use aruna_core::document::{AppliedStep, AppliedSync, applied_sync_entry};
 use aruna_core::keyspaces::APPLIED_SYNC_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::types::Key;
@@ -25,15 +25,14 @@ type Turn = Result<Next<()>, IoError>;
 #[derive(Clone, Debug, PartialEq)]
 enum DrainStep {
     Page,
-    Usage,
-    Interest,
-    Mail,
-    Metadata,
+    Run(AppliedStep),
+    Progress,
     Delete,
 }
 
 /// One drain run: the follow-ups of every queued reconcile run and its row is deleted, page by
-/// page, until the keyspace is empty. A row that does not decode is deleted without follow-ups.
+/// page, until the keyspace is empty. Each finished follow-up is stored in the row, so a rerun
+/// after a restart starts at the next one. A row that does not decode is deleted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedDrainOperation {
     step: DrainStep,
@@ -81,25 +80,50 @@ impl AppliedDrainOperation {
         let Some(applied) = applied else {
             return self.delete();
         };
-        self.step = DrainStep::Usage;
-        let refresh = RefreshUsageOperation::new(
-            applied.node_id,
-            applied.realm_id,
-            &applied.result.targets,
-            applied.id,
-        );
+        let next = applied.next;
         self.applied = Some(applied);
-        Ok(Next::Call(IoCall::child(refresh)))
+        self.run(next)
     }
 
     fn applied(&mut self) -> Result<&mut AppliedSync, IoError> {
         self.applied.as_mut().ok_or(IoError::Unfinished)
     }
 
-    fn mail(&mut self) -> Turn {
-        self.step = DrainStep::Mail;
-        let refresh = RefreshMailOperation::applied(&self.applied()?.result.targets);
-        Ok(Next::Call(IoCall::child(refresh)))
+    fn run(&mut self, step: AppliedStep) -> Turn {
+        let applied = self.applied()?;
+        let targets = &applied.result.targets;
+        let call = match step {
+            AppliedStep::Usage => IoCall::child(RefreshUsageOperation::new(
+                applied.node_id,
+                applied.realm_id,
+                targets,
+                applied.id,
+            )),
+            AppliedStep::Interest => match applied.realm_id {
+                Some(realm_id) => IoCall::child(RefreshInterestOperation::new(targets, realm_id)),
+                None => return self.run(AppliedStep::Mail),
+            },
+            AppliedStep::Mail => IoCall::child(RefreshMailOperation::applied(targets)),
+            AppliedStep::Metadata => {
+                let result = std::mem::take(&mut applied.result);
+                IoCall::child(AfterSyncOperation::new(Some(applied.node_id), result, false))
+            }
+        };
+        self.step = DrainStep::Run(step);
+        Ok(Next::Call(call))
+    }
+
+    /// Stores that `step` ran, so a rerun goes on with the next one; the last one ends the row.
+    fn finished(&mut self, step: AppliedStep) -> Turn {
+        let Some(next) = step.after() else {
+            return self.delete();
+        };
+        let applied = self.applied()?;
+        applied.next = next;
+        let entry = applied_sync_entry(applied);
+        let entry = entry.map_err(|error| IoError::Codec(error.to_string()))?;
+        self.step = DrainStep::Progress;
+        Ok(Next::Call(IoCall::Write(vec![entry])))
     }
 
     fn delete(&mut self) -> Turn {
@@ -111,6 +135,10 @@ impl AppliedDrainOperation {
     }
 }
 
+fn error_text<T, E: std::fmt::Display>(outcome: Result<T, E>) -> Option<String> {
+    outcome.err().map(|error| error.to_string())
+}
+
 impl Operation for AppliedDrainOperation {
     type Output = ();
     type Error = IoError;
@@ -120,7 +148,7 @@ impl Operation for AppliedDrainOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Turn {
-        match self.step {
+        match std::mem::replace(&mut self.step, DrainStep::Page) {
             DrainStep::Page => {
                 let (rows, next) = result.page()?;
                 self.more = next.is_some();
@@ -132,40 +160,24 @@ impl Operation for AppliedDrainOperation {
                 }
                 self.next_row()
             }
-            DrainStep::Usage => {
-                if let Err(error) = result.child::<(), RefreshUsageError>()? {
-                    warn!(%error, "Realm usage refresh stopped after the shard restore");
-                }
-                let Some(realm_id) = self.applied()?.realm_id else {
-                    return self.mail();
+            DrainStep::Run(step) => {
+                let failure = match step {
+                    AppliedStep::Usage => error_text(result.child::<(), RefreshUsageError>()?),
+                    AppliedStep::Interest => error_text(result.child::<(), IoError>()?),
+                    AppliedStep::Mail => error_text(result.child::<(), IoError>()?),
+                    AppliedStep::Metadata => {
+                        error_text(result.child::<MetadataTimings, IoError>()?)
+                    }
                 };
-                let targets = &self.applied()?.result.targets;
-                let refresh = RefreshInterestOperation::new(targets, realm_id);
-                self.step = DrainStep::Interest;
-                Ok(Next::Call(IoCall::child(refresh)))
-            }
-            DrainStep::Interest => {
-                if let Err(error) = result.child::<(), IoError>()? {
-                    warn!(%error, "Watch interest refresh stopped after the shard restore");
+                if let Some(error) = failure {
+                    warn!(%error, ?step, "A follow-up stopped after the shard restore");
                 }
-                self.mail()
+                self.finished(step)
             }
-            DrainStep::Mail => {
-                if let Err(error) = result.child::<(), IoError>()? {
-                    warn!(%error, "Mail settings refresh stopped after the shard restore");
-                }
-                let applied = self.applied()?;
-                let node_id = applied.node_id;
-                let result = std::mem::take(&mut applied.result);
-                self.step = DrainStep::Metadata;
-                let after = AfterSyncOperation::new(Some(node_id), result, false);
-                Ok(Next::Call(IoCall::child(after)))
-            }
-            DrainStep::Metadata => {
-                if let Err(error) = result.child::<MetadataTimings, IoError>()? {
-                    warn!(%error, "Metadata follow-up stopped after the shard restore");
-                }
-                self.delete()
+            DrainStep::Progress => {
+                result.done()?;
+                let next = self.applied()?.next;
+                self.run(next)
             }
             DrainStep::Delete => {
                 result.done()?;
@@ -180,7 +192,7 @@ mod tests {
     use super::*;
     use aruna_core::NodeId;
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::document::{DocumentReconcileResult, DocumentTarget, applied_sync_entry};
+    use aruna_core::document::{DocumentReconcileResult, DocumentTarget};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::Value;
     use ulid::Ulid;
@@ -197,8 +209,8 @@ mod tests {
         vec![DocumentTarget::RealmConfig { realm_id: realm() }]
     }
 
-    fn queued(realm_id: Option<RealmId>) -> IoResult {
-        let applied = AppliedSync {
+    fn applied(realm_id: Option<RealmId>, next: AppliedStep) -> AppliedSync {
+        AppliedSync {
             id: Ulid::from_parts(1_000, 7),
             node_id: node(),
             realm_id,
@@ -206,12 +218,22 @@ mod tests {
                 targets: targets(),
                 ..DocumentReconcileResult::default()
             },
-        };
-        let (_, key, value) = applied_sync_entry(&applied).unwrap();
+            next,
+        }
+    }
+
+    fn queued(applied: &AppliedSync) -> IoResult {
+        let (_, key, value) = applied_sync_entry(applied).unwrap();
         IoResult::Page {
             rows: vec![(key, value)],
             next: None,
         }
+    }
+
+    /// The row write that stores `next` as the follow-up a rerun starts at.
+    fn progress(realm_id: Option<RealmId>, next: AppliedStep) -> Turn {
+        let entry = applied_sync_entry(&applied(realm_id, next)).unwrap();
+        Ok(Next::Call(IoCall::Write(vec![entry])))
     }
 
     fn child<T, E>(outcome: Result<T, E>) -> IoResult
@@ -222,45 +244,65 @@ mod tests {
         IoResult::Child(ChildOutcome::new(outcome))
     }
 
-    // The follow-ups run in order, a failed one does not stop the next, and the row goes last.
-    #[test]
-    fn followups_run_ordered() {
-        let mut drain = AppliedDrainOperation::new();
-        assert!(matches!(drain.first(), Ok(Next::Call(IoCall::Page { .. }))));
-        let generation = Ulid::from_parts(1_000, 7);
-        let usage = RefreshUsageOperation::new(node(), Some(realm()), &targets(), generation);
-        assert_eq!(
-            drain.next(queued(Some(realm()))),
-            Ok(Next::Call(IoCall::child(usage)))
-        );
-        let failed = RefreshUsageError::Io(IoError::Aborted);
-        let interest = RefreshInterestOperation::new(&targets(), realm());
-        let turn = drain.next(child::<(), _>(Err(failed)));
-        assert_eq!(turn, Ok(Next::Call(IoCall::child(interest))));
-        let mail = RefreshMailOperation::applied(&targets());
-        let turn = drain.next(child::<(), IoError>(Ok(())));
-        assert_eq!(turn, Ok(Next::Call(IoCall::child(mail))));
+    fn after_sync() -> IoCall {
         let result = DocumentReconcileResult {
             targets: targets(),
             ..DocumentReconcileResult::default()
         };
-        let after = AfterSyncOperation::new(Some(node()), result, false);
+        IoCall::child(AfterSyncOperation::new(Some(node()), result, false))
+    }
+
+    // The follow-ups run in order and each is stored once it ran; a failed one does not stop
+    // the next, and the row goes last.
+    #[test]
+    fn followups_run_ordered() {
+        let realm_id = Some(realm());
+        let mut drain = AppliedDrainOperation::new();
+        assert!(matches!(drain.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        let generation = Ulid::from_parts(1_000, 7);
+        let usage = RefreshUsageOperation::new(node(), realm_id, &targets(), generation);
+        let row = applied(realm_id, AppliedStep::Usage);
+        assert_eq!(drain.next(queued(&row)), Ok(Next::Call(IoCall::child(usage))));
+        let failed = RefreshUsageError::Io(IoError::Aborted);
+        let turn = drain.next(child::<(), _>(Err(failed)));
+        assert_eq!(turn, progress(realm_id, AppliedStep::Interest));
+        let interest = RefreshInterestOperation::new(&targets(), realm());
+        assert_eq!(drain.next(IoResult::Done), Ok(Next::Call(IoCall::child(interest))));
         let turn = drain.next(child::<(), IoError>(Ok(())));
-        assert_eq!(turn, Ok(Next::Call(IoCall::child(after))));
+        assert_eq!(turn, progress(realm_id, AppliedStep::Mail));
+        let mail = RefreshMailOperation::applied(&targets());
+        assert_eq!(drain.next(IoResult::Done), Ok(Next::Call(IoCall::child(mail))));
+        let turn = drain.next(child::<(), IoError>(Ok(())));
+        assert_eq!(turn, progress(realm_id, AppliedStep::Metadata));
+        assert_eq!(drain.next(IoResult::Done), Ok(Next::Call(after_sync())));
         let timings = MetadataTimings::default();
         let turn = drain.next(child::<_, IoError>(Ok(timings)));
         assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
         assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(())));
     }
 
+    // A rerun after a restart starts at the stored follow-up: the refreshes that ran already
+    // do not run again.
+    #[test]
+    fn rerun_skips_finished() {
+        let mut drain = AppliedDrainOperation::new();
+        drain.first().unwrap();
+        let row = applied(Some(realm()), AppliedStep::Metadata);
+        assert_eq!(drain.next(queued(&row)), Ok(Next::Call(after_sync())));
+        let timings = MetadataTimings::default();
+        let turn = drain.next(child::<_, IoError>(Ok(timings)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+    }
+
     #[test]
     fn realmless_skips_interest() {
         let mut drain = AppliedDrainOperation::new();
         drain.first().unwrap();
-        drain.next(queued(None)).unwrap();
-        let mail = RefreshMailOperation::applied(&targets());
+        drain.next(queued(&applied(None, AppliedStep::Usage))).unwrap();
         let turn = drain.next(child::<(), RefreshUsageError>(Ok(())));
-        assert_eq!(turn, Ok(Next::Call(IoCall::child(mail))));
+        assert_eq!(turn, progress(None, AppliedStep::Interest));
+        let mail = RefreshMailOperation::applied(&targets());
+        assert_eq!(drain.next(IoResult::Done), Ok(Next::Call(IoCall::child(mail))));
     }
 
     #[test]

@@ -4,12 +4,12 @@
 
 use crate::shared;
 
+use aruna_core::blob_paths::ResolvePathsOperation;
 use aruna_core::structs::storage::blob::HashIndex;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_drivers::driver::drive;
 use aruna_drivers::driver::node_facts;
-use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
@@ -131,9 +131,9 @@ async fn content_hash_missing() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn crowded_hash_conflicts() -> TestResult<()> {
+    use aruna_core::blob_paths::MAX_HASH_ALIASES;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-    use aruna_operations::blob::permission_paths::MAX_HASH_ALIASES;
 
     let seed = spawn_complete_seed().await?;
     let result = async {

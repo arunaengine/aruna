@@ -26,12 +26,12 @@ use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::read_peer::{PeerReader, ReadPeerOperation, SearchPeerOperation};
 use crate::metadata::search_cursor::MAX_PAGINATION_DEPTH;
 use crate::metadata::text_search::LocalSearchOperation;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::LocalBucketSearch;
 use crate::s3::bucket::release::publish::{HolderAnswerOperation, PublishError};
 use crate::s3::bucket::search::{SearchBucketsError, SearchBucketsInput};
 use crate::s3::object::search::{SearchObjectsError, SearchObjectsInput};
 use crate::s3::object::search_scan::SearchObjectsOperation;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::metadata::api::{
     IdentifierMatch, LinkNodePage, ReferenceNodeExecution, ReferenceNodeRequest, SetPreviewPage,
 };

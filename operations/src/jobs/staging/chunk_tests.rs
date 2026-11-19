@@ -7,11 +7,12 @@ use std::sync::Arc;
 use aruna_core::events::Event;
 
 use super::*;
+use crate::jobs::staging::StagingRun;
 use crate::jobs::staging::pure_tests::{child_answer, test_bucket, test_connector, test_run};
-use crate::jobs::staging::{StagingRun, initial_checkpoint};
 use crate::jobs::store::mutation_error::JobMutationError;
-use crate::s3::object::get::ObjectInfo;
+use aruna_core::staging_checkpoint::initial_checkpoint;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
+use aruna_core::structs::storage::object_read::ObjectInfo;
 
 fn table_run() -> StagingRun {
     let run = test_run();

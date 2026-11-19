@@ -95,6 +95,8 @@ pub enum TaskKey {
     DrainWatchEvents,
     /// Runs the follow-ups of the reconciles shard pulls applied, then deletes their rows.
     DrainAppliedSync,
+    /// Takes the Git snapshots of materialized documents whose capture marks remain.
+    DrainCaptures,
 }
 
 impl TaskKey {

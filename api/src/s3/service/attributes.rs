@@ -6,9 +6,9 @@ use super::response::ObjectResponseFields;
 use crate::s3::checksum::{ChecksumSelection, EncodedChecksums, encode_checksums};
 use crate::s3::util::{checksum_response_hashes, map_checksum_type};
 use aruna_core::structs::storage::multipart::MultipartObjectPart;
+use aruna_core::structs::storage::object_read::ObjectInfo;
 use aruna_operations::s3::multipart::parts::ListPartsOperation;
 use aruna_operations::s3::object::attributes::GetAttributesResult;
-use aruna_operations::s3::object::get::ObjectInfo;
 use s3s::dto::{
     Checksum, ChecksumType, GetObjectAttributesOutput, GetObjectAttributesParts, ObjectAttributes,
     ObjectPart, StorageClass,

@@ -393,7 +393,7 @@ impl ListBucketOperation {
     }
 
     fn common_prefix_of(&self, key: &str) -> Option<String> {
-        crate::s3::listing::common_prefix_of(
+        aruna_core::structs::storage::blob::common_prefix_of(
             key,
             self.input.prefix.as_deref(),
             self.input.delimiter.as_deref(),

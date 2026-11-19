@@ -22,9 +22,9 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
-use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};
+use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_core::replication_protocol::LocationSummaryRequest;
 use aruna_core::request_policy::PolicyRequestExtras;
 

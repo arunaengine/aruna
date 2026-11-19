@@ -28,7 +28,7 @@ use super::workspace::{authorization_error, bucket_lookup_error};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::s3::access::create::{CreateUserConfig, CreateUserError, CreateUserOperation};
 use crate::s3::access::get::{GetAccessError, GetAccessOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::job_request::session_of;
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.

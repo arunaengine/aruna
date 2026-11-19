@@ -7,7 +7,7 @@ use super::calls::{
 };
 use super::dataset::{self, PushTarget};
 use super::snapshot::held_refresh;
-use super::{GitError, GitNode, records};
+use super::{GitError, records};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
@@ -15,7 +15,7 @@ use crate::metadata::update_document::{
 use crate::metadata::update_entry::UpdateEntryOperation;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageReadError;
-use aruna_core::git::{GitEffect, GitEvent, PENDING, PendingMerge, ZERO_OID};
+use aruna_core::git::{GitEffect, GitEvent, GitNode, PENDING, PendingMerge, ZERO_OID};
 use aruna_core::metadata::api::UpdateDocumentMutation;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::operation::Operation;

@@ -181,7 +181,7 @@ pub(super) fn reference_content(
         return Err(refused("input is not materialized"));
     };
     let range_bound = binding.descriptor.kind.enforces_if_match()
-        && crate::s3::object::get::strong_validator(metadata.etag.as_deref());
+        && aruna_core::structs::storage::blob::strong_validator(metadata.etag.as_deref());
     let pin = SourcePin::of(&binding.descriptor);
     let content = InputContent::Reference {
         etag: metadata.etag.clone(),

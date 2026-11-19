@@ -58,13 +58,13 @@ use crate::replication::version_replication::{
 };
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 /// What an output capture works with.
 #[derive(Clone, Debug, PartialEq)]

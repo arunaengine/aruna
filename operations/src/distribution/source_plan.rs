@@ -30,7 +30,7 @@ use ulid::Ulid;
 
 use super::held::{HeldElsewhere, admitted};
 use crate::connectors::{ResolveBindingInput, ResolveBindingOperation};
-use crate::s3::object::get::strong_validator;
+use aruna_core::structs::storage::blob::strong_validator;
 
 /// One reference a read served from its source.
 #[derive(Clone, Debug, PartialEq)]

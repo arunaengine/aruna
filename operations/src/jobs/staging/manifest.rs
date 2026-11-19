@@ -17,7 +17,7 @@ use byteview::ByteView;
 
 use super::walk::{canonical_walker_path, read_check_call, record_failure, source_permission_path};
 use super::{ClearRowsOperation, PageFailure, StagingRun, committed};
-use crate::staging::head_source::{
+use crate::s3::object::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
 use crate::staging::read_source::{

@@ -13,6 +13,7 @@ use crate::routes::notification_calls::{
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -29,7 +30,6 @@ use aruna_operations::notifications::mark_read::MARK_MAX_IDS;
 use aruna_operations::notifications::user_call::WatchDispatchError;
 use aruna_operations::notifications::watch::check::WatchCheckOperation;
 use aruna_operations::notifications::watch::paths::{WatchAuthorization, watch_permission_path};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};

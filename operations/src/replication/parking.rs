@@ -5,7 +5,8 @@
 
 use aruna_core::structs::storage::replication_queue::BlobJobRecord;
 
-use super::queue::{BlobQueueError, schedule_blob_drain};
+use super::queue::BlobQueueError;
+use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
 use std::collections::VecDeque;
 use std::time::Duration;
 

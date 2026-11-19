@@ -27,7 +27,7 @@ use crate::connectors::descriptor::build_source_binding;
 use crate::jobs::repository::connector::{ConnectOperation, ConnectRequest};
 use crate::jobs::repository::link_store::time_of;
 use crate::jobs::repository::{JobScope, TransferError, not_supported, remote_call};
-use crate::staging::reference::{ReferenceWrite, WriteReferenceOperation};
+use crate::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
 
 #[derive(Debug, PartialEq)]
 enum ReferenceStep {

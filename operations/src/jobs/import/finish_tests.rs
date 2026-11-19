@@ -39,17 +39,19 @@ fn rewrite_checks_document() {
     assert!(rewrite.first().is_err());
 }
 
-// The created dataset ends the phase and records its revision for a pull.
+// The created dataset ends the phase and arms the drain of its queued watch event.
 #[test]
 fn created_dataset_advances() {
     let mut create = CreateDatasetOperation::new(run(), ImportCheckpoint::default());
     create.step = CreateStep::Emit;
     create.checkpoint.created = true;
     create.checkpoint.phase = ImportPhase::Cleanup;
-    let Ok(Next::Done(done)) = create.next(IoResult::Done) else {
+    let written = child(Ok::<_, aruna_core::calls::IoError>(IoResult::Done));
+    let Ok(Next::Then { output, calls }) = create.next(written) else {
         panic!("expected the finished phase");
     };
-    assert!(done.created);
+    assert!(output.created);
+    assert_eq!(calls, vec![IoCall::from(schedule_watch_drain())]);
 }
 
 // Creating needs the rewritten crate.

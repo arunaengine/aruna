@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::errors::StorageError;
 use aruna_core::structs::execution::staging::SourceMapping;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -12,7 +13,6 @@ use aruna_drivers::driver::drive;
 use aruna_operations::connectors::get_connector::{
     GetSourceError, GetSourceInput, GetSourceOperation,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::source::edit::{
     SourceChange, SourceEditError, SourceEditInput, SourceEditOperation, SourceEditResult,
 };

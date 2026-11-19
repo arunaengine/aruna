@@ -42,7 +42,7 @@ use crate::blob::migration::misplaced::KeyRule;
 use crate::connectors::repository::source_connector_key;
 use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use crate::s3::bucket::dataset::{BucketMetadataError, BucketMetadataOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum OriginError {

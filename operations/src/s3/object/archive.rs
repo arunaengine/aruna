@@ -27,7 +27,6 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::route_read;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -42,6 +41,7 @@ use crate::s3::object::pages::{
 };
 use crate::s3::object::range_list::{DelegatedCaller, MemberAccess};
 use crate::s3::object::read::GetRoutedOperation;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Bucket names never contain `_`, so these paths cannot meet a `bucket/key` path.

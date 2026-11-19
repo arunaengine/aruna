@@ -5,7 +5,6 @@
 use crate::connectors::repository::{parse_secret_read, read_secret_effect};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::distribution::guard::{authority_reads, write_epochs};
-use crate::replication::queue::schedule_blob_drain;
 use crate::s3::usage::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 use crate::staging::page::rows::{
     MAX_PAGE_ENTRIES, PageGuards, PreparedRows, check_guards, decode_heads, guard_reads,
@@ -19,6 +18,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::structs::storage::blob::CurrentVersionPointer;
+use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
 use aruna_core::structs::sync_relationship_prefix;
 use std::collections::BTreeSet;
 use ulid::Ulid;

@@ -25,7 +25,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::object_version::{ObjectVersion, ObjectVersionError, ObjectVersionOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 /// At most this many entities are looked at per save.
 const MAX_ENTITIES: usize = 10_000;
@@ -560,7 +560,7 @@ mod tests {
             aruna_core::structs::storage::blob::BucketInfo,
             _,
         >(
-            crate::s3::bucket::get::GetBucketError::NotFound,
+            aruna_core::bucket_read::GetBucketError::NotFound,
         )));
         let Ok(Next::Done((_, count))) = normalize.next(missing) else {
             panic!("expected the unchanged document");

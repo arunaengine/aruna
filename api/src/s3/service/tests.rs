@@ -40,13 +40,14 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
+use aruna_core::structs::storage::object_read::ObjectInfo;
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::read_value;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
+use aruna_operations::notifications::watch::drain::WatchDrainOperation;
 use aruna_operations::notifications::watch::store::StoreWatchOperation;
-use aruna_operations::s3::object::get::ObjectInfo;
 use aruna_operations::s3::object::list::ListContinuationToken;
 use aruna_operations::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
 use aruna_operations::s3::object::metadata_drain::RefreshReferenceOperation;
@@ -656,6 +657,10 @@ async fn put_expands_watch() {
         )
         .await
         .expect("committed PUT response should succeed");
+    // The PUT queues its watch event; the drain, armed to run at once, delivers it.
+    drive(WatchDrainOperation::new(), &context)
+        .await
+        .expect("the watch drain runs");
 
     let rows = read_watch_rows(context.as_ref()).await;
     assert_eq!(rows.len(), 1, "the local holder expands immediately");
@@ -733,6 +738,9 @@ async fn anonymous_put_silent() {
         )
         .await
         .expect("committed PUT response should succeed");
+    drive(WatchDrainOperation::new(), &context)
+        .await
+        .expect("the watch drain runs");
 
     assert!(
         read_watch_rows(context.as_ref()).await.is_empty(),

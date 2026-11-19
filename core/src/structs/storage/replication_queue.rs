@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -13,6 +15,7 @@ use crate::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::storage::replication::ArunaArn;
 use crate::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_key};
+use crate::task::{TaskEffect, TaskKey};
 use crate::types::Key;
 use byteview::ByteView;
 
@@ -513,4 +516,11 @@ pub fn merge_due_job(
         jobs.push((key, job));
         jobs.len() >= limit
     }
+}
+
+pub fn schedule_blob_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainReplicationQueue,
+        after: Duration::ZERO,
+    })
 }

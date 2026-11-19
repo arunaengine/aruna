@@ -6,15 +6,14 @@ use std::sync::Arc;
 
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
-use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::protocol::{PersistentIdRequest, PersistentIdResolution};
 use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export_types::GetVisibleRequest;
@@ -27,7 +26,7 @@ use aruna_operations::metadata::forward::write::MetadataWriteError;
 use aruna_operations::metadata::id_mapping::PersistentIdError;
 use aruna_operations::metadata::persistent_id::MappingReadOperation;
 use aruna_operations::metadata::persistent_id::forward::{
-    PidRouteOperation, outcome_mapping, outcome_resolution, outcome_submission, submission_error,
+    PidRouteOperation, outcome_mapping, outcome_resolution,
 };
 use ulid::Ulid;
 
@@ -134,25 +133,6 @@ pub async fn resolve_pid_routed(
     let request = PersistentIdRequest::Resolve { pid };
     let outcome = pid_request(context, (realm_id, document_id), request, (None, None)).await;
     outcome.and_then(outcome_resolution)
-}
-
-pub async fn submit_mint_pid(
-    context: &Arc<DriverContext>,
-    spec: MintPersistentSpec,
-    local_node_id: NodeId,
-    retention_ms: u64,
-    token: Option<AuthToken>,
-) -> Result<SubmitJobResult, SubmitJobError> {
-    let realm_id = context.serving_realm(spec.minted_by.realm_id);
-    let request = PersistentIdRequest::SubmitMint {
-        minted_by: spec.minted_by,
-        retention_ms,
-    };
-    let node = (realm_id, local_node(context));
-    let route = PidRouteOperation::new(node, spec.document_id, request, (token, None))
-        .with_owner(local_node_id);
-    let outcome = drive(route, context).await.map_err(submission_error)?;
-    outcome_submission(outcome)
 }
 
 pub async fn add_identifiers_routed(

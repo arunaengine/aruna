@@ -13,7 +13,7 @@ use crate::s3::multipart::part_upload::{
 use crate::s3::object::copy::{
     CopySourceConditions, evaluate_source_conditions, source_etag, source_modified,
 };
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
 use crate::s3::object::read::{ReadSourceOperation, TokenRead};
 use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -25,6 +25,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
 use std::time::SystemTime;

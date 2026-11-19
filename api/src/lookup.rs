@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -12,7 +13,6 @@ use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::forward::routing::is_user_origin;
 use aruna_operations::metadata::forward::holders::origin_holds_document;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::list::ListedObject;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};

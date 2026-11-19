@@ -2,10 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::Duration;
-
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
@@ -16,8 +13,9 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::replication_queue::{
     BlobJobRecord, LiveObligationRecord, LiveReplicationContinuation, ReferenceAdvance,
     ReplicateScopeInput, blob_job_entry, blob_job_key, blob_job_preferred, live_obligation_entry,
+    schedule_blob_drain,
 };
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::task::TaskEvent;
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_core::{NodeId, UserId};
 use thiserror::Error;
@@ -59,13 +57,6 @@ impl From<IoError> for BlobQueueError {
 }
 
 type QueueTurn = Result<Next<QueueBlobResult>, BlobQueueError>;
-
-pub fn schedule_blob_drain() -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainReplicationQueue,
-        after: Duration::ZERO,
-    })
-}
 
 /// Whether the drain timer was set; the queued work is durable either way.
 fn drain_scheduled(result: IoResult) -> bool {
@@ -669,6 +660,7 @@ mod tests {
     use super::super::version_replication::SourceAuthorizationError;
     use crate::replication::mirror_repair::StoreStatusOperation;
     use aruna_core::UserId;
+    use aruna_core::effects::Effect;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
@@ -693,9 +685,10 @@ mod tests {
     };
     use aruna_core::structs::storage::replication_queue::{ReplicationMode, SyncOrigin};
     use aruna_core::structs::{ReferenceHandling, SyncStatusSnapshot, sync_relationship_key};
+    use aruna_core::task::TaskKey;
     use aruna_net::NetHandle;
     use aruna_storage::FjallStorage;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
 
     fn node(seed: u8) -> NodeId {

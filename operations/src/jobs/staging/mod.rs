@@ -20,10 +20,8 @@ use aruna_core::keyspaces::{
     STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::values;
-use aruna_core::structs::execution::job::{
-    JobId, ManifestRead, StagingJobCheckpoint, StagingJobPhase, StagingJobSpec,
-};
+use aruna_core::staging_checkpoint::checkpoint_key;
+use aruna_core::structs::execution::job::{JobId, StagingJobCheckpoint, StagingJobSpec};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::types::{Key, KeySpace, Value};
@@ -34,7 +32,7 @@ use ulid::Ulid;
 pub use self::job::StagingJobOperation;
 use super::run_rows::SettledRowsOperation;
 use super::store::mutation_error::JobMutationError;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 /// Queue rows one cleanup pass deletes.
 const QUEUE_CLEANUP_PAGE: usize = 256;
@@ -121,70 +119,6 @@ impl From<IoError> for StagingStoreError {
     fn from(error: IoError) -> Self {
         Self(error.to_string())
     }
-}
-
-#[derive(Debug, PartialEq)]
-enum ReadStep {
-    Main,
-    Lanes(Box<StagingJobCheckpoint>),
-}
-
-/// The job's progress with its open prefix lanes counted in; a lane's prefix reads as not
-/// started yet, as a job handed over goes on from there.
-#[derive(Debug, PartialEq)]
-pub struct ReadCheckpointOperation {
-    job_id: JobId,
-    step: ReadStep,
-}
-
-impl ReadCheckpointOperation {
-    pub fn new(job_id: JobId) -> Self {
-        Self {
-            job_id,
-            step: ReadStep::Main,
-        }
-    }
-}
-
-impl Operation for ReadCheckpointOperation {
-    type Output = Option<StagingJobCheckpoint>;
-    type Error = StagingStoreError;
-
-    fn first(&mut self) -> Result<Next<Self::Output>, StagingStoreError> {
-        Ok(Next::Call(main_read(self.job_id)))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, StagingStoreError> {
-        match std::mem::replace(&mut self.step, ReadStep::Main) {
-            ReadStep::Main => {
-                let Some(main) = decode_main(result)? else {
-                    return Ok(Next::Done(None));
-                };
-                self.step = ReadStep::Lanes(Box::new(main));
-                Ok(Next::Call(lanes::lanes_page(self.job_id)))
-            }
-            ReadStep::Lanes(main) => {
-                let (rows, _) = result.page()?;
-                let open = lanes::parse_lanes(rows).map_err(StagingStoreError)?;
-                Ok(Next::Done(Some(lanes::merged(*main, open))))
-            }
-        }
-    }
-}
-
-fn main_read(job_id: JobId) -> IoCall {
-    let row = (
-        STAGING_STATE_KEYSPACE.to_string(),
-        checkpoint_key(job_id, None),
-    );
-    IoCall::Read(vec![row])
-}
-
-fn decode_main(result: IoResult) -> Result<Option<StagingJobCheckpoint>, StagingStoreError> {
-    let [row] = values::<1>(result)?;
-    row.map(|value| postcard::from_bytes(&value))
-        .transpose()
-        .map_err(|error| StagingStoreError(error.to_string()))
 }
 
 /// Stores the checkpoint a job submitted as `job_id` starts from, before it can run.
@@ -328,80 +262,6 @@ impl Operation for ClearQueueOperation {
     }
 }
 
-fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
-    StagingJobCheckpoint {
-        phase: StagingJobPhase::Queued,
-        flat: None,
-        items_done: 0,
-        prefixes_done: 0,
-        walk: None,
-        manifest: None,
-        table: spec.table.as_ref().map(|_| Default::default()),
-        queue_head: 0,
-        queue_tail: 0,
-        items_current: 0,
-        items_succeeded: 0,
-        items_failed: 0,
-        items_total: (spec.prefixes.is_empty() && spec.table.is_none())
-            .then_some(spec.items.len() as u64),
-        bytes_current: 0,
-        bytes_total: None,
-        bytes_discovered: 0,
-        current_path: None,
-        errors: Vec::new(),
-    }
-}
-
-/// Where a job taken over by a range's new coordinator goes on: the former position without
-/// counters, errors or directory queue. A flat walk keeps its cursor and rereads its manifest;
-/// a manifest read, a table or a directory walk, whose queue stays behind, starts over.
-pub(crate) fn handed_checkpoint(
-    spec: &StagingJobSpec,
-    at: &StagingJobCheckpoint,
-) -> StagingJobCheckpoint {
-    let mut next = initial_checkpoint(spec);
-    // The table is read again from its start, pinned to what the former job first read.
-    if let (Some(table), Some(read)) = (next.table.as_mut(), at.table.as_ref()) {
-        table.version_id = read.version_id;
-        table.observation = read.observation.clone();
-    }
-    next.flat = at.flat;
-    next.items_done = at.items_done;
-    let queued = at.queue_head < at.queue_tail;
-    let open = at.walk.is_some() || at.manifest.is_some() || queued;
-    let flat_walk = at.flat == Some(true)
-        && at.manifest.is_none()
-        && !queued
-        && at
-            .walk
-            .as_ref()
-            .is_some_and(|walk| walk.queue_row.is_none());
-    match flat_walk {
-        true => {
-            next.prefixes_done = at.prefixes_done;
-            next.walk = at.walk.clone();
-            // The manifest's rows stay with the former job, so this one reads it before its walk.
-            let manifest = spec.checksum_manifest.as_ref().zip(at.walk.as_ref());
-            next.manifest = manifest.map(|(name, walk)| ManifestRead {
-                source_path: format!("{}{name}", walk.source_path),
-                offset: 0,
-                observation: None,
-            });
-        }
-        false => next.prefixes_done = at.prefixes_done.saturating_sub(u64::from(open)),
-    }
-    next
-}
-
-/// The checkpoint row of a job, or of its prefix lane `slot`, which extends the job's key.
-pub(crate) fn checkpoint_key(job_id: JobId, slot: Option<u64>) -> ByteView {
-    let mut key = job_id.to_bytes().to_vec();
-    if let Some(slot) = slot {
-        key.extend_from_slice(&slot.to_be_bytes());
-    }
-    ByteView::from(key)
-}
-
 pub(super) fn queue_key(job_id: JobId, position: u64) -> Key {
     let mut key = job_id.to_bytes().to_vec();
     key.extend_from_slice(&position.to_be_bytes());
@@ -455,7 +315,10 @@ impl From<ItemFailure> for PageFailure {
 pub(crate) mod pure_tests {
     use super::walk::{directory_list_path, record_failure};
     use super::*;
-    use crate::staging::page::rows::MAX_ERROR_SAMPLE;
+    use aruna_core::staging_checkpoint::{
+        LANE_ROWS, MAX_ERROR_SAMPLE, ReadCheckpointOperation, handed_checkpoint, initial_checkpoint,
+        main_read,
+    };
     use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
     use aruna_test_support::staging::test_spec;
 
@@ -653,7 +516,7 @@ pub(crate) mod pure_tests {
         else {
             panic!("expected the lane page");
         };
-        assert_eq!(limit, lanes::LANE_ROWS);
+        assert_eq!(limit, LANE_ROWS);
         let mut lane = main.clone();
         lane.items_current = 3;
         let key = checkpoint_key(job_id, Some(0));

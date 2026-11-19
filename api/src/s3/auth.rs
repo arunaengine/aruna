@@ -9,6 +9,7 @@ use super::util::{anonymous_read_allowed, operation_permission, public_read_allo
 use crate::object_key::ObjectKey;
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
 use crate::s3::service::InputView;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 use aruna_core::errors::StorageError;
@@ -38,7 +39,6 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::jobs::workflow::input_view::view_job;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
 use aruna_operations::s3::session::{
     GetS3Operation, S3SessionError, TouchS3Config, TouchS3Operation,

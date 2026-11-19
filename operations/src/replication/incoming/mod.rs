@@ -2,8 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::holders::dht_registration_effect;
-use crate::blob::records::{HeadAliasContext, release_rows};
 use crate::connectors::root_record::{compact_version, root_write};
 use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
@@ -13,7 +11,6 @@ use crate::placement::policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::error::ReplicationError;
-use crate::replication::queue::schedule_blob_drain;
 use crate::s3::abe_copies::copy_row;
 use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::object::put::abe::{abe_reads, keyed, located_rows, parse_abe};
@@ -22,6 +19,7 @@ use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
 };
+use aruna_core::blob_records::{HeadAliasContext, dht_registration_effect, release_rows};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{BlobEffect, Effect};
@@ -74,9 +72,9 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
 };
-use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::replication_queue::live_obligation_entry;
+use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, schedule_blob_drain};
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
 };

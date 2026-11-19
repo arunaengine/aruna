@@ -29,13 +29,13 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 pub type Blob = BackendStream<Result<Bytes, StreamError>>;
 

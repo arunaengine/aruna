@@ -39,7 +39,8 @@ use crate::blob::migration::rewrite::{RewriteError, RewriteOutcome, RewriteVersi
 use crate::blob::unlocked::KeyUnlockedOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::replication::parking::WakeParkedOperation;
-use crate::replication::queue::{BlobQueueError, schedule_blob_drain};
+use crate::replication::queue::BlobQueueError;
+use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
 
 /// Versions, or old copies, one run checks per bucket.
 const PAGE: usize = 64;

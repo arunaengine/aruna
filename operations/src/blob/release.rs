@@ -28,7 +28,7 @@ use ulid::Ulid;
 
 use crate::blob::migration::shared::MigrationError;
 use crate::blob::reclaim::{ReclaimBlobError, ReclaimBlobOperation, ReclaimVerdict};
-use crate::blob::records::{iter_index_effect, owners_scan_effect};
+use aruna_core::blob_records::{iter_index_effect, owners_scan_effect};
 
 const RULE_PAGE: usize = 128;
 /// Claim index pages one pass reads past claims whose delete was sent.

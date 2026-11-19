@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::checksum::checksum_mismatch_error;
+use aruna_core::bucket_read::GetBucketError;
 use aruna_core::errors::{
     BlobError, ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
@@ -19,7 +20,6 @@ use aruna_operations::placement::policy::PolicyGateError;
 use aruna_operations::s3::bucket::cors::{DeleteCorsError, GetCorsError, PutCorsError};
 use aruna_operations::s3::bucket::create::CreateBucketError;
 use aruna_operations::s3::bucket::delete::DeleteBucketError;
-use aruna_operations::s3::bucket::get::GetBucketError;
 use aruna_operations::s3::bucket::list::ListBucketsError;
 use aruna_operations::s3::imports::ImportRuleError;
 use aruna_operations::s3::multipart::abort::AbortUploadError;
@@ -36,10 +36,10 @@ use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::head::HeadObjectError;
 use aruna_operations::s3::object::list::ListBucketError;
 use aruna_operations::s3::object::put::PutObjectError;
+use aruna_operations::s3::object::reference::MaterializeReferenceError;
 use aruna_operations::s3::object::versions::ListVersionsError;
 use aruna_operations::s3::purge_fence::PurgeFenceError;
 use aruna_operations::s3::usage::UsageUpdateError;
-use aruna_operations::staging::reference::MaterializeReferenceError;
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use std::fmt::Display;
 use tracing::warn;

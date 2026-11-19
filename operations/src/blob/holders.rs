@@ -5,6 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
+use aruna_core::blob_records::dht_registration_effect;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
 use aruna_core::errors::{ConversionError, DhtError, StorageError};
@@ -377,21 +378,6 @@ impl Operation for GetHoldersOperation {
             }),
         }
     }
-}
-
-/// The DHT put that announces this node as a holder of the blob with hash `blake3`.
-pub(crate) fn dht_registration_effect(
-    blake3: &[u8],
-    local_realm_id: RealmId,
-    limits: &RoCrateLimits,
-) -> Result<Effect, ConversionError> {
-    let key = DhtKeyId::from_bytes(blake3.try_into()?);
-    Ok(Effect::Net(NetEffect::Dht(DhtEffect::Put {
-        key,
-        realm_id: local_realm_id,
-        value: Vec::new(),
-        ttl: Duration::from_millis(limits.holder_ttl_ms),
-    })))
 }
 
 #[cfg(test)]

@@ -49,7 +49,6 @@ use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation, QueueLiveOperation};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::queue::LiveVersionInput;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::write_guard::{BucketGuardError, BucketGuardOperation};
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
@@ -57,15 +56,14 @@ use crate::s3::object::delete::{
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use crate::s3::object::versions::{
-    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
-    ListVersionsResult,
-};
+use crate::s3::object::versions::{ListVersionsError, ListVersionsInput, ListVersionsOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, encode_message, peer_call, peer_reply,
 };
 use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::storage::listing::{ListVersionsItem, ListVersionsResult};
 
 /// How long a forwarded listing waits for the holder of a range.
 const HOLDER_TIMEOUT: Duration = Duration::from_secs(15);

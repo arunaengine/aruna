@@ -37,7 +37,7 @@ use crate::forward::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::request_policy::PolicyRequestExtras;
 

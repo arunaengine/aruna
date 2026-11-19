@@ -49,10 +49,10 @@ use super::repository::JobScope;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::metadata::forward::write::MetadataWriteError;
 use crate::placement::policy::GateContextError;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::put::PutObjectError;
 use crate::staging::read_source::ReadSourceError;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::repository::remote::NodeScope;
 

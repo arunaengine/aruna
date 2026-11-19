@@ -9,9 +9,8 @@ use std::sync::Arc;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::outbound::{RangeEntry, RangeRefusal};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::blob::{BucketInfo, common_prefix_of};
 use aruna_operations::distribution::routing::{copies_interval, lists_interval};
-use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::object::list::ListedObject;
 use aruna_operations::s3::object::pages::{
     self, ListRequest, ObjectPage, ObjectPageOperation, PageError, PageNode, PageObject, Resume,

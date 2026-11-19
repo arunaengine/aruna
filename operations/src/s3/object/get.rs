@@ -21,7 +21,6 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::rows::StagedCall;
 use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
 use std::collections::{HashMap, VecDeque};
-use std::ops::Range;
 use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -51,12 +50,16 @@ use aruna_core::structs::storage::abe::{AbeEffect, AbeError};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey,
+    strong_validator,
 };
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
+use aruna_core::structs::storage::object_read::{
+    InvalidRange, ObjectInfo, ObjectRangeRequest, ResolvedObjectRange,
+};
 use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::replication_queue::live_obligation_entry;
@@ -210,55 +213,6 @@ pub enum GetObjectError {
     Abe(#[from] aruna_core::structs::storage::abe::AbeError),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ObjectRangeRequest {
-    StartEnd { start: u64, end: u64 },
-    Start { start: u64 },
-    Suffix { length: u64 },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolvedObjectRange {
-    pub range: Range<u64>,
-    pub content_length: i64,
-    pub content_range: String,
-}
-
-impl ObjectRangeRequest {
-    pub fn resolve(&self, full_length: u64) -> Result<ResolvedObjectRange, GetObjectError> {
-        if full_length == 0 {
-            return Err(GetObjectError::InvalidRange);
-        }
-
-        let range = match self {
-            ObjectRangeRequest::StartEnd { start, end } => {
-                if start > end || *start >= full_length {
-                    return Err(GetObjectError::InvalidRange);
-                }
-                *start..((*end).min(full_length - 1) + 1)
-            }
-            ObjectRangeRequest::Start { start } => {
-                if *start >= full_length {
-                    return Err(GetObjectError::InvalidRange);
-                }
-                *start..full_length
-            }
-            ObjectRangeRequest::Suffix { length } => {
-                if *length == 0 {
-                    return Err(GetObjectError::InvalidRange);
-                }
-                full_length.saturating_sub(*length)..full_length
-            }
-        };
-
-        Ok(ResolvedObjectRange {
-            content_range: format!("bytes {}-{}/{}", range.start, range.end - 1, full_length),
-            content_length: (range.end - range.start) as i64,
-            range,
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct GetObjectInput {
     pub bucket: String,
@@ -271,20 +225,6 @@ pub struct GetObjectInput {
     pub realm_id: RealmId,
     /// Local node recorded on the replication obligation of a drift successor.
     pub node_id: NodeId,
-}
-
-/// Authoritative whole-object facts of one read, carried independently of any
-/// physical location. `size` is the whole-object size; a ranged read reports its
-/// response length in `GetObjectResult::resolved_range` instead.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ObjectInfo {
-    pub size: u64,
-    pub version_created_at: Option<SystemTime>,
-    pub etag: Option<String>,
-    pub checksum_type: MultipartChecksumType,
-    pub hashes: HashMap<String, Vec<u8>>,
-    pub composite_hashes: HashMap<String, Vec<u8>>,
-    pub part_count: Option<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -309,6 +249,12 @@ pub struct GetObjectResult {
 impl From<IoError> for GetObjectError {
     fn from(error: IoError) -> Self {
         Self::StorageError(error.into())
+    }
+}
+
+impl From<InvalidRange> for GetObjectError {
+    fn from(_: InvalidRange) -> Self {
+        Self::InvalidRange
     }
 }
 
@@ -1968,9 +1914,3 @@ pub(super) fn locked(error: BucketKeyError) -> GetObjectError {
 #[cfg(test)]
 #[path = "get_tests.rs"]
 mod test;
-
-/// Whether an ETag can bind a read through `If-Match`: present and not weak.
-pub(crate) fn strong_validator(etag: Option<&str>) -> bool {
-    etag.map(str::trim)
-        .is_some_and(|etag| !etag.is_empty() && !etag.starts_with("W/"))
-}

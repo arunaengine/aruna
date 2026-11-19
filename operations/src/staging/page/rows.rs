@@ -22,6 +22,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, JOB_CLAIM_KEYSPACE, PURGE_FENCE_KEYSPACE,
     S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
+use aruna_core::staging_checkpoint::MAX_ERROR_SAMPLE;
 use aruna_core::structs::execution::job::ClaimGuard;
 use aruna_core::structs::execution::job::{
     JobId, StagingJobCheckpoint, StagingJobError, job_record_key,
@@ -57,8 +58,6 @@ use ulid::Ulid;
 pub const MAX_PAGE_ENTRIES: usize = 10_000;
 /// Most bytes one page writes, keys and values together.
 pub const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
-/// Most per-entry errors a staging checkpoint keeps; the failed counter counts all of them.
-pub const MAX_ERROR_SAMPLE: usize = 100;
 /// Rows read ahead of the heads: purge fence, bucket, connector and job claim.
 pub(crate) const GUARD_READS: usize = 4;
 /// Rows of other keys the head read may meet between the page's keys before the page reads its

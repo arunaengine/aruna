@@ -30,10 +30,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::guard::{authority_reads, write_target};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::metadata::{
     QueueRefreshOperation, QueueRefreshResult, ReferenceRefresh, ReferenceRefreshError,
 };
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 /// Heads one range's page reads.
 const PAGE: usize = 256;

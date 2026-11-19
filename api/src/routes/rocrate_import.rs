@@ -24,7 +24,7 @@ use aruna_operations::jobs::import::upload::{
 };
 use aruna_operations::metadata::create_entry::DocumentMintOperation;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_operations::staging::head_source::{
+use aruna_operations::s3::object::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation,
 };
 use axum::body::Body;

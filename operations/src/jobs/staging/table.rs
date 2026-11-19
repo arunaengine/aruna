@@ -52,10 +52,12 @@ use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::replication::queue::{
     BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult,
 };
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
+use crate::s3::object::head_source::{
+    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
@@ -63,13 +65,12 @@ use crate::s3::object::put::{
 use crate::s3::object::read::GetRoutedOperation;
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::s3::usage::QuotaGateError;
-use crate::staging::head_source::{
-    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
-};
 use crate::staging::page::rows::MAX_PAGE_ENTRIES;
 use crate::staging::read_source::{
     ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
 };
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 
 /// Directories the queue holds before the table is read further.
 const QUEUE_PAUSE: u64 = 1024;

@@ -51,8 +51,8 @@ use super::status_view::{ReadViewOperation, StatusError};
 use super::submit::{StateOperation, Stated};
 use crate::replication::members::{OwesFanoutOperation, RecordError};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::usage::{MarkDirtyOperation, dirty_rows};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 /// Sets one pass looks at, and purge pages it spends at most.
 const SET_BATCH: usize = 16;

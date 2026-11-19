@@ -59,6 +59,7 @@ fn timer_is_restored(effect: &TaskEffect) -> bool {
             | TaskKey::MaintainRanges
             | TaskKey::DrainWatchEvents
             | TaskKey::DrainAppliedSync
+            | TaskKey::DrainCaptures
     )
 }
 

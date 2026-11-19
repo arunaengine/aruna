@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::blob::holders::dht_registration_effect;
+use aruna_core::blob_records::dht_registration_effect;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent};

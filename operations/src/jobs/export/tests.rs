@@ -10,7 +10,6 @@ use super::sources::{
     learn_probe_hash, merge_candidates,
 };
 use super::*;
-use crate::blob::permission_paths::MAX_HASH_ALIASES;
 use crate::jobs::repository::test_support::{
     artifact, job_id, job_scope as scoped_job, local_scope, other_node, owner_node, realm,
 };
@@ -21,6 +20,7 @@ use aruna_blob::archive::zip_date;
 use aruna_blob::archive::zip_entry;
 use aruna_core::archive_path::safe_zip_path;
 use aruna_core::archive_path::synthesized_path;
+use aruna_core::blob_paths::MAX_HASH_ALIASES;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::BlobEvent;
 use aruna_core::events::Event;

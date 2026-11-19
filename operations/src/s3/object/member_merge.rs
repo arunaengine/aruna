@@ -32,7 +32,6 @@ use crate::distribution::uploads::{
 use crate::distribution::versions::{
     InventoryVersionsError, InventoryVersionsInput, InventoryVersionsOperation,
 };
-use crate::s3::multipart::uploads::ListUploadsResult;
 use crate::s3::object::link::{LinkCaller, LinkError, LinkNode};
 use crate::s3::object::list::{
     ListBucketError, ListBucketInput, ListBucketOperation, ListContinuationToken, ListedObject,
@@ -43,10 +42,12 @@ use crate::s3::object::member_read::{
     MemberTextOperation,
 };
 use crate::s3::object::range_list::DelegatedCaller;
-use crate::s3::object::versions::{ListVersionsItem, ListVersionsResult};
 use crate::s3::object::visible::{
     LinkShows, ListingKeys, NextPage, RecordSource, VisibleError, VisiblePage,
     VisiblePageOperation, is_sealed,
+};
+use aruna_core::structs::storage::listing::{
+    ListUploadsResult, ListVersionsItem, ListVersionsResult,
 };
 
 /// Ranges one merged page visits at most, so its fan-out stays bounded.

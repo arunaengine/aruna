@@ -25,10 +25,10 @@ use super::metadata::{
     split_due,
 };
 use crate::queue_backoff::{due_after, min_due_at, retry_delay_ms};
-use crate::replication::queue::schedule_blob_drain;
 use crate::s3::object::refresh_mint::{MintError, MintSuccessorOperation};
 use crate::s3::object::refresh_observe::{ObserveError, ObserveSourceOperation};
 use crate::s3::usage::schedule_snapshot_publish;
+use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
 
 const REFRESH_SCAN_PAGE: usize = 512;
 
