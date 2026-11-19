@@ -9,7 +9,8 @@ use aruna_core::events::{Event, NetEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
+    WatchEvent, WatchEventDetail, WatchEventKind, schedule_watch_drain, watch_event_entry,
+    watch_resource_path,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
@@ -18,7 +19,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::queue::{BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult};
-use crate::notifications::watch::origin::EmitWatchOperation;
 
 /// A committed put, as its live replication and its watchers need it.
 #[derive(Clone, Debug, PartialEq)]
@@ -40,8 +40,8 @@ enum PutStep {
     Emit,
 }
 
-/// Best effort after a committed put: queues live replication, then tells the watchers. Every
-/// failure only warns, since the durable obligation remains for repair.
+/// Best effort after a committed put: queues live replication, then queues the watch event when
+/// anyone watches. Every failure only warns, since the durable obligation remains for repair.
 #[derive(Debug, PartialEq)]
 pub struct CompletePutOperation {
     now_ms: u64,
@@ -85,9 +85,9 @@ impl CompletePutOperation {
                 });
             }
         };
-        let Some((local, holders)) = route else {
+        if route.is_none() {
             return Ok(Next::Done(()));
-        };
+        }
         let event_id = self.ids.mint(self.now_ms);
         let input = &self.input;
         let event = WatchEvent {
@@ -106,8 +106,13 @@ impl CompletePutOperation {
             },
         };
         self.step = PutStep::Emit;
-        let emit = EmitWatchOperation::new(event, local, holders);
-        Ok(Next::Call(IoCall::child(emit)))
+        match watch_event_entry(&event) {
+            Ok(entry) => Ok(Next::Call(IoCall::Write(vec![entry]))),
+            Err(error) => {
+                warn!(%error, "The upload watch event could not be queued");
+                Ok(Next::Done(()))
+            }
+        }
     }
 }
 
@@ -137,9 +142,13 @@ impl Operation for CompletePutOperation {
             }
             PutStep::Holders => self.emit(result.event()?),
             PutStep::Emit => {
-                // Every failure is logged inside the emission.
-                let _ = result.child::<(), IoError>()?;
-                Ok(Next::Done(()))
+                if let Err(error) = result.done() {
+                    warn!(%error, "The upload watch event could not be queued");
+                }
+                Ok(Next::Then {
+                    output: (),
+                    calls: vec![IoCall::from(schedule_watch_drain())],
+                })
             }
         }
     }
@@ -253,12 +262,17 @@ mod tests {
         operation
     }
 
+    // A watched put queues its event, then arms the drain after the write.
     #[test]
-    fn put_emits_watch() {
+    fn put_queues_watch() {
         let mut operation = asking();
         let turn = operation.next(holders(Some((node(1), vec![node(2)]))));
-        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
-        assert_eq!(operation.next(done()), Ok(Next::Done(())));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
+        let armed = Ok(Next::Then {
+            output: (),
+            calls: vec![IoCall::from(schedule_watch_drain())],
+        });
+        assert_eq!(operation.next(IoResult::Done), armed);
     }
 
     #[test]

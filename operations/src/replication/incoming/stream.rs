@@ -13,7 +13,8 @@ use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
+    WatchEvent, WatchEventDetail, WatchEventKind, schedule_watch_drain, watch_event_entry,
+    watch_resource_path,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -37,7 +38,6 @@ use crate::distribution::resolve::{
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{QuotaOperation, RoutingInputsError};
-use crate::notifications::watch::origin::EmitEventOperation;
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::{BaoReadError, IncomingBaoOperation, IncomingBaoResult};
@@ -412,13 +412,20 @@ impl Operation for AcceptVersionOperation {
             },
             AcceptStep::Incoming => {
                 match result.child::<IncomingVersionResult, IncomingVersionError>()? {
-                    Ok(applied) => match self.watch_event(&applied) {
-                        Some(event) => {
-                            self.step = AcceptStep::Emit;
-                            Ok(Next::Call(IoCall::child(EmitEventOperation::new(event))))
+                    Ok(applied) => {
+                        let entry = self.watch_event(&applied).as_ref().map(watch_event_entry);
+                        match entry {
+                            Some(Ok(entry)) => {
+                                self.step = AcceptStep::Emit;
+                                Ok(Next::Call(IoCall::Write(vec![entry])))
+                            }
+                            Some(Err(error)) => {
+                                warn!(%error, "A replicated watch event was not queued");
+                                Ok(Next::Done(()))
+                            }
+                            None => Ok(Next::Done(())),
                         }
-                        None => Ok(Next::Done(())),
-                    },
+                    }
                     Err(error) => {
                         error!(error = ?error, "Failed to process inbound version replication stream");
                         self.refuse()
@@ -426,7 +433,16 @@ impl Operation for AcceptVersionOperation {
                 }
             }
             // Failures only warn inside the operation.
-            AcceptStep::Emit => Ok(Next::Done(())),
+            // A failed queue write only warns, as a failed emission did.
+            AcceptStep::Emit => {
+                if let Err(error) = result.done() {
+                    warn!(%error, "A replicated watch event was not queued");
+                }
+                Ok(Next::Then {
+                    output: (),
+                    calls: vec![IoCall::from(schedule_watch_drain())],
+                })
+            }
             AcceptStep::Close => closed(result),
         }
     }
