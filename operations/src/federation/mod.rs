@@ -3,9 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod access;
-pub mod grant;
-#[cfg(test)]
-mod grant_tests;
 pub mod import;
 pub mod link;
 pub mod login;

@@ -22,13 +22,13 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_drivers::driver::drive;
-use aruna_operations::federation::grant::AdmitGrantOperation;
 use aruna_operations::jobs::REPORT_MAX_ROWS;
 use aruna_operations::jobs::command::{
     CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
+use aruna_operations::jobs::export::grant::AdmitGrantOperation;
 use aruna_operations::jobs::local_run::LocalExecutionError;
 use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::s3::object::get::ObjectRangeRequest;

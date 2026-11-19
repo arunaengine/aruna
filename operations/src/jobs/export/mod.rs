@@ -28,6 +28,7 @@ use resolve::ExportCandidate;
 
 pub mod archive;
 mod assemble;
+pub mod grant;
 pub mod consent;
 mod job;
 pub mod open;
@@ -283,5 +284,7 @@ impl From<IoError> for ExportFailure {
 
 #[cfg(test)]
 mod candidate_tests;
+#[cfg(test)]
+mod grant_tests;
 #[cfg(test)]
 mod tests;

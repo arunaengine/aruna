@@ -54,7 +54,7 @@
     "core_clocks": 19,
     "duplicate_groups": 5,
     "group_cycle_modules": 11,
-    "group_mutual_pairs": 13,
+    "group_mutual_pairs": 12,
     "mixed_files": 0,
     "pure_async_refs": 3,
     "runner_refs": 0,

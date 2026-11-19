@@ -10,11 +10,10 @@ use aruna_core::transfer::{ExportGrant, GrantError, GrantRecord};
 use ulid::Ulid;
 use url::Url;
 
-use crate::federation::grant::{
-    AdmitGrantOperation, IssueExportOperation, IssueGrantConfig, ReadGrantOperation,
-    RevokeGrantOperation, record_key,
+use crate::jobs::export::grant::{
+    AdmitGrantOperation, IssueExportOperation, IssueGrantConfig, IssueGrantOperation,
+    ReadGrantOperation, RevokeGrantOperation, grant_principal, record_key,
 };
-use crate::federation::grant::{IssueGrantOperation, grant_principal};
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{
