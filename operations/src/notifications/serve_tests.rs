@@ -116,6 +116,7 @@ fn watch_created() {
     )));
     assert!(matches!(allowed, Ok(Next::Call(IoCall::Child(_)))));
     let subscription = WatchSubscription::new(
+        ulid::Ulid::new(),
         user(1, 2),
         format!("meta/{}/", Ulid::from_parts(5, 5)),
         WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),

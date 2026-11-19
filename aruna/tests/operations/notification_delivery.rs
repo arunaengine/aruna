@@ -395,6 +395,7 @@ fn added_group_record(
     created_at_ms: u64,
 ) -> NotificationRecord {
     NotificationRecord::new(
+        ulid::Ulid::new(),
         recipient,
         NotificationClass::Direct,
         NotificationKind::AddedToGroup {
@@ -726,6 +727,7 @@ impl SettingRealm {
     /// The delivery decision of node `index` for a notice of `owner`.
     async fn decide(&self, index: usize, owner: UserId) -> Delivery {
         let record = NotificationRecord::new(
+            ulid::Ulid::new(),
             owner,
             NotificationClass::Direct,
             NotificationKind::AddedToGroup {

@@ -7,6 +7,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::rows::{read_row, values};
@@ -69,6 +70,7 @@ pub struct ServeInboxOperation {
     user: UserId,
     request: InboxRequest,
     state: ServeState,
+    ids: IdMint,
 }
 
 impl ServeInboxOperation {
@@ -78,6 +80,7 @@ impl ServeInboxOperation {
             user,
             request,
             state: ServeState::Config,
+            ids: IdMint::default(),
         }
     }
 
@@ -173,8 +176,9 @@ impl ServeInboxOperation {
         };
         let input = self.input;
         let watch = (path_prefix, event_mask);
-        match CreateWatchOperation::new(input.local, self.user, watch, authorization, input.now_ms)
-        {
+        let watch_id = self.ids.mint(input.now_ms);
+        let (local, user) = (input.local, self.user);
+        match CreateWatchOperation::new(watch_id, local, user, watch, authorization, input.now_ms) {
             Ok(create) => {
                 self.state = ServeState::Create;
                 Ok(Next::Call(IoCall::child(create)))
@@ -200,6 +204,10 @@ impl ServeInboxOperation {
 impl Operation for ServeInboxOperation {
     type Output = NotificationTransportMessage;
     type Error = DeliverError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> AnswerTurn {
         let realm_id = self.user.realm_id;

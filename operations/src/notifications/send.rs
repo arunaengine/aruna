@@ -164,7 +164,13 @@ mod call_tests {
             key: "a.csv".to_string(),
             size_bytes: 9,
         };
-        let notification = NotificationRecord::new(user(1, 2), NotificationClass::Direct, kind, 42);
+        let notification = NotificationRecord::new(
+            ulid::Ulid::new(),
+            user(1, 2),
+            NotificationClass::Direct,
+            kind,
+            42,
+        );
         WebhookDeliverySpec {
             subscription_id: Ulid::nil(),
             notification,

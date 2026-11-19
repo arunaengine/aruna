@@ -552,8 +552,10 @@ impl KeyOperation {
         };
         for holder in holders {
             let class = NotificationClass::Direct;
-            let record = NotificationRecord::new(holder, class, kind.clone(), self.now);
-            match outbox_write_entry(&new_outbox_record(record)) {
+            let id = self.ids.mint(self.now);
+            let record = NotificationRecord::new(id, holder, class, kind.clone(), self.now);
+            let outbox_id = self.ids.mint(self.now);
+            match outbox_write_entry(&new_outbox_record(outbox_id, record)) {
                 Ok(entry) => self.writes.push(entry),
                 Err(_) => return self.fail(KeyError::Storage),
             }

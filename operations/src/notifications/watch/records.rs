@@ -65,6 +65,7 @@ pub struct WatchReplication {
 }
 
 pub(crate) fn validated_subscription(
+    watch_id: Ulid,
     owner: UserId,
     path_prefix: String,
     event_mask: WatchEventMask,
@@ -79,6 +80,7 @@ pub(crate) fn validated_subscription(
     }
 
     Ok(WatchSubscription::new_with_authorization(
+        watch_id,
         owner,
         path_prefix,
         event_mask,

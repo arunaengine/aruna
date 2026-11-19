@@ -11,6 +11,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -66,6 +67,7 @@ pub struct AddUserOperation {
     step: Step,
     added: Option<(GroupAuthorizationDocument, bool)>,
     now_ms: u64,
+    ids: IdMint,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -124,6 +126,7 @@ impl AddUserOperation {
             step: Step::Check,
             added: None,
             now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -176,7 +179,7 @@ impl AddUserOperation {
     /// The document, with the drain wake and a new member's notice made after it; their failures
     /// are only logged, as the change is already durable.
     fn finish(
-        &self,
+        &mut self,
         auth_doc: GroupAuthorizationDocument,
         newly_added: bool,
         drain: Option<IoCall>,
@@ -194,7 +197,7 @@ impl AddUserOperation {
 
     /// The notice to a member the change newly added.
     fn added_notice(
-        &self,
+        &mut self,
         auth_doc: &GroupAuthorizationDocument,
         newly_added: bool,
     ) -> Option<IoCall> {
@@ -211,6 +214,7 @@ impl AddUserOperation {
                     realm_id: self.input.actor.realm_id,
                 },
                 self.now_ms,
+                &mut self.ids,
             );
             if let (false, Effect::SubOperation(child)) =
                 (records.is_empty(), emit_notifications_effect(records))
@@ -228,6 +232,10 @@ impl Operation for AddUserOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn first(&mut self) -> Result<Next<GroupAuthorizationDocument>, AddUserError> {

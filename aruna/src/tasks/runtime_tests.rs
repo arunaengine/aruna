@@ -781,7 +781,13 @@ async fn deferred_for_delay() {
         size_bytes: 1,
     };
     let now = unix_timestamp_millis();
-    let notification = NotificationRecord::new(owner, NotificationClass::Direct, kind, now);
+    let notification = NotificationRecord::new(
+        ulid::Ulid::new(),
+        owner,
+        NotificationClass::Direct,
+        kind,
+        now,
+    );
     let payload = JobPayload::WebhookDelivery(WebhookDeliverySpec {
         subscription_id: Ulid::nil(),
         notification,

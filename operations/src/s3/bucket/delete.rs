@@ -513,6 +513,7 @@ impl DeleteBucketOperation {
             };
             let outbox_id = ulid::Ulid::generate();
             let record = NotificationRecord::new(
+                self.ids.mint(self.now_ms),
                 member,
                 NotificationClass::Direct,
                 kind,

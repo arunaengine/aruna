@@ -7,6 +7,7 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::id_mint::IdMint;
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
@@ -105,6 +106,7 @@ pub struct UserCallOperation {
     transport: bool,
     call: UserCall,
     state: CallState,
+    ids: IdMint,
 }
 
 fn watch_error(error: WatchSubscriptionError) -> WatchDispatchError {
@@ -142,6 +144,7 @@ impl UserCallOperation {
             transport,
             call,
             state: CallState::Config,
+            ids: IdMint::default(),
         }
     }
 
@@ -178,8 +181,10 @@ impl UserCallOperation {
                 now_ms,
             } => {
                 let watch = (path_prefix.clone(), *event_mask);
+                let watch_id = self.ids.mint(*now_ms);
+                let authorization = authorization.clone();
                 let create =
-                    CreateWatchOperation::new(local, user, watch, authorization.clone(), *now_ms)
+                    CreateWatchOperation::new(watch_id, local, user, watch, authorization, *now_ms)
                         .map_err(watch_error)?;
                 IoCall::child(create)
             }
@@ -353,6 +358,10 @@ impl UserCallOperation {
 impl Operation for UserCallOperation {
     type Output = UserAnswer;
     type Error = WatchDispatchError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Turn {
         let config = GetConfigOperation::new(self.user.realm_id);

@@ -11,6 +11,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -189,6 +190,7 @@ struct MemberRemoval {
     was_member: bool,
     deletes: Vec<(KeySpace, Key)>,
     marks: DueMarks,
+    ids: IdMint,
 }
 
 impl MemberRemoval {
@@ -203,6 +205,7 @@ impl MemberRemoval {
             was_member: false,
             deletes: Vec::new(),
             marks,
+            ids: IdMint::default(),
         }
     }
 
@@ -337,7 +340,7 @@ impl MemberRemoval {
     }
 
     /// The notice to the removed user when the change ended their membership.
-    fn removed_notice(&self, auth_doc: &GroupAuthorizationDocument) -> Option<IoCall> {
+    fn removed_notice(&mut self, auth_doc: &GroupAuthorizationDocument) -> Option<IoCall> {
         let still_member = auth_doc
             .roles
             .values()
@@ -355,6 +358,7 @@ impl MemberRemoval {
                     realm_id: self.input.actor.realm_id,
                 },
                 self.marks.now(),
+                &mut self.ids,
             );
             if let (false, Effect::SubOperation(child)) =
                 (records.is_empty(), emit_notifications_effect(records))
@@ -387,6 +391,10 @@ impl Operation for MemberRemoval {
 
     fn stamp(&mut self, now_ms: u64) {
         self.marks.stamp(now_ms);
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn transaction(&self) -> TransactionMode {

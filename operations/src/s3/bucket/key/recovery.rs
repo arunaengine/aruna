@@ -9,6 +9,7 @@ use crate::s3::bucket::key::rows::{
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, BUCKET_RECOVERY_KEYSPACE, KEY_COPY_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
@@ -99,6 +100,7 @@ pub struct RecoveryNoticeOperation {
     grants: Vec<BucketHolder>,
     copies: Vec<SealedCopy>,
     told: Vec<UserId>,
+    ids: IdMint,
 }
 
 impl RecoveryNoticeOperation {
@@ -112,6 +114,7 @@ impl RecoveryNoticeOperation {
             grants: Vec::new(),
             copies: Vec::new(),
             told: Vec::new(),
+            ids: IdMint::default(),
         }
     }
 
@@ -178,8 +181,11 @@ impl RecoveryNoticeOperation {
                         group_id: self.input.group_id,
                     };
                     let class = NotificationClass::Direct;
-                    let record = NotificationRecord::new(*holder, class, kind, self.input.now_ms);
-                    writes.push(outbox_write_entry(&new_outbox_record(record))?);
+                    let now_ms = self.input.now_ms;
+                    let id = self.ids.mint(now_ms);
+                    let record = NotificationRecord::new(id, *holder, class, kind, now_ms);
+                    let outbox = new_outbox_record(self.ids.mint(now_ms), record);
+                    writes.push(outbox_write_entry(&outbox)?);
                 }
                 self.told = told;
                 IoCall::Write(writes)
@@ -216,6 +222,10 @@ fn decode<T>(
 impl Operation for RecoveryNoticeOperation {
     type Output = Vec<UserId>;
     type Error = RecoveryNoticeError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Step {
         let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);

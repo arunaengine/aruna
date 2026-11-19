@@ -274,7 +274,8 @@ mod tests {
         let node_id = node(3);
         let path = watch_resource_path(group_id, node_id, "bucket", "");
         let event_mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-        let subscription = WatchSubscription::new(owner, path.clone(), event_mask, 1);
+        let subscription =
+            WatchSubscription::new(ulid::Ulid::new(), owner, path.clone(), event_mask, 1);
         let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         realm_config.ensure_node(node_id, RealmNodeKind::Server);
         let context = DriverContext {
