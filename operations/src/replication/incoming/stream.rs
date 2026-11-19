@@ -135,10 +135,10 @@ impl Operation for BaoAdmissionOperation {
 /// A registered bao stream and the nodes on its two ends.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BaoPeerStream {
-    pub(crate) realm_id: RealmId,
-    pub(crate) local_node: NodeId,
-    pub(crate) peer: NodeId,
-    pub(crate) stream_id: Ulid,
+    pub realm_id: RealmId,
+    pub local_node: NodeId,
+    pub peer: NodeId,
+    pub stream_id: Ulid,
 }
 
 /// Answers the first frame of an admitted stream. Every family closes the stream when it

@@ -188,8 +188,8 @@ impl RecoveryStatus {
     }
 
     /// The last progress time in milliseconds, finer than the snapshot's seconds.
-    #[cfg(test)]
-    pub(crate) fn progress_ms(&self) -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn progress_ms(&self) -> u64 {
         self.inner.last_progress_ms.load(Ordering::Relaxed)
     }
 

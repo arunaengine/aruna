@@ -32,12 +32,12 @@ pub const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 #[derive(Debug, PartialEq)]
 pub struct PreparedTask {
     pub(super) inputs: Vec<TaskInput>,
-    pub(super) mounts: Vec<S3Mount>,
-    pub(super) secrets: BTreeMap<String, Secret>,
+    pub mounts: Vec<S3Mount>,
+    pub secrets: BTreeMap<String, Secret>,
     pub(super) staging: StagingMode,
     /// Set for a session or a batch run inside its bucket: the bucket and endpoint its
     /// credential reaches.
-    pub(super) workspace: Option<WorkspaceBinding>,
+    pub workspace: Option<WorkspaceBinding>,
 }
 
 /// The bucket a run works inside, empty when it owns none.

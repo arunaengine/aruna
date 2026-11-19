@@ -466,7 +466,6 @@ impl Operation for DeleteDocumentOperation {
 mod call_tests {
     use super::*;
     use aruna_core::document::DocumentChangeKind;
-    use aruna_core::effects::Effect;
     use aruna_core::keyspaces::{
         DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, METADATA_AUDIT_KEYSPACE,
         PRUNE_JOB_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,

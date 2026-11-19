@@ -38,6 +38,10 @@ use aruna_tasks::TaskHandle;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 
+const RECOVERY_TEST_GUARD: Duration = Duration::from_secs(5 * 60);
+/// Real-time grace before a pass that published nothing counts as stuck.
+const RECOVERY_PASS_GRACE: Duration = Duration::from_secs(5);
+
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
