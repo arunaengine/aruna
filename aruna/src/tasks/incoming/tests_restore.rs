@@ -426,7 +426,8 @@ async fn drain_reconcile_summary() {
     use aruna_core::structs::storage::usage::{
         NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, UsageCounters, global_shard_key, usage_global_key,
     };
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::NetHandle;
+    use aruna_net::config::NetConfig;
 
     async fn write_stat(
         storage: &aruna_storage::storage::handle::StorageHandle,
@@ -554,7 +555,8 @@ async fn drain_reconcile_summary() {
 async fn drain_reconcile_config() {
     use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{SUMMARY_GLOBAL_KEY, UsageCounters};
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::NetHandle;
+    use aruna_net::config::NetConfig;
 
     let temp_dir = tempdir().expect("temp dir");
     let storage =

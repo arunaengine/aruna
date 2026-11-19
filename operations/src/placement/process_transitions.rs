@@ -1267,7 +1267,8 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_core::structs::placement::record::PlacementStrategy;
     use aruna_core::structs::placement::transition::BucketCompletion;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use tempfile::tempdir;
     use ulid::Ulid;
 

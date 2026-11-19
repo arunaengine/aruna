@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::config::NetConfig;
 use crate::test_support::make_secret;
 use crate::tests::test_net_handle;
 use aruna_core::events::StorageEvent;

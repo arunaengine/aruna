@@ -12,7 +12,8 @@ use aruna_core::storage_entries::pending_projection_key;
 use aruna_core::structs::identity::group_delete::*;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use ulid::Ulid;
 
 use super::commit::CommitOperation;

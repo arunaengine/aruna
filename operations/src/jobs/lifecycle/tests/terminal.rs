@@ -9,7 +9,8 @@ use aruna_core::structs::execution::job::{
     AttemptIntent, ExecutionReceipt, JobClaim, JobFamilyRecord, JobId, JobPayload, JobRecord,
     JobResultPayload, JobState, LogicalJobState, OutputObject, PhysicalExecutionState,
 };
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use tempfile::TempDir;
 use ulid::Ulid;
 

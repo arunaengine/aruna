@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use crate::streams::BiStream;
-use crate::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
+use crate::{InboundEventHandler, NetHandle};
 use aruna_core::document::{
     DocumentSyncRevision, DocumentTarget, ShardManifest, ShardManifestEntry,
 };

@@ -42,7 +42,8 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::placement::record::METADATA_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 use aruna_drivers::driver::DriverContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };

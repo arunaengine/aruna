@@ -26,7 +26,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::connection_pool::ConnectionPool;
-use crate::dht::{self, DhtHandle};
+use crate::dht::handle::DhtHandle;
+use crate::dht::{self};
 use crate::error::{NetError, Result};
 use crate::unique_peer_nodes;
 

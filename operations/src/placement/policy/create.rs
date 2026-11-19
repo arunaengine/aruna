@@ -480,7 +480,8 @@ mod tests {
     use aruna_core::structs::placement::policy::PlacementSelector;
     use aruna_core::structs::placement::policy::document::verify_policy_authority;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;

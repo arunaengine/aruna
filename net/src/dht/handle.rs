@@ -24,7 +24,7 @@ use super::storage::DhtClock;
 use crate::connection_pool::ConnectionPool;
 use crate::error::{NetError, Result};
 use crate::streams::PeerKinds;
-use crate::telemetry::{current_trace_context, duration_ms};
+use aruna_core::telemetry::{current_trace_context, duration_ms};
 
 #[derive(Debug)]
 pub(crate) struct DhtSpawnResources {

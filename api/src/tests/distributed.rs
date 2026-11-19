@@ -31,7 +31,8 @@ use aruna_core::structs::storage::node_info::{
 };
 use aruna_core::{NodeId, UserId};
 use aruna_drivers::driver::DriverContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::distribution::inventory::open_ranges;
 use aruna_storage::storage::worker::FjallStorage;
 use axum::Router;

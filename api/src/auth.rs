@@ -752,7 +752,8 @@ mod test {
     use aruna_core::structs::identity::realm::OidcProviderConfig;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::auth::error::AuthorizeError;
     use aruna_operations::auth::revoke_token::{

@@ -822,12 +822,12 @@ mod tests {
                 .await;
         }
         let net = aruna_net::NetHandle::new(
-            aruna_net::NetConfig {
+            aruna_net::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
                 realm_id,
-                discovery_method: aruna_net::DiscoveryMethod::None,
-                relay_method: aruna_net::RelayMethod::None,
-                ..aruna_net::NetConfig::default()
+                discovery_method: aruna_net::config::DiscoveryMethod::None,
+                relay_method: aruna_net::config::RelayMethod::None,
+                ..aruna_net::config::NetConfig::default()
             },
             storage.clone(),
         )

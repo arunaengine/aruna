@@ -29,7 +29,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, trace, warn};
 
-use crate::{DhtHandle, DocumentSyncService};
+use crate::dht::handle::DhtHandle;
+use crate::document_sync::DocumentSyncService;
 use aruna_core::events::ShardNetEvent;
 
 /// A snapshot younger than this answers without any DHT work.
@@ -753,13 +754,13 @@ mod tests {
             .expect("test storage");
         let realm_id = RealmId::from_bytes([seed; 32]);
         let handle = crate::NetHandle::new(
-            crate::NetConfig {
+            crate::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("test bind address"),
                 secret_key: Some(iroh::SecretKey::from_bytes(&[seed; 32])),
                 realm_id,
-                discovery_method: crate::DiscoveryMethod::None,
-                relay_method: crate::RelayMethod::None,
-                ..crate::NetConfig::default()
+                discovery_method: crate::config::DiscoveryMethod::None,
+                relay_method: crate::config::RelayMethod::None,
+                ..crate::config::NetConfig::default()
             },
             storage,
         )
@@ -804,28 +805,28 @@ mod tests {
         let second_secret = iroh::SecretKey::from_bytes(&[seed + 1; 32]);
         let second_id = second_secret.public();
         let first = crate::NetHandle::new(
-            crate::NetConfig {
+            crate::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("first bind address"),
                 secret_key: Some(first_secret),
                 realm_id,
                 peer_nodes: vec![second_id],
-                discovery_method: crate::DiscoveryMethod::None,
-                relay_method: crate::RelayMethod::None,
-                ..crate::NetConfig::default()
+                discovery_method: crate::config::DiscoveryMethod::None,
+                relay_method: crate::config::RelayMethod::None,
+                ..crate::config::NetConfig::default()
             },
             first_storage,
         )
         .await
         .expect("first net handle");
         let second = crate::NetHandle::new(
-            crate::NetConfig {
+            crate::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("second bind address"),
                 secret_key: Some(second_secret),
                 realm_id,
                 peer_nodes: vec![first.node_id()],
-                discovery_method: crate::DiscoveryMethod::None,
-                relay_method: crate::RelayMethod::None,
-                ..crate::NetConfig::default()
+                discovery_method: crate::config::DiscoveryMethod::None,
+                relay_method: crate::config::RelayMethod::None,
+                ..crate::config::NetConfig::default()
             },
             second_storage,
         )

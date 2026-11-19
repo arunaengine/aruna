@@ -22,7 +22,8 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage::worker::FjallStorage;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;

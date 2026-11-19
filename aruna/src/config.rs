@@ -18,7 +18,8 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::storage::backends::NodeBackendsConfig;
 use aruna_core::structs::storage::blob::BlobTimeoutConfig;
-use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config};
+use aruna_net::config::{DiscoveryMethod, RelayMethod, parse_endpoint_config};
+use irokle::net::IrohRuntimeConfig;
 
 use crate::identity::{
     EnrollmentPlan, IdentityError, IdentityStore, bootstrap_node_state, onboarding_realm_endpoints,
@@ -767,7 +768,7 @@ mod tests {
         DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
         StaticRealmEndpoint,
     };
-    use aruna_net::{RelayMethod, format_endpoint_config};
+    use aruna_net::config::{RelayMethod, format_endpoint_config};
     use aruna_storage::storage::worker::FjallStorage;
     use std::collections::BTreeMap;
     use tempfile::tempdir;

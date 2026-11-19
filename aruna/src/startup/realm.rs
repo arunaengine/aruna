@@ -375,7 +375,7 @@ async fn replay_until_stopped(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 
     // A stop accepted before preparation starts must return cleanly without
     // touching storage or the network, so the caller can release the acquired

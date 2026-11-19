@@ -1007,7 +1007,8 @@ mod pure_tests {
 #[cfg(test)]
 mod tests {
     use aruna_drivers::driver::DriverContext;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use irokle::Storage as _;
     use ulid::Ulid;
 

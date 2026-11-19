@@ -1083,7 +1083,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
-    use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage::worker::FjallStorage;
     use std::collections::HashMap;
     use tempfile::tempdir;

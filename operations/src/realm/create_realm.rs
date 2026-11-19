@@ -466,7 +466,8 @@ mod test {
         BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
     };
     use aruna_core::types::{Key, KeySpace, Value};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use ed25519_dalek::SigningKey;

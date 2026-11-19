@@ -22,7 +22,8 @@ use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::record::{PlacementOverride, PlacementStrategy};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
+use aruna_net::config::NetConfig;
 use aruna_operations::node::recovery_run::{
     PresencePhaseOperation, RECOVERY_RETRY_BASE, RECOVERY_RETRY_MAX, RecoveryConfig,
     RecoveryOperation,

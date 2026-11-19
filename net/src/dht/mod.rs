@@ -11,4 +11,3 @@ pub mod rpc;
 pub mod state;
 pub mod storage;
 
-pub use handle::DhtHandle;

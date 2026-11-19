@@ -20,7 +20,8 @@ use aruna_core::structs::{
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
 use aruna_drivers::testing::write_entries;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::sync::sync_quarantine::{
     AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
     QuarantinePage, QuarantinePageRequest, ReadQuarantineOperation,

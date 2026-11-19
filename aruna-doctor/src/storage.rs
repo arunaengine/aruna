@@ -216,7 +216,8 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::testing::EnvGuard;
     use aruna_drivers::driver::{DriverContext, drive, node_routing};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
     use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};

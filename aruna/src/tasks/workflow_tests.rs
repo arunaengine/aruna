@@ -1060,7 +1060,7 @@ async fn finalize_renews_lease() {
 /// needs this node's key.
 async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_net::NetHandle) {
     let net = aruna_net::NetHandle::new(
-        aruna_net::NetConfig {
+        aruna_net::config::NetConfig {
             realm_id: aruna_core::structs::identity::realm::RealmId([1; 32]),
             ..aruna_drivers::testing::local_net()
         },

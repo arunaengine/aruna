@@ -21,7 +21,8 @@ use aruna_core::structs::execution::notification::{NotificationRecord, new_outbo
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmNodeKind;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::sync::outbox_record::outbox_key;

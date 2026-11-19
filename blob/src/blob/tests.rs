@@ -38,8 +38,9 @@ use aruna_core::structs::storage::group_backend::{
 };
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
 use aruna_core::{NodeId, UserId};
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_net::streams::BiStream;
-use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
+use aruna_net::{InboundEventHandler, NetHandle};
 use aruna_storage::storage;
 use async_trait::async_trait;
 use futures::TryStreamExt;

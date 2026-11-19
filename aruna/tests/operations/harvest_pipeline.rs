@@ -32,7 +32,8 @@ use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle};
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::connectors::harvest_rows::connector_writes;
 use aruna_operations::harvest::repository::{
     parse_provenance_read, parse_source_read, read_provenance_effect, read_source_effect,

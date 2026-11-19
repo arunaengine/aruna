@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::config::NetConfig;
 
 #[path = "tests_document_sync.rs"]
 pub(crate) mod document_sync_support;

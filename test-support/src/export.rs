@@ -28,7 +28,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::Compression;
 use aruna_drivers::driver::DriverContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_storage::storage::worker::FjallStorage;
 use bytes::Bytes;
 use tempfile::TempDir;

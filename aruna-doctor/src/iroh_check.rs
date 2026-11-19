@@ -409,7 +409,8 @@ fn iroh_check_error(step: &'static str, message: impl std::fmt::Display) -> CliE
 mod tests {
     use super::*;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage::worker::FjallStorage;
     use aruna_wire::info::{
         InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeStatus, ServicesStatus,

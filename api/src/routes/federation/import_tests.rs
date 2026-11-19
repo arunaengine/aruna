@@ -30,7 +30,8 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::transfer::{MAX_TRANSFER_SECS, import_key, intent_digest};
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::federation::import::{
     BoundUploadOperation, ReadImportOperation, WriteImportOperation,
 };

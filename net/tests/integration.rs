@@ -15,10 +15,10 @@ use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keys::realm_presence_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::{ConnectionAddressStatus, NetState, PeerConnectionStatus};
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_net::error::NetError;
 use aruna_net::streams::BiStream;
-use aruna_net::{
-    DiscoveryMethod, InboundEventHandler, NetConfig, NetError, NetHandle, RelayMethod,
-};
+use aruna_net::{InboundEventHandler, NetHandle};
 use aruna_storage::storage::worker::FjallStorage;
 use async_trait::async_trait;
 use byteview::ByteView;

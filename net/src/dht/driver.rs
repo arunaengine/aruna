@@ -50,11 +50,11 @@ use super::storage::{
     merge_entry, parse_deadline, retained_entries, row_deadline, validate_entries,
 };
 use crate::connection_pool::{ConnectionPool, PoolConnectError};
-use crate::telemetry::{
-    current_trace_context, duration_ms, extract_trace_context, record_duration_ms,
-    record_selected_path, warn_iroh_phase, warn_iroh_request,
-};
+use crate::telemetry::{record_selected_path, warn_iroh_phase, warn_iroh_request};
 use aruna_clock::unix_timestamp_secs;
+use aruna_core::telemetry::{
+    current_trace_context, duration_ms, extract_trace_context, record_duration_ms,
+};
 
 pub type CallerOutcome = std::result::Result<DhtOutputValue, DhtIoError>;
 pub type InboundDhtStream = (SendStream, RecvStream, NodeId);

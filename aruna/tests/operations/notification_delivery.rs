@@ -24,7 +24,8 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::{NodeId, UserId};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::notifications::client::{
     HolderRequestOperation, marked_read, unread_counted,
