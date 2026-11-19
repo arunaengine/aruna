@@ -20,7 +20,7 @@ pub use bindings::aruna::plugin::services::Method;
 pub use bindings::aruna::plugin::types::WatchEvent;
 pub use datasets::Dataset;
 pub use form::Form;
-pub use jobs::Job;
+pub use jobs::{Job, Task, task};
 pub use objects::Object;
 pub use outcome::{Error, Result, fail, retry};
 #[doc(hidden)]

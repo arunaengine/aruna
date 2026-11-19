@@ -50,6 +50,20 @@ class JobsTest(unittest.TestCase):
         sent = ("upload", "zenodo", "POST", "deposit", "raw/r.fq", None, "file", {"title": "Run 7"})
         self.assertEqual(self.fake.calls[-1], sent)
 
+    def test_task_starts(self):
+        reads = aruna.Object("raw/run-7/a.fq", 4, "v3")
+        job = aruna.task("map").start(
+            parameters={"reference": "GCF_000005845.2"},
+            inputs={"/in/a.fq": reads, "/in/reads/": "raw/run-7/"},
+            files={"/in/samples.tsv": "a.fq\tA\n"},
+            outputs={"/out/results/": "results/run-7/"},
+        )
+        self.assertEqual((job.id, job.kind, job.state), ("job-1", "task", "queued"))
+        inputs = [("/in/a.fq", "raw/run-7/a.fq", "v3"), ("/in/reads/", "raw/run-7/", None)]
+        sent = ("task", "map", {"reference": "GCF_000005845.2"}, inputs,
+                {"/in/samples.tsv": b"a.fq\tA\n"}, {"/out/results/": "results/run-7/"})
+        self.assertEqual(self.fake.calls[-1], sent)
+
 
 if __name__ == "__main__":
     unittest.main()

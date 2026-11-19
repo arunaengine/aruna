@@ -1,5 +1,5 @@
-//! Jobs the install started: copies, downloads and uploads now, tasks later. A start answers the
-//! job at once; `job_finished` delivers it once it ended and the run that started it succeeded.
+//! Jobs the install started: copies, downloads, uploads and tasks. A start answers the job at
+//! once; `job_finished` delivers it once it ended and the run that started it succeeded.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -127,6 +127,89 @@ impl Copy {
         let version = self.version.as_deref();
         let id = host::with(|host| host.job_copy(&self.source, version, &self.target))?;
         Ok(Job::started(id, "copy", &self.target))
+    }
+}
+
+/// A container task to start: `aruna::task("map").parameter("reference", r).start()?`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Task {
+    name: String,
+    parameters: Vec<(String, String)>,
+    inputs: Vec<(String, String, Option<String>)>,
+    files: Vec<(String, Vec<u8>)>,
+    outputs: Vec<(String, String)>,
+}
+
+/// The task `name` the manifest declares under `[tasks.<name>]`.
+pub fn task(name: &str) -> Task {
+    Task {
+        name: name.to_string(),
+        parameters: Vec::new(),
+        inputs: Vec::new(),
+        files: Vec::new(),
+        outputs: Vec::new(),
+    }
+}
+
+impl Task {
+    /// A value for the `{name}` part of the command; it stays one argument.
+    pub fn parameter(mut self, name: &str, value: &str) -> Self {
+        self.parameters.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// The object or bucket path the task reads at `path`; a source ending in `/` gives every
+    /// object below it.
+    pub fn input(mut self, path: &str, source: &str) -> Self {
+        self.inputs
+            .push((path.to_string(), source.to_string(), None));
+        self
+    }
+
+    /// One object version the task reads at `path`.
+    pub fn object(mut self, path: &str, object: &Object) -> Self {
+        let pinned = Some(object.version.clone());
+        self.inputs
+            .push((path.to_string(), object.path.clone(), pinned));
+        self
+    }
+
+    /// A small file the plugin writes for the task; a task's files hold 64 KiB together.
+    pub fn file(mut self, path: &str, content: impl Into<Vec<u8>>) -> Self {
+        self.files.push((path.to_string(), content.into()));
+        self
+    }
+
+    /// The container directory whose files the task writes below the bucket path `prefix`.
+    pub fn output(mut self, directory: &str, prefix: &str) -> Self {
+        self.outputs
+            .push((directory.to_string(), prefix.to_string()));
+        self
+    }
+
+    /// Starts the task; it needs read on every input and write on every output. A rerun of
+    /// the run gets the same job back.
+    pub fn start(self) -> Result<Job> {
+        use crate::bindings::aruna::plugin::jobs::{TaskFile, TaskInput, TaskRequest};
+        use crate::bindings::aruna::plugin::types::Field;
+        let field = |(name, value): (String, String)| Field { name, value };
+        let request = TaskRequest {
+            task: self.name,
+            parameters: self.parameters.into_iter().map(field).collect(),
+            inputs: (self.inputs.into_iter())
+                .map(|(path, source, version)| TaskInput {
+                    path,
+                    source,
+                    version,
+                })
+                .collect(),
+            files: (self.files.into_iter())
+                .map(|(path, content)| TaskFile { path, content })
+                .collect(),
+            outputs: self.outputs.into_iter().map(field).collect(),
+        };
+        let id = host::with(|host| host.job_task(&request))?;
+        Ok(Job::started(id, "task", ""))
     }
 }
 
