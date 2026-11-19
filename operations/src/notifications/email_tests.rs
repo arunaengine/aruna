@@ -331,7 +331,7 @@ async fn seed_profile(context: &DriverContext, profile: Option<RealmEmailProfile
         let key = RealmVaultKey::derive(&ed25519_dalek::SigningKey::from_bytes(&[5; 32]));
         let secret = SecretBytes::new(PASSWORD.as_bytes().to_vec());
         let sealed = key
-            .seal(&realm_id, reference.entry, reference.revision, &secret)
+            .seal(&realm_id, (reference.entry, reference.revision), &secret, 7)
             .unwrap();
         config.vault.push(RealmVaultRecord {
             entry: reference.entry,

@@ -37,10 +37,31 @@ impl IdMint {
     }
 }
 
+/// An id fixed by `scope` and `name`, the same on every node, for the built-in parts of a new
+/// document such as the default roles of a group.
+pub fn named_id(scope: &[u8], name: &str) -> Ulid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-named-id-v1\0");
+    hasher.update(&(scope.len() as u64).to_le_bytes());
+    hasher.update(scope);
+    hasher.update(name.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Ulid::from_bytes(bytes)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::IdMint;
+    use super::{IdMint, named_id};
     use ulid::Ulid;
+
+    #[test]
+    fn named_ids_stable() {
+        let id = named_id(b"group", "admin");
+        assert_eq!(id, named_id(b"group", "admin"));
+        assert_ne!(id, named_id(b"group", "user"));
+        assert_ne!(id, named_id(b"other", "admin"));
+    }
 
     #[test]
     fn ids_only_increase() {

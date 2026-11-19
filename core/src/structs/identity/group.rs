@@ -4,6 +4,7 @@
 
 use crate::UserId;
 use crate::errors::ConversionError;
+use crate::id_mint::named_id;
 use crate::permission_path::permission_pattern_matches;
 use crate::structs::identity::auth::Actor;
 use crate::structs::identity::auth::{Permission, Role};
@@ -11,7 +12,6 @@ use crate::structs::identity::realm::RealmId;
 use crate::types::{GroupId, RoleId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use ulid::Ulid;
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Group {
@@ -53,9 +53,11 @@ pub struct GroupAuthorizationDocument {
 }
 
 impl GroupAuthorizationDocument {
+    /// The admin, user and viewer roles of a new group; their ids follow from the group id.
     pub fn default_group_doc(user_id: UserId, realm_id: RealmId, group_id: GroupId) -> Self {
+        let scope = group_id.to_bytes();
         let mut roles = HashMap::new();
-        let admin = Ulid::generate();
+        let admin = named_id(&scope, "admin");
         roles.insert(
             admin,
             Role {
@@ -69,7 +71,7 @@ impl GroupAuthorizationDocument {
             },
         );
 
-        let user = Ulid::generate();
+        let user = named_id(&scope, "user");
         roles.insert(
             user,
             Role {
@@ -93,7 +95,7 @@ impl GroupAuthorizationDocument {
             },
         );
 
-        let viewer = Ulid::generate();
+        let viewer = named_id(&scope, "viewer");
         roles.insert(
             viewer,
             Role {

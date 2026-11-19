@@ -189,6 +189,7 @@ struct EmailWrite {
     deletes: Vec<(KeySpace, Key)>,
     now_ms: u64,
     ids: IdMint,
+    entropy: u128,
 }
 
 impl EmailWrite {
@@ -200,6 +201,7 @@ impl EmailWrite {
             deletes: Vec::new(),
             now_ms: 0,
             ids: IdMint::default(),
+            entropy: 0,
         }
     }
 
@@ -298,7 +300,8 @@ impl EmailWrite {
                 };
                 let revision = self.ids.mint(self.now_ms);
                 let realm_id = self.config.actor.realm_id;
-                let sealed = (self.config.vault_key).seal(&realm_id, entry, revision, secret)?;
+                let vault_key = &self.config.vault_key;
+                let sealed = vault_key.seal(&realm_id, (entry, revision), secret, self.entropy)?;
                 writes.push(AdminDocumentOperation::ConfigVaultSet {
                     entry,
                     record: Some(RealmVaultRecord {
@@ -404,6 +407,7 @@ impl Operation for EmailWrite {
 
     fn seed(&mut self, entropy: u128) {
         self.ids = IdMint::new(entropy);
+        self.entropy = entropy;
     }
 
     fn transaction(&self) -> TransactionMode {
