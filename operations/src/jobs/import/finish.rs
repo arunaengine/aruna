@@ -35,7 +35,6 @@ use super::{
     entry_arn, entry_location, entry_report, failure_message, hidden_delete, hidden_deleted,
     permission_result, rollback_required, transfer_failure, validation_failure,
 };
-use crate::forward::transport::MetadataWriteError;
 use crate::jobs::export::CrateJsonOperation;
 use crate::jobs::repository::links::LinkError;
 use crate::jobs::repository::pull::{PullRunningOperation, SettleImportOperation};
@@ -47,6 +46,7 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
+use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::notifications::watch::origin::EmitEventOperation;

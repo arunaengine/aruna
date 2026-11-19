@@ -311,7 +311,7 @@ impl Operation for ProfileExportOperation {
             ExportStage::Peers => self.peers_read(result),
             ExportStage::Owner => result
                 .child::<ExportMetadataResult, MetadataApiError>()?
-                .map_err(crate::forward::transport::read_error)
+                .map_err(crate::metadata::forward::write::read_error)
                 .map(Next::Done),
         }
     }

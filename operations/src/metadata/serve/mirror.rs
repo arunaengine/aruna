@@ -18,7 +18,7 @@ use aruna_core::types::GroupId;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::metadata::write_peer::WritePeerOperation;
+use crate::forward::write_peer::WritePeerOperation;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};

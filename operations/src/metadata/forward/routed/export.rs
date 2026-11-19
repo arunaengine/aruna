@@ -470,7 +470,7 @@ impl Operation for RoutedExportOperation {
             RoutedStage::Holder => {
                 let local = result
                     .child::<ExportMetadataResult, MetadataApiError>()?
-                    .map_err(crate::forward::transport::read_error);
+                    .map_err(crate::metadata::forward::write::read_error);
                 if let Some(node) = self.local_node {
                     self.answers.push((node, local));
                 }

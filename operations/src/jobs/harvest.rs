@@ -36,7 +36,6 @@ use super::repository::{JobScope, remote_answer, remote_call};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{AuthorizeCreateOperation, CreateScope};
-use crate::forward::transport::MetadataWriteError;
 use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
 use crate::harvest::oai_pmh::parse::{
     OaiPage, OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
@@ -56,6 +55,7 @@ use crate::metadata::create_document::{
 use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use crate::metadata::forward::routed::write::RouteDeleteOperation;
+use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};

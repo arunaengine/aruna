@@ -3,9 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::fetch::{PeerFrame, peer_call, peer_reply};
-use super::transport::MetadataWriteError;
-use crate::metadata::create_document::CreateDocumentConfig;
-use crate::metadata::create_document::resolve_metadata_id;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::events::PeerRequestError;
@@ -14,12 +11,10 @@ use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{error, warn};
-use ulid::Ulid;
 
 /// Bounds one forwarded write above the transport's own timeouts, which end it first.
 const HOLDER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -63,50 +58,6 @@ pub fn is_user_origin(config: &RealmConfigDocument, local_node_id: NodeId) -> Op
     Some(!node.kind.is_sync_eligible())
 }
 
-/// Whether the origin currently holds a structured metadata document's bucket.
-/// `None` when the config does not list the local node or the id has no placement.
-pub fn origin_holds_document(
-    config: &RealmConfigDocument,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    document_id: Ulid,
-) -> Option<bool> {
-    if !config.has_node(local_node_id) {
-        return None;
-    }
-    let placement = resolve_metadata_id(config, realm_id, None, document_id).ok()?;
-    Some(holds_placement(config, &placement, local_node_id))
-}
-
-pub(crate) fn holds_metadata_id(
-    config: &RealmConfigDocument,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    document_id: Ulid,
-) -> bool {
-    resolve_metadata_id(config, realm_id, None, document_id)
-        .is_ok_and(|placement| holds_placement(config, &placement, local_node_id))
-}
-
-/// Holders of the document's blind-hashed bucket: candidates for a create the
-/// origin cannot place. Every candidate holds that one bucket and a forwarded
-/// create stamps exactly it, so the answering candidate cannot change placement.
-pub(crate) fn create_forward_holders(
-    realm_config: &RealmConfigDocument,
-    config: &CreateDocumentConfig,
-    document_id: Ulid,
-) -> Option<(PlacementRef, Vec<NodeId>)> {
-    let placement = resolve_metadata_id(
-        realm_config,
-        config.actor.realm_id,
-        Some(config.group_id),
-        document_id,
-    )
-    .ok()?;
-    let holders = resolve_shard_holders(realm_config, &placement);
-    Some((placement, holders))
-}
-
 pub(crate) fn distinct_holders(holders: &[NodeId]) -> Vec<NodeId> {
     let mut distinct = Vec::with_capacity(holders.len());
     for holder in holders.iter().copied() {
@@ -142,17 +93,6 @@ pub enum HolderWriteError {
 impl From<IoError> for HolderWriteError {
     fn from(error: IoError) -> Self {
         Self::Undeliverable(error.to_string())
-    }
-}
-
-impl From<HolderWriteError> for MetadataWriteError {
-    fn from(error: HolderWriteError) -> Self {
-        match error {
-            HolderWriteError::Unauthorized => Self::Unauthorized,
-            HolderWriteError::Forbidden => Self::Forbidden,
-            HolderWriteError::NotFound => Self::NotFound,
-            HolderWriteError::Undeliverable(detail) => Self::Undeliverable(detail),
-        }
     }
 }
 

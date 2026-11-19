@@ -14,7 +14,7 @@ use crate::forward::authorize::{
 use crate::forward::fetch::{PeerFrame, peer_call, peer_reply};
 use crate::forward::routing::distinct_holders;
 use crate::forward::transport::{ForwardError, reject};
-use crate::metadata::write_peer::forwarded_checks;
+use crate::forward::write_peer::forwarded_checks;
 use aruna_core::NodeId;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};

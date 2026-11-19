@@ -25,7 +25,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::git::linked::unreadable_file;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::fanout_types::{MetadataFanoutStats, forwarded_bearer};
@@ -39,6 +38,7 @@ use aruna_operations::metadata::forward::authorized_create::CreateAuthorizedErro
 use aruna_operations::metadata::forward::authorized_create::{
     AuthorizedCreateOperation, DocumentCreate,
 };
+use aruna_operations::metadata::forward::write::MetadataWriteError;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
 use chrono::{TimeZone, Utc};

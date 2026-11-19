@@ -45,7 +45,6 @@ use super::rows::StoreError;
 use super::submit::WorkRequest;
 use super::unavailable;
 use super::work::RequestContext;
-use crate::forward::transport::MetadataWriteError;
 use crate::jobs::records::pages::ServingNode;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::ExportMetadataRequest;
@@ -55,6 +54,7 @@ use crate::metadata::forward::authorized_create::CreateAuthorizedError;
 use crate::metadata::forward::pinned::{PinnedCreate, PinnedMintOperation};
 use crate::metadata::forward::routed::export::RoutedExportOperation;
 use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
+use crate::metadata::forward::write::MetadataWriteError;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };

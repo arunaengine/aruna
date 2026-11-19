@@ -14,12 +14,13 @@ use ulid::Ulid;
 
 use super::ServeNode;
 use super::paths::{config_call, digest_matches, read_config};
-use crate::forward::routing::holds_metadata_id;
-use crate::forward::transport::{read_error, reject};
+use crate::forward::transport::reject;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::readable::RecordReadableOperation;
+use crate::metadata::forward::holders::holds_metadata_id;
+use crate::metadata::forward::write::read_error;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
 use crate::metadata::read_peer::ReadPeerOperation;

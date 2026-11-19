@@ -47,7 +47,7 @@ use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document};
 use super::metadata_class::MetadataFailure;
 use super::repository::JobScope;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::forward::transport::MetadataWriteError;
+use crate::metadata::forward::write::MetadataWriteError;
 use crate::placement::policy::GateContextError;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::GetObjectError;

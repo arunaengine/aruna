@@ -60,7 +60,6 @@ pub mod update_entry;
 pub(crate) mod updated_page;
 pub mod visibility_index;
 pub(crate) mod visible_scope;
-pub mod write_peer;
 
 pub use builtin::builtin_shapes;
 

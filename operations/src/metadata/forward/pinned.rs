@@ -19,11 +19,11 @@ use ulid::Ulid;
 use super::authorized_create::CreateAuthorizedError;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::routing::is_user_origin;
-use crate::forward::transport::MetadataWriteError;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::{
     CreateDocumentError, mint_forward_document, mint_local_document, resolve_metadata_id,
 };
+use crate::metadata::forward::write::MetadataWriteError;
 use aruna_core::metadata::api::CreateDocumentPayload;
 
 /// A create of a given document on one pinned node, kept so that a retry sends the very same

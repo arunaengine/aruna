@@ -17,10 +17,10 @@ use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::release::HolderAnswer;
 
 use super::ServeNode;
-use crate::forward::transport::read_error;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::links::local::{LinksLocalOperation, SetPreviewOperation};
 use crate::metadata::api::preflight::local::references_preflight_local;
+use crate::metadata::forward::write::read_error;
 use crate::metadata::identifier_lookup::{IdentifierLookupOperation, IdentifierQuery};
 use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::read_peer::{PeerReader, ReadPeerOperation, SearchPeerOperation};

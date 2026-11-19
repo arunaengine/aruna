@@ -28,12 +28,12 @@ use aruna_core::structs::{
     persistent_id_key,
 };
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
+use aruna_operations::metadata::forward::write::MetadataWriteError;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::testing::replay_event_log;
