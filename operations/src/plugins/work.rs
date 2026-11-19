@@ -444,11 +444,11 @@ pub struct PruneKeepingWork {
     now_ms: Option<u64>,
     checks: Vec<(JobId, PluginWorkSpec)>,
     kept: BTreeSet<JobId>,
-    phase: PrunePhase,
+    phase: KeepPhase,
 }
 
 #[derive(Debug, PartialEq)]
-enum PrunePhase {
+enum KeepPhase {
     Due,
     Holds(JobId),
     Prune,
@@ -463,7 +463,7 @@ impl PruneKeepingWork {
             now_ms: None,
             checks: Vec::new(),
             kept: BTreeSet::new(),
-            phase: PrunePhase::Due,
+            phase: KeepPhase::Due,
         }
     }
 
@@ -473,10 +473,10 @@ impl PruneKeepingWork {
 
     fn check_next(&mut self) -> PruneNext {
         if let Some((job_id, spec)) = self.checks.pop() {
-            self.phase = PrunePhase::Holds(job_id);
+            self.phase = KeepPhase::Holds(job_id);
             return Ok(Next::Call(IoCall::child(holds_job(&spec))));
         }
-        self.phase = PrunePhase::Prune;
+        self.phase = KeepPhase::Prune;
         let kept = std::mem::take(&mut self.kept);
         let prune = PruneJobsOperation::new(self.now(), self.page_size, kept);
         Ok(Next::Call(IoCall::child(prune)))
@@ -497,8 +497,8 @@ impl Operation for PruneKeepingWork {
     }
 
     fn next(&mut self, result: IoResult) -> PruneNext {
-        match std::mem::replace(&mut self.phase, PrunePhase::Prune) {
-            PrunePhase::Due => {
+        match std::mem::replace(&mut self.phase, KeepPhase::Prune) {
+            KeepPhase::Due => {
                 let due = result.child::<Vec<(JobId, JobPayload)>, PruneError>()??;
                 for (job_id, payload) in due.into_iter().rev() {
                     if let JobPayload::PluginWork(spec) = payload {
@@ -507,14 +507,14 @@ impl Operation for PruneKeepingWork {
                 }
                 self.check_next()
             }
-            PrunePhase::Holds(job_id) => {
+            KeepPhase::Holds(job_id) => {
                 let holds = result.child::<bool, StoreError>()?;
                 if holds.map_err(|error| PruneError(error.0))? {
                     self.kept.insert(job_id);
                 }
                 self.check_next()
             }
-            PrunePhase::Prune => {
+            KeepPhase::Prune => {
                 let outcome = result.child::<JobPruneOutcome, PruneError>()??;
                 Ok(Next::Done(outcome))
             }
