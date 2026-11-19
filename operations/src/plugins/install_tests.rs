@@ -7,13 +7,16 @@ use super::*;
 use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::plugins::account::{EnsureAccount, EnsureRole};
 use crate::plugins::calls::*;
-#[allow(unused_imports)]
-pub(crate) use crate::plugins::test_support::{Fixture, REALM_KEY};
+use crate::plugins::test_support::{
+    group_role, group_roles, install_as, install_request, prepared_only,
+};
 use aruna_core::effects::StorageEffect;
 use aruna_core::structs::identity::auth::{Permission as Access, Role};
 use aruna_core::structs::identity::user::User;
 use aruna_drivers::driver::drive;
 use aruna_storage::StorageHandle;
+#[allow(unused_imports)]
+use aruna_test_support::plugins::Fixture;
 use serde_json::json;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -22,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[tokio::test]
 async fn installs_and_resumes() {
     let fixture = Fixture::new().await;
-    let (auth, first) = (fixture.auth(), fixture.request(None));
+    let (auth, first) = (fixture.auth(), install_request(&fixture, None));
     let preview = prepare_install(&fixture.ctx, &auth, fixture.actor.realm_id, &first).await;
     let id = preview.unwrap().scope.install_id;
     assert!(
@@ -30,8 +33,8 @@ async fn installs_and_resumes() {
         "a preview writes nothing"
     );
 
-    let request = fixture.request(Some(id));
-    let installed = fixture.install(&request).await.unwrap();
+    let request = install_request(&fixture, Some(id));
+    let installed = install_as(&fixture, &request).await.unwrap();
     assert_eq!(
         (installed.state, installed.revision),
         (InstallState::Active, 2)
@@ -48,22 +51,22 @@ async fn installs_and_resumes() {
     assert_eq!(account.install(), Some(id));
     assert!(!account.is_deactivated());
     assert!(account.name.starts_with("plugin announcer (Lab A)"));
-    let role = fixture.role(&installed).await.unwrap();
+    let role = group_role(&fixture, &installed).await.unwrap();
     assert_eq!(role.name, "plugin-write");
     assert_eq!(role.assigned_users, HashSet::from([installed.account]));
 
     assert_eq!(
-        fixture.install(&request).await.unwrap(),
+        install_as(&fixture, &request).await.unwrap(),
         installed,
         "a retry answers the same"
     );
     // A newer version published meanwhile does not change what a retry without version means.
     fixture.publish("0.1.1", "cd", json!({})).await;
-    assert_eq!(fixture.install(&request).await.unwrap(), installed);
+    assert_eq!(install_as(&fixture, &request).await.unwrap(), installed);
     let mut other = request.clone();
     other.grants.insert("write".into(), Vec::new());
     assert!(matches!(
-        fixture.install(&other).await,
+        install_as(&fixture, &other).await,
         Err(InstallError::Changed)
     ));
 }
@@ -74,7 +77,7 @@ async fn resumes_after_steps() {
         let fixture = Fixture::new().await;
         let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
         let id = Ulid::from_parts(9, stop);
-        let record = fixture.prepared_only(id).await;
+        let record = prepared_only(&fixture, id).await;
         let change = AccountChange::of((actor, &auth), &record, 1);
         if stop >= 2 {
             let ensure = EnsureAccount::new(change.clone(), "x".into());
@@ -89,17 +92,19 @@ async fn resumes_after_steps() {
         if stop == 4 {
             drive(Teardown::new(change), ctx).await.unwrap();
             assert!(fixture.account(&record).await.unwrap().is_deactivated());
-            assert!(fixture.role(&record).await.is_none());
+            assert!(group_role(&fixture, &record).await.is_none());
         }
         assert_eq!(fixture.installs().await[0].state, InstallState::Preparing);
-        let installed = fixture.install(&fixture.request(Some(id))).await.unwrap();
+        let installed = install_as(&fixture, &install_request(&fixture, Some(id)))
+            .await
+            .unwrap();
         assert_eq!(
             installed.state,
             InstallState::Active,
             "stop after step {stop}"
         );
         assert!(!fixture.account(&installed).await.unwrap().is_deactivated());
-        assert!(fixture.role(&installed).await.is_some());
+        assert!(group_role(&fixture, &installed).await.is_some());
     }
 }
 
@@ -109,29 +114,30 @@ async fn refuses_requests() {
     let mut outsider = fixture.auth();
     outsider.user_id = UserId::local(Ulid::from_parts(4, 4), fixture.actor.realm_id);
     let realm_id = fixture.actor.realm_id;
-    let refused = prepare_install(&fixture.ctx, &outsider, realm_id, &fixture.request(None)).await;
+    let request = install_request(&fixture, None);
+    let refused = prepare_install(&fixture.ctx, &outsider, realm_id, &request).await;
     assert!(
         matches!(refused, Err(InstallError::Unauthorized)),
         "{refused:?}"
     );
 
-    let mut unknown = fixture.request(None);
+    let mut unknown = install_request(&fixture, None);
     unknown.plugin = "other".into();
     assert!(matches!(
-        fixture.install(&unknown).await,
+        install_as(&fixture, &unknown).await,
         Err(InstallError::NotPublished)
     ));
-    let mut outside = fixture.request(None);
+    let mut outside = install_request(&fixture, None);
     let other_group = format!("/{realm_id}/g/{}/meta/**", Ulid::from_parts(5, 5));
     outside.grants.insert("read".into(), vec![other_group]);
     assert!(matches!(
-        fixture.install(&outside).await,
+        install_as(&fixture, &outside).await,
         Err(InstallError::Grant(_))
     ));
-    let mut settings = fixture.request(None);
+    let mut settings = install_request(&fixture, None);
     settings.settings.clear();
     assert!(matches!(
-        fixture.install(&settings).await,
+        install_as(&fixture, &settings).await,
         Err(InstallError::Setting(_))
     ));
 
@@ -142,11 +148,11 @@ async fn refuses_requests() {
             json!({ "secrets": { "key": { "title": "Key" } } }),
         )
         .await;
-    let mut secrets = fixture.request(None);
+    let mut secrets = install_request(&fixture, None);
     secrets.version = Some(secret);
     // A slot whose secret does not exist is refused before anything is written.
     assert!(matches!(
-        fixture.install(&secrets).await,
+        install_as(&fixture, &secrets).await,
         Err(InstallError::Binding(_))
     ));
     assert!(fixture.installs().await.is_empty());
@@ -157,11 +163,13 @@ async fn refuses_held_accounts() {
     // An account id that already holds a role is never adopted: neither a realm role nor
     // another role of the group.
     let fixture = Fixture::new().await;
-    let record = fixture.prepared_only(Ulid::from_parts(9, 1)).await;
+    let record = prepared_only(&fixture, Ulid::from_parts(9, 1)).await;
     fixture.realm_roles(&[record.account]).await;
-    let held = fixture
-        .install(&fixture.request(Some(record.install_id)))
-        .await;
+    let held = install_as(
+        &fixture,
+        &install_request(&fixture, Some(record.install_id)),
+    )
+    .await;
     assert!(
         matches!(
             held,
@@ -182,7 +190,7 @@ async fn refuses_held_accounts() {
     );
 
     let fixture = Fixture::new().await;
-    let record = fixture.prepared_only(Ulid::from_parts(9, 2)).await;
+    let record = prepared_only(&fixture, Ulid::from_parts(9, 2)).await;
     let extra = AddRoleOperation::new(AddRoleConfig {
         auth_context: fixture.auth(),
         actor: fixture.actor.clone(),
@@ -196,9 +204,11 @@ async fn refuses_held_accounts() {
         },
     });
     drive(extra, &fixture.ctx).await.unwrap();
-    let held = fixture
-        .install(&fixture.request(Some(record.install_id)))
-        .await;
+    let held = install_as(
+        &fixture,
+        &install_request(&fixture, Some(record.install_id)),
+    )
+    .await;
     assert!(
         matches!(
             held,
@@ -215,16 +225,15 @@ async fn refuses_held_accounts() {
 async fn keeps_foreign_roles() {
     // An install id equal to an existing role's id leaves that role alone.
     let fixture = Fixture::new().await;
-    let roles = fixture.roles().await;
+    let roles = group_roles(&fixture).await;
     let (admin_id, admin) = (roles.iter())
         .find(|(_, role)| role.name == "admin")
         .unwrap();
-    let installed = fixture
-        .install(&fixture.request(Some(*admin_id)))
+    let installed = install_as(&fixture, &install_request(&fixture, Some(*admin_id)))
         .await
         .unwrap();
     assert_ne!(installed.role_id, *admin_id);
-    assert_eq!(fixture.roles().await.get(admin_id), Some(admin));
+    assert_eq!(group_roles(&fixture).await.get(admin_id), Some(admin));
 }
 
 #[tokio::test]
@@ -235,43 +244,46 @@ async fn checks_policies() {
     fixture
         .deny(&[&format!("path.startsWith('{meta}/private')")])
         .await;
-    let refused = fixture.install(&fixture.request(None)).await;
+    let refused = install_as(&fixture, &install_request(&fixture, None)).await;
     assert!(
         matches!(refused, Err(InstallError::NotHeld(_))),
         "{refused:?}"
     );
-    let mut exact = fixture.request(None);
+    let mut exact = install_request(&fixture, None);
     exact
         .grants
         .insert("read".into(), vec![format!("{meta}/runs")]);
     exact.grants.insert("write".into(), Vec::new());
-    assert!(fixture.install(&exact).await.is_ok());
+    assert!(install_as(&fixture, &exact).await.is_ok());
 
     // A policy on one action refuses that action only, with its own access and operation.
     let fixture = Fixture::new().await;
     fixture
         .deny(&["operation == 'plugin.metadata.write' && permission == 'write'"])
         .await;
-    let refused = fixture.install(&fixture.request(None)).await;
+    let refused = install_as(&fixture, &install_request(&fixture, None)).await;
     assert!(
         matches!(refused, Err(InstallError::NotHeld(_))),
         "{refused:?}"
     );
-    let mut read_only = fixture.request(None);
+    let mut read_only = install_request(&fixture, None);
     read_only.grants.insert("write".into(), Vec::new());
-    assert!(fixture.install(&read_only).await.is_ok());
+    assert!(install_as(&fixture, &read_only).await.is_ok());
 }
 
 #[tokio::test]
 async fn serializes_retries() {
     let fixture = Fixture::new().await;
-    let request = fixture.request(Some(Ulid::from_parts(9, 3)));
-    let (first, second) = tokio::join!(fixture.install(&request), fixture.install(&request));
+    let request = install_request(&fixture, Some(Ulid::from_parts(9, 3)));
+    let (first, second) = tokio::join!(
+        install_as(&fixture, &request),
+        install_as(&fixture, &request)
+    );
     let (first, second) = (first.unwrap(), second.unwrap());
     assert_eq!(first, second);
     assert_eq!(first.state, InstallState::Active);
     assert!(!fixture.account(&first).await.unwrap().is_deactivated());
-    assert!(fixture.role(&first).await.is_some());
+    assert!(group_role(&fixture, &first).await.is_some());
 }
 
 #[test]
@@ -338,19 +350,21 @@ async fn failed_activation() {
     let id = Ulid::from_parts(9, 4);
     let (probe, seen, _) = counted().await;
     let start = seen.load(Ordering::SeqCst);
-    probe.install(&probe.request(Some(id))).await.unwrap();
+    install_as(&probe, &install_request(&probe, Some(id)))
+        .await
+        .unwrap();
     let commits = seen.load(Ordering::SeqCst) - start;
 
     let (fixture, seen, fail_at) = counted().await;
     fail_at.store(seen.load(Ordering::SeqCst) + commits - 1, Ordering::SeqCst);
-    let request = fixture.request(Some(id));
-    let failed = fixture.install(&request).await;
+    let request = install_request(&fixture, Some(id));
+    let failed = install_as(&fixture, &request).await;
     assert!(matches!(failed, Err(InstallError::Record(_))), "{failed:?}");
     let record = fixture.installs().await.remove(0);
     assert_eq!(record.state, InstallState::Preparing);
     assert!(fixture.account(&record).await.is_some());
-    assert!(fixture.role(&record).await.is_some());
-    let retried = fixture.install(&request).await.unwrap();
+    assert!(group_role(&fixture, &record).await.is_some());
+    let retried = install_as(&fixture, &request).await.unwrap();
     assert_eq!(retried.state, InstallState::Active);
 }
 
@@ -361,17 +375,17 @@ async fn copy_needs_both() {
         let fixture = Fixture::new().await;
         let copy = json!({ "permissions": { "required": ["metadata.read"], "optional": ["objects.copy"] } });
         let digest = fixture.publish("0.1.1", "cd", copy).await;
-        let mut request = fixture.request(None);
+        let mut request = install_request(&fixture, None);
         request.version = Some(digest);
         let rule = format!("operation == 'plugin.objects.copy' && permission == '{denied}'");
         fixture.deny(&[&rule]).await;
-        let refused = fixture.install(&request).await;
+        let refused = install_as(&fixture, &request).await;
         assert!(
             matches!(refused, Err(InstallError::NotHeld(_))),
             "{denied}: {refused:?}"
         );
         request.grants.insert("write".into(), Vec::new());
-        assert!(fixture.install(&request).await.is_ok(), "{denied}");
+        assert!(install_as(&fixture, &request).await.is_ok(), "{denied}");
     }
 }
 
@@ -381,7 +395,9 @@ async fn keeps_receiver() {
     use crate::plugins::receiver::{eligible, pick_receiver};
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     assert_eq!(installed.receiver, actor.node_id);
     let mut moved = installed.clone();
     moved.receiver = iroh::SecretKey::from_bytes(&[9u8; 32]).public();

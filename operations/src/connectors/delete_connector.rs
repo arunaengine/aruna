@@ -184,9 +184,9 @@ mod tests {
         create_connector, defers_pending, reference_rows, source_metadata, vault_context,
         write_reference,
     };
+    use aruna_core::calls::CallRun;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::handle::Handle;
-    use aruna_core::calls::CallRun;
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::{
         SourceConnector, SourceConnectorKind, SourceConnectorSecret,

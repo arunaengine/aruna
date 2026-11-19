@@ -10,7 +10,6 @@ use aws_sdk_s3::primitives::ByteStream;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Once;
-use std::time::Duration;
 
 static MOCK_KEYRING: Once = Once::new();
 
@@ -291,22 +290,17 @@ async fn metadata_round_trip() -> TestResult<()> {
             .to_string();
         assert_eq!(created["document_path"], "datasets/quokka-field-notes");
 
-        shared::wait_until(
-            "the new crate in search",
-            shared::WAIT_CAP,
-            Duration::from_millis(100),
-            || async {
-                cli_json(&config, &["meta", "search", "zyxwquokka"])
-                    .await
-                    .is_ok_and(|page| {
-                        page["hits"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .any(|hit| hit["document_id"] == id.as_str())
-                    })
-            },
-        )
+        shared::wait_until("the new crate in search", shared::WAIT_CAP, || async {
+            cli_json(&config, &["meta", "search", "zyxwquokka"])
+                .await
+                .is_ok_and(|page| {
+                    page["hits"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|hit| hit["document_id"] == id.as_str())
+                })
+        })
         .await?;
 
         let output = dir.path().join("export.json");

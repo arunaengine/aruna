@@ -49,7 +49,13 @@ struct Member {
 async fn member_two(policies: bool) -> Member {
     let (dir, handle) = open();
     let (snapshot, bytes) = replicated(true, 1);
-    aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     install(&handle, snapshot.set_id(), &snapshot.config.ranges).await;
     let mut bucket = BucketInfo {
         group_id: snapshot.config.owner_group,
@@ -312,7 +318,13 @@ async fn feeds_searched_sets() {
         ..DistributionSettings::default()
     };
     let (snapshot, bytes) = with_settings(true, 1, settings);
-    aruna_drivers::testing::write_value(&member.handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &member.handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let second = record("b", 2, 1, &member.publication);
     let answer = apply(&member, page(&member, vec![second]), 1).await;
     assert!(matches!(answer, PageAnswer::Applied { applied: 1, .. }));

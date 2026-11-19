@@ -158,7 +158,13 @@ mod tests {
         let context = context(&handle);
         let (snapshot, bytes) = record(true);
         let set_id = snapshot.set_id();
-        aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), bytes).await;
+        aruna_drivers::testing::write_value(
+            &handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            set_id.to_bytes().to_vec(),
+            bytes,
+        )
+        .await;
         let info = BucketInfo {
             group_id: snapshot.config.owner_group,
             created_at: std::time::SystemTime::UNIX_EPOCH,
@@ -217,7 +223,13 @@ mod tests {
         use crate::distribution::test_record::binding;
         use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
         let set_id = snapshot.set_id();
-        aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), bytes).await;
+        aruna_drivers::testing::write_value(
+            handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            set_id.to_bytes().to_vec(),
+            bytes,
+        )
+        .await;
         let info = BucketInfo {
             group_id: snapshot.config.owner_group,
             created_at: std::time::SystemTime::UNIX_EPOCH,

@@ -7,6 +7,7 @@ pub mod export;
 pub mod groups;
 pub mod jobs;
 pub mod metadata;
+pub mod plugins;
 pub mod projection;
 pub mod s3;
 pub mod staging;

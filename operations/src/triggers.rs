@@ -86,9 +86,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::PublishWatchInterest => Some(TimerOperation::PublishWatchInterest(
             PublishInterestOperation::new(input.local_node),
         )),
-        TaskKey::DrainWatchEvents => Some(TimerOperation::DrainWatchEvents(
-            WatchDrainOperation::new(),
-        )),
+        TaskKey::DrainWatchEvents => {
+            Some(TimerOperation::DrainWatchEvents(WatchDrainOperation::new()))
+        }
         TaskKey::DrainAppliedSync => Some(TimerOperation::DrainAppliedSync(
             AppliedDrainOperation::new(),
         )),

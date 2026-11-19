@@ -165,10 +165,15 @@ mod tests {
         let (_, key, value) = watch_event_entry(&event()).unwrap();
         let mut drain = WatchDrainOperation::new();
         drain.first().unwrap();
-        drain.next(page(vec![(key, value)], Some(Key::from(vec![1])))).unwrap();
+        drain
+            .next(page(vec![(key, value)], Some(Key::from(vec![1]))))
+            .unwrap();
         let failed = Err::<(), IoError>(IoError::Unfinished);
         let failed = IoResult::Child(ChildOutcome::new(failed));
-        assert!(matches!(drain.next(failed), Ok(Next::Call(IoCall::Delete(_)))));
+        assert!(matches!(
+            drain.next(failed),
+            Ok(Next::Call(IoCall::Delete(_)))
+        ));
         let more = drain.next(IoResult::Done);
         assert!(matches!(more, Ok(Next::Call(IoCall::Page { .. }))));
     }

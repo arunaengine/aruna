@@ -558,6 +558,7 @@ version = "3.0.0-alpha.207"
 dependencies = [
  "aruna-core",
  "nix",
+ "tokio",
  "ulid 3.0.0",
 ]
 
@@ -1046,6 +1047,7 @@ dependencies = [
  "aruna-net",
  "aruna-operations",
  "aruna-outbound",
+ "aruna-plugin-types",
  "aruna-storage",
  "aruna-tasks",
  "axum",

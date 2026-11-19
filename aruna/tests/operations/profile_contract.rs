@@ -41,10 +41,10 @@ use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use aruna_operations::metadata::update_entry::UpdateEntryOperation;
-use aruna_test_support::metadata::process_materialization_batch;
-use aruna_test_support::projection::drain_projection_queue;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::drain_projection_queue;
 use byteview::ByteView;
 use serde_json::json;
 use tempfile::TempDir;

@@ -101,9 +101,9 @@ impl Operation for LookupKeysOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_test_support::s3::test_storage;
     use aruna_core::calls::ChildOutcome;
     use aruna_drivers::testing::test_context;
+    use aruna_test_support::s3::test_storage;
     use ulid::Ulid;
 
     fn user(seed: u8) -> UserId {

@@ -8,8 +8,9 @@
 use crate::shared;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use aruna_clock::testing::poll_until;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_core::structs::execution::job::JobId;
@@ -151,26 +152,36 @@ async fn wait_view(
     idle: Duration,
 ) -> Value {
     let mut progress = None;
-    let mut deadline = Instant::now() + idle;
     let mut last = Err("get_job was never answered".to_string());
     loop {
-        last = job_view(client, job_id).await.or(last);
-        let state = last
-            .as_ref()
-            .ok()
-            .and_then(|job| job["state"].as_str())
-            .map(str::to_string);
-        if matches!(state.as_deref(), Some("succeeded" | "failed" | "cancelled")) {
-            return last.expect("terminal view");
+        // A window ends early when the view moves, so only a stalled view fails.
+        let moved = poll_until(idle, async || {
+            let answer = job_view(client, job_id).await;
+            if answer.is_ok() {
+                last = answer;
+            }
+            let state = last
+                .as_ref()
+                .ok()
+                .and_then(|job| job["state"].as_str())
+                .map(str::to_string);
+            if matches!(state.as_deref(), Some("succeeded" | "failed" | "cancelled")) {
+                return Some(true);
+            }
+            if state.is_some() && state != progress {
+                progress = state;
+                return Some(false);
+            }
+            None
+        })
+        .await;
+        match moved {
+            Some(true) => return last.expect("terminal view"),
+            Some(false) => {}
+            None => {
+                return last.unwrap_or_else(|error| panic!("get_job stayed unavailable: {error}"));
+            }
         }
-        if state.is_some() && state != progress {
-            progress = state;
-            deadline = Instant::now() + idle;
-        }
-        if Instant::now() >= deadline {
-            return last.unwrap_or_else(|error| panic!("get_job stayed unavailable: {error}"));
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 

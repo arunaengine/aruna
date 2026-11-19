@@ -137,7 +137,11 @@ mod tests {
         // One slot through the uses of a run, as the release of each use asks and answers.
         let holder = (92 << 64 | 1, 1);
         let (one, two) = (|| Some(b"one".to_vec()), || Some(b"two".to_vec()));
-        assert_eq!(held_value(holder, "a"), None, "the first use names no value");
+        assert_eq!(
+            held_value(holder, "a"),
+            None,
+            "the first use names no value"
+        );
         assert_eq!(hold_value(holder, "a", 1, one()), one());
         assert_eq!(held_value(holder, "a"), Some(1));
         // The check passed again for the same value: the held fields are used.

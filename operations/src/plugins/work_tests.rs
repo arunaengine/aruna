@@ -11,17 +11,17 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 use super::*;
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::page_call;
 use crate::plugins::rows::read_call;
 use crate::plugins::rows::tests::{page_result, values_result};
-use crate::plugins::store::Txn;
 #[allow(unused_imports)]
 pub(crate) use crate::plugins::test_support::edit_work;
-use crate::plugins::test_support::installed;
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_drivers::driver::drive;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::artifacts::installed;
+use aruna_test_support::plugins::rows::Txn;
 
 const SOURCE: &str = "/realm/g/group/data/node/in/a.txt";
 const TARGET: &str = "/realm/g/group/data/node/out/a.txt";
@@ -368,14 +368,14 @@ async fn prunes_settled_rows() {
     // A settled row goes once it aged and its run is pruned, since no rerun can ask for it; until
     // then it answers its paths, also after its job record was pruned.
     use crate::jobs::JOB_PRUNE_PAGE;
-    use aruna_test_support::jobs::insert_job;
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
+    use aruna_test_support::jobs::insert_job;
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let ctx = &fixture.ctx;
     let mut rows = Vec::new();
     for seq in [1, 2] {
-        let run = crate::plugins::runs::tests::queued(install.install_id, seq);
+        let run = aruna_test_support::plugins::queued(install.install_id, seq);
         drive(crate::plugins::runs::admit(run.clone()), ctx)
             .await
             .unwrap();
@@ -441,10 +441,10 @@ async fn prunes_settled_rows() {
 async fn removal_cancels_first() {
     // A removed install's running work is cancelled and its row stays until the job settled;
     // settled rows and work that never got a job go at once.
+    use aruna_core::plugin_installs::InstallState;
     use aruna_test_support::jobs::insert_job;
     use aruna_test_support::jobs::read_job_record;
-    use crate::plugins::bound::tests::edit_config;
-    use aruna_core::plugin_installs::InstallState;
+    use aruna_test_support::plugins::edit_config;
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let ctx = &fixture.ctx;
@@ -532,9 +532,9 @@ async fn reserved_work_settles() {
 async fn removal_keeps_finished() {
     // A removed install's reserved work whose job already finished keeps the job, settles, and
     // only then goes.
-    use aruna_test_support::jobs::insert_job;
-    use crate::plugins::bound::tests::edit_config;
     use aruna_core::plugin_installs::InstallState;
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::plugins::edit_config;
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let ctx = &fixture.ctx;

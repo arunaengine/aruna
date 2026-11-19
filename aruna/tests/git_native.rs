@@ -85,7 +85,7 @@ async fn native_clients() -> TestResult<()> {
                 "license":"https://creativecommons.org/licenses/by/4.0/","public":false}))
             .send().await?.error_for_status()?.json().await?;
         let id = document["document_id"].as_str().ok_or_else(|| std::io::Error::other("document ID missing"))?;
-        shared::wait_until("metadata registry visibility", shared::WAIT_CAP, Duration::from_millis(100), || async {
+        shared::wait_until("metadata registry visibility", shared::WAIT_CAP, || async {
             client.get(format!("{base}/api/v1/metadata/{id}")).bearer_auth(&token).send().await
                 .is_ok_and(|response| response.status().is_success())
         }).await?;
@@ -96,7 +96,7 @@ async fn native_clients() -> TestResult<()> {
                 permission: aruna_core::structs::identity::auth::Permission::READ,
             },
         ])?;
-        shared::wait_until("automatic ARC repository", shared::WAIT_CAP, Duration::from_millis(100), || async {
+        shared::wait_until("automatic ARC repository", shared::WAIT_CAP, || async {
             matches!(seed.context.storage_handle.send_storage_effect(StorageEffect::Read {
                 key_space: aruna_core::git::STATUS.into(), key: id.parse::<ulid::Ulid>().expect("document ID").to_bytes().to_vec().into(), txn_id: None,
             }).await, Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }))
@@ -188,7 +188,7 @@ async fn holder_failover() -> TestResult<()> {
             .send().await?.error_for_status()?.json().await?;
         let id = document["document_id"].as_str().ok_or_else(|| std::io::Error::other("document ID missing"))?;
         for base in [&base_a, &base_b] {
-            shared::wait_until("ARC repository on each holder", shared::WAIT_CAP, Duration::from_millis(250), || async {
+            shared::wait_until("ARC repository on each holder", shared::WAIT_CAP, || async {
                 let Ok(response) = client.get(format!("{base}/api/v1/metadata/{id}/git")).bearer_auth(&token).send().await else {
                     return false;
                 };

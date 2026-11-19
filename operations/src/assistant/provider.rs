@@ -272,9 +272,7 @@ impl Operation for ListProviderOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ProviderStoreError> {
         if let Some(provider_ids) = self.provider_ids.take() {
-            return Ok(Next::Done(
-                self.collect(&provider_ids, result.values()?)?,
-            ));
+            return Ok(Next::Done(self.collect(&provider_ids, result.values()?)?));
         }
         let index = decode_index(result.value()?.as_ref())?;
         if index.is_empty() {

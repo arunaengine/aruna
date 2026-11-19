@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aruna_clock::testing::poll_until;
 use aruna_compute::DockerConfig;
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_core::compute::{
@@ -206,14 +207,15 @@ fn sh(job: &str, script: &str) -> TaskSpec {
 }
 
 async fn wait_running(backend: &DockerBackend, attempt: &AttemptRef) {
-    for _ in 0..200 {
+    let reached = poll_until(Duration::from_secs(60), async || {
         let status = backend.status(attempt).await.unwrap();
-        if matches!(status.phase, AttemptPhase::Running) || status.is_terminal() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("container never reached running/terminal");
+        (matches!(status.phase, AttemptPhase::Running) || status.is_terminal()).then_some(())
+    })
+    .await;
+    assert!(
+        reached.is_some(),
+        "container never reached running/terminal"
+    );
 }
 
 #[tokio::test]

@@ -43,6 +43,7 @@ crossfire = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
+aruna-clock = { workspace = true, features = ["test-hooks"] }
 aruna-core = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }
 

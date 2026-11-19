@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::metadata::{GraphLifecycleRecord, MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::events::Event;
+use aruna_core::metadata::{GraphLifecycleRecord, MetadataEffect, MetadataError, MetadataEvent};
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::testing::send_metadata_effect;
 use aruna_operations::git::GitNode;
@@ -26,7 +26,11 @@ pub async fn process_materialization_batch(
     };
     let concurrency = materialization_group_concurrency();
     let link_timer = context.task_handle.is_some();
-    drive(MaterializationBatchOperation::new(node, concurrency, link_timer), context).await
+    drive(
+        MaterializationBatchOperation::new(node, concurrency, link_timer),
+        context,
+    )
+    .await
 }
 
 /// Whether a live metadata materialization job is queued; dead ones it meets are deleted.

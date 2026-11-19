@@ -2,21 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
-use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::groups::routing::BucketRules;
-use aruna_operations::groups::routing::SnapshotOperation;
-use aruna_operations::placement::policy::GateOperation;
-use aruna_operations::replication::queue::LiveVersionInput;
-use aruna_operations::replication::queue::LiveVersionOperation;
-use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::s3::object::head::HeadObjectInput;
-use aruna_operations::s3::object::head::HeadObjectOperation;
-use aruna_operations::s3::object::put::PutObjectConfig;
-use aruna_operations::s3::object::put::PutObjectInput;
-use aruna_operations::s3::object::put::PutObjectOperation;
-use aruna_operations::s3::object::search::SearchObjectsInput;
-use aruna_operations::s3::object::search_scan::SearchObjectsOperation;
 use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
@@ -39,6 +24,23 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_net::NetHandle;
+use aruna_operations::connectors::create_connector::{
+    SourceConnectorInput, SourceConnectorOperation,
+};
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::groups::routing::BucketRules;
+use aruna_operations::groups::routing::SnapshotOperation;
+use aruna_operations::metadata::api::object_search::search_objects;
+use aruna_operations::metadata::api::search_types::{ObjectQueryMode, SearchQueryRequest};
+use aruna_operations::placement::policy::GateOperation;
+use aruna_operations::replication::queue::LiveVersionInput;
+use aruna_operations::replication::queue::LiveVersionOperation;
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::object::head::HeadObjectInput;
+use aruna_operations::s3::object::head::HeadObjectOperation;
+use aruna_operations::s3::object::put::PutObjectConfig;
+use aruna_operations::s3::object::put::PutObjectInput;
+use aruna_operations::s3::object::put::PutObjectOperation;
 use aruna_storage::storage;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
@@ -188,7 +190,7 @@ pub fn sample_metadata() -> SourceMetadata {
 }
 
 /// The NCBI assembly summary the table fixtures serve.
-pub const SUMMARY: &str = include_str!("../../../core/tests/fixtures/assembly_summary.tsv");
+pub const SUMMARY: &str = include_str!("../../core/tests/fixtures/assembly_summary.tsv");
 pub const COLI: &str = "all/GCF/000/005/845/GCF_000005845.2_ASM584v2/";
 pub const HUMAN: &str = "all/GCF/000/001/405/GCF_000001405.40_GRCh38.p14/";
 pub const STRUCTURE: &str = "GCF_000001405.40_GRCh38.p14_assembly_structure/";
@@ -361,8 +363,10 @@ pub struct Fixture {
 
 impl Fixture {
     pub async fn new(endpoint: &str, table: serde_json::Value) -> Self {
-        use aruna_operations::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
         use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_operations::connectors::create_connector::{
+            SourceConnectorInput, SourceConnectorOperation,
+        };
 
         let test = setup_driver_context().await;
         let driver = test.driver_context;
@@ -415,9 +419,12 @@ impl Fixture {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        aruna_drivers::driver::drive(aruna_operations::jobs::store::row_calls::insert_job(&record), &self.driver)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            aruna_operations::jobs::store::row_calls::insert_job(&record),
+            &self.driver,
+        )
+        .await
+        .unwrap();
         JobContext {
             driver: self.driver.clone(),
             job_id,
@@ -454,22 +461,22 @@ impl Fixture {
     }
 
     pub async fn hits(&self, query: &str) -> Vec<aruna_core::search::ObjectInventoryHit> {
+        // The object search route's path in local mode: this node scans its own objects.
         let auth = self.spec.auth_context.clone();
-        let input = SearchObjectsInput {
-            realm_id: auth.realm_id,
-            auth,
-            node_id: self.spec.node_id,
+        let request = SearchQueryRequest {
+            auth: auth.clone(),
+            bearer_token: None,
             query: query.to_string(),
             key_match: ObjectKeyMatch::Metadata,
             bucket: Some(self.spec.bucket.clone()),
             limit: 100,
-            start_after: None,
-            as_of: SystemTime::now() + std::time::Duration::from_secs(3600),
+            cursor: None,
+            mode: ObjectQueryMode::Local,
+            target_nodes: None,
         };
         let indexed = self.driver.storage_handle.range_indexes().is_some();
-        let search = SearchObjectsOperation::new(input, indexed);
-        let page = drive(search, &self.driver).await.unwrap();
-        page.hits.into_iter().map(|hit| hit.hit).collect()
+        let search = search_objects(auth.realm_id, self.spec.node_id, request, indexed);
+        drive(search, &self.driver).await.unwrap().hits
     }
 
     /// The source observation stored on the current reference version of `key`.

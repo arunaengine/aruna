@@ -1395,7 +1395,13 @@ mod tests {
     async fn distribute(context: &DriverContext) -> Ulid {
         use crate::distribution::test_record::{binding, record};
         let (snapshot, bytes) = record(true);
-        aruna_drivers::testing::write_value(&context.storage_handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+        aruna_drivers::testing::write_value(
+            &context.storage_handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            snapshot.set_id().to_bytes().to_vec(),
+            bytes,
+        )
+        .await;
         // The inventory a mint keeps current needs the set's ranges opened on this member.
         crate::distribution::test_store::install(
             &context.storage_handle,

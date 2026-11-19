@@ -6,13 +6,13 @@ use super::*;
 use crate::jobs::store::job_calls::{CancelRequestOutcome, ClaimOutcome};
 use crate::jobs::store::park_wake::{AwaitOutcome, ParkJobOperation, SatisfyWaitOperation};
 use crate::jobs::store::row_calls::{WAKE_PAGE, park_mutation};
-use aruna_test_support::jobs::{insert_job, read_job_record, read_key_waits};
 use aruna_core::structs::execution::job::KeyWait;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_drivers::driver::DriverContext;
 use aruna_storage::scan::iter_prefix_page;
 use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_test_support::jobs::{insert_job, read_job_record, read_key_waits};
 
 fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -47,8 +47,12 @@ async fn claimed_job(context: &DriverContext, seed: u8) -> (JobId, Ulid) {
     let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
     let record = JobRecord::new(job_id, payload, owner, node(7), 1_000, 1_000, None);
     insert_job(context, &record).await.unwrap();
-    let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, node(3), 2_000), context).await.unwrap()
-    else {
+    let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node(3), 2_000),
+        context,
+    )
+    .await
+    .unwrap() else {
         panic!("job must be claimed")
     };
     (job_id, claimed.claim.unwrap().claim_token)
@@ -62,9 +66,12 @@ async fn rows(context: &DriverContext, key_space: &str) -> Vec<Key> {
 }
 
 async fn park(context: &DriverContext, job_id: JobId, token: Ulid, waits: Vec<KeyWait>) {
-    let outcome = aruna_drivers::driver::drive(crate::jobs::store::row_calls::park_job(job_id, token, 3_000, waits), context)
-        .await
-        .unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::row_calls::park_job(job_id, token, 3_000, waits),
+        context,
+    )
+    .await
+    .unwrap();
     assert!(matches!(outcome, AwaitOutcome::Parked(_)));
 }
 
@@ -87,7 +94,11 @@ async fn park_keeps_attempts() {
     assert!(rows(&context, SCHEDULE_INDEX_KEYSPACE).await.is_empty());
     assert_eq!(read_key_waits(&context, job_id).await.unwrap().len(), 2);
     // The old claim no longer mutates the parked job.
-    let again = aruna_drivers::driver::drive(crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait("a", 8)]), &context).await;
+    let again = aruna_drivers::driver::drive(
+        crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait("a", 8)]),
+        &context,
+    )
+    .await;
     assert!(matches!(again, Err(JobMutationError::TokenMismatch)));
 }
 
@@ -99,7 +110,15 @@ async fn waits_for_keys() {
     let (first, second) = (wait("a", 8), wait("b", 9));
     park(&context, job_id, token, vec![first.clone(), second.clone()]).await;
 
-    assert_eq!(aruna_drivers::driver::drive(crate::jobs::store::row_calls::wake_key_waits(first.key, 4_000), &context).await.unwrap(), 0);
+    assert_eq!(
+        aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::wake_key_waits(first.key, 4_000),
+            &context
+        )
+        .await
+        .unwrap(),
+        0
+    );
     let record = read_job_record(&context, job_id, None)
         .await
         .unwrap()
@@ -111,7 +130,12 @@ async fn waits_for_keys() {
     );
 
     assert_eq!(
-        aruna_drivers::driver::drive(crate::jobs::store::row_calls::wake_key_waits(second.key, 5_000), &context).await.unwrap(),
+        aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::wake_key_waits(second.key, 5_000),
+            &context
+        )
+        .await
+        .unwrap(),
         1
     );
     let record = read_job_record(&context, job_id, None)
@@ -135,10 +159,20 @@ async fn wake_pages_bounded() {
         let (job_id, token) = claimed_job(&context, 100 + seed as u8).await;
         park(&context, job_id, token, vec![shared.clone()]).await;
     }
-    let (woken, more) = aruna_drivers::driver::drive(crate::jobs::store::row_calls::wake_key_page(shared.key, 4_000), &context).await.unwrap();
+    let (woken, more) = aruna_drivers::driver::drive(
+        crate::jobs::store::row_calls::wake_key_page(shared.key, 4_000),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!((woken, more), (WAKE_PAGE, true));
     assert_eq!(
-        aruna_drivers::driver::drive(crate::jobs::store::row_calls::wake_key_waits(shared.key, 4_000), &context).await.unwrap(),
+        aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::wake_key_waits(shared.key, 4_000),
+            &context
+        )
+        .await
+        .unwrap(),
         3
     );
     assert!(rows(&context, KEY_WAIT_KEYSPACE).await.is_empty());
@@ -152,14 +186,27 @@ async fn cancel_parked_job() {
     let key = wait("a", 8);
     park(&context, job_id, token, vec![key.clone()]).await;
 
-    let outcome = aruna_drivers::driver::drive(crate::jobs::store::job_calls::set_cancel_requested(job_id, 4_000), &context).await.unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 4_000),
+        &context,
+    )
+    .await
+    .unwrap();
     let CancelRequestOutcome::Cancelled(record) = outcome else {
         panic!("a parked job that never ran cancels at once")
     };
     assert_eq!(record.state, JobState::Cancelled);
     assert!(read_key_waits(&context, job_id).await.unwrap().is_empty());
     // The leftover wake row is dropped without reviving the job.
-    assert_eq!(aruna_drivers::driver::drive(crate::jobs::store::row_calls::wake_key_waits(key.key, 5_000), &context).await.unwrap(), 0);
+    assert_eq!(
+        aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::wake_key_waits(key.key, 5_000),
+            &context
+        )
+        .await
+        .unwrap(),
+        0
+    );
     assert!(rows(&context, KEY_WAIT_KEYSPACE).await.is_empty());
     let record = read_job_record(&context, job_id, None)
         .await
@@ -173,15 +220,23 @@ async fn cancel_requeues_ran() {
     let (_dir, storage) = temp_storage();
     let context = aruna_drivers::testing::test_context(storage.clone());
     let (job_id, token) = claimed_job(&context, 5).await;
-    aruna_drivers::driver::drive(crate::jobs::store::job_calls::change_job(job_id, |record| {
-        record.has_run = true;
-        Ok(JobMutation::Persist)
-    }), &context)
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::change_job(job_id, |record| {
+            record.has_run = true;
+            Ok(JobMutation::Persist)
+        }),
+        &context,
+    )
     .await
     .unwrap();
     park(&context, job_id, token, vec![wait("a", 8)]).await;
 
-    aruna_drivers::driver::drive(crate::jobs::store::job_calls::set_cancel_requested(job_id, 4_000), &context).await.unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 4_000),
+        &context,
+    )
+    .await
+    .unwrap();
     let record = read_job_record(&context, job_id, None)
         .await
         .unwrap()
@@ -197,8 +252,17 @@ async fn cancellation_beats_parking() {
     let (_dir, storage) = temp_storage();
     let context = aruna_drivers::testing::test_context(storage.clone());
     let (job_id, token) = claimed_job(&context, 5).await;
-    aruna_drivers::driver::drive(crate::jobs::store::job_calls::set_cancel_requested(job_id, 2_500), &context).await.unwrap();
-    let outcome = aruna_drivers::driver::drive(crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait("a", 8)]), &context).await;
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 2_500),
+        &context,
+    )
+    .await
+    .unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait("a", 8)]),
+        &context,
+    )
+    .await;
     assert!(matches!(outcome, Ok(AwaitOutcome::Skipped)));
     assert!(rows(&context, KEY_WAIT_KEYSPACE).await.is_empty());
 }

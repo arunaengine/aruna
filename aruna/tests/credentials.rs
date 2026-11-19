@@ -405,19 +405,14 @@ async fn credential_outlives_session() -> TestResult<()> {
     assert_eq!(stored.expiry, never_expiry(), "no lifetime means no expiry");
     let group_path = &format!("{}/api/v1/access/groups/{group_id}", seed.base_url);
     let short = &short;
-    wait_until(
-        "the issuing token to expire",
-        WAIT_CAP,
-        Duration::from_millis(500),
-        || async move {
-            let response = reqwest::Client::new()
-                .get(group_path)
-                .bearer_auth(short)
-                .send()
-                .await;
-            response.is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
-        },
-    )
+    wait_until("the issuing token to expire", WAIT_CAP, || async move {
+        let response = reqwest::Client::new()
+            .get(group_path)
+            .bearer_auth(short)
+            .send()
+            .await;
+        response.is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
+    })
     .await?;
     let client = s3_client_once(&s3, &keys);
     assert_eq!(put_code(&client, "after-session.txt").await?, None);
@@ -1155,8 +1150,13 @@ async fn token_needs_credential() -> TestResult<()> {
 
         // A holder publishes the live token's request without reading the creator's vault.
         let action = KeyAction::Publish(grant.clone());
-        let mut operation =
-            CallRun::new(KeyOperation::new(BUCKET.into(), auth.clone(), node, action, now));
+        let mut operation = CallRun::new(KeyOperation::new(
+            BUCKET.into(),
+            auth.clone(),
+            node,
+            action,
+            now,
+        ));
         let mut effects: std::collections::VecDeque<_> = operation.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {
             let aruna_core::effects::Effect::Storage(effect) = effect else {

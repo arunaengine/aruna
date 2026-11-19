@@ -7,6 +7,7 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_compute::ExecutorRegistry;
 use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
+use aruna_core::calls::CallRun;
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
@@ -15,7 +16,6 @@ use aruna_core::heartbeat::{Heard, HeldHeartbeat, Here, MAX_HEARTBEAT_AGE};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::node_facts::{NodeFacts, class_labels, permille_of};
 use aruna_core::operation::SubOperation;
-use aruna_core::calls::CallRun;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation};
 use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
@@ -1405,14 +1405,7 @@ async fn drive_machine<P: Operation>(
     // nested effect-loop futures otherwise stack up in one caller's future.
     let mut state = Box::pin(holding(
         scope,
-        drive_effects(
-            &mut run,
-            context,
-            0,
-            None,
-            ExpiryRecheck::Once,
-            None,
-        ),
+        drive_effects(&mut run, context, 0, None, ExpiryRecheck::Once, None),
     ))
     .await;
     let record = run.1;
@@ -1582,7 +1575,10 @@ mod test {
         }
 
         fn first(&mut self) -> Result<Next<()>, IoError> {
-            Ok(Next::Call(IoCall::Write(vec![row(b"staged-marker", b"staged")])))
+            Ok(Next::Call(IoCall::Write(vec![row(
+                b"staged-marker",
+                b"staged",
+            )])))
         }
 
         fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
@@ -1620,7 +1616,10 @@ mod test {
         }
 
         fn first(&mut self) -> Result<Next<bool>, IoError> {
-            Ok(Next::Call(IoCall::Write(vec![row(b"staged-marker", b"staged")])))
+            Ok(Next::Call(IoCall::Write(vec![row(
+                b"staged-marker",
+                b"staged",
+            )])))
         }
 
         fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
@@ -1887,11 +1886,7 @@ mod test {
             outbound_handle: None,
         };
 
-        let result = drive(
-            MarkerAbortOperation { fail: false },
-            &context,
-        )
-        .await;
+        let result = drive(MarkerAbortOperation { fail: false }, &context).await;
 
         assert!(result.is_ok());
         assert!(marker_absent(&context).await);
@@ -1917,11 +1912,7 @@ mod test {
             outbound_handle: None,
         };
 
-        let result = drive(
-            MarkerAbortOperation { fail: true },
-            &context,
-        )
-        .await;
+        let result = drive(MarkerAbortOperation { fail: true }, &context).await;
 
         assert!(result.is_err());
         // An operation's own error runs its cleanup calls after the rollback.
@@ -2117,7 +2108,9 @@ mod test {
         type Error = IoError;
 
         fn first(&mut self) -> Result<Next<()>, IoError> {
-            Ok(Next::Call(IoCall::child(MarkerAbortOperation { fail: true })))
+            Ok(Next::Call(IoCall::child(MarkerAbortOperation {
+                fail: true,
+            })))
         }
 
         fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
@@ -2128,7 +2121,11 @@ mod test {
 
     /// One row of the test keyspace.
     fn row(key: &'static [u8], value: &'static [u8]) -> (String, ByteView, ByteView) {
-        ("default".to_string(), ByteView::from(key), ByteView::from(value))
+        (
+            "default".to_string(),
+            ByteView::from(key),
+            ByteView::from(value),
+        )
     }
 
     /// The error a test operation fails with on purpose.
@@ -2240,7 +2237,10 @@ mod test {
         }
 
         fn first(&mut self) -> Result<Next<bool>, IoError> {
-            Ok(Next::Call(IoCall::Write(vec![row(b"nested-staged", b"staged")])))
+            Ok(Next::Call(IoCall::Write(vec![row(
+                b"nested-staged",
+                b"staged",
+            )])))
         }
 
         fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
@@ -2261,7 +2261,8 @@ mod test {
         }
 
         fn abort(&mut self) -> Vec<IoCall> {
-            self.aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.aborted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Vec::new()
         }
     }
@@ -2452,7 +2453,11 @@ mod test {
         )
         .await;
 
-        assert_eq!(result, Err(IoError::Aborted), "the deadline must end the operation");
+        assert_eq!(
+            result,
+            Err(IoError::Aborted),
+            "the deadline must end the operation"
+        );
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
@@ -3207,14 +3212,16 @@ mod test {
                 let _ = gate.await;
                 Ok::<_, aruna_core::stream::StreamError>(bytes::Bytes::new())
             });
-            Ok(Next::Call(IoCall::from(Effect::Blob(BlobEffect::SpoolHidden {
-                namespace: ulid::Ulid::from_bytes([5u8; 16]),
-                name: self.name.to_string(),
-                created_by: aruna_core::UserId::default(),
-                max_bytes: None,
-                deadline: None,
-                blob: aruna_core::stream::BackendStream::new(blob),
-            }))))
+            Ok(Next::Call(IoCall::from(Effect::Blob(
+                BlobEffect::SpoolHidden {
+                    namespace: ulid::Ulid::from_bytes([5u8; 16]),
+                    name: self.name.to_string(),
+                    created_by: aruna_core::UserId::default(),
+                    max_bytes: None,
+                    deadline: None,
+                    blob: aruna_core::stream::BackendStream::new(blob),
+                },
+            ))))
         }
 
         fn next(&mut self, _: IoResult) -> Result<Next<()>, IoError> {

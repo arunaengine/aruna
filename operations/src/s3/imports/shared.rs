@@ -372,12 +372,12 @@ pub fn claim_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_test_support::s3::test_storage;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
     use aruna_core::structs::storage::backend_import::{DEFAULT_PATTERN, ImportedObject};
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::test_context;
+    use aruna_test_support::s3::test_storage;
     use std::time::SystemTime;
     use ulid::Ulid;
 

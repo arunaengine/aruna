@@ -5,6 +5,7 @@
 use crate::shared;
 
 use aruna_api::routes::credentials::CreateS3Response;
+use aruna_clock::testing::poll_until;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -16,8 +17,7 @@ use shared::{
     s3_client_once, shutdown_pair, sign_token, spawn_complete_joiner, spawn_complete_seed,
     wait_group_member, wait_realm_nodes, wait_until,
 };
-use std::time::{Duration, Instant, SystemTime};
-use tokio::time::sleep;
+use std::time::{Duration, SystemTime};
 
 const YEAR_SECS: u64 = 365 * 24 * 60 * 60;
 
@@ -141,18 +141,27 @@ async fn joiner_issues_credential() -> TestResult<()> {
         "path_restrictions": [{ "pattern": "shared-bucket/elabftw/**", "permission": "WRITE" }]
     });
     // The joiner refuses until the account and its role reached it.
-    let deadline = Instant::now() + WAIT_CAP;
-    let (created, short) = loop {
-        let short = sign_token(&seed, seed.user_id, None, 15)?;
-        let response = issue(&joiner.base_url, &short, &group_id, &account, &body).await?;
-        if response.status() == StatusCode::CREATED {
-            break (response.json::<CreateS3Response>().await?, short);
+    let mut refused = None;
+    let issued = poll_until(WAIT_CAP, async || {
+        let short = match sign_token(&seed, seed.user_id, None, 15) {
+            Ok(short) => short,
+            Err(error) => return Some(Err(error)),
+        };
+        match issue(&joiner.base_url, &short, &group_id, &account, &body).await {
+            Ok(response) if response.status() == StatusCode::CREATED => Some(Ok((response, short))),
+            Ok(response) => {
+                refused = Some(response.status());
+                None
+            }
+            Err(error) => Some(Err(error)),
         }
-        if Instant::now() >= deadline {
-            return Err(format!("no credential: {}", response.status()).into());
-        }
-        sleep(Duration::from_millis(200)).await;
+    })
+    .await;
+    let Some(issued) = issued else {
+        return Err(format!("no credential: {refused:?}").into());
     };
+    let (response, short) = issued?;
+    let created = response.json::<CreateS3Response>().await?;
     let access_key = created.access_key_id.clone();
     let stored = get_user_access(joiner.context.as_ref(), &access_key).await?;
     assert_eq!(stored.user_identity.to_string(), account);
@@ -177,19 +186,14 @@ async fn joiner_issues_credential() -> TestResult<()> {
 
     let group_path = &format!("{}/api/v1/access/groups/{group_id}", joiner.base_url);
     let short = &short;
-    wait_until(
-        "the issuing token to expire",
-        WAIT_CAP,
-        Duration::from_millis(500),
-        || async move {
-            let response = reqwest::Client::new()
-                .get(group_path)
-                .bearer_auth(short)
-                .send()
-                .await;
-            response.is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
-        },
-    )
+    wait_until("the issuing token to expire", WAIT_CAP, || async move {
+        let response = reqwest::Client::new()
+            .get(group_path)
+            .bearer_auth(short)
+            .send()
+            .await;
+        response.is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
+    })
     .await?;
 
     let keys = as_credentials(created);
@@ -280,7 +284,6 @@ async fn account_changes_apply() -> TestResult<()> {
     wait_until(
         "the role reduction to narrow the key",
         WAIT_CAP,
-        Duration::from_millis(200),
         || async move { put(service, "shared-bucket", "late.txt").await.is_err() },
     )
     .await?;
@@ -294,12 +297,9 @@ async fn account_changes_apply() -> TestResult<()> {
         .bearer_auth(&admin)
         .json(&json!({ "active": false }));
     assert_eq!(deactivated.send().await?.status(), StatusCode::NO_CONTENT);
-    wait_until(
-        "deactivation to end the key",
-        WAIT_CAP,
-        Duration::from_millis(200),
-        || async move { get(service, "shared-bucket", "entry.txt").await.is_err() },
-    )
+    wait_until("deactivation to end the key", WAIT_CAP, || async move {
+        get(service, "shared-bucket", "entry.txt").await.is_err()
+    })
     .await?;
     // The refused request deleted the key, so it is now unknown.
     let ended = get(service, "shared-bucket", "entry.txt").await;

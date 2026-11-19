@@ -28,7 +28,9 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::peer_trust::is_sync_eligible;
-use crate::replication::mirror_repair::{KickRepairOperation, StoreStatusOperation, SyncMirrorError};
+use crate::replication::mirror_repair::{
+    KickRepairOperation, StoreStatusOperation, SyncMirrorError,
+};
 use crate::replication::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };

@@ -91,7 +91,8 @@ pub(crate) fn mapping_call(document_id: Ulid) -> IoCall {
 pub(crate) fn mapping_answer(
     result: IoResult,
 ) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
-    result.value()?
+    result
+        .value()?
         .map(|value| PersistentIdMapping::from_bytes(value.as_ref()))
         .transpose()
         .map_err(PersistentIdError::Conversion)

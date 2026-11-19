@@ -143,7 +143,6 @@ mod tests {
     use crate::s3::bucket::write_guard::BucketGuardOperation;
     use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
     use crate::staging::offer::list::ListOffersOperation;
-    use aruna_test_support::staging::setup_driver_context;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USAGE_STATS_KEYSPACE};
@@ -152,6 +151,7 @@ mod tests {
     };
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_test_support::staging::setup_driver_context;
     use futures_util::StreamExt;
 
     fn input(bucket: &str, root: &str) -> OfferDirectoryInput {
@@ -236,8 +236,13 @@ mod tests {
         let context = &fixture.driver_context;
         let root = tempfile::tempdir().expect("root must be created");
         let offer = input("taken", root.path().to_str().expect("utf-8 root"));
-        aruna_test_support::staging::create_test_bucket(context, offer.group_id, offer.user_id, "taken")
-            .await;
+        aruna_test_support::staging::create_test_bucket(
+            context,
+            offer.group_id,
+            offer.user_id,
+            "taken",
+        )
+        .await;
 
         assert_eq!(
             drive(offer_directory(offer), context).await,

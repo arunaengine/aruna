@@ -20,7 +20,6 @@ use shared::{
     create_s3_credentials, s3_client, shutdown_pair, spawn_complete_joiner, spawn_complete_seed,
     spawn_seed_node, wait_group_member, wait_realm_nodes, wait_until,
 };
-use std::time::Duration;
 use ulid::Ulid;
 
 const FIXTURE_BYTES: &[u8] = b"drs placeholder fixture bytes";
@@ -437,22 +436,17 @@ async fn remote_version_downloads() -> TestResult<()> {
         .to_string();
         let object_url = format!("{}/api/v1/ga4gh/drs/v1/objects/{object_id}", seed.base_url);
         // The seed answers 503 until the published document reaches it.
-        wait_until(
-            "routed DRS lookup",
-            shared::WAIT_CAP,
-            Duration::from_millis(200),
-            || {
-                let request = reqwest::Client::new()
-                    .get(&object_url)
-                    .bearer_auth(&bearer_token);
-                async move {
-                    request
-                        .send()
-                        .await
-                        .is_ok_and(|response| response.status() == StatusCode::OK)
-                }
-            },
-        )
+        wait_until("routed DRS lookup", shared::WAIT_CAP, || {
+            let request = reqwest::Client::new()
+                .get(&object_url)
+                .bearer_auth(&bearer_token);
+            async move {
+                request
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status() == StatusCode::OK)
+            }
+        })
         .await?;
         let object_body: Value = reqwest::Client::new()
             .get(&object_url)

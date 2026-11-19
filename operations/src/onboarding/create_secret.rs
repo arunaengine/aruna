@@ -248,11 +248,12 @@ pub fn secret_record_key(enrollment_id: Ulid) -> ByteView {
 mod tests {
     use super::{CreateSecretError, CreateSecretInput, CreateSecretOperation};
     use aruna_core::UserId;
+    use aruna_core::calls::CallRun;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
-    use aruna_core::calls::CallRun;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::{
         QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
     };

@@ -1301,7 +1301,6 @@ mod tests {
     #[tokio::test]
     async fn lists_work_state() {
         // The receiver lists its work with the state of each job, to the group's admins only.
-        use aruna_test_support::jobs::insert_job;
         use aruna_core::structs::execution::job::{
             JobId, JobPayload, JobRecord, JobState, PluginWorkAction, PluginWorkSpec,
         };
@@ -1311,6 +1310,7 @@ mod tests {
         use aruna_operations::plugins::work::{
             Identity, WorkChange, WorkRow, reserve, update_work,
         };
+        use aruna_test_support::jobs::insert_job;
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();

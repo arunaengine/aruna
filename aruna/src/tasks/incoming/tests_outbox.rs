@@ -4,6 +4,7 @@
 
 use super::harness::*;
 use super::*;
+use aruna_clock::testing::poll_until;
 use aruna_drivers::testing::freeze_clock;
 
 #[test]
@@ -1140,17 +1141,11 @@ async fn draining_a_topics() {
         .send_effect(aruna_operations::sync::outbox_record::schedule_drain_effect())
         .await;
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if net.sync_topic_exists(topic).unwrap_or(false) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "rank-0 shard topic was not created after the local config change drained"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let exists = || std::future::ready(net.sync_topic_exists(topic).unwrap_or(false).then_some(()));
+    assert!(
+        poll_until(Duration::from_secs(20), exists).await.is_some(),
+        "rank-0 shard topic was not created after the local config change drained"
+    );
 
     net.shutdown().await;
 }
@@ -1432,22 +1427,17 @@ async fn pull_reaches_holder() {
         outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
+    let (handler, storage, record_key) = (&handler, &storage, &record_key);
+    let published = poll_until(Duration::from_secs(60), move || async move {
         handler.drain_sync_outbox().await;
-        if read_outbox_record(&storage, &record_key)
-            .await
-            .expect("read outbox record")
-            .is_none()
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "record never published: the drain did not adopt the ex-holder's genesis"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+        let record = read_outbox_record(storage, record_key).await;
+        record.expect("read outbox record").is_none().then_some(())
+    })
+    .await;
+    assert!(
+        published.is_some(),
+        "record never published: the drain did not adopt the ex-holder's genesis"
+    );
     assert!(
         net.sync_topic_exists(topic).unwrap_or(false),
         "the genesis must be adopted from the stamped ex-holder"

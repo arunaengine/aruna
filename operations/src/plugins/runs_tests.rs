@@ -8,11 +8,11 @@ use crate::plugins::calls::*;
 use crate::plugins::host_calls::call_intent;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
-#[allow(unused_imports)]
-pub(crate) use crate::plugins::test_support::queued;
 use aruna_core::plugin_runs::RunState;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::FjallStorage;
+#[allow(unused_imports)]
+use aruna_test_support::plugins::queued;
 use tempfile::{TempDir, tempdir};
 
 /// A node context on its own empty storage.

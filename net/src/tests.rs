@@ -10,6 +10,7 @@ pub(crate) mod document_sync_support;
 use crate::discovery::{DHT_MAX_SKEW, select_signed_endpoint, validate_endpoint_announcement};
 use crate::eviction::flush_evicted_documents;
 use crate::test_support::make_secret;
+use aruna_clock::testing::poll_until;
 use aruna_core::events::DhtEntry;
 use aruna_core::structs::identity::realm::{RealmEndpointAnnouncement, endpoint_signing_bytes};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus};
@@ -18,7 +19,7 @@ use iroh::{Endpoint, EndpointAddr};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 
 fn make_announcement(
     secret: &iroh::SecretKey,
@@ -695,15 +696,19 @@ pub(crate) async fn test_net_handle() -> Result<(NetHandle, TempDir)> {
 
 const WAIT_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The first status `done` accepts, or the last one read once the wait timed out.
 async fn wait_for_status(handle: &NetHandle, mut done: impl FnMut(&NetState) -> bool) -> NetState {
-    let deadline = tokio::time::Instant::now() + WAIT_STATUS_TIMEOUT;
-    loop {
+    let mut last = None;
+    let accepted = poll_until(WAIT_STATUS_TIMEOUT, async || {
         let status = handle.get_status().await;
-        if done(&status) || tokio::time::Instant::now() >= deadline {
-            return status;
+        if done(&status) {
+            return Some(status);
         }
-        sleep(Duration::from_millis(20)).await;
-    }
+        last = Some(status);
+        None
+    })
+    .await;
+    accepted.or(last).expect("the wait reads a status")
 }
 
 async fn await_open_connections(handle: &NetHandle, expected: usize) -> NetState {

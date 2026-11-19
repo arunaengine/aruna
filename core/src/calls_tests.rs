@@ -531,7 +531,7 @@ fn conflict_marks_retry() {
     assert!(CallRun::<Script>::is_conflict(&error));
     let full = IoError::Storage(StorageError::QueueFull);
     assert!(!CallRun::<Script>::is_conflict(&full));
-    assert_eq!(CallRun::<Script>::conflict_retries(), 3);
+    assert_eq!(Script::conflict_retries(), 3);
     let mut fresh = run(script(Vec::new()), true);
     assert_eq!(fresh.on_conflict(3), AfterConflict::Rerun);
     assert_eq!(fresh.on_conflict(4), AfterConflict::Fail);
@@ -791,7 +791,10 @@ fn reads_effect_answers() {
         values: vec![(key.clone(), value.clone())],
         next_start_after: Some(key.clone()),
     };
-    assert_eq!(stored(iter).page(), Ok((vec![(key.clone(), value)], Some(key))));
+    assert_eq!(
+        stored(iter).page(),
+        Ok((vec![(key.clone(), value)], Some(key)))
+    );
 }
 
 // A storage failure an effect answers with reads as the runner reports its own calls' failures.

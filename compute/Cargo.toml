@@ -44,6 +44,7 @@ k8s-openapi = { workspace = true, optional = true }
 json-patch = { workspace = true, optional = true }
 
 [dev-dependencies]
+aruna-clock = { workspace = true, features = ["test-hooks"] }
 http = { workspace = true }
 iroh = { workspace = true }
 tempfile = { workspace = true }

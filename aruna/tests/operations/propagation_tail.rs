@@ -51,8 +51,7 @@ fn sustained_load_converges() -> Result<(), BoxError> {
             .iter()
             .map(|(group_id, document_id, _)| (*group_id, *document_id))
             .collect();
-        let result = match wait_for_visibility(&contexts, &pairs, Duration::from_millis(200)).await
-        {
+        let result = match wait_for_visibility(&contexts, &pairs).await {
             Ok(()) => wait_empty_queues(&contexts).await,
             Err(error) => Err(error),
         };

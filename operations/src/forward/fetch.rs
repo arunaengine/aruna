@@ -12,7 +12,7 @@ use aruna_core::events::{
     Event, GroupEvent, GroupResult, MetadataAnswer, NetEvent, PeerRequestError,
 };
 use aruna_core::metadata::protocol::{
-    MetadataTransportMessage, decode_answer, encode_message, metadata_request,
+    MetadataTransportMessage, decode_answer, encode_message, metadata_request, peer_call,
 };
 use aruna_core::operation::Operation;
 use thiserror::Error;

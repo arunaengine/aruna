@@ -218,7 +218,7 @@ pub(crate) mod tests {
         use crate::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
         use crate::metadata::create_entry::CreateEntryOperation;
         use aruna_core::metadata::api::CreateDocumentPayload;
-        let fixture = crate::plugins::install::tests::Fixture::new().await;
+        let fixture = aruna_test_support::plugins::Fixture::new().await;
         let mut ctx = fixture.ctx.clone();
         let dir = tempfile::tempdir().unwrap();
         let storage = fixture.ctx.storage_handle.clone();
@@ -252,7 +252,9 @@ pub(crate) mod tests {
         .await
         .unwrap();
         for _ in 0..3 {
-            aruna_test_support::projection::drain_projection_queue(&ctx).await.unwrap();
+            aruna_test_support::projection::drain_projection_queue(&ctx)
+                .await
+                .unwrap();
         }
         let page = journal_page(JOURNAL_ROW, None, 10);
         let (kept, _) = drive(page, &ctx).await.unwrap();

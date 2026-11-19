@@ -57,7 +57,13 @@ async fn counts_owner_group() {
         outbound_handle: None,
     };
     let (snapshot, bytes) = record(true);
-    aruna_drivers::testing::write_value(&context.storage_handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &context.storage_handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let owner = snapshot.config.owner_group;
 
     let all = drive(SetCountsOperation::new(None), &context)
@@ -104,7 +110,12 @@ async fn reads_deleting_record() {
         head: SignedSnapshot::sign(snapshot.clone(), realm(), &secret(1)).unwrap(),
         conflict: None,
     };
-    aruna_drivers::testing::write_value(&context.storage_handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), view.to_bytes().unwrap())
+    aruna_drivers::testing::write_value(
+        &context.storage_handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        view.to_bytes().unwrap(),
+    )
     .await;
 
     let counts = drive(

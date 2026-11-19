@@ -28,7 +28,9 @@ use crate::groups::forward::ApplyGroupOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::audit::AUDIT_DEADLINE_SECS;
 use crate::metadata::audit_entry::ServeAuditOperation;
-use crate::metadata::device::serve::{apply_device_batch, serve_graph_state, serve_realm_documents};
+use crate::metadata::device::serve::{
+    apply_device_batch, serve_graph_state, serve_realm_documents,
+};
 use crate::metadata::persistent_id::forward::ServePidOperation;
 use crate::metadata::read_peer::ReadPeerOperation;
 use crate::metadata::serve::publish::serve_publish;

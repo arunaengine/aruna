@@ -802,7 +802,9 @@ impl Operation for CleanupWorkOperation {
             })),
             WorkStep::Dht => Ok(Next::Done(registered(result.event()?))),
             WorkStep::Planned(file, job_id) => {
-                let row = result.child::<IoResult, IoError>()?.and_then(IoResult::value);
+                let row = result
+                    .child::<IoResult, IoError>()?
+                    .and_then(IoResult::value);
                 self.planned(*file, row.map(|row| decode_job_record(job_id, row)))
             }
             // The settlement removes the record itself, and only while it is unchanged.

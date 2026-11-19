@@ -1734,7 +1734,13 @@ mod tests {
             conflict: None,
         };
         let (_dir, handle) = open();
-        aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), view.to_bytes().unwrap()).await;
+        aruna_drivers::testing::write_value(
+            &handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            set_id.to_bytes().to_vec(),
+            view.to_bytes().unwrap(),
+        )
+        .await;
         let left = DistributionBinding {
             member_id: Ulid::from_bytes([3; 16]),
             ..crate::distribution::test_record::binding(&snapshot, 2, 5)
@@ -1816,7 +1822,13 @@ mod tests {
             conflict: None,
         };
         let (_dir, handle) = open();
-        aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), view.to_bytes().unwrap()).await;
+        aruna_drivers::testing::write_value(
+            &handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            set_id.to_bytes().to_vec(),
+            view.to_bytes().unwrap(),
+        )
+        .await;
         let info = BucketInfo {
             group_id: snapshot.config.owner_group,
             created_at: std::time::SystemTime::UNIX_EPOCH,

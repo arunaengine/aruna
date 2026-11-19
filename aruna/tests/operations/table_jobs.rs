@@ -19,6 +19,7 @@ use aruna_core::structs::execution::job::JobResultPayload;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use aruna_clock::testing::poll_until;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_drivers::driver::drive;
@@ -32,7 +33,7 @@ async fn paused_job_stops() {
         throttled: true,
         ..Site::ncbi(endpoint)
     };
-    let (endpoint, _site, server) = serve(throttled).await;
+    let (endpoint, site, server) = serve(throttled).await;
     let fixture = Fixture::new(&endpoint, summary_table()).await;
     for (seed, cancel) in [(20u8, true), (21u8, false)] {
         let ctx = fixture.context(seed).await;
@@ -40,8 +41,12 @@ async fn paused_job_stops() {
             true => ctx.cancel.clone(),
             false => ctx.shutdown.clone(),
         };
+        // The source answers each request with a pause, so the run pauses once it asked.
+        let asked = site.requests.lock().unwrap().len();
         let stopping = async {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let more = async || (site.requests.lock().unwrap().len() > asked).then_some(());
+            let paused = poll_until(std::time::Duration::from_secs(60), more).await;
+            assert!(paused.is_some(), "the run never asked its source");
             stop.cancel();
         };
         let run = run_staging_job(&ctx, &fixture.spec);
@@ -259,7 +264,12 @@ async fn record_pages_resume() {
     let indexes = RangeIndexes::new(fixture._dir.path().join("range-indexes"));
     let indexes = fixture.driver.storage_handle.install_range_indexes(indexes);
     let mut feeder = Feeder::new(FeedLimits::default());
-    while feeder.passed(aruna_drivers::driver::drive(feeder.next_pass(), &fixture.driver).await) {}
+    loop {
+        let pass = aruna_drivers::driver::drive(feeder.next_pass(), &fixture.driver).await;
+        if !feeder.passed(pass) {
+            break;
+        }
+    }
     for row in [0, MAX_PAGE_ENTRIES, rows - 1, rows + 299] {
         let query = KeyQuery {
             start: Bound::Unbounded,
@@ -416,7 +426,14 @@ async fn import_records(
     let mut feeder = feed.await.unwrap();
     server.abort();
     // The index catches up with what the jobs wrote.
-    while background && feeder.pass(&fixture.driver).await {}
+    if background {
+        loop {
+            let pass = aruna_drivers::driver::drive(feeder.next_pass(), &fixture.driver).await;
+            if !feeder.passed(pass) {
+                break;
+            }
+        }
+    }
     let index = ended.elapsed().as_secs_f64();
     if background {
         assert!(
@@ -450,13 +467,19 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
     use aruna_core::structs::storage::distribution::accounting::{
         RangeCounters, SAMPLE_SIZE, SampleEntry, sample_count_key,
     };
-    use aruna_operations::distribution::test_record::{binding, searched};
     use aruna_operations::distribution::inventory::open_ranges;
+    use aruna_operations::distribution::test_record::{binding, searched};
     use aruna_operations::distribution::test_store::range;
     let handle = &ctx.driver.storage_handle;
     let (snapshot, bytes) = searched();
     let set_id = snapshot.set_id();
-    aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let found = GetBucketOperation::new(spec.bucket.clone());
     let mut bucket = aruna_drivers::driver::drive(found, &ctx.driver)
         .await
@@ -505,7 +528,9 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
         .await;
     assert!(matches!(
         committed,
-        aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::TransactionCommitted { .. })
+        aruna_core::events::Event::Storage(
+            aruna_core::events::StorageEvent::TransactionCommitted { .. }
+        )
     ));
     (set_id, range_id)
 }

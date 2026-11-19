@@ -684,7 +684,6 @@ mod tests {
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
     use crate::node::usage_rebuild::RebuildStatsOperation;
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{
@@ -709,6 +708,9 @@ mod tests {
     use aruna_core::structs::storage::usage::{UsageCounters, global_group_key, usage_group_key};
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
     use axum::{Router, routing::get};
     use std::collections::HashMap;
     use std::time::SystemTime;

@@ -185,8 +185,6 @@ mod tests {
     use super::*;
     use crate::jobs::key_locks::{KeyCheckError, LockedInputsOperation, ParkLockedOperation};
     use crate::jobs::store::job_calls::ClaimOutcome;
-    use aruna_test_support::jobs::insert_job;
-    use aruna_test_support::jobs::read_job_record;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
@@ -200,6 +198,8 @@ mod tests {
     use aruna_core::structs::storage::encryption::BucketEncryption;
     use aruna_core::time::unix_timestamp_millis;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use byteview::ByteView;
     use ulid::Ulid;
 
@@ -408,9 +408,12 @@ mod tests {
         let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
         let record = JobRecord::new(job_id, payload, owner, node, 1_000, 1_000, None);
         insert_job(&context, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) =
-            aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, node, 2_000), &context).await.unwrap()
-        else {
+        let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, node, 2_000),
+            &context,
+        )
+        .await
+        .unwrap() else {
             panic!("job must be claimed")
         };
         let token = claimed.claim.unwrap().claim_token;
@@ -421,9 +424,12 @@ mod tests {
             group_id: None,
             key,
         };
-        aruna_drivers::driver::drive(crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait]), &context)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait]),
+            &context,
+        )
+        .await
+        .unwrap();
 
         let origin = (RealmId([1; 32]), node);
         let limits = RoCrateLimits::default();
@@ -638,11 +644,11 @@ mod tests {
     #[tokio::test]
     async fn lock_after_precheck() {
         use crate::jobs::lifecycle::stage::stage_error;
-        use aruna_test_support::jobs::read_key_waits;
         use crate::jobs::workflow::workspace::LOCKED_INPUT;
         use crate::replication::bao_read::BaoReadError;
         use aruna_core::replication_protocol::BaoReadRefusal;
         use aruna_core::structs::execution::job::JobError;
+        use aruna_test_support::jobs::read_key_waits;
 
         // The input copy is not converted yet; the locked bucket key still parks the job.
         let (_dir, context, node, key) = sealed_node(false).await;
@@ -674,9 +680,12 @@ mod tests {
             served_by: None,
         });
         insert_job(&context, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) =
-            aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, node, 2_000), &context).await.unwrap()
-        else {
+        let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, node, 2_000),
+            &context,
+        )
+        .await
+        .unwrap() else {
             panic!("job must be claimed")
         };
         let token = claimed.claim.as_ref().unwrap().claim_token;

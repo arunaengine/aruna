@@ -323,9 +323,7 @@ impl UpdateEntryOperation {
 
     fn generation_read(&mut self, result: IoResult) -> EntryTurn {
         // A node without the metadata handle keeps no cache.
-        if let Event::Metadata(MetadataEvent::CacheGeneration { generation }) =
-            result.event()?
-        {
+        if let Event::Metadata(MetadataEvent::CacheGeneration { generation }) = result.event()? {
             self.generation = Some(generation);
         }
         let operation = self

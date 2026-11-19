@@ -9,13 +9,13 @@ use std::time::SystemTime;
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PENDING_LOCATION_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
-use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::realm::{
     GroupQuotaOverride, QuotaConfig, RealmConfigDocument, RealmId,
 };

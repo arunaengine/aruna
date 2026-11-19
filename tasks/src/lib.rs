@@ -1125,7 +1125,13 @@ mod tests {
     /// Waits until the handler recorded `expected` runs; each run notifies `recorded` once.
     async fn wait_for_records(handler: &RecordingHandler, expected: usize) {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while handler.runs.lock().expect("run log lock should stay open").len() < expected {
+            while handler
+                .runs
+                .lock()
+                .expect("run log lock should stay open")
+                .len()
+                < expected
+            {
                 handler.recorded.notified().await;
             }
         })
@@ -1426,9 +1432,7 @@ mod tests {
             runs: runs.clone(),
             recorded: Arc::new(Notify::new()),
         };
-        handle
-            .set_inbound_handler(Arc::new(handler.clone()))
-            .await;
+        handle.set_inbound_handler(Arc::new(handler.clone())).await;
 
         tokio::time::advance(Duration::from_secs(3600)).await;
 
@@ -1479,9 +1483,7 @@ mod tests {
             runs: runs.clone(),
             recorded: Arc::new(Notify::new()),
         };
-        handle
-            .set_inbound_handler(Arc::new(handler.clone()))
-            .await;
+        handle.set_inbound_handler(Arc::new(handler.clone())).await;
 
         let _ = handle
             .send_effect(Effect::Task(TaskEffect::ResetTimer {

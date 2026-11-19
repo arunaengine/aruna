@@ -4,9 +4,6 @@
 
 use super::*;
 use crate::auth::UnrestrictedAuth;
-use aruna_test_support::jobs::insert_job;
-use aruna_test_support::jobs::put_job_entry;
-use aruna_test_support::jobs::{claim_job, complete_job, transition_to_running};
 use crate::jobs::{
     JobRequestError, MAX_OUTPUT_PREFIXES, mount_permission_path, native_input, native_outputs,
     output_buckets, validate_output_prefixes, workspace_request,
@@ -32,6 +29,9 @@ use aruna_operations::jobs::command::{
 };
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
+use aruna_test_support::jobs::insert_job;
+use aruna_test_support::jobs::put_job_entry;
+use aruna_test_support::jobs::{claim_job, complete_job, transition_to_running};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::collections::HashMap;
@@ -578,9 +578,9 @@ async fn report_pending_typed() {
 #[test]
 fn submit_conflict_typed() {
     let existing_job_id = JobId::from_bytes([15u8; 16]);
-    let error = map_submit_error(
-        aruna_core::job_request::SubmitJobError::JobPlanConflict { existing_job_id },
-    );
+    let error = map_submit_error(aruna_core::job_request::SubmitJobError::JobPlanConflict {
+        existing_job_id,
+    });
     assert!(matches!(
         error,
         ServerError::JobPlanConflict(message)

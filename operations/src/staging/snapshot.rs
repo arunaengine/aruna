@@ -287,8 +287,10 @@ impl From<SnapshotReuseError> for MaterializeSnapshotError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_drivers::driver::{drive, node_routing};
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
     use axum::Router;
     use axum::routing::get;
     use tokio::net::TcpListener;

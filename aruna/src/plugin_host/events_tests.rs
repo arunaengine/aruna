@@ -4,8 +4,11 @@
 
 use crate::plugin_host::worker::tests::worker;
 use aruna_clock::unix_timestamp_millis;
+use aruna_core::NodeId;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
+use aruna_core::plugin_runs::Decisions;
 use aruna_core::plugin_runs::EVENTS_QUEUED;
 use aruna_core::plugin_runs::EventBatch;
 use aruna_core::plugin_runs::ForwardRow;
@@ -17,38 +20,48 @@ use aruna_core::structs::SyncMode;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::SyncState;
 use aruna_core::structs::SyncStatusSnapshot;
+use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeInput;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 use aruna_core::structs::storage::replication_queue::ReplicationMode;
-use aruna_drivers::driver::drive;
-use aruna_operations::plugins::calls::decide_batch;
-use aruna_operations::plugins::calls::match_journal;
-use aruna_operations::plugins::calls::plan_replays;
-use aruna_operations::plugins::calls::set_grants;
-use aruna_operations::plugins::flow_support::events::dataset;
-use aruna_operations::plugins::flow_support::events::decide;
-use aruna_operations::plugins::flow_support::events::ran;
-use aruna_operations::plugins::flow_support::events::sync_at;
-use aruna_operations::plugins::flow_support::matcher::config;
-use aruna_operations::plugins::flow_support::matcher::forwarded;
-use aruna_operations::plugins::flow_support::matcher::journal;
+use aruna_drivers::driver::{drive, node_routing};
+use aruna_operations::plugins::install::InstallCaller;
+use aruna_operations::plugins::lifecycle::{SetGrants, match_targets};
+use aruna_operations::plugins::matcher::MatchJournal;
+use aruna_operations::plugins::peer::AnswerPeer;
+use aruna_operations::plugins::replay::PlanReplays;
 use aruna_operations::plugins::runs::list_runs;
-use aruna_operations::plugins::store::Txn;
-use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::created;
-use aruna_operations::plugins::test_support::drain_blob_batch;
-use aruna_operations::plugins::test_support::echoed_sync;
-use aruna_operations::plugins::test_support::install_artifact;
-use aruna_operations::plugins::test_support::installed;
-use aruna_operations::plugins::test_support::scoped;
+use aruna_operations::replication::drain::ProcessBatchOperation;
+use aruna_operations::replication::page::deliver::MetadataPages;
 use aruna_operations::replication::queue::QueueBlobOperation;
 use aruna_operations::replication::sync_relationship::StoreRelationshipOperation;
 use aruna_operations::replication::sync_relationship::SyncRelationshipDirection::Outgoing;
+use aruna_test_support::plugins::artifacts::{echoed_sync, install_artifact, installed};
+use aruna_test_support::plugins::flows::events::{dataset, ran, sync_at};
+use aruna_test_support::plugins::flows::matcher::{config, forwarded, journal};
+use aruna_test_support::plugins::rows::Txn;
+use aruna_test_support::plugins::{Fixture, created, edit_config, scoped};
+use std::sync::Arc;
 use std::time::SystemTime;
 use ulid::Ulid;
+
+/// Decides `rows` on this node as a forward from `holder`, through the peer request it serves.
+async fn decide(fixture: &Fixture, holder: NodeId, rows: Vec<ForwardRow>, now: u64) -> Decisions {
+    let batch = EventBatch {
+        events: rows,
+        gaps: Vec::new(),
+    };
+    let message = MetadataTransportMessage::ForwardEvents { batch };
+    let node = Some((fixture.actor.realm_id, fixture.actor.node_id));
+    let answer = AnswerPeer::new(node, holder, message, now).unwrap();
+    match drive(answer, &fixture.ctx).await.unwrap() {
+        MetadataTransportMessage::EventsDecided { result } => result.unwrap(),
+        other => panic!("unexpected answer {other:?}"),
+    }
+}
 
 #[tokio::test]
 async fn restart_runs_once() {
@@ -66,17 +79,13 @@ async fn restart_runs_once() {
     let mut bare = config.clone();
     bare.installs.clear();
     journal(&fixture, &dataset(&install, "replayed", now - 4)).await;
-    match_journal(&fixture.ctx, &bare, local, (now, EVENTS_QUEUED))
-        .await
-        .unwrap();
-    let no_clock = |_| async { None };
-    plan_replays(&fixture.ctx, &config, local, now, no_clock)
-        .await
-        .unwrap();
+    let matched = MatchJournal::new(match_targets(&bare, local), now, EVENTS_QUEUED);
+    drive(matched, &fixture.ctx).await.unwrap();
+    let plan = PlanReplays::new(Arc::new(config.clone()), local, now);
+    drive(plan, &fixture.ctx).await.unwrap();
     journal(&fixture, &dataset(&install, "outbox", now - 3)).await;
-    match_journal(&fixture.ctx, &config, local, (now, EVENTS_QUEUED))
-        .await
-        .unwrap();
+    let matched = MatchJournal::new(match_targets(&config, local), now, EVENTS_QUEUED);
+    drive(matched, &fixture.ctx).await.unwrap();
     journal(&fixture, &dataset(&install, "journal", now - 2)).await;
     let waiting = ForwardRow {
         install_id: install.install_id,
@@ -84,7 +93,7 @@ async fn restart_runs_once() {
         event: dataset(&install, "waiting", now - 1),
         queued_ms: now,
     };
-    let decided = decide(&fixture, vec![waiting], now).await;
+    let decided = decide(&fixture, local, vec![waiting], now).await;
     assert_eq!(decided.events[0].2, Outcome::Waiting);
 
     // The restarted node delivers everything; once the account's writes arrive, all run.
@@ -109,20 +118,14 @@ async fn narrowed_grant_stops() {
     let install = installed(&fixture).await;
     let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
     journal(&fixture, &dataset(&install, "B/one", now - 1)).await;
-    match_journal(
-        &fixture.ctx,
-        &config(&fixture).await,
-        local,
-        (now, EVENTS_QUEUED),
-    )
-    .await
-    .unwrap();
+    let targets = match_targets(&config(&fixture).await, local);
+    let matched = MatchJournal::new(targets, now, EVENTS_QUEUED);
+    drive(matched, &fixture.ctx).await.unwrap();
     let base = created(&install, "").1;
     let narrowed = scoped(vec![format!("{base}/A/**")]);
-    let (auth, id) = (fixture.auth(), install.install_id);
-    set_grants(&fixture.ctx, &fixture.actor, &auth, id, &narrowed)
-        .await
-        .unwrap();
+    let caller = InstallCaller::new(&fixture.actor, &fixture.auth(), now);
+    let grants = SetGrants::new(caller, install.install_id, &narrowed);
+    drive(grants, &fixture.ctx).await.unwrap();
     journal(&fixture, &dataset(&install, "B/two", now)).await;
     worker(&fixture).claim(now).await.unwrap();
     assert!(forwarded(&fixture, &install).await.is_empty());
@@ -180,7 +183,12 @@ async fn sync_job_runs() {
     let queue = QueueBlobOperation::new_relationship(input, None, relationship.id);
     drive(queue, &fixture.ctx).await.unwrap();
 
-    let drained = drain_blob_batch(&fixture.ctx).await;
+    let drain = ProcessBatchOperation::new(
+        MetadataPages,
+        node_routing(&fixture.ctx),
+        fixture.ctx.node_and_realm(),
+    );
+    let drained = drive(drain, &fixture.ctx).await.unwrap();
     assert_eq!(drained.succeeded, 1);
     for _ in 0..2 {
         let worker = worker(&fixture);
@@ -216,17 +224,17 @@ async fn remote_sync_runs() {
         event: sync_at(&install, 5, now),
         queued_ms: now,
     };
+    // The holder is a server of the realm, as a peer that forwards events must be.
     let holder = iroh::SecretKey::from_bytes(&[7; 32]).public();
-    let config = config(&fixture).await;
+    edit_config(&fixture, |config| {
+        config.nodes.push(RealmNode {
+            node_id: holder.to_string(),
+            kind: RealmNodeKind::Server,
+        });
+    })
+    .await;
     for _ in 0..2 {
-        let batch = EventBatch {
-            events: vec![row.clone()],
-            gaps: Vec::new(),
-        };
-        let nodes = (fixture.actor.node_id, holder);
-        decide_batch(&fixture.ctx, &config, nodes, batch, now)
-            .await
-            .unwrap();
+        decide(&fixture, holder, vec![row.clone()], now).await;
     }
     let worker = worker(&fixture);
     worker.claim(now).await.unwrap();
@@ -252,17 +260,13 @@ async fn sync_restart_once() {
     let mut bare = config.clone();
     bare.installs.clear();
     journal(&fixture, &sync_at(&install, 1, now - 4)).await;
-    match_journal(&fixture.ctx, &bare, local, (now, EVENTS_QUEUED))
-        .await
-        .unwrap();
-    let no_clock = |_| async { None };
-    plan_replays(&fixture.ctx, &config, local, now, no_clock)
-        .await
-        .unwrap();
+    let matched = MatchJournal::new(match_targets(&bare, local), now, EVENTS_QUEUED);
+    drive(matched, &fixture.ctx).await.unwrap();
+    let plan = PlanReplays::new(Arc::new(config.clone()), local, now);
+    drive(plan, &fixture.ctx).await.unwrap();
     journal(&fixture, &sync_at(&install, 2, now - 3)).await;
-    match_journal(&fixture.ctx, &config, local, (now, EVENTS_QUEUED))
-        .await
-        .unwrap();
+    let matched = MatchJournal::new(match_targets(&config, local), now, EVENTS_QUEUED);
+    drive(matched, &fixture.ctx).await.unwrap();
     journal(&fixture, &sync_at(&install, 3, now - 2)).await;
     let waiting = ForwardRow {
         install_id: install.install_id,
@@ -270,7 +274,7 @@ async fn sync_restart_once() {
         event: sync_at(&install, 4, now - 1),
         queued_ms: now,
     };
-    let decided = decide(&fixture, vec![waiting], now).await;
+    let decided = decide(&fixture, local, vec![waiting], now).await;
     assert_eq!(decided.events[0].2, Outcome::Waiting);
 
     worker(&fixture).claim(now).await.unwrap();

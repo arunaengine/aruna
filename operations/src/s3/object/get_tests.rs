@@ -1438,7 +1438,10 @@ async fn drift_creates_successor() {
 }
 
 fn observation(content_length: u64) -> SourceMetadata {
-    aruna_test_support::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
+    aruna_test_support::staging::sized_source(
+        content_length,
+        Some(format!("etag-{content_length}")),
+    )
 }
 
 fn reference_source() -> VersionSourceBinding {

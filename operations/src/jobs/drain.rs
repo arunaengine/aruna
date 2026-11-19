@@ -519,8 +519,6 @@ impl Operation for DrainTimerOperation {
 mod tests {
     use super::*;
     use crate::jobs::JOB_LEASE_MS;
-    use aruna_test_support::jobs::insert_job;
-    use aruna_test_support::jobs::read_job_record;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::Event;
@@ -536,6 +534,8 @@ mod tests {
     use aruna_storage::FjallStorage;
     use aruna_storage::scan::iter_prefix_page;
     use aruna_tasks::TaskHandle;
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use byteview::ByteView;
     use std::sync::Arc;
     use std::sync::Mutex;

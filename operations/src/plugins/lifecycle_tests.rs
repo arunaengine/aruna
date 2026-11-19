@@ -7,7 +7,7 @@ use super::*;
 use crate::plugins::account::{AccountChange, EnsureRole, Teardown};
 use crate::plugins::calls::*;
 use crate::plugins::grants::role_paths;
-use crate::plugins::install::tests::Fixture;
+use crate::plugins::test_support::{group_role, install_as, install_request};
 use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation};
 use crate::users::admin_audit::{AuditPageInput, AuditPageOperation};
 use aruna_core::UserId;
@@ -15,6 +15,7 @@ use aruna_core::structs::identity::admin_audit::AuditIndex;
 use aruna_core::structs::identity::auth::{PathRestriction, Permission as Access};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_drivers::driver::drive;
+use aruna_test_support::plugins::Fixture;
 use serde_json::json;
 
 fn needs_write() -> Value {
@@ -30,14 +31,16 @@ fn no_write() -> BTreeMap<String, Vec<String>> {
 async fn later_changes() {
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let id = installed.install_id;
     let meta = format!("/{}/g/{}/meta", actor.realm_id, fixture.group_id);
     let choices = BTreeMap::from([("write".to_string(), vec![format!("{meta}/runs/**")])]);
     let narrowed = set_grants(ctx, actor, &auth, id, &choices).await.unwrap();
     assert_eq!(narrowed.state, InstallState::Active);
     assert_eq!(narrowed.grants["write"], vec![format!("{meta}/runs/**")]);
-    let role = fixture.role(&narrowed).await.unwrap();
+    let role = group_role(&fixture, &narrowed).await.unwrap();
     assert_eq!(role.permissions[&format!("{meta}/runs/**")], Access::WRITE);
     let group = format!("/{}/g/{}/**", actor.realm_id, fixture.group_id);
     assert_eq!(role.permissions[&group], Access::READ);
@@ -71,7 +74,7 @@ async fn later_changes() {
     remove_install(ctx, actor, &auth, id).await.unwrap();
     assert!(fixture.installs().await.is_empty());
     assert!(fixture.account(&approved).await.unwrap().is_deactivated());
-    assert!(fixture.role(&approved).await.is_none());
+    assert!(group_role(&fixture, &approved).await.is_none());
     let page = AuditPageOperation::new(AuditPageInput {
         index: AuditIndex::Group(fixture.group_id),
         start_after: None,
@@ -99,8 +102,7 @@ async fn keeps_pause() {
     // A paused install stays paused through an update and the approval of what it needs.
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let id = fixture
-        .install(&fixture.request(None))
+    let id = install_as(&fixture, &install_request(&fixture, None))
         .await
         .unwrap()
         .install_id;
@@ -135,8 +137,7 @@ async fn resume_needs_grants() {
     // Resuming a paused install that misses a required grant leaves it blocked.
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let id = fixture
-        .install(&fixture.request(None))
+    let id = install_as(&fixture, &install_request(&fixture, None))
         .await
         .unwrap()
         .install_id;
@@ -160,8 +161,7 @@ async fn checks_updater() {
     // A session restricted to the group's admin path may not carry whole-group grants over.
     let fixture = Fixture::new().await;
     let (ctx, actor) = (&fixture.ctx, &fixture.actor);
-    let id = fixture
-        .install(&fixture.request(None))
+    let id = install_as(&fixture, &install_request(&fixture, None))
         .await
         .unwrap()
         .install_id;
@@ -188,7 +188,9 @@ async fn recovers_changes() {
     // role wider than its grants; the next change finishes it.
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let id = installed.install_id;
     let group = format!("/{}/g/{}", actor.realm_id, fixture.group_id);
     let choices = no_write();
@@ -204,7 +206,7 @@ async fn recovers_changes() {
     assert_eq!(crashed.unwrap().state, InstallState::Preparing);
     let finished = set_grants(ctx, actor, &auth, id, &choices).await.unwrap();
     assert_eq!(finished.state, InstallState::Active);
-    let role = fixture.role(&finished).await.unwrap();
+    let role = group_role(&fixture, &finished).await.unwrap();
     assert_eq!(
         role.permissions[&format!("{group}/**")],
         Access::READ,
@@ -227,7 +229,9 @@ async fn stale_node_changes() {
     // Node A stalls in a grant change while node B finishes another one; A's late role write and
     // cleanup must not break B's newer active install, on either node.
     let fixture = Fixture::new().await;
-    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let id = installed.install_id;
     let (a, b) = fixture.split().await;
     let a_auth = a.auth();
@@ -261,14 +265,14 @@ async fn stale_node_changes() {
     let write = EnsureRole::new(change.clone(), paths_a.clone());
     drive(write, &a.ctx).await.unwrap();
     a.deliver_group(&b).await;
-    assert_ne!(b.role(&active).await.unwrap().permissions, wanted);
+    assert_ne!(group_role(&b, &active).await.unwrap().permissions, wanted);
     let node = b.actor.node_id;
     assert!(
         repair_install(&b.ctx, node, b.actor.realm_id, &active)
             .await
             .unwrap()
     );
-    assert_eq!(b.role(&active).await.unwrap().permissions, wanted);
+    assert_eq!(group_role(&b, &active).await.unwrap().permissions, wanted);
 
     // Once A holds B's record, its stale role write and cleanup are refused, and A repairs too.
     b.deliver_config(&a).await;
@@ -283,14 +287,16 @@ async fn stale_node_changes() {
             .await
             .unwrap()
     );
-    assert_eq!(a.role(&active).await.unwrap().permissions, wanted);
+    assert_eq!(group_role(&a, &active).await.unwrap().permissions, wanted);
 }
 
 #[tokio::test]
 async fn keeps_admin_deactivation() {
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let (node, realm) = (actor.node_id, actor.realm_id);
     let change = AccountChange::of((actor, &auth), &installed, 1);
 
@@ -316,7 +322,9 @@ async fn keeps_admin_deactivation() {
 async fn repairs_after_failure() {
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let (node, realm) = (actor.node_id, actor.realm_id);
     let change = AccountChange::of((actor, &auth), &installed, 1);
     drive(Teardown::new(change), ctx).await.unwrap();
@@ -327,7 +335,7 @@ async fn repairs_after_failure() {
     let repaired = repair_settled(ctx, node, realm, &[orphaned, installed.clone()]).await;
     assert_eq!(repaired, 1);
     assert!(!fixture.account(&installed).await.unwrap().is_deactivated());
-    assert!(fixture.role(&installed).await.is_some());
+    assert!(group_role(&fixture, &installed).await.is_some());
 }
 
 #[tokio::test]
@@ -339,7 +347,7 @@ async fn coverage_times() {
     let triggers = json!({
         "triggers": { "dataset_created": {} }
     });
-    let mut request = fixture.request(None);
+    let mut request = install_request(&fixture, None);
     request.version = Some(fixture.publish("0.3.0", "aa", triggers).await);
     let meta = format!("/{}/g/{}/meta", actor.realm_id, fixture.group_id);
     let only = |pattern: &str| {
@@ -347,7 +355,7 @@ async fn coverage_times() {
         BTreeMap::from([read, ("write".to_string(), Vec::new())])
     };
     request.grants = only("a/**");
-    let installed = fixture.install(&request).await.unwrap();
+    let installed = install_as(&fixture, &request).await.unwrap();
     let id = installed.install_id;
     assert_eq!(installed.activated_by, Some(actor.node_id));
     assert_eq!(installed.widened, None);
@@ -373,8 +381,8 @@ async fn coverage_times() {
 
 #[tokio::test]
 async fn updates_bind_slots() {
-    use crate::plugins::bound::tests::{bound, secret};
     use crate::plugins::rules::tests::plain_secret;
+    use aruna_test_support::plugins::{bound, secret};
     let fixture = Fixture::keyed().await;
     let install = bound(&fixture).await;
     secret(&fixture, &install).await;

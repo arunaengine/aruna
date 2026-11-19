@@ -13,19 +13,17 @@ use serde_json::json;
 
 use super::*;
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::install::{pick_version, read_manifest};
 use crate::plugins::secret_use::slot_kind;
-#[allow(unused_imports)]
-pub(crate) use crate::plugins::test_support::{
-    ORIGIN, TOKEN, bound, edit_config, hold_keys, rule_for, secret, secret_with,
-};
 use crate::secrets::SecretChange;
 use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugins::{Refusal, ReleaseError};
 use aruna_core::secrets::UseRule;
 use aruna_drivers::driver::drive;
+use aruna_test_support::plugins::Fixture;
+#[allow(unused_imports)]
+use aruna_test_support::plugins::{TOKEN, bound, hold_keys, rule_for, secret};
 use ulid::Ulid;
 
 #[tokio::test]

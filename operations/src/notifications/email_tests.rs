@@ -4,13 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_test_support::jobs::find_dedup_plan;
 use crate::node_vault::{parse_secret, read_secret, write_secret};
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::notifications::opt_in::{EmailOptIn, SetEmailOperation};
 use crate::notifications::setting_rows::SettingError;
 use crate::tests::notifications::managers;
-use aruna_test_support::staging::setup_driver_context;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::compute::SecretBytes;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -33,6 +31,8 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_outbound::{MailBuilder, MailSender, OutboundHandle};
+use aruna_test_support::jobs::find_dedup_plan;
+use aruna_test_support::staging::setup_driver_context;
 use ed25519_dalek::SigningKey;
 use std::sync::{Arc, Mutex};
 use ulid::Ulid;
@@ -572,7 +572,9 @@ async fn restore_prunes_password() {
     let apply = crate::shard::pull::ApplyPulledOperation::new(node(), realm_id, applied);
     assert!(aruna_drivers::driver::drive(apply, &context).await.unwrap());
     let followups = crate::node::applied_drain::AppliedDrainOperation::new();
-    aruna_drivers::driver::drive(followups, &context).await.unwrap();
+    aruna_drivers::driver::drive(followups, &context)
+        .await
+        .unwrap();
     let row = VaultEntry::new(VaultPurpose::RealmSecret, Ulid::from_parts(3, 3));
     let event = context
         .storage_handle

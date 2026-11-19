@@ -632,7 +632,9 @@ impl PlanFinishOperation {
         let finished = std::mem::take(&mut self.finished);
         let (mut plan, superseding) = plan_rows(finished, &snapshot, &parked, self.now_ms)?;
         // Linked repositories learn of the change in the same commit as the new status.
-        let changes = superseding.into_iter().map(|id| link_change_entry(id, self.now_ms));
+        let changes = superseding
+            .into_iter()
+            .map(|id| link_change_entry(id, self.now_ms));
         plan.writes.extend(changes);
         Ok(Next::Done(plan))
     }

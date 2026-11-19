@@ -664,8 +664,6 @@ impl Operation for DeliverWakesOperation {
 mod tests {
     use super::*;
     use crate::jobs::store::job_calls::ClaimOutcome;
-    use aruna_test_support::jobs::insert_job;
-    use aruna_test_support::jobs::read_job_record;
     use aruna_core::UserId;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::execution::job::JobPayload;
@@ -675,6 +673,8 @@ mod tests {
     use aruna_core::time::unix_timestamp_millis;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::scan::iter_prefix_page;
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use std::future::Future;
     use ulid::Ulid;
 
@@ -764,9 +764,12 @@ mod tests {
         let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
         let record = JobRecord::new(job_id, payload, owner, local, 1_000, 1_000, None);
         insert_job(&context, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) =
-            aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, local, 2_000), &context).await.unwrap()
-        else {
+        let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, local, 2_000),
+            &context,
+        )
+        .await
+        .unwrap() else {
             panic!("job must be claimed")
         };
         let auth = owner_auth(&claimed, RealmId([1; 32]));
@@ -785,9 +788,12 @@ mod tests {
             key,
         };
         let token = claimed.claim.unwrap().claim_token;
-        aruna_drivers::driver::drive(crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait]), &context)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait]),
+            &context,
+        )
+        .await
+        .unwrap();
         // Only the node holding the key wakes the job; another node's wake is acknowledged only.
         assert_eq!(
             accept_wake(&context, local, &auth, job_id, key).await,
@@ -1058,10 +1064,12 @@ mod tests {
         let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
         let record = JobRecord::new(job_id, payload, owner, waiter, 1_000, 1_000, None);
         insert_job(&waiter_node, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, waiter, 2_000), &waiter_node)
-            .await
-            .unwrap()
-        else {
+        let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, waiter, 2_000),
+            &waiter_node,
+        )
+        .await
+        .unwrap() else {
             panic!("job must be claimed")
         };
         let auth = owner_auth(&claimed, RealmId([1; 32]));
@@ -1073,9 +1081,12 @@ mod tests {
             key,
         };
         let token = claimed.claim.unwrap().claim_token;
-        aruna_drivers::driver::drive(crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait]), &waiter_node)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait]),
+            &waiter_node,
+        )
+        .await
+        .unwrap();
         let register = WaitRowOperation::register(key, waiter, job_id, &auth);
         drive(register, &key_node).await.unwrap();
         drive(QueueWakesOperation::new(key), &key_node)

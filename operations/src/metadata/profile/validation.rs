@@ -703,8 +703,7 @@ impl ProfileAssessOperation {
     }
 
     fn structure_checked(&mut self, result: IoResult) -> AssessTurn {
-        let report =
-            checked(result.event()?, None)?.map_err(|error| shacl_failure(error, None))?;
+        let report = checked(result.event()?, None)?.map_err(|error| shacl_failure(error, None))?;
         Ok(Next::Done(MetadataProfilePreview {
             status: ProfileValidationStatus {
                 validated_at_ms: Some(self.now_ms),

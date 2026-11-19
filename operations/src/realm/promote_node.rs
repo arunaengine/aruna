@@ -23,8 +23,8 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
 use crate::realm::mutate_placement::{is_management, node_kind};
 use aruna_core::metadata::protocol::{
-    MetadataReadError, MetadataTransportMessage, RealmKeyPem, encode_message, peer_call, peer_reply,
-    transport_message_kind,
+    MetadataReadError, MetadataTransportMessage, RealmKeyPem, encode_message, peer_call,
+    peer_reply, transport_message_kind,
 };
 
 #[derive(Debug, Clone, PartialEq)]

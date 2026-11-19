@@ -1727,7 +1727,13 @@ mod tests {
         use crate::distribution::test_record::{binding, record};
         let fixture = policy_fixture(None).await;
         let (snapshot, bytes) = record(true);
-        aruna_drivers::testing::write_value(&fixture.context.storage_handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+        aruna_drivers::testing::write_value(
+            &fixture.context.storage_handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            snapshot.set_id().to_bytes().to_vec(),
+            bytes,
+        )
+        .await;
         let binding = binding(&snapshot, 1, 5);
         let listing = |cursor| SetListing {
             bucket: "spire".to_string(),
@@ -1755,7 +1761,13 @@ mod tests {
         use crate::distribution::test_record::{binding, record, secret};
         let fixture = policy_fixture(None).await;
         let (snapshot, bytes) = record(true);
-        aruna_drivers::testing::write_value(&fixture.context.storage_handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+        aruna_drivers::testing::write_value(
+            &fixture.context.storage_handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            snapshot.set_id().to_bytes().to_vec(),
+            bytes,
+        )
+        .await;
         let mut bucket = bucket_info(fixture.group_id, fixture.auth.user_id);
         bucket.distribution = Some(binding(&snapshot, 1, 5));
         assert_eq!(coordinates(&fixture.context, &bucket, "a").await, Ok(()));
