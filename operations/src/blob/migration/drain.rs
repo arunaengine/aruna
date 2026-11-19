@@ -49,6 +49,7 @@ use crate::auth::bearer_token::GrantValidOperation;
 use crate::auth::error::{ArunaBearerError, AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::{BucketAccess, BucketAccessOperation};
 use crate::s3::bucket::job_pages::{ProcessLinkedOperation, StillAdminOperation};
+use crate::s3::policy::count::ProcessCountsOperation;
 
 /// Versions one task run handles per bucket before it yields to other timers.
 pub(super) const MIGRATION_PAGE: usize = 64;
@@ -210,6 +211,7 @@ enum RunStep {
     Page,
     Transitions,
     Checks,
+    Counts,
     Linked,
 }
 
@@ -373,6 +375,11 @@ impl Operation for ProcessMigrationsOperation {
                 self.call(RunStep::Checks, IoCall::child(checks))
             }
             RunStep::Checks => {
+                self.take_wait(result)?;
+                let counts = ProcessCountsOperation::new();
+                self.call(RunStep::Counts, IoCall::child(counts))
+            }
+            RunStep::Counts => {
                 self.take_wait(result)?;
                 let linked = ProcessLinkedOperation::new(self.routing.clone());
                 self.call(RunStep::Linked, IoCall::child(linked))
