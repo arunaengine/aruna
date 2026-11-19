@@ -698,11 +698,6 @@ impl<P: Operation> CallRun<P> {
     pub fn on_conflict(&mut self, attempt: u32) -> AfterConflict<P::Output> {
         self.operation.on_conflict(attempt)
     }
-
-    /// Whether a deadline still runs `abort` after a commit; only a commit's own cleanup does.
-    pub fn abort_after_commit(&self) -> bool {
-        false
-    }
 }
 
 impl<P: Operation> CallRun<P> {

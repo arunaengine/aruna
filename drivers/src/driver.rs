@@ -547,7 +547,7 @@ fn extend_unblocked(queue: &mut VecDeque<Effect>, effects: Effects, tracker: &Tr
 }
 
 /// State the effect loop carries between dispatches: the tracker owns every
-/// started transaction, `committed` gates `abort_after_commit`, and `expired`
+/// started transaction, `committed` stops a deadline's abort, and `expired`
 /// plus `cleanup_deadline` bound cleanup. `holds` pin backend reservations.
 struct RunState {
     tracker: TransactionTracker,
@@ -582,36 +582,12 @@ impl RunState {
     }
 }
 
-/// Whether a deadline may still run `abort` after a commit was acknowledged.
-#[derive(Clone, Copy)]
-enum DeadlineAbort {
-    /// Suboperations always stop at an acknowledged commit.
-    BeforeCommitOnly,
-    /// Parents keep the operation's opt-in: only an `abort` that protects
-    /// already committed work may run after one.
-    OperationOptIn,
-}
-
-impl DeadlineAbort {
-    fn allows(self, committed: bool, abort_after_commit: bool) -> bool {
-        match self {
-            Self::BeforeCommitOnly => !committed,
-            Self::OperationOptIn => !committed || abort_after_commit,
-        }
-    }
-}
-
-/// Stops normal effects after the run deadline and queues the operation's cleanup when the
-/// policy allows it.
-fn expire(
-    executable: &mut dyn Drive,
-    queue: &mut VecDeque<Effect>,
-    state: &mut RunState,
-    abort_policy: DeadlineAbort,
-) {
+/// Stops normal effects after the run deadline and queues the operation's cleanup unless a
+/// commit was acknowledged: committed work is the outcome, not something to clean up.
+fn expire(executable: &mut dyn Drive, queue: &mut VecDeque<Effect>, state: &mut RunState) {
     state.mark_expired();
     queue.clear();
-    if abort_policy.allows(state.committed, executable.abort_after_commit()) {
+    if !state.committed {
         extend_unblocked(queue, executable.abort(), &state.tracker);
     }
 }
@@ -633,11 +609,6 @@ trait Drive: Send {
     fn step(&mut self, event: Event) -> Effects;
     fn is_complete(&self) -> bool;
     fn abort(&mut self) -> Effects;
-    /// Read at each deadline decision: an operation may opt in only once it has
-    /// committed work to protect.
-    fn abort_after_commit(&self) -> bool {
-        false
-    }
 }
 
 /// The runner's clock for one event delivery, recording the event when the run is recorded.
@@ -675,10 +646,6 @@ impl<P: Operation> Drive for ParentRun<'_, P> {
 
     fn abort(&mut self) -> Effects {
         self.0.abort()
-    }
-
-    fn abort_after_commit(&self) -> bool {
-        self.0.abort_after_commit()
     }
 }
 
@@ -1077,7 +1044,6 @@ async fn drive_effects(
     context: &DriverContext,
     depth: usize,
     deadline: Option<tokio::time::Instant>,
-    abort_policy: DeadlineAbort,
     expiry_recheck: ExpiryRecheck,
     expiry_log: Option<&str>,
 ) -> RunState {
@@ -1103,7 +1069,7 @@ async fn drive_effects(
             {
                 // Suppress aborts after commit. Dropping `state.holds` releases
                 // backend reservations.
-                expire(executable, &mut queue, &mut state, abort_policy);
+                expire(executable, &mut queue, &mut state);
                 continue;
             }
             if let Effect::Group(group) = effect {
@@ -1120,7 +1086,7 @@ async fn drive_effects(
                                 "Operation deadline expired in an effect group; running its abort path"
                             );
                         }
-                        expire(executable, &mut queue, &mut state, abort_policy);
+                        expire(executable, &mut queue, &mut state);
                     }
                     GroupEnd::CleanupExpired => {
                         queue.clear();
@@ -1179,7 +1145,7 @@ async fn drive_effects(
                                     error: StorageError::CommitFailed,
                                 })
                             } else {
-                                expire(executable, &mut queue, &mut state, abort_policy);
+                                expire(executable, &mut queue, &mut state);
                                 continue;
                             }
                         }
@@ -1242,7 +1208,6 @@ pub(crate) fn drive_suboperation<'a>(
                 context,
                 depth,
                 deadline,
-                DeadlineAbort::BeforeCommitOnly,
                 ExpiryRecheck::EveryEffect,
                 None,
             );
@@ -1367,7 +1332,6 @@ async fn machine_until<P: Operation>(
         context,
         0,
         Some(deadline),
-        DeadlineAbort::OperationOptIn,
         ExpiryRecheck::Once,
         Some(type_name::<CallRun<P>>()),
     );
@@ -1446,7 +1410,6 @@ async fn drive_machine<P: Operation>(
             context,
             0,
             None,
-            DeadlineAbort::BeforeCommitOnly,
             ExpiryRecheck::Once,
             None,
         ),
@@ -1537,13 +1500,13 @@ async fn retry_machine<P: Operation>(
 #[cfg(test)]
 mod test {
     use crate::driver::{
-        DeadlineAbort, DriverContext, GroupEnd, GroupRun, HangLimits, Instant,
-        MAX_TRACKED_TRANSACTIONS, MemberStop, ParentRun, TransactionEffect, TransactionState,
-        TransactionTracker, dispatch_bounded, drive, drive_retry, drive_retry_until, drive_until,
-        extend_unblocked, run_all, run_window,
+        DriverContext, GroupEnd, GroupRun, HangLimits, Instant, MAX_TRACKED_TRANSACTIONS,
+        MemberStop, ParentRun, TransactionEffect, TransactionState, TransactionTracker,
+        dispatch_bounded, drive, drive_retry, drive_retry_until, drive_until, extend_unblocked,
+        run_all, run_window,
     };
     use crate::testing::freeze_clock;
-    use aruna_core::calls::{IoError, IoResult, Next};
+    use aruna_core::calls::{CallRun, IoCall, IoError, IoResult, Next};
     use aruna_core::effects::{
         BlobEffect, Effect, EffectGroup, GroupForm, StagingSourceEffect, StorageEffect,
     };
@@ -2004,17 +1967,6 @@ mod test {
         assert!(tracker.reject_start(Some(TransactionEffect::Start)));
         tracker.observe(Some(TransactionEffect::Start), &started);
         assert_eq!(tracker.states.len(), MAX_TRACKED_TRANSACTIONS);
-    }
-
-    #[test]
-    fn deadline_abort_policy() {
-        // A suboperation stops at an acknowledged commit; a parent continues
-        // only through the operation's opt-in.
-        assert!(DeadlineAbort::BeforeCommitOnly.allows(false, false));
-        assert!(!DeadlineAbort::BeforeCommitOnly.allows(true, true));
-        assert!(DeadlineAbort::OperationOptIn.allows(false, false));
-        assert!(!DeadlineAbort::OperationOptIn.allows(true, false));
-        assert!(DeadlineAbort::OperationOptIn.allows(true, true));
     }
 
     #[test]
