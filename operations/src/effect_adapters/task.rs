@@ -6,9 +6,9 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
+use aruna_storage::task_timers::persist_task_effect;
 
 use crate::driver::DriverContext;
-use crate::tasks::task_persistence::persist_task_effect;
 
 pub(super) async fn dispatch_task(effect: TaskEffect, context: &DriverContext) -> Event {
     // An audit record retry runs from memory when storage cannot persist it.

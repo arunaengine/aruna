@@ -385,7 +385,7 @@ mod tests {
             key: retry_timer(&record),
             after: AUDIT_RETRY,
         };
-        let persist = crate::tasks::task_persistence::persist_task_effect(&storage_handle, &arm);
+        let persist = aruna_storage::task_timers::persist_task_effect(&storage_handle, &arm);
         persist.await.unwrap();
         assert_eq!(
             drive(ResumeAuditOperation::default(), &context).await,
@@ -466,8 +466,7 @@ mod tests {
                 key: key.clone(),
                 after: AUDIT_RETRY,
             };
-            let persist =
-                crate::tasks::task_persistence::persist_task_effect(&storage_handle, &arm);
+            let persist = aruna_storage::task_timers::persist_task_effect(&storage_handle, &arm);
             persist.await.unwrap();
             let (fired, timer_key) = (Arc::clone(&handler), key.clone());
             let run = tokio::spawn(async move { fired.handle_timer(timer_key).await });

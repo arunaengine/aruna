@@ -19,6 +19,7 @@ aruna-core = { workspace = true }
 ulid = { workspace = true }
 byteview = { workspace = true }
 hex = { workspace = true }
+postcard = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
