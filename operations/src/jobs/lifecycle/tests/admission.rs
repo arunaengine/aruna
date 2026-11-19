@@ -454,3 +454,40 @@ fn refuses_reserved_tags() {
     store_workspace(&mut spec, WorkspaceMode::None, None).expect("workspace stored");
     assert!(store_workspace(&mut spec, WorkspaceMode::None, None).is_err());
 }
+
+// A keyed submission whose family is still being deleted here gets a retryable error and writes
+// nothing; it is admitted as a new incarnation once the deletion finished.
+#[tokio::test]
+async fn waits_for_pruning() {
+    use aruna_core::keyspaces::FAMILY_TOMBSTONE_KEYSPACE;
+    use aruna_core::structs::execution::job::FamilyTombstone;
+    use aruna_core::structs::execution::job::record_keys::family_prefix;
+    let family = Family::new([5u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let store = |finished| {
+        let tombstone = FamilyTombstone {
+            pruned_at_ms: 600,
+            last_record_ms: 500,
+            finished,
+            created_by: None,
+        };
+        StorageEffect::Write {
+            key_space: FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+            key: family_prefix(&family.family()),
+            value: postcard::to_allocvec(&tombstone).unwrap().into(),
+            txn_id: None,
+        }
+    };
+    ctx.storage_handle.send_storage_effect(store(false)).await;
+
+    let refused = admit(&ctx, &family, family.job_id).await;
+    assert_eq!(refused, Err(LifecycleError::Pruning));
+    let alias = drive(AliasFamilyOperation::new(family.job_id), &ctx).await;
+    assert_eq!(alias, Ok(None));
+    ctx.storage_handle.send_storage_effect(store(true)).await;
+    let admitted = admit(&ctx, &family, family.job_id).await;
+    assert!(
+        admitted.expect("new incarnation").1,
+        "the keyed family starts again"
+    );
+}

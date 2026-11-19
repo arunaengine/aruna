@@ -72,12 +72,19 @@ async fn seed_config(
         .await;
 }
 
+/// The fixture spec created now: a holder refuses a spec older than the horizon.
+fn fresh_spec(family: &Family) -> aruna_core::structs::execution::job::LogicalJobSpec {
+    let mut spec = family.spec();
+    spec.created_at_ms = aruna_core::time::unix_timestamp_millis();
+    spec.store_digest().expect("spec digest stored")
+}
+
 #[tokio::test]
 async fn separates_peer_authority() {
     // An authenticated relay is not an author, and an authorized author does
     // not make an unknown relay a peer: both checks must hold on their own.
     let (_dir, context, net, family) = fixture().await;
-    let spec = family.spec();
+    let spec = fresh_spec(&family);
     let record = JobRecordFrame::new(family.sign(
         &family.holder,
         JobFamilyRecord::Spec(Box::new(spec.clone())),
@@ -89,6 +96,7 @@ async fn separates_peer_authority() {
         secret(9).public(),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
+            attached: Vec::new(),
             record: Box::new(record.clone()),
         },
     )
@@ -109,6 +117,7 @@ async fn separates_peer_authority() {
         crate::tests::records::node(2),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
+            attached: Vec::new(),
             record: Box::new(forged),
         },
     )
@@ -125,6 +134,7 @@ async fn separates_peer_authority() {
         crate::tests::records::node(2),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
+            attached: Vec::new(),
             record: Box::new(record),
         },
     )
@@ -178,13 +188,14 @@ async fn holds_bound_pages() {
         },
     );
     let (manifest, pages) = paginate(&[pair], PageEntries::Spec).expect("pages");
-    let mut spec = family.spec();
+    let mut spec = fresh_spec(&family);
     spec.input_pages = Some(manifest);
     let spec = spec.store_digest().expect("spec digest stored");
     let record = JobFamilyRecord::Spec(Box::new(spec.clone()));
     let record = JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded");
     let publish = || MetadataTransportMessage::ForwardJobRecord {
         placement: family.placement,
+        attached: Vec::new(),
         record: Box::new(record.clone()),
     };
     let missing = serve_job_record(&context, crate::tests::records::node(2), publish()).await;

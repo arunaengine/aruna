@@ -797,6 +797,12 @@ pub enum JobRecordRejection {
     Unauthorized,
     /// The record failed contract validation, such as budget or chain rules.
     Invalid,
+    /// The responder holds no accepted spec of the family; offer the record again with its spec.
+    SpecNeeded,
+    /// The record's spec is older than the horizon, so the family can never start here.
+    StaleFamily,
+    /// The record's spec belongs to a family the responder pruned.
+    FamilyPruned,
 }
 
 /// The placement detail one decline may carry. Decoding rejects an oversized

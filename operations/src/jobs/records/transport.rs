@@ -47,7 +47,8 @@ struct PageRequest {
 /// What a peer asks of this holder.
 #[derive(Debug, PartialEq)]
 enum RecordRequest {
-    Publish(Box<JobRecordFrame>),
+    /// A record with the records sent along with it.
+    Publish(Box<JobRecordFrame>, Vec<JobRecordFrame>),
     Page(PageRequest),
 }
 
@@ -155,7 +156,11 @@ fn admission_refusal(admission: &Admission) -> Option<ServeError> {
         | Admission::Pending(
             PendingNeed::Evidence(_) | PendingNeed::LocalView | PendingNeed::HolderView,
         )
-        | Admission::PendingFull => Some(ServeError::Unavailable),
+        | Admission::PendingFull
+        | Admission::Pruning => Some(ServeError::Unavailable),
+        Admission::SpecNeeded => Some(ServeError::Refused(JobRecordRejection::SpecNeeded)),
+        Admission::Stale => Some(ServeError::Refused(JobRecordRejection::StaleFamily)),
+        Admission::Pruned => Some(ServeError::Refused(JobRecordRejection::FamilyPruned)),
         Admission::Conflict => Some(ServeError::Refused(JobRecordRejection::Conflict)),
         Admission::Rejected(
             JobRecordError::BadSignature
@@ -175,9 +180,15 @@ impl ServeRecordOperation {
         now_ms: u64,
     ) -> Self {
         let (placement, request, rejected) = match message {
-            MetadataTransportMessage::ForwardJobRecord { placement, record } => {
-                (placement, Some(RecordRequest::Publish(record)), None)
-            }
+            MetadataTransportMessage::ForwardJobRecord {
+                placement,
+                record,
+                attached,
+            } => (
+                placement,
+                Some(RecordRequest::Publish(record, attached)),
+                None,
+            ),
             MetadataTransportMessage::ForwardRecordPage {
                 placement,
                 submission_id,
@@ -253,12 +264,12 @@ impl ServeRecordOperation {
             return Err(IoError::Unfinished);
         };
         match request {
-            RecordRequest::Publish(record) => {
+            RecordRequest::Publish(record, attached) => {
                 let family = record.envelope().family();
                 if let Err(error) = self.authorized(&config, family.submission_id) {
                     return self.fail(error);
                 }
-                self.append(*record)
+                self.append(*record, attached)
             }
             RecordRequest::Page(request) => {
                 if let Err(error) = self.authorized(&config, request.submission_id) {
@@ -282,7 +293,7 @@ impl ServeRecordOperation {
         }
     }
 
-    fn append(&mut self, record: JobRecordFrame) -> ServeNext {
+    fn append(&mut self, record: JobRecordFrame, attached: Vec<JobRecordFrame>) -> ServeNext {
         let Some((local, realm_id)) = self.serving else {
             return self.fail(ServeError::Unavailable);
         };
@@ -302,6 +313,8 @@ impl ServeRecordOperation {
             origin: RecordOrigin::Peer(self.peer),
             now_ms: self.now_ms,
         });
+        let attached = attached.into_iter().map(JobRecordFrame::into_inner);
+        let append = append.attach(attached.collect());
         Ok(Next::Call(IoCall::child(append)))
     }
 
@@ -536,6 +549,7 @@ mod pure_tests {
         let envelope = family.sign(&family.holder, JobFamilyRecord::Spec(Box::new(spec)));
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
+            attached: Vec::new(),
             record: Box::new(JobRecordFrame::new(envelope).expect("bounded record")),
         }
     }
@@ -601,6 +615,19 @@ mod pure_tests {
             admission_refusal(&Admission::Conflict),
             Some(ServeError::Refused(JobRecordRejection::Conflict))
         );
+        // A family being pruned is asked again; a missing, stale or pruned spec is refused.
+        assert_eq!(
+            admission_refusal(&Admission::Pruning),
+            Some(ServeError::Unavailable)
+        );
+        for (admission, reason) in [
+            (Admission::SpecNeeded, JobRecordRejection::SpecNeeded),
+            (Admission::Stale, JobRecordRejection::StaleFamily),
+            (Admission::Pruned, JobRecordRejection::FamilyPruned),
+        ] {
+            let refused = Some(ServeError::Refused(reason));
+            assert_eq!(admission_refusal(&admission), refused);
+        }
     }
 
     // A stored record with a cancel on file stops the local runs before it is acknowledged.

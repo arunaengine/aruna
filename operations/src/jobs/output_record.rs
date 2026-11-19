@@ -255,7 +255,7 @@ impl StoreOutputsOperation {
                     "Output record deferred: the local job family view is unavailable"
                 );
             }
-            Admission::Pending(_) | Admission::PendingFull => {
+            Admission::Pending(_) | Admission::PendingFull | Admission::Pruning => {
                 return Err(JobError::retryable(
                     "output record admission is awaiting family evidence",
                 ));

@@ -137,6 +137,7 @@ impl PublishRecordOperation {
         let message = MetadataTransportMessage::ForwardJobRecord {
             placement: self.config.placement,
             record: self.config.record.clone(),
+            attached: Vec::new(),
         };
         let frame = match encode_message(&message) {
             Ok(frame) => frame,

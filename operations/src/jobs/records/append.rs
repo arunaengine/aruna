@@ -13,18 +13,19 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
     FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+    FAMILY_TOMBSTONE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
-    RETENTION_MS, TOMBSTONE_RETENTION_MS,
+    FamilyTombstone, JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind,
+    LocalExecution, RETENTION_MS, TOMBSTONE_RETENTION_MS,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::types::{Key, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use tracing::debug;
 
 use super::admit::{
-    Admission, AppendPlan, FamilyState, MAX_PENDING_RECORDS, admitted_aliases, plan_append,
+    Admission, AppendPlan, FamilyState, MAX_PENDING_RECORDS, admitted_aliases, plan_bundle,
     relayable,
 };
 use super::verify::{EvidencePlan, FamilyView};
@@ -90,6 +91,9 @@ pub struct AppendRecordOperation {
     asked: Vec<Key>,
     outcome: Option<AppendOutcome>,
     state: AppendState,
+    /// Records that travel with the candidate, such as the spec it binds.
+    attached: Vec<JobRecordEnvelope>,
+    tombstone: Option<FamilyTombstone>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +123,34 @@ impl AppendRecordOperation {
             asked: Vec::new(),
             outcome: None,
             state: AppendState::ReadConfig,
+            attached: Vec::new(),
+            tombstone: None,
         }
+    }
+
+    /// Adds the records a peer sent along with the candidate; an attached spec is admitted first.
+    pub fn attach(mut self, attached: Vec<JobRecordEnvelope>) -> Self {
+        self.attached = attached;
+        self
+    }
+
+    /// The attached spec of the candidate's own family; a spec of another family is ignored.
+    fn attached_spec(&self) -> Option<&JobRecordEnvelope> {
+        let family = self.family();
+        (self.attached.iter()).find(|envelope| {
+            matches!(envelope.record, JobFamilyRecord::Spec(_)) && envelope.family() == family
+        })
+    }
+
+    /// The group of the spec this append may start the family with.
+    fn spec_group(&self) -> Option<GroupId> {
+        [Some(self.envelope()), self.attached_spec()]
+            .into_iter()
+            .flatten()
+            .find_map(|envelope| match &envelope.record {
+                JobFamilyRecord::Spec(spec) => Some(spec.group_id),
+                _ => None,
+            })
     }
 
     fn envelope(&self) -> &JobRecordEnvelope {
@@ -166,15 +197,20 @@ impl AppendRecordOperation {
                 FAMILY_PROJECTION_KEYSPACE.to_string(),
                 family_prefix(&self.family()),
             ),
+            // Read in this transaction, so the append after the last page sees the finished mark.
+            (
+                FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+                family_prefix(&self.family()),
+            ),
         ];
-        if let JobFamilyRecord::Spec(spec) = &self.envelope().record {
-            reads.push(crate::groups::fence::group_fence_key(spec.group_id));
+        if let Some(group_id) = self.spec_group() {
+            reads.push(crate::groups::fence::group_fence_key(group_id));
         }
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    /// Keeps the candidate's own row and the projection cache, and checks that a spec's
-    /// group still accepts writes.
+    /// Keeps the candidate's own row, the projection cache and the family tombstone, and checks
+    /// that a spec's group still accepts writes.
     fn keep_row(&mut self, values: Vec<Option<Value>>) -> Result<(), RecordStoreError> {
         let mut values = values.into_iter();
         let row = values
@@ -184,7 +220,10 @@ impl AppendRecordOperation {
         if let Some(Some(value)) = values.next() {
             self.cache = ProjectionCache::decode(&value);
         }
-        if matches!(self.envelope().record, JobFamilyRecord::Spec(_)) {
+        if let Some(Some(value)) = values.next() {
+            self.tombstone = Some(from_bytes::<FamilyTombstone>(&value)?);
+        }
+        if self.spec_group().is_some() {
             let Some(value) = values.next() else {
                 return Err(RecordStoreError::EvidenceIncomplete);
             };
@@ -241,6 +280,8 @@ impl AppendRecordOperation {
     fn read_evidence(&mut self) -> Step {
         let mut plan = EvidencePlan::default();
         plan.extend(&self.envelope().record);
+        // Whether this node holds an accepted spec decides the admission rules.
+        plan.kinds.insert(JobRecordKind::Spec);
         for (_, row) in &self.retained {
             plan.extend(&row.envelope.record);
         }
@@ -327,9 +368,11 @@ impl AppendRecordOperation {
             stored: &self.stored,
             local: self.config.local.as_ref(),
             now_ms: self.config.now_ms,
+            tombstone: self.tombstone.as_ref(),
         };
-        let (admission, plan) =
-            plan_append(&state, &self.retained, self.envelope().clone(), relayed);
+        let candidate = self.envelope().clone();
+        let spec = self.attached_spec();
+        let (admission, plan) = plan_bundle(&state, &self.retained, candidate, spec, relayed);
         let writes = self.batch_writes(&plan)?;
         self.plan = Some(plan);
         let outcome = self.settle(admission);

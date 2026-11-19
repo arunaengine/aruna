@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
 use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordError, JobRecordKey, LocalExecution,
-    RecordVerdict,
+    FamilyTombstone, Freshness, JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordError,
+    JobRecordKey, LocalExecution, RecordVerdict, spec_freshness,
 };
 use tracing::warn;
 
@@ -39,6 +39,14 @@ pub enum Admission {
     Conflict,
     /// Forged or invalid: dropped without a row.
     Rejected(JobRecordError),
+    /// The family is being pruned here; the record is refused for now and offered again later.
+    Pruning,
+    /// This node holds no accepted spec of the family; the record must come with its spec.
+    SpecNeeded,
+    /// The spec that would start the family here is older than the horizon. Refused for good.
+    Stale,
+    /// The spec belongs to an incarnation this node pruned. Refused for good.
+    Pruned,
 }
 
 /// Everything one admission is decided against.
@@ -54,6 +62,8 @@ pub struct FamilyState<'a> {
     /// This node's own fenced execution, if it is the one publishing.
     pub local: Option<&'a LocalExecution>,
     pub now_ms: u64,
+    /// This node's tombstone of the family, if it pruned it.
+    pub tombstone: Option<&'a FamilyTombstone>,
 }
 
 /// One record that becomes visible in this admission.
@@ -90,8 +100,17 @@ pub fn plan_append(
     let mut plan = AppendPlan::default();
     let mut visible: BTreeMap<JobRecordKey, [u8; 32]> = BTreeMap::new();
 
+    if let Some(refused) = gate(state, &candidate, relayed_by.is_some()) {
+        return (refused, plan);
+    }
     let key = candidate.key();
-    let outcome = admit_one(state, &evidence, &candidate);
+    let outcome = match admit_one(state, &evidence, &candidate) {
+        Admission::Authentic => fresh(state, &candidate).unwrap_or(Admission::Authentic),
+        outcome => outcome,
+    };
+    if matches!(outcome, Admission::Stale | Admission::Pruned) {
+        return (outcome, plan);
+    }
     let retained_row = match &outcome {
         Admission::Pending(_) => retained
             .iter()
@@ -157,12 +176,91 @@ pub fn plan_append(
         Admission::Rejected(error) => {
             warn!(kind = ?key.kind, error = %error, "Refusing an unauthentic job record");
         }
-        Admission::Duplicate | Admission::PendingFull => {}
+        // The gate answered these before the candidate was judged.
+        Admission::Duplicate
+        | Admission::PendingFull
+        | Admission::Pruning
+        | Admission::SpecNeeded
+        | Admission::Stale
+        | Admission::Pruned => {}
     }
 
     if !visible.is_empty() {
         cascade(state, retained, &mut evidence, &mut visible, &mut plan);
     }
+    (outcome, plan)
+}
+
+/// The rules that keep a pruned family from coming back, checked before any record is judged.
+/// A peer's record of a family without a held spec waits for its spec instead of pending here.
+fn gate(
+    state: &FamilyState<'_>,
+    candidate: &JobRecordEnvelope,
+    relayed: bool,
+) -> Option<Admission> {
+    if state.tombstone.is_some_and(|tombstone| !tombstone.finished) {
+        return Some(Admission::Pruning);
+    }
+    let spec = matches!(candidate.record, JobFamilyRecord::Spec(_));
+    (relayed && !spec && !holds_spec(state)).then_some(Admission::SpecNeeded)
+}
+
+/// An authentic spec that would start the family here must be newer than the horizon and than
+/// the last record of a pruned incarnation.
+fn fresh(state: &FamilyState<'_>, candidate: &JobRecordEnvelope) -> Option<Admission> {
+    let JobFamilyRecord::Spec(spec) = &candidate.record else {
+        return None;
+    };
+    if holds_spec(state) {
+        return None;
+    }
+    let pruned = state.tombstone.map(|tombstone| tombstone.last_record_ms);
+    match spec_freshness(spec.created_at_ms, state.now_ms, pruned) {
+        Freshness::Fresh => None,
+        Freshness::Stale => Some(Admission::Stale),
+        Freshness::Pruned => Some(Admission::Pruned),
+    }
+}
+
+fn holds_spec(state: &FamilyState<'_>) -> bool {
+    (state.stored.values()).any(|stored| matches!(stored.record, JobFamilyRecord::Spec(_)))
+}
+
+/// Admits `spec`, then `candidate` with it, as one plan: the record a peer offered again together
+/// with the spec it binds. A stale or pruned spec refuses both for good.
+pub fn plan_bundle(
+    state: &FamilyState<'_>,
+    retained: &[(JobRecordKey, PendingRecord)],
+    candidate: JobRecordEnvelope,
+    spec: Option<&JobRecordEnvelope>,
+    relayed_by: Option<NodeId>,
+) -> (Admission, AppendPlan) {
+    let Some(spec) = spec.filter(|_| !holds_spec(state)) else {
+        return plan_append(state, retained, candidate, relayed_by);
+    };
+    let (outcome, mut plan) = plan_append(state, retained, spec.clone(), relayed_by);
+    match outcome {
+        Admission::Authentic => {}
+        Admission::Stale | Admission::Pruned => return (outcome, AppendPlan::default()),
+        outcome => return (outcome, plan),
+    }
+    let mut stored = state.stored.clone();
+    for admitted in &plan.admitted {
+        stored.insert(admitted.envelope.key(), admitted.envelope.clone());
+    }
+    let next = FamilyState {
+        stored: &stored,
+        ..*state
+    };
+    let left: Vec<_> = (retained.iter())
+        .filter(|(key, _)| !plan.cleared.contains(key))
+        .cloned()
+        .collect();
+    let (outcome, more) = plan_append(&next, &left, candidate, relayed_by);
+    plan.admitted.extend(more.admitted);
+    plan.pending.extend(more.pending);
+    plan.cleared.extend(more.cleared);
+    plan.conflicts.extend(more.conflicts);
     (outcome, plan)
 }
 
@@ -197,7 +295,13 @@ fn cascade(
                     plan.cleared.push(*key);
                     settled.push(*key);
                 }
-                Admission::Duplicate | Admission::Rejected(_) | Admission::PendingFull => {
+                Admission::Duplicate
+                | Admission::Rejected(_)
+                | Admission::PendingFull
+                | Admission::Pruning
+                | Admission::SpecNeeded
+                | Admission::Stale
+                | Admission::Pruned => {
                     plan.cleared.push(*key);
                     settled.push(*key);
                 }

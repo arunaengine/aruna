@@ -104,6 +104,7 @@ async fn admit_cancel(ctx: &Arc<DriverContext>, family: &Family) {
         family.holder.public(),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
+            attached: Vec::new(),
             record: Box::new(record),
         },
     )
@@ -131,6 +132,7 @@ async fn admitted_cancel_stops() {
         family.holder.public(),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
+            attached: Vec::new(),
             record: Box::new(
                 JobRecordFrame::new(family.sign(
                     &family.holder,
@@ -170,6 +172,7 @@ async fn promoted_cancel_stops() {
             family.holder.public(),
             MetadataTransportMessage::ForwardJobRecord {
                 placement: family.placement,
+                attached: Vec::new(),
                 record: Box::new(JobRecordFrame::new(family.sign(&family.holder, record)).unwrap()),
             },
         )

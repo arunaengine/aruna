@@ -190,6 +190,7 @@ pub(crate) fn classify(error: &LifecycleError) -> CommitVerdict {
         | LifecycleError::AdmissionClosed
         // The next offer's task check refuses an ended task for good.
         | LifecycleError::TaskEnded
+        | LifecycleError::Pruning
         | LifecycleError::NotFinished
         | LifecycleError::UnexpectedEvent { .. } => CommitVerdict::Faulted,
     }

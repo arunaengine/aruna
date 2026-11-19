@@ -90,6 +90,9 @@ pub enum LifecycleError {
     /// A plugin task's work row on the receiver is no longer dispatched.
     #[error("the plugin task's work has ended")]
     TaskEnded,
+    /// The keyed family is still being deleted on this node; the submission is retried later.
+    #[error("the job family is still being pruned; retry later")]
+    Pruning,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: expected {expected}, got {got}")]

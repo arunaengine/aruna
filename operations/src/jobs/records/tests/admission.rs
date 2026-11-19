@@ -5,11 +5,14 @@
 use std::collections::BTreeMap;
 
 use aruna_core::structs::execution::job::{
-    ExecutionStop, JobFamilyRecord, JobRecordBody, JobRecordEnvelope, JobRecordError, JobRecordKey,
-    JobRecordKind, LocalExecution, PhysicalExecutionState, StopEvidence,
+    CLOCK_MARGIN_MS, ExecutionStop, FamilyTombstone, JobFamilyRecord, JobRecordBody,
+    JobRecordEnvelope, JobRecordError, JobRecordKey, JobRecordKind, LocalExecution,
+    PhysicalExecutionState, StopEvidence, TOMBSTONE_RETENTION_MS,
 };
 
-use crate::jobs::records::admit::{Admission, FamilyState, plan_append, relayable};
+use crate::jobs::records::admit::{
+    Admission, AppendPlan, FamilyState, plan_append, plan_bundle, relayable,
+};
 use crate::jobs::records::verify::FamilyView;
 use crate::tests::records::{Family, node, secret};
 use aruna_core::structs::execution::job::record_rows::{PendingNeed, PendingRecord};
@@ -29,6 +32,7 @@ fn state<'a>(view: Option<&'a FamilyView>, records: &'a Stored) -> FamilyState<'
         stored: records,
         local: None,
         now_ms: 2_000,
+        tombstone: None,
     }
 }
 
@@ -241,6 +245,7 @@ fn keeps_local_record() {
         stored: &empty,
         local: Some(&local),
         now_ms: 2_000,
+        tombstone: None,
     };
 
     let (admission, plan) = plan_append(&state, &[], candidate, None);
@@ -331,4 +336,114 @@ fn stop_waits_terminal() {
         admission,
         Admission::Rejected(JobRecordError::WrongPublisher(JobRecordKind::Stop))
     );
+}
+
+fn tombstone(last_record_ms: u64, finished: bool) -> FamilyTombstone {
+    FamilyTombstone {
+        pruned_at_ms: last_record_ms + 1,
+        last_record_ms,
+        finished,
+        created_by: None,
+    }
+}
+
+// A replayed spec of a pruned family is refused for good, and a peer's other record of it waits
+// for its spec instead of becoming a pending row.
+#[test]
+fn refuses_pruned_family() {
+    let family = Family::new([42u8; 32]);
+    let view = family.view();
+    let spec = family.spec();
+    let pruned = tombstone(1_100, true);
+    let empty = Stored::new();
+    let state = FamilyState {
+        tombstone: Some(&pruned),
+        ..state(Some(&view), &empty)
+    };
+    let replay = JobFamilyRecord::Spec(Box::new(spec.clone()));
+    let replay = family.sign(&family.holder, replay);
+    let claim = family.sign(&family.holder, JobFamilyRecord::Claim(family.claim(&spec)));
+
+    let (admission, plan) = plan_append(&state, &[], replay.clone(), Some(node(2)));
+    assert_eq!(
+        (admission, plan),
+        (Admission::Pruned, AppendPlan::default())
+    );
+    let (admission, plan) = plan_append(&state, &[], claim.clone(), Some(node(2)));
+    assert_eq!(admission, Admission::SpecNeeded);
+    assert!(
+        plan.pending.is_empty(),
+        "a missing spec makes no pending row"
+    );
+    let (admission, plan) = plan_bundle(&state, &[], claim, Some(&replay), Some(node(2)));
+    assert_eq!(
+        (admission, plan),
+        (Admission::Pruned, AppendPlan::default())
+    );
+}
+
+// A fresh spec offered with the record that binds it admits both in one plan; a spec older than
+// the horizon refuses both for good.
+#[test]
+fn bundles_fresh_spec() {
+    let family = Family::new([43u8; 32]);
+    let view = family.view();
+    let spec = family.spec();
+    let empty = Stored::new();
+    let signed = JobFamilyRecord::Spec(Box::new(spec.clone()));
+    let signed = family.sign(&family.holder, signed);
+    let budget = family.budget(&spec, family.holder.public());
+    let budget = family.sign(&family.holder, JobFamilyRecord::Budget(budget));
+
+    let fresh = state(Some(&view), &empty);
+    let (admission, plan) = plan_bundle(&fresh, &[], budget.clone(), Some(&signed), Some(node(2)));
+    assert_eq!(admission, Admission::Authentic);
+    assert_eq!(plan.admitted.len(), 2);
+    let late = FamilyState {
+        now_ms: spec.created_at_ms + TOMBSTONE_RETENTION_MS,
+        ..fresh
+    };
+    let (admission, plan) = plan_bundle(&late, &[], budget, Some(&signed), Some(node(2)));
+    assert_eq!((admission, plan), (Admission::Stale, AppendPlan::default()));
+}
+
+// While a family is being deleted every record of it, a fresh spec too, is refused for now.
+#[test]
+fn unfinished_refuses_now() {
+    let family = Family::new([44u8; 32]);
+    let view = family.view();
+    let deleting = tombstone(500, false);
+    let empty = Stored::new();
+    let state = FamilyState {
+        tombstone: Some(&deleting),
+        ..state(Some(&view), &empty)
+    };
+    let spec = JobFamilyRecord::Spec(Box::new(family.spec()));
+    let spec = family.sign(&family.holder, spec);
+
+    let local = plan_append(&state, &[], spec.clone(), None).0;
+    assert_eq!(local, Admission::Pruning);
+    let relayed = plan_append(&state, &[], spec, Some(node(2))).0;
+    assert_eq!(relayed, Admission::Pruning);
+}
+
+// After the deletion finished, a spec newer than the pruned records plus the clock margin starts
+// a new incarnation of the same family.
+#[test]
+fn starts_new_incarnation() {
+    let family = Family::new([45u8; 32]);
+    let view = family.view();
+    let pruned = tombstone(1_000, true);
+    let empty = Stored::new();
+    let state = FamilyState {
+        tombstone: Some(&pruned),
+        ..state(Some(&view), &empty)
+    };
+    let mut spec = family.spec();
+    spec.created_at_ms = 1_000 + CLOCK_MARGIN_MS + 1;
+    let spec = spec.store_digest().expect("spec digest stored");
+    let spec = family.sign(&family.holder, JobFamilyRecord::Spec(Box::new(spec)));
+
+    let admission = plan_append(&state, &[], spec, Some(node(2))).0;
+    assert_eq!(admission, Admission::Authentic);
 }

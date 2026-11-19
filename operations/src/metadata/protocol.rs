@@ -302,6 +302,8 @@ pub enum MetadataTransportMessage {
     ForwardJobRecord {
         placement: PlacementRef,
         record: Box<JobRecordFrame>,
+        /// Records sent along, such as the spec the record binds.
+        attached: Vec<JobRecordFrame>,
     },
     /// `Ok` means the holder durably accepted or already had the record.
     ForwardedJobRecord {

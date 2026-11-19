@@ -12,15 +12,15 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ADMISSION_QUOTA_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
-    FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
-    SUBMISSION_CLOSURE_KEYSPACE,
+    FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, FAMILY_TOMBSTONE_KEYSPACE,
+    JOB_INDEX_KEYSPACE, JOB_KEYSPACE, SUBMISSION_CLOSURE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
 use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, LogicalJobSpec,
-    RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode, job_record_key, owner_index_key,
-    plugin_tag,
+    FamilyTombstone, JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope,
+    LogicalJobSpec, RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode, job_record_key,
+    owner_index_key, plugin_tag,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Key, Value};
@@ -210,7 +210,7 @@ impl AdmitSubmissionOperation {
     }
 
     /// Checks the group still accepts writes and that the quota revision is the one the
-    /// caller's check observed, then reads the projection cache.
+    /// caller's check observed, then reads the projection cache and the family tombstone.
     fn read_cache(&mut self, result: IoResult) -> Step {
         let [quota, fence] = values::<2>(result)?;
         aruna_core::structs::identity::group_delete::check_group_write(fence.as_deref())?;
@@ -226,10 +226,11 @@ impl AdmitSubmissionOperation {
             return Err(StorageError::TransactionConflict.into());
         }
         self.state = AdmitState::ReadCache;
-        Ok(Next::Call(IoCall::Read(vec![(
-            FAMILY_PROJECTION_KEYSPACE.to_string(),
-            family_prefix(&self.family()),
-        )])))
+        let family = family_prefix(&self.family());
+        Ok(Next::Call(IoCall::Read(vec![
+            (FAMILY_PROJECTION_KEYSPACE.to_string(), family.clone()),
+            (FAMILY_TOMBSTONE_KEYSPACE.to_string(), family),
+        ])))
     }
 
     fn batch_writes(&self) -> Result<Vec<(String, Key, Value)>, LifecycleError> {
@@ -389,12 +390,17 @@ impl Operation for AdmitSubmissionOperation {
             (AdmitState::ReadClosure, result) => self.closed(result),
             (AdmitState::ReadQuota, result) => self.read_cache(result),
             (AdmitState::ReadCache, result) => {
-                let [value] = values::<1>(result)?;
+                let [value, tombstone] = values::<2>(result)?;
                 self.cache = value
                     .as_ref()
                     .and_then(|value| ProjectionCache::decode(value));
                 if value.is_some() && self.cache.is_none() {
                     warn!("Job projection cache is unreadable");
+                }
+                // A keyed submission to a family that is still being deleted waits for it.
+                let tombstone = tombstone.and_then(|row| from_bytes::<FamilyTombstone>(&row).ok());
+                if tombstone.is_some_and(|tombstone| !tombstone.finished) {
+                    return Err(LifecycleError::Pruning);
                 }
                 // Verifies the two records this node signed against its own local view,
                 // then commits them, the alias row, and their replication entries together.
