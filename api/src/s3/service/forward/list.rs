@@ -13,7 +13,7 @@ use aruna_operations::s3::object::member_merge::{
     MergeCaller, MergeError, MergeShows, MergedObject, MergedObjectsOperation,
 };
 use aruna_operations::s3::object::visible::VisibleError;
-use percent_encoding::{percent_decode_str, utf8_percent_encode};
+use percent_encoding::utf8_percent_encode;
 use s3s::dto::{CommonPrefix, ETag, Object, Owner, Timestamp, TimestampFormat};
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
@@ -133,13 +133,6 @@ impl ArunaS3Service {
         match url_encoded {
             true => utf8_percent_encode(&value, URL_ENCODE_SET).to_string(),
             false => value,
-        }
-    }
-
-    pub(in crate::s3::service) fn raw(value: &str, url_encoded: bool) -> String {
-        match url_encoded {
-            true => percent_decode_str(value).decode_utf8_lossy().into_owned(),
-            false => value.to_string(),
         }
     }
 

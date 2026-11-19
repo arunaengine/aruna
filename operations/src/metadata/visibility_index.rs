@@ -1092,17 +1092,6 @@ mod tests {
         drive(VisibilityPassOperation::bounded(bounds), context).await
     }
 
-    async fn drive_index(
-        context: &DriverContext,
-        bounds: PassBounds,
-    ) -> Result<u64, VisibilityError> {
-        let rebuild = RebuildIndexOperation {
-            bounds,
-            ..RebuildIndexOperation::default()
-        };
-        drive(rebuild, context).await
-    }
-
     fn actor() -> Actor {
         Actor {
             node_id: NodeId::from_bytes(&[1u8; 32]).expect("node id"),
