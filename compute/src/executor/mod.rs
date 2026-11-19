@@ -108,6 +108,11 @@ pub trait ExecutorBackend: Send + Sync {
         BackendCaps::default()
     }
 
+    /// Where this backend's attempts live; `None` for a backend that cannot name it.
+    fn destination(&self) -> Option<aruna_core::compute::backend::RuntimeDestination> {
+        None
+    }
+
     /// The identity tasks actually run as, which the task manifest reports.
     /// Backends that perform a real user switch pin it; backends that perform
     /// none MUST report the service's own identity rather than a wish.
