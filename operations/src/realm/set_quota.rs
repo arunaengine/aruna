@@ -420,6 +420,7 @@ mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
     use crate::driver::{DriverContext, drive};
+    use crate::testing::path_context;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
@@ -431,19 +432,6 @@ mod tests {
     };
     use tempfile::tempdir;
     use ulid::Ulid;
-
-    fn test_ctx(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
-    }
 
     fn actor(seed: u8, realm_id: RealmId) -> Actor {
         Actor {
@@ -542,7 +530,7 @@ mod tests {
     #[tokio::test]
     async fn quota_round_trips() {
         let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(1, realm_id);
         let document = management_config(realm_id, &actor);
@@ -576,7 +564,7 @@ mod tests {
     async fn rejects_zero_limits() {
         // Zero would silence every enrolled device; unset is the uncapped value.
         let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(1, realm_id);
         let document = management_config(realm_id, &actor);
@@ -609,7 +597,7 @@ mod tests {
     async fn rejects_zero_cap() {
         // A zero `devices_per_user` would enroll nobody; unset means no cap.
         let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(1, realm_id);
         let document = management_config(realm_id, &actor);
@@ -635,7 +623,7 @@ mod tests {
     #[tokio::test]
     async fn missing_config_fails() {
         let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([2; 32]);
         let actor = actor(2, realm_id);
         seed_realm_admin(&ctx, &actor).await;
@@ -653,7 +641,7 @@ mod tests {
     async fn refuses_server_node() {
         // A realm admin token still may not write the config on a server node.
         let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([5; 32]);
         let actor = actor(5, realm_id);
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);

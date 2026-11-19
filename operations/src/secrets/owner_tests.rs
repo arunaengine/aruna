@@ -6,6 +6,7 @@ use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use crate::secrets::tests::{create, name, token};
+use crate::testing::path_context;
 use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
 use aruna_core::realm_vault::RealmSealKey;
 use aruna_core::secrets::SecretFields;
@@ -13,19 +14,6 @@ use aruna_core::structs::identity::admin_audit::{AuditIndex, audit_prefix};
 use aruna_core::structs::identity::auth::Actor;
 use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
-
-fn context(root: &str) -> DriverContext {
-    DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    }
-}
 
 fn realm_key() -> SigningKey {
     SigningKey::from_bytes(&[5u8; 32])
@@ -42,7 +30,7 @@ fn actor() -> Actor {
 
 /// A realm whose config made the actor's node a management node.
 async fn seeded(root: &str) -> DriverContext {
-    let ctx = context(root);
+    let ctx = path_context(root);
     let config = CreateRealmConfig {
         actor: actor(),
         realm_description: "Realm".to_string(),

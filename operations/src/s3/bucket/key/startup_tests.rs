@@ -3,32 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::s3::bucket::key::test_rows::{rows, settings};
 use aruna_core::calls::ChildOutcome;
 use aruna_core::compute::SecretBytes;
 use aruna_core::structs::storage::encryption::{KeyTicket, public_key_of};
 use std::time::SystemTime;
 
 const MANAGED: Ulid = Ulid::from_bytes([1; 16]);
-
-fn rows(values: Vec<Vec<u8>>) -> IoResult {
-    IoResult::Page {
-        rows: values
-            .into_iter()
-            .map(|value| (Key::from(Vec::new()), value.into()))
-            .collect(),
-        next: None,
-    }
-}
-
-fn settings(mode: EncryptionMode, bucket_id: Ulid) -> Vec<u8> {
-    let settings = BucketEncryption {
-        mode,
-        bucket_id: Some(bucket_id),
-        key_generation: 2,
-        ..Default::default()
-    };
-    settings.to_bytes().unwrap()
-}
 
 fn record(generation: u64, state: KeyState) -> BucketKeyRecord {
     let public = public_key_of(&SecretBytes::new(vec![3; 32])).unwrap();

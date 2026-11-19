@@ -12,13 +12,13 @@ use aruna_core::events::LaunchDecline;
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    EffectiveResources, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordKind, LaunchIntent,
+    JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordKind, LaunchIntent,
 };
 use aruna_core::types::Key;
 use tokio::sync::Barrier;
 use ulid::Ulid;
 
-use super::settle;
+use super::{resources, settle};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::launch_admit::{
@@ -28,9 +28,9 @@ use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::store::test_calls::read_job_record;
-use crate::storage_read::iter_prefix_page;
 use crate::tests::records::{Family, REALM, context};
 use aruna_core::structs::execution::job::record_keys::kind_prefix;
+use aruna_storage::scan::iter_prefix_page;
 
 pub(super) fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {
@@ -38,16 +38,6 @@ pub(super) fn envelope(max_concurrent: u32) -> ResourceEnvelope {
         max_ram_bytes: Some(8_192),
         max_disk_bytes: Some(16_384),
         max_concurrent: Some(max_concurrent),
-    }
-}
-
-fn resources() -> EffectiveResources {
-    EffectiveResources {
-        cpu_cores: 1,
-        ram_bytes: 1024,
-        disk_bytes: 2048,
-        max_walltime_ms: 60_000,
-        preemptible: false,
     }
 }
 

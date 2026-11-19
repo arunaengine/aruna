@@ -886,6 +886,7 @@ mod tests {
     };
     use crate::node::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
     use crate::s3::bucket::create::CreateBucketOperation;
+    use crate::testing::path_context;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{
@@ -1012,19 +1013,6 @@ mod tests {
         let realm_id = ctx.node_and_realm().map(|(_, realm_id)| realm_id);
         let mut totals = drive(RealmUsageOperation::new(local, realm_id, scope), ctx).await?;
         Ok(totals.pop().expect("one scope gives one total"))
-    }
-
-    fn test_ctx(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
     }
 
     fn location(blob_size: u64, staging: bool, partial: bool) -> BackendLocation {
@@ -1349,7 +1337,7 @@ mod tests {
     #[tokio::test]
     async fn bucket_maintains_usage() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let group_id = Ulid::generate();
 
         drive(
@@ -1381,7 +1369,7 @@ mod tests {
     #[tokio::test]
     async fn load_reads_counters() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let group_id = Ulid::generate();
         let group = UsageCounters {
             buckets: 1,
@@ -1418,7 +1406,7 @@ mod tests {
         assert_eq!(loaded, expected);
 
         let stale_global_temp = tempdir().unwrap();
-        let stale_global_ctx = test_ctx(stale_global_temp.path().to_str().unwrap());
+        let stale_global_ctx = path_context(stale_global_temp.path().to_str().unwrap());
         write_counters(
             &stale_global_ctx,
             USAGE_GLOBAL_KEY.to_vec(),
@@ -1440,7 +1428,7 @@ mod tests {
     #[tokio::test]
     async fn rebuild_counts_bytes() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let group_a = Ulid::generate();
         let group_b = Ulid::generate();
 
@@ -1703,7 +1691,7 @@ mod tests {
     #[tokio::test]
     async fn rebuild_removes_stale() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let stale_group = Ulid::generate();
         let stale_key = usage_group_key(stale_group);
 
@@ -1985,7 +1973,7 @@ mod tests {
     #[tokio::test]
     async fn totals_count_once() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let (local, remote) = (node(1), node(2));
         let group_id = Ulid::from_bytes([5; 16]);
         let counters = |objects, logical_bytes, referenced_bytes, stored_bytes| UsageCounters {
@@ -2076,7 +2064,7 @@ mod tests {
     #[tokio::test]
     async fn record_marks_groups() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let (bound, plain) = (Ulid::from_bytes([6; 16]), Ulid::from_bytes([7; 16]));
         write_bucket(&ctx, "spire", bound, Some(binding(8))).await;
         write_bucket(&ctx, "plain", plain, None).await;
@@ -2101,7 +2089,7 @@ mod tests {
     async fn share_failure_keeps() {
         use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let group_id = Ulid::from_bytes([6; 16]);
         write_bucket(&ctx, "spire", group_id, Some(binding(8))).await;
         let record = Ulid::from_bytes([8; 16]).to_bytes().to_vec();
@@ -2121,7 +2109,7 @@ mod tests {
     #[tokio::test]
     async fn update_writes_markers() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let group_id = Ulid::generate();
 
         drive(
@@ -2161,7 +2149,7 @@ mod tests {
     #[tokio::test]
     async fn share_marker_publishes() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let group_id = Ulid::from_bytes([5; 16]);
         write_counters(&ctx, usage_group_key(group_id), logical(7)).await;
         write_node_stat(&ctx, dirty_share_key(group_id), vec![1]).await;
@@ -2184,7 +2172,7 @@ mod tests {
     #[tokio::test]
     async fn publish_consumes_markers() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let node_id = node(1);
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let group_id = Ulid::generate();
@@ -2238,7 +2226,7 @@ mod tests {
     #[tokio::test]
     async fn summary_excludes_own() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let local = node(1);
         let remote = node(2);
         let group_id = Ulid::generate();
@@ -2312,7 +2300,7 @@ mod tests {
     #[tokio::test]
     async fn load_recomputes_usage() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let local = node(1);
         let remote = node(2);
 
@@ -2353,7 +2341,7 @@ mod tests {
     #[tokio::test]
     async fn rebuild_preserves_snapshots() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let remote = node(2);
         let snapshot_key = usage_global_key(remote);
         let snapshot = NodeUsageSnapshot {
@@ -2384,7 +2372,7 @@ mod tests {
     #[tokio::test]
     async fn clear_keeps_regenerated() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let generation_one = Ulid::generate().to_bytes().to_vec();
 
         write_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec(), generation_one.clone()).await;
@@ -2427,7 +2415,7 @@ mod tests {
     #[tokio::test]
     async fn failure_preserves_markers() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let node_id = node(1);
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let group_id = Ulid::generate();
@@ -2480,7 +2468,7 @@ mod tests {
     #[tokio::test]
     async fn replication_failure_redirties() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let node_id = node(1);
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let group_id = Ulid::generate();
@@ -2548,7 +2536,7 @@ mod tests {
     #[tokio::test]
     async fn summary_failure_preserves() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let node_id = node(1);
         let remote = node(2);
         let realm_id = RealmId::from_bytes([9u8; 32]);
@@ -2591,7 +2579,7 @@ mod tests {
     #[tokio::test]
     async fn summary_failure_redirties() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let node_id = node(1);
         let remote = node(2);
         let realm_id = RealmId::from_bytes([9u8; 32]);
@@ -2650,7 +2638,7 @@ mod tests {
     #[tokio::test]
     async fn publish_zeros_stale() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let node_id = node(1);
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let live_group = Ulid::generate();
@@ -2711,7 +2699,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_recomputes_targets() {
         let temp = tempdir().unwrap();
-        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let ctx = path_context(temp.path().to_str().unwrap());
         let local = node(1);
         let remote = node(2);
         let group_id = Ulid::generate();

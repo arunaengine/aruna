@@ -91,7 +91,7 @@ fn is_member(config: &RealmConfigDocument, node: NodeId) -> bool {
 
 /// Makes the deletion decision durable before anything acts on it.
 #[derive(Debug, PartialEq)]
-pub(crate) struct SyncDecisionOperation;
+pub struct SyncDecisionOperation;
 
 impl Operation for SyncDecisionOperation {
     type Output = ();

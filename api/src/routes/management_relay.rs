@@ -34,8 +34,7 @@ use tracing::{debug, warn};
 
 /// The nodes a relayed call passed, comma-separated. Anyone can send it, so it never makes a
 /// node answer a call it would relay; it only stops a call that would circle.
-pub(crate) const RELAY_HOP_HEADER: HeaderName =
-    HeaderName::from_static(member_rest::RELAY_HOP_HEADER);
+pub const RELAY_HOP_HEADER: HeaderName = HeaderName::from_static(member_rest::RELAY_HOP_HEADER);
 
 /// Realm membership changes rarely, so the resolved targets are reused inside
 /// this window instead of re-reading realm state per request.

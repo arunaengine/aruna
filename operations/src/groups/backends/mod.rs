@@ -163,7 +163,3 @@ pub fn parse_iter<T>(
         _ => Err(RecordReadError::Unexpected),
     }
 }
-
-#[cfg(test)]
-#[path = "drain_tests.rs"]
-mod drain_tests;

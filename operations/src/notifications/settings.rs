@@ -29,7 +29,7 @@ use crate::notifications::unexpected_event;
 use crate::realm_vault::{SecretAnswer, ServeRequest, ServeSecretOperation};
 
 /// The first delay after no management node opened a secret; it doubles up to `BACKOFF_CAP_MS`.
-pub(crate) const BACKOFF_START_MS: u64 = 30_000;
+pub const BACKOFF_START_MS: u64 = 30_000;
 const BACKOFF_CAP_MS: u64 = 30 * 60_000;
 /// How long one management node may take to open a setting secret.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);

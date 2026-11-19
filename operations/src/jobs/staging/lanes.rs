@@ -33,7 +33,7 @@ use crate::staging::page::rows::MAX_ERROR_SAMPLE;
 /// job holds a bounded number of pages whatever the source holds.
 const LANE_LIMIT: usize = 4;
 /// Checkpoint rows of one job a reader looks at: its own, and two per lane.
-pub(super) const LANE_ROWS: usize = 2 * LANE_LIMIT + 1;
+pub const LANE_ROWS: usize = 2 * LANE_LIMIT + 1;
 /// Slots per spec prefix: lane `slot` walks part `slot % PARTS` of prefix `slot / PARTS`.
 const PARTS: u64 = LANE_LIMIT as u64;
 /// One-key listings that split one prefix, whatever its key space looks like.
@@ -89,7 +89,7 @@ pub(super) fn lanes_page(job_id: JobId) -> IoCall {
 }
 
 /// The open lanes among a job's state rows, each with its checkpoint and where it stops.
-pub(super) fn parse_lanes(rows: Vec<(Key, Value)>) -> Result<Vec<Lane>, String> {
+pub fn parse_lanes(rows: Vec<(Key, Value)>) -> Result<Vec<Lane>, String> {
     let mut lanes: Vec<Lane> = Vec::new();
     for (key, value) in rows {
         let Some(slot) = (key.get(16..24)).and_then(|slot| <[u8; 8]>::try_from(slot).ok()) else {

@@ -2,15 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
-
-use aruna_core::compute::{
-    AdoptableEvidence, ArtifactEvidence, AttemptPhase, ResumePoint, StagingMode,
-};
+use aruna_core::compute::{AdoptableEvidence, AttemptPhase, ResumePoint};
 use aruna_core::structs::execution::job::AttemptIntent;
 
 use super::super::fixtures::{
-    EPOCH, child, compute, control, job, record, scope, status, stops, token,
+    EPOCH, artifact, child, compute, control, job, prepared, record, scope, status, stops, token,
 };
 use super::*;
 
@@ -71,16 +67,6 @@ fn tombstone() -> TombstoneEvidence {
     TombstoneEvidence {
         backend_ref: "stone".to_string(),
         attempt_epoch: EPOCH,
-    }
-}
-
-fn prepared() -> PreparedTask {
-    PreparedTask {
-        inputs: Vec::new(),
-        mounts: Vec::new(),
-        secrets: BTreeMap::new(),
-        staging: StagingMode::Files,
-        workspace: None,
     }
 }
 
@@ -302,18 +288,6 @@ fn tombstoned_attempt_retired() {
     assert_eq!(recover.next(found), Ok(tombstone_write()));
     let failed = child(Err::<AttemptControl, _>(JobMutationError::TokenMismatch));
     assert_eq!(recover.next(failed), Ok(Next::Done(false)));
-}
-
-fn artifact(exact_identity: bool) -> ReconcileEvidence {
-    ReconcileEvidence::Unadoptable(ArtifactEvidence {
-        artifact_kind: "helper".to_string(),
-        backend_ref: None,
-        observed_epoch: Some(EPOCH),
-        observed_generation: Some(1),
-        exact_identity,
-        multiple: false,
-        foreign: false,
-    })
 }
 
 // An artifact that is surely ours is stopped first, and the attempt parks either way.

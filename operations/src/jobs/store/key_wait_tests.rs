@@ -11,10 +11,10 @@ use crate::jobs::store::test_calls::{
     claim_job, insert_job, mutate_job, park_job, read_job_record, read_key_waits,
     set_cancel_requested, wake_key_page, wake_key_waits,
 };
-use crate::storage_read::iter_prefix_page;
 use aruna_core::structs::execution::job::KeyWait;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
+use aruna_storage::scan::iter_prefix_page;
 use aruna_storage::{FjallStorage, StorageHandle};
 
 fn temp_storage() -> (tempfile::TempDir, StorageHandle) {

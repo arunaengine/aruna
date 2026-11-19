@@ -38,7 +38,7 @@ use crate::realm::create_realm::CreateRealmOperation;
 use crate::secrets::SecretChange;
 use crate::secrets::owner::OwnerChange;
 use crate::secrets::owner::OwnerSecretOperation;
-use crate::tasks::job_context::JobContext;
+use crate::jobs::context::JobContext;
 use crate::testing_objects::seed_bucket;
 use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentTarget;

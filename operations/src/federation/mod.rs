@@ -11,6 +11,6 @@ pub mod link;
 pub mod login;
 pub mod publish;
 pub mod records;
-pub(crate) mod registration;
+pub mod registration;
 pub mod totals;
 pub mod transfer;

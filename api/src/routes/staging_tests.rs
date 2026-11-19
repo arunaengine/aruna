@@ -5,7 +5,9 @@
 use super::*;
 use crate::auth::RealmAuth;
 use crate::openapi::ApiDoc;
-use crate::tests::routes::{seed_realm_auth, seed_realm_config, test_state, test_storage};
+use crate::tests::routes::{
+    seed_realm_auth, seed_realm_config, test_state, test_storage, write_doc,
+};
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -849,27 +851,6 @@ async fn setup_state() -> TestState {
             session: None,
         },
     }
-}
-
-async fn write_doc(
-    driver_ctx: &Arc<DriverContext>,
-    key_space: &str,
-    key: byteview::ByteView,
-    value: byteview::ByteView,
-) {
-    let event = driver_ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key,
-            value,
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
 }
 
 async fn read_doc(

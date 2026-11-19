@@ -338,6 +338,7 @@ mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
     use crate::driver::{DriverContext, drive};
+    use crate::testing::path_context;
     use aruna_core::UserId;
     use aruna_core::compute::quota::ComputeQuota;
     use aruna_core::document::DocumentTarget;
@@ -350,19 +351,6 @@ mod tests {
     use aruna_core::structs::placement::compute_config::{GroupComputeQuota, LocationLink};
     use tempfile::tempdir;
     use ulid::Ulid;
-
-    fn context(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
-    }
 
     fn actor(realm_id: RealmId) -> Actor {
         Actor {
@@ -459,7 +447,7 @@ mod tests {
         // The mutation must survive as the document a later read resolves, or
         // the planner and the quota gate would keep deciding on stale values.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
         seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
@@ -491,7 +479,7 @@ mod tests {
         // A zero bandwidth would make one transfer estimate infinite, so the
         // mutation is refused instead of clamped.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
         seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
@@ -518,7 +506,7 @@ mod tests {
     async fn refuses_unauthorized_caller() {
         // Nothing is written when the caller holds no realm-config write.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let actor = actor(realm_id);
         seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
@@ -557,7 +545,7 @@ mod tests {
         // A realm admin token still may not write the config on a server node:
         // peers reject a realm-config event whose origin is not management.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let actor = actor(realm_id);
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);

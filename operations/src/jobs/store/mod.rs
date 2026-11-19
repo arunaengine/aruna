@@ -62,7 +62,7 @@ use ulid::Ulid;
 
 use super::lifecycle::ids::session_of;
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_PRUNE_PAGE, MUTATE_MAX_ATTEMPTS};
-use crate::tasks::queue_backoff::retry_delay_ms;
+use crate::queue_backoff::retry_delay_ms;
 
 pub mod attempt_intent;
 pub mod control_mutation;
@@ -120,7 +120,7 @@ fn hash_report_value(hasher: &mut blake3::Hasher, value: &[u8]) {
 
 #[cfg(test)]
 mod key_wait_tests;
-#[cfg(test)]
-pub(crate) mod test_calls;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_calls;
 #[cfg(test)]
 mod tests;

@@ -9,15 +9,15 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use ulid::Ulid;
 
-pub(crate) fn realm_id() -> RealmId {
+pub fn realm_id() -> RealmId {
     RealmId::from_bytes([1u8; 32])
 }
 
-pub(crate) fn node_id(seed: u8) -> NodeId {
+pub fn node_id(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-pub(crate) fn auth() -> AuthContext {
+pub fn auth() -> AuthContext {
     AuthContext {
         user_id: UserId::nil(realm_id()),
         realm_id: realm_id(),
@@ -26,7 +26,7 @@ pub(crate) fn auth() -> AuthContext {
     }
 }
 
-pub(crate) fn request(version_id: Option<Ulid>) -> LocationSummaryRequest {
+pub fn request(version_id: Option<Ulid>) -> LocationSummaryRequest {
     LocationSummaryRequest {
         realm_id: realm_id(),
         bucket: "raw".to_string(),

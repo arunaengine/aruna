@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub(crate) mod after_sync;
+pub mod after_sync;
 pub mod api;
 pub mod audit;
 pub mod audit_entry;
@@ -13,7 +13,7 @@ pub(crate) mod checkpoint_window;
 pub mod contact;
 pub mod create_document;
 pub mod create_entry;
-pub(crate) mod data_links;
+pub mod data_links;
 pub mod delete_document;
 pub mod deletion_guard;
 pub mod device_pull;
@@ -24,7 +24,7 @@ pub(crate) mod graph_deleted;
 pub(crate) mod handle;
 pub mod id_mapping;
 pub mod identifier_lookup;
-pub(crate) mod iri_index;
+pub mod iri_index;
 pub mod list_documents;
 pub(crate) mod live_records;
 pub mod local_query;
@@ -37,7 +37,7 @@ pub mod pid_read;
 pub(crate) mod pid_transition;
 pub mod profile;
 pub mod projection;
-pub(crate) mod protocol;
+pub mod protocol;
 pub mod provenance;
 pub(crate) mod prune_jobs;
 pub mod prune_queue;
@@ -56,7 +56,7 @@ pub mod secondary_ids;
 pub(crate) mod span_timing;
 pub mod stats;
 pub mod text_search;
-pub(crate) mod timestamp_sweep;
+pub mod timestamp_sweep;
 pub mod update_document;
 pub mod update_entry;
 pub(crate) mod updated_page;

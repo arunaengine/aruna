@@ -245,7 +245,7 @@ mod storage_tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::testing::test_context;
-    use crate::tests::access::seed_open_access;
+    use crate::testing_access::seed_open_access;
     use crate::tests::s3::test_storage;
     use aruna_core::NodeId;
     use aruna_core::structs::identity::realm::RealmId;

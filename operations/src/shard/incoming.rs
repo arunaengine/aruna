@@ -16,7 +16,7 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 
 /// What a manifest request is answered with.
 #[derive(Debug, PartialEq)]
-pub(crate) enum ManifestAnswer {
+pub enum ManifestAnswer {
     Reject(String),
     Manifest(Box<ShardManifest>),
 }
@@ -27,7 +27,7 @@ fn reject(reason: String) -> Result<Next<ManifestAnswer>, IoError> {
 
 /// Serves one manifest request after checking the realm, the peer and this node's holdership.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ServeManifestOperation {
+pub struct ServeManifestOperation {
     local: (NodeId, RealmId),
     peer: NodeId,
     realm_id: RealmId,
@@ -37,11 +37,7 @@ pub(crate) struct ServeManifestOperation {
 }
 
 impl ServeManifestOperation {
-    pub(crate) fn new(
-        local: (NodeId, RealmId),
-        peer: NodeId,
-        message: ShardTransportMessage,
-    ) -> Self {
+    pub fn new(local: (NodeId, RealmId), peer: NodeId, message: ShardTransportMessage) -> Self {
         let ShardTransportMessage::ManifestRequest {
             realm_id,
             placement,

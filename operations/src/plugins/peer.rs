@@ -87,7 +87,7 @@ impl PeerAnswer {
 
 /// Answers one plugin request of another node; a node without a network serves none.
 #[derive(Debug, PartialEq)]
-pub(crate) struct AnswerPeer {
+pub struct AnswerPeer {
     node: Option<ServingNode>,
     peer: NodeId,
     now_ms: u64,
@@ -97,7 +97,7 @@ pub(crate) struct AnswerPeer {
 
 impl AnswerPeer {
     /// The operation for `message`, or the message back when it is no plugin request.
-    pub(crate) fn new(
+    pub fn new(
         node: Option<ServingNode>,
         peer: NodeId,
         message: MetadataTransportMessage,
@@ -127,7 +127,7 @@ impl AnswerPeer {
     }
 
     /// The kind of answer this request gets, also when the runner gives up on it.
-    pub(crate) fn answer(&self) -> PeerAnswer {
+    pub fn answer(&self) -> PeerAnswer {
         self.answer
     }
 

@@ -589,7 +589,7 @@ impl RealmPlacementMutation {
 }
 
 /// The configured kind of `node_id`, or `None` when the realm does not know it.
-pub(crate) fn node_kind(document: &RealmConfigDocument, node_id: NodeId) -> Option<RealmNodeKind> {
+pub fn node_kind(document: &RealmConfigDocument, node_id: NodeId) -> Option<RealmNodeKind> {
     document.node_kind(&node_id).cloned()
 }
 

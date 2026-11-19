@@ -11,12 +11,15 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::heartbeat::NodeHeartbeat;
 use aruna_core::keyspaces::{
-    DISTRIBUTION_KEYSPACE, NODE_INFO_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    DISTRIBUTION_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, TokenClaims};
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmId, RealmNode, RealmNodeKind,
 };
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::distribution::presets::{replica_layout, shard_layout};
 use aruna_core::structs::storage::distribution::{
@@ -230,6 +233,21 @@ pub(crate) fn bucket_info(group_id: Ulid, distribution: Option<DistributionBindi
         compression: Default::default(),
         distribution,
     }
+}
+
+/// Stores the placement subject of the local node, so placement may choose it.
+pub(crate) async fn advertise(node: &Node) {
+    let record = NodeSubjectRecord::seed(PlacementSubject {
+        node_id: node_id(LOCAL),
+        generation: 1,
+        location: "eu-west".to_string(),
+        labels: Default::default(),
+        executor_kind: None,
+        local_to_controller: true,
+    })
+    .unwrap();
+    let (key, value) = (NODE_SUBJECT_KEY.to_vec(), record.to_bytes().unwrap());
+    write(&node.state, NODE_SUBJECT_KEYSPACE, key, value).await;
 }
 
 pub(crate) async fn write(state: &ServerState, key_space: &str, key: Vec<u8>, value: Vec<u8>) {

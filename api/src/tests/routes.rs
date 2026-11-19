@@ -73,6 +73,16 @@ pub(crate) async fn write_doc(
     ));
 }
 
+/// Writes one row through the storage of `state`; panics on any other answer.
+pub(crate) async fn write_fixture(
+    state: &ServerState,
+    key_space: &str,
+    key: ByteView,
+    value: ByteView,
+) {
+    write_doc(&state.get_ctx(), key_space, key, value).await;
+}
+
 pub(crate) async fn seed_realm_auth(
     context: &Arc<DriverContext>,
     realm_id: RealmId,

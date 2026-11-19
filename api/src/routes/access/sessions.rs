@@ -351,61 +351,15 @@ mod tests {
     use super::*;
     use crate::auth::handle_token;
     use crate::error::TokenError;
-    use crate::tests::routes::{test_state, test_storage};
+    use crate::tests::realms::member_state;
     use aruna_core::UserId;
-    use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::identity::auth::{NodeCapabilities, SessionRef};
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::testing::test_context;
+    use aruna_core::structs::identity::auth::SessionRef;
     use axum::response::IntoResponse;
     use tempfile::TempDir;
 
-    async fn setup_state() -> (TempDir, Arc<ServerState>, AuthContext) {
-        let (dir, storage) = test_storage();
-        let context = Arc::new(test_context(storage));
-        let signing_key = generate_signing_key();
-        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
-        let user_id = UserId::local(Ulid::generate(), realm_id);
-        let node_id = iroh::SecretKey::generate().public();
-        drive(
-            CreateRealmOperation::new(CreateRealmConfig {
-                actor: Actor {
-                    node_id,
-                    user_id: UserId::nil(realm_id),
-                    realm_id,
-                },
-                realm_description: "Realm".to_string(),
-                oidc_providers: Vec::new(),
-                node_location: None,
-                node_weight: None,
-                node_labels: Default::default(),
-            }),
-            &context,
-        )
-        .await
-        .unwrap();
-        let state = Arc::new(
-            test_state(
-                context,
-                realm_id,
-                node_id,
-                NodeCapabilities::management_node(signing_key).unwrap(),
-            )
-            .await,
-        );
-        let auth = AuthContext {
-            user_id,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        };
-        (dir, state, auth)
-    }
-
     #[tokio::test]
     async fn invalid_kind_rejected() {
-        let (_dir, state, auth) = setup_state().await;
+        let (_dir, state, auth) = member_state().await;
         let error = create_session(
             State(state),
             RealmAuth(auth),
@@ -424,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_kind_change() {
-        let (_dir, state, mut auth) = setup_state().await;
+        let (_dir, state, mut auth) = member_state().await;
         auth.session = Some(SessionRef {
             sid: Ulid::generate().to_string(),
             kind: SessionKind::Assistant,
@@ -452,7 +406,7 @@ mod tests {
 
     /// State whose caller owns one group, with the group data root.
     async fn group_state() -> (TempDir, Arc<ServerState>, AuthContext, String) {
-        let (dir, state, auth) = setup_state().await;
+        let (dir, state, auth) = member_state().await;
         let group_id = Ulid::generate();
         let actor = Actor {
             node_id: state.get_node_id(),
@@ -625,7 +579,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoked_token_rejected() {
-        let (_dir, state, mut auth) = setup_state().await;
+        let (_dir, state, mut auth) = member_state().await;
         auth.session = Some(SessionRef {
             sid: Ulid::generate().to_string(),
             kind: SessionKind::Portal,
@@ -661,7 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn foreign_session_hidden() {
-        let (_dir, state, auth) = setup_state().await;
+        let (_dir, state, auth) = member_state().await;
         let (_, Json(created)) = create_session(
             State(state.clone()),
             RealmAuth(auth.clone()),

@@ -2,13 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::compute::effect::{BackendFacts, ComputeAnswer};
 use aruna_core::compute::{
-    AttemptPhase, AttemptRef, AttemptStatus, ExecutorKind, FenceContext, NOBODY,
+    ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, ExecutorKind, FenceContext, NOBODY,
+    ReconcileEvidence, StagingMode,
 };
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
@@ -21,6 +23,7 @@ use aruna_core::structs::storage::routing::NodeRouting;
 use ulid::Ulid;
 
 use super::attempt::{AttemptScope, RunWiring};
+use super::prepare::PreparedTask;
 
 pub(super) const EPOCH: u64 = 3;
 pub(super) const BUCKET: &str = "work";
@@ -40,6 +43,10 @@ pub(super) fn node() -> NodeId {
 
 pub(super) fn realm() -> RealmId {
     RealmId([1; 32])
+}
+
+pub(super) fn group_spec(group_id: Ulid) -> ExecutionSpec {
+    ExecutionSpec { group_id, ..spec() }
 }
 
 pub(super) fn spec() -> ExecutionSpec {
@@ -77,6 +84,28 @@ pub(super) fn claimed() -> JobRecord {
         lease_expires_ms: 1,
     });
     job
+}
+
+pub(super) fn artifact(exact_identity: bool) -> ReconcileEvidence {
+    ReconcileEvidence::Unadoptable(ArtifactEvidence {
+        artifact_kind: "helper".to_string(),
+        backend_ref: None,
+        observed_epoch: Some(EPOCH),
+        observed_generation: Some(1),
+        exact_identity,
+        multiple: false,
+        foreign: false,
+    })
+}
+
+pub(super) fn prepared() -> PreparedTask {
+    PreparedTask {
+        inputs: Vec::new(),
+        mounts: Vec::new(),
+        secrets: BTreeMap::new(),
+        staging: StagingMode::Files,
+        workspace: None,
+    }
 }
 
 pub(super) fn intent() -> AttemptIntent {

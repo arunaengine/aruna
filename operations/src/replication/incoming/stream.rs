@@ -69,7 +69,7 @@ fn closed(result: IoResult) -> StreamTurn {
 /// What the bao plane admitted a peer as. A device reaches the read branch and
 /// nothing else, so replication stays infrastructure-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BaoAdmission {
+pub enum BaoAdmission {
     Infra,
     DeviceRead,
 }
@@ -78,14 +78,14 @@ pub(crate) enum BaoAdmission {
 /// nodes only; an owner-bound device gets bao reads alone from a sync-eligible node, never
 /// becoming a replication source. Identity comes from the realm config. Fails closed.
 #[derive(Debug, PartialEq)]
-pub(crate) struct BaoAdmissionOperation {
+pub struct BaoAdmissionOperation {
     realm_id: RealmId,
     local: NodeId,
     peer: NodeId,
 }
 
 impl BaoAdmissionOperation {
-    pub(crate) fn new(realm_id: RealmId, local: NodeId, peer: NodeId) -> Self {
+    pub fn new(realm_id: RealmId, local: NodeId, peer: NodeId) -> Self {
         Self {
             realm_id,
             local,
@@ -134,7 +134,7 @@ impl Operation for BaoAdmissionOperation {
 
 /// A registered bao stream and the nodes on its two ends.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct BaoPeerStream {
+pub struct BaoPeerStream {
     pub(crate) realm_id: RealmId,
     pub(crate) local_node: NodeId,
     pub(crate) peer: NodeId,
@@ -144,7 +144,7 @@ pub(crate) struct BaoPeerStream {
 /// Answers the first frame of an admitted stream. Every family closes the stream when it
 /// refuses, so an error here means an answer could not be read at all.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ServeBaoOperation {
+pub struct ServeBaoOperation {
     stream: BaoPeerStream,
     admission: BaoAdmission,
     payload: Vec<u8>,
@@ -154,7 +154,7 @@ pub(crate) struct ServeBaoOperation {
 }
 
 impl ServeBaoOperation {
-    pub(crate) fn new(
+    pub fn new(
         stream: BaoPeerStream,
         admission: BaoAdmission,
         payload: Vec<u8>,

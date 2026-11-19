@@ -1,0 +1,2233 @@
+//! Tests the execution workflow: submit recovery, sessions, cancels, walltime, and reconcile.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::tasks::runner::{execution_host, resume_attempt as run_resume, run_execution_job};
+use crate::tasks::runner::{run_wiring, under_lease};
+use aruna_compute::ExecutorBackend;
+use aruna_compute::ExecutorRegistry;
+use aruna_compute::session::{Session, SessionConfig};
+use aruna_core::UserId;
+use aruna_core::compute::session::EndReason;
+use aruna_core::compute::{
+    AdoptableEvidence, AttemptPhase, AttemptStatus, CancelEvidence, LogLimits, LogTails, NOBODY,
+    NetworkAccess, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, UserSpec,
+};
+use aruna_core::structs::execution::job::{
+    JobErrorKind, JobResultPayload, JobState, MAX_MESSAGE_BYTES, OutputDestination,
+    OutputSelection, SessionReportDetail, SessionReportRow, WorkspaceMode,
+};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::driver::{DriverContext, drive, node_routing};
+use aruna_operations::effect_adapters::job::with_job_host;
+use aruna_operations::jobs::context::JobContext;
+use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
+use aruna_operations::jobs::store::job_calls::ClaimOutcome;
+use aruna_operations::jobs::store::test_calls::{
+    begin_external_running, claim_job, handoff_external_attempt, insert_job, mutate_job,
+    put_crate_status, read_attempt_control, read_job_record, record_attempt_intent,
+    record_attempt_started, set_cancel_requested, transition_to_preparing, transition_to_ready,
+};
+use aruna_operations::jobs::workflow::attempt::{AttemptScope, RunWiring};
+use aruna_operations::jobs::workflow::credential::{
+    MintCredentialOperation, RunIdentity, WorkspaceAccessOperation,
+};
+use aruna_operations::jobs::workflow::finalize::exit_message;
+use aruna_operations::jobs::workflow::inventory::CollectOutputsOperation;
+use aruna_operations::jobs::workflow::prepare::{NETWORK_TAG_KEY, PreparedTask, build_task_spec};
+use aruna_operations::jobs::workflow::settle::{ParkAttemptOperation, SettleScope};
+use aruna_operations::jobs::workflow::supervise::WalltimeAnchorOperation;
+use aruna_operations::jobs::workflow::*;
+use aruna_operations::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_tasks::TaskHandle;
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tempfile::tempdir;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
+
+use super::workflow_fixtures::{execution_spec, node_id};
+use aruna_operations::testing::task_context;
+
+/// The context of a call about `backend`: one whose registry holds it.
+fn with_backend(context: &DriverContext, backend: &Arc<dyn ExecutorBackend>) -> DriverContext {
+    let mut context = context.clone();
+    let held = (context.compute_handle.as_ref())
+        .is_some_and(|registry| registry.get(&backend.kind()).is_some());
+    if !held {
+        let registry = ExecutorRegistry::new().with_backend(backend.clone());
+        context.compute_handle = Some(Arc::new(registry));
+    }
+    context
+}
+
+fn wiring(context: &DriverContext) -> RunWiring {
+    RunWiring {
+        serving: context.node_and_realm(),
+        routing: node_routing(context),
+        encryption_key: None,
+    }
+}
+
+fn attempt_scope(
+    context: &DriverContext,
+    (job_id, token): (JobId, ulid::Ulid),
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    spec: &ExecutionSpec,
+    bucket: &str,
+) -> Arc<AttemptScope> {
+    Arc::new(AttemptScope {
+        job_id,
+        token,
+        kind: backend.kind(),
+        fence: fence.clone(),
+        spec: Arc::new(spec.clone()),
+        bucket: bucket.to_string(),
+        run_as: backend.run_identity(),
+        wiring: match context.net_handle {
+            Some(_) => run_wiring(context),
+            None => wiring(context),
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_attempt(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    spec: &ExecutionSpec,
+    bucket: &str,
+    result: Result<AttemptStatus, BackendError>,
+    cancel: &CancellationToken,
+) {
+    let scope = attempt_scope(context, (job_id, token), backend, fence, spec, bucket);
+    let context = with_backend(context, backend);
+    let finalize = FinalizeOperation::new(scope, FinalizeGoal::Attempt(result));
+    let run = drive(finalize, &context);
+    with_job_host(execution_host(cancel.clone()), run)
+        .await
+        .unwrap();
+}
+
+async fn finalize_cancel(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    spec: &ExecutionSpec,
+    bucket: &str,
+) {
+    let scope = attempt_scope(context, (job_id, token), backend, fence, spec, bucket);
+    let context = with_backend(context, backend);
+    let finalize = FinalizeOperation::new(scope, FinalizeGoal::Cancel);
+    drive(finalize, &context).await.unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_failed_submit(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: &Arc<dyn ExecutorBackend>,
+    fence: &FenceContext,
+    spec: &ExecutionSpec,
+    bucket: &str,
+    cancel: &CancellationToken,
+    error: BackendError,
+) -> bool {
+    let scope = attempt_scope(context, (job_id, token), backend, fence, spec, bucket);
+    let context = with_backend(context, backend);
+    let recover = RecoverSubmitOperation::new(scope, error);
+    let run = drive(recover, &context);
+    with_job_host(execution_host(cancel.clone()), run)
+        .await
+        .unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_and_finalize(
+    context: Arc<DriverContext>,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: Arc<dyn ExecutorBackend>,
+    fence: FenceContext,
+    spec: ExecutionSpec,
+    bucket: String,
+    cancel: CancellationToken,
+) {
+    let scope = attempt_scope(&context, (job_id, token), &backend, &fence, &spec, &bucket);
+    let context = with_backend(&context, &backend);
+    let supervise = SuperviseOperation::new(scope);
+    let _ = under_lease(&context, (job_id, token), cancel, supervise).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resume_attempt(
+    context: Arc<DriverContext>,
+    job_id: JobId,
+    token: ulid::Ulid,
+    backend: Arc<dyn ExecutorBackend>,
+    fence: FenceContext,
+    phase: AttemptPhase,
+    spec: ExecutionSpec,
+    bucket: String,
+    record: JobRecord,
+    cancel: CancellationToken,
+) {
+    let scope = attempt_scope(&context, (job_id, token), &backend, &fence, &spec, &bucket);
+    let context = Arc::new(with_backend(&context, &backend));
+    run_resume(context, scope, Arc::new(record), phase, cancel).await;
+}
+
+async fn collect_or_park(
+    context: &DriverContext,
+    job_id: JobId,
+    token: ulid::Ulid,
+    spec: &ExecutionSpec,
+    bucket: &str,
+    control: &aruna_core::structs::execution::job::AttemptControl,
+) -> Option<Vec<aruna_core::structs::execution::job::OutputObject>> {
+    let node = context.net_handle.as_ref().map(|net| net.node_id());
+    let collect = CollectOutputsOperation::new(spec, bucket, control.clone(), node);
+    match drive(collect, context).await {
+        Ok(outputs) => Some(outputs),
+        Err(error) => {
+            let scope = SettleScope {
+                serving: context.node_and_realm(),
+                now_ms: unix_timestamp_millis(),
+            };
+            let park = ParkAttemptOperation::new(job_id, token, error, scope);
+            drive(park, context).await.unwrap();
+            None
+        }
+    }
+}
+
+async fn prepare_workspace(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: aruna_core::id::NodeId,
+    bucket: &str,
+) -> Result<(), JobError> {
+    let realm_id = context.serving_realm(record.created_by.realm_id);
+    let run = RunIdentity::new(spec, record, realm_id, node_id);
+    drive(WorkspaceAccessOperation::existing(run, bucket), context).await
+}
+
+async fn prepare_attempt(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: aruna_core::id::NodeId,
+    bucket: &str,
+) -> Result<PreparedTask, JobError> {
+    let realm_id = context.serving_realm(record.created_by.realm_id);
+    let run = RunIdentity::new(spec, record, realm_id, node_id);
+    let job = (Arc::new(spec.clone()), Arc::new(record.clone()));
+    let key = run_wiring(context).encryption_key;
+    let prepare = PrepareAttemptOperation::new(run, job, bucket, key, false);
+    drive(prepare, context).await
+}
+
+async fn pre_submit_failure(
+    context: &DriverContext,
+    _job_id: JobId,
+    token: ulid::Ulid,
+    record: &JobRecord,
+    error: JobError,
+    logged: bool,
+) {
+    let scope = SettleScope {
+        serving: context.node_and_realm(),
+        now_ms: unix_timestamp_millis(),
+    };
+    let failure = settle::SubmitFailureOperation::new(record, token, error, logged, scope);
+    drive(failure, context).await.unwrap();
+}
+
+async fn walltime_anchor(context: &DriverContext, job_id: JobId, token: ulid::Ulid) -> u64 {
+    let anchor = WalltimeAnchorOperation::new(job_id, token);
+    drive(anchor, context).await.unwrap()
+}
+
+async fn resolve_backend(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    job_id: JobId,
+) -> Result<aruna_core::compute::effect::BackendFacts, JobError> {
+    let resolve = ResolveBackendOperation::new(spec, job_id);
+    drive(resolve, context).await.map(|resolved| resolved.facts)
+}
+
+fn workspace_mint(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: aruna_core::id::NodeId,
+    scope: (&str, Option<&str>),
+) -> MintCredentialOperation {
+    let realm_id = context.serving_realm(record.created_by.realm_id);
+    let run = RunIdentity::new(spec, record, realm_id, node_id);
+    let key = run_wiring(context).encryption_key;
+    let secret = (key, std::time::SystemTime::now());
+    MintCredentialOperation::workspace((spec, record), run, scope, secret)
+}
+
+fn job_id() -> JobId {
+    aruna_operations::jobs::submit::mint_job_id(
+        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+        BucketId::new(0).unwrap(),
+    )
+    .unwrap()
+}
+
+enum StubReconcile {
+    NotFound,
+    Unavailable,
+    Waiting,
+    Pending,
+    Adopted,
+}
+
+struct StubBackend {
+    reconcile: StubReconcile,
+    submits: Mutex<Vec<String>>,
+    wait_started: Notify,
+    logs_started: Notify,
+    logs_release: Notify,
+    logs_fail: AtomicBool,
+    cancel_lost: AtomicBool,
+    cancels: AtomicUsize,
+    reconcile_started: Notify,
+    image_started: Notify,
+    image_stall: AtomicBool,
+    mounts: AtomicBool,
+    sessions: AtomicBool,
+    capture_hangs: AtomicBool,
+    capture_fails: AtomicBool,
+    cancel_exited: AtomicBool,
+}
+
+impl StubBackend {
+    fn new(reconcile: StubReconcile) -> Arc<Self> {
+        Arc::new(Self {
+            reconcile,
+            submits: Mutex::new(Vec::new()),
+            wait_started: Notify::new(),
+            logs_started: Notify::new(),
+            logs_release: Notify::new(),
+            logs_fail: AtomicBool::new(false),
+            cancel_lost: AtomicBool::new(false),
+            cancels: AtomicUsize::new(0),
+            reconcile_started: Notify::new(),
+            image_started: Notify::new(),
+            image_stall: AtomicBool::new(false),
+            mounts: AtomicBool::new(false),
+            sessions: AtomicBool::new(false),
+            capture_hangs: AtomicBool::new(false),
+            capture_fails: AtomicBool::new(false),
+            cancel_exited: AtomicBool::new(false),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ExecutorBackend for StubBackend {
+    fn kind(&self) -> ExecutorKind {
+        ExecutorKind::Docker
+    }
+    fn capabilities(&self) -> aruna_core::compute::offer::BackendCaps {
+        aruna_core::compute::offer::BackendCaps {
+            s3_mount: self.mounts.load(Ordering::Relaxed),
+            session: self.sessions.load(Ordering::Relaxed),
+            ..Default::default()
+        }
+    }
+    fn run_identity(&self) -> UserSpec {
+        NOBODY
+    }
+    async fn health(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    async fn resolve_image(
+        &self,
+        _image: &str,
+        _cancel: &CancellationToken,
+    ) -> Result<String, BackendError> {
+        if self.image_stall.load(Ordering::Relaxed) {
+            self.image_started.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(
+            "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        )
+    }
+    async fn fence(&self, _context: &FenceContext) -> Result<(), BackendError> {
+        Ok(())
+    }
+    async fn submit(
+        &self,
+        _context: &FenceContext,
+        spec: &TaskSpec,
+        _cancel: &CancellationToken,
+    ) -> Result<AttemptStatus, BackendError> {
+        self.submits
+            .lock()
+            .unwrap()
+            .push(spec.attempt.external_name());
+        Err(BackendError::Unavailable("stub submit".to_string()))
+    }
+    async fn status(&self, _context: &FenceContext) -> Result<AttemptStatus, BackendError> {
+        Err(BackendError::Unavailable("stub status".to_string()))
+    }
+    async fn wait(
+        &self,
+        _context: &FenceContext,
+        _cancel: &CancellationToken,
+    ) -> Result<AttemptStatus, BackendError> {
+        if matches!(self.reconcile, StubReconcile::Waiting) {
+            self.wait_started.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(AttemptStatus {
+            phase: AttemptPhase::Exited { code: 0 },
+            backend_ref: "done".to_string(),
+            started_at_ms: Some(1),
+            finished_at_ms: Some(2),
+            detail: None,
+        })
+    }
+    async fn cancel(&self, _context: &FenceContext) -> Result<CancelEvidence, BackendError> {
+        self.cancels.fetch_add(1, Ordering::Relaxed);
+        if self.cancel_exited.load(Ordering::Relaxed) {
+            return Ok(CancelEvidence::Stopped(AttemptStatus {
+                phase: AttemptPhase::Exited { code: 0 },
+                backend_ref: "c1".to_string(),
+                started_at_ms: Some(1),
+                finished_at_ms: Some(2),
+                detail: None,
+            }));
+        }
+        if self.cancel_lost.load(Ordering::Relaxed) {
+            return Ok(CancelEvidence::Stopped(AttemptStatus {
+                phase: AttemptPhase::SystemError {
+                    reason: "node evicted".to_string(),
+                },
+                backend_ref: "c1".to_string(),
+                started_at_ms: Some(1),
+                finished_at_ms: Some(2),
+                detail: None,
+            }));
+        }
+        Ok(CancelEvidence::AlreadyGone)
+    }
+    async fn fetch_logs(
+        &self,
+        _context: &FenceContext,
+        _limits: &LogLimits,
+    ) -> Result<LogTails, BackendError> {
+        if self.logs_fail.load(Ordering::Relaxed) {
+            return Err(BackendError::Api("log stream truncated".to_string()));
+        }
+        self.logs_started.notify_one();
+        self.logs_release.notified().await;
+        Ok(LogTails::default())
+    }
+    async fn fetch_output(
+        &self,
+        _context: &FenceContext,
+        _path: &str,
+    ) -> Result<TaskOutput, BackendError> {
+        Err(BackendError::InvalidSpec("no output".to_string()))
+    }
+    async fn list_outputs(
+        &self,
+        _context: &FenceContext,
+        _pattern: &str,
+    ) -> Result<Vec<String>, BackendError> {
+        if self.capture_hangs.load(Ordering::Relaxed) {
+            std::future::pending::<()>().await;
+        }
+        if self.capture_fails.load(Ordering::Relaxed) {
+            return Err(BackendError::Unavailable("exec stream dropped".to_string()));
+        }
+        Err(BackendError::InvalidSpec("no listing".to_string()))
+    }
+    async fn reconcile(&self, _context: &FenceContext) -> ReconcileEvidence {
+        match self.reconcile {
+            StubReconcile::NotFound => ReconcileEvidence::Absent,
+            StubReconcile::Unavailable => {
+                ReconcileEvidence::Unavailable(BackendError::Unavailable("down".to_string()))
+            }
+            StubReconcile::Waiting => ReconcileEvidence::Absent,
+            StubReconcile::Pending => {
+                self.reconcile_started.notify_one();
+                std::future::pending::<ReconcileEvidence>().await
+            }
+            StubReconcile::Adopted => ReconcileEvidence::Adoptable(AdoptableEvidence {
+                status: AttemptStatus {
+                    phase: AttemptPhase::Running,
+                    backend_ref: "attempt".to_string(),
+                    started_at_ms: Some(1),
+                    finished_at_ms: None,
+                    detail: None,
+                },
+                resume: ResumePoint::Observe,
+            }),
+        }
+    }
+    async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
+        Ok(())
+    }
+}
+
+fn fence(attempt: &AttemptRef) -> FenceContext {
+    FenceContext {
+        attempt: attempt.clone(),
+        attempt_epoch: 1,
+        controller_generation: 1,
+    }
+}
+
+#[test]
+fn exit_message_bounds() {
+    // An over-long detail must not push the message past the stored cap,
+    // because storage drops an over-cap message entirely.
+    assert_eq!(exit_message(2, None), "container exited with code 2");
+    assert_eq!(exit_message(2, Some("  ")), "container exited with code 2");
+    assert_eq!(
+        exit_message(2, Some(" Error: boom ")),
+        "container exited with code 2: Error: boom"
+    );
+
+    let detail = "a".repeat(MAX_MESSAGE_BYTES) + "end";
+    let message = exit_message(2, Some(&detail));
+    assert!(message.len() <= MAX_MESSAGE_BYTES);
+    assert!(message.starts_with("container exited with code 2: "));
+    assert!(message.ends_with("end"));
+}
+
+#[tokio::test]
+async fn denied_write_blocks() {
+    // Queued execution must not outlive the submitter's group write access.
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = task_context(storage);
+    let spec = execution_spec();
+    let job_id = job_id();
+    let mut record = JobRecord::new(
+        job_id,
+        JobPayload::Execution(spec.clone()),
+        UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+        node_id(7),
+        1,
+        1,
+        None,
+    );
+    record.workspace_mode = WorkspaceMode::Existing;
+    let bucket = "shared-workspace".to_string();
+    record.workspace_bucket = Some(bucket.clone());
+
+    let Err(error) = prepare_workspace(&context, &spec, &record, node_id(7), &bucket).await else {
+        panic!("workspace preparation unexpectedly succeeded");
+    };
+    assert_eq!(error.kind, JobErrorKind::Permanent);
+    assert!(
+        matches!(
+            drive(GetBucketOperation::new(bucket.clone()), context.as_ref())
+                .await
+                .unwrap_err(),
+            GetBucketError::NotFound
+        ),
+        "a run never creates the bucket it names"
+    );
+
+    let mint = workspace_mint(&context, &spec, &record, node_id(7), (&bucket, None));
+    let Err(error) = Box::pin(drive(mint, &context)).await else {
+        panic!("workspace credential mint unexpectedly succeeded");
+    };
+    assert_eq!(error.kind, JobErrorKind::Permanent);
+}
+
+/// A claimed execution job in `Ready` with its attempt intent written, i.e.
+/// the exact state at the moment `backend.submit()` fails.
+async fn ready_with_intent(context: &DriverContext) -> (JobRecord, ulid::Ulid, AttemptRef) {
+    let job_id = job_id();
+    let record = JobRecord::new(
+        job_id,
+        JobPayload::Execution(execution_spec()),
+        UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+        node_id(7),
+        1,
+        1,
+        None,
+    );
+    insert_job(context, &record).await.unwrap();
+    let ClaimOutcome::Claimed(claimed) = claim_job(context, job_id, node_id(7), 2).await.unwrap()
+    else {
+        panic!("claim failed");
+    };
+    let token = claimed.claim.as_ref().unwrap().claim_token;
+    transition_to_preparing(context, job_id, token, 3)
+        .await
+        .unwrap();
+    transition_to_ready(context, job_id, token, 4)
+        .await
+        .unwrap();
+    let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), claimed.attempts);
+    let intent = AttemptIntent {
+        attempt_no: claimed.attempts,
+        external_name: attempt.external_name(),
+        executor_kind: "docker".to_string(),
+        pinned_image:
+            "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        attempt_epoch: 0,
+    };
+    let record = record_attempt_intent(context, job_id, token, intent, None, None, 5)
+        .await
+        .unwrap();
+    (record.record, token, attempt)
+}
+
+// A submit error with an unobservable backend parks the job Indeterminate and
+// keeps the write-ahead intent, so container a{N} stays adoptable, never a{N+1}.
+#[tokio::test]
+async fn ambiguous_submit_parks() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let ctx = task_context(storage.clone());
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
+    let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::Unavailable);
+
+    recover_failed_submit(
+        &ctx,
+        record.job_id,
+        token,
+        &backend,
+        &fence(&attempt),
+        &execution_spec(),
+        "ws-test",
+        &CancellationToken::new(),
+        BackendError::Unavailable("io fault".to_string()),
+    )
+    .await;
+
+    let stored = read_job_record(&ctx, record.job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Indeterminate);
+    assert_eq!(stored.attempts, 1, "the park charges an attempt");
+    let intent = stored.attempt_intent.expect("intent retained");
+    assert_eq!(intent.external_name, attempt.external_name());
+}
+
+// An output-inventory failure at finalize parks the job for a retry instead
+// of terminalizing Succeeded with a false-empty output manifest.
+#[tokio::test]
+async fn inventory_failure_parks() {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
+    use byteview::ByteView;
+
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let (ctx, _net) = net_context(storage.clone()).await;
+    let (record, token, _attempt) = ready_with_intent(&context).await;
+    let job_id = record.job_id;
+    begin_external_running(&context, job_id, token, None, 6)
+        .await
+        .unwrap();
+
+    // Poison the workspace listing: an undecodable head row fails the scan.
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            key: ByteView::from(b"ws-test/poison".to_vec()),
+            value: ByteView::from(vec![0xFF]),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected write event: {other:?}"),
+    }
+
+    let mut spec = execution_spec();
+    spec.file_outputs.push(OutputSelection {
+        container_path: "/out/result".to_string(),
+        path_prefix: None,
+        destination_node_id: Some(ctx.net_handle.as_ref().unwrap().node_id()),
+        destination: OutputDestination::S3 {
+            bucket: "dest".to_string(),
+            key: "result".to_string(),
+        },
+        name: None,
+        description: None,
+    });
+    spec.output_prefixes = vec!["poison".to_string()];
+    let epoch = record.attempt_intent.as_ref().unwrap().attempt_epoch;
+    let control = read_attempt_control(&context, job_id, epoch, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        Box::pin(collect_or_park(
+            &ctx, job_id, token, &spec, "ws-test", &control,
+        ))
+        .await
+        .is_none()
+    );
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Indeterminate);
+    assert!(stored.result.is_none(), "no false-empty manifest recorded");
+}
+
+// Infrastructure evidence proves nothing about the job, so a system error must
+// park instead of writing a terminal row the family would read as a verdict.
+#[tokio::test]
+async fn system_error_parks() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let mut ctx = task_context(storage.clone());
+    Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
+    let job_id = record.job_id;
+    begin_external_running(&ctx, job_id, token, Some(1), 6)
+        .await
+        .unwrap();
+    let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
+
+    Box::pin(finalize_attempt(
+        &ctx,
+        job_id,
+        token,
+        &backend,
+        &fence(&attempt),
+        &execution_spec(),
+        "ws-test",
+        Ok(AttemptStatus {
+            phase: AttemptPhase::SystemError {
+                reason: "node evicted".to_string(),
+            },
+            backend_ref: "c1".to_string(),
+            started_at_ms: Some(1),
+            finished_at_ms: Some(2),
+            detail: None,
+        }),
+        &CancellationToken::new(),
+    ))
+    .await;
+
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
+    assert_eq!(stored.state, JobState::Indeterminate);
+    assert!(!stored.locally_exhausted);
+    assert!(stored.finished_at_ms.is_none());
+    assert_eq!(
+        stored.last_error.as_ref().map(|error| error.kind),
+        Some(JobErrorKind::Retryable)
+    );
+}
+
+// A stopped cancellation whose only evidence is infrastructure must terminalize
+// as Cancelled: a Failed row would read as a job-specific verdict.
+#[tokio::test]
+async fn cancel_lost_evidence() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let mut ctx = task_context(storage.clone());
+    Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
+    let job_id = record.job_id;
+    begin_external_running(&ctx, job_id, token, Some(1), 6)
+        .await
+        .unwrap();
+    let stub = StubBackend::new(StubReconcile::NotFound);
+    stub.cancel_lost.store(true, Ordering::Relaxed);
+    stub.logs_release.notify_one();
+    let backend: Arc<dyn ExecutorBackend> = stub;
+
+    Box::pin(finalize_cancel(
+        &ctx,
+        job_id,
+        token,
+        &backend,
+        &fence(&attempt),
+        &execution_spec(),
+        "ws-test",
+    ))
+    .await;
+
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert!(stored.finished_at_ms.is_some());
+}
+
+// A retryably failing capture must terminalize at the attempt cap; without the
+// charge it parks Indeterminate and the lease sweep re-drives it forever.
+#[tokio::test]
+async fn capture_failure_caps() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let mut ctx = task_context(storage.clone());
+    Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
+    let job_id = record.job_id;
+    begin_external_running(&ctx, job_id, token, Some(1), 6)
+        .await
+        .unwrap();
+    let stub = StubBackend::new(StubReconcile::NotFound);
+    stub.logs_fail.store(true, Ordering::Relaxed);
+    let backend: Arc<dyn ExecutorBackend> = stub;
+
+    for _ in 0..JOB_MAX_ATTEMPTS {
+        Box::pin(finalize_attempt(
+            &ctx,
+            job_id,
+            token,
+            &backend,
+            &fence(&attempt),
+            &execution_spec(),
+            "ws-test",
+            Ok(AttemptStatus {
+                phase: AttemptPhase::Exited { code: 0 },
+                backend_ref: "c1".to_string(),
+                started_at_ms: Some(1),
+                finished_at_ms: Some(2),
+                detail: None,
+            }),
+            &CancellationToken::new(),
+        ))
+        .await;
+    }
+
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
+    assert_eq!(stored.state, JobState::Indeterminate);
+    assert!(stored.locally_exhausted);
+    assert_eq!(stored.attempts, JOB_MAX_ATTEMPTS);
+    assert!(stored.claim.is_none());
+    assert!(
+        matches!(stored.result, Some(JobResultPayload::Execution { .. })),
+        "cleanup and the run crate need a result"
+    );
+}
+
+/// A run that exited 0 and captures one wildcard output.
+fn capture_spec(node: aruna_core::id::NodeId) -> ExecutionSpec {
+    let mut spec = execution_spec();
+    spec.file_outputs
+        .push(aruna_core::structs::execution::job::OutputSelection {
+            container_path: "/out/*".to_string(),
+            path_prefix: Some("/out".to_string()),
+            destination_node_id: Some(node),
+            destination: aruna_core::structs::execution::job::OutputDestination::S3 {
+                bucket: "dest".to_string(),
+                key: "results/".to_string(),
+            },
+            name: None,
+            description: None,
+        });
+    spec
+}
+
+fn exited_zero() -> Result<AttemptStatus, BackendError> {
+    Ok(AttemptStatus {
+        phase: AttemptPhase::Exited { code: 0 },
+        backend_ref: "c1".to_string(),
+        started_at_ms: Some(1),
+        finished_at_ms: Some(2),
+        detail: None,
+    })
+}
+
+// A cancel during output capture stops the capture and settles the run as cancelled.
+#[tokio::test]
+async fn cancel_stops_capture() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let (ctx, net) = net_context(storage.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
+    let job_id = record.job_id;
+    begin_external_running(&context, job_id, token, Some(1), 6)
+        .await
+        .unwrap();
+    let stub = StubBackend::new(StubReconcile::NotFound);
+    stub.capture_hangs.store(true, Ordering::Relaxed);
+    let backend: Arc<dyn ExecutorBackend> = stub;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    // Only a lost cancel would block here; the cap reports that instead of hanging the suite.
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        Box::pin(finalize_attempt(
+            &ctx,
+            job_id,
+            token,
+            &backend,
+            &fence(&attempt),
+            &capture_spec(net.node_id()),
+            "ws-test",
+            exited_zero(),
+            &cancel,
+        )),
+    )
+    .await
+    .expect("capture ignored the cancel");
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert!(stored.claim.is_none());
+    net.shutdown().await;
+}
+
+// A capture that fails after a cancel settles as cancelled; parking it would retry the run
+// and, once local attempts ran out, let the family place it on another node.
+#[tokio::test]
+async fn cancelled_capture_settles() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let (ctx, net) = net_context(storage.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
+    let job_id = record.job_id;
+    begin_external_running(&context, job_id, token, Some(1), 6)
+        .await
+        .unwrap();
+    set_cancel_requested(&context, job_id, 7).await.unwrap();
+    let stub = StubBackend::new(StubReconcile::NotFound);
+    stub.capture_fails.store(true, Ordering::Relaxed);
+    stub.cancel_exited.store(true, Ordering::Relaxed);
+    stub.logs_release.notify_one();
+    let backend: Arc<dyn ExecutorBackend> = stub;
+
+    Box::pin(finalize_attempt(
+        &ctx,
+        job_id,
+        token,
+        &backend,
+        &fence(&attempt),
+        &capture_spec(net.node_id()),
+        "ws-test",
+        exited_zero(),
+        &CancellationToken::new(),
+    ))
+    .await;
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert_eq!(stored.attempts, record.attempts);
+    net.shutdown().await;
+}
+
+// A cancelled run whose last local attempt parks settles as cancelled, not as an
+// exhausted error the family would place on another node.
+#[tokio::test]
+async fn cancelled_exhaustion_settles() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let mut ctx = task_context(storage.clone());
+    Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
+    let job_id = record.job_id;
+    begin_external_running(&ctx, job_id, token, Some(1), 6)
+        .await
+        .unwrap();
+    mutate_job(&ctx, job_id, |record| {
+        record.attempts = JOB_MAX_ATTEMPTS - 1;
+        Ok(aruna_operations::jobs::store::JobMutation::Persist)
+    })
+    .await
+    .unwrap();
+    set_cancel_requested(&ctx, job_id, 7).await.unwrap();
+    let stub = StubBackend::new(StubReconcile::NotFound);
+    stub.logs_fail.store(true, Ordering::Relaxed);
+    stub.cancel_exited.store(true, Ordering::Relaxed);
+    let backend: Arc<dyn ExecutorBackend> = stub;
+
+    Box::pin(finalize_attempt(
+        &ctx,
+        job_id,
+        token,
+        &backend,
+        &fence(&attempt),
+        &execution_spec(),
+        "ws-test",
+        exited_zero(),
+        &CancellationToken::new(),
+    ))
+    .await;
+
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert!(!stored.locally_exhausted);
+    assert_eq!(stored.attempts, JOB_MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn finalize_renews_lease() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let mut ctx = task_context(storage.clone());
+    Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
+    let job_id = record.job_id;
+    begin_external_running(&ctx, job_id, token, None, unix_timestamp_millis())
+        .await
+        .unwrap();
+    let backend = StubBackend::new(StubReconcile::NotFound);
+
+    let task = tokio::spawn(supervise_and_finalize(
+        ctx.clone(),
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        execution_spec(),
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    ));
+    backend.logs_started.notified().await;
+    let before = read_job_record(&ctx, job_id, None)
+        .await
+        .unwrap()
+        .unwrap()
+        .claim
+        .unwrap()
+        .lease_expires_ms;
+
+    tokio::time::pause();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(JOB_HEARTBEAT_MS)).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+    let mut after = before;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        after = read_job_record(&ctx, job_id, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .claim
+            .unwrap()
+            .lease_expires_ms;
+        if after > before {
+            break;
+        }
+    }
+    assert!(after > before);
+
+    backend.logs_release.notify_one();
+    task.await.unwrap();
+}
+
+/// A context that can sign: terminal success stores an output record, which
+/// needs this node's key.
+async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_net::NetHandle) {
+    let net = aruna_net::NetHandle::new(
+        aruna_net::NetConfig {
+            realm_id: aruna_core::structs::identity::realm::RealmId([1; 32]),
+            ..aruna_operations::testing::local_net()
+        },
+        storage.clone(),
+    )
+    .await
+    .unwrap();
+    let context = Arc::new(DriverContext {
+        storage_handle: storage,
+        net_handle: Some(net.clone()),
+        blob_handle: None,
+        metadata_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    (context, net)
+}
+
+/// A session job's spec: the tags the node writes at submit, and a short
+/// idle wait so the timer test does not depend on the realm default.
+fn session_spec(idle_after_ms: Option<u64>) -> ExecutionSpec {
+    use aruna_core::compute::runtimes::{
+        SESSION_IDLE_TAG, SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+    };
+    let mut spec = execution_spec();
+    spec.tags
+        .insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+    spec.tags.insert(
+        SESSION_RUNTIME_TAG.to_string(),
+        "python-notebook".to_string(),
+    );
+    if let Some(idle) = idle_after_ms {
+        spec.tags
+            .insert(SESSION_IDLE_TAG.to_string(), idle.to_string());
+    }
+    spec
+}
+
+/// A context whose compute plane can register sessions.
+async fn session_context(
+    storage: StorageHandle,
+    backend: Arc<dyn ExecutorBackend>,
+) -> (
+    Arc<DriverContext>,
+    aruna_net::NetHandle,
+    Arc<ExecutorRegistry>,
+) {
+    let (context, net) = net_context(storage).await;
+    let registry = Arc::new(ExecutorRegistry::new().with_backend(backend));
+    let mut context = context;
+    Arc::get_mut(&mut context).unwrap().compute_handle = Some(registry.clone());
+    (context, net, registry)
+}
+
+/// Waits for the supervisor to register the session it is about to watch.
+async fn wait_for_session(
+    registry: &Arc<ExecutorRegistry>,
+    job_id: JobId,
+    backend: &StubBackend,
+) -> Arc<Session> {
+    tokio::time::timeout(Duration::from_secs(120), backend.wait_started.notified())
+        .await
+        .expect("the supervisor never started waiting");
+    registry
+        .sessions()
+        .get(&job_id.to_string())
+        .expect("the supervisor registers its session before waiting")
+}
+
+#[tokio::test]
+async fn session_end_succeeds() {
+    // Ending a session finishes its job, so quota is released at once.
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
+    let job_id = record.job_id;
+    mutate_job(&context, job_id, |record| {
+        record.payload = JobPayload::Execution(session_spec(None));
+        Ok(aruna_operations::jobs::store::JobMutation::Persist)
+    })
+    .await
+    .unwrap();
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
+        .await
+        .unwrap();
+
+    let supervisor = tokio::spawn(supervise_and_finalize(
+        ctx.clone(),
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        session_spec(None),
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    ));
+    let session = wait_for_session(&registry, job_id, &backend).await;
+    session.end(EndReason::Ended);
+    supervisor.await.unwrap();
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Succeeded);
+    assert!(stored.report_digest.is_some());
+    assert_eq!(session.finished().await, EndReason::Ended);
+    assert!(registry.sessions().get(&job_id.to_string()).is_none());
+    let query = aruna_operations::jobs::job_reports::ReportQuery {
+        expected_digest: None,
+        last_key: None,
+        limit: 10,
+    };
+    let report = read_owned_report(&ctx, stored.created_by, job_id, query)
+        .await
+        .unwrap();
+    let aruna_operations::jobs::job_reports::JobReportLookup::Ready { rows, .. } = report else {
+        panic!("ended session report must be readable");
+    };
+    assert_eq!(rows.len(), 1);
+    let row: SessionReportRow = postcard::from_bytes(&rows[0].1).unwrap();
+    assert_eq!(
+        row.detail,
+        SessionReportDetail::End {
+            reason: "ended".to_string()
+        }
+    );
+    net.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_idle_succeeds() {
+    // The idle timer finishes the job on its own, with reason `idle`.
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let (ctx, net, _registry) = session_context(storage.clone(), backend.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
+    let job_id = record.job_id;
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
+        .await
+        .unwrap();
+
+    supervise_and_finalize(
+        ctx,
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        session_spec(Some(1)),
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Succeeded);
+    net.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_kernel_fails() {
+    // A kernel that died is a permanent execution failure, not a clean end.
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
+    let job_id = record.job_id;
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
+        .await
+        .unwrap();
+
+    let supervisor = tokio::spawn(supervise_and_finalize(
+        ctx,
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        session_spec(None),
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    ));
+    wait_for_session(&registry, job_id, &backend)
+        .await
+        .end(EndReason::KernelExit);
+    supervisor.await.unwrap();
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Failed);
+    assert_eq!(stored.last_error.unwrap().message, "session kernel exited");
+    net.shutdown().await;
+}
+
+/// Moves virtual time past the next execution heartbeat so a rotated claim is
+/// noticed without a real wait.
+async fn skip_heartbeat() {
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(2 * JOB_HEARTBEAT_MS)).await;
+    tokio::time::resume();
+}
+
+// A lost claim while the attempt wait is still pending must stop and release
+// this node's session instead of leaking it in the registry.
+#[tokio::test]
+async fn superseded_releases_session() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
+    let job_id = record.job_id;
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
+        .await
+        .unwrap();
+
+    let supervisor = tokio::spawn(supervise_and_finalize(
+        ctx,
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        session_spec(None),
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    ));
+    let session = wait_for_session(&registry, job_id, &backend).await;
+    let taken_over = lose_claim(&context, job_id, token).await;
+
+    skip_heartbeat().await;
+    tokio::time::timeout(
+        Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000),
+        supervisor,
+    )
+    .await
+    .expect("the superseded supervisor must return")
+    .expect("the supervisor task must not panic");
+
+    assert_eq!(session.finished().await, EndReason::Cancelled);
+    assert!(
+        registry.sessions().get(&job_id.to_string()).is_none(),
+        "the superseded session must be released"
+    );
+    let after = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, taken_over, "a lost claim must not be written");
+    net.shutdown().await;
+}
+
+// A replacement registered under the same job id while the old attempt is
+// still supervised must survive the superseded supervisor's cleanup.
+#[tokio::test]
+async fn superseded_keeps_replacement() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
+    let job_id = record.job_id;
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
+        .await
+        .unwrap();
+
+    let supervisor = tokio::spawn(supervise_and_finalize(
+        ctx,
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        session_spec(None),
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    ));
+    let first = wait_for_session(&registry, job_id, &backend).await;
+    // The attempt's session ends without terminalizing, so a replacement can
+    // register under the same job id while the supervisor still waits.
+    first.end(EndReason::Cancelled);
+    let replacement = registry.sessions().open(
+        SessionConfig {
+            job_id: job_id.to_string(),
+            public_job_id: job_id.to_string(),
+            runtime: "python-notebook".to_string(),
+            workspace_bucket: "ws-test".to_string(),
+            executor_node_id: node_id(7).to_string(),
+            idle_after_ms: 600_000,
+            credential_expires_ms: 0,
+        },
+        backend.clone(),
+        fence(&attempt),
+    );
+    assert!(!Arc::ptr_eq(&first, &replacement));
+    let taken_over = lose_claim(&context, job_id, token).await;
+
+    skip_heartbeat().await;
+    tokio::time::timeout(
+        Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000),
+        supervisor,
+    )
+    .await
+    .expect("the superseded supervisor must return")
+    .expect("the supervisor task must not panic");
+
+    let registered = registry
+        .sessions()
+        .get(&job_id.to_string())
+        .expect("the replacement must survive the old cleanup");
+    assert!(Arc::ptr_eq(&registered, &replacement));
+    let after = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, taken_over, "a lost claim must not be written");
+    net.shutdown().await;
+}
+
+// A cancellation that ends supervision must still release the session.
+#[tokio::test]
+async fn cancel_releases_session() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let backend = StubBackend::new(StubReconcile::NotFound);
+    let (ctx, net, registry) = session_context(storage.clone(), backend.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
+    let job_id = record.job_id;
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
+        .await
+        .unwrap();
+    set_cancel_requested(&context, job_id, 7).await.unwrap();
+
+    supervise_and_finalize(
+        ctx,
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        session_spec(None),
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert!(
+        registry.sessions().get(&job_id.to_string()).is_none(),
+        "the session must be released"
+    );
+    net.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancel_beats_success() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let (ctx, net) = net_context(storage.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
+    let job_id = record.job_id;
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
+        .await
+        .unwrap();
+    let backend = StubBackend::new(StubReconcile::NotFound);
+
+    let task = tokio::spawn(supervise_and_finalize(
+        ctx,
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        execution_spec(),
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    ));
+    backend.logs_started.notified().await;
+    set_cancel_requested(&context, job_id, 7).await.unwrap();
+    backend.logs_release.notify_one();
+    task.await.unwrap();
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    net.shutdown().await;
+}
+
+#[tokio::test]
+async fn walltime_fails_job() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let mut ctx = task_context(storage.clone());
+    Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
+    let job_id = record.job_id;
+    begin_external_running(&ctx, job_id, token, Some(1), 6)
+        .await
+        .unwrap();
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let mut spec = execution_spec();
+    spec.resources.max_walltime_ms = Some(0);
+
+    supervise_and_finalize(
+        ctx.clone(),
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        spec,
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
+    assert_eq!(backend.cancels.load(Ordering::Relaxed), 1);
+    assert_eq!(stored.state, JobState::Failed);
+    assert_eq!(
+        stored.last_error.unwrap().message,
+        "walltime limit exceeded"
+    );
+}
+
+#[tokio::test]
+async fn arms_missing_start() {
+    // A record carrying no backend start evidence must still be capped,
+    // anchored at the moment supervision begins.
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let mut ctx = task_context(storage.clone());
+    Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
+    let job_id = record.job_id;
+    assert!(record.started_at_ms.is_none());
+    let backend = StubBackend::new(StubReconcile::Waiting);
+    let mut spec = execution_spec();
+    spec.resources.max_walltime_ms = Some(0);
+
+    supervise_and_finalize(
+        ctx.clone(),
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        spec,
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
+    assert_eq!(backend.cancels.load(Ordering::Relaxed), 1);
+    assert_eq!(stored.state, JobState::Failed);
+    assert_eq!(
+        stored.last_error.unwrap().message,
+        "walltime limit exceeded"
+    );
+}
+
+#[tokio::test]
+async fn anchor_survives_restart() {
+    // A crashlooping supervisor must not keep granting the attempt a fresh
+    // pre-Running window, so the first derived anchor is the durable one.
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let (record, token, _attempt) = ready_with_intent(&context).await;
+    let job_id = record.job_id;
+    assert!(record.started_at_ms.is_none());
+
+    let first = Box::pin(walltime_anchor(&context, job_id, token)).await;
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.started_at_ms, Some(first));
+    assert_eq!(
+        Box::pin(walltime_anchor(&context, job_id, token)).await,
+        first
+    );
+    // Backend start evidence never moves an anchor that already exists.
+    record_attempt_started(&context, job_id, token, first.saturating_add(60_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        Box::pin(walltime_anchor(&context, job_id, token)).await,
+        first
+    );
+}
+
+#[tokio::test]
+async fn reconcile_skips_submit() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let mut ctx = task_context(storage.clone());
+    Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
+    let job_id = record.job_id;
+    set_cancel_requested(&ctx, job_id, 6).await.unwrap();
+    let backend = StubBackend::new(StubReconcile::NotFound);
+
+    resume_attempt(
+        ctx.clone(),
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        AttemptPhase::Submitted,
+        execution_spec(),
+        "ws-test".to_string(),
+        record,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert!(backend.submits.lock().unwrap().is_empty());
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+}
+
+// Absence after intent retries the same name and retains the lineage.
+#[tokio::test]
+async fn absent_retries_same() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let ctx = task_context(storage.clone());
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
+    let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
+
+    recover_failed_submit(
+        &ctx,
+        record.job_id,
+        token,
+        &backend,
+        &fence(&attempt),
+        &execution_spec(),
+        "ws-test",
+        &CancellationToken::new(),
+        BackendError::Unavailable("io fault".to_string()),
+    )
+    .await;
+
+    let stored = read_job_record(&ctx, record.job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Indeterminate);
+    assert_eq!(stored.attempts, 1);
+    assert!(stored.attempt_intent.is_some());
+}
+
+// A mounted session recovered after its first submit minted the run credential submits again
+// with that credential, which carries the workspace and the input view together.
+#[tokio::test]
+async fn recovery_reuses_credential() {
+    use aruna_core::structs::execution::job::{
+        CapturedInput, InputContent, InputMode, InputSelection, InputSource,
+    };
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let (mut ctx, net) = net_context(storage.clone()).await;
+    let backend = StubBackend::new(StubReconcile::NotFound);
+    backend.mounts.store(true, Ordering::Relaxed);
+    let registry = ExecutorRegistry::new()
+        .with_backend(backend.clone())
+        .with_workspace_endpoint(Some("http://s3.test".to_string()), String::new());
+    Arc::get_mut(&mut ctx).unwrap().compute_handle = Some(Arc::new(registry));
+    let (record, token, attempt) = ready_with_intent(&context).await;
+    let local = net.node_id();
+    let mut spec = session_spec(None);
+    spec.executor_constraint = Some("docker".to_string());
+    spec.inputs.push(InputSelection {
+        source: InputSource::S3 {
+            bucket: "bakta".to_string(),
+            key: "db/bakta.db".to_string(),
+            version_id: Some(Ulid::from_parts(1, 1).to_string()),
+        },
+        source_node_id: None,
+        dest_key: "db/bakta.db".to_string(),
+        mode: InputMode::Mount,
+        container_path: Some("/db/bakta.db".to_string()),
+        name: None,
+        description: None,
+    });
+    let captured = CapturedInput {
+        destination_key: "db/bakta.db".to_string(),
+        source_node_id: local,
+        version_id: Ulid::from_parts(1, 1),
+        content: InputContent::Blake3([1; 32]),
+        bytes: 1,
+        policies: Vec::new(),
+        source_group_id: spec.group_id,
+        public: false,
+        link: None,
+        source_pin: None,
+        database: None,
+        releases: Vec::new(),
+        releases_complete: false,
+        grant: None,
+        served_by: None,
+    };
+    let scope = (RealmId([1; 32]), spec.group_id, local);
+    let owner = aruna_operations::testing_access::seed_access(&ctx, scope, "/none")
+        .await
+        .user_id;
+    let record = mutate_job(&context, record.job_id, |record| {
+        record.payload = JobPayload::Execution(spec.clone());
+        record.created_by = owner;
+        record.captured_inputs = vec![captured.clone()];
+        record.workspace_bucket = Some("ws-test".to_string());
+        Ok(aruna_operations::jobs::store::JobMutation::Persist)
+    })
+    .await
+    .unwrap();
+    let first = Box::pin(prepare_attempt(&ctx, &spec, &record, local, "ws-test"))
+        .await
+        .unwrap();
+    assert_eq!(first.mounts.len(), 1);
+    let fence = fence(&attempt);
+    let dyn_backend: Arc<dyn ExecutorBackend> = backend.clone();
+    recover_failed_submit(
+        &ctx,
+        record.job_id,
+        token,
+        &dyn_backend,
+        &fence,
+        &spec,
+        "ws-test",
+        &CancellationToken::new(),
+        BackendError::Unavailable("io fault".to_string()),
+    )
+    .await;
+    assert_eq!(backend.submits.lock().unwrap().len(), 1);
+    net.shutdown().await;
+}
+
+// A batch run inside its bucket gets a session's credential and endpoint where its backend
+// gives sessions S3 access; elsewhere it runs without one, as before.
+#[tokio::test]
+async fn workspace_run_credential() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let (mut ctx, net) = net_context(storage.clone()).await;
+    let backend = StubBackend::new(StubReconcile::NotFound);
+    let registry = ExecutorRegistry::new()
+        .with_backend(backend.clone())
+        .with_workspace_endpoint(Some("http://s3.test".to_string()), String::new());
+    Arc::get_mut(&mut ctx).unwrap().compute_handle = Some(Arc::new(registry));
+    let (record, _token, _attempt) = ready_with_intent(&context).await;
+    let local = net.node_id();
+    let mut spec = execution_spec();
+    spec.executor_constraint = Some("docker".to_string());
+    let scope = (RealmId([1; 32]), spec.group_id, local);
+    let owner = aruna_operations::testing_access::seed_access(&ctx, scope, "/none")
+        .await
+        .user_id;
+    let record = mutate_job(&context, record.job_id, |record| {
+        record.payload = JobPayload::Execution(spec.clone());
+        record.created_by = owner;
+        record.workspace_mode = WorkspaceMode::Existing;
+        record.workspace_bucket = Some("ws-test".to_string());
+        Ok(aruna_operations::jobs::store::JobMutation::Persist)
+    })
+    .await
+    .unwrap();
+    let prepare = || prepare_attempt(&ctx, &spec, &record, local, "ws-test");
+    let plain = Box::pin(prepare()).await.unwrap();
+    assert!(plain.workspace.is_none());
+    assert!(plain.secrets.is_empty());
+
+    backend.sessions.store(true, Ordering::Relaxed);
+    let bound = Box::pin(prepare()).await.unwrap();
+    let workspace = bound.workspace.expect("workspace binding");
+    assert_eq!(workspace.bucket_name, "ws-test");
+    assert_eq!(workspace.s3_endpoint, "http://s3.test");
+    assert!(bound.secrets.contains_key("AWS_ACCESS_KEY_ID"));
+    assert!(bound.secrets.contains_key("AWS_SECRET_ACCESS_KEY"));
+    net.shutdown().await;
+}
+
+// A re-driven crate job must return the already-written resource, not mint a
+// second document; without the durable-status return it fails on no net handle.
+#[tokio::test]
+async fn crate_write_idempotent() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let driver = task_context(storage.clone());
+    let (record, token, _attempt) = ready_with_intent(&driver).await;
+    let job_id = record.job_id;
+
+    put_crate_status(
+        &driver,
+        job_id,
+        &aruna_core::structs::execution::job::RunCrateStatus::Written {
+            resource: "already-there".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let ctx = JobContext {
+        driver: task_context(storage.clone()),
+        job_id,
+        owner_node_id: record.owner_node_id,
+        claim_token: token,
+        final_attempt: false,
+        cancel: CancellationToken::new(),
+        shutdown: CancellationToken::new(),
+        progress: ProgressReporter::from_progress(&record.progress),
+        range_turns: Default::default(),
+        handlers: Default::default(),
+    };
+    let write = super::run_crate::WriteCrateOperation::new(job_id, ctx.driver.node_and_realm());
+    let outcome = super::run_crate::crate_outcome(drive(write, &ctx.driver).await);
+    match outcome {
+        JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource }) => {
+            assert_eq!(resource, "already-there");
+        }
+        _ => panic!("re-drive must return the already-written resource"),
+    }
+}
+
+#[test]
+fn defaults_task_walltime() {
+    let spec = build_task_spec(
+        &execution_spec(),
+        &AttemptRef::new("job", 1),
+        "alpine@sha256:digest",
+        PreparedTask {
+            inputs: Vec::new(),
+            mounts: Vec::new(),
+            secrets: BTreeMap::new(),
+            staging: StagingMode::Files,
+            workspace: None,
+        },
+        NOBODY,
+    );
+
+    assert_eq!(
+        spec.resources.max_walltime,
+        Some(Duration::from_secs(86_400))
+    );
+}
+
+#[test]
+fn carries_backend_identity() {
+    // The manifest must report the backend's real identity, not the 65534 default.
+    let run_as = UserSpec {
+        uid: NOBODY.uid ^ 1,
+        gid: NOBODY.gid ^ 1,
+    };
+    let spec = build_task_spec(
+        &execution_spec(),
+        &AttemptRef::new("job", 1),
+        "alpine@sha256:digest",
+        PreparedTask {
+            inputs: Vec::new(),
+            mounts: Vec::new(),
+            secrets: BTreeMap::new(),
+            staging: StagingMode::Files,
+            workspace: None,
+        },
+        run_as,
+    );
+
+    assert_eq!(spec.security.run_as, run_as);
+}
+
+#[test]
+fn carries_network_access() {
+    let mut execution = execution_spec();
+    execution
+        .tags
+        .insert(NETWORK_TAG_KEY.to_string(), "open".to_string());
+    let spec = build_task_spec(
+        &execution,
+        &AttemptRef::new("job", 1),
+        "alpine@sha256:digest",
+        PreparedTask {
+            inputs: Vec::new(),
+            mounts: Vec::new(),
+            secrets: BTreeMap::new(),
+            staging: StagingMode::Files,
+            workspace: None,
+        },
+        NOBODY,
+    );
+
+    assert_eq!(spec.security.network, NetworkAccess::Open);
+}
+
+/// Writes the receipted reservation and the node subject a fenced start
+/// compares against.
+async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, digest: [u8; 32]) {
+    use aruna_core::compute::quota::JobReservationRecord;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{JOB_RESERVATION_KEYSPACE, NODE_SUBJECT_KEYSPACE};
+    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+    use aruna_core::structs::placement::policy::PlacementSubject;
+
+    let reservation = JobReservationRecord {
+        execution_id: Ulid::from_bytes([0xA1; 16]),
+        job_id,
+        logical_job_id: job_id,
+        resources: aruna_core::structs::execution::job::EffectiveResources {
+            cpu_cores: 1,
+            ram_bytes: 1,
+            disk_bytes: 0,
+            max_walltime_ms: 1_000,
+            preemptible: false,
+        },
+        created_at_ms: 1,
+        subject_generation: generation,
+        subject_digest: digest,
+    };
+    let _ = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: JOB_RESERVATION_KEYSPACE.to_string(),
+            key: reservation.execution_id.to_bytes().as_slice().into(),
+            value: postcard::to_allocvec(&reservation).unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    let record = NodeSubjectRecord::seed(PlacementSubject {
+        node_id: node_id(7),
+        generation: 1,
+        location: "eu-west".to_string(),
+        labels: Default::default(),
+        executor_kind: None,
+        local_to_controller: true,
+    })
+    .unwrap();
+    let _ = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+            key: NODE_SUBJECT_KEY.to_vec().into(),
+            value: record.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+}
+
+fn compute_context(storage: StorageHandle) -> Arc<DriverContext> {
+    let mut registry = aruna_compute::ExecutorRegistry::new();
+    registry.register(StubBackend::new(StubReconcile::NotFound));
+    Arc::new(DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        graph_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: Some(Arc::new(registry)),
+        outbound_handle: None,
+    })
+}
+
+#[tokio::test]
+async fn unreceipted_start_unfenced() {
+    // A local job never reserved capacity, so no receipt fences its start.
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let ctx = compute_context(storage.clone());
+
+    assert!(
+        resolve_backend(&ctx, &execution_spec(), job_id())
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn drifted_site_refuses() {
+    // The receipt stored one execution site; a node advertising another one
+    // must refuse to start the accepted work, retryably.
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let ctx = compute_context(storage.clone());
+    let job_id = job_id();
+    store_site(&context, job_id, 99, [7u8; 32]).await;
+
+    let Err(error) = resolve_backend(&ctx, &execution_spec(), job_id).await else {
+        panic!("a drifted subject must refuse the start");
+    };
+    assert_eq!(error.kind, JobErrorKind::Retryable);
+    assert!(error.message.contains("drifted"));
+}
+
+#[tokio::test]
+async fn drift_requeues_attempt() {
+    // A fenced refusal must return the job to the queue, not terminalize it:
+    // the site may return, or another target may take the work.
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let ctx = compute_context(storage.clone());
+    let (record, token, _) = ready_with_intent(&context).await;
+    store_site(&context, record.job_id, 99, [7u8; 32]).await;
+    let Err(error) = resolve_backend(&ctx, &execution_spec(), record.job_id).await else {
+        panic!("a drifted subject must refuse the start");
+    };
+
+    pre_submit_failure(&ctx, record.job_id, token, &record, error, false).await;
+
+    let stored = read_job_record(&context, record.job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Queued);
+    assert!(
+        stored
+            .last_error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("drifted"))
+    );
+}
+
+#[tokio::test]
+async fn stored_site_starts() {
+    // The exact stored generation and digest still admit the start.
+    use aruna_compute::ExecutorRegistry;
+    use aruna_core::compute::ExecutorCapability;
+    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+    use aruna_core::structs::placement::policy::PlacementSubject;
+
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let ctx = compute_context(storage.clone());
+    let job_id = job_id();
+    let subject = NodeSubjectRecord::seed(PlacementSubject {
+        node_id: node_id(7),
+        generation: 1,
+        location: "eu-west".to_string(),
+        labels: Default::default(),
+        executor_kind: None,
+        local_to_controller: true,
+    })
+    .unwrap()
+    .subject;
+    let registry = ExecutorRegistry::new().with_backend(StubBackend::new(StubReconcile::NotFound));
+    let capability: ExecutorCapability = registry
+        .capabilities(&subject, false)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    store_site(
+        &context,
+        job_id,
+        capability.subject.generation,
+        capability.subject_digest,
+    )
+    .await;
+
+    assert!(
+        resolve_backend(&ctx, &execution_spec(), job_id)
+            .await
+            .is_ok()
+    );
+}
+
+/// A claimed external execution exactly as `run_execution_job` receives it,
+/// with a context that resolves `backend`.
+async fn claimed_execution(
+    context: &DriverContext,
+    backend: Arc<StubBackend>,
+) -> (
+    Arc<DriverContext>,
+    aruna_net::NetHandle,
+    JobRecord,
+    ulid::Ulid,
+) {
+    let (context, net) = net_context(context.storage_handle.clone()).await;
+    let mut context = context;
+    Arc::get_mut(&mut context).unwrap().compute_handle =
+        Some(Arc::new(ExecutorRegistry::new().with_backend(backend)));
+
+    let job_id = job_id();
+    let record = JobRecord::new(
+        job_id,
+        JobPayload::Execution(execution_spec()),
+        UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+        node_id(7),
+        1,
+        1,
+        None,
+    );
+    insert_job(&context, &record).await.unwrap();
+    let ClaimOutcome::Claimed(claimed) = claim_job(&context, job_id, node_id(7), 2).await.unwrap()
+    else {
+        panic!("claim failed");
+    };
+    let token = claimed.claim.as_ref().unwrap().claim_token;
+    (context, net, claimed, token)
+}
+
+/// Rotate or release the claim so the running heartbeat's next renewal loses
+/// the token: a recorded intent rotates it, a still-staging job is released.
+async fn lose_claim(context: &DriverContext, job_id: JobId, token: ulid::Ulid) -> JobRecord {
+    handoff_external_attempt(context, job_id, token, unix_timestamp_millis())
+        .await
+        .unwrap();
+    let taken_over = read_job_record(context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        taken_over
+            .claim
+            .as_ref()
+            .is_none_or(|claim| claim.claim_token != token),
+        "the stored claim must no longer match the run's token"
+    );
+    taken_over
+}
+
+// The reconciliation select may consume the heartbeat's completion when the
+// claim is lost; polling the finished handle again panics and must not adopt.
+#[tokio::test]
+async fn heartbeat_consumed_once() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let backend = StubBackend::new(StubReconcile::Pending);
+    let (ctx, net, record, token) = claimed_execution(&context, backend.clone()).await;
+    let job_id = record.job_id;
+
+    let run = tokio::spawn(run_execution_job(ctx, record, CancellationToken::new()));
+    backend.reconcile_started.notified().await;
+    assert_eq!(backend.submits.lock().unwrap().len(), 1);
+    let taken_over = lose_claim(&context, job_id, token).await;
+
+    // The heartbeat notices the rotated token at its next real interval; the
+    // claim-loss path must consume that completion exactly once.
+    tokio::time::timeout(Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000), run)
+        .await
+        .expect("the heartbeat completion must be consumed exactly once")
+        .expect("the workflow task must not panic");
+
+    let after = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, taken_over, "a lost claim must not be written");
+    assert_eq!(after.state, JobState::Ready);
+    assert!(after.result.is_none());
+    assert_eq!(
+        backend.submits.lock().unwrap().len(),
+        1,
+        "recovery must not submit again"
+    );
+    net.shutdown().await;
+}
+
+// Recovery's adoption verdict starts supervision; the still-pending heartbeat
+// is stopped and awaited once before the adopted attempt is supervised.
+#[tokio::test]
+async fn recovery_wins_adoption() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let backend = StubBackend::new(StubReconcile::Adopted);
+    backend.logs_fail.store(true, Ordering::Relaxed);
+    let (ctx, net, record, _token) = claimed_execution(&context, backend.clone()).await;
+    let job_id = record.job_id;
+
+    Box::pin(run_execution_job(ctx, record, CancellationToken::new())).await;
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(stored.state, JobState::Ready, "the adopted attempt ran");
+    assert!(stored.started_at_ms.is_some());
+    assert_eq!(
+        backend.submits.lock().unwrap().len(),
+        1,
+        "adoption must not submit again"
+    );
+    net.shutdown().await;
+}
+
+// A lease renewal failure ends the run while preparation is still pending; the
+// lost claim must not be written to or submitted to.
+#[tokio::test]
+async fn heartbeat_failure_stops() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let backend = StubBackend::new(StubReconcile::NotFound);
+    backend.image_stall.store(true, Ordering::Relaxed);
+    let (ctx, net, record, token) = claimed_execution(&context, backend.clone()).await;
+    let job_id = record.job_id;
+
+    let run = tokio::spawn(run_execution_job(ctx, record, CancellationToken::new()));
+    backend.image_started.notified().await;
+    let taken_over = lose_claim(&context, job_id, token).await;
+
+    tokio::time::timeout(Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000), run)
+        .await
+        .expect("a lost claim ends the run")
+        .expect("the workflow task must not panic");
+
+    let after = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, taken_over, "a lost claim must not be written");
+    assert_eq!(after.state, JobState::Queued);
+    assert!(backend.submits.lock().unwrap().is_empty());
+    net.shutdown().await;
+}
+
+// A cancellation seen by reconciliation stops the heartbeat once and
+// terminalizes without adopting the ambiguous attempt.
+#[tokio::test]
+async fn cancellation_skips_adoption() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = aruna_operations::testing::test_context(storage.clone());
+    let backend = StubBackend::new(StubReconcile::Pending);
+    let (ctx, net, record, _token) = claimed_execution(&context, backend.clone()).await;
+    let job_id = record.job_id;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    Box::pin(run_execution_job(ctx, record, cancel)).await;
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert_eq!(backend.submits.lock().unwrap().len(), 1);
+    net.shutdown().await;
+}
+
+/// Reads the report of a job its owner asks for, as the report route does.
+async fn read_owned_report(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    query: aruna_operations::jobs::job_reports::ReportQuery,
+) -> Result<aruna_operations::jobs::job_reports::JobReportLookup, String> {
+    let now_ms = unix_timestamp_millis();
+    let read = aruna_operations::jobs::job_reports::JobReportOperation::owned(
+        user_id, job_id, query, now_ms,
+    );
+    drive(read, context).await.map_err(|error| error.0)
+}

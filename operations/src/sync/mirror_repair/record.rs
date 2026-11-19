@@ -14,7 +14,7 @@ use super::{
     SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, decode_record, one_value, repair_key,
     repair_read, same_relationship,
 };
-use crate::tasks::queue_backoff::retry_delay_ms;
+use crate::queue_backoff::retry_delay_ms;
 
 /// What the operation does with the record it reads.
 #[derive(Debug, PartialEq)]

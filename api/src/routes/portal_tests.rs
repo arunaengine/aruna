@@ -5,65 +5,10 @@
 use super::*;
 use crate::auth::RealmAuth;
 use crate::auth::extract;
-use crate::tests::routes::{test_state, test_storage};
+use crate::tests::realms::{admin_state, state_auth};
 use aruna_core::UserId;
-use aruna_core::keys::generate_signing_key;
-use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::auth::NodeCapabilities;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::testing::test_context;
 use axum::http::StatusCode;
-use tempfile::TempDir;
 use ulid::Ulid;
-
-/// A management node state with one realm admin; returns the admin's id.
-async fn setup_state() -> (TempDir, Arc<ServerState>, UserId) {
-    let (dir, storage) = test_storage();
-    let context = Arc::new(test_context(storage));
-    let signing_key = generate_signing_key();
-    let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
-    let actor = Actor {
-        node_id: iroh::SecretKey::generate().public(),
-        user_id: UserId::local(Ulid::generate(), realm_id),
-        realm_id,
-    };
-    drive(
-        CreateRealmOperation::new(CreateRealmConfig {
-            actor: actor.clone(),
-            realm_description: "Realm".to_string(),
-            oidc_providers: Vec::new(),
-            node_location: None,
-            node_weight: None,
-            node_labels: Default::default(),
-        }),
-        &context,
-    )
-    .await
-    .unwrap();
-    drive(
-        ClaimInitialOperation::new(ClaimInitialInput {
-            actor: actor.clone(),
-        }),
-        &context,
-    )
-    .await
-    .unwrap();
-    let capabilities = NodeCapabilities::management_node(signing_key).unwrap();
-    let state = Arc::new(test_state(context, realm_id, actor.node_id, capabilities).await);
-    (dir, state, actor.user_id)
-}
-
-fn auth(state: &ServerState, user_id: UserId) -> Option<AuthContext> {
-    Some(AuthContext {
-        user_id,
-        realm_id: state.get_realm_id(),
-        path_restrictions: None,
-        session: None,
-    })
-}
 
 fn body() -> Json<PortalFeatures> {
     Json(PortalFeatures {
@@ -74,11 +19,11 @@ fn body() -> Json<PortalFeatures> {
 #[tokio::test]
 async fn member_reads_defaults() {
     // Every portal needs the defaults, so a member without admin rights reads them.
-    let (_dir, state, admin) = setup_state().await;
+    let (_dir, state, admin) = admin_state().await;
     let member = UserId::local(Ulid::generate(), state.get_realm_id());
     let Json(stored) = set_portal_features(
         State(state.clone()),
-        RealmAuth(auth(&state, admin).expect("a signed-in caller")),
+        RealmAuth(state_auth(&state, admin).expect("a signed-in caller")),
         body(),
     )
     .await
@@ -87,7 +32,7 @@ async fn member_reads_defaults() {
 
     let Json(read) = get_portal_features(
         State(state.clone()),
-        RealmAuth(auth(&state, member).expect("a signed-in caller")),
+        RealmAuth(state_auth(&state, member).expect("a signed-in caller")),
     )
     .await
     .unwrap();
@@ -100,11 +45,11 @@ async fn member_reads_defaults() {
 
 #[tokio::test]
 async fn member_cannot_replace() {
-    let (_dir, state, _admin) = setup_state().await;
+    let (_dir, state, _admin) = admin_state().await;
     let member = UserId::local(Ulid::generate(), state.get_realm_id());
     let error = set_portal_features(
         State(state.clone()),
-        RealmAuth(auth(&state, member).expect("a signed-in caller")),
+        RealmAuth(state_auth(&state, member).expect("a signed-in caller")),
         body(),
     )
     .await
@@ -113,7 +58,7 @@ async fn member_cannot_replace() {
 
     let Json(read) = get_portal_features(
         State(state.clone()),
-        RealmAuth(auth(&state, member).expect("a signed-in caller")),
+        RealmAuth(state_auth(&state, member).expect("a signed-in caller")),
     )
     .await
     .unwrap();
@@ -122,13 +67,13 @@ async fn member_cannot_replace() {
 
 #[tokio::test]
 async fn rejects_invalid_name() {
-    let (_dir, state, admin) = setup_state().await;
+    let (_dir, state, admin) = admin_state().await;
     let invalid = Json(PortalFeatures {
         features: BTreeMap::from([("Compute".to_string(), false)]),
     });
     let error = set_portal_features(
         State(state.clone()),
-        RealmAuth(auth(&state, admin).expect("a signed-in caller")),
+        RealmAuth(state_auth(&state, admin).expect("a signed-in caller")),
         invalid,
     )
     .await

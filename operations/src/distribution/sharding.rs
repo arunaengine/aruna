@@ -90,7 +90,7 @@ impl MaintainPass {
 
 /// One bounded pass over the range accounts and this node's other range work, resuming where
 /// the last finished pass stopped.
-pub(crate) fn maintain_ranges(
+pub fn maintain_ranges(
     ids: NodeRealm,
     fresh: &BTreeMap<NodeId, HeldHeartbeat>,
     capacity: Option<u64>,
@@ -104,7 +104,7 @@ pub(crate) fn maintain_ranges(
 }
 
 /// How long to wait after a pass the runner could not finish.
-pub(crate) fn maintain_retry() -> Duration {
+pub fn maintain_retry() -> Duration {
     MAINTAIN_AFTER
 }
 

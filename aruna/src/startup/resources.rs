@@ -5,6 +5,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::inbound::initialize_net_holder;
+use crate::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
 use aruna_blob::blob::{BackendRegistry, BlobHandle, BlobHandler};
 use aruna_core::NodeId;
@@ -15,14 +17,12 @@ use aruna_graph::{GraphHandle, GraphOptions};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::distribution::sharding::begin_range_rebuilds;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::inbound::initialize_net_holder;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::shard::recovery::RecoveryStatus;
-use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_storage::FjallPersistPolicy;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
@@ -701,21 +701,9 @@ mod tests {
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{UsageCounters, global_shard_keys};
     use aruna_operations::node::counter_check::CounterCheckError;
+    use aruna_operations::testing::test_context;
     use aruna_storage::StorageHandle;
     use tempfile::tempdir;
-
-    fn test_driver_ctx(storage_handle: StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
-    }
 
     fn open_storage(dir: &tempfile::TempDir) -> StorageHandle {
         aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
@@ -753,7 +741,7 @@ mod tests {
         use aruna_core::structs::storage::usage::USAGE_REBUILD_KEY;
         let temp = tempdir().expect("temp dir");
         let storage_handle = open_storage(&temp);
-        let driver_ctx = test_driver_ctx(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         assert!(
             ensure_usage_counters(&driver_ctx).await.unwrap(),
@@ -809,7 +797,7 @@ mod tests {
 
         let temp = tempdir().expect("temp dir");
         let storage_handle = open_storage(&temp);
-        let driver_ctx = test_driver_ctx(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
         assert!(ensure_usage_counters(&driver_ctx).await.unwrap());
         rebuild(&driver_ctx).await;
         // A bucket from before bucket rows existed has shards but no row of its own.

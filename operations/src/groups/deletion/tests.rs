@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::storage::format::Compression;
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::time::SystemTime;
 
@@ -10,10 +11,14 @@ use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
-use aruna_core::effects::{Effect, StorageEffect};
+#[cfg(test)]
+use aruna_core::effects::Effect;
+use aruna_core::effects::StorageEffect;
+#[cfg(test)]
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::*;
+#[cfg(test)]
 use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::storage_entries::reducer_state_entry;
@@ -31,10 +36,12 @@ use ulid::Ulid;
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
 use crate::driver::{DriverContext, drive};
+#[cfg(test)]
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
+#[cfg(test)]
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 
-pub(super) struct Fixture {
+pub struct Fixture {
     pub dir: TempDir,
     pub context: DriverContext,
     pub actor: Actor,
@@ -43,7 +50,7 @@ pub(super) struct Fixture {
     pub config: RealmConfigDocument,
 }
 
-pub(super) fn context(path: &std::path::Path) -> DriverContext {
+pub fn context(path: &std::path::Path) -> DriverContext {
     let storage_handle = aruna_storage::FjallStorage::open(path.to_str().unwrap()).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     DriverContext {
@@ -58,7 +65,7 @@ pub(super) fn context(path: &std::path::Path) -> DriverContext {
     }
 }
 
-pub(super) fn empty(kinds: &str) -> GroupDeletionError {
+pub fn empty(kinds: &str) -> GroupDeletionError {
     GroupDeletionError::NotEmpty {
         kinds: vec![kinds.into()],
         buckets: Vec::new(),
@@ -67,11 +74,11 @@ pub(super) fn empty(kinds: &str) -> GroupDeletionError {
     }
 }
 
-pub(super) fn node(seed: u8) -> aruna_core::NodeId {
+pub fn node(seed: u8) -> aruna_core::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-pub(super) async fn write(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {
+pub async fn write(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
@@ -87,7 +94,7 @@ pub(super) async fn write(context: &DriverContext, space: &str, key: Vec<u8>, va
     ));
 }
 
-pub(super) async fn read(context: &DriverContext, space: &str, key: Vec<u8>) -> Option<Value> {
+pub async fn read(context: &DriverContext, space: &str, key: Vec<u8>) -> Option<Value> {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -316,7 +323,7 @@ async fn commit_releases_owner() {
     assert_eq!(record.phase, GroupDeletePhase::Deleted);
     assert_eq!(record.event.as_deref(), Some(&deleted));
     assert_eq!(fixture.commit(vec![proof]).await.unwrap(), deleted);
-    let (outbox, _) = crate::storage_read::iter_prefix_page(
+    let (outbox, _) = aruna_storage::scan::iter_prefix_page(
         &fixture.context.storage_handle,
         SYNC_OUTBOX_KEYSPACE,
         None,

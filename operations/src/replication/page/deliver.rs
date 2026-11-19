@@ -25,7 +25,7 @@ use crate::replication::members::{
     BoundRecord, BoundRecordOperation, RecordError, member_publication,
 };
 use crate::replication::queue::BlobQueueError;
-use crate::tasks::queue_backoff::{min_due_at, retry_delay_ms};
+use crate::queue_backoff::{min_due_at, retry_delay_ms};
 use aruna_core::structs::storage::replication_queue::BlobJobRecord;
 use aruna_core::structs::storage::replication_queue::MemberTarget;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;

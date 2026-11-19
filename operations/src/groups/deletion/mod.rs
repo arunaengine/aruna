@@ -5,24 +5,21 @@
 mod access;
 mod check;
 mod commit;
-mod coordinator;
+pub mod coordinator;
 mod onboarding;
 mod peer;
 mod prepare;
 mod resources;
 
 pub use check::{CheckGroupOperation, GroupBlockers};
-pub(crate) use coordinator::SyncDecisionOperation;
 pub use coordinator::{DeleteGroupOperation, InstallOnboardingOperation};
 pub(crate) use peer::ApplyRequestOperation;
 
 #[cfg(test)]
 mod barrier_tests;
-#[cfg(test)]
-mod check_tests;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod check_tests;
 #[cfg(test)]
 mod recovery_tests;
-#[cfg(test)]
-mod tests;
-#[cfg(test)]
-mod transport_tests;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod tests;

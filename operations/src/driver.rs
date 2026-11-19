@@ -1538,7 +1538,7 @@ mod test {
         TransactionTracker, dispatch_bounded, drive, drive_retry, drive_retry_until, drive_until,
         extend_unblocked, run_all, run_window,
     };
-    use crate::tests::incoming::freeze_clock;
+    use crate::testing::freeze_clock;
     use aruna_core::calls::{IoError, IoResult, Next};
     use aruna_core::effects::{
         BlobEffect, Effect, EffectGroup, GroupForm, StagingSourceEffect, StorageEffect,

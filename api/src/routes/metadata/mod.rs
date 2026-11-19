@@ -3,14 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub(crate) mod documents;
+pub mod documents;
 pub(crate) mod harvests;
 pub(crate) mod links;
-pub(crate) mod query;
-pub(crate) mod references;
+pub mod query;
+pub mod references;
 pub(crate) mod repositories;
-pub(crate) mod rocrate;
-pub(crate) mod validation;
+pub mod rocrate;
+pub mod validation;
 
 #[cfg(test)]
 pub(crate) mod tests;

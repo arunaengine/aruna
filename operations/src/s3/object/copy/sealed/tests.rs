@@ -367,10 +367,6 @@ fn copy_skips_content() {
     let source_id = Ulid::generate();
     let mut operation = SealedCopyOperation::new(input(&location, source_id));
     let event = |event: StorageEvent| IoResult::Event(Box::new(Event::Storage(event)));
-    let missing = StorageEvent::ReadResult {
-        key: Vec::<u8>::new().into(),
-        value: None,
-    };
     let unset = StorageEvent::BatchReadResult {
         values: vec![(Vec::<u8>::new().into(), None); 2],
     };
@@ -385,7 +381,8 @@ fn copy_skips_content() {
     for result in [
         IoResult::Values(vec![None]),
         IoResult::Values(vec![None; 4]),
-        event(missing),
+        // No purge fence covers the key.
+        IoResult::Values(vec![None]),
         event(unset),
         IoResult::Values(vec![Some(source.to_bytes().unwrap().into()), None]),
     ] {
@@ -412,8 +409,9 @@ async fn governed_copy_registered() {
     // the source refs, and registered on this node.
     use crate::driver::drive;
     use crate::placement::policy::GateOperation;
-    use crate::s3::object::copy::test::{admits, full_context, seed_bucket};
+    use crate::s3::object::copy::test::{admits, seed_bucket};
     use crate::tests::policy::{seed_gate, subject};
+    use crate::tests::s3::full_context;
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
     use aruna_core::managed_copy::{CopyRequest, validate_registration};
     use aruna_core::structs::storage::blob::ManagedCopyKey;

@@ -12,6 +12,7 @@ use crate::plugins::calls::*;
 use crate::plugins::copy_rows::tests::stale_progress;
 use crate::plugins::copy_rows::{CHUNK, GRACE, MAX_UNSETTLED, chunk_count, chunk_of};
 use crate::plugins::rows::{Scan, scan_rows};
+use crate::testing::test_context;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
@@ -27,23 +28,10 @@ const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
 /// A fixed clock for the copies these tests write.
 const T0: u64 = 1_762_700_000_000;
 
-fn context(storage_handle: StorageHandle) -> DriverContext {
-    DriverContext {
-        storage_handle,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    }
-}
-
 fn opened() -> (TempDir, DriverContext) {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    (dir, context(storage))
+    (dir, test_context(storage))
 }
 
 /// A storage that passes every effect to `real`, but fails the `nth` effect (counted from 0)
@@ -79,7 +67,7 @@ fn faulty(real: StorageHandle, matching: fn(&StorageEffect) -> bool, nth: usize)
 fn faulty_context(matching: fn(&StorageEffect) -> bool, nth: usize) -> (TempDir, DriverContext) {
     let dir = tempdir().unwrap();
     let real = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    (dir, context(faulty(real, matching, nth)))
+    (dir, test_context(faulty(real, matching, nth)))
 }
 
 fn syncs(effect: &StorageEffect) -> bool {
@@ -365,13 +353,13 @@ async fn survives_restart() {
     let config = config(&[]);
     let big = padded();
     let digest = digest(&big);
-    let ctx = context(FjallStorage::open(&path).unwrap());
+    let ctx = test_context(FjallStorage::open(&path).unwrap());
     let first = store_chunk(&ctx, &config, chunk_of(&digest, &big, 0), T0).await;
     assert!(!first.unwrap());
     let second = store_chunk(&ctx, &config, chunk_of(&digest, &big, 1), T0).await;
     assert!(!second.unwrap());
     ctx.storage_handle.close().await;
-    let ctx = context(FjallStorage::open(&path).unwrap());
+    let ctx = test_context(FjallStorage::open(&path).unwrap());
     let last = store_chunk(&ctx, &config, chunk_of(&digest, &big, 2), T0).await;
     assert!(last.unwrap());
     assert_eq!(local(&ctx, &digest).await, Some(big));

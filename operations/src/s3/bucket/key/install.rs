@@ -884,7 +884,7 @@ mod tests {
     async fn unlock_resumes_rewrite() {
         use crate::blob::migration::queue::{ProcessTransitionsOperation, RECHECK};
         use crate::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
-        use crate::tests::incoming::{RecordingTaskHandler, freeze_clock};
+        use crate::testing::{RecordingTaskHandler, freeze_clock};
         use crate::tests::records::read_row;
         use aruna_core::handle::Handle;
         use aruna_core::keyspaces::{

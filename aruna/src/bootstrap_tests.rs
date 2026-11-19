@@ -7,6 +7,8 @@ use super::{
     publish_core_documents, retry_deadline, sync_peer_topic, sync_with_retry, unique_user_topic,
     watch_target_needed,
 };
+use crate::inbound::initialize_incoming_fixture;
+use crate::tasks::incoming::OutboxDrainer;
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::StorageEffect;
@@ -23,13 +25,11 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::inbound::initialize_incoming_fixture;
 use aruna_operations::notifications::watch::interest::PublishInterestOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
-use aruna_operations::tasks::incoming::OutboxDrainer;
-use aruna_operations::testing::{read_outbox_records, reconcile_topics};
+use aruna_operations::testing::{read_outbox_records, reconcile_topics, test_context};
 use aruna_storage::FjallStorage;
 use byteview::ByteView;
 use std::sync::Arc;
@@ -132,19 +132,6 @@ fn watch_target_cases() {
     assert!(watch_target_needed(false, true, false));
     assert!(!watch_target_needed(false, false, true));
     assert!(!watch_target_needed(false, false, false));
-}
-
-fn context(storage_handle: aruna_storage::StorageHandle) -> DriverContext {
-    DriverContext {
-        storage_handle,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    }
 }
 
 fn context_net(
@@ -746,7 +733,7 @@ async fn initial_watch_digest() {
 async fn existing_watch_digest() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = context(storage);
+    let context = test_context(storage);
     let realm_id = RealmId::from_bytes([5u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
     let digest = WatchInterestDigest {
@@ -811,7 +798,7 @@ async fn interrupted_secret_retries() {
     let seed_url = "http://127.0.0.1:1".to_string();
     let orphan = admin_record("orphan");
 
-    let interrupted = context(FjallStorage::open(path).unwrap());
+    let interrupted = test_context(FjallStorage::open(path).unwrap());
     drive(
         CreateSecretOperation::new(CreateSecretInput {
             record: orphan.clone(),
@@ -822,14 +809,14 @@ async fn interrupted_secret_retries() {
     .unwrap();
     interrupted.storage_handle.close().await;
 
-    let retried = context(FjallStorage::open(path).unwrap());
+    let retried = test_context(FjallStorage::open(path).unwrap());
     let secret = ensure_onboarding_secret(&retried, seed_url.clone(), &[3u8; 32], realm_id)
         .await
         .unwrap();
     assert_ne!(secret.enrollment_id, orphan.enrollment_id);
     retried.storage_handle.close().await;
 
-    let reopened = context(FjallStorage::open(path).unwrap());
+    let reopened = test_context(FjallStorage::open(path).unwrap());
     let reloaded = ensure_onboarding_secret(&reopened, seed_url.clone(), &[3u8; 32], realm_id)
         .await
         .unwrap();

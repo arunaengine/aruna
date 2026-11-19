@@ -801,7 +801,7 @@ fn name_output_record(result: &mut JobResultPayload, digest: [u8; 32]) {
 
 /// Failure message for a non-zero exit, keeping the exit code readable when the
 /// backend detail would not fit the stored message.
-pub(super) fn exit_message(code: i32, detail: Option<&str>) -> String {
+pub fn exit_message(code: i32, detail: Option<&str>) -> String {
     let head = format!("container exited with code {code}");
     let Some(detail) = detail.map(str::trim).filter(|text| !text.is_empty()) else {
         return head;

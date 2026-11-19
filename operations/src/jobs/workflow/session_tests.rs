@@ -8,6 +8,7 @@ use aruna_core::compute::session::StagedInput;
 use aruna_core::structs::execution::job::JobPayload;
 
 use super::*;
+use crate::jobs::workflow::fixtures::group_spec;
 
 fn job() -> JobId {
     JobId::from_bytes([1; 16])
@@ -18,24 +19,7 @@ fn node() -> NodeId {
 }
 
 fn spec() -> ExecutionSpec {
-    ExecutionSpec {
-        group_id: Ulid::from_bytes([2; 16]),
-        name: None,
-        description: None,
-        tags: Default::default(),
-        image: "alpine".to_string(),
-        entrypoint: None,
-        command: Vec::new(),
-        workdir: None,
-        env: Default::default(),
-        resources: Default::default(),
-        executor_constraint: None,
-        inputs: Vec::new(),
-        file_outputs: Vec::new(),
-        workspace_outputs: Vec::new(),
-        output_prefixes: Vec::new(),
-        collision_policy: Default::default(),
-    }
+    group_spec(Ulid::from_bytes([2; 16]))
 }
 
 fn record() -> JobRecord {

@@ -156,7 +156,8 @@ impl Operation for ListPartsOperation {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::drive;
+    use crate::testing::test_context;
     use crate::tests::s3::seed_upload;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
@@ -167,19 +168,6 @@ mod test {
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::tempdir;
-
-    fn driver_context(storage_handle: storage::StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
-    }
 
     fn part_location() -> BackendLocation {
         BackendLocation {
@@ -246,7 +234,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
         seed_upload(
@@ -284,7 +272,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
         seed_upload(
@@ -330,7 +318,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
         seed_upload(
@@ -381,7 +369,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle);
+        let driver_ctx = test_context(storage_handle);
 
         let result = drive(
             ListPartsOperation::new(ListPartsInput {
@@ -403,7 +391,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
         seed_upload(
@@ -432,7 +420,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
         let mut record = upload_record(upload_id, "bucket", "object");
@@ -464,7 +452,7 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
         let mut record = upload_record(upload_id, "bucket", "object");

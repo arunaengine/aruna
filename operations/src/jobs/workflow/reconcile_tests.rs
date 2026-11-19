@@ -2,15 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
-
-use aruna_core::compute::{
-    AdoptableEvidence, ArtifactEvidence, ResumePoint, StagingMode, TombstoneEvidence,
-};
+use aruna_core::compute::{AdoptableEvidence, ResumePoint, TombstoneEvidence};
 
 use super::super::fixtures::{
-    EPOCH, PINNED, child, claimed, compute, control, facts, intent, job, node, record, scope, spec,
-    status, token,
+    EPOCH, PINNED, artifact, child, claimed, compute, control, facts, intent, job, node, prepared,
+    record, scope, spec, status, token,
 };
 use super::*;
 
@@ -160,18 +156,6 @@ fn in_state(state: JobState) -> JobRecord {
     let mut job = record();
     job.state = state;
     job
-}
-
-fn artifact(exact_identity: bool) -> ReconcileEvidence {
-    ReconcileEvidence::Unadoptable(ArtifactEvidence {
-        artifact_kind: "helper".to_string(),
-        backend_ref: None,
-        observed_epoch: Some(EPOCH),
-        observed_generation: Some(1),
-        exact_identity,
-        multiple: false,
-        foreign: false,
-    })
 }
 
 // A fence that did not hold parks the attempt; nothing is read from the backend.
@@ -368,16 +352,6 @@ fn resume_of(job: JobRecord, phase: AttemptPhase) -> ResumeAttemptOperation {
 
 fn current(job: JobRecord) -> IoResult {
     child(Ok::<_, JobMutationError>(Some(job)))
-}
-
-fn prepared() -> PreparedTask {
-    PreparedTask {
-        inputs: Vec::new(),
-        mounts: Vec::new(),
-        secrets: BTreeMap::new(),
-        staging: StagingMode::Files,
-        workspace: None,
-    }
 }
 
 /// A resume of a never started attempt, waiting for its preparation.

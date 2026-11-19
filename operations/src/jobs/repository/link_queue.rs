@@ -46,7 +46,7 @@ use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::raw_events::RawReadError;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
 use crate::metadata::revision_read::{RawViewOperation, RawViewOutput};
-use crate::tasks::queue_backoff::{due_after, min_due_at};
+use crate::queue_backoff::{due_after, min_due_at};
 
 const QUEUE_PAGE: usize = 256;
 const ERROR_RETRY_MS: u64 = 60_000;

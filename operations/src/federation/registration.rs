@@ -256,7 +256,7 @@ fn known<T, E: std::fmt::Display>(count: Result<T, E>, name: &'static str) -> Op
 /// Decides what this node publishes, reads the counts a registration reports and sends it.
 /// Totals need the dataset count and the usage sum, so either one unknown omits them.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PublishRegistrationOperation {
+pub struct PublishRegistrationOperation {
     realm_id: RealmId,
     node_id: NodeId,
     capabilities: NodeCapabilities,
@@ -267,7 +267,7 @@ pub(crate) struct PublishRegistrationOperation {
 }
 
 impl PublishRegistrationOperation {
-    pub(crate) fn new(realm_id: RealmId, node_id: NodeId, capabilities: NodeCapabilities) -> Self {
+    pub fn new(realm_id: RealmId, node_id: NodeId, capabilities: NodeCapabilities) -> Self {
         Self {
             realm_id,
             node_id,

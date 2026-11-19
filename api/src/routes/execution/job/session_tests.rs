@@ -7,6 +7,7 @@ use crate::auth::UnrestrictedAuth;
 use crate::job_test_calls::insert_job;
 use crate::job_test_calls::put_job_entry;
 use crate::job_test_calls::{cancel_running_job, claim_job, read_job_record};
+use crate::tests::execution::auth_for;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::{ExecutorBackend, SessionChannel};
 use aruna_compute::session::{Session, SessionConfig};
@@ -159,15 +160,6 @@ fn node() -> NodeId {
 
 fn user(seed: u8) -> UserId {
     UserId::new(ulid::Ulid::from_bytes([seed; 16]), realm())
-}
-
-fn auth_for(user_id: UserId) -> Option<AuthContext> {
-    Some(AuthContext {
-        user_id,
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    })
 }
 
 fn session_spec() -> ExecutionSpec {

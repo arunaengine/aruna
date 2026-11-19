@@ -265,102 +265,16 @@ mod tests {
     use super::*;
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
     use crate::connectors::descriptor::build_source_binding;
-    use crate::connectors::repository::{connector_reference_key, connector_reference_write};
     use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
-    use crate::driver::{DriverContext, drive};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::keyspaces::{
-        BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
+    use crate::driver::drive;
+    use crate::tests::connectors::{
+        create_connector, defers_pending, reference_rows, source_metadata, vault_context,
+        write_reference,
     };
-    use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
-    use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
-    use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
-    use aruna_core::types::Key;
-    use aruna_storage::storage;
-    use tempfile::{TempDir, tempdir};
-
-    fn test_context() -> (TempDir, DriverContext) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
-        (tempdir, context)
-    }
-
-    fn source_metadata() -> SourceMetadata {
-        SourceMetadata {
-            content_length: 42,
-            content_type: Some("text/plain".to_string()),
-            etag: None,
-            last_modified: None,
-            source_version: None,
-            digests: Default::default(),
-        }
-    }
-
-    async fn create_connector(context: &DriverContext) -> SourceConnector {
-        drive(
-            SourceConnectorOperation::new(SourceConnectorInput {
-                group_id: ulid::Ulid::generate(),
-                created_by: Default::default(),
-                name: "dav-source".to_string(),
-                kind: SourceConnectorKind::Webdav,
-                public_config: HashMap::from([
-                    (
-                        "endpoint".to_string(),
-                        "https://dav.example.org".to_string(),
-                    ),
-                    ("root".to_string(), "/datasets".to_string()),
-                ]),
-                secret_config: HashMap::from([
-                    ("username".to_string(), "alice".to_string()),
-                    ("password".to_string(), "secret".to_string()),
-                ]),
-            }),
-            context,
-        )
-        .await
-        .unwrap()
-        .connector
-    }
-
-    async fn write_reference_version(context: &DriverContext, source: VersionSourceBinding) {
-        let version_key = VersionKey::new("bucket", "key", ulid::Ulid::generate());
-        let version = BlobVersion::reference(
-            source,
-            source_metadata(),
-            SystemTime::UNIX_EPOCH,
-            Default::default(),
-            SystemTime::UNIX_EPOCH,
-        );
-        let mut writes = vec![(
-            BLOB_VERSIONS_KEYSPACE.to_string(),
-            version_key.to_bytes().unwrap().into(),
-            version.to_bytes().unwrap().into(),
-        )];
-        writes.extend(connector_reference_write(&version, &version_key).unwrap());
-
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::BatchWriteResult { .. })
-        ));
-    }
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+    use aruna_core::structs::execution::staging::StagingStrategy;
+    use aruna_core::structs::storage::blob::BlobVersion;
 
     fn connector_secret(connector_id: Ulid, user: &str) -> SourceConnectorSecret {
         SourceConnectorSecret::new(
@@ -450,17 +364,6 @@ mod tests {
         operation
     }
 
-    fn reference_rows(connector_id: Ulid, next: Option<Key>) -> IoResult {
-        let version_key = VersionKey::new("bucket", "key", Ulid::nil());
-        IoResult::Page {
-            rows: vec![(
-                connector_reference_key(connector_id, &version_key).unwrap(),
-                Vec::new().into(),
-            )],
-            next,
-        }
-    }
-
     fn version_read(version: Option<BlobVersion>) -> IoResult {
         IoResult::Values(vec![
             version.map(|version| version.to_bytes().unwrap().into()),
@@ -512,36 +415,10 @@ mod tests {
         );
     }
 
-    // A stale page with more rows behind it commits its pruning and the queued background work,
-    // then asks the caller to retry instead of scanning on.
     #[test]
     fn pending_defers_check() {
         let connector_id = Ulid::from_bytes([2u8; 16]);
-        let mut operation = scanning(connector_id);
-        operation
-            .next(reference_rows(connector_id, Some(vec![9u8].into())))
-            .unwrap();
-        assert!(matches!(
-            operation.next(version_read(None)),
-            Ok(Next::Call(IoCall::Delete(deletes)))
-                if deletes[0].0 == CONNECTOR_REFERENCE_KEYSPACE
-        ));
-        assert!(matches!(
-            operation.next(IoResult::Done),
-            Ok(Next::Call(IoCall::Write(writes)))
-                if writes[0].0 == CONNECTOR_PRUNE_KEYSPACE
-        ));
-        let Ok(Next::Then {
-            output: None,
-            calls,
-        }) = operation.next(IoResult::Done)
-        else {
-            panic!("expected the pending outcome");
-        };
-        assert!(
-            matches!(calls.as_slice(), [IoCall::Effect(wake)] if matches!(**wake, Effect::Task(_))),
-            "the pruning is woken after the commit"
-        );
+        defers_pending(scanning(connector_id), connector_id);
     }
 
     #[test]
@@ -555,20 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn removes_secret_config() {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
-
+        let (_tempdir, context) = vault_context();
         let created = drive(
             SourceConnectorOperation::new(SourceConnectorInput {
                 group_id: ulid::Ulid::generate(),
@@ -610,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn secret_change_rejected() {
-        let (_tempdir, context) = test_context();
+        let (_tempdir, context) = vault_context();
         let connector = create_connector(&context).await;
         let source = build_source_binding(
             StagingStrategy::Reference,
@@ -620,7 +484,7 @@ mod tests {
             None,
             Some(connector.connector_id),
         );
-        write_reference_version(&context, source).await;
+        write_reference(&context, source).await;
 
         let result = drive(
             ReplaceSourceOperation::new(ReplaceSourceInput {
@@ -643,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_change_allowed() {
-        let (_tempdir, context) = test_context();
+        let (_tempdir, context) = vault_context();
         let connector = create_connector(&context).await;
         let source = build_source_binding(
             StagingStrategy::Reference,
@@ -653,7 +517,7 @@ mod tests {
             None,
             Some(connector.connector_id),
         );
-        write_reference_version(&context, source.clone()).await;
+        write_reference(&context, source.clone()).await;
 
         let replaced = drive(
             ReplaceSourceOperation::new(ReplaceSourceInput {

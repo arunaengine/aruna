@@ -433,7 +433,7 @@ mod tests {
     async fn blob_jobs_exist(storage: &StorageHandle) -> Result<bool, BlobQueueError> {
         for key_space in [REPLICATION_OBLIGATION_KEYSPACE, REPLICATION_JOB_KEYSPACE] {
             let (rows, _) =
-                crate::storage_read::iter_prefix_page(storage, key_space, None, None, 1, None)
+                aruna_storage::scan::iter_prefix_page(storage, key_space, None, None, 1, None)
                     .await
                     .map_err(|error| BlobQueueError::Storage(StorageError::ReadError(error)))?;
             if !rows.is_empty() {

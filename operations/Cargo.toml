@@ -14,9 +14,10 @@ autotests = false
 
 [features]
 # Test seams and shared test helpers; only dev-dependencies enable it.
-test-hooks = ["dep:tempfile"]
+test-hooks = ["dep:tempfile", "dep:axum"]
 
 [dependencies]
+axum = { workspace = true, optional = true }
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
 aruna-core = { workspace = true }
@@ -85,12 +86,3 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 zip = { workspace = true }
-
-[[test]]
-name = "integration"
-path = "tests/main.rs"
-
-# Prints workload rates on request (cargo run --release --example measure); never a test.
-[[example]]
-name = "measure"
-test = false

@@ -4,17 +4,14 @@
 
 use crate::server::state::ServerState;
 use crate::tests::routes::{
-    seed_group_docs, seed_realm_auth, seed_realm_config, test_state, test_storage,
+    seed_group_docs, seed_realm_auth, seed_realm_config, test_state, test_storage, write_doc,
 };
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
-use aruna_operations::driver::DriverContext;
 use aruna_operations::testing::test_context;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -104,25 +101,4 @@ pub(crate) async fn setup_state() -> TestState {
         bucket,
         state,
     }
-}
-
-async fn write_doc(
-    driver_ctx: &Arc<DriverContext>,
-    key_space: &str,
-    key: byteview::ByteView,
-    value: byteview::ByteView,
-) {
-    let event = driver_ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key,
-            value,
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
 }

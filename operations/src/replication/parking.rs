@@ -750,7 +750,6 @@ mod tests {
         }
     }
     use crate::replication::drain::NextTimerOperation;
-    use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::{BlobEffect, StorageEffect};
@@ -767,6 +766,7 @@ mod tests {
         ReplicateScopeInput, ReplicateScopeTarget,
     };
     use aruna_core::types::TxnId;
+    use aruna_storage::scan::iter_prefix_page;
     use std::time::SystemTime;
     use tempfile::TempDir;
 

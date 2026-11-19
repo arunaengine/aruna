@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::bucket::key::test_rows::authority_rows;
+use crate::s3::bucket::key::test_rows::{authority_rows, woke};
 use aruna_core::compute::SecretBytes;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
@@ -39,20 +39,6 @@ fn asked(turn: &Turn) -> &Effect {
     match turn {
         Ok(Next::Call(IoCall::Effect(effect))) => effect,
         other => panic!("expected an effect call, got {other:?}"),
-    }
-}
-
-fn woke(turn: Turn) -> ChangeResult {
-    match turn {
-        Ok(Next::Then { output, calls }) => {
-            let wake = Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::MigrateCompression,
-                after: std::time::Duration::ZERO,
-            });
-            assert_eq!(calls, vec![IoCall::from(wake)]);
-            output
-        }
-        other => panic!("expected the transition wake, got {other:?}"),
     }
 }
 

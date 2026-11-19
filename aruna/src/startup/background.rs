@@ -5,6 +5,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::tasks::incoming::TaskQueues;
+use crate::tasks::metadata_sweeps::spawn_metadata_warmup;
 use aruna_api::monitoring::Readiness;
 use aruna_core::document::DocumentTarget;
 use aruna_core::events::Event;
@@ -20,8 +22,6 @@ use aruna_operations::jobs::lifecycle::outbox::timers::{
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::node::recovery_run::RecoveryConfig;
 use aruna_operations::shard::recovery::RecoveryStatus;
-use aruna_operations::tasks::incoming::TaskQueues;
-use aruna_operations::tasks::metadata_sweeps::spawn_metadata_warmup;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
@@ -258,10 +258,7 @@ pub(crate) async fn start(
                 spawn_cutoff_sweep(driver_ctx.clone(), &shutdown, realm_id, node_id)
             }
             StartupPhase::DrainGitMerges => {
-                aruna_operations::tasks::incoming::git_drain::spawn_drain(
-                    driver_ctx.clone(),
-                    &shutdown,
-                )
+                crate::tasks::incoming::git_drain::spawn_drain(driver_ctx.clone(), &shutdown)
             }
             StartupPhase::RecoverChild => {
                 let recovery_config = RecoveryConfig {
@@ -318,7 +315,7 @@ async fn publish_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_operations::tasks::incoming::install_task_queues;
+    use crate::tasks::incoming::install_task_queues;
 
     async fn test_background() -> (Background, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("temp dir");

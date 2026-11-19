@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::bucket::key::test_rows::authority_rows;
+use crate::s3::bucket::key::test_rows::{authority_rows, settings};
 use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
@@ -39,16 +39,6 @@ fn page(values: Vec<(Vec<u8>, Vec<u8>)>, next: Option<Vec<u8>>) -> IoResult {
 
 fn rows(values: Vec<(Vec<u8>, Vec<u8>)>) -> IoResult {
     page(values, None)
-}
-
-fn settings(mode: EncryptionMode, bucket_id: Ulid) -> Vec<u8> {
-    let settings = BucketEncryption {
-        mode,
-        bucket_id: Some(bucket_id),
-        key_generation: 2,
-        ..Default::default()
-    };
-    settings.to_bytes().unwrap()
 }
 
 /// The key record of `generation`; a node-managed key has a node vault copy.

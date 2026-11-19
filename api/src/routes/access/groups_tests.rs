@@ -14,6 +14,7 @@ use crate::auth::extract;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use crate::tests::routes::{seed_realm_auth, test_state, test_storage};
+use crate::tests::users::foreign_auth;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -171,16 +172,6 @@ async fn setup_state() -> (Arc<ServerState>, TempDir) {
     .await;
 
     (state, tempdir)
-}
-
-fn foreign_auth() -> AuthContext {
-    let realm_id = RealmId::from_bytes([7u8; 32]);
-    AuthContext {
-        user_id: UserId::local(Ulid::generate(), realm_id),
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
 }
 
 /// A realm whose initial admin is claimed, so the realm admin path grants.

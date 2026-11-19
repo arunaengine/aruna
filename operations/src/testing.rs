@@ -41,6 +41,19 @@ pub fn test_context(storage: StorageHandle) -> DriverContext {
     }
 }
 
+/// A storage driver context with a task plane, shared behind an `Arc`.
+pub fn task_context(storage: StorageHandle) -> std::sync::Arc<DriverContext> {
+    std::sync::Arc::new(DriverContext {
+        task_handle: Some(TaskHandle::new()),
+        ..test_context(storage)
+    })
+}
+
+/// A storage-only driver context on a store opened at `root`.
+pub fn path_context(root: &str) -> DriverContext {
+    test_context(aruna_storage::FjallStorage::open(root).expect("open the test store"))
+}
+
 /// A net on loopback without relays or discovery, so a test reaches no outside service. A relay
 /// connection's timers also read the real clock and spin forever under paused time.
 pub fn local_net() -> NetConfig {
@@ -299,4 +312,38 @@ pub async fn prune_jobs_exist(
 ) -> Result<bool, crate::metadata::prune_queue::MetadataGraphError> {
     let due = crate::driver::drive(crate::metadata::prune_queue::jobs_queued(), context).await?;
     Ok(!due.jobs.is_empty())
+}
+
+pub struct RecordingTaskHandler {
+    pub seen: tokio::sync::mpsc::Sender<aruna_core::task::TaskKey>,
+}
+
+#[async_trait::async_trait]
+impl aruna_tasks::InboundTaskHandler for RecordingTaskHandler {
+    async fn handle_timer(&self, key: aruna_core::task::TaskKey) {
+        let _ = self.seen.send(key).await;
+    }
+}
+
+/// Tokio inhibits paused-clock auto-advance while a blocking task is alive.
+/// Storage and net answer from their own threads, so without this the clock
+/// races ahead of every round trip. `tokio::time::advance` still applies.
+pub struct ClockGuard {
+    _stop: std::sync::mpsc::Sender<()>,
+}
+
+pub fn freeze_clock() -> ClockGuard {
+    let (stop, wait) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        let _ = wait.recv();
+    });
+    ClockGuard { _stop: stop }
+}
+
+/// The graph handle a test installed on its context.
+pub fn installed_graph_handle(context: &DriverContext) -> &aruna_graph::GraphHandle {
+    context
+        .graph_handle
+        .as_ref()
+        .expect("graph handle installed")
 }

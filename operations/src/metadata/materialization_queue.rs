@@ -44,7 +44,7 @@ use crate::metadata::call_results::page_rows;
 use crate::metadata::checkpoint::{CheckpointError, CheckpointOperation};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
-use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
+use crate::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
 
 use super::data_links::{DataLinkError, LinkRows};
 use super::iri_index::{MetadataIriError, ProjectRowsOperation};
@@ -225,12 +225,12 @@ type MaterializationTurn<T> = Result<Next<T>, MetadataMaterializationError>;
 /// When the materialization drain should run next: now while a job is due, at the earliest
 /// due time otherwise, and never with an empty queue.
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct NextTimerOperation {
+pub struct NextTimerOperation {
     now_ms: u64,
 }
 
 impl NextTimerOperation {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 }
@@ -262,7 +262,7 @@ impl Operation for NextTimerOperation {
 }
 
 // Half-core concurrency reserves capacity for foreground create and validation traffic.
-pub(crate) fn materialization_group_concurrency() -> usize {
+pub fn materialization_group_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(|cores| cores.get())
         .unwrap_or(4)
@@ -283,7 +283,7 @@ enum BatchStage {
 /// One drain pass: materializes the due jobs one document group at a time, `concurrency`
 /// groups at once, then settles them in finish transactions of a bounded size.
 #[derive(Debug, PartialEq)]
-pub(crate) struct MaterializationBatchOperation {
+pub struct MaterializationBatchOperation {
     node: GitNode,
     concurrency: usize,
     link_timer: bool,
@@ -304,7 +304,7 @@ pub(crate) struct MaterializationBatchOperation {
 
 impl MaterializationBatchOperation {
     /// `link_timer` arms the repository link drain after finished jobs, on a node with tasks.
-    pub(crate) fn new(node: GitNode, concurrency: usize, link_timer: bool) -> Self {
+    pub fn new(node: GitNode, concurrency: usize, link_timer: bool) -> Self {
         Self {
             node,
             concurrency,
@@ -959,7 +959,7 @@ enum RequeueStage {
 /// node converges once the cause clears. Dead letters the document has moved
 /// past are dropped instead. Answers the number of jobs requeued.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RequeueParkedOperation {
+pub struct RequeueParkedOperation {
     now_ms: u64,
     due_ms: u64,
     rows: VecDeque<(Key, Value)>,
@@ -969,7 +969,7 @@ pub(crate) struct RequeueParkedOperation {
 }
 
 impl RequeueParkedOperation {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             now_ms: 0,
             due_ms: 0,
@@ -2394,13 +2394,13 @@ enum ExistStage {
 /// Whether a live job is queued. Dead and stale rows met on the way are deleted, so a queue
 /// of only dead jobs answers `false` and is empty afterwards.
 #[derive(Debug, PartialEq)]
-pub(crate) struct JobsExistOperation {
+pub struct JobsExistOperation {
     next: Option<Key>,
     stage: ExistStage,
 }
 
 impl JobsExistOperation {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             next: None,
             stage: ExistStage::Page,

@@ -254,7 +254,7 @@ async fn journaled(handle: &StorageHandle) -> Vec<String> {
     let (mut rows, mut after) = (Vec::new(), None);
     loop {
         let prefix = Some(b"j".to_vec().into());
-        let (page, next) = crate::storage_read::iter_prefix_page(
+        let (page, next) = aruna_storage::scan::iter_prefix_page(
             handle,
             EVENT_JOURNAL_KEYSPACE,
             prefix,

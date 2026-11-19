@@ -340,7 +340,7 @@ pub(crate) fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<ApiQuery
     })
 }
 
-pub(crate) fn bearer_token_string(bearer_token: Option<ValidatedBearer>) -> Option<String> {
+pub fn bearer_token_string(bearer_token: Option<ValidatedBearer>) -> Option<String> {
     bearer_token.map(|carrier| carrier.as_str().to_string())
 }
 

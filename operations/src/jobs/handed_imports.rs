@@ -39,7 +39,7 @@ enum StartStep {
 /// Runs each fetched job here as its own job from its handed position. A started job leaves
 /// the row at once, so a later pass starts only what is left.
 #[derive(Debug, PartialEq)]
-pub(crate) struct StartKeptOperation {
+pub struct StartKeptOperation {
     key: Key,
     kept: Kept,
     bucket: BucketIdentity,
@@ -51,7 +51,7 @@ pub(crate) struct StartKeptOperation {
 type StartNext = Result<Next<()>, StartKeptError>;
 
 impl StartKeptOperation {
-    pub(crate) fn new(start: KeptStart, serving: ServingNode, now_ms: u64) -> Self {
+    pub fn new(start: KeptStart, serving: ServingNode, now_ms: u64) -> Self {
         Self {
             key: Key::from(start.key),
             kept: start.kept,

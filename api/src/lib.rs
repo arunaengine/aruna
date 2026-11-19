@@ -29,7 +29,7 @@ pub mod s3;
 pub mod server;
 pub mod telemetry;
 
-#[cfg(test)]
-mod tests;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod tests;
 
 mod object_key;

@@ -30,26 +30,26 @@ use super::JobScope;
 use super::invenio::Session;
 use crate::jobs::executor::ProgressReporter;
 
-pub(crate) const NOW_MS: u64 = 1_700_000_000_000;
+pub const NOW_MS: u64 = 1_700_000_000_000;
 
-pub(crate) fn realm() -> RealmId {
+pub fn realm() -> RealmId {
     RealmId::from_bytes([3; 32])
 }
 
-pub(crate) fn owner_node() -> NodeId {
+pub fn owner_node() -> NodeId {
     iroh::SecretKey::from_bytes(&[7; 32]).public()
 }
 
-pub(crate) fn other_node() -> NodeId {
+pub fn other_node() -> NodeId {
     iroh::SecretKey::from_bytes(&[8; 32]).public()
 }
 
-pub(crate) fn credential_key() -> CredentialEncryptionKey {
+pub fn credential_key() -> CredentialEncryptionKey {
     CredentialEncryptionKey::derive(&[1; 32])
 }
 
 /// A node with every plane, the owner of [`link`].
-pub(crate) fn scope() -> NodeScope {
+pub fn scope() -> NodeScope {
     NodeScope {
         node: Some((owner_node(), realm())),
         credential_key: Some(credential_key()),
@@ -59,7 +59,7 @@ pub(crate) fn scope() -> NodeScope {
 }
 
 /// A node without a net transport.
-pub(crate) fn local_scope() -> NodeScope {
+pub fn local_scope() -> NodeScope {
     NodeScope {
         node: None,
         credential_key: None,
@@ -68,7 +68,7 @@ pub(crate) fn local_scope() -> NodeScope {
     }
 }
 
-pub(crate) fn job_id(nonce: u64) -> JobId {
+pub fn job_id(nonce: u64) -> JobId {
     JobId::from_parts(
         NOW_MS,
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
@@ -78,11 +78,11 @@ pub(crate) fn job_id(nonce: u64) -> JobId {
     .unwrap()
 }
 
-pub(crate) fn stop() -> JobStop {
+pub fn stop() -> JobStop {
     aruna_blob::remote::job_stop(CancellationToken::new(), CancellationToken::new())
 }
 
-pub(crate) fn job_scope() -> JobScope {
+pub fn job_scope() -> JobScope {
     JobScope {
         job_id: job_id(1),
         owner_node: owner_node(),
@@ -97,7 +97,7 @@ pub(crate) fn job_scope() -> JobScope {
     }
 }
 
-pub(crate) fn link() -> RepositoryLink {
+pub fn link() -> RepositoryLink {
     RepositoryLink {
         link_id: Ulid::from_bytes([1; 16]),
         document_id: Ulid::from_bytes([2; 16]),
@@ -126,14 +126,14 @@ pub(crate) fn link() -> RepositoryLink {
 }
 
 /// A session on the endpoint of [`link`] whose calls do not watch a job.
-pub(crate) fn session() -> Session {
+pub fn session() -> Session {
     Session::new(
         InvenioAccess::new(&link().endpoint, Some("token".into()), 1024 * 1024).unwrap(),
         None,
     )
 }
 
-pub(crate) fn artifact() -> ArtifactRef {
+pub fn artifact() -> ArtifactRef {
     ArtifactRef {
         location: BackendLocation {
             backend: BackendRef::node_default(),
@@ -157,7 +157,7 @@ pub(crate) fn artifact() -> ArtifactRef {
 }
 
 /// The registry row of the linked dataset.
-pub(crate) fn registry_record() -> MetadataRegistryRecord {
+pub fn registry_record() -> MetadataRegistryRecord {
     let link = link();
     MetadataRegistryRecord {
         realm_id: realm(),
@@ -181,12 +181,12 @@ pub(crate) fn registry_record() -> MetadataRegistryRecord {
     }
 }
 
-pub(crate) fn link_bytes(link: &RepositoryLink) -> Value {
+pub fn link_bytes(link: &RepositoryLink) -> Value {
     ByteView::from(link.to_bytes().unwrap())
 }
 
 /// The answer of a typed child.
-pub(crate) fn child<T, E>(result: Result<T, E>) -> IoResult
+pub fn child<T, E>(result: Result<T, E>) -> IoResult
 where
     T: Send + Debug + PartialEq + 'static,
     E: Send + Debug + PartialEq + 'static,
@@ -194,14 +194,14 @@ where
     IoResult::Child(ChildOutcome::new(result))
 }
 
-pub(crate) fn event(event: Event) -> IoResult {
+pub fn event(event: Event) -> IoResult {
     IoResult::Event(Box::new(event))
 }
 
-pub(crate) fn remote(answer: Result<RemoteAnswer, RemoteFailure>) -> IoResult {
+pub fn remote(answer: Result<RemoteAnswer, RemoteFailure>) -> IoResult {
     event(Event::Blob(BlobEvent::Remote(answer)))
 }
 
-pub(crate) fn body(value: Json) -> IoResult {
+pub fn body(value: Json) -> IoResult {
     remote(Ok(RemoteAnswer::Json(value)))
 }

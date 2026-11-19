@@ -12,6 +12,10 @@ rust-version.workspace = true
 # Integration tests build as one binary; declare each new tests/ file in tests/main.rs.
 autotests = false
 
+[features]
+# Exposes the shared metadata test fixtures to the node crate's route tests.
+test-hooks = ["aruna-operations/test-hooks"]
+
 [dependencies]
 zeroize = { workspace = true }
 # Aruna modules
