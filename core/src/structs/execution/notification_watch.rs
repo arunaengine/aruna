@@ -712,13 +712,46 @@ impl WatchInterestTable {
     }
 }
 
+/// A watch event the drain still has to deliver, with what an earlier delivery left open.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedWatchEvent {
+    pub event: WatchEvent,
+    /// `None` until a delivery did not settle.
+    pub retry: Option<WatchRetry>,
+}
+
+/// When an unsettled watch event is delivered again, and to which holders.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchRetry {
+    pub due_at_ms: u64,
+    pub attempts: u32,
+    /// The holders still waiting, this node for its own open expansion; `None` asks the current
+    /// holders again, as after a delivery that did not report them.
+    pub holders: Option<Vec<NodeId>>,
+}
+
+impl QueuedWatchEvent {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// The row the drain reads; its key is the event id, so a retry rewrites the same row.
+    pub fn entry(&self) -> Result<(KeySpace, Key, Value), ConversionError> {
+        Ok((
+            WATCH_OUTBOX_KEYSPACE.to_string(),
+            Key::from(self.event.event_id.to_bytes().to_vec()),
+            Value::from(postcard::to_allocvec(self)?),
+        ))
+    }
+}
+
 /// The row that asks the notification drain to emit `event`; a retried event keeps its row.
 pub fn watch_event_entry(event: &WatchEvent) -> Result<(KeySpace, Key, Value), ConversionError> {
-    Ok((
-        WATCH_OUTBOX_KEYSPACE.to_string(),
-        Key::from(event.event_id.to_bytes().to_vec()),
-        Value::from(event.to_bytes()?),
-    ))
+    let queued = QueuedWatchEvent {
+        event: event.clone(),
+        retry: None,
+    };
+    queued.entry()
 }
 
 /// Arms the watch event drain now, so a queued event leaves right after its commit.

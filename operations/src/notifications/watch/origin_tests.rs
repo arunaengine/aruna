@@ -51,7 +51,7 @@ fn single_server() -> RealmConfigDocument {
 fn nil_actor_skipped() {
     let realm_id = user(1, 2).realm_id;
     let mut emit = EmitWatchOperation::new(event(UserId::nil(realm_id)), node_id(1), Vec::new());
-    assert_eq!(emit.first(), Ok(Next::Done(true)));
+    assert_eq!(emit.first(), Ok(Next::Done(Vec::new())));
 }
 
 /// Without the realm config only remote holders get the event; a holder not reached leaves it
@@ -68,7 +68,7 @@ fn remote_forward_only() {
     ));
     assert_eq!(emit.state, EmitState::Forward(node_id(2)));
     let failed = child::<NotificationTransportMessage, _>(Err(RemoteError("down".into())));
-    assert_eq!(emit.next(failed), Ok(Next::Done(false)));
+    assert_eq!(emit.next(failed), Ok(Next::Done(vec![node_id(2)])));
 }
 
 /// A holder that cannot take the event now, or answers anything but an ack, leaves it open.
@@ -83,7 +83,7 @@ fn unavailable_reply_unsettled() {
         let unread = child::<RealmConfigDocument, _>(Err(GetConfigError::DocumentNotFound));
         emit.next(unread).unwrap();
         let answer = child::<_, RemoteError>(Ok(answer));
-        assert_eq!(emit.next(answer), Ok(Next::Done(false)));
+        assert_eq!(emit.next(answer), Ok(Next::Done(vec![node_id(2)])));
     }
 }
 
@@ -97,7 +97,19 @@ fn failed_discovery_unsettled() {
     emit.next(child::<RealmConfigDocument, _>(Err(failed))).unwrap();
     let acked = NotificationTransportMessage::WatchEventsAck { written: 1 };
     let acked = child::<_, RemoteError>(Ok(acked));
-    assert_eq!(emit.next(acked), Ok(Next::Done(false)));
+    assert_eq!(emit.next(acked), Ok(Next::Done(vec![node_id(1)])));
+}
+
+/// A retry goes only to the holders an earlier delivery left open; the others already settled.
+#[test]
+fn retry_only_open() {
+    let holders = vec![node_id(2), node_id(3)];
+    let emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), holders);
+    let mut emit = emit.only(Some(vec![node_id(3)]));
+    emit.first().unwrap();
+    let unread = child::<RealmConfigDocument, _>(Err(GetConfigError::DocumentNotFound));
+    emit.next(unread).unwrap();
+    assert_eq!(emit.state, EmitState::Forward(node_id(3)));
 }
 
 /// A holder that refuses the event settles it: a refusal does not pass on a later run.
@@ -110,7 +122,7 @@ fn refused_forward_settles() {
     emit.next(unread).unwrap();
     let refused = NotificationTransportMessage::Reject("not a holder".into());
     let refused = child::<_, RemoteError>(Ok(refused));
-    assert_eq!(emit.next(refused), Ok(Next::Done(true)));
+    assert_eq!(emit.next(refused), Ok(Next::Done(Vec::new())));
 }
 
 /// A matching watch held here makes this node a holder; the expansion's new records wake their
@@ -151,7 +163,7 @@ fn local_watch_expands() {
     assert!(matches!(emit.next(woken), Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(
         emit.next(child::<_, InterestError>(Ok(true))),
-        Ok(Next::Done(true))
+        Ok(Next::Done(Vec::new()))
     );
 }
 
@@ -183,8 +195,8 @@ fn event_reads_holders() {
     let found = holders_answer(Some((node_id(1), vec![node_id(2)])));
     assert!(matches!(emit.next(found), Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(
-        emit.next(child::<bool, IoError>(Ok(true))),
-        Ok(Next::Done(true))
+        emit.next(child::<Vec<NodeId>, IoError>(Ok(Vec::new()))),
+        Ok(Next::Done(Vec::new()))
     );
 
     let mut failed = EmitEventOperation::new(event);
@@ -197,7 +209,7 @@ fn event_reads_holders() {
         got: "another",
     };
     assert_eq!(
-        failed.next(child::<bool, IoError>(Err(error.clone()))),
+        failed.next(child::<Vec<NodeId>, IoError>(Err(error.clone()))),
         Err(error)
     );
 }
@@ -207,7 +219,7 @@ fn event_reads_holders() {
 fn event_without_net() {
     let mut emit = EmitEventOperation::new(event(user(1, 2)));
     emit.first().unwrap();
-    assert_eq!(emit.next(holders_answer(None)), Ok(Next::Done(true)));
+    assert_eq!(emit.next(holders_answer(None)), Ok(Next::Done(Vec::new())));
 
     let mut wrong = EmitEventOperation::new(event(user(1, 2)));
     wrong.first().unwrap();
