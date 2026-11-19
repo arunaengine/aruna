@@ -132,7 +132,11 @@ pub fn parse_prune_due(key: &[u8]) -> Option<(u64, JobFamilyId)> {
 /// The prune index rows a write at `now_ms` adds in its own transaction. Writers never read the
 /// old row, so concurrent appends do not conflict; the prune pass drops rows the slot no longer names.
 pub fn prune_rows(family: &JobFamilyId, now_ms: u64) -> [(String, Key, Value); 2] {
-    let due_ms = now_ms.saturating_add(RETENTION_MS);
+    prune_rows_at(family, now_ms.saturating_add(RETENTION_MS))
+}
+
+/// The prune index rows that schedule `family` at `due_ms`.
+pub fn prune_rows_at(family: &JobFamilyId, due_ms: u64) -> [(String, Key, Value); 2] {
     [
         (
             FAMILY_PRUNE_KEYSPACE.to_string(),

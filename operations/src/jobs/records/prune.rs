@@ -66,21 +66,6 @@ pub enum PruneStep {
     Moved,
 }
 
-pub(super) fn slot_rows(family: &JobFamilyId, due_ms: u64) -> JobWrites {
-    vec![
-        (
-            FAMILY_PRUNE_KEYSPACE.to_string(),
-            prune_due_key(due_ms, family),
-            Value::from(&[][..]),
-        ),
-        (
-            FAMILY_PRUNE_KEYSPACE.to_string(),
-            prune_slot_key(family),
-            Value::from(due_ms.to_be_bytes().as_slice()),
-        ),
-    ]
-}
-
 pub(super) fn index_rows(family: &JobFamilyId, due_ms: u64) -> JobDeletes {
     vec![
         (

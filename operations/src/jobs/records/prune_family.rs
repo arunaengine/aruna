@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::record_keys::{
-    family_prefix, prune_due_key, prune_slot_key,
+    family_prefix, prune_due_key, prune_rows_at, prune_slot_key,
 };
 use aruna_core::structs::execution::job::record_rows::{PendingRecord, from_bytes, to_bytes};
 use aruna_core::structs::execution::job::{
@@ -30,7 +30,7 @@ use super::admit::MAX_PENDING_RECORDS;
 use super::family::{FamilyReadError, LoadFamilyOperation};
 use super::prune::{
     BODY_SPACES, FAMILY_PRUNE_PAGE, PruneCommitOperation, PruneError, PruneStep, index_rows,
-    slot_of, slot_rows,
+    slot_of,
 };
 use super::prune_pages::PrunePagesOperation;
 use super::reduce::reduce_family;
@@ -187,7 +187,7 @@ impl PruneFamilyOperation {
             FAMILY_PRUNE_KEYSPACE.to_string(),
             prune_due_key(self.due_ms, &self.family),
         ));
-        let writes = slot_rows(&self.family, recheck_ms);
+        let writes = prune_rows_at(&self.family, recheck_ms).to_vec();
         self.commit(PruneStep::Moved, true, (deletes, writes))
     }
 
@@ -261,6 +261,10 @@ impl PruneFamilyOperation {
                     _ => RETENTION_MS,
                 };
                 let recheck = recheck_ms.unwrap_or(self.now_ms.saturating_add(later));
+                // The family is read again no later than its earliest pending row expires.
+                let expiry =
+                    (self.earliest_ms).map(|first| first.saturating_add(TOMBSTONE_RETENTION_MS));
+                let recheck = expiry.map_or(recheck, |expiry| recheck.min(expiry));
                 let expired = std::mem::take(&mut self.expired);
                 self.moved(recheck, expired)
             }
@@ -292,7 +296,7 @@ impl PruneFamilyOperation {
             DEADLINE_INDEX_KEYSPACE.to_string(),
             deadline_index_key(&self.family),
         ));
-        let mut writes = slot_rows(&self.family, self.now_ms);
+        let mut writes = prune_rows_at(&self.family, self.now_ms).to_vec();
         let value = Value::from(to_bytes(&tombstone)?.as_slice());
         writes.push((FAMILY_TOMBSTONE_KEYSPACE.to_string(), prefix, value));
         self.commit(PruneStep::Paged, true, (deletes, writes))

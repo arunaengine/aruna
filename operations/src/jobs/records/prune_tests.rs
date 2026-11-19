@@ -5,6 +5,7 @@
 
 use aruna_core::calls::ChildOutcome;
 use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
+use aruna_core::structs::execution::job::record_keys::prune_rows_at;
 use aruna_core::structs::execution::job::record_rows::to_bytes;
 use aruna_core::structs::execution::job::{FamilyTombstone, JobRecordEnvelope, SubmissionId};
 use aruna_core::types::Key;
@@ -59,7 +60,7 @@ fn commit_checks_slot() {
         moved.next(IoResult::Values(vec![slot(8)])),
         Ok(Next::Done(false))
     );
-    let writes = slot_rows(&family(), 9);
+    let writes = prune_rows_at(&family(), 9).to_vec();
     let mut kept = PruneCommitOperation::new(Some((family(), 7)), rows, writes);
     kept.first().unwrap();
     let deleting = kept.next(IoResult::Values(vec![slot(7)]));

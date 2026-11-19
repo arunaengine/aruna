@@ -7,7 +7,9 @@ use aruna_core::keyspaces::FAMILY_PRUNE_KEYSPACE;
 use aruna_core::structs::execution::job::record_keys::{
     PRUNE_DUE_PREFIX, parse_prune_due, prune_slot_key,
 };
-use aruna_core::structs::execution::job::{JobFamilyId, JobFamilyRecord, RETENTION_MS};
+use aruna_core::structs::execution::job::{
+    JobFamilyId, JobFamilyRecord, RETENTION_MS, TOMBSTONE_RETENTION_MS,
+};
 use aruna_core::types::Key;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
@@ -16,6 +18,7 @@ use super::admission::admit;
 use super::terminal::{node_context, reserve_execution, seed_family};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::tests::prune::pass;
 use crate::tests::records::{Family, REALM, context, read_row};
 
 /// The due time the family's slot row names, if any.
@@ -106,4 +109,28 @@ async fn indexes_admission_writes() {
         after.is_some() && after != before,
         "the reservation wrote the slot"
     );
+}
+
+#[tokio::test]
+async fn retries_keep_expiry() {
+    // A pending record offered again keeps its first sight, so a late retry never schedules the
+    // family past the pending expiry, and the pass then deletes the row with the index.
+    let family = Family::new([83u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let claim = JobFamilyRecord::Claim(family.claim(&family.spec()));
+    let expiry = 1_000 + TOMBSTONE_RETENTION_MS;
+    append(&ctx, &family, claim.clone(), 1_000).await;
+
+    let retried = append(&ctx, &family, claim, expiry - 1).await;
+
+    assert!(matches!(retried, Admission::Pending(_)));
+    let due = slot_due(&ctx, &family.family()).await.expect("indexed");
+    assert!(
+        due <= expiry,
+        "the retry moved the family to {due}, past {expiry}"
+    );
+    // The pass runs at the runner's time, long past the fixture's expiry.
+    pass(&ctx).await;
+    assert_eq!(slot_due(&ctx, &family.family()).await, None);
+    assert!(due_rows(&ctx).await.is_empty());
 }

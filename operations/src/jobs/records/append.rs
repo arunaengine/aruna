@@ -17,6 +17,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
+    RETENTION_MS, TOMBSTONE_RETENTION_MS,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, Value};
@@ -29,7 +30,7 @@ use super::admit::{
 use super::verify::{EvidencePlan, FamilyView};
 use super::{MAX_EVIDENCE_ROWS, RECORD_PAGE_SIZE, RecordStoreError};
 use aruna_core::structs::execution::job::record_keys::{
-    alias_key, conflict_key, family_prefix, kind_prefix, prune_rows, record_key,
+    alias_key, conflict_key, family_prefix, kind_prefix, prune_rows_at, record_key,
 };
 use aruna_core::structs::execution::job::record_rows::{
     OutboxEntry, PendingRecord, ProjectionCache, from_bytes, to_bytes,
@@ -390,7 +391,17 @@ impl AppendRecordOperation {
             ));
         }
         if !plan.admitted.is_empty() || !plan.pending.is_empty() {
-            writes.extend(prune_rows(&self.family(), self.config.now_ms));
+            // A pending row keeps its first sight across re-arrivals, so it bounds the due time.
+            let kept = (self.retained.iter())
+                .filter(|(key, _)| !plan.cleared.contains(key))
+                .chain(plan.pending.iter());
+            let expiry =
+                kept.map(|(_, row)| row.first_seen_ms.saturating_add(TOMBSTONE_RETENTION_MS));
+            let written = self.config.now_ms.saturating_add(RETENTION_MS);
+            writes.extend(prune_rows_at(
+                &self.family(),
+                expiry.fold(written, u64::min),
+            ));
         }
         if !plan.admitted.is_empty() {
             writes.push((
