@@ -20,7 +20,6 @@ use aruna_core::structs::placement::record::PlacementStrategy;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::storage::FjallStorage;
 use tempfile::tempdir;
-use tokio_util::sync::CancellationToken;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -605,9 +604,7 @@ fn no_network_wraps() {
 
 #[test]
 fn stop_keeps_cursor() {
-    let token = CancellationToken::new();
-    token.cancel();
-    let (_, turn) = started_pass(RecoveryStop::new(token));
+    let (_, turn) = started_pass(RecoveryStop::new(|| true));
     let Ok(Next::Done((done, cursor))) = turn else {
         panic!("a stopped pass runs no unit");
     };

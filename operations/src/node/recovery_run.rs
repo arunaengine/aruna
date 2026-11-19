@@ -426,7 +426,8 @@ mod tests {
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::RealmNodeKind;
     use irokle::TopicId;
-    use tokio_util::sync::CancellationToken;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::shard::recovery::RecoveryState;
@@ -566,22 +567,22 @@ mod tests {
 
     #[test]
     fn stop_ends_wait() {
-        let token = CancellationToken::new();
-        let (mut operation, _status) = recovery(RecoveryStop::new(token.clone()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        let stop = RecoveryStop::new(move || flag.load(Ordering::Relaxed));
+        let (mut operation, _status) = recovery(stop);
         operation.reconcile_placements = false;
         operation.announce_presence = false;
         operation.first().unwrap();
         operation.attempts = 40;
         operation.next(passed(blocked_pass())).unwrap();
-        token.cancel();
+        stopped.store(true, Ordering::Relaxed);
         assert_eq!(operation.next(IoResult::Woke), Ok(Next::Done(())));
     }
 
     #[test]
     fn stopped_before_pass() {
-        let token = CancellationToken::new();
-        token.cancel();
-        let (mut operation, status) = recovery(RecoveryStop::new(token));
+        let (mut operation, status) = recovery(RecoveryStop::new(|| true));
         assert_eq!(operation.first(), Ok(Next::Done(())));
         assert_eq!(status.snapshot().state, RecoveryState::Pending);
     }

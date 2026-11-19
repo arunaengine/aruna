@@ -173,6 +173,46 @@ pub struct ShardManifest {
     pub updated_at_ms: u64,
 }
 
+/// New-holder request: give me your paged manifest for this shard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardTransportMessage {
+    ManifestRequest {
+        realm_id: RealmId,
+        placement: PlacementRef,
+    },
+}
+
+/// A digest of the entries that does not depend on their order.
+pub fn manifest_entry_digest(entries: &[ShardManifestEntry]) -> [u8; 32] {
+    let mut encoded_entries: Vec<Vec<u8>> = entries.iter().map(canonical_entry_bytes).collect();
+    encoded_entries.sort();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(encoded_entries.len() as u64).to_be_bytes());
+    for encoded in encoded_entries {
+        hasher.update(&(encoded.len() as u64).to_be_bytes());
+        hasher.update(&encoded);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn canonical_entry_bytes(entry: &ShardManifestEntry) -> Vec<u8> {
+    let target_key = crate::storage_entries::sync_revision_key(&entry.target);
+    let target_key = target_key.as_ref();
+    let mut bytes = Vec::with_capacity(4 + target_key.len() + 8 + 16 + 32 + 8);
+    bytes.extend_from_slice(&(target_key.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(target_key);
+    bytes.extend_from_slice(&entry.revision.generation.to_be_bytes());
+    bytes.extend_from_slice(&entry.revision.event_id.to_bytes());
+    bytes.extend_from_slice(entry.revision.actor.as_bytes());
+    bytes.extend_from_slice(&entry.revision.updated_at_ms.to_be_bytes());
+    bytes
+}
+
+// Matches irokle's 1024-topic wire batches; the worst-case data stream sends
+// three messages per topic, staying under the peer's 4096-message stream cap.
+pub const BATCH_TOPIC_LIMIT: usize = 1_024;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentOutboxRecord {
     pub outbox_id: Ulid,

@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::document::manifest_entry_digest;
 use aruna_core::document::{ShardManifest, shard_topic_id};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, ShardNetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, ShardNetEvent};
@@ -16,7 +17,6 @@ use aruna_core::rows::{PrefixPages, done, encoded_row, read_row, value};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::Key;
-use aruna_net::shard_manifest::manifest_entry_digest;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 

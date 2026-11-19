@@ -448,7 +448,8 @@ fn spawn_recovery(
         node_id: node.net.node_id(),
         publish_full_usage: false,
     };
-    let stop = RecoveryStop::new(cancelled.clone());
+    let flag = cancelled.clone();
+    let stop = RecoveryStop::new(move || flag.is_cancelled());
     let serving = node.context.node_and_realm().map(|(_, realm_id)| realm_id);
     let recovery = RecoveryOperation::new(config, serving, status.clone(), stop);
     let context = node.context.clone();
