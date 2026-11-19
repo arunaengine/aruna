@@ -4,6 +4,7 @@
 
 use crate::error::CliError;
 use aruna::config::load;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::calls::Next;
@@ -13,7 +14,6 @@ use aruna_core::onboarding::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
@@ -435,7 +435,7 @@ impl DoctorValidationState {
         // The replicated realm config is the only revocation authority.
         for realm_id in &trusted_realms {
             if let Ok(config) = drive(GetConfigOperation::new(*realm_id), driver_ctx).await {
-                let now = aruna_core::time::unix_timestamp_secs();
+                let now = aruna_clock::unix_timestamp_secs();
                 revoked_token_hashes.extend(
                     config
                         .revoked_tokens

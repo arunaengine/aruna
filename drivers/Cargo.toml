@@ -17,6 +17,7 @@ test-hooks = []
 [dependencies]
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
+aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
 aruna-graph = { workspace = true }
 aruna-net = { workspace = true }

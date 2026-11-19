@@ -447,7 +447,7 @@ async fn finish_report(state: &ServerState, job_id: JobId, owner: UserId) -> [u8
             unit: "entries".to_string(),
             paused_until: None,
         },
-        aruna_core::time::unix_timestamp_millis(),
+        aruna_clock::unix_timestamp_millis(),
     )
     .await
     .unwrap()
@@ -642,11 +642,7 @@ async fn artifact_head_headers() {
     let job_id = JobId::from_bytes([11u8; 16]);
     insert_job(
         &state.get_ctx(),
-        &export_job(
-            job_id,
-            owner,
-            aruna_core::time::unix_timestamp_millis() + 60_000,
-        ),
+        &export_job(job_id, owner, aruna_clock::unix_timestamp_millis() + 60_000),
     )
     .await
     .unwrap();

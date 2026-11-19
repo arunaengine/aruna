@@ -24,6 +24,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use ulid::Ulid;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
@@ -32,7 +33,6 @@ use aruna_core::structs::execution::job::{
     WorkspaceMode,
 };
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::JOB_PRUNE_PAGE;

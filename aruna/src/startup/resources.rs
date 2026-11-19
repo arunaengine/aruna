@@ -571,7 +571,7 @@ async fn open_managed_keys(
     driver_ctx: &DriverContext,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_core::time::unix_timestamp_millis;
+    use aruna_clock::unix_timestamp_millis;
     use aruna_operations::jobs::key_wake::WakeUnlockedOperation;
     use aruna_operations::s3::bucket::key::startup::OpenManagedOperation;
 
@@ -624,7 +624,7 @@ async fn record_restart_locks(
         Ok(stored) => info!(records = stored, "Stored kept bucket key audit records"),
         Err(error) => warn!(error = %error, "Kept bucket key audit records not read"),
     }
-    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let now_ms = aruna_clock::unix_timestamp_millis();
     let scan = RestartScanOperation::new(now_ms, config.realm_id);
     let buckets = drive(scan, driver_ctx).await?;
     if buckets.is_empty() {

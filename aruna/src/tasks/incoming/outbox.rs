@@ -725,7 +725,7 @@ impl OperationsTaskHandler {
         // Publish to the bucket's sync members (admitted targets and retained departing holders included), but
         // keep stamped peers above as genesis sources: a target must see writes made during the window.
         if let Some(config) = config {
-            let now_ms = aruna_core::time::unix_timestamp_millis();
+            let now_ms = aruna_clock::unix_timestamp_millis();
             for (_, record, _) in &mut records {
                 if !record.target.uses_shard_topic() {
                     continue;

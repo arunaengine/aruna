@@ -6,6 +6,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
@@ -17,7 +18,6 @@ use aruna_core::structs::storage::share::{
     SHARE_SCHEME, ShareAction, ShareEvent, ShareLink, ShareTarget, ShareToken, TICKET_SECS,
     TicketBody, client_network,
 };
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{drive, drive_retry};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::distribution::nonce::SpendNonceOperation;
@@ -61,7 +61,7 @@ use crate::rate_limit::LocalKey;
 use crate::routes::storage::objects::{page_error, page_node};
 use crate::s3::service::{ArunaS3Service, delegated_caller};
 use crate::server::state::ServerState;
-use aruna_core::time::unix_timestamp_secs;
+use aruna_clock::unix_timestamp_secs;
 use aruna_operations::s3::object::member_read::{MemberKey, MemberRead, MemberReadOperation};
 use aruna_operations::s3::object::pages::{ListRequest, ObjectPageOperation, PageError};
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -6,6 +6,7 @@ use super::storage::*;
 use super::*;
 use crate::test_support::test_endpoint;
 use ::irokle::sync::SyncData;
+use aruna_clock::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::admin_checks::{has_write_permission, revocation_origin_known};
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
@@ -73,7 +74,6 @@ use aruna_core::sync_checks::{
     validate_policy_document, validate_register_upsert, validate_setting_upsert,
     validate_watch_upsert,
 };
-use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::{MetaResourceId, StructuredId, UserId};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;

@@ -1286,7 +1286,7 @@ fn derives_family_tags() {
 /// Writes a live user cutoff for `user` into this realm's config.
 async fn deactivate(state: &ServerState, user: UserId) {
     use aruna_core::structs::identity::realm::TokenRevocation;
-    let now = aruna_core::time::unix_timestamp_secs();
+    let now = aruna_clock::unix_timestamp_secs();
     let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
     config.revoked_tokens.push(TokenRevocation {
         token_hash: aruna_core::auth::user_cutoff_hash(&user),

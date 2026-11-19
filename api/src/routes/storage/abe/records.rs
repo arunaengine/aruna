@@ -146,7 +146,7 @@ pub(crate) async fn member_requests(
     group_id: Ulid,
     members: Vec<aruna_core::UserId>,
 ) -> Vec<String> {
-    let now = aruna_core::time::unix_timestamp_millis();
+    let now = aruna_clock::unix_timestamp_millis();
     let node = state.get_node_id();
     let operation = MemberKeysOperation::new(auth.clone(), node, group_id, members, now);
     match drive(operation, &state.get_ctx()).await {
@@ -178,7 +178,7 @@ async fn raise_run(
     };
     let node = state.get_node_id();
     for _ in 0..100_000 {
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
         let page = ReissueOperation::new(bucket.into(), auth.clone(), node, now, MAX_REQUESTS);
         match drive(page, &state.get_ctx()).await {
             Ok(true) => {}
@@ -194,7 +194,7 @@ async fn raise_run(
 /// Raises the node managed buckets of a group, or of every group without one, after the change
 /// that lost a READ scope marked them due in its transaction.
 pub(crate) async fn epoch_due(state: &ServerState, auth: &AuthContext, group_id: Option<Ulid>) {
-    let now = aruna_core::time::unix_timestamp_millis();
+    let now = aruna_clock::unix_timestamp_millis();
     let managed = match drive(EpochDueOperation::new(group_id, now), &state.get_ctx()).await {
         Ok(managed) => managed,
         Err(error) => {

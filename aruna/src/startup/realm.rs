@@ -332,7 +332,7 @@ async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<
         config.realm_id,
         config.node_id,
         aruna_operations::placement::policy::SubjectTrigger::Reconcile(mode),
-        aruna_core::time::unix_timestamp_millis(),
+        aruna_clock::unix_timestamp_millis(),
     );
     aruna_drivers::driver::drive(sync, ctx)
         .await

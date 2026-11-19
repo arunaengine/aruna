@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::time::unix_timestamp_millis;
+use aruna_clock::unix_timestamp_millis;
 use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;

@@ -139,7 +139,7 @@ pub async fn export_provenance(
             ));
         }
     };
-    let (now, unix_now) = (Instant::now(), aruna_core::time::unix_timestamp_secs());
+    let (now, unix_now) = (Instant::now(), aruna_clock::unix_timestamp_secs());
     let finish_by = export_deadline(now, unix_now, bearer.expires_at_secs());
     let caller = Caller {
         state,

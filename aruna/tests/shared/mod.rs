@@ -855,7 +855,7 @@ async fn spawn_seed_at(
             realm_id,
             net.node_id(),
             SubjectTrigger::Reconcile(mode),
-            aruna_core::time::unix_timestamp_millis(),
+            aruna_clock::unix_timestamp_millis(),
         );
         drive(sync, context.as_ref())
             .await

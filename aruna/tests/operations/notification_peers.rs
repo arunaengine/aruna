@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna::inbound::initialize_incoming_fixture;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -26,7 +27,6 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenRevocation,
 };
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::document_repository::GetConfigOperation;
@@ -112,7 +112,7 @@ async fn revoke_watch_token(
             .expect("watch binding")
             .token_hash
             .clone(),
-        expires_at: aruna_core::time::unix_timestamp_secs() + 600,
+        expires_at: aruna_clock::unix_timestamp_secs() + 600,
     });
     write_config(node, config.realm_id, &config).await;
 }

@@ -10,6 +10,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_compute::session::Session;
 use aruna_core::compute::AttemptPhase;
 use aruna_core::events::Event;
@@ -20,7 +21,6 @@ use aruna_core::structs::execution::job::{
     JobError, JobExecutionClass, JobId, JobPayload, JobRecord, JobState,
 };
 use aruna_core::task::TaskEvent;
-use aruna_core::time::unix_timestamp_millis;
 use futures_util::future::{BoxFuture, FutureExt};
 use tokio::sync::RwLockReadGuard;
 use tokio::time::interval;

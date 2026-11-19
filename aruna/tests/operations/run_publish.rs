@@ -159,7 +159,7 @@ async fn finished_run(
     );
     record.state = JobState::Succeeded;
     // Inside its retention, so the node's job pruner leaves it alone.
-    record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
+    record.finished_at_ms = Some(aruna_clock::unix_timestamp_millis());
     record.result = Some(JobResultPayload::Execution {
         exit_code: Some(0),
         workspace_bucket: None,

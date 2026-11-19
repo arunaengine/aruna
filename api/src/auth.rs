@@ -1031,7 +1031,7 @@ mod test {
     }
 
     async fn revoke(driver_ctx: &Arc<DriverContext>, actor: Actor, token: &str) {
-        let now = aruna_core::time::unix_timestamp_secs();
+        let now = aruna_clock::unix_timestamp_secs();
         let token_owner = actor.user_id;
         drive(
             RevokeTokenOperation::new(RevokeTokenConfig {

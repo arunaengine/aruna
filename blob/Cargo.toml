@@ -15,6 +15,7 @@ async_zip = { workspace = true }
 async-compression = { workspace = true }
 aruna-kpabe = { workspace = true }
 lru = { workspace = true }
+aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
 aruna-net = { workspace = true }
 aruna-storage = { workspace = true }

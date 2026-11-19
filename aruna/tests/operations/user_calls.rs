@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
 };
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::notifications::dispatch::NotificationDispatchError;

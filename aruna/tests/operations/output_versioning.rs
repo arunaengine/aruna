@@ -11,6 +11,7 @@ use crate::job_calls::record_attempt_intent;
 use crate::job_calls::reserve_output_commits;
 use aruna::tasks::runner::under_lease;
 use aruna_blob::blob::BlobHandler;
+use aruna_clock::unix_timestamp_millis;
 use aruna_compute::{ExecutorBackend, ExecutorRegistry};
 use aruna_core::UserId;
 use aruna_core::compute::{
@@ -40,7 +41,6 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskKey;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_net::{NetConfig, NetHandle};
