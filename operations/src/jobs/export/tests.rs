@@ -18,8 +18,7 @@ use crate::jobs::repository::test_support::{
     artifact, job_id, job_scope as scoped_job, local_scope, other_node, owner_node, realm,
 };
 use crate::tests::export::{
-    crate_document, destination, job_context, probe_sources, recognized_entities, remote_spec,
-    scope_of,
+    crate_document, job_context, probe_sources, recognized_entities, remote_spec, scope_of,
 };
 use aruna_blob::archive::zip_date;
 use aruna_blob::archive::zip_entry;

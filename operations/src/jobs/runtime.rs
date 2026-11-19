@@ -448,3 +448,71 @@ impl JobsRuntime {
         std::mem::take(&mut self.state().pending_releases)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::jobs::import_record;
+    use crate::tests::locations::node_id;
+    use aruna_core::jobs::JobTarget;
+    use aruna_core::structs::execution::job::JobProgress;
+    use ulid::Ulid;
+
+    // Staging and both import kinds count as imports in the node telemetry.
+    #[test]
+    fn counts_import_kinds() {
+        let runtime = JobsRuntime::new();
+        let job_id = JobId::from_bytes([0x6B; 16]);
+        let nonce = runtime.register_test_execution(job_id, JobExecutionClass::InProcess);
+        for kind in [
+            JobKind::Staging,
+            JobKind::ImportRoCrate,
+            JobKind::BackendImport,
+        ] {
+            runtime.state().running.get_mut(&job_id).unwrap().view.kind = kind;
+            assert_eq!(
+                runtime.running_jobs(),
+                RunningJobs {
+                    total: 1,
+                    imports: 1
+                }
+            );
+        }
+        runtime.retire(job_id, nonce);
+        assert_eq!(runtime.running_jobs(), RunningJobs::default());
+    }
+
+    // The list carries what an import works on, and progress only once the job counts.
+    #[test]
+    fn lists_running_jobs() {
+        let runtime = JobsRuntime::new();
+        let job_id = JobId::from_bytes([0x6C; 16]);
+        runtime.register_test_execution(job_id, JobExecutionClass::InProcess);
+        let reporter = ProgressReporter::from_progress(&JobProgress::new("entries"));
+        {
+            let mut state = runtime.state();
+            let job = state.running.get_mut(&job_id).unwrap();
+            job.view = RunningJobView::new(&import_record(job_id, node_id(7)), 42);
+            job.progress = Some(reporter.clone());
+        }
+        let listed = runtime.running_list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, JobKind::ImportRoCrate);
+        assert_eq!(
+            listed[0].target,
+            Some(JobTarget::Bucket {
+                bucket: "target".to_string(),
+                path: Some("crate".to_string()),
+                exact: false,
+            })
+        );
+        assert_eq!(listed[0].group_id, Some(Ulid::from_bytes([4u8; 16])));
+        assert_eq!(listed[0].started_at_ms, 42);
+        assert_eq!(listed[0].progress, None, "nothing counted yet");
+
+        reporter.set_total(20);
+        reporter.set_current(14);
+        let progress = runtime.running_list()[0].progress.clone().unwrap();
+        assert_eq!((progress.current, progress.total), (14, Some(20)));
+    }
+}
