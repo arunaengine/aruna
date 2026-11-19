@@ -430,7 +430,6 @@ fn search_plan_limits() {
 #[test]
 fn search_assembly_order() {
     let realm_id = RealmId::from_bytes([72u8; 32]);
-    let test = metadata_test();
     let first = iroh::SecretKey::from_bytes(&[73u8; 32]).public();
     let second = iroh::SecretKey::from_bytes(&[74u8; 32]).public();
     let plan = ObjectSearchPlan {
@@ -528,7 +527,7 @@ fn search_assembly_order() {
         ..page(second, None)
     };
     let parts = vec![(first, page(first, Some("a"))), (second, unsearched)];
-    let refused = assemble_object_execution(&test.context, &strict, partitions(), parts, stats());
+    let refused = assemble_object_execution((&strict, first), partitions(), parts, stats());
     let Err(MetadataApiError::SearchIncomplete(reason)) = refused else {
         panic!("a strict search with an unsearched range is refused");
     };
@@ -548,9 +547,8 @@ fn search_assembly_order() {
         mode: ObjectQueryMode::DistributedBestEffort,
         ..strict
     };
-    let execution = assemble_object_execution(
-        &test.context,
-        &plan,
+    let (execution, cursor) = assemble_object_execution(
+        (&plan, first),
         partitions(),
         vec![
             (first, page(first, Some("a"))),
@@ -558,7 +556,7 @@ fn search_assembly_order() {
         ],
         stats(),
     )
-    .expect("exhausted partitions assemble without a net handle");
+    .expect("exhausted partitions assemble");
 
     assert_eq!(
         execution
@@ -576,7 +574,7 @@ fn search_assembly_order() {
             .all(|partition| !partition.truncated)
     );
     assert!(execution.complete);
-    assert!(execution.next_cursor.is_none());
+    assert!(cursor.is_none());
 
     // Changed keys of finished pages add to the total the earlier pages carried.
     let changed = |node_id, key: Option<&str>, changed: &str| SearchNodePage {
@@ -591,8 +589,8 @@ fn search_assembly_order() {
         (first, changed(first, Some("b"), "a")),
         (second, changed(second, None, "z")),
     ];
-    let execution = assemble_object_execution(&test.context, &plan, carried, parts, stats())
-        .expect("exhausted partitions assemble without a net handle");
+    let (execution, _) = assemble_object_execution((&plan, first), carried, parts, stats())
+        .expect("exhausted partitions assemble");
     assert_eq!(execution.page_changed, 2);
     assert_eq!(execution.changed_keys, Some(5));
 
@@ -630,8 +628,8 @@ fn search_assembly_order() {
     ];
     for (carried, [left, right], kept) in cases {
         let parts = vec![(first, left), (second, right)];
-        let execution = assemble_object_execution(&test.context, &plan, carried, parts, stats())
-            .expect("exhausted partitions assemble without a net handle");
+        let (execution, _) = assemble_object_execution((&plan, first), carried, parts, stats())
+            .expect("exhausted partitions assemble");
         assert_eq!(execution.complete, kept);
         assert_eq!(execution.layout_changed, !kept);
         assert_eq!(execution.changed_keys, kept.then_some(0));
@@ -641,8 +639,7 @@ fn search_assembly_order() {
         ..plan
     };
     let parts = vec![(first, laid(first, 1, 2)), (second, page(second, None))];
-    let refused =
-        assemble_object_execution(&test.context, &strict, seen(1, 1, false), parts, stats());
+    let refused = assemble_object_execution((&strict, first), seen(1, 1, false), parts, stats());
     assert!(matches!(
         refused,
         Err(MetadataApiError::SearchIncomplete(_))

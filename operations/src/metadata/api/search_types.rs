@@ -94,14 +94,14 @@ pub struct SearchQueryRequest {
     pub target_nodes: Option<Vec<NodeId>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ObjectPartitionCoverage {
     pub node_id: NodeId,
     pub observed_at: SystemTime,
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ObjectExecution {
     pub hits: Vec<ObjectInventoryHit>,
     pub next_cursor: Option<String>,

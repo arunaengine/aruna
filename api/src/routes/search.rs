@@ -16,7 +16,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
 use aruna_operations::metadata::api::fanout::search_buckets_distributed;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
-use aruna_operations::metadata::api::search::search_objects;
+use aruna_operations::metadata::api::object_search::search_objects;
 use aruna_operations::metadata::api::search_fanout::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
@@ -643,28 +643,36 @@ pub async fn object_search(
         ObjectMatchMode::Prefix => ObjectKeyMatch::Prefix,
         ObjectMatchMode::Metadata => ObjectKeyMatch::Metadata,
     };
-    let result = search_objects(
-        state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        SearchQueryRequest {
-            auth,
-            bearer_token: bearer_token.map(|carrier| carrier.as_str().to_string()),
-            query: query.to_string(),
-            key_match,
-            bucket,
-            limit: params
-                .limit
-                .unwrap_or(DEFAULT_SEARCH_LIMIT)
-                .clamp(1, MAX_SEARCH_LIMIT),
-            cursor: params.cursor,
-            mode: match mode {
-                ObjectMode::Local => ObjectQueryMode::Local,
-                ObjectMode::DistributedBestEffort => ObjectQueryMode::DistributedBestEffort,
-                ObjectMode::DistributedStrict => ObjectQueryMode::DistributedStrict,
+    let result = drive(
+        search_objects(
+            state.get_realm_id(),
+            state.get_node_id(),
+            SearchQueryRequest {
+                auth,
+                bearer_token: bearer_token.map(|carrier| carrier.as_str().to_string()),
+                query: query.to_string(),
+                key_match,
+                bucket,
+                limit: params
+                    .limit
+                    .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                    .clamp(1, MAX_SEARCH_LIMIT),
+                cursor: params.cursor,
+                mode: match mode {
+                    ObjectMode::Local => ObjectQueryMode::Local,
+                    ObjectMode::DistributedBestEffort => ObjectQueryMode::DistributedBestEffort,
+                    ObjectMode::DistributedStrict => ObjectQueryMode::DistributedStrict,
+                },
+                target_nodes: None,
             },
-            target_nodes: None,
-        },
+            state
+                .get_ctx()
+                .as_ref()
+                .storage_handle
+                .range_indexes()
+                .is_some(),
+        ),
+        state.get_ctx().as_ref(),
     )
     .await
     .map_err(map_api_error)?;
