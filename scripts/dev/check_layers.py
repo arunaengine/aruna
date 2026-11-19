@@ -785,10 +785,11 @@ def core_clocks(sources, root="core/src/"):
     return found
 
 
-def clean_findings(ops, clean):
+def async_findings(ops):
+    """Every production file of operations with async code, at its first async line."""
     found = []
     for rel, info in sorted(ops.files.items()):
-        if info["module"] in clean and info["kind"] in ("async", "mixed"):
+        if info["kind"] in ("async", "mixed"):
             hit = ASYNC_RE.search(info["source"].masked)
             line = info["source"].masked.count("\n", 0, hit.start()) + 1
             found.append(f"{rel}:{line}")
@@ -802,9 +803,8 @@ def load_baseline(path):
     except FileNotFoundError:
         baseline = {}
     missing = [key for key, _ in COUNTS if key not in baseline.get("structural", {})]
-    for key in ("clean_domains", "crate_allow", "async_lines"):
-        if key not in baseline:
-            missing.append(key)
+    if "crate_allow" not in baseline:
+        missing.append("crate_allow")
     return baseline, missing
 
 
@@ -812,12 +812,12 @@ def report(root, baseline, show_all):
     """Print the guard report and return the number of errors."""
     counts, details, lines, ops, sources = measure(root)
     errors = 0
-    total, base_total = sum(lines.values()), sum(baseline["async_lines"].values())
-    print(f"async production lines in operations: {total} (baseline {base_total}), reported only")
-    for module in sorted(set(lines) | set(baseline["async_lines"])):
-        now, before = lines.get(module, 0), baseline["async_lines"].get(module, 0)
-        if show_all or now != before:
-            print(f"  {module}: {now} (baseline {before})")
+    print(f"async production lines in operations: {sum(lines.values())}")
+    for module, count in lines.items():
+        print(f"  {module}: {count}")
+    for hit in async_findings(ops):
+        errors += 1
+        print(f"  error: async code in operations production at {hit}")
     for key, label in COUNTS:
         now, limit = counts[key], baseline["structural"][key]
         print(f"{label}: {now} (baseline {limit})")
@@ -829,12 +829,6 @@ def report(root, baseline, show_all):
         if show_all or now > limit:
             for line in details[key]:
                 print(f"    {line}")
-    clean = baseline["clean_domains"]
-    dirty = clean_findings(ops, set(clean))
-    print(f"clean domains: {', '.join(clean) if clean else 'none'}")
-    for hit in dirty:
-        errors += 1
-        print(f"  error: async code in a clean domain at {hit}")
     outside_deps, unused = crate_findings(root, baseline["crate_allow"])
     print(f"crate dependencies outside the target table and allow list: {len(outside_deps)}")
     for dep in outside_deps:
@@ -850,12 +844,10 @@ def report(root, baseline, show_all):
 
 
 def current_json(root, baseline):
-    counts, _, lines, _, _ = measure(root)
+    counts, _, _, _, _ = measure(root)
     result = {
-        "clean_domains": baseline.get("clean_domains", []),
         "crate_allow": baseline.get("crate_allow", {}),
         "structural": {key: counts[key] for key, _ in COUNTS},
-        "async_lines": lines,
     }
     return json.dumps(result, indent=2) + "\n"
 

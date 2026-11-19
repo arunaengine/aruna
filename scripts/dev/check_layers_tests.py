@@ -42,12 +42,17 @@ def base_tree(extra=None):
     return files
 
 
-def zero_baseline(clean=()):
+def pure_tree(extra=None):
+    """The base tree without its async module, as production operations must be."""
+    files = base_tree({"operations/src/jobs/mod.rs": "pub fn run() {}\n"})
+    files.update(extra or {})
+    return files
+
+
+def zero_baseline():
     return {
-        "clean_domains": list(clean),
         "crate_allow": {},
         "structural": {key: 0 for key, _ in check_layers.COUNTS},
-        "async_lines": {},
     }
 
 
@@ -326,23 +331,27 @@ class CratesTest(unittest.TestCase):
 
 
 class GuardTest(unittest.TestCase):
-    def test_clean_await(self):
-        errors, output = run_report(base_tree(), zero_baseline(["abe"]))
+    def test_production_await(self):
+        errors, output = run_report(pure_tree(), zero_baseline())
         self.assertEqual(errors, 0, output)
-        added = base_tree({"operations/src/abe/mod.rs": PURE_OP + "fn later() { ready.await; }\n"})
-        errors, output = run_report(added, zero_baseline(["abe"]))
-        self.assertGreater(errors, 0)
-        self.assertIn("async code in a clean domain at operations/src/abe/mod.rs:3", output)
+        added = pure_tree({"operations/src/abe/plain.rs": "fn later() { ready.await; }\n"})
+        errors, output = run_report(added, zero_baseline())
+        self.assertEqual(errors, 1, output)
+        self.assertIn("error: async code in operations production at operations/src/abe/plain.rs:1", output)
+        errors, output = run_report(base_tree(), zero_baseline())
+        self.assertEqual(errors, 1, output)
+        self.assertIn("at operations/src/jobs/mod.rs:1", output)
 
     def test_count_rises(self):
-        files = base_tree({"operations/src/abe/mod.rs": PURE_OP + "async fn later() {}\n"})
+        files = pure_tree({"operations/src/abe/mod.rs": PURE_OP + "async fn later() {}\n"})
         errors, output = run_report(files, zero_baseline())
-        self.assertEqual(errors, 1)
+        self.assertEqual(errors, 2)
         self.assertIn("error: mixed_files rose above its baseline", output)
+        self.assertIn("error: async code in operations production at operations/src/abe/mod.rs:3", output)
         baseline = zero_baseline()
         baseline["structural"]["mixed_files"] = 2
         errors, output = run_report(files, baseline)
-        self.assertEqual(errors, 0)
+        self.assertEqual(errors, 1)
         self.assertIn("note: mixed_files fell below its baseline", output)
 
     def test_baseline_keys(self):
