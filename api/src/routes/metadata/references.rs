@@ -14,7 +14,7 @@ use crate::metadata::{
 };
 use crate::server::state::ServerState;
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::api::preflight_fanout::references_preflight as run_references_preflight;
+use aruna_operations::metadata::api::preflight::fanout::references_preflight as run_references_preflight;
 use aruna_operations::metadata::api::preflight_types::{
     MetadataIndexState, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,
     ReferenceTarget,

@@ -6,11 +6,11 @@ use super::*;
 use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
 use aruna_core::structs::storage::blob::CurrentVersionPointer;
 
+use super::super::preflight::targets::{ResolveTargetsOperation, ResolveVersionsOperation};
 use super::super::preflight::{
     PreflightCursorPlan, PreflightPlan, assemble_preflight_execution, index_state,
     plan_preflight_request, version_targets, visible_prefix,
 };
-use super::super::preflight_targets::{ResolveTargetsOperation, ResolveVersionsOperation};
 use super::super::preflight_types::preflight_fingerprint;
 use super::super::search_fanout::resume_cursor;
 use crate::driver::drive;

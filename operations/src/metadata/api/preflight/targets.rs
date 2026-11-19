@@ -13,17 +13,19 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
 
-use super::head_versions::{HeadVersions, HeadVersionsError, HeadVersionsOperation};
-use super::prefix_scan::{PrefixScanError, PrefixScanOperation, ScannedRows};
-use super::preflight::{
-    LONG_KEY_ROWS, MAX_TARGET_VERSIONS, ResolvedPreflightTargets, decode_version, version_targets,
+use super::super::head_versions::{HeadVersions, HeadVersionsError, HeadVersionsOperation};
+use super::super::prefix_scan::{PrefixScanError, PrefixScanOperation, ScannedRows};
+use super::super::preflight_types::{
+    MetadataResolvedTarget, MetadataStorageOperation, ReferenceTarget,
 };
-use super::preflight_types::{MetadataResolvedTarget, MetadataStorageOperation, ReferenceTarget};
-use super::read_access::{child_results, children};
-use super::readable::PathPermissionOperation;
-use super::{
+use super::super::read_access::{child_results, children};
+use super::super::readable::PathPermissionOperation;
+use super::super::{
     ARUNA_DATA_PREFIX, BLOB_VERSIONS_KEYSPACE, BlobHeadKey, BlobVersion, Key, MetadataApiError,
     VersionKey, W3idIdentifier, bucket_permission_path, object_permission_path,
+};
+use super::{
+    LONG_KEY_ROWS, MAX_TARGET_VERSIONS, ResolvedPreflightTargets, decode_version, version_targets,
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -99,7 +101,7 @@ fn purge_scans(bucket: &str, key_prefix: Option<&str>) -> Result<VecDeque<Scan>,
 /// most `MAX_TARGET_VERSIONS` keys, or for a purge at most that many versions, also those
 /// without a head; `false` marks a cut scope.
 #[derive(Debug, PartialEq)]
-pub(super) struct ResolveVersionsOperation {
+pub(in crate::metadata::api) struct ResolveVersionsOperation {
     bucket: String,
     prefix: Option<String>,
     operation: MetadataStorageOperation,
@@ -111,7 +113,7 @@ pub(super) struct ResolveVersionsOperation {
 type VersionTurn = Result<Next<(Versions, bool)>, MetadataApiError>;
 
 impl ResolveVersionsOperation {
-    pub(super) fn new(
+    pub(in crate::metadata::api) fn new(
         bucket: &str,
         prefix: Option<&str>,
         operation: MetadataStorageOperation,
@@ -222,7 +224,7 @@ enum TargetStage {
 /// The targets of one preflight. A bucket target needs the caller's write permission on its
 /// scope and on every key it resolves to; a cut scope is incomplete.
 #[derive(Debug, PartialEq)]
-pub(super) struct ResolveTargetsOperation {
+pub(in crate::metadata::api) struct ResolveTargetsOperation {
     realm_id: RealmId,
     local_node: NodeId,
     auth: AuthContext,
@@ -238,7 +240,7 @@ pub(super) struct ResolveTargetsOperation {
 type TargetTurn = Result<Next<ResolvedPreflightTargets>, MetadataApiError>;
 
 impl ResolveTargetsOperation {
-    pub(super) fn new(
+    pub(in crate::metadata::api) fn new(
         (realm_id, local_node): (RealmId, NodeId),
         auth: AuthContext,
         target: ReferenceTarget,
@@ -373,5 +375,5 @@ impl Operation for ResolveTargetsOperation {
 }
 
 #[cfg(test)]
-#[path = "preflight_targets_tests.rs"]
+#[path = "targets_tests.rs"]
 mod call_tests;

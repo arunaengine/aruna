@@ -464,7 +464,7 @@ impl MetadataHandle {
                                     .and_then(|document| document.urls.s3);
                                 let local = (*net.realm_id(), net.node_id());
                                 let preflight =
-                                    super::super::api::preflight_local::references_preflight_local(
+                                    super::super::api::preflight::local::references_preflight_local(
                                         local, auth, *request, endpoint,
                                     );
                                 drive(preflight, context.as_ref())
