@@ -51,7 +51,7 @@ fn group(members: Vec<Effect>) -> IoCall {
 }
 
 /// Runs `operations` as one group of children, at most [`FANOUT_LIMIT`] at a time.
-pub(super) fn children<O, K>(operations: Vec<O>) -> IoCall
+pub(crate) fn children<O, K>(operations: Vec<O>) -> IoCall
 where
     O: Runnable<K> + 'static,
     K: 'static,
@@ -63,7 +63,7 @@ where
 
 /// The child results of a group from [`children`], in order; `None` for a member that did not
 /// finish or answered with another type.
-pub(super) fn child_results<T: 'static, E: 'static>(
+pub(crate) fn child_results<T: 'static, E: 'static>(
     result: IoResult,
 ) -> Result<Vec<Option<Result<T, E>>>, MetadataApiError> {
     let IoResult::Group(GroupEvent::Finished { results }) = result else {

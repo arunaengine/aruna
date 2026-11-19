@@ -211,13 +211,11 @@ async fn search_candidate_graphs(
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
     let (records, iri_matches) = match iri_filter.as_ref() {
         Some((predicate_iri, object_iri)) => {
-            let (found, matches) = super::super::iri_index::lookup_iri_references(
-                context,
-                predicate_iri,
-                object_iri,
+            let lookup = super::super::iri_index::ReferenceLookupOperation::new(
+                (predicate_iri, object_iri),
                 REGISTRY_CANDIDATE_LIMIT,
-            )
-            .await?;
+            );
+            let (found, matches) = drive(lookup, context).await?;
             (Arc::new(found), Some(matches))
         }
         None => (records, None),

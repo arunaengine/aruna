@@ -31,7 +31,8 @@ pub fn spawn_metadata_warmup(context: Arc<DriverContext>, shutdown: &Shutdown) {
             warn!(error = %error, "Metadata visibility cache warmup failed");
             return;
         }
-        if let Err(error) = crate::metadata::iri_index::rebuild_index(&context).await {
+        let rebuild = crate::metadata::iri_index::RebuildIrisOperation::new();
+        if let Err(error) = drive(rebuild, &context).await {
             warn!(error = %error, "Metadata IRI reference index rebuild failed");
         }
     });
