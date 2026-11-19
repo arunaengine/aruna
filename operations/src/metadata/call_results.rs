@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoError, IoResult};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::types::{Key, PageRows, Value};
+use aruna_core::types::{PageRows, Value};
 
 /// The values of a read call, one per requested key. A batch read effect, used inside a
 /// caller's transaction, answers the same way.
