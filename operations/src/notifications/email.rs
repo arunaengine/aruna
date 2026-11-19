@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
+use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
@@ -16,7 +17,6 @@ use aruna_core::structs::execution::email::EmailPreference;
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::user::id::UserId;
-use tracing::warn;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::notifications::opt_in::EmailError;
@@ -64,8 +64,9 @@ enum RefreshState {
     Prune,
 }
 
-/// Drops the cached mail sender and realm secrets the realm config no longer names. Best effort:
-/// a config read error keeps both, and every failure only warns.
+/// Drops the cached mail sender and realm secrets the realm config no longer names. A config read
+/// or prune that failed keeps the cache and ends in an error, so a caller that retries runs it
+/// again; a realm without a config has nothing to refresh.
 #[derive(Debug, PartialEq)]
 pub struct RefreshMailOperation {
     realm_id: Option<RealmId>,
@@ -114,9 +115,11 @@ impl Operation for RefreshMailOperation {
                     let refresh = Effect::Outbound(OutboundEffect::RefreshMail(revision));
                     Ok(Next::Call(IoCall::from(refresh)))
                 }
+                Err(GetConfigError::DocumentNotFound) => Ok(Next::Done(())),
+                Err(GetConfigError::StorageError(error)) => Err(IoError::Storage(error)),
                 Err(error) => {
-                    warn!(error = %error, "Realm config read failed; cached mail settings stay");
-                    Ok(Next::Done(()))
+                    let error = StorageError::ReadError(error.to_string());
+                    Err(IoError::Storage(error))
                 }
             },
             RefreshState::Sender(config) => match result.event()? {
@@ -127,12 +130,13 @@ impl Operation for RefreshMailOperation {
                 }
                 other => Err(unexpected_event("OutboundEvent::MailRefreshed", &other)),
             },
-            RefreshState::Prune => {
-                if let Err(error) = result.child::<usize, RealmSecretError>()? {
-                    warn!(error = %error, "Pruning cached realm secrets failed");
+            RefreshState::Prune => match result.child::<usize, RealmSecretError>()? {
+                Ok(_) => Ok(Next::Done(())),
+                Err(error) => {
+                    let error = StorageError::WriteError(error.to_string());
+                    Err(IoError::Storage(error))
                 }
-                Ok(Next::Done(()))
-            }
+            },
         }
     }
 }

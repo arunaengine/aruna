@@ -590,3 +590,18 @@ async fn restore_prunes_password() {
     let cached = parse_secret(event, row, |bytes| Ok(bytes.to_vec())).unwrap();
     assert!(cached.is_none(), "the deleted password is no longer cached");
 }
+
+// A config read that failed ends in an error the applied drain retries, instead of finishing as
+// if the cache were refreshed; a realm without a config has nothing to refresh.
+#[test]
+fn failed_read_retries() {
+    let read = |error| IoResult::Child(ChildOutcome::new(Err::<RealmConfigDocument, _>(error)));
+    let mut refresh = RefreshMailOperation::new(user().realm_id);
+    refresh.first().unwrap();
+    let failed = read(GetConfigError::StorageError(StorageError::Timeout));
+    assert_eq!(refresh.next(failed), Err(IoError::Storage(StorageError::Timeout)));
+    let mut missing = RefreshMailOperation::new(user().realm_id);
+    missing.first().unwrap();
+    let missing_config = read(GetConfigError::DocumentNotFound);
+    assert_eq!(missing.next(missing_config), Ok(Next::Done(())));
+}
