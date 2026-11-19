@@ -4,7 +4,7 @@
 
 use std::sync::Mutex;
 
-use crate::job_test_calls::put_crate_outcome;
+use aruna_test_support::jobs::put_crate_outcome;
 use aruna_core::structs::execution::job::{JobId, RunCrateStatus, RunLink};
 use axum::Router;
 use axum::http::StatusCode;

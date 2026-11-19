@@ -3,5 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod documents;
+pub mod jobs;
 pub mod projection;
 pub mod tokens;

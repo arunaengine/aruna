@@ -21,4 +21,5 @@ chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
+serde = { workspace = true }
 ulid = { workspace = true }

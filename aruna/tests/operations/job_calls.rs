@@ -40,7 +40,7 @@ use aruna_operations::jobs::job_reports::{ReportQuery, ReportRouteOperation};
 use aruna_operations::jobs::job_routes::{RecordRouteOperation, StatusRouteOperation};
 use aruna_operations::jobs::prune::{JobPruneOutcome, PruneJobsOperation};
 use aruna_operations::jobs::route::{JobRouteError, RoutedJobStatus};
-pub use aruna_operations::jobs::store::test_calls::{
+pub use aruna_test_support::jobs::{
     list_job_entries, record_attempt_intent, submit_execution_job,
 };
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};

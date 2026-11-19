@@ -840,6 +840,7 @@ dependencies = [
  "aruna-plugin-types",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-test-support",
  "astral_async_zip",
  "async-trait",
  "axum",
@@ -1046,6 +1047,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "irokle",
  "jsonwebtoken",
+ "serde",
  "ulid 3.0.0",
 ]
 

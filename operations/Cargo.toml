@@ -78,6 +78,7 @@ url = { workspace = true }
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+aruna-test-support = { workspace = true }
 async-trait = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-graph = { workspace = true }
