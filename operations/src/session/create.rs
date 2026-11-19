@@ -9,6 +9,7 @@ use aruna_core::auth::bearer_token_hash;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::Secret;
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{USER_KEYSPACE, USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
@@ -120,6 +121,8 @@ pub struct CreateSessionOperation {
     state: Stage,
     /// Who issued a restricted session for another account, and the group owning that account.
     issuer: Option<(UserId, Option<GroupId>)>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 pub fn bound_session_expiry(
@@ -140,9 +143,10 @@ pub fn bound_session_expiry(
 
 impl CreateSessionOperation {
     pub fn new(config: CreateSessionConfig) -> Self {
-        Self::new_with_sid(config, Ulid::generate().to_string())
+        Self::new_with_sid(config, String::new())
     }
 
+    /// An empty `sid` takes a fresh session id from the run.
     pub fn new_with_sid(config: CreateSessionConfig, sid: String) -> Self {
         Self {
             config,
@@ -152,6 +156,8 @@ impl CreateSessionOperation {
             index: BTreeSet::new(),
             state: Stage::Index,
             issuer: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -162,6 +168,9 @@ impl CreateSessionOperation {
     }
 
     fn prepare_session(&mut self) -> Result<(), CreateSessionError> {
+        if self.sid.is_empty() {
+            self.sid = self.ids.mint(self.now_ms).to_string();
+        }
         Ulid::from_string(&self.sid).map_err(ConversionError::from)?;
         if self.config.expiry <= self.config.time {
             return Err(CreateSessionError::InvalidExpiry);
@@ -315,6 +324,14 @@ impl CreateSessionOperation {
 impl Operation for CreateSessionOperation {
     type Output = CreatedSession;
     type Error = CreateSessionError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -500,8 +517,11 @@ pub(super) mod pure_tests {
         }]);
         let admin = UserId::local(Ulid::from_bytes([5; 16]), config.realm_id);
         let group = Ulid::from_bytes([6; 16]);
-        let operation = CreateSessionOperation::new(config.clone()).issued_by(admin, Some(group));
-        let sid = operation.sid.clone();
+        let mut operation =
+            CreateSessionOperation::new(config.clone()).issued_by(admin, Some(group));
+        operation.stamp(1_000);
+        operation.seed(7);
+        let sid = Ulid::from_parts(1_000, 7).to_string();
         let rows = written_rows(operation);
         let audit: Vec<_> = rows
             .iter()
