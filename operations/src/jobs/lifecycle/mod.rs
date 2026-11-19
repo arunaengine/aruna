@@ -21,6 +21,7 @@ pub mod alias;
 pub mod cancel;
 pub mod chain;
 pub mod closure;
+pub mod deferred;
 pub mod family_reads;
 pub(crate) mod fetch;
 mod forward;

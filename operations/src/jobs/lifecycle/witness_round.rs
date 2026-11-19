@@ -432,6 +432,8 @@ impl WitnessRoundOperation {
             sequence,
             plan: empty_plan(),
             declined: Vec::new(),
+            deferred: Vec::new(),
+            answer: None,
             overlapping: false,
             stored_at_ms: now_ms,
         });
@@ -527,6 +529,7 @@ impl WitnessRoundOperation {
             config: facts.config.clone(),
             spec,
             excluded: explain.declined.clone(),
+            deferred: explain.deferred.clone(),
             now_ms,
             local,
             fresh,

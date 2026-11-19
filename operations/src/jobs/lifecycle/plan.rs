@@ -29,6 +29,7 @@ use tracing::debug;
 use ulid::Ulid;
 
 use super::advertised::{Advertised, AdvertisementsOperation};
+use super::deferred::{DeferredTarget, Signal, reconsidered};
 use super::ids;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{PolicyEvaluator, compiled_policies, policy_reads, read_policies};
@@ -75,6 +76,8 @@ pub struct PlanRound {
     /// The stored spec with its paged inputs read in.
     pub spec: LogicalJobSpec,
     pub excluded: Vec<ExecutionTargetId>,
+    /// Targets set aside after only temporary answers; excluded until reconsidered.
+    pub deferred: Vec<DeferredTarget>,
     pub now_ms: u64,
     pub local: NodeId,
     /// The fresh heartbeats whose telemetry overrides the advertised one.
@@ -92,10 +95,10 @@ enum PlanStep {
     Screen,
 }
 
-/// Builds and runs one planning round: the advertisement of every member, the pinned inputs
-/// with their holders, the policies, and whether the submitter may run on each node. Targets
-/// already declined for this request are excluded before ranking; an unread advertisement may
-/// hold the only legal target, so the round is then a continuation, not a conclusive refusal.
+/// Builds and runs one planning round from the members' advertisements, the pinned inputs, the
+/// policies and the submitter's grants. Declined targets, and deferred ones not reconsidered yet,
+/// are excluded; an unread advertisement may hold the only legal target, so the round is then a
+/// continuation, not a conclusive refusal.
 #[derive(Debug, PartialEq)]
 pub struct BuildPlanOperation {
     round: PlanRound,
@@ -132,6 +135,20 @@ impl BuildPlanOperation {
         self.documents = documents;
         self.unread = unread;
         live_telemetry(&self.round.fresh, &mut self.documents, self.round.now_ms);
+        let round = &self.round;
+        let waiting: Vec<_> = (round.deferred.iter())
+            .filter(|entry| {
+                let signal = deferral_signal(&self.documents, round, entry);
+                !reconsidered(
+                    entry,
+                    &signal,
+                    round.now_ms,
+                    round.config.compute.catch_up_ms,
+                )
+            })
+            .map(|entry| entry.target.clone())
+            .collect();
+        self.round.excluded.extend(waiting);
         self.inputs = pinned_inputs(&self.round.config, &self.round.spec)?;
         self.holders(0)
     }
@@ -403,6 +420,80 @@ fn plugin_target(config: &RealmConfigDocument, spec: &LogicalJobSpec) -> Option<
     let tagged = tagged(&spec.payload)?;
     let install = tagged.and_then(|tagged| named_install(&config.installs, tagged));
     Some(install.ok().map(|install| install.receiver))
+}
+
+/// What this round sees of a deferred target, from advertisements with live telemetry. An
+/// unknown availability field never fits.
+fn deferral_signal(
+    documents: &BTreeMap<NodeId, NodeInfoDocument>,
+    round: &PlanRound,
+    entry: &DeferredTarget,
+) -> Signal {
+    let (target, resources) = (&entry.target, &round.spec.resources);
+    let (now_ms, stale_ms) = (round.now_ms, round.config.compute.availability_stale_ms);
+    let document = documents.get(&target.node_id);
+    let executor = document.and_then(|document| {
+        (document.executors.iter()).find(|executor| executor.target(target.node_id) == *target)
+    });
+    let fits_ms = executor.and_then(|executor| {
+        let available = executor.availability?;
+        let room = available.free_cpu_cores? >= resources.cpu_cores
+            && available.free_ram_bytes? >= resources.ram_bytes
+            && available.free_disk_bytes? >= resources.disk_bytes
+            && (executor.limits.max_concurrent).is_none_or(|max| available.active_executions < max);
+        let recent = now_ms.saturating_sub(available.observed_at_ms) <= stale_ms;
+        (room && recent).then_some(available.observed_at_ms)
+    });
+    let fresh = round.fresh.get(&target.node_id);
+    Signal {
+        heartbeat_ms: fresh.map(|held| now_ms.saturating_sub(held.age_ms)),
+        fits_ms,
+        draining: document.map(|document| document.compute_draining),
+    }
+}
+
+/// Whether a deferred target is a candidate again in this round. Its launch goes out again
+/// without a plan, so the target passes the planner's membership, leaving and drain screening.
+#[derive(Debug, PartialEq)]
+pub struct DeferredReadyOperation {
+    round: PlanRound,
+    entry: DeferredTarget,
+}
+
+impl DeferredReadyOperation {
+    pub fn new(round: PlanRound, entry: DeferredTarget) -> Self {
+        Self { round, entry }
+    }
+
+    fn ready(&self, mut documents: BTreeMap<NodeId, NodeInfoDocument>) -> bool {
+        let (config, node_id) = (&self.round.config, self.entry.target.node_id);
+        let drained = (config.placement_entry(node_id)).is_some_and(|entry| entry.draining);
+        let offers = documents.get(&node_id).is_some_and(|document| {
+            node_kind(config, node_id).is_some() && !document.leaving && !document.compute_draining
+        });
+        if !offers || drained {
+            return false;
+        }
+        live_telemetry(&self.round.fresh, &mut documents, self.round.now_ms);
+        let signal = deferral_signal(&documents, &self.round, &self.entry);
+        let floor_ms = config.compute.catch_up_ms;
+        reconsidered(&self.entry, &signal, self.round.now_ms, floor_ms)
+    }
+}
+
+impl Operation for DeferredReadyOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        let read = AdvertisementsOperation::new(&self.round.config);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        let (documents, _) = result.child::<Advertised, IoError>()??;
+        Ok(Next::Done(self.ready(documents)))
+    }
 }
 
 fn candidates(
@@ -685,6 +776,7 @@ mod tests {
             config: config.clone(),
             spec: spec.clone(),
             excluded: excluded.to_vec(),
+            deferred: Vec::new(),
             now_ms: 2_000,
             local: node(1),
             fresh: BTreeMap::new(),
@@ -999,5 +1091,100 @@ mod tests {
         let (unread, plan) = quiet_round(&mut operation);
         assert_eq!(unread, 1);
         assert!(plan.selected.is_none() && plan.retryable);
+    }
+
+    /// A deferred docker target of node 1, deferred at 1 000 for `kind`.
+    fn deferral(kind: super::super::deferred::DeferKind) -> DeferredTarget {
+        DeferredTarget {
+            target: docker(node(1)).target(node(1)),
+            kind,
+            at_ms: 1_000,
+        }
+    }
+
+    // A deferred target fits only with every availability field known and large enough, a recent
+    // observation and a free execution slot; draining comes from the advertisement.
+    #[test]
+    fn signal_needs_room() {
+        use super::super::deferred::DeferKind;
+        use aruna_core::compute::ExecutorAvailability;
+        use aruna_core::structs::execution::job::EffectiveResources;
+        let target = node(1);
+        let mut executor = docker(target);
+        executor.limits.max_concurrent = Some(2);
+        let room = ExecutorAvailability {
+            free_cpu_cores: Some(4),
+            free_ram_bytes: Some(4_096),
+            free_disk_bytes: Some(4_096),
+            active_executions: 1,
+            observed_at_ms: 9_000,
+        };
+        let (mut config, _) = realm(1);
+        config.compute.availability_stale_ms = 5_000;
+        let mut spec = Family::new([5u8; 32]).spec();
+        spec.resources = EffectiveResources {
+            cpu_cores: 2,
+            ram_bytes: 1_024,
+            disk_bytes: 0,
+            max_walltime_ms: 1_000,
+            preemptible: false,
+        };
+        let mut planning = round(&config, &spec, &[]);
+        planning.now_ms = 10_000;
+        let entry = deferral(DeferKind::Capacity);
+        let signal = |availability: Option<ExecutorAvailability>| {
+            let mut document = advertised(target);
+            document.compute_draining = true;
+            let mut executor = executor.clone();
+            executor.availability = availability;
+            document.executors = vec![executor];
+            let documents = BTreeMap::from([(target, document)]);
+            deferral_signal(&documents, &planning, &entry)
+        };
+        let fitting = signal(Some(room));
+        assert_eq!(fitting.fits_ms, Some(9_000));
+        assert_eq!(fitting.draining, Some(true));
+        assert_eq!(fitting.heartbeat_ms, None);
+        let unknown = ExecutorAvailability {
+            free_disk_bytes: None,
+            ..room
+        };
+        assert_eq!(signal(Some(unknown)).fits_ms, None);
+        let full = ExecutorAvailability {
+            active_executions: 2,
+            ..room
+        };
+        assert_eq!(signal(Some(full)).fits_ms, None);
+        let stale = ExecutorAvailability {
+            observed_at_ms: 4_000,
+            ..room
+        };
+        assert_eq!(signal(Some(stale)).fits_ms, None);
+        assert_eq!(signal(None).fits_ms, None);
+    }
+
+    // A deferred target past its launch window gets its launch again only while the planner would
+    // still take it: a member that is neither draining nor leaving.
+    #[test]
+    fn reoffer_needs_screening() {
+        use super::super::deferred::DeferKind;
+        use aruna_core::structs::execution::job::LAUNCH_WINDOW_MS;
+        let (config, _) = realm(1);
+        let spec = Family::new([5u8; 32]).spec();
+        let mut planning = round(&config, &spec, &[]);
+        planning.now_ms = 1_000 + LAUNCH_WINDOW_MS;
+        let ready = DeferredReadyOperation::new(planning, deferral(DeferKind::Silent));
+        let mut document = advertised(node(1));
+        document.executors = vec![docker(node(1))];
+        let documents = |document: &NodeInfoDocument| BTreeMap::from([(node(1), document.clone())]);
+        assert!(ready.ready(documents(&document)));
+        document.compute_draining = true;
+        assert!(!ready.ready(documents(&document)));
+        let (removed, _) = realm(0);
+        let mut planning = round(&removed, &spec, &[]);
+        planning.now_ms = 1_000 + LAUNCH_WINDOW_MS;
+        let gone = DeferredReadyOperation::new(planning, deferral(DeferKind::Silent));
+        document.compute_draining = false;
+        assert!(!gone.ready(documents(&document)));
     }
 }

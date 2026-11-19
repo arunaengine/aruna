@@ -510,6 +510,8 @@ fn explain(old: bool) -> Vec<u8> {
                     omitted: 0,
                 },
                 declined: vec![target],
+                deferred: Vec::new(),
+                answer: None,
                 overlapping: false,
                 stored_at_ms: 1,
             })

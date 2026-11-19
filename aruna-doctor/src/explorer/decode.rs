@@ -1247,6 +1247,8 @@ mod tests {
                 omitted: 0,
             },
             declined: Vec::new(),
+            deferred: Vec::new(),
+            answer: None,
             overlapping: false,
             stored_at_ms: 23,
         };

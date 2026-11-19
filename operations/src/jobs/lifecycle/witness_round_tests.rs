@@ -313,6 +313,8 @@ fn permanent_decline_recorded() {
         sequence: 0,
         plan: empty_plan(),
         declined: Vec::new(),
+        deferred: Vec::new(),
+        answer: None,
         overlapping: false,
         stored_at_ms: 1,
     };

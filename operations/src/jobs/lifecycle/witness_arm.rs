@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::LifecycleError;
+use super::deferred::{DeferKind, DeferredTarget};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::verify::FamilyView;
@@ -46,6 +47,10 @@ pub struct WitnessExplain {
     pub sequence: u32,
     pub plan: ExecutionPlan,
     pub declined: Vec<ExecutionTargetId>,
+    /// Targets whose receipt wait ended after only temporary answers.
+    pub deferred: Vec<DeferredTarget>,
+    /// The last temporary answer to the current launch.
+    pub answer: Option<DeferKind>,
     /// The previous launch was never confirmed, so this one may overlap it.
     pub overlapping: bool,
     pub stored_at_ms: u64,
