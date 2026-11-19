@@ -1885,7 +1885,12 @@ fn carries_network_access() {
 
 /// Writes the receipted reservation and the node subject a fenced start
 /// compares against.
-async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, digest: [u8; 32]) {
+async fn store_site(
+    context: &DriverContext,
+    job_id: JobId,
+    (generation, digest): (u64, [u8; 32]),
+    config_digest: [u8; 32],
+) {
     use aruna_core::compute::quota::JobReservationRecord;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{JOB_RESERVATION_KEYSPACE, NODE_SUBJECT_KEYSPACE};
@@ -1909,7 +1914,7 @@ async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, dig
         config_clock: Default::default(),
         backend: "default".to_string(),
         config_generation: 0,
-        config_digest: [0; 32],
+        config_digest,
     };
     let _ = context
         .storage_handle
@@ -1982,7 +1987,7 @@ async fn drifted_site_refuses() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let ctx = compute_context(storage.clone());
     let job_id = job_id();
-    store_site(&context, job_id, 99, [7u8; 32]).await;
+    store_site(&context, job_id, (99, [7u8; 32]), [0; 32]).await;
 
     let Err(error) = resolve_backend(&ctx, &execution_spec(), job_id).await else {
         panic!("a drifted subject must refuse the start");
@@ -2000,7 +2005,7 @@ async fn drift_requeues_attempt() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let ctx = compute_context(storage.clone());
     let (record, token, _) = ready_with_intent(&context).await;
-    store_site(&context, record.job_id, 99, [7u8; 32]).await;
+    store_site(&context, record.job_id, (99, [7u8; 32]), [0; 32]).await;
     let Err(error) = resolve_backend(&ctx, &execution_spec(), record.job_id).await else {
         panic!("a drifted subject must refuse the start");
     };
@@ -2022,7 +2027,7 @@ async fn drift_requeues_attempt() {
 
 #[tokio::test]
 async fn stored_site_starts() {
-    // The exact stored generation and digest still admit the start.
+    // The exact stored generation, subject digest and backend config still admit the start.
     use aruna_compute::ExecutorRegistry;
     use aruna_core::compute::ExecutorCapability;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
@@ -2051,13 +2056,9 @@ async fn stored_site_starts() {
         .into_iter()
         .next()
         .unwrap();
-    store_site(
-        &context,
-        job_id,
-        capability.subject.generation,
-        capability.subject_digest,
-    )
-    .await;
+    let site = (capability.subject.generation, capability.subject_digest);
+    let config = registry.config_digest("docker").unwrap();
+    store_site(&context, job_id, site, config).await;
 
     assert!(
         resolve_backend(&ctx, &execution_spec(), job_id)
