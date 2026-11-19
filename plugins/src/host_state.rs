@@ -133,6 +133,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reuse_while_unchanged() {
+        // One slot through the uses of a run, as the release of each use asks and answers.
+        let holder = (92 << 64 | 1, 1);
+        let (one, two) = (|| Some(b"one".to_vec()), || Some(b"two".to_vec()));
+        assert_eq!(held_value(holder, "a"), None, "the first use names no value");
+        assert_eq!(hold_value(holder, "a", 1, one()), one());
+        assert_eq!(held_value(holder, "a"), Some(1));
+        // The check passed again for the same value: the held fields are used.
+        assert_eq!(hold_value(holder, "a", 1, None), one());
+        // A rotated value arrives with its fields, and later uses name it.
+        assert_eq!(hold_value(holder, "a", 2, two()), two());
+        assert_eq!(held_value(holder, "a"), Some(2));
+        assert_eq!(hold_value(holder, "a", 2, None), two());
+        // A value the run never received has no fields here.
+        assert_eq!(hold_value(holder, "a", 3, None), None);
+        forget_held(holder);
+    }
+
+    #[test]
     fn holds_per_broker() {
         let run = 91 << 64 | 1;
         let (holder, other, later) = ((run, 1), (run + 1, 1), (run, 2));
