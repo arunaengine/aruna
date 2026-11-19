@@ -46,6 +46,10 @@ impl GraphHandle {
             Ok(event) => return event,
             Err(effect) => effect,
         };
+        let effect = match self.run_scoped(effect).await {
+            Ok(event) => return event,
+            Err(effect) => effect,
+        };
         let effect = match effect {
             MetadataEffect::CheckStructure { jsonld } => {
                 let report = self.run_profile_shacl(move |engine| {
@@ -995,6 +999,9 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::RegistrySnapshot
         | MetadataEffect::StoreRegistry { .. }
         | MetadataEffect::RefreshLifecycle { .. }
+        | MetadataEffect::QueryScope { .. }
+        | MetadataEffect::SearchScope { .. }
+        | MetadataEffect::DescribeHits { .. }
         | MetadataEffect::ExportSummaryAt { .. }
         | MetadataEffect::DescribeTitle { .. }
         | MetadataEffect::IriReferences { .. }

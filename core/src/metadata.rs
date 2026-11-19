@@ -1503,6 +1503,26 @@ pub enum MetadataEffect {
     },
     /// The query cache's current stamp, taken before a read whose result it may keep.
     QueryCacheStamp,
+    // Reads within a scope an operation decided.
+    /// One SPARQL query over exactly `graph_iris`, failing on a missing one, or, when not
+    /// `exact`, over those of them the store holds.
+    QueryScope {
+        graph_iris: Vec<String>,
+        exact: bool,
+        sparql: String,
+    },
+    /// A text search over the graphs of `records`, each hit named and described by its record;
+    /// `exact` as for a query.
+    SearchScope {
+        records: Vec<MetadataRegistryRecord>,
+        exact: bool,
+        query: String,
+        limit: usize,
+    },
+    /// Describes one subject of each record's graph, as search hits of equal score.
+    DescribeHits {
+        targets: Vec<(MetadataRegistryRecord, String)>,
+    },
 }
 
 impl MetadataEffect {
@@ -1551,6 +1571,9 @@ impl MetadataEffect {
             MetadataEffect::StoreRegistry { .. } => "store_registry",
             MetadataEffect::RefreshLifecycle { .. } => "refresh_lifecycle",
             MetadataEffect::QueryCacheStamp => "query_cache_stamp",
+            MetadataEffect::QueryScope { .. } => "query_scope",
+            MetadataEffect::SearchScope { .. } => "search_scope",
+            MetadataEffect::DescribeHits { .. } => "describe_hits",
             MetadataEffect::QueryCacheGet { .. } => "query_cache_get",
             MetadataEffect::QueryCachePut { .. } => "query_cache_put",
         }
@@ -1606,7 +1629,10 @@ impl MetadataEffect {
             | MetadataEffect::RegistrySnapshot
             | MetadataEffect::StoreRegistry { .. }
             | MetadataEffect::RefreshLifecycle { .. }
-            | MetadataEffect::QueryCacheStamp => None,
+            | MetadataEffect::QueryCacheStamp
+            | MetadataEffect::QueryScope { .. }
+            | MetadataEffect::SearchScope { .. }
+            | MetadataEffect::DescribeHits { .. } => None,
         }
     }
 

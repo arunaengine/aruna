@@ -27,6 +27,7 @@ mod persist;
 mod profiles;
 mod read;
 mod run;
+mod scope_reads;
 mod shacl;
 mod summaries;
 
