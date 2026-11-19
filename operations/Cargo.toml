@@ -16,6 +16,13 @@ autotests = false
 # Test seams and shared test helpers; only dev-dependencies enable it.
 test-hooks = [
     "dep:tempfile",
+    "dep:aruna-blob",
+    "dep:aruna-graph",
+    "dep:aruna-storage",
+    "dep:aruna-net",
+    "dep:aruna-outbound",
+    "dep:tokio",
+    "dep:tokio-util",
     "dep:axum",
     "dep:aruna-drivers",
     "dep:aruna-tasks",
@@ -25,19 +32,17 @@ test-hooks = [
 
 [dependencies]
 axum = { workspace = true, optional = true }
-aruna-blob = { workspace = true }
+aruna-blob = { workspace = true, optional = true }
 aruna-core = { workspace = true }
 aruna-drivers = { workspace = true, optional = true }
-aruna-graph = { workspace = true }
+aruna-graph = { workspace = true, optional = true }
 aruna-plugin-types = { workspace = true }
-aruna-storage = { workspace = true }
-aruna-net = { workspace = true }
-aruna-outbound = { workspace = true }
+aruna-storage = { workspace = true, optional = true }
+aruna-net = { workspace = true, optional = true }
+aruna-outbound = { workspace = true, optional = true }
 aruna-tasks = { workspace = true, optional = true }
 craqle = { workspace = true }
-async-compression = { workspace = true }
 async-trait = { workspace = true }
-async_zip = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 md5 = { workspace = true }
@@ -51,12 +56,10 @@ globset = { workspace = true }
 fjall = { workspace = true }
 rustix = { workspace = true }
 futures-util = { workspace = true }
-http = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
 lru = { workspace = true }
-opentelemetry = { workspace = true }
 postcard = { workspace = true }
 quick-xml = { workspace = true }
 rand = { workspace = true }
@@ -66,13 +69,11 @@ serde_json = { workspace = true }
 smallvec = { workspace = true }
 spareval = { workspace = true }
 spargebra = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-opentelemetry = { workspace = true }
 ulid = { workspace = true }
-unicode-normalization = { workspace = true }
 ed25519-dalek = { workspace = true }
 oxrdf = { workspace = true }
 oxttl = { workspace = true }
@@ -82,6 +83,12 @@ url = { workspace = true }
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+aruna-blob = { workspace = true }
+aruna-graph = { workspace = true }
+aruna-net = { workspace = true }
+aruna-outbound = { workspace = true }
+async_zip = { workspace = true }
+tokio-util = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
 aruna-core = { workspace = true, features = ["test-hooks"] }
 aruna-drivers = { workspace = true, features = ["test-hooks"] }
