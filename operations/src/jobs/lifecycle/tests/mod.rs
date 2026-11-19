@@ -8,6 +8,7 @@ mod cancel;
 mod capacity;
 mod family_reads;
 mod launch_admit;
+mod prune_index;
 mod refusals;
 mod report;
 mod run_link;

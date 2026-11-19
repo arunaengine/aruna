@@ -494,6 +494,9 @@ pub const DEADLINE_INDEX_KEYSPACE: &str = "job_witness_deadline_index";
 pub const PLAN_EXPLAIN_KEYSPACE: &str = "job_plan_explains";
 /// Launches without a receipt that their target answered as closed, by family and launch id.
 pub const LAUNCH_CLOSURE_KEYSPACE: &str = "job_launch_closures";
+/// Family prune index: due rows by due time and family, and one row per family naming its
+/// current due time.
+pub const FAMILY_PRUNE_KEYSPACE: &str = "job_family_prune";
 pub const ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
 /// The single row recording what this node could not resolve when it departed.
 pub const COMPUTE_DEPARTURE_KEYSPACE: &str = "compute_departure";
@@ -829,6 +832,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DEADLINE_INDEX_KEYSPACE,
     PLAN_EXPLAIN_KEYSPACE,
     LAUNCH_CLOSURE_KEYSPACE,
+    FAMILY_PRUNE_KEYSPACE,
     ARTIFACT_TOMBSTONE_KEYSPACE,
     COMPUTE_DEPARTURE_KEYSPACE,
     JOB_STATE_KEYSPACE,

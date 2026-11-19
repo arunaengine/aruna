@@ -32,7 +32,7 @@ use super::{LifecycleError, stored_view};
 use crate::jobs::records::verify::{Evidence, FamilyView};
 use crate::jobs::records::{RECORD_PAGE_SIZE, RecordStoreError};
 use aruna_core::structs::execution::job::record_keys::{
-    alias_key, family_prefix, record_key, submission_prefix,
+    alias_key, family_prefix, prune_rows, record_key, submission_prefix,
 };
 use aruna_core::structs::execution::job::record_rows::{
     OutboxEntry, ProjectionCache, from_bytes, to_bytes,
@@ -269,6 +269,7 @@ impl AdmitSubmissionOperation {
                 ),
             ));
         }
+        writes.extend(prune_rows(&self.family(), self.config.now_ms));
         writes.push((
             FAMILY_ALIAS_KEYSPACE.to_string(),
             alias_key(self.config.candidate.job_id, &self.family()),

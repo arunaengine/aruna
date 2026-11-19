@@ -29,7 +29,7 @@ use super::admit::{
 use super::verify::{EvidencePlan, FamilyView};
 use super::{MAX_EVIDENCE_ROWS, RECORD_PAGE_SIZE, RecordStoreError};
 use aruna_core::structs::execution::job::record_keys::{
-    alias_key, conflict_key, family_prefix, kind_prefix, record_key,
+    alias_key, conflict_key, family_prefix, kind_prefix, prune_rows, record_key,
 };
 use aruna_core::structs::execution::job::record_rows::{
     OutboxEntry, PendingRecord, ProjectionCache, from_bytes, to_bytes,
@@ -388,6 +388,9 @@ impl AppendRecordOperation {
                 conflict_key(key, &row.envelope.digest()?),
                 Value::from(to_bytes(row)?.as_slice()),
             ));
+        }
+        if !plan.admitted.is_empty() || !plan.pending.is_empty() {
+            writes.extend(prune_rows(&self.family(), self.config.now_ms));
         }
         if !plan.admitted.is_empty() {
             writes.push((

@@ -82,7 +82,9 @@ fn signs_terminal_stop() {
         panic!("the record and its outbox entry are written");
     };
     let spaces: Vec<&str> = rows.iter().map(|(space, _, _)| space.as_str()).collect();
-    assert_eq!(spaces, [FAMILY_RECORD_KEYSPACE, FAMILY_OUTBOX_KEYSPACE]);
+    let prune = aruna_core::keyspaces::FAMILY_PRUNE_KEYSPACE;
+    let expected = [FAMILY_RECORD_KEYSPACE, FAMILY_OUTBOX_KEYSPACE, prune, prune];
+    assert_eq!(spaces, expected);
     assert_eq!(rows[0].1, rows[1].1);
 }
 

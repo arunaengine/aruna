@@ -41,7 +41,7 @@ fn candidate(family: &Family, spec: LogicalJobSpec, claim: SubmissionClaim) -> A
     }
 }
 
-async fn admit(
+pub(super) async fn admit(
     context: &DriverContext,
     family: &Family,
     job_id: JobId,

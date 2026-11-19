@@ -3,11 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    JobFamilyId, JobId, JobRecordError, JobRecordKey, JobRecordKind, RECORD_KEY_BYTES, SubmissionId,
+    JobFamilyId, JobId, JobRecordError, JobRecordKey, JobRecordKind, RECORD_KEY_BYTES,
+    RETENTION_MS, SubmissionId,
 };
 use crate::NodeId;
 use crate::effects::{FetchCursor, FrameBoundsError};
-use crate::types::Key;
+use crate::keyspaces::FAMILY_PRUNE_KEYSPACE;
+use crate::types::{Key, Value};
 
 /// Encoded width of a conflict row key: record key plus the rejected digest.
 pub const CONFLICT_KEY_BYTES: usize = RECORD_KEY_BYTES + 32;
@@ -93,6 +95,56 @@ pub fn alias_family(key: &[u8]) -> Option<JobFamilyId> {
         submission_id: SubmissionId(submission),
         request_digest,
     })
+}
+
+/// Prefix of the prune index rows ordered by due time.
+pub const PRUNE_DUE_PREFIX: u8 = b'd';
+const PRUNE_SLOT_PREFIX: u8 = b'f';
+
+/// The prune index row of `family` that comes due at `due_ms`.
+pub fn prune_due_key(due_ms: u64, family: &JobFamilyId) -> Key {
+    let mut bytes = vec![PRUNE_DUE_PREFIX];
+    bytes.extend_from_slice(&due_ms.to_be_bytes());
+    bytes.extend_from_slice(&family.to_bytes());
+    Key::from(bytes.as_slice())
+}
+
+/// The row naming the due time that is current for `family`; a due row it does not name is stale.
+pub fn prune_slot_key(family: &JobFamilyId) -> Key {
+    let mut bytes = vec![PRUNE_SLOT_PREFIX];
+    bytes.extend_from_slice(&family.to_bytes());
+    Key::from(bytes.as_slice())
+}
+
+/// The due time and family of a due row.
+pub fn parse_prune_due(key: &[u8]) -> Option<(u64, JobFamilyId)> {
+    let rest = key.strip_prefix(&[PRUNE_DUE_PREFIX])?;
+    let due: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+    let submission: [u8; 32] = rest.get(8..40)?.try_into().ok()?;
+    let request_digest: [u8; 32] = rest.get(40..72)?.try_into().ok()?;
+    let family = JobFamilyId {
+        submission_id: SubmissionId(submission),
+        request_digest,
+    };
+    Some((u64::from_be_bytes(due), family))
+}
+
+/// The prune index rows a write at `now_ms` adds in its own transaction. Writers never read the
+/// old row, so concurrent appends do not conflict; the prune pass drops rows the slot no longer names.
+pub fn prune_rows(family: &JobFamilyId, now_ms: u64) -> [(String, Key, Value); 2] {
+    let due_ms = now_ms.saturating_add(RETENTION_MS);
+    [
+        (
+            FAMILY_PRUNE_KEYSPACE.to_string(),
+            prune_due_key(due_ms, family),
+            Value::from(&[][..]),
+        ),
+        (
+            FAMILY_PRUNE_KEYSPACE.to_string(),
+            prune_slot_key(family),
+            Value::from(due_ms.to_be_bytes().as_slice()),
+        ),
+    ]
 }
 
 /// Audit and page cursors carry the last returned record key, which is bounded

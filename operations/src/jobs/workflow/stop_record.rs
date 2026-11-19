@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, ExecutionSignEvent, NetEvent};
 use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_core::structs::execution::job::record_keys::{prune_rows, record_key};
 use aruna_core::structs::execution::job::record_rows::{OutboxEntry, to_bytes};
 use aruna_core::structs::execution::job::{
     ExecutionClaim, ExecutionReceipt, ExecutionStop, JobError, JobFamilyId, JobFamilyRecord, JobId,
@@ -119,7 +119,7 @@ impl StopRecordOperation {
         Ok(Next::Call(IoCall::Effect(Box::new(effect))))
     }
 
-    /// The record and its outbox entry, for one batch.
+    /// The record, its outbox entry and the family's prune index rows, for one batch.
     fn rows(&self, envelope: &JobRecordEnvelope) -> StopNext {
         let entry = OutboxEntry {
             queued_at_ms: self.now_ms,
@@ -130,10 +130,12 @@ impl StopRecordOperation {
         let key = record_key(&envelope.key());
         let record = Value::from(to_bytes(envelope).map_err(retryable)?.as_slice());
         let outbox = Value::from(to_bytes(&entry).map_err(retryable)?.as_slice());
-        Ok(Next::Done(vec![
+        let mut rows = vec![
             (FAMILY_RECORD_KEYSPACE.to_string(), key.clone(), record),
             (FAMILY_OUTBOX_KEYSPACE.to_string(), key, outbox),
-        ]))
+        ];
+        rows.extend(prune_rows(&envelope.family(), self.now_ms));
+        Ok(Next::Done(rows))
     }
 }
 

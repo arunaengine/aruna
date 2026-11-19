@@ -31,7 +31,7 @@ use crate::jobs::records::verify::{Evidence, FamilyView};
 use crate::plugins::task_row::{TaskRow, task_place};
 use crate::plugins::work::{Found, WorkLookup, WorkState};
 use aruna_core::structs::execution::job::job_insert_entries;
-use aruna_core::structs::execution::job::record_keys::{family_prefix, record_key};
+use aruna_core::structs::execution::job::record_keys::{family_prefix, prune_rows, record_key};
 use aruna_core::structs::execution::job::record_rows::{
     OutboxEntry, ProjectionCache, from_bytes, to_bytes,
 };
@@ -285,6 +285,7 @@ impl ReserveExecutionOperation {
                 ),
             ),
         ];
+        writes.extend(prune_rows(&self.family(), self.config.now_ms));
         if let JobPayload::Execution(spec) = &self.config.record.payload {
             let link = RunLink {
                 family: Some(self.family()),
