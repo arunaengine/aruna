@@ -57,6 +57,17 @@ impl IdMint {
     }
 }
 
+/// `N` nonce bytes as unique as `id`, for a cipher whose nonce must never repeat under one key.
+/// An id minted in a run is unique, so the nonce is too; it need not be secret.
+pub fn id_nonce<const N: usize>(id: Ulid) -> [u8; N] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-id-nonce-v1\0");
+    hasher.update(&id.to_bytes());
+    let mut nonce = [0u8; N];
+    hasher.finalize_xof().fill(&mut nonce);
+    nonce
+}
+
 /// An id fixed by `scope` and `name`, the same on every node, for the built-in parts of a new
 /// document such as the default roles of a group.
 pub fn named_id(scope: &[u8], name: &str) -> Ulid {

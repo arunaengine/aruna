@@ -252,7 +252,11 @@ impl CreateUserOperation {
             issued_by: self.config.issued_by,
             revoked_at: None,
         };
-        access.encrypt_secret(&self.encryption_key, &plaintext)?;
+        access.encrypt_secret(
+            &self.encryption_key,
+            &plaintext,
+            aruna_core::id_mint::id_nonce(self.ids.mint(self.now_ms)),
+        )?;
         self.pending_secret = Some(Secret::new(plaintext));
         self.access = Some(access);
         Ok(())

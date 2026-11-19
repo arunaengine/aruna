@@ -351,7 +351,7 @@ fn binds_link_token() {
     let (user, group, connector) = (link.created_by, link.group_id, link.connector_id);
     let seal = |link_id| {
         RepositoryCredential::seal_link(
-            &key,
+            (&key, [3; 24]),
             user,
             group,
             connector,

@@ -9,6 +9,7 @@ use super::{
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::PathRestriction;
@@ -48,6 +49,8 @@ pub struct CreateS3Operation {
     /// The owner index as it is read, then as it is written.
     index: BTreeSet<String>,
     phase: CreatePhase,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl CreateS3Operation {
@@ -67,6 +70,8 @@ impl CreateS3Operation {
             pending: None,
             index: BTreeSet::new(),
             phase: CreatePhase::Index,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -188,6 +193,14 @@ impl Operation for CreateS3Operation {
     type Output = S3SessionCredentials;
     type Error = S3SessionError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<S3SessionCredentials>, S3SessionError> {
         let ttl = (self.config.expiry.duration_since(self.config.now))
             .map_err(|_| S3SessionError::InvalidExpiry)?;
@@ -203,6 +216,7 @@ impl Operation for CreateS3Operation {
             self.config.path_restrictions.clone(),
             self.config.issued_by,
             &self.encryption_key,
+            aruna_core::id_mint::id_nonce(self.ids.mint(self.now_ms)),
         )?);
         let owner = owner_key(self.config.user_identity, self.config.group_id);
         Ok(Next::Call(IoCall::Read(vec![

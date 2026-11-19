@@ -985,6 +985,7 @@ dependencies = [
  "byteview",
  "crossfire",
  "fjall",
+ "getrandom 0.4.3",
  "hex",
  "lru",
  "postcard",

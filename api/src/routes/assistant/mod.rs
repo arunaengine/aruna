@@ -618,8 +618,18 @@ pub async fn patch_provider(
             })?,
     };
     provider
-        .encrypt_secret(state.credential_encryption_key(), &secret)
-        .and_then(|_| provider.encrypt_headers(state.credential_encryption_key(), &headers))
+        .encrypt_secret(
+            state.credential_encryption_key(),
+            &secret,
+            rand::random::<[u8; 24]>(),
+        )
+        .and_then(|_| {
+            provider.encrypt_headers(
+                state.credential_encryption_key(),
+                &headers,
+                rand::random::<[u8; 24]>(),
+            )
+        })
         .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     let provider = save_provider(&state, auth.user_id, expected, provider).await?;
     Ok((StatusCode::OK, Json(provider_summary(&provider))))

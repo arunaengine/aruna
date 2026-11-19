@@ -429,6 +429,7 @@ pub async fn submit_rocrate_export(
                 &view,
                 None,
                 access_token.as_deref().unwrap_or_default(),
+                rand::random::<[u8; 24]>(),
             )
             .map_err(|error| match error {
                 TransferError::Permanent(message) => ServerError::BadRequestReason(message),
