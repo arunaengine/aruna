@@ -376,7 +376,7 @@ enum PinnedStage {
 /// Creates a pinned document on its target only, authorized on the document's own path, so a
 /// retry meets the holder's replay of an accepted create. Emits the watch event like REST.
 #[derive(Debug, PartialEq)]
-pub struct CreateWithIdOperation {
+pub struct PinnedCreateOperation {
     actor: Actor,
     auth: AuthContext,
     extras: PolicyRequestExtras,
@@ -387,7 +387,7 @@ pub struct CreateWithIdOperation {
     permission_started_ms: u64,
 }
 
-impl CreateWithIdOperation {
+impl PinnedCreateOperation {
     /// `local_node` is this node on the network, if it has one.
     pub fn new(
         (actor, local_node): (Actor, Option<NodeId>),
@@ -431,7 +431,7 @@ impl CreateWithIdOperation {
     }
 }
 
-impl Operation for CreateWithIdOperation {
+impl Operation for PinnedCreateOperation {
     type Output = MetadataRegistryRecord;
     type Error = CreateAuthorizedError;
 

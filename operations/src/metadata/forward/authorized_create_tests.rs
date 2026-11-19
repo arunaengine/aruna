@@ -71,7 +71,7 @@ fn create(path: &str) -> AuthorizedCreateOperation {
     AuthorizedCreateOperation::new(node, (auth(realm()), extras(), None), document)
 }
 
-fn pinned(target: NodeId) -> CreateWithIdOperation {
+fn pinned(target: NodeId) -> PinnedCreateOperation {
     let actor = Actor {
         node_id: node(1),
         user_id: auth(realm()).user_id,
@@ -85,7 +85,7 @@ fn pinned(target: NodeId) -> CreateWithIdOperation {
         payload: payload(),
         message: None,
     };
-    CreateWithIdOperation::new((actor, Some(node(1))), (auth(realm()), extras()), create)
+    PinnedCreateOperation::new((actor, Some(node(1))), (auth(realm()), extras()), create)
 }
 
 #[test]
