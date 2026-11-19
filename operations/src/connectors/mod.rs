@@ -6,6 +6,7 @@ pub mod create_connector;
 pub mod delete_connector;
 pub mod descriptor;
 pub mod get_connector;
+pub mod harvest_rows;
 pub mod list_connectors;
 pub mod reference_prune;
 pub mod reference_scan;

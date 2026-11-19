@@ -18,10 +18,10 @@ use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::connectors::harvest_rows::{connector_key, connector_secret_key, connector_writes};
 use crate::groups::fence::group_fence_key;
 use crate::harvest::create_connector::{CreateConnectorError, validate_connector};
 use crate::harvest::read_connector::ConnectorView;
-use crate::harvest::repository::{connector_key, connector_secret_key, connector_writes};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct UpdateConnectorInput {

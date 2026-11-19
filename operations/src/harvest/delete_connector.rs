@@ -13,7 +13,7 @@ use aruna_core::types::GroupId;
 use byteview::ByteView;
 use ulid::Ulid;
 
-use crate::harvest::repository::{connector_key, connector_secret_key};
+use crate::connectors::harvest_rows::{connector_key, connector_secret_key};
 use crate::harvest::update_connector::UpdateConnectorError;
 
 /// The call a delete waits for.

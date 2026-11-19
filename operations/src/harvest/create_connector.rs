@@ -17,8 +17,8 @@ use aruna_core::structs::execution::harvest::{
 use aruna_core::types::GroupId;
 use thiserror::Error;
 
+use crate::connectors::harvest_rows::{INVENIO_TOKEN, connector_writes};
 use crate::endpoint_screening;
-use crate::harvest::repository::connector_writes;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct CreateConnectorInput {
@@ -184,8 +184,6 @@ fn validate_invenio(
 
 /// Public config key naming the Invenio community new records are submitted to.
 pub const INVENIO_COMMUNITY: &str = "community";
-/// Secret config key of the optional read token an Invenio connector keeps.
-pub const INVENIO_TOKEN: &str = "token";
 
 impl Operation for CreateConnectorOperation {
     type Output = CreateConnectorResult;
@@ -243,7 +241,7 @@ impl Operation for CreateConnectorOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harvest::repository::{parse_connector_read, read_connector_effect};
+    use crate::connectors::harvest_rows::{parse_connector_read, read_connector_effect};
     use aruna_core::calls::IoCall;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
