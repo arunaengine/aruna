@@ -195,7 +195,12 @@ async fn marks_once() {
         ordinal: 0,
     };
     let proposed = || {
-        let mut row = WorkRow::reserved(&install, WorkKind::Download, Ulid::from_parts(9, 9), 1);
+        let mut row = WorkRow::reserved(
+            &install,
+            WorkKind::Download,
+            (Ulid::from_parts(9, 9), Ulid::generate()),
+            1,
+        );
         (row.digest, row.version_id) = ([3; 32], Some(Ulid::generate()));
         row
     };
@@ -236,7 +241,12 @@ async fn retired_unmarked() {
         run_id: Ulid::from_parts(9, 9),
         ordinal: 0,
     };
-    let mut row = WorkRow::reserved(&install, WorkKind::Download, Ulid::from_parts(9, 9), 1);
+    let mut row = WorkRow::reserved(
+        &install,
+        WorkKind::Download,
+        (Ulid::from_parts(9, 9), Ulid::generate()),
+        1,
+    );
     row.version_id = Some(Ulid::generate());
     let marked = Some(("in", "reads.fq"));
     drive(
@@ -377,7 +387,7 @@ fn copy_prepared_ordered() {
     assert_eq!(prepare.current, Step::Target);
     assert!(is_child(prepare.next(placed()).unwrap()));
     assert_eq!(prepare.current, Step::Reserve);
-    let mut row = WorkRow::reserved(&install, WorkKind::Copy, Ulid::nil(), 1);
+    let mut row = WorkRow::reserved(&install, WorkKind::Copy, (Ulid::nil(), Ulid::generate()), 1);
     row.version_id = Some(Ulid::from_parts(8, 8));
     let reserved = child_result(Ok::<_, WorkError>((row.clone(), Reserve::Fresh)));
     let Next::Done(PreparedWork::Submit { account, spec }) = prepare.next(reserved).unwrap() else {
@@ -393,7 +403,7 @@ fn known_work_answers() {
     let mut prepare = PrepareWork::new(&scope, plain_copy(&install), (5, Ulid::nil()));
     prepare.install = Some(install.clone());
     prepare.current = Step::Reserve;
-    let mut row = WorkRow::reserved(&install, WorkKind::Copy, Ulid::nil(), 1);
+    let mut row = WorkRow::reserved(&install, WorkKind::Copy, (Ulid::nil(), Ulid::generate()), 1);
     row.state = WorkState::Dispatched;
     let found = child_result(Ok::<_, WorkError>((row.clone(), Reserve::Earlier)));
     let answer = prepare.next(found);

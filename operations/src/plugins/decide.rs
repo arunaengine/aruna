@@ -5,6 +5,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -128,12 +129,12 @@ impl Operation for LateEvent {
 pub(crate) fn decide_event(
     verdict: Verdict,
     row: &ForwardRow,
-    now_ms: u64,
+    (hold_id, now_ms): (Ulid, u64),
 ) -> Result<DecideEvent, StoreError> {
     let phase = match verdict {
         Verdict::Unavailable => DecidePhase::Busy,
         Verdict::Run(run) => DecidePhase::Admitting(Admission::new(*run)),
-        Verdict::Unready => DecidePhase::Holding(Hold::new(row, now_ms)?),
+        Verdict::Unready => DecidePhase::Holding(Hold::new(row, (hold_id, now_ms))?),
         Verdict::Denied(reason) => DecidePhase::Denying(reason),
     };
     Ok(DecideEvent {
@@ -366,13 +367,13 @@ pub enum Slot {
 }
 
 impl Hold {
-    pub fn new(row: &ForwardRow, now_ms: u64) -> Result<Self, StoreError> {
+    pub fn new(row: &ForwardRow, (key_id, now_ms): (Ulid, u64)) -> Result<Self, StoreError> {
         let waiting = WaitingRow {
             row: row.clone(),
             received_ms: now_ms,
         };
         Ok(Self {
-            key: queue_key(row.install_id, Ulid::generate()),
+            key: queue_key(row.install_id, key_id),
             waiting: encode(&waiting)?,
             queued: Scan::new(PLUGIN_QUEUE_KEYSPACE, row.install_id.to_bytes().to_vec()),
         })
@@ -582,6 +583,7 @@ pub(crate) struct Judge {
     local: NodeId,
     row: ForwardRow,
     now_ms: u64,
+    ids: IdMint,
     phase: JudgePhase,
 }
 
@@ -597,6 +599,7 @@ impl Judge {
             local,
             row,
             now_ms,
+            ids: IdMint::default(),
             phase: JudgePhase::Prerequisites,
         }
     }
@@ -607,11 +610,12 @@ impl Judge {
     }
 
     fn check(&mut self) -> Result<Next<Verdict>, StoreError> {
+        let run_id = self.ids.mint(self.now_ms);
         let Some(install) = self.install() else {
             return Ok(Next::Done(Verdict::Unready));
         };
         let event = &self.row.event;
-        let Some(run) = event_run(&self.config, install, event, self.now_ms) else {
+        let Some(run) = event_run(&self.config, install, event, (run_id, self.now_ms)) else {
             let refused = "the install has no trigger of this kind".to_string();
             return Ok(Next::Done(Verdict::Denied(refused)));
         };
@@ -631,6 +635,10 @@ impl Judge {
 impl Operation for Judge {
     type Output = Verdict;
     type Error = StoreError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<Verdict>, StoreError> {
         Ok(match self.install() {
@@ -677,6 +685,7 @@ pub(crate) struct DecideRow {
     local: NodeId,
     row: ForwardRow,
     now_ms: u64,
+    ids: IdMint,
     phase: RowPhase,
 }
 
@@ -687,6 +696,7 @@ impl DecideRow {
             local,
             row,
             now_ms,
+            ids: IdMint::default(),
             phase: RowPhase::Seen,
         }
     }
@@ -695,6 +705,10 @@ impl DecideRow {
 impl Operation for DecideRow {
     type Output = Outcome;
     type Error = StoreError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<Outcome>, StoreError> {
         Ok(Next::Call(IoCall::child(seen_outcome(&self.row))))
@@ -725,7 +739,8 @@ impl Operation for DecideRow {
             RowPhase::Judging => {
                 let verdict = answer.child::<Verdict, StoreError>()??;
                 self.phase = RowPhase::Deciding;
-                let decide = decide_event(verdict, &self.row, self.now_ms)?;
+                let hold_id = self.ids.mint(self.now_ms);
+                let decide = decide_event(verdict, &self.row, (hold_id, self.now_ms))?;
                 Ok(Next::Call(IoCall::child(decide)))
             }
             RowPhase::Deciding => Ok(Next::Done(answer.child::<Outcome, StoreError>()??)),

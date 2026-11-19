@@ -257,12 +257,15 @@ mod operations {
     #[test]
     fn start_queues_run() {
         let mut run = start("{}", 3);
+        run.seed(7);
         assert_eq!(run.hold_scope(), Some(HoldScope::PluginAdmissions));
         assert!(is_child(&checked(&mut run)));
         let Ok(Next::Done(queued)) = run.next(child_result(Ok::<(), RunError>(()))) else {
             panic!("the admission ends the start");
         };
         assert_eq!(queued.install_id, fixtures::install().install_id);
+        // The run id comes from the runner's entropy at the start's time.
+        assert_eq!(queued.run_id, Ulid::from_parts(5_000, 7));
     }
 
     #[test]

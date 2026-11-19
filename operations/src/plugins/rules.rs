@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall, SecretBinding};
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
@@ -80,6 +81,7 @@ pub(crate) struct EditRules {
     wanted: Vec<UseRule>,
     guard: RuleGuard,
     now_ms: u64,
+    ids: IdMint,
     phase: EditPhase,
 }
 
@@ -99,6 +101,7 @@ impl EditRules {
             wanted,
             guard,
             now_ms,
+            ids: IdMint::default(),
             phase: EditPhase::Guard,
         }
     }
@@ -144,6 +147,7 @@ impl EditRules {
             uses,
             expected: Some(entry.revision()),
         };
+        let write_ids = [(); 3].map(|_| self.ids.mint(self.now_ms));
         let input = OwnerChange {
             realm_id: self.actor.realm_id,
             node_id: self.actor.node_id,
@@ -152,7 +156,7 @@ impl EditRules {
             change,
             readable: false,
             now_ms: self.now_ms,
-            write_ids: [(); 3].map(|_| Ulid::generate()),
+            write_ids,
         };
         self.phase = EditPhase::Writing;
         Ok(Next::Call(IoCall::child(OwnerSecretOperation::new(input))))
@@ -162,6 +166,10 @@ impl EditRules {
 impl Operation for EditRules {
     type Output = bool;
     type Error = RuleError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> Result<Next<bool>, RuleError> {
         let read = GetConfigOperation::new(self.actor.realm_id);

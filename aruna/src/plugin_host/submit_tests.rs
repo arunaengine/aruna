@@ -241,7 +241,12 @@ async fn reply_rechecked() {
         aruna_operations::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
     let install = config.await.unwrap().installs.remove(0);
     secret_with(&fixture, &install, ResponseExposure::Full).await;
-    let mut row = WorkRow::reserved(&install, WorkKind::Upload, Ulid::from_parts(9, 9), 1);
+    let mut row = WorkRow::reserved(
+        &install,
+        WorkKind::Upload,
+        (Ulid::from_parts(9, 9), Ulid::generate()),
+        1,
+    );
     let mut context = send(&fixture, &install, None).context;
     context.base = format!("{ORIGIN}/api/");
     row.context = Some(context);
