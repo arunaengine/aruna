@@ -9,7 +9,6 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
-use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::realm_vault::{
     RealmSecretRef, RealmVaultEntry, RealmVaultError, RealmVaultKey, RealmVaultPurpose,
@@ -18,7 +17,7 @@ use aruna_core::realm_vault::{
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
@@ -189,6 +188,7 @@ struct EmailWrite {
     deletes: Vec<(KeySpace, Key)>,
     now_ms: u64,
     ids: IdMint,
+    entropy: u128,
 }
 
 impl EmailWrite {
@@ -200,6 +200,7 @@ impl EmailWrite {
             deletes: Vec::new(),
             now_ms: 0,
             ids: IdMint::default(),
+            entropy: 0,
         }
     }
 
@@ -298,7 +299,8 @@ impl EmailWrite {
                 };
                 let revision = self.ids.mint(self.now_ms);
                 let realm_id = self.config.actor.realm_id;
-                let sealed = (self.config.vault_key).seal(&realm_id, entry, revision, secret)?;
+                let vault_key = &self.config.vault_key;
+                let sealed = vault_key.seal(&realm_id, (entry, revision), secret, self.entropy)?;
                 writes.push(AdminDocumentOperation::ConfigVaultSet {
                     entry,
                     record: Some(RealmVaultRecord {
@@ -404,6 +406,7 @@ impl Operation for EmailWrite {
 
     fn seed(&mut self, entropy: u128) {
         self.ids = IdMint::new(entropy);
+        self.entropy = entropy;
     }
 
     fn transaction(&self) -> TransactionMode {
@@ -415,18 +418,8 @@ impl Operation for EmailWrite {
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, SetEmailError> {
-        let document = self.document_ref();
-        let target = self.admin_target();
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                document.storage_keyspace().to_string(),
-                document.storage_key(),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        let reads = crate::realm::document_reads(self.document_ref(), &self.admin_target());
+        Ok(Next::Call(reads))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetEmailError> {

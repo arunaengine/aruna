@@ -94,20 +94,7 @@ impl From<IoError> for LockError {
     }
 }
 
-impl From<AuditError> for LockError {
-    fn from(error: AuditError) -> Self {
-        match error {
-            AuditError::Conversion(error) => Self::Conversion(error),
-            AuditError::Storage(error) => Self::Storage(error),
-            AuditError::NotAuditTimer => Self::NotFinished,
-            AuditError::Unexpected(received) => Self::InvalidStateEvent {
-                state: "WriteAudit".to_string(),
-                expected: "the audit retry timer's answer",
-                received,
-            },
-        }
-    }
-}
+crate::s3::bucket::audit_retry::audit_failure!(LockError, "WriteAudit");
 
 type LockTurn = Result<Next<LockResult>, LockError>;
 

@@ -16,9 +16,11 @@ use std::time::{Duration, Instant};
 
 use aruna::tasks::incoming::drain_notification_outbox;
 use aruna_blob::blob::BlobHandler;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
 use aruna_core::operation::EffectOperation;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -30,7 +32,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId};
 use aruna_core::{NodeId, StructuredId, UserId};
 use aruna_drivers::driver::{DriverContext, drive};
@@ -390,9 +391,11 @@ async fn run_sampler(
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
         };
-        let document_id = mint_local_document(&config, &actor, group_id, &document_path)
-            .map_err(|error| format!("mint failed index={index}: {error:?}"))?
-            .as_ulid();
+        let (mut ids, now_ms) = (IdMint::new(rand::random()), unix_timestamp_millis());
+        let document_id =
+            mint_local_document(&config, &actor, group_id, &document_path, &mut ids, now_ms)
+                .map_err(|error| format!("mint failed index={index}: {error:?}"))?
+                .as_ulid();
         let t0 = Instant::now();
         let result = drive(
             CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
@@ -518,6 +521,7 @@ async fn drain_outbox(realm_id: RealmId, nodes: &[TestNode]) -> Result<f64, BoxE
 
 fn notification(realm_id: RealmId) -> NotificationRecord {
     NotificationRecord::new(
+        Ulid::generate(),
         UserId::local(Ulid::generate(), realm_id),
         NotificationClass::Direct,
         NotificationKind::AddedToGroup {

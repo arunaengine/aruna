@@ -109,8 +109,15 @@ async fn create_materialized_document(
     actor: Actor,
     config: &RealmConfigDocument,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let document_id =
-        mint_local_document(config, &actor, group_id(), "datasets/restart-persistence")?.as_ulid();
+    let document_id = mint_local_document(
+        config,
+        &actor,
+        group_id(),
+        "datasets/restart-persistence",
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let created = drive(
         CreateDocumentOperation::new(CreateDocumentConfig {
             actor,

@@ -1476,12 +1476,7 @@ mod tests {
     }
 
     fn read(values: Vec<Option<Vec<u8>>>) -> IoResult {
-        IoResult::Values(
-            values
-                .into_iter()
-                .map(|value| value.map(Value::from))
-                .collect(),
-        )
+        crate::tests::calls::values_of(values)
     }
 
     fn record_value(searching: bool) -> Option<Vec<u8>> {

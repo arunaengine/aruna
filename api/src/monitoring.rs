@@ -7,12 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::effect_adapters::queue_lag::{QueueLagReporter, QueueLagSnapshot};
 use aruna_operations::shard::recovery::{RecoveryOutcome, RecoveryState, RecoveryStatus};

@@ -64,7 +64,7 @@ pub(crate) fn spawn_cutoff_sweep(
                 _ = token.cancelled() => return,
                 _ = tokio::time::sleep(CUTOFF_SWEEP) => {}
             }
-            let now = aruna_core::time::unix_timestamp_secs();
+            let now = aruna_clock::unix_timestamp_secs();
             let config = CutoffSweepConfig {
                 realm_id,
                 node_id,
@@ -88,7 +88,7 @@ pub(crate) fn spawn_recovery_sweep(
     let token = shutdown.token();
     shutdown.spawn(async move {
         loop {
-            let now_ms = aruna_core::time::unix_timestamp_millis();
+            let now_ms = aruna_clock::unix_timestamp_millis();
             let sweep = RecoverySweepOperation::new(origin, now_ms);
             tokio::select! {
                 _ = token.cancelled() => return,

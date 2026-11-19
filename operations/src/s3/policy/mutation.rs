@@ -6,7 +6,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::policy::attachment::PolicyRefMode;
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
 use aruna_core::structs::placement::policy::{
@@ -19,7 +19,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::records::HeadAliasContext;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
@@ -112,12 +111,8 @@ impl PolicyMutationOperation {
     }
 
     fn authorize(&mut self, state: MutationState, path: String) -> MutationTurn {
-        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: self.config.auth_context.clone(),
-            path,
-            required_permission: Permission::WRITE,
-        });
-        self.call(state, IoCall::child(check))
+        let check = super::write_check(self.config.auth_context.clone(), path);
+        self.call(state, check)
     }
 
     /// A failed check counts as a denial.

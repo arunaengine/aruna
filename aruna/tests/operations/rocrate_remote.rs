@@ -15,6 +15,7 @@ use crate::job_calls::{insert_job, list_job_entries};
 use aruna::inbound::initialize_incoming_fixture;
 use aruna::tasks::rocrate_jobs::run_export_job;
 use aruna_blob::blob::BlobHandler;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
@@ -41,7 +42,6 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
@@ -252,7 +252,15 @@ async fn setup_remote(
         user_id: owner,
         realm_id,
     };
-    let document_id = mint_local_document(&config, &exporter_actor, group_id, DOC_PATH)?.as_ulid();
+    let document_id = mint_local_document(
+        &config,
+        &exporter_actor,
+        group_id,
+        DOC_PATH,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let arn = VersionedObjectArn::new(realm_id, holder.net.node_id(), BUCKET, KEY, version_id)?;
     let jsonld = remote_crate_json(&arn.to_w3id(), &content_hash_iri(hash));
     create_document(&exporter, owner, group_id, realm_id, document_id, jsonld).await?;

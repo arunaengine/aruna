@@ -16,19 +16,16 @@ use aruna_core::UserId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{
     ArtifactRef, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
-    ImportMetadataTarget, ImportReportDetail, ImportRoCrateResult, ImportRoCrateSource,
-    ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, JobProgress, JobResultPayload, ReasonCode,
-    RoCrateLimits,
+    ImportMetadataTarget, ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec,
+    ImportRoCrateTarget, JobPayload, JobProgress, JobResultPayload, RoCrateLimits,
 };
 use aruna_core::structs::execution::job::{
     CollisionPolicy, ComputeResources, ExecutionSpec, OutputDestination, WorkspaceMode,
 };
 use aruna_core::structs::execution::job::{JobRecord, JobState};
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
-use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredFormat;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::jobs::command::{
     ExecutionInput, ExecutionOutput, InputMode, WorkspaceMode as CommandWorkspaceMode,
     WorkspaceSpec,
@@ -225,13 +222,7 @@ fn user(byte: u8) -> UserId {
 }
 
 fn job_id(timestamp_ms: u64) -> JobId {
-    JobId::from_parts(
-        timestamp_ms,
-        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
-        BucketId::new(0).unwrap(),
-        0,
-    )
-    .unwrap()
+    aruna_core::testing::job_at(timestamp_ms, 0)
 }
 
 fn restricted_auth_for(user_id: UserId) -> Option<AuthContext> {
@@ -293,21 +284,7 @@ fn import_job(job_id: JobId, owner: UserId) -> JobRecord {
 }
 
 fn report_row(entry_key: &str) -> ImportReportRow {
-    ImportReportRow {
-        entry_key: entry_key.to_string(),
-        code: ReasonCode::Imported,
-        message: None,
-        detail: ImportReportDetail {
-            archive_path: entry_key.to_string(),
-            target_key: Some(entry_key.to_string()),
-            version_id: None,
-            blake3: None,
-            size: None,
-            arn: None,
-            w3id: None,
-            validation: None,
-        },
-    }
+    aruna_core::testing::report_row(entry_key)
 }
 
 #[test]
@@ -447,7 +424,7 @@ async fn finish_report(state: &ServerState, job_id: JobId, owner: UserId) -> [u8
             unit: "entries".to_string(),
             paused_until: None,
         },
-        aruna_core::time::unix_timestamp_millis(),
+        aruna_clock::unix_timestamp_millis(),
     )
     .await
     .unwrap()
@@ -642,11 +619,7 @@ async fn artifact_head_headers() {
     let job_id = JobId::from_bytes([11u8; 16]);
     insert_job(
         &state.get_ctx(),
-        &export_job(
-            job_id,
-            owner,
-            aruna_core::time::unix_timestamp_millis() + 60_000,
-        ),
+        &export_job(job_id, owner, aruna_clock::unix_timestamp_millis() + 60_000),
     )
     .await
     .unwrap();

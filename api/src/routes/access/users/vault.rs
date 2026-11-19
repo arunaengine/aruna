@@ -152,7 +152,7 @@ pub(super) async fn append(
         user_id: auth.user_id,
         record_id: Ulid::generate(),
         change,
-        now_ms: aruna_core::time::unix_timestamp_millis(),
+        now_ms: aruna_clock::unix_timestamp_millis(),
     };
     drive(
         AppendRoutedOperation::new(config, auth_token),

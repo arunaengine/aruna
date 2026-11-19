@@ -4,6 +4,7 @@
 
 use crate::tasks::runner::{execution_host, resume_attempt as run_resume, run_execution_job};
 use crate::tasks::runner::{run_wiring, under_lease};
+use aruna_clock::unix_timestamp_millis;
 use aruna_compute::ExecutorBackend;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::session::{Session, SessionConfig};
@@ -23,7 +24,6 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::effect_adapters::job::with_job_host;
 use aruna_drivers::jobs::context::JobContext;

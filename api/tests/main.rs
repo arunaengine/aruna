@@ -9,3 +9,4 @@ mod bucket_overview;
 mod deletion_routes;
 mod git_auth;
 mod mcp_transport;
+mod shared;

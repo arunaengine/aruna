@@ -26,6 +26,7 @@ use ulid::Ulid;
 
 use super::metrics::{InFlightGuard, StorageMetrics, StorageMetricsSnapshot};
 use super::owner::TransactionOwner;
+use super::policies::PolicyPrograms;
 use super::sealing::{open_event, seal_effect};
 use super::telemetry::{effect_kind, storage_effect_kind, storage_effect_span, storage_event_kind};
 use super::vault::{vault_effect, vault_event};
@@ -98,6 +99,8 @@ pub struct StorageHandle {
     pub(super) database: Arc<OnceLock<OpenDatabase>>,
     /// The key indexes of distributed bucket ranges, on a node that keeps them.
     pub(super) range_indexes: Arc<OnceLock<Arc<RangeIndexes>>>,
+    /// Compiled request policy sets by content, shared by every clone of the handle.
+    pub(super) policies: Arc<PolicyPrograms>,
 }
 
 /// The opened node database behind a `Send + Sync` object, so the auto trait proofs of handle
@@ -168,6 +171,7 @@ impl StorageHandle {
                 realm_keys: Arc::new(OnceLock::new()),
                 database: Arc::new(OnceLock::new()),
                 range_indexes: Arc::new(OnceLock::new()),
+                policies: Arc::new(PolicyPrograms::default()),
             },
             StorageReceivers { foreground, bulk },
         )
@@ -383,6 +387,18 @@ impl StorageHandle {
         skip(self, effect),
         fields(operation = storage_effect_kind(&effect))
     )]
+    /// Starts a write transaction and returns its id; panics on any other answer.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn begin_write(&self) -> Ulid {
+        match self
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
     pub async fn send_storage_effect(&self, effect: StorageEffect) -> Event {
         Event::Storage(self.dispatch_storage_effect(effect).await)
     }
@@ -409,6 +425,9 @@ impl StorageHandle {
     pub(super) async fn dispatch_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
+        if let StorageEffect::CompilePolicies(sets) = &effect {
+            return StorageEvent::PoliciesCompiled(self.policies.compile(sets));
+        }
         if let StorageEffect::RealmOpen(sealed) = &effect {
             let keys = self.realm_keys.get();
             let result = keys.map_or(Err(RealmVaultError::NoKey), |keys| sealed.open(keys));
@@ -736,7 +755,8 @@ pub(super) fn storage_effect_mutates(effect: &StorageEffect) -> bool {
         | StorageEffect::VaultRead { .. }
         | StorageEffect::AbortTransaction { .. }
         | StorageEffect::SyncAll
-        | StorageEffect::RealmOpen(_) => false,
+        | StorageEffect::RealmOpen(_)
+        | StorageEffect::CompilePolicies(_) => false,
     }
 }
 
@@ -810,7 +830,8 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
         | StorageEffect::VaultDelete { txn_id: None, .. }
         | StorageEffect::BeginUsageRebuild { .. }
         | StorageEffect::FinishUsageRebuild { .. }
-        | StorageEffect::RealmOpen(_) => None,
+        | StorageEffect::RealmOpen(_)
+        | StorageEffect::CompilePolicies(_) => None,
     }
 }
 

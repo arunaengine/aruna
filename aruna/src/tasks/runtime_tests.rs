@@ -6,6 +6,7 @@ use crate::tasks::runner::{
     claim_producer, finish_job, recover_stale_jobs, recover_until_stopped, run_job, shutdown_jobs,
     spawn_job, wait_for_terminal,
 };
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
@@ -18,7 +19,6 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::execution::job::{JobError, JobState};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::ExternalReconciler;
 use aruna_drivers::jobs::executor::RangeTurns;
@@ -781,7 +781,13 @@ async fn deferred_for_delay() {
         size_bytes: 1,
     };
     let now = unix_timestamp_millis();
-    let notification = NotificationRecord::new(owner, NotificationClass::Direct, kind, now);
+    let notification = NotificationRecord::new(
+        ulid::Ulid::new(),
+        owner,
+        NotificationClass::Direct,
+        kind,
+        now,
+    );
     let payload = JobPayload::WebhookDelivery(WebhookDeliverySpec {
         subscription_id: Ulid::nil(),
         notification,

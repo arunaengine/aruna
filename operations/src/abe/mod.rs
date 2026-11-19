@@ -17,6 +17,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, VaultQuery};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::*;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{all_values, done, event, page, values};
@@ -152,6 +153,7 @@ pub struct KeyOperation {
     quiet: bool,
     managed: bool,
     result: Option<KeyResult>,
+    ids: IdMint,
 }
 impl KeyOperation {
     pub fn new(
@@ -188,6 +190,7 @@ impl KeyOperation {
             quiet: false,
             managed: false,
             result: None,
+            ids: IdMint::default(),
         }
     }
     /// Sends no holder notifications and walks no reissue pages, for reissue's own runs.
@@ -437,6 +440,9 @@ impl KeyOperation {
 impl Operation for KeyOperation {
     type Output = KeyResult;
     type Error = KeyError;
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }

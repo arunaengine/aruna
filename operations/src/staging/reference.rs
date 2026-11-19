@@ -918,19 +918,7 @@ mod tests {
         key_space: &str,
         key: Vec<u8>,
     ) -> Option<aruna_core::types::Value> {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                txn_id: None,
-            })
-            .await
-        else {
-            panic!("unexpected storage read result");
-        };
-
-        value
+        crate::testing::read_value(&context.storage_handle, key_space, key).await
     }
 
     async fn read_usage_counters(context: &DriverContext, key: Vec<u8>) -> UsageCounters {

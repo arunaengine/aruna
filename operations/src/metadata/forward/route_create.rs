@@ -8,6 +8,7 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -59,6 +60,8 @@ pub struct RouteCreateOperation {
     holders: VecDeque<NodeId>,
     asked: usize,
     failures: Vec<String>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 type RouteTurn = Result<Next<CreateDocumentResult>, MetadataWriteError>;
@@ -84,6 +87,8 @@ impl RouteCreateOperation {
             holders: VecDeque::new(),
             asked: 0,
             failures: Vec::new(),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -116,6 +121,8 @@ impl RouteCreateOperation {
                 &self.config.actor,
                 self.config.group_id,
                 &self.config.document_path,
+                &mut self.ids,
+                self.now_ms,
             )?
         } else {
             MetaResourceId::from_bytes(self.config.document_id.to_bytes()).map_err(|error| {
@@ -292,6 +299,14 @@ impl Operation for RouteCreateOperation {
             RouteStage::Config => self.config_read(result),
             RouteStage::Forward => self.holder_answered(result),
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

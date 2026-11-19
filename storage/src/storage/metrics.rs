@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aruna_core::telemetry::LatencyAggregator;
 use tokio::sync::Notify;
@@ -20,11 +20,15 @@ pub(super) fn record_storage_call(
     queue_wait: Duration,
     service: Duration,
 ) {
+    let now = Instant::now();
     match key_space {
-        Some(key_space) => {
-            STORAGE_LATENCY.record_split(&format!("{operation}:{key_space}"), queue_wait, service)
-        }
-        None => STORAGE_LATENCY.record_split(operation, queue_wait, service),
+        Some(key_space) => STORAGE_LATENCY.record_split(
+            &format!("{operation}:{key_space}"),
+            queue_wait,
+            service,
+            now,
+        ),
+        None => STORAGE_LATENCY.record_split(operation, queue_wait, service, now),
     }
 }
 

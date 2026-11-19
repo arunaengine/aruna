@@ -158,16 +158,20 @@ impl RealmVaultKey {
         Aes256Gcm::new((&self.0).into())
     }
 
-    /// Seals `secret` for one revision of `entry` as `nonce || ciphertext`.
+    /// Seals `secret` for one revision of `entry` as `nonce || ciphertext`. The nonce mixes the
+    /// run's random `entropy` with the revision, so each revision a run seals gets its own.
     pub fn seal(
         &self,
         realm_id: &RealmId,
-        entry: RealmVaultEntry,
-        revision: Ulid,
+        (entry, revision): (RealmVaultEntry, Ulid),
         secret: &SecretBytes,
+        entropy: u128,
     ) -> Result<Vec<u8>, RealmVaultError> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&entropy.to_le_bytes());
+        hasher.update(&revision.to_bytes());
         let mut nonce = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce).map_err(|_| RealmVaultError::Seal)?;
+        nonce.copy_from_slice(&hasher.finalize().as_bytes()[..NONCE_LEN]);
         let payload = Payload {
             msg: secret.expose(),
             aad: &associated(realm_id, entry, revision),
@@ -476,7 +480,7 @@ mod tests {
             revision,
             sealed: keys
                 .vault
-                .seal(&realm_id, entry, revision, &secret)
+                .seal(&realm_id, (entry, revision), &secret, 7)
                 .unwrap(),
             changed_by: UserId::local(Ulid::from_bytes([7; 16]), realm_id),
             changed_at_ms: 1,
@@ -504,7 +508,7 @@ mod tests {
         RealmVaultRecord {
             entry,
             revision,
-            sealed: key.seal(realm_id, entry, revision, &secret).unwrap(),
+            sealed: key.seal(realm_id, (entry, revision), &secret, 7).unwrap(),
             changed_by: UserId::local(Ulid::from_bytes([4u8; 16]), *realm_id),
             changed_at_ms: 1,
         }

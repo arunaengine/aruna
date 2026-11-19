@@ -497,13 +497,7 @@ mod pure_tests {
     }
 
     fn multiply_rule(key: &str, value: &str, permille: u32) -> AffinityRule {
-        AffinityRule {
-            matcher: LabelMatch {
-                key: key.to_string(),
-                value: value.to_string(),
-            },
-            effect: AffinityEffect::Multiply { permille },
-        }
+        crate::placement::distribution::multiply_rule(key, value, permille)
     }
 
     fn sid(seed: u8) -> Ulid {

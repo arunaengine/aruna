@@ -60,7 +60,15 @@ async fn interleaved_writes_converge() -> Result<(), Box<dyn std::error::Error>>
                 user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
             };
-            mint_local_document(&config, &actor, group_id, CONVERGE_PATH).map(|id| id.as_ulid())
+            mint_local_document(
+                &config,
+                &actor,
+                group_id,
+                CONVERGE_PATH,
+                &mut crate::fresh_ids(),
+                aruna_core::time::unix_timestamp_millis(),
+            )
+            .map(|id| id.as_ulid())
         })
         .collect::<Result<Vec<_>, _>>()?;
 

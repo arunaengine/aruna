@@ -50,13 +50,7 @@ pub async fn send(handle: &StorageHandle, effect: Effect) -> Event {
 }
 
 pub async fn begin(handle: &StorageHandle) -> TxnId {
-    match handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => panic!("unexpected storage event: {other:?}"),
-    }
+    handle.begin_write().await
 }
 
 /// True when the commit succeeded, false on a conflict.

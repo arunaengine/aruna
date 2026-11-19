@@ -484,12 +484,7 @@ pub fn decode_token(bucket: &str, token: &str) -> Option<String> {
 
 /// The run creator as admitted: submissions refuse path restricted credentials.
 pub fn creator(record: &JobRecord, realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id: record.created_by,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(record.created_by, realm_id)
 }
 
 fn source_of(entry: &ViewEntry) -> (&str, &str) {

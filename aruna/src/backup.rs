@@ -123,7 +123,7 @@ pub(crate) fn serve(storage_path: &Path, ctx: &DriverContext, shutdown: &Shutdow
             let backup = tokio::task::spawn_blocking(move || {
                 let stream = stream.into_std()?;
                 stream.set_nonblocking(false)?;
-                let now = aruna_core::time::unix_timestamp_secs();
+                let now = aruna_clock::unix_timestamp_secs();
                 write_backup(BufWriter::new(stream), &sources, now)
             });
             tokio::select! {

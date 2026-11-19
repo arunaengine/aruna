@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::plugin_runs::HookRequest;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::plugins::dispatch::VerifyHook;
 use aruna_operations::plugins::hooks::{AdmitHook, HookError};

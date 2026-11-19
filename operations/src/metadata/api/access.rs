@@ -76,13 +76,7 @@ pub(crate) fn child_results<T: 'static, E: 'static>(
 }
 
 fn child_result<T: 'static, E: 'static>(member: GroupResult) -> Option<Result<T, E>> {
-    let GroupResult::Done(event) = member else {
-        return None;
-    };
-    match *event {
-        Event::Child(outcome) => outcome.take(),
-        _ => None,
-    }
+    member.child_outcome()
 }
 
 /// The read rules of a caller per group and the request policies per scope.
@@ -203,8 +197,9 @@ impl Operation for ReadAccessOperation {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::auth::enforcement::{policy_reads, read_policies};
+    use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
     use crate::auth::permission_rules::CollectedRole;
+    use crate::tests::calls::compiled;
     use aruna_core::UserId;
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -247,7 +242,8 @@ pub(crate) mod tests {
         (records.iter())
             .map(|record| {
                 let rows = policy_rows(record.group_id);
-                let evaluator = read_policies(realm(), Some(record.group_id), rows).unwrap();
+                let sets = read_policies(realm(), Some(record.group_id), rows).unwrap();
+                let evaluator = compiled_policies(compiled(sets.compile())).unwrap();
                 ((record.realm_id, record.group_id), evaluator)
             })
             .collect()
@@ -303,12 +299,7 @@ pub(crate) mod tests {
     }
 
     fn caller() -> AuthContext {
-        AuthContext {
-            user_id: UserId::local(Ulid::from_parts(8, 8), realm()),
-            realm_id: realm(),
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(UserId::local(Ulid::from_parts(8, 8), realm()), realm())
     }
 
     #[test]

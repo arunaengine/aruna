@@ -6,6 +6,7 @@ use crate::topology;
 
 use std::collections::BTreeMap;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
 use aruna_core::placement::transition::{preview_transition, transition_health};
@@ -13,7 +14,6 @@ use aruna_core::placement::{holds_placement, resolve_shard_holders};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::placement::transition::TransitionLimits;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::metadata::create_document::mint_local_document;
 use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
 
@@ -38,8 +38,15 @@ async fn unreachable_target_stalls() -> TestResult<()> {
 
     let path = "datasets/stalled";
     let origin = realm.leading_node(group_id, path);
-    let document_id =
-        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
     let placement = realm
         .create_document(origin, group_id, document_id, path, "stall fixture")
         .await?;

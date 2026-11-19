@@ -38,6 +38,7 @@ fn small_handle(capacity: usize) -> (StorageHandle, super::StorageReceivers) {
         database: std::sync::Arc::new(std::sync::OnceLock::new()),
         realm_keys: std::sync::Arc::new(std::sync::OnceLock::new()),
         range_indexes: std::sync::Arc::new(std::sync::OnceLock::new()),
+        policies: std::sync::Arc::new(super::policies::PolicyPrograms::default()),
     };
     (handle, super::StorageReceivers { foreground, bulk })
 }
@@ -561,6 +562,7 @@ fn worker_exit_latches() {
         database: _,
         realm_keys: _,
         range_indexes: _,
+        policies: _,
     } = handle;
 
     assert!(!metrics.channel_closed.load(Ordering::Relaxed));
@@ -1013,13 +1015,7 @@ async fn sync_surfaces_errors() {
 }
 
 pub(super) async fn start_write_transaction(handle: &StorageHandle) -> Ulid {
-    match handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => panic!("unexpected storage event: {other:?}"),
-    }
+    handle.begin_write().await
 }
 
 #[tokio::test]

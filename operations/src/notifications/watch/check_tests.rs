@@ -43,7 +43,10 @@ fn open_policies() -> PolicyEvaluator {
     let bytes = config.to_bytes(&actor).unwrap();
     let mut load = PolicyLoadOperation::new(realm_id, None);
     load.first().unwrap();
-    match load.next(IoResult::Values(vec![Some(bytes.into())])) {
+    let Ok(Next::Call(compile)) = load.next(IoResult::Values(vec![Some(bytes.into())])) else {
+        panic!("the realm policies compile");
+    };
+    match load.next(crate::tests::calls::compiled(compile)) {
         Ok(Next::Done(evaluator)) => evaluator,
         other => panic!("the realm policies load: {other:?}"),
     }
@@ -219,7 +222,7 @@ fn unexpected_results_fail() {
 }
 
 fn watch(seed: u64) -> WatchSubscription {
-    let mut watch = WatchSubscription::new(owner(), prefix(), mask(), 1_000);
+    let mut watch = WatchSubscription::new(ulid::Ulid::new(), owner(), prefix(), mask(), 1_000);
     watch.watch_id = Ulid::from_parts(seed, u128::from(seed));
     watch
 }

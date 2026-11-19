@@ -26,7 +26,7 @@ use super::submission_rules::{
 };
 use super::submit_external::IngressNode;
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::pages::{LoadChainOperation, PageReadError, StoreEntriesOperation};
@@ -40,6 +40,7 @@ use crate::realm::peer_trust::peer_acts_for;
 pub(super) struct GroupWriteOperation {
     check: CheckPermissionsConfig,
     group_id: GroupId,
+    compiling: bool,
 }
 
 impl GroupWriteOperation {
@@ -49,7 +50,11 @@ impl GroupWriteOperation {
             path: group_permission_path(auth.realm_id, group_id, local),
             required_permission: Permission::WRITE,
         };
-        Self { check, group_id }
+        Self {
+            check,
+            group_id,
+            compiling: false,
+        }
     }
 }
 
@@ -67,6 +72,9 @@ impl Operation for GroupWriteOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        if self.compiling {
+            return Ok(Next::Done(self.policies_allow(result)));
+        }
         let IoResult::Values(mut rows) = result else {
             let got = result.label();
             let expected = "IoResult::Values";
@@ -79,17 +87,28 @@ impl Operation for GroupWriteOperation {
         if !self.check.allowed(rows).unwrap_or(false) {
             return Ok(Next::Done(false));
         }
-        let auth = &self.check.auth_context;
-        let Ok(evaluator) = read_policies(auth.realm_id, Some(self.group_id), policies) else {
+        let realm_id = self.check.auth_context.realm_id;
+        let Ok(sets) = read_policies(realm_id, Some(self.group_id), policies) else {
             return Ok(Next::Done(false));
+        };
+        self.compiling = true;
+        Ok(Next::Call(sets.compile()))
+    }
+}
+
+impl GroupWriteOperation {
+    /// Whether the compiled request policies allow the write.
+    fn policies_allow(&self, result: IoResult) -> bool {
+        let Ok(evaluator) = compiled_policies(result) else {
+            return false;
         };
         let request = policy_request_with(
             &self.check.path,
             &Permission::WRITE,
-            Some(auth),
+            Some(&self.check.auth_context),
             PolicyRequestExtras::rest(),
         );
-        Ok(Next::Done(evaluator.evaluate(&request).is_ok()))
+        evaluator.evaluate(&request).is_ok()
     }
 }
 
@@ -363,12 +382,7 @@ mod tests {
     }
 
     fn auth(user_id: UserId) -> AuthContext {
-        AuthContext {
-            user_id,
-            realm_id: REALM,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(user_id, REALM)
     }
 
     fn operation(node_view: Option<IngressNode>) -> AdmitForwardedOperation {

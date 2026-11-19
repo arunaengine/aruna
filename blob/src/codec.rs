@@ -466,11 +466,11 @@ pub(crate) fn decode_frame(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Seeded xorshift bytes, so random samples are the same on every run.
-    fn random(len: usize, mut seed: u64) -> Vec<u8> {
+    pub(crate) fn random(len: usize, mut seed: u64) -> Vec<u8> {
         (0..len)
             .map(|_| {
                 seed ^= seed << 13;

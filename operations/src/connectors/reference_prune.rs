@@ -337,17 +337,7 @@ mod tests {
     use std::time::SystemTime;
 
     async fn write_rows(context: &DriverContext, writes: Vec<(KeySpace, Key, Value)>) {
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::BatchWriteResult { .. })
-        ));
+        crate::testing::write_entries(&context.storage_handle, writes).await;
     }
 
     async fn count(context: &DriverContext, key_space: &str) -> usize {

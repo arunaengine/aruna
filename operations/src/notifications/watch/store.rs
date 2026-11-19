@@ -261,14 +261,21 @@ pub struct CreateWatchOperation {
 
 impl CreateWatchOperation {
     pub fn new(
+        watch_id: Ulid,
         local: aruna_core::NodeId,
         owner: UserId,
         (path_prefix, event_mask): (String, WatchEventMask),
         authorization: WatchAuthorizationBinding,
         now_ms: u64,
     ) -> Result<Self, WatchSubscriptionError> {
-        let subscription =
-            validated_subscription(owner, path_prefix, event_mask, now_ms, authorization)?;
+        let subscription = validated_subscription(
+            watch_id,
+            owner,
+            path_prefix,
+            event_mask,
+            now_ms,
+            authorization,
+        )?;
         let replication = watch_upsert_replication(local, &subscription)?;
         Ok(Self {
             subscription,
@@ -332,7 +339,13 @@ mod call_tests {
 
     fn subscription() -> WatchSubscription {
         let mask = WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]);
-        WatchSubscription::new(user(1, 2), "meta/x".to_string(), mask, 1_000)
+        WatchSubscription::new(
+            ulid::Ulid::new(),
+            user(1, 2),
+            "meta/x".to_string(),
+            mask,
+            1_000,
+        )
     }
 
     fn rows(change: Change) -> WatchRowsOperation {
@@ -453,6 +466,7 @@ mod call_tests {
         let binding = WatchAuthorizationBinding::default();
         let new = || {
             CreateWatchOperation::new(
+                Ulid::from_parts(4, 4),
                 local,
                 user(1, 2),
                 (prefix.clone(), mask),

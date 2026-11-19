@@ -5,11 +5,11 @@
 use crate::git_cache::GitCaches;
 use aruna_core::git::{GitEffect, GitEvent, MAX_GIT_BYTES};
 use aruna_core::repo_layout::Layout;
-use aruna_core::telemetry::{record_stage, time_stage};
+use aruna_core::telemetry::record_stage;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -563,6 +563,14 @@ pub(crate) async fn exchange(
     })
     .await
     .map_err(std::io::Error::other)?
+}
+
+/// Awaits `future` and attributes its wall time to the named request stage.
+async fn time_stage<F: Future>(name: &'static str, future: F) -> F::Output {
+    let started = Instant::now();
+    let output = future.await;
+    record_stage(name, started.elapsed());
+    output
 }
 
 #[cfg(test)]

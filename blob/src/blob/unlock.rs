@@ -359,10 +359,7 @@ impl UnlockRegistry {
             false
         });
         locked.sort_by_key(|ticket| ticket.key.generation);
-        (
-            locked,
-            next_event_id(aruna_core::time::unix_timestamp_millis()),
-        )
+        (locked, next_event_id(aruna_clock::unix_timestamp_millis()))
     }
 
     /// A lease for one plaintext read of `archive`, while its key generation is unlocked.
@@ -491,7 +488,7 @@ impl UnlockRegistry {
                 if ended && session.active {
                     expired.insert(
                         (*key, session.session_id),
-                        next_event_id(aruna_core::time::unix_timestamp_millis()),
+                        next_event_id(aruna_clock::unix_timestamp_millis()),
                     );
                 }
                 !ended
@@ -644,7 +641,7 @@ impl super::BlobHandler {
             Ok(mut registry) => registry.unlocked_key(key, Instant::now()),
             Err(_) => Err(BucketKeyError::Locked(key.bucket_id)),
         };
-        let now_ms = aruna_core::time::unix_timestamp_millis();
+        let now_ms = aruna_clock::unix_timestamp_millis();
         let sealed = unlocked.and_then(|(secret, public_key)| {
             seal_copies(key, &public_key, secret.bytes(), origin, holders, now_ms)
         });

@@ -4,6 +4,7 @@
 
 use crate::error::CliError;
 use aruna::config::load;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::calls::Next;
@@ -13,7 +14,6 @@ use aruna_core::onboarding::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
@@ -435,7 +435,7 @@ impl DoctorValidationState {
         // The replicated realm config is the only revocation authority.
         for realm_id in &trusted_realms {
             if let Ok(config) = drive(GetConfigOperation::new(*realm_id), driver_ctx).await {
-                let now = aruna_core::time::unix_timestamp_secs();
+                let now = aruna_clock::unix_timestamp_secs();
                 revoked_token_hashes.extend(
                     config
                         .revoked_tokens
@@ -535,7 +535,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, TokenClaims};
     use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
     use aruna_core::structs::identity::user::User;
@@ -741,20 +741,7 @@ mod tests {
     }
 
     async fn read_user(context: &DriverContext, user_id: UserId) -> User {
-        match context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Read {
-                key_space: USER_KEYSPACE.to_string(),
-                key: ByteView::from(user_id.to_bytes()),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult {
-                value: Some(bytes), ..
-            }) => User::from_bytes(&bytes).unwrap(),
-            other => panic!("unexpected user read result: {other:?}"),
-        }
+        aruna_operations::testing::read_user(context, user_id).await
     }
 
     async fn read_realm_config(
@@ -953,22 +940,7 @@ mod tests {
     }
 
     fn aruna_token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
-        let now = chrono::Utc::now().timestamp().max(0) as u64;
-        TokenClaims {
-            sub: user_id.to_string(),
-            iss: realm_id.to_string(),
-            iat: now,
-            exp: now + 600,
-            jti: Ulid::generate().to_string(),
-            sid: None,
-            session_kind: None,
-            restrictions: None,
-            issuer_pubkey: None,
-            delegation_signature: None,
-            name: None,
-            via: None,
-            auth_time: None,
-        }
+        aruna_operations::testing::token_claims(realm_id, user_id)
     }
 
     fn sign_aruna_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {

@@ -493,7 +493,7 @@ async fn rejects_restricted_run() {
     ] {
         let (_storage_dir, state, mut auth, _) = test_state().await;
         auth.path_restrictions = restrictions;
-        // `run_sync` takes `UnrestrictedAuth`, so the refusal is its check.
+        // `run_sync` and `create_sync` take `UnrestrictedAuth`, so the refusal is its check.
         let error = crate::auth::require_unrestricted_auth(&state, Some(auth));
         assert!(matches!(error, Err(ServerError::Forbidden)));
     }
@@ -516,23 +516,6 @@ async fn rejects_restricted_control() {
             crate::auth::require_unrestricted_auth(&state, Some(auth)),
             Err(ServerError::Forbidden)
         ));
-    }
-}
-
-#[tokio::test]
-async fn rejects_restricted_create() {
-    for restrictions in [
-        Some(vec![PathRestriction {
-            pattern: "/restricted/**".to_string(),
-            permission: Permission::READ,
-        }]),
-        Some(Vec::new()),
-    ] {
-        let (_storage_dir, state, mut auth, _) = test_state().await;
-        auth.path_restrictions = restrictions;
-        // `create_sync` takes `UnrestrictedAuth`, so the refusal is its check.
-        let error = crate::auth::require_unrestricted_auth(&state, Some(auth));
-        assert!(matches!(error, Err(ServerError::Forbidden)));
     }
 }
 

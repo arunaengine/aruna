@@ -54,7 +54,7 @@ use crate::telemetry::{
     current_trace_context, duration_ms, extract_trace_context, record_duration_ms,
     record_selected_path, warn_iroh_phase, warn_iroh_request,
 };
-use aruna_core::time::unix_timestamp_secs;
+use aruna_clock::unix_timestamp_secs;
 
 pub type CallerOutcome = std::result::Result<DhtOutputValue, DhtIoError>;
 pub type InboundDhtStream = (SendStream, RecvStream, NodeId);

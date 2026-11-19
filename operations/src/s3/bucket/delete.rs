@@ -517,6 +517,7 @@ impl DeleteBucketOperation {
             };
             let outbox_id = self.ids.mint(self.now_ms);
             let record = NotificationRecord::new(
+                self.ids.mint(self.now_ms),
                 member,
                 NotificationClass::Direct,
                 kind,

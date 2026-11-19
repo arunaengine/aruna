@@ -900,7 +900,7 @@ mod pure_tests {
     use aruna_core::errors::AuthorizationError;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::operation::{Operation, TransactionMode};
-    use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
+    use aruna_core::reducer::{AdminConflict, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key, sync_revision_key};
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::realm::RealmId;
@@ -926,12 +926,7 @@ mod pure_tests {
     }
 
     fn auth_context(realm_id: RealmId, user_id: UserId) -> AuthContext {
-        AuthContext {
-            user_id,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(user_id, realm_id)
     }
 
     fn input(realm_id: RealmId, caller_id: UserId, user_id: UserId) -> UpdateUserInput {
@@ -987,19 +982,7 @@ mod pure_tests {
     }
 
     fn conflict(path: &str, first_seed: u8, second_seed: u8) -> AdminConflict {
-        AdminConflict {
-            path: path.to_string(),
-            values: vec![
-                AdminConflictValue {
-                    value: Some(format!("value-{first_seed}")),
-                    dot: dot(first_seed),
-                },
-                AdminConflictValue {
-                    value: Some(format!("value-{second_seed}")),
-                    dot: dot(second_seed),
-                },
-            ],
-        }
+        aruna_core::testing::admin_conflict(path, first_seed, second_seed)
     }
 
     fn conflict_state(user_id: UserId) -> AdminDocumentState {
@@ -1275,8 +1258,12 @@ mod pure_tests {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let original = stored_user(user_id);
-        let mut record =
-            AdminAuditRecord::new(AdminAuditAction::AccountDeactivated, user_id, user_id);
+        let mut record = AdminAuditRecord::new(
+            Ulid::from_parts(1, 1),
+            AdminAuditAction::AccountDeactivated,
+            user_id,
+            user_id,
+        );
         record.group_id = Some(Ulid::from_bytes([4u8; 16]));
         let mut operation = write(input(realm_id, user_id, user_id));
         operation.audit = Some(record.clone());

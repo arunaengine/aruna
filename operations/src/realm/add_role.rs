@@ -358,17 +358,9 @@ impl Operation for RoleWrite {
     }
 
     fn first(&mut self) -> Result<Next<WrittenRole>, RealmRoleError> {
-        let target = AdminDocumentTarget::Realm {
-            realm_id: self.input.realm_id,
-        };
-        let auth_key = (*self.input.realm_id.as_bytes()).into();
-        Ok(Next::Call(IoCall::Read(vec![
-            (AUTH_KEYSPACE.to_string(), auth_key),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        Ok(Next::Call(crate::realm::authorization_reads(
+            self.input.realm_id,
+        )))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<WrittenRole>, RealmRoleError> {

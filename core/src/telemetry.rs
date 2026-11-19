@@ -306,22 +306,26 @@ impl LatencyAggregator {
         }
     }
 
-    pub fn record(&self, key: &str, total: Duration) {
-        self.observe(key, total, None);
+    /// Records a call that ended at `now`, the caller's clock reading.
+    pub fn record(&self, key: &str, total: Duration, now: Instant) {
+        self.observe(key, total, None, now);
     }
 
-    pub fn record_split(&self, key: &str, queue_wait: Duration, service: Duration) {
-        self.observe(
-            key,
-            queue_wait.saturating_add(service),
-            Some((queue_wait, service)),
-        );
+    /// Records a call with its queue wait and service time that ended at `now`.
+    pub fn record_split(&self, key: &str, queue_wait: Duration, service: Duration, now: Instant) {
+        let total = queue_wait.saturating_add(service);
+        self.observe(key, total, Some((queue_wait, service)), now);
     }
 
-    fn observe(&self, key: &str, total: Duration, split: Option<(Duration, Duration)>) {
+    fn observe(
+        &self,
+        key: &str,
+        total: Duration,
+        split: Option<(Duration, Duration)>,
+        now: Instant,
+    ) {
         let due = {
             let mut inner = self.inner.lock().unwrap_or_else(|lock| lock.into_inner());
-            let now = Instant::now();
             let window_started = *inner.window_started.get_or_insert(now);
             let key = self.bucket_key(&inner, key);
             let entry = match inner.entries.get_mut(key.as_ref()) {
@@ -367,11 +371,11 @@ impl LatencyAggregator {
         }
     }
 
-    /// Drains and emits the current window regardless of the interval.
-    pub fn flush(&self) -> Vec<LatencySummary> {
+    /// Drains and emits the current window at `now`, regardless of the interval.
+    pub fn flush(&self, now: Instant) -> Vec<LatencySummary> {
         let summaries = {
             let mut inner = self.inner.lock().unwrap_or_else(|lock| lock.into_inner());
-            Self::drain_locked(&mut inner, Instant::now())
+            Self::drain_locked(&mut inner, now)
         };
         self.emit(&summaries);
         summaries
@@ -555,14 +559,6 @@ pub fn record_stage_detail(name: &'static str, detail: impl FnOnce() -> String, 
     let _ = REQUEST_STAGES.try_with(|stages| stages.add_detail(name, detail(), elapsed));
 }
 
-/// Awaits `future` and attributes its wall time to the named stage.
-pub async fn time_stage<F: Future>(name: &'static str, future: F) -> F::Output {
-    let started = Instant::now();
-    let output = future.await;
-    record_stage(name, started.elapsed());
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,11 +629,11 @@ mod tests {
     #[test]
     fn aggregator_flush_window() {
         let aggregator = LatencyAggregator::new("test");
-        aggregator.record("route_a", Duration::from_millis(5));
-        aggregator.record("route_a", Duration::from_millis(5));
-        aggregator.record("route_b", Duration::from_millis(50));
+        aggregator.record("route_a", Duration::from_millis(5), Instant::now());
+        aggregator.record("route_a", Duration::from_millis(5), Instant::now());
+        aggregator.record("route_b", Duration::from_millis(50), Instant::now());
 
-        let summaries = aggregator.flush();
+        let summaries = aggregator.flush(Instant::now());
         assert_eq!(summaries.len(), 2);
         let route_a = summaries
             .iter()
@@ -647,14 +643,22 @@ mod tests {
         assert_eq!(route_a.p50_ms, 5.0);
         assert!(route_a.split.is_none());
 
-        assert!(aggregator.flush().is_empty(), "window must reset on flush");
+        assert!(
+            aggregator.flush(Instant::now()).is_empty(),
+            "window must reset on flush"
+        );
     }
 
     #[test]
     fn aggregator_split_service() {
         let aggregator = LatencyAggregator::new("test");
-        aggregator.record_split("write", Duration::from_millis(40), Duration::from_millis(2));
-        let summaries = aggregator.flush();
+        aggregator.record_split(
+            "write",
+            Duration::from_millis(40),
+            Duration::from_millis(2),
+            Instant::now(),
+        );
+        let summaries = aggregator.flush(Instant::now());
         let split = summaries[0].split.as_ref().expect("split summary");
         assert_eq!(split.wait_max_ms, 40.0);
         assert_eq!(split.service_max_ms, 2.0);
@@ -664,12 +668,12 @@ mod tests {
     #[test]
     fn aggregator_limits_cardinality() {
         let aggregator = LatencyAggregator::with_options("test", bounded_options(2, 64));
-        aggregator.record("route_a", Duration::from_millis(5));
-        aggregator.record("route_b", Duration::from_millis(10));
-        aggregator.record("route_c", Duration::from_millis(15));
-        aggregator.record("route_a", Duration::from_millis(20));
+        aggregator.record("route_a", Duration::from_millis(5), Instant::now());
+        aggregator.record("route_b", Duration::from_millis(10), Instant::now());
+        aggregator.record("route_c", Duration::from_millis(15), Instant::now());
+        aggregator.record("route_a", Duration::from_millis(20), Instant::now());
 
-        let summaries = aggregator.flush();
+        let summaries = aggregator.flush(Instant::now());
         assert_eq!(summaries.len(), 3);
         assert_eq!(summary(&summaries, "route_a").count, 2);
         assert_eq!(summary(&summaries, "route_b").count, 1);
@@ -680,10 +684,10 @@ mod tests {
     #[test]
     fn aggregator_limits_length() {
         let aggregator = LatencyAggregator::with_options("test", bounded_options(10, 4));
-        aggregator.record("ok", Duration::from_millis(5));
-        aggregator.record("too-long", Duration::from_millis(10));
+        aggregator.record("ok", Duration::from_millis(5), Instant::now());
+        aggregator.record("too-long", Duration::from_millis(10), Instant::now());
 
-        let summaries = aggregator.flush();
+        let summaries = aggregator.flush(Instant::now());
         assert_eq!(summary(&summaries, "ok").count, 1);
         assert_eq!(summary(&summaries, "overflow").count, 1);
         assert!(summaries.iter().all(|summary| summary.key != "too-long"));
@@ -692,9 +696,14 @@ mod tests {
     #[test]
     fn aggregator_overflow_latency() {
         let aggregator = LatencyAggregator::with_options("test", bounded_options(0, 64));
-        aggregator.record_split("write", Duration::from_millis(40), Duration::from_millis(2));
+        aggregator.record_split(
+            "write",
+            Duration::from_millis(40),
+            Duration::from_millis(2),
+            Instant::now(),
+        );
 
-        let summaries = aggregator.flush();
+        let summaries = aggregator.flush(Instant::now());
         let overflow = summary(&summaries, "overflow");
         let split = overflow.split.as_ref().expect("split summary");
         assert_eq!(overflow.count, 1);
@@ -706,16 +715,16 @@ mod tests {
     #[test]
     fn aggregator_resets_window() {
         let aggregator = LatencyAggregator::with_options("test", bounded_options(1, 64));
-        aggregator.record("route_a", Duration::from_millis(5));
-        aggregator.record("route_b", Duration::from_millis(10));
+        aggregator.record("route_a", Duration::from_millis(5), Instant::now());
+        aggregator.record("route_b", Duration::from_millis(10), Instant::now());
 
-        let first_window = aggregator.flush();
+        let first_window = aggregator.flush(Instant::now());
         assert_eq!(summary(&first_window, "route_a").count, 1);
         assert_eq!(summary(&first_window, "overflow").count, 1);
         assert!(first_window.iter().all(|summary| summary.key != "route_b"));
 
-        aggregator.record("route_b", Duration::from_millis(15));
-        let second_window = aggregator.flush();
+        aggregator.record("route_b", Duration::from_millis(15), Instant::now());
+        let second_window = aggregator.flush(Instant::now());
         assert_eq!(second_window.len(), 1);
         assert_eq!(summary(&second_window, "route_b").count, 1);
     }
@@ -724,9 +733,9 @@ mod tests {
     fn aggregator_emits_elapses() {
         let aggregator = LatencyAggregator::with_interval("test", Duration::ZERO);
         // Window opens and immediately becomes due on the second record.
-        aggregator.record("k", Duration::from_millis(1));
-        aggregator.record("k", Duration::from_millis(1));
-        assert!(aggregator.flush().is_empty());
+        aggregator.record("k", Duration::from_millis(1), Instant::now());
+        aggregator.record("k", Duration::from_millis(1), Instant::now());
+        assert!(aggregator.flush(Instant::now()).is_empty());
     }
 
     #[test]
@@ -751,7 +760,7 @@ mod tests {
         stages
             .clone()
             .scope(async {
-                time_stage("inner", async {}).await;
+                record_stage("inner", Duration::from_millis(2));
                 record_stage("manual", Duration::from_millis(3));
             })
             .await;

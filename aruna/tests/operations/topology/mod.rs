@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use aruna::inbound::{initialize_incoming_fixture, initialize_net_holder};
 use aruna::tasks::incoming::start_task_queues;
 use aruna_blob::blob::BlobHandler;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::REALMS_LIST_KEY;
 use aruna_core::document::DocumentTarget;
@@ -42,7 +43,6 @@ use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::placement::transition::TransitionLimits;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, group_permission_path};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, StructuredId, UserId};
 use aruna_drivers::driver::{DriverContext, drive};
@@ -1826,9 +1826,16 @@ pub async fn run_writer(
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
         };
-        let document_id = mint_local_document(&config, &actor, group_id, &document_path)
-            .map_err(|error| format!("mint failed writer={writer} index={index}: {error:?}"))?
-            .as_ulid();
+        let document_id = mint_local_document(
+            &config,
+            &actor,
+            group_id,
+            &document_path,
+            &mut crate::fresh_ids(),
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .map_err(|error| format!("mint failed writer={writer} index={index}: {error:?}"))?
+        .as_ulid();
         let payload = payload(label, writer, index, document_id);
         let result = drive(
             CreateDocumentOperation::new_generated_id(CreateDocumentConfig {

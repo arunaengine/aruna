@@ -23,12 +23,7 @@ fn bearer() -> Option<AuthToken> {
 }
 
 fn auth() -> AuthContext {
-    AuthContext {
-        user_id: user(),
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user(), realm())
 }
 
 fn append_config() -> AppendVaultConfig {

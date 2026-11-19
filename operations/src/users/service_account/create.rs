@@ -263,6 +263,7 @@ impl ServiceWrite {
         }
         writes.push(reducer_state_entry(&reducer_state)?);
         let mut audit = AdminAuditRecord::new(
+            self.ids.mint(self.now_ms),
             AdminAuditAction::ServiceAccountCreated,
             actor.user_id,
             user.user_id,

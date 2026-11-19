@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::plugin_host::worker::tests::worker;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::keyspaces::PLUGIN_OUTBOX_KEYSPACE;
 use aruna_core::keyspaces::PLUGIN_QUEUE_KEYSPACE;
@@ -10,7 +11,6 @@ use aruna_core::keyspaces::PLUGIN_REPLAYS_KEYSPACE;
 use aruna_core::keyspaces::PLUGIN_WAITING_KEYSPACE;
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::storage_entries::reducer_state_key;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
 use aruna_operations::plugins::cleanup::sweep_events;
 use aruna_operations::plugins::flow_support::cleanup::count;

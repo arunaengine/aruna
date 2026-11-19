@@ -17,7 +17,6 @@ use crate::federation::grant::{
 use crate::federation::grant::{IssueGrantOperation, grant_principal};
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, FEDERATION_KEYSPACE,
 };
@@ -28,7 +27,7 @@ use aruna_core::transfer::PinnedSource;
 use aruna_core::transfer::{MAX_TRANSFER_SECS, TransferError};
 use aruna_drivers::driver::{DriverContext, drive};
 use ed25519_dalek::SigningKey;
-use tempfile::{TempDir, tempdir};
+use tempfile::TempDir;
 
 const NOW: u64 = 10_000;
 
@@ -99,17 +98,7 @@ async fn write_record(
 }
 
 fn context() -> (TempDir, DriverContext) {
-    let dir = tempdir().unwrap();
-    let context = DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    };
-    (dir, context)
+    crate::testing::temp_context()
 }
 
 fn capabilities() -> NodeCapabilities {
@@ -172,13 +161,7 @@ async fn denial_stops_reads() {
 }
 
 async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-    let effect = StorageEffect::Write {
-        key_space: key_space.to_string(),
-        key: key.into(),
-        value: value.into(),
-        txn_id: None,
-    };
-    context.storage_handle.send_storage_effect(effect).await;
+    crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
 }
 
 #[tokio::test]

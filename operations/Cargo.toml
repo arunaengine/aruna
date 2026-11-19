@@ -28,6 +28,7 @@ test-hooks = [
     "dep:aruna-tasks",
     "aruna-drivers/test-hooks",
     "aruna-net/test-hooks",
+    "aruna-storage/test-hooks",
 ]
 
 [dependencies]
@@ -52,8 +53,6 @@ byteview = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
 globset = { workspace = true }
-fjall = { workspace = true }
-rustix = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }

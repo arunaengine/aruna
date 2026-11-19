@@ -1778,19 +1778,7 @@ mod tests {
     }
 
     async fn write_stat(ctx: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                value: value.into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
     }
 
     fn logical(logical_bytes: u64) -> UsageCounters {

@@ -551,7 +551,7 @@ async fn rescue_displaced(spool: &Path, target: &Path) -> Result<(), PlaceError>
         ));
     };
     let relative = target.to_string_lossy().to_string();
-    let stamp = conflict_stamp(aruna_core::time::unix_timestamp_millis());
+    let stamp = conflict_stamp(aruna_clock::unix_timestamp_millis());
     for attempt in 1..=MAX_COPY_ATTEMPTS {
         let candidate = parent.join(copy_name(&relative, &stamp, attempt));
         if place_new(spool, &candidate).is_ok() {
@@ -688,21 +688,10 @@ fn sibling_path(relative: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use crate::fs_source::list_local;
-    use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_ROOT;
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-    use std::collections::HashMap;
 
     fn access(root: &Path, path: &str) -> ResolvedSourceAccess {
-        ResolvedSourceAccess::OpenDal {
-            kind: SourceConnectorKind::LocalDirectory,
-            config: HashMap::from([(
-                OFFERED_DIRECTORY_ROOT.to_string(),
-                root.to_string_lossy().to_string(),
-            )]),
-            path: path.to_string(),
-            version: None,
-        }
+        crate::fs_source::tests::access(root, path)
     }
 
     fn body(bytes: &'static [u8]) -> BackendStream<Result<Bytes, StreamError>> {

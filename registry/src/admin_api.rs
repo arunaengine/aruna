@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::{RealmTotals, Registration, Signed};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::time::unix_timestamp_secs;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};

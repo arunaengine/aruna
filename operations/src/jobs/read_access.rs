@@ -13,7 +13,7 @@ use aruna_core::types::{GroupId, Value};
 use thiserror::Error;
 
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -69,6 +69,7 @@ pub struct SourceReadOperation {
     auth: AuthContext,
     object: SourceObject,
     group_id: Option<GroupId>,
+    compiling: bool,
 }
 
 type ReadNext = Result<Next<GroupId>, SourceReadError>;
@@ -95,6 +96,7 @@ impl SourceReadOperation {
             auth,
             object,
             group_id: None,
+            compiling: false,
         }
     }
 
@@ -104,6 +106,7 @@ impl SourceReadOperation {
             auth,
             object,
             group_id: Some(group_id),
+            compiling: false,
         }
     }
 
@@ -129,15 +132,23 @@ impl SourceReadOperation {
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn decide(&self, group_id: GroupId, mut rows: Vec<Option<Value>>) -> ReadNext {
+    fn decide(&mut self, group_id: GroupId, mut rows: Vec<Option<Value>>) -> ReadNext {
         let check = self.check(group_id);
         let split = check.reads().map_err(check_failure)?.len();
         let policies = rows.split_off(split.min(rows.len()));
         if !check.allowed(rows).map_err(check_failure)? {
             return Err(SourceReadError::Denied);
         }
-        let evaluator =
+        let sets =
             read_policies(self.auth.realm_id, Some(group_id), policies).map_err(policy_failure)?;
+        self.compiling = true;
+        Ok(Next::Call(sets.compile()))
+    }
+
+    /// Runs the request policies once their sets are compiled.
+    fn policies(&self, group_id: GroupId, result: IoResult) -> ReadNext {
+        let check = self.check(group_id);
+        let evaluator = compiled_policies(result).map_err(policy_failure)?;
         let request = policy_request_with(
             &check.path,
             &Permission::READ,
@@ -170,6 +181,9 @@ impl Operation for SourceReadOperation {
                 Err(error) => Err(SourceReadError::Unavailable(error.to_string())),
             };
         };
+        if self.compiling {
+            return self.policies(group_id, result);
+        }
         match result {
             IoResult::Values(rows) => self.decide(group_id, rows),
             other => Err(IoError::Unexpected {

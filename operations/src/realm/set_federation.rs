@@ -13,14 +13,13 @@ use aruna_core::federation::{
     AcceptedRealms, FederationSettings, LoginProvider, PUBLISH_SOON, RealmDescriptor,
     RegistrationMode, Signed,
 };
-use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, CONFIG_DESCRIPTION_PATH, CONFIG_FEDERATION_PATH,
 };
 use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -415,18 +414,8 @@ impl Operation for FederationWrite {
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, SetFederationError> {
-        let document = self.document_ref();
-        let target = self.admin_target();
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                document.storage_keyspace().to_string(),
-                document.storage_key(),
-            ),
-            (
-                DOCUMENT_STATE_KEYSPACE.to_string(),
-                reducer_state_key(&target),
-            ),
-        ])))
+        let reads = crate::realm::document_reads(self.document_ref(), &self.admin_target());
+        Ok(Next::Call(reads))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetFederationError> {
@@ -494,8 +483,6 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentDot;
     use aruna_core::document::DocumentOutboxRecord;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_core::reducer::{AdminConflict, AdminConflictValue};
     use aruna_core::structs::identity::realm::{
@@ -544,19 +531,7 @@ mod tests {
     }
 
     async fn write(ctx: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                value: value.into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
     }
 
     async fn seed(ctx: &DriverContext, actor: &Actor, kind: RealmNodeKind, admin: bool) {

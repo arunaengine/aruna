@@ -37,7 +37,7 @@ use ulid::Ulid;
 use super::input_walk::{InputCaller, reference_of, source_parts};
 use super::submission_rules::{admitted_description, reference_content, source_error};
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError, check_error};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::jobs::read_access::{SourceObject, SourceReadError, SourceReadOperation};
@@ -113,6 +113,7 @@ impl From<IoError> for DatabaseError {
 #[derive(Debug, PartialEq)]
 enum DatabaseStep {
     Check,
+    Policies,
     Metadata,
     Summary(BucketMetadata),
 }
@@ -175,7 +176,18 @@ impl ReadableDatabaseOperation {
             Err(error) => return Self::rule_failure(error),
         }
         let group = Some(self.info.group_id);
-        let verdict = read_policies(self.auth.realm_id, group, policies).and_then(|evaluator| {
+        match read_policies(self.auth.realm_id, group, policies) {
+            Ok(sets) => {
+                self.step = DatabaseStep::Policies;
+                Ok(Next::Call(sets.compile()))
+            }
+            Err(error) => Self::refused(error.into()),
+        }
+    }
+
+    /// Runs the request policies once their sets are compiled.
+    fn policies(&mut self, result: IoResult) -> DatabaseNext {
+        let verdict = compiled_policies(result).and_then(|evaluator| {
             evaluator.evaluate(&policy_request_with(
                 &self.check.path,
                 &Permission::READ,
@@ -230,6 +242,7 @@ impl Operation for ReadableDatabaseOperation {
                 };
                 self.decide(rows)
             }
+            DatabaseStep::Policies => self.policies(result),
             DatabaseStep::Metadata => {
                 let read = result.child::<Option<BucketMetadata>, BucketMetadataError>()?;
                 self.described(read.map_err(|error| DatabaseError(error.to_string()))?)
@@ -637,7 +650,7 @@ mod tests {
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::job::{InputMode, InputSource};
     use aruna_core::structs::storage::blob::BackendRef;
-    use aruna_core::structs::storage::format::{Compression, StoredFormat};
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::MultipartChecksumType;
 
     const GROUP: Ulid = Ulid::from_parts(2, 2);
@@ -690,17 +703,7 @@ mod tests {
     }
 
     fn info() -> BucketInfo {
-        BucketInfo {
-            group_id: GROUP,
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: user(),
-            cors_configuration: None,
-            storage_routing: Vec::new(),
-            placement_policies: Vec::new(),
-            placement_policy_generation: 0,
-            compression: Compression::Off,
-            distribution: None,
-        }
+        crate::tests::s3::bucket_info(GROUP, user())
     }
 
     fn child<T, E>(result: Result<T, E>) -> IoResult

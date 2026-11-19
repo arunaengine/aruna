@@ -920,7 +920,7 @@ impl BlobHandler {
                 node_id,
                 holders,
             } => {
-                let now_ms = aruna_core::time::unix_timestamp_millis();
+                let now_ms = aruna_clock::unix_timestamp_millis();
                 let origin = (realm_id, node_id);
                 let sealed = seal_copies(
                     key,

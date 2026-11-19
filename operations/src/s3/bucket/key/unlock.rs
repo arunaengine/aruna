@@ -66,20 +66,7 @@ impl From<IoError> for UnlockError {
     }
 }
 
-impl From<AuditError> for UnlockError {
-    fn from(error: AuditError) -> Self {
-        match error {
-            AuditError::Conversion(error) => Self::Conversion(error),
-            AuditError::Storage(error) => Self::Storage(error),
-            AuditError::NotAuditTimer => Self::NotFinished,
-            AuditError::Unexpected(received) => Self::InvalidStateEvent {
-                state: "WriteOutcome".to_string(),
-                expected: "the audit retry timer's answer",
-                received,
-            },
-        }
-    }
-}
+crate::s3::bucket::audit_retry::audit_failure!(UnlockError, "WriteOutcome");
 
 /// One unlock request; the caller's implicit authority is read in the unlock's transaction.
 #[derive(Clone, Debug, PartialEq)]

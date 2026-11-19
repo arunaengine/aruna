@@ -515,28 +515,7 @@ mod test {
     fn activated_config(
         actor: &Actor,
     ) -> aruna_core::structs::identity::realm::RealmConfigDocument {
-        let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(
-            actor.realm_id,
-            Vec::new(),
-            3,
-        );
-        config.ensure_node(
-            actor.node_id,
-            aruna_core::structs::identity::realm::RealmNodeKind::Server,
-        );
-        config
-            .strategies
-            .push(aruna_core::structs::placement::record::PlacementStrategy {
-                strategy_id: Ulid::from_bytes([5; 16]),
-                name: "default".to_string(),
-                replica_count: Some(1),
-                distinct_locations: false,
-                affinity: Vec::new(),
-                shard_count: 16,
-            });
-        config.default_strategy_id = Some(config.strategies[0].strategy_id);
-        config.snapshot_candidate_map();
-        config
+        crate::tests::groups::activated_config(actor)
     }
 
     /// Runs a create to the bucket fence read and answers it with `closed`.

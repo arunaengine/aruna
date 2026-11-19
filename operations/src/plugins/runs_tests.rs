@@ -132,7 +132,12 @@ async fn resolved_runs() {
     let mut run = queued(install, 1);
     drive(admit(run.clone()), &ctx).await.unwrap();
     let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
-    let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
+    let audit = AdminAuditRecord::new(
+        Ulid::from_parts(1, 1),
+        AdminAuditAction::PluginRunResolved,
+        admin,
+        admin,
+    );
     let early = drive(
         resolve_run(
             (install, run.run_id),
@@ -222,7 +227,12 @@ async fn unresolved_count() {
     assert_eq!(running.len(), RUNS_QUEUED - 1);
     assert!(!running.contains(&(install, waiting.run_id)));
     let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
-    let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
+    let audit = AdminAuditRecord::new(
+        Ulid::from_parts(1, 1),
+        AdminAuditAction::PluginRunResolved,
+        admin,
+        admin,
+    );
     drive(
         resolve_run(
             (install, waiting.run_id),
@@ -262,7 +272,12 @@ async fn resolved_expire() {
     );
     drive(save_run(&run).unwrap(), &ctx).await.unwrap();
     let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
-    let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
+    let audit = AdminAuditRecord::new(
+        Ulid::from_parts(1, 1),
+        AdminAuditAction::PluginRunResolved,
+        admin,
+        admin,
+    );
     let resolved = drive(
         resolve_run(
             (install, run.run_id),
@@ -346,6 +361,7 @@ fn resolve_decisions() {
     let mut waiting = queued(install, 1);
     waiting.state = RunState::NeedsAttention;
     let audit = AdminAuditRecord::new(
+        Ulid::from_parts(1, 1),
         aruna_core::structs::identity::admin_audit::AdminAuditAction::PluginRunResolved,
         UserId::local(Ulid::from_parts(2, 2), RealmId::from_bytes([1; 32])),
         UserId::local(Ulid::from_parts(2, 3), RealmId::from_bytes([1; 32])),

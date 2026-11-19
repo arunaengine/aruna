@@ -64,6 +64,8 @@ async fn expansion_hands_buckets() -> TestResult<()> {
         &realm.actor(realm.find(origin)),
         group_id,
         path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
     )?
     .as_ulid();
     let placement =
@@ -160,6 +162,8 @@ async fn expansion_hands_buckets() -> TestResult<()> {
         &realm.actor(realm.find(origin)),
         group_id,
         late_path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
     )?
     .as_ulid();
     create_document(&realm, realm.find(origin), group_id, late_id, late_path).await?;

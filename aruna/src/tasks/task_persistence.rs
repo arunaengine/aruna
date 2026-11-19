@@ -4,12 +4,12 @@
 
 use std::time::Duration;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
 use aruna_core::task::{PersistedTaskTimer, TaskEffect};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_storage::task_timers::delete_timer_key;
 use aruna_tasks::TaskHandle;

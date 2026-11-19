@@ -746,7 +746,7 @@ async fn upload_requires_auth() {
 async fn submit_accepts_upload() {
     let (_dir, state, user, group) = submit_state().await;
     let upload_id = Ulid::generate();
-    let future = aruna_core::time::unix_timestamp_millis() + 60_000;
+    let future = aruna_clock::unix_timestamp_millis() + 60_000;
     seed_upload(&state, upload_id, user, 1, future).await;
     seed_bucket(&state, "target", group, user).await;
     let (status, Json(response)) = submit_import(
@@ -790,7 +790,7 @@ async fn submit_foreign_upload() {
         upload_id,
         other,
         1,
-        aruna_core::time::unix_timestamp_millis() + 60_000,
+        aruna_clock::unix_timestamp_millis() + 60_000,
     )
     .await;
     let result = submit_import(
@@ -823,7 +823,7 @@ async fn submit_oversized_upload() {
     // An upload larger than the import-source cap is rejected at submit time.
     let (_dir, state, user, group) = submit_state().await;
     let upload_id = Ulid::generate();
-    let future = aruna_core::time::unix_timestamp_millis() + 60_000;
+    let future = aruna_clock::unix_timestamp_millis() + 60_000;
     seed_upload(&state, upload_id, user, 2048, future).await;
     seed_bucket(&state, "target", group, user).await;
     let result = submit_import(
@@ -845,7 +845,7 @@ async fn submit_target_forbidden() {
         upload_id,
         user,
         1,
-        aruna_core::time::unix_timestamp_millis() + 60_000,
+        aruna_clock::unix_timestamp_millis() + 60_000,
     )
     .await;
     let foreign = Ulid::generate();
@@ -869,7 +869,7 @@ async fn submit_dedups_key() {
         upload_id,
         user,
         1,
-        aruna_core::time::unix_timestamp_millis() + 60_000,
+        aruna_clock::unix_timestamp_millis() + 60_000,
     )
     .await;
     seed_bucket(&state, "target", group, user).await;

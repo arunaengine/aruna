@@ -119,6 +119,8 @@ pub struct CreateUserOperation {
     pages: Option<PrefixPages>,
     /// The administrator who issues this credential for another account, audited with it.
     issuer: Option<UserId>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 /// The encrypted buckets a new credential reads with its token, and the audit rows of each.
@@ -203,6 +205,8 @@ impl CreateUserOperation {
             stale: Vec::new(),
             pages: None,
             issuer: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -417,7 +421,9 @@ impl CreateUserOperation {
         ];
         if let Some(actor) = self.issuer {
             let action = AdminAuditAction::ServiceCredentialIssued;
-            let mut audit = AdminAuditRecord::new(action, actor, self.config.user_identity);
+            let audit_id = self.ids.mint(self.now_ms);
+            let mut audit =
+                AdminAuditRecord::new(audit_id, action, actor, self.config.user_identity);
             audit.group_id = Some(self.config.group_id);
             audit.session_id = Some(access.access_key.clone());
             writes.extend(audit.entries()?);
@@ -441,6 +447,14 @@ impl CreateUserOperation {
 impl Operation for CreateUserOperation {
     type Output = (String, Secret, UserAccess);
     type Error = CreateUserError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> CreateTurn {
         // Minted once, so a rerun after a conflict keeps the key id.
@@ -809,7 +823,6 @@ mod pure_tests {
     mod tokens {
         use super::*;
         use aruna_core::structs::storage::encryption::EncryptionMode;
-        use aruna_core::structs::storage::format::Compression;
 
         const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
 
@@ -818,17 +831,7 @@ mod pure_tests {
         }
 
         fn info() -> BucketInfo {
-            BucketInfo {
-                group_id: Ulid::from_bytes([3; 16]),
-                created_at: SystemTime::UNIX_EPOCH,
-                created_by: user(1),
-                cors_configuration: None,
-                storage_routing: Vec::new(),
-                placement_policies: Vec::new(),
-                placement_policy_generation: 0,
-                compression: Compression::Off,
-                distribution: None,
-            }
+            crate::tests::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
         }
 
         fn sealed() -> BucketEncryption {
