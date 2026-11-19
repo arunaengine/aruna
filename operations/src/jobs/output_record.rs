@@ -475,7 +475,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let destinations = vec![(net.node_id(), "ws".to_string(), "reports/a.txt".to_string())];
+        let destinations = [(net.node_id(), "ws".to_string(), "reports/a.txt".to_string())];
         let control = aruna_drivers::driver::drive(
             crate::jobs::store::job_calls::reserve_output_commits(
                 record.job_id,

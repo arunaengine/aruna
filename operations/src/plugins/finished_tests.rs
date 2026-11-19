@@ -29,14 +29,14 @@ use aruna_test_support::plugins::{path, ready};
 async fn finisher(fixture: &Fixture) -> PluginInstall {
     let manifest = json!({ "permissions": { "required": ["objects.copy"] },
         "triggers": { "job_finished": {} } });
-    let mut request = install_request(&fixture, None);
+    let mut request = install_request(fixture, None);
     request.version = Some(fixture.publish("0.3.0", "ce", manifest).await);
     let data = format!("/{}/g/{}/data/**", fixture.actor.realm_id, fixture.group_id);
     let grants = [("read", data.clone()), ("write", data)];
     request.grants = (grants.into_iter())
         .map(|(grant, pattern)| (grant.to_string(), vec![pattern]))
         .collect();
-    let install = install_as(&fixture, &request).await.unwrap();
+    let install = install_as(fixture, &request).await.unwrap();
     for bucket in ["in", "out"] {
         seed_bucket(
             &fixture.ctx,

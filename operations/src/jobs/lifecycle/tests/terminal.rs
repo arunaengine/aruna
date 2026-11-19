@@ -173,7 +173,7 @@ async fn publishes_terminal_success() {
     .await
     .expect("attempt intent commits");
     let executor = family.target.public();
-    let destinations = vec![(executor, "ws".to_string(), "out.txt".to_string())];
+    let destinations = [(executor, "ws".to_string(), "out.txt".to_string())];
     let control = aruna_drivers::driver::drive(
         crate::jobs::store::job_calls::reserve_output_commits(
             physical(),
