@@ -681,8 +681,7 @@ impl MetadataHandle {
             query @ MetadataTransportMessage::QueryDocument { .. } => {
                 Box::pin(async {
                     let result =
-                        super::super::forward::read::apply_document_query(context, peer, query)
-                            .await;
+                        super::forward_serve::apply_document_query(context, peer, query).await;
                     MetadataTransportMessage::DocumentQueryResults { result }
                 })
                 .await
@@ -815,7 +814,7 @@ impl MetadataHandle {
         let response = match message {
             forward @ MetadataTransportMessage::ForwardExportDocument { .. } => {
                 Box::pin(async {
-                    match super::super::forward::read::apply_forwarded_export(
+                    match super::forward_serve::apply_forwarded_export(
                         context,
                         peer,
                         forward,
@@ -848,7 +847,7 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardExportProfile { .. } => {
                 Box::pin(async {
-                    match super::super::forward::read::apply_forwarded_profile(
+                    match super::forward_serve::apply_forwarded_profile(
                         context,
                         peer,
                         forward,
@@ -921,8 +920,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardReadDocument { .. }
             | MetadataTransportMessage::ForwardValidationStatus { .. }) => {
                 Box::pin(async {
-                    super::super::forward::write::apply_forwarded_write(context, peer, forward)
-                        .await
+                    super::forward_serve::apply_forwarded_write(context, peer, forward).await
                 })
                 .await
             }
@@ -1007,16 +1005,12 @@ impl MetadataHandle {
                     .unwrap_or_else(|error| reject(error.to_string()))
             }
             pull @ MetadataTransportMessage::ForwardSyncPull { .. } => {
-                Box::pin(async {
-                    super::pull_serve::serve_sync_pull(context, peer, pull).await
-                })
-                .await
+                Box::pin(async { super::pull_serve::serve_sync_pull(context, peer, pull).await })
+                    .await
             }
             poll @ MetadataTransportMessage::ForwardPullStatus { .. } => {
-                Box::pin(async {
-                    super::pull_serve::serve_pull_status(context, peer, poll).await
-                })
-                .await
+                Box::pin(async { super::pull_serve::serve_pull_status(context, peer, poll).await })
+                    .await
             }
             listing @ MetadataTransportMessage::ForwardListVersions { .. } => {
                 Box::pin(async {
