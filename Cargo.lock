@@ -989,6 +989,7 @@ dependencies = [
  "crossfire",
  "fjall",
  "hex",
+ "lru",
  "postcard",
  "tantivy",
  "tempfile",
