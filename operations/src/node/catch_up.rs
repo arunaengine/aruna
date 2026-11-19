@@ -7,13 +7,14 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{CatchUpEffect, Effect, NetEffect};
 use aruna_core::events::{CatchUpEvent, Event, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::COMPUTE_DEPARTURE_KEYSPACE;
-use aruna_core::node_state::LAST_CONTACT_KEY;
-use aruna_core::operation::Operation;
+use aruna_core::node_state::{DISCARD_KEY, LAST_CONTACT_KEY};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -22,6 +23,8 @@ use tracing::{debug, warn};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::fence::LiftFenceOperation;
+use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::held::HeldReservations;
 
 /// Spacing of the passes after the node caught up; each one refreshes the last contact.
 pub const CATCH_UP_REFRESH: Duration = Duration::from_secs(300);
@@ -38,6 +41,9 @@ pub struct CatchUpOutcome {
 
 #[derive(Debug, PartialEq)]
 enum CatchUpStep {
+    /// The marker of an unfinished discard, then the reservations it still holds.
+    Marker,
+    Held,
     Config,
     Round(usize),
     Applied,
@@ -62,6 +68,8 @@ pub struct CatchUpOperation {
     /// Each counted round's target with the management node that answered it.
     targets: Vec<(NodeId, irokle::ActorClock)>,
     unanswered: Vec<NodeId>,
+    /// An unfinished discard: the contact is refreshed only with the marker's deletion.
+    marker: bool,
     step: CatchUpStep,
 }
 
@@ -74,7 +82,8 @@ impl CatchUpOperation {
             management: Vec::new(),
             targets: Vec::new(),
             unanswered: Vec::new(),
-            step: CatchUpStep::Config,
+            marker: false,
+            step: CatchUpStep::Marker,
         }
     }
 
@@ -169,13 +178,8 @@ impl CatchUpOperation {
 
     fn contact(&mut self) -> CatchUpNext {
         self.step = CatchUpStep::Contact;
-        let value = Value::from(self.now_ms.to_be_bytes().as_slice());
-        let row = (
-            COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            Key::from(LAST_CONTACT_KEY),
-            value,
-        );
-        Ok(Next::Call(IoCall::Write(vec![row])))
+        let refresh = RefreshContactOperation::new(self.now_ms, self.marker);
+        Ok(Next::Call(IoCall::child(refresh)))
     }
 
     fn finish(&mut self, caught_up: bool) -> CatchUpNext {
@@ -211,11 +215,36 @@ impl Operation for CatchUpOperation {
     }
 
     fn first(&mut self) -> CatchUpNext {
-        self.read_config(CatchUpStep::Config)
+        let marker = (
+            COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            Key::from(DISCARD_KEY),
+        );
+        Ok(Next::Call(IoCall::Read(vec![marker])))
     }
 
     fn next(&mut self, result: IoResult) -> CatchUpNext {
         match std::mem::replace(&mut self.step, CatchUpStep::Contact) {
+            CatchUpStep::Marker => {
+                self.marker = result.value()?.is_some();
+                match self.marker {
+                    true => {
+                        self.step = CatchUpStep::Held;
+                        Ok(Next::Call(IoCall::child(HeldReservations::all())))
+                    }
+                    false => self.read_config(CatchUpStep::Config),
+                }
+            }
+            // While an unfinished discard still holds reservations, nothing is refreshed or lifted.
+            CatchUpStep::Held => {
+                match result.child::<Vec<JobReservationRecord>, LifecycleError>()? {
+                    Ok(held) if held.is_empty() => self.read_config(CatchUpStep::Config),
+                    Ok(_) => self.finish(false),
+                    Err(error) => {
+                        warn!(error = %error, "Discard state was not read; the catch-up waits");
+                        self.finish(false)
+                    }
+                }
+            }
             step @ (CatchUpStep::Config | CatchUpStep::Reload) => {
                 let config = match result.child::<RealmConfigDocument, GetConfigError>()? {
                     Ok(config) => config,
@@ -243,7 +272,7 @@ impl Operation for CatchUpOperation {
                 }
             },
             CatchUpStep::Contact => {
-                result.done()?;
+                result.child::<(), IoError>()??;
                 if !self.unanswered.is_empty() {
                     debug!(unanswered = ?self.unanswered, "Caught up without every management node");
                 }
@@ -275,6 +304,57 @@ fn management_nodes(config: &RealmConfigDocument, local: NodeId) -> Vec<NodeId> 
         .filter_map(|node| NodeId::from_str(&node.node_id).ok())
         .filter(|node_id| *node_id != local)
         .collect()
+}
+
+/// Writes the last contact, and deletes the marker of an unfinished discard in the same
+/// transaction.
+#[derive(Debug, PartialEq)]
+pub struct RefreshContactOperation {
+    now_ms: u64,
+    marker: bool,
+    deleting: bool,
+}
+
+impl RefreshContactOperation {
+    pub fn new(now_ms: u64, marker: bool) -> Self {
+        Self {
+            now_ms,
+            marker,
+            deleting: false,
+        }
+    }
+}
+
+impl Operation for RefreshContactOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let value = Value::from(self.now_ms.to_be_bytes().as_slice());
+        let row = (
+            COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            Key::from(LAST_CONTACT_KEY),
+            value,
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        result.done()?;
+        if !self.marker || self.deleting {
+            return Ok(Next::Done(()));
+        }
+        self.deleting = true;
+        let marker = (
+            COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            Key::from(DISCARD_KEY),
+        );
+        Ok(Next::Call(IoCall::Delete(vec![marker])))
+    }
 }
 
 /// When the next pass is due after `outcome`.

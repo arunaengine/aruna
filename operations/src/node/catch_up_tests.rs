@@ -51,19 +51,23 @@ fn config_read() -> CatchUpNext {
 }
 
 fn contact() -> CatchUpNext {
-    let value = Value::from(7_000u64.to_be_bytes().as_slice());
-    let row = (
+    let refresh = RefreshContactOperation::new(7_000, false);
+    Ok(Next::Call(IoCall::child(refresh)))
+}
+
+fn marker_read() -> CatchUpNext {
+    let marker = (
         COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-        Key::from(LAST_CONTACT_KEY),
-        value,
+        Key::from(DISCARD_KEY),
     );
-    Ok(Next::Call(IoCall::Write(vec![row])))
+    Ok(Next::Call(IoCall::Read(vec![marker])))
 }
 
 fn started() -> CatchUpOperation {
     let mut operation = CatchUpOperation::new(node(1), REALM);
     operation.stamp(7_000);
-    assert_eq!(operation.first(), config_read());
+    assert_eq!(operation.first(), marker_read());
+    assert_eq!(operation.next(IoResult::Values(vec![None])), config_read());
     operation
 }
 
@@ -103,7 +107,8 @@ fn counts_answering_managers() {
         contact()
     );
     let lift = IoCall::child(LiftFenceOperation::new(node(1), REALM));
-    assert_eq!(operation.next(IoResult::Done), Ok(Next::Call(lift)));
+    let refreshed = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(())));
+    assert_eq!(operation.next(refreshed), Ok(Next::Call(lift)));
     let lifted = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(true)));
     assert_eq!(operation.next(lifted), outcome(true, vec![node(3)]));
 }
@@ -173,4 +178,69 @@ fn spaces_next_pass() {
     });
     assert_eq!(next_pass(&waiting), CATCH_UP_RETRY);
     assert_eq!(next_pass(&Err(IoError::Unfinished)), CATCH_UP_RETRY);
+}
+
+// While an unfinished discard still holds reservations nothing is refreshed; once none is left
+// the contact refresh also deletes the marker.
+#[test]
+fn discard_marker_waits() {
+    let marked = || {
+        let mut operation = CatchUpOperation::new(node(1), REALM);
+        operation.stamp(7_000);
+        operation.first().unwrap();
+        let marker = IoResult::Values(vec![Some(Value::from(&[][..]))]);
+        let held = IoCall::child(HeldReservations::all());
+        assert_eq!(operation.next(marker), Ok(Next::Call(held)));
+        operation
+    };
+    let job_id = aruna_core::structs::execution::job::JobId::from_bytes([8; 16]);
+    let reservation = JobReservationRecord {
+        execution_id: ulid::Ulid::from_bytes([7; 16]),
+        job_id,
+        logical_job_id: job_id,
+        resources: aruna_core::structs::execution::job::EffectiveResources {
+            cpu_cores: 1,
+            ram_bytes: 0,
+            disk_bytes: 0,
+            max_walltime_ms: 0,
+            preemptible: false,
+        },
+        created_at_ms: 1,
+        subject_generation: 0,
+        subject_digest: [0u8; 32],
+        config_clock: Default::default(),
+        backend: "default".to_string(),
+        config_generation: 0,
+        config_digest: [0; 32],
+    };
+    let holding = IoResult::Child(ChildOutcome::new(Ok::<_, LifecycleError>(vec![
+        reservation,
+    ])));
+    assert_eq!(marked().next(holding), outcome(false, Vec::new()));
+    let mut released = marked();
+    let none = IoResult::Child(ChildOutcome::new(Ok::<_, LifecycleError>(Vec::new())));
+    assert_eq!(released.next(none), config_read());
+    let refresh = IoCall::child(RefreshContactOperation::new(7_000, true));
+    let alone = config(RealmNodeKind::Management, &[]);
+    assert_eq!(released.next(alone), Ok(Next::Call(refresh)));
+}
+
+// The refresh writes the contact and deletes the marker in one transaction.
+#[test]
+fn refresh_clears_marker() {
+    let mut refresh = RefreshContactOperation::new(7_000, true);
+    assert_eq!(refresh.transaction(), TransactionMode::Write);
+    assert!(matches!(refresh.first(), Ok(Next::Call(IoCall::Write(_)))));
+    let marker = (
+        COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+        Key::from(DISCARD_KEY),
+    );
+    assert_eq!(
+        refresh.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Delete(vec![marker])))
+    );
+    assert_eq!(refresh.next(IoResult::Done), Ok(Next::Done(())));
+    let mut plain = RefreshContactOperation::new(7_000, false);
+    plain.first().unwrap();
+    assert_eq!(plain.next(IoResult::Done), Ok(Next::Done(())));
 }
