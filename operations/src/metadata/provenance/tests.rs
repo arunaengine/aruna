@@ -22,16 +22,30 @@ fn copied(from: &str) -> Value {
     json!({ "created_at": "2026-10-27T10:00:00Z", "origin": { "kind": "copy", "from": from } })
 }
 
-/// The root metadata as the export writes it.
-fn root(built: ProvenanceCrate) -> Value {
-    let mut out = Vec::new();
-    built.write_root(&mut out, &|| false).unwrap();
-    serde_json::from_slice(&out).unwrap()
+/// A crate about `start` whose rows are all held in memory.
+fn built(start: &str, published: &str) -> ProvenanceCrate {
+    let state = ExportState::new(Ulid::nil(), start, published);
+    ProvenanceCrate::new(state, Workspace::complete(Ulid::nil()))
+}
+
+/// The root metadata as the export pages it: the head, the parts and the entities in order.
+fn root(mut built: ProvenanceCrate) -> Value {
+    let mut out = built.root_head();
+    let (_, rows) = built.into_parts();
+    for (index, (key, _)) in rows.rows_of(workspace::PART).into_iter().enumerate() {
+        out.push_str(&part_piece(index == 0, workspace::row_name(&key)));
+    }
+    out.push_str(PARTS_END);
+    for (_, value) in rows.rows_of(workspace::ENTITY) {
+        out.push_str(&entity_piece(&value).unwrap_or_default());
+    }
+    out.push_str(GRAPH_END);
+    serde_json::from_slice(out.as_bytes()).unwrap()
 }
 
 /// Reads hops the way the route does, from `answers` by asked id; a missing answer is hidden.
 fn walk(start: &str, answers: &BTreeMap<String, Value>) -> (Value, Vec<String>, usize) {
-    let mut built = ProvenanceCrate::new(start, "2026-10-27T12:00:00Z").unwrap();
+    let mut built = built(start, "2026-10-27T12:00:00Z");
     let first = built.version_start();
     built.push([first]);
     let (mut files, mut reads) = (Vec::new(), 0);
@@ -146,7 +160,7 @@ fn hidden_hops_private() {
     assert!(text.contains("#hidden-1"));
     assert!(!text.contains("x/y.txt") && !text.contains(&arn(8, "x/y.txt")));
 
-    let mut built = ProvenanceCrate::new(&output, "2026-10-27T12:00:00Z").unwrap();
+    let mut built = built(&output, "2026-10-27T12:00:00Z");
     let run = Hop {
         target: Target::Run(run_id),
         from: output.clone(),
@@ -179,7 +193,7 @@ fn stored_dataset_parts() {
         { "@id": "#a", "@type": "MediaObject", "contentUrl": [exact, "s3://bucket/in.txt"] },
         { "@id": "#b", "@type": "MediaObject", "contentUrl": "s3://bucket/old.txt" }
     ]});
-    let mut built = ProvenanceCrate::new("dataset", "2026-10-27T12:00:00Z").unwrap();
+    let mut built = built("dataset", "2026-10-27T12:00:00Z");
     let (hops, file) = built.dataset(&document);
     assert_eq!(hops.len(), 1);
     assert_eq!(hops[0].target, Target::Version(exact));
@@ -218,10 +232,9 @@ fn run_results_linked() {
 }
 
 #[test]
-fn spooled_state_streams() {
-    // The working state lives on disk: links come back in the order queued, every entity is
-    // written into the root, and the working folder is gone once the crate is written.
-    let mut built = ProvenanceCrate::new("start", "2026-10-27T12:00:00Z").unwrap();
+fn queued_state_streams() {
+    // Links come back in the order queued and every entity is written into the root.
+    let mut built = built("start", "2026-10-27T12:00:00Z");
     let hops: Vec<_> = (0..500)
         .map(|index| Hop {
             target: Target::Version(arn(1, &format!("f{index}"))),
@@ -237,10 +250,7 @@ fn spooled_state_streams() {
         popped.push(hop);
     }
     assert_eq!(popped, hops);
-    let folder = built.spool.path.clone();
-    assert!(folder.exists());
     let document = root(built);
-    assert!(!folder.exists());
     let graph = document["@graph"].as_array().unwrap();
     let hidden = graph
         .iter()
@@ -251,53 +261,11 @@ fn spooled_state_streams() {
 }
 
 #[test]
-#[cfg(unix)]
-fn scratch_stays_private() {
-    // Export working state lives in a folder only this user may open, in files only it may read.
-    use std::os::unix::fs::PermissionsExt;
-    let dir = scratch_dir().unwrap();
-    let mode =
-        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(&dir), 0o700);
-    let path = dir.join(format!("{}.json", scratch_name()));
-    drop(scratch_file(&path).unwrap());
-    assert_eq!(mode(&path), 0o600);
-    std::fs::remove_file(&path).unwrap();
-    let built = ProvenanceCrate::new("start", "2026-10-28T00:00:00Z").unwrap();
-    assert!(built.spool.path.starts_with(&dir));
-}
-
-#[test]
-#[cfg(unix)]
-fn crashed_scratch_reclaimed() {
-    // Entries of exports whose process is gone are removed before the next export; entries of
-    // running processes and anything else stay.
-    let dir = scratch_dir().unwrap();
-    let mut child = std::process::Command::new("true").spawn().unwrap();
-    let gone = child.id();
-    child.wait().unwrap();
-    let crashed = dir.join(format!("{gone}-{}", Ulid::generate()));
-    std::fs::create_dir_all(crashed.join("journal")).unwrap();
-    let crashed_root = dir.join(format!("{gone}-{}.json", Ulid::generate()));
-    std::fs::write(&crashed_root, b"{}").unwrap();
-    let live = dir.join(scratch_name());
-    std::fs::create_dir(&live).unwrap();
-    let other = dir.join(format!("{gone}-not-an-id"));
-    std::fs::write(&other, b"").unwrap();
-
-    scratch_dir().unwrap();
-    assert!(!crashed.exists() && !crashed_root.exists());
-    assert!(live.exists() && other.exists());
-    std::fs::remove_dir(&live).unwrap();
-    std::fs::remove_file(&other).unwrap();
-}
-
-#[test]
 fn unwritten_run_status() {
     // A run whose crate was denied says so instead of reading as not visible.
     let output = arn(1, "out.txt");
     let run_id = Ulid::from_bytes([5; 16]).to_string();
-    let mut built = ProvenanceCrate::new(&output, "2026-10-27T12:00:00Z").unwrap();
+    let mut built = built(&output, "2026-10-27T12:00:00Z");
     let run = Hop {
         target: Target::Run(run_id.clone()),
         from: output.clone(),
@@ -312,7 +280,7 @@ fn unwritten_run_status() {
     assert_eq!(entity["description"], "metadata write access denied");
 
     // A crate that is still being written says so, not that the record is hidden.
-    let mut built = ProvenanceCrate::new(&output, "2026-10-27T12:00:00Z").unwrap();
+    let mut built = built(&output, "2026-10-27T12:00:00Z");
     assert!(built.unwritten(&run, "pending", None));
     let document = root(built);
     let entity = node(&document, &format!("#run-{run_id}"));
@@ -393,4 +361,124 @@ fn database_from_dataset() {
         database["identifier"][0],
         "https://doi.org/10.5281/zenodo.1"
     );
+}
+
+fn spool_row(key: Vec<u8>) -> (String, aruna_core::types::Key) {
+    let space = aruna_core::keyspaces::PROVENANCE_SPOOL_KEYSPACE.to_string();
+    (space, aruna_core::types::Key::from(key))
+}
+
+#[test]
+fn step_loads_rows() {
+    // A step pages the queue and reads the rows it missed before it answers.
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
+    let export = Ulid::from_bytes([9; 16]);
+    let start = arn(1, "start.txt");
+    let state = ExportState::new(export, &start, "2026-10-27T12:00:00Z");
+    let mut step = ExportStepOperation::new(state, ExportAnswer::Begin);
+    let Ok(Next::Call(IoCall::Page { prefix, after, .. })) = step.first() else {
+        panic!("expected the queue head first");
+    };
+    assert_eq!(
+        prefix.to_vec(),
+        workspace::prefix(export, Some(workspace::QUEUE))
+    );
+    assert_eq!(after, None);
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    let label = workspace::row_key(export, workspace::LABEL, start.as_bytes());
+    let read = IoCall::Read(vec![spool_row(label)]);
+    assert_eq!(step.next(empty), Ok(Next::Call(read)));
+    assert_eq!(
+        step.next(IoResult::Values(vec![None])),
+        Ok(Next::Call(IoCall::Write(Vec::new())))
+    );
+    let queued = workspace::row_key(export, workspace::QUEUE, &1u64.to_be_bytes());
+    let delete = IoCall::Delete(vec![spool_row(queued)]);
+    assert_eq!(step.next(IoResult::Done), Ok(Next::Call(delete)));
+    let Ok(Next::Done(outcome)) = step.next(IoResult::Done) else {
+        panic!("expected the step's outcome");
+    };
+    let first = Hop {
+        target: Target::Version(start),
+        from: "./".to_string(),
+        property: "mainEntity",
+        digest: None,
+    };
+    assert_eq!(outcome.ask, ExportAsk::Hop(first));
+    assert!(outcome.files.is_empty());
+}
+
+#[test]
+fn revoked_hop_stops() {
+    // A credential that ended before a read stops the walk and asks for the root.
+    let mut built = built("start", "2026-10-27T12:00:00Z");
+    let hop = Hop {
+        target: Target::Version("start".to_string()),
+        from: "./".to_string(),
+        property: "mainEntity",
+        digest: None,
+    };
+    built.state().awaiting = Some(Awaiting::Hop(hop));
+    let (files, ask) = export::step(&mut built, ExportAnswer::Revoked);
+    assert!(files.is_empty());
+    assert_eq!(ask, ExportAsk::Root);
+    let document = root(built);
+    assert_eq!(
+        node(&document, "./")["creativeWorkStatus"],
+        json!("Incomplete: the token expired or was revoked")
+    );
+}
+
+#[test]
+fn root_parts_close() {
+    // The root pages its parts one at a time and closes the list after the last.
+    use aruna_core::calls::{IoResult, Next};
+    use aruna_core::operation::Operation;
+    let state = ExportState::new(Ulid::nil(), "start", "2026-10-27T12:00:00Z");
+    let mut page = RootPageOperation::new(state, RootCursor::Parts { after: None });
+    page.first().unwrap();
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    let closed = (
+        PARTS_END.to_string(),
+        Some(RootCursor::Entities { after: None }),
+    );
+    assert_eq!(page.next(empty), Ok(Next::Done(closed)));
+}
+
+#[test]
+fn forget_deletes_pages() {
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
+    let state = ExportState::new(Ulid::from_bytes([3; 16]), "start", "2026-10-27T12:00:00Z");
+    let mut forget = ForgetSpoolOperation::export(&state);
+    assert!(matches!(
+        forget.first(),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
+    let key = workspace::row_key(state.export(), workspace::PART, b"runs/");
+    let rows = IoResult::Page {
+        rows: vec![(
+            spool_row(key.clone()).1,
+            aruna_core::types::Value::from(Vec::new()),
+        )],
+        next: None,
+    };
+    let delete = IoCall::Delete(vec![spool_row(key)]);
+    assert_eq!(forget.next(rows), Ok(Next::Call(delete)));
+    assert!(matches!(
+        forget.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    assert_eq!(forget.next(empty), Ok(Next::Done(())));
 }
