@@ -37,6 +37,7 @@ use crate::jobs::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
 use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::submit::schedule_drain_effect;
+use crate::plugins::screen::tagged;
 
 fn unavailable(reason: impl std::fmt::Display) -> JobRouteError {
     JobRouteError::Unavailable(reason.to_string())
@@ -499,6 +500,12 @@ struct CancelTarget {
     spec: LogicalJobSpec,
 }
 
+/// Whether `from` may speak for a spec's submitter. A plugin task's account has no credential
+/// of its own, so only its receiver, the ingress that admission checked, speaks for it.
+pub(crate) fn submitter_from(spec: &LogicalJobSpec, from: NodeId) -> bool {
+    tagged(&spec.payload).is_none() || from == spec.ingress_node_id
+}
+
 /// Cancels one external job through its family; `None` means the alias names no family here, so
 /// the caller keeps its ordinary local cancellation. Every known active execution is asked to
 /// stop; a partitioned one may still finish and stays visible as a late completion.
@@ -508,6 +515,8 @@ pub struct CancelFamilyOperation {
     job_id: JobId,
     token: Option<AuthToken>,
     serving: ServingNode,
+    /// The node that asked; `None` for a caller on this node.
+    peer: Option<NodeId>,
     now_ms: u64,
     step: CancelStep,
 }
@@ -527,9 +536,16 @@ impl CancelFamilyOperation {
             job_id,
             token,
             serving,
+            peer: None,
             now_ms,
             step: CancelStep::Alias,
         }
+    }
+
+    /// A cancel another node asked for.
+    pub fn from_peer(mut self, peer: Option<NodeId>) -> Self {
+        self.peer = peer;
+        self
     }
 
     fn projected(&mut self, family: JobFamilyId, read: Option<FamilyView>) -> CancelNext {
@@ -548,10 +564,14 @@ impl CancelFamilyOperation {
         });
         // The submitter is checked by every holder again; a group admin's permission is
         // checked here and the signature is that statement.
-        if self.auth.user_id == target.spec.created_by {
-            return self.publish(target, CancelAuthority::Submitter);
-        }
         let (local, _) = self.serving.ok_or(JobRouteError::Forbidden)?;
+        if self.auth.user_id == target.spec.created_by {
+            // A plugin task's account speaks only through its receiver, never as a group writer.
+            return match submitter_from(&target.spec, self.peer.unwrap_or(local)) {
+                true => self.publish(target, CancelAuthority::Submitter),
+                false => Err(JobRouteError::Forbidden),
+            };
+        }
         let check = GroupWriteOperation::new(&self.auth, target.spec.group_id, local);
         self.step = CancelStep::Authority(target);
         Ok(Next::Call(IoCall::child(check)))
@@ -813,6 +833,17 @@ mod tests {
         cancel.first().expect("the alias is read");
         let none = child(Ok::<Option<JobFamilyId>, JobRouteError>(None));
         assert_eq!(cancel.next(none), Ok(Next::Done(None)));
+    }
+
+    // A plugin task's account cancels only through the receiver that admission checked.
+    #[test]
+    fn task_needs_receiver() {
+        let mut spec = Family::new([1; 32]).spec();
+        assert!(submitter_from(&spec, node(9)));
+        let work = "aruna-engine.org/plugin-work".to_string();
+        spec.payload.tags.insert(work, Ulid::nil().to_string());
+        assert!(submitter_from(&spec, spec.ingress_node_id));
+        assert!(!submitter_from(&spec, node(9)));
     }
 
     // Only the submitter may delete the record of a run.
