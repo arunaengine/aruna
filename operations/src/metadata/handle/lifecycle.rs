@@ -395,6 +395,7 @@ pub(crate) async fn prune_if_deleted(
         .inner
         .visibility_cache
         .store_lifecycle_deleted(graph_iri.clone(), true);
+    graph.store_lifecycle(graph_iri.clone(), true);
     if !graph.contains_graph(graph_iri.clone()).await? {
         return Ok(true);
     }
@@ -484,7 +485,7 @@ pub(super) async fn metadata_graph_deleted(
     context: &DriverContext,
     graph_iri: &str,
 ) -> Result<bool, MetadataError> {
-    let (metadata, _) = handles(context)?;
+    let (metadata, graph) = handles(context)?;
     let inner = &metadata.inner;
     if let Some((true, _)) = inner.visibility_cache.lifecycle_deleted_any(graph_iri) {
         return Ok(true);
@@ -494,6 +495,7 @@ pub(super) async fn metadata_graph_deleted(
     inner
         .visibility_cache
         .store_lifecycle_deleted(graph_iri.to_string(), deleted);
+    graph.store_lifecycle(graph_iri.to_string(), deleted);
     Ok(deleted)
 }
 
