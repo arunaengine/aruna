@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
+use super::offer::ExecutorOffer;
 use super::session::EndReason;
 use super::{
     AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, GrantedResources,
@@ -26,6 +27,8 @@ pub enum ComputeEffect {
     },
     /// What backend `backend` offers.
     Facts { backend: String },
+    /// What every backend offers, in name order.
+    Offers,
     /// Backend `backend`, while this node still advertises the exact site a launch was
     /// receipted under.
     Fenced {
@@ -170,6 +173,7 @@ pub enum ComputeAnswer {
     Stopped,
     Selected(Option<BackendFacts>),
     Facts(BackendFacts),
+    Offers(Vec<ExecutorOffer>),
     Fenced(Result<BackendFacts, BackendError>),
     Endpoint(WorkspaceAddress),
     Image(Result<String, BackendError>),

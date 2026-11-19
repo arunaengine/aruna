@@ -150,17 +150,6 @@ impl ExecutorRegistry {
         self.backends.get(name).map(Registered::caps)
     }
 
-    /// Every backend name, in the name order local selection walks.
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.backends.keys().map(String::as_str)
-    }
-
-    /// The suitability backend `name` filters by: its written values, else its kind's defaults.
-    pub fn suitability_of(&self, name: &str) -> Option<WorkloadSuitability> {
-        let backend = self.named(name)?;
-        Some(suitability(backend.as_ref(), &self.caps(name)?))
-    }
-
     /// The backend registered under `name`.
     pub fn named(&self, name: &str) -> Option<&Arc<dyn ExecutorBackend>> {
         self.backends.get(name).map(|entry| &entry.backend)
@@ -692,7 +681,7 @@ mod tests {
         );
         assert!(caps.file_staging, "adapter capabilities stay");
         assert_eq!(
-            written.suitability_of("lab").unwrap().sessions,
+            written.offers()[0].suitability().sessions,
             Suitability::Refused
         );
         let advertised = &written.capabilities(&subject(), false).unwrap()[0];

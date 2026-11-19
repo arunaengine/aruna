@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use super::backend::{DeclaredCapabilities, WorkloadSuitability};
-use super::{ExecutorCapability, ResourceEnvelope};
+use super::{ExecutorCapability, ExecutorKind, ResourceEnvelope};
 use crate::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
 use crate::structs::storage::node_info::{NODE_LABEL_KEY, stamp_location};
 use crate::types::GroupId;
@@ -114,6 +114,29 @@ impl ExecutorOffer {
     /// Where the backend's attempts live.
     pub fn home(&self) -> [u8; 32] {
         self.home
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn caps(&self) -> &BackendCaps {
+        &self.caps
+    }
+
+    /// The workload kinds the backend takes: its written values, else its kind's defaults.
+    pub fn suitability(&self) -> WorkloadSuitability {
+        let kind = ExecutorKind::from_wire(&self.kind);
+        (self.caps.suitability).unwrap_or_else(|| WorkloadSuitability::of_kind(&kind))
+    }
+
+    /// The digest over the home and everything placement and admission read of the backend.
+    pub fn config_digest(&self) -> [u8; 32] {
+        config_digest(&self.home, &self.caps, self.suitability())
     }
 
     /// The advertisement of this backend under `subject`, at the site it actually runs on.

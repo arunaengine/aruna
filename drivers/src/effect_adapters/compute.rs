@@ -248,6 +248,7 @@ pub(super) async fn dispatch_compute(
             Some(named) => ComputeAnswer::Facts(facts(registry, (&backend, named))),
             None => ComputeAnswer::NoBackend,
         },
+        ComputeEffect::Offers => ComputeAnswer::Offers(registry.offers()),
         ComputeEffect::Fenced {
             backend,
             subject,
