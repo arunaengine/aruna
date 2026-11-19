@@ -410,3 +410,68 @@ fn audit_needs_caller() {
         Err(MetadataReadError::Unauthorized)
     );
 }
+
+#[test]
+fn held_read_needs_holder() {
+    // A record read for a document this node does not hold answers unavailable.
+    use super::held::{HeldAsk, HeldReadOperation};
+    let document_id = ulid::Ulid::from_bytes([5u8; 16]);
+    let read = (None, digest(1));
+    let mut held = HeldReadOperation::new((node(2), local()), read, document_id, HeldAsk::Record);
+    assert!(runs_child(held.first()));
+    assert!(runs_child(held.next(child(config(1)))));
+    let caller: Result<Option<AuthContext>, MetadataReadError> = Ok(None);
+    assert_eq!(
+        held.next(child(caller)),
+        Ok(Next::Done(MetadataTransportMessage::ForwardedRead {
+            result: Err(MetadataReadError::Unavailable)
+        }))
+    );
+}
+
+#[test]
+fn write_needs_digest() {
+    use super::writes::WriteServeOperation;
+    let request = MetadataTransportMessage::ForwardDeleteDocument {
+        auth_token: None,
+        config_digest: digest(1),
+        document_id: ulid::Ulid::from_bytes([5u8; 16]),
+    };
+    let mut write = WriteServeOperation::new((node(2), local()), digest(1), request);
+    assert!(runs_child(write.first()));
+    assert_eq!(
+        write.next(child(config(2))),
+        Ok(Next::Done(
+            MetadataTransportMessage::ForwardedWriteUnavailable
+        ))
+    );
+}
+
+#[test]
+fn create_needs_path() {
+    // A create whose path is only slashes is refused before any write check.
+    use super::writes::WriteServeOperation;
+    use crate::forward::authorize::ForwardAuthError;
+    use crate::metadata::create_document::CreateDocumentPayload;
+    let request = MetadataTransportMessage::ForwardCreateDocument {
+        auth_token: None,
+        config_digest: digest(1),
+        group_id: ulid::Ulid::from_bytes([3u8; 16]),
+        document_id: ulid::Ulid::from_bytes([5u8; 16]),
+        document_path: "/".to_string(),
+        public: false,
+        payload: CreateDocumentPayload::RoCrate {
+            jsonld: "{}".to_string(),
+        },
+        commit_message: None,
+    };
+    let mut write = WriteServeOperation::new((node(2), local()), digest(1), request);
+    write.first().unwrap();
+    assert!(runs_child(write.next(child(config(1)))));
+    let caller: Result<AuthContext, ForwardAuthError> = Ok(caller_of(RealmId([1u8; 32])));
+    let refused = "forwarded metadata create has an empty document path".to_string();
+    assert_eq!(
+        write.next(child(caller)),
+        Ok(Next::Done(MetadataTransportMessage::Reject(refused)))
+    );
+}

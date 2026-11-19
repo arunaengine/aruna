@@ -14,7 +14,6 @@ use aruna_storage::key_index::RangeIndexes;
 use super::protocol::METADATA_IO_TIMEOUT;
 
 mod effects;
-mod forward_serve;
 pub(crate) mod frames;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
 pub use self::pull_serve::{accept_pull, pull_status};

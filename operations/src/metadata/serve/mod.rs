@@ -4,9 +4,11 @@
 
 mod exports;
 mod forwards;
+mod held;
 mod mirror;
 mod paths;
 mod reads;
+mod writes;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -18,9 +20,11 @@ use thiserror::Error;
 
 use self::exports::{ExportAsk, ExportServeOperation};
 use self::forwards::{Forward, ForwardReply, forward_call};
+use self::held::{HeldAsk, HeldReadOperation};
 use self::mirror::{MirrorRequest, MirrorServeOperation};
 use self::paths::{PathAsk, PathReadOperation};
 use self::reads::{CallerReadOperation, ReadReply};
+use self::writes::WriteServeOperation;
 use crate::distribution::imports::{HandedImport, StagingSpecOperation};
 use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
@@ -61,9 +65,8 @@ pub enum ServeError {
 /// The child a request waits for, which names the reply its outcome becomes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Waiting {
-    Read,
-    Path,
-    Mirror,
+    /// A child that answers the reply itself.
+    Reply,
     Export,
     Forward(ForwardReply),
     Spec,
@@ -117,9 +120,7 @@ impl Waiting {
     fn answer(self, result: IoResult) -> Result<ServedReply, ServeError> {
         let reply = match self {
             Self::Export => return Ok(result.child::<ServedReply, IoError>()??),
-            Self::Read | Self::Path | Self::Mirror => {
-                result.child::<MetadataTransportMessage, IoError>()??
-            }
+            Self::Reply => result.child::<MetadataTransportMessage, IoError>()??,
             Self::Spec => MetadataTransportMessage::StagingSpecResult {
                 result: (result.child::<HandedImport, MetadataReadError>()?).map(Box::new),
             },
@@ -166,12 +167,12 @@ impl ServeRequestOperation {
 
     fn path(&mut self, token: Option<AuthToken>, digest: [u8; 32], ask: PathAsk) -> ServeTurn {
         let read = PathReadOperation::new((self.peer, self.node.clone()), token, digest, ask);
-        self.call(Waiting::Path, IoCall::child(read))
+        self.call(Waiting::Reply, IoCall::child(read))
     }
 
     fn mirror(&mut self, request: MirrorRequest) -> ServeTurn {
         let mirror = MirrorServeOperation::new(self.peer, self.node.local, request);
-        self.call(Waiting::Mirror, IoCall::child(mirror))
+        self.call(Waiting::Reply, IoCall::child(mirror))
     }
 
     fn export(&mut self, digest: [u8; 32], ask: ExportAsk) -> ServeTurn {
@@ -203,7 +204,7 @@ impl Operation for ServeRequestOperation {
         })?;
         if let Some(reply) = ReadReply::of(&message) {
             let read = CallerReadOperation::new(peer, self.node.clone(), message, reply);
-            return self.call(Waiting::Read, IoCall::child(read));
+            return self.call(Waiting::Reply, IoCall::child(read));
         }
         let local = (self.node.local, self.node.here.as_ref());
         let message = match forward_call(peer, local, message) {
@@ -212,6 +213,35 @@ impl Operation for ServeRequestOperation {
             Err(message) => message,
         };
         match message {
+            MetadataTransportMessage::ForwardReadDocument {
+                auth_token,
+                config_digest,
+                document_id,
+            } => {
+                let peer = (self.peer, self.node.clone());
+                let read = (auth_token, config_digest);
+                let held = HeldReadOperation::new(peer, read, document_id, HeldAsk::Record);
+                self.call(Waiting::Reply, IoCall::child(held))
+            }
+            MetadataTransportMessage::ForwardValidationStatus {
+                auth_token,
+                config_digest,
+                document_id,
+                revalidate,
+            } => {
+                let peer = (self.peer, self.node.clone());
+                let read = (auth_token, config_digest);
+                let ask = HeldAsk::Status { revalidate };
+                let held = HeldReadOperation::new(peer, read, document_id, ask);
+                self.call(Waiting::Reply, IoCall::child(held))
+            }
+            write @ (MetadataTransportMessage::ForwardCreateDocument { config_digest, .. }
+            | MetadataTransportMessage::ForwardUpdateDocument { config_digest, .. }
+            | MetadataTransportMessage::ForwardDeleteDocument { config_digest, .. }) => {
+                let write =
+                    WriteServeOperation::new((self.peer, self.node.clone()), config_digest, write);
+                self.call(Waiting::Reply, IoCall::child(write))
+            }
             MetadataTransportMessage::CreateSyncMirror {
                 auth_token,
                 source_group_id,

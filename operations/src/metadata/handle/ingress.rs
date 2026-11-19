@@ -30,16 +30,6 @@ impl MetadataHandle {
         message: MetadataTransportMessage,
     ) -> MetadataTransportMessage {
         match message {
-            forward @ (MetadataTransportMessage::ForwardCreateDocument { .. }
-            | MetadataTransportMessage::ForwardUpdateDocument { .. }
-            | MetadataTransportMessage::ForwardDeleteDocument { .. }
-            | MetadataTransportMessage::ForwardReadDocument { .. }
-            | MetadataTransportMessage::ForwardValidationStatus { .. }) => {
-                Box::pin(async {
-                    super::forward_serve::apply_forwarded_write(context, peer, forward).await
-                })
-                .await
-            }
             pull @ MetadataTransportMessage::ForwardSyncPull { .. } => {
                 Box::pin(async { super::pull_serve::serve_sync_pull(context, peer, pull).await })
                     .await
@@ -100,12 +90,7 @@ impl MetadataHandle {
             Err(ServeError::Io(error)) => return (reject(error.to_string()), None),
         };
         match message {
-            message @ (MetadataTransportMessage::ForwardCreateDocument { .. }
-            | MetadataTransportMessage::ForwardUpdateDocument { .. }
-            | MetadataTransportMessage::ForwardDeleteDocument { .. }
-            | MetadataTransportMessage::ForwardReadDocument { .. }
-            | MetadataTransportMessage::ForwardValidationStatus { .. }
-            | MetadataTransportMessage::ForwardSyncPull { .. }
+            message @ (MetadataTransportMessage::ForwardSyncPull { .. }
             | MetadataTransportMessage::ForwardPullStatus { .. }
             | MetadataTransportMessage::ForwardListVersions { .. }) => {
                 (self.forward_request(context, peer, message).await, None)
