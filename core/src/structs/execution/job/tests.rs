@@ -2289,6 +2289,7 @@ fn outcomes_stay_decided() {
         scheduler_seq: 1,
         target: ExecutionTargetId {
             node_id: node_id(5),
+            backend: "docker".to_string(),
             executor_kind: "docker".to_string(),
         },
         config_clock: config_clock(2),
