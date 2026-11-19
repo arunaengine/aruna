@@ -34,8 +34,8 @@ fn plan(coordinator: NodeId) -> Box<GroupDeletePlan> {
         request_id: Ulid::from_bytes([5; 16]),
         group_id: Ulid::from_bytes([3; 16]),
         realm_id: realm(),
-        owner: UserId::nil(realm()),
-        requested_by: UserId::nil(realm()),
+        owner: UserId::local(Ulid::from_bytes([6; 16]), realm()),
+        requested_by: UserId::local(Ulid::from_bytes([7; 16]), realm()),
         coordinator,
         nodes: BTreeSet::from([node(1), node(2)]),
     })
