@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Layer guard: counts async code, references, test habits and duplicates against layers_baseline.json.
-A structural count above its baseline, async code in a clean domain or a new crate dependency fails."""
+Fails on a count above its baseline, async code in operations production or a new crate dependency."""
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 import argparse
@@ -151,7 +151,7 @@ BRACE_RE = re.compile(r"[{}]")
 BRACKET_RE = re.compile(r"[\[\]]")
 ITEM_RE = re.compile(r"[()\[\]{};]")
 ARM_RE = re.compile(r"=>|[()\[\]{},]")
-ASYNC_RE = re.compile(r"\basync\s+(?:move\s+)?(?:fn\b|\{|\|)|\.await\b")
+ASYNC_RE = re.compile(r"\basync\b|\.await\b")
 OPERATION_RE = re.compile(r"\bimpl(?:\s*<[^{;]*?>)?\s+(?:[\w:]+::)?(?:Sub|Effect)?Operation\s+for\b")
 DEF_RE = re.compile(r"\b(?:struct|enum|trait|type|fn|const|static|mod|union)\s+([A-Za-z_]\w*)")
 USE_RE = re.compile(r"\buse\s+((?:crate|super|self)\b[^;]*);")
