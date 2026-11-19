@@ -11,6 +11,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentClock;
+use aruna_core::alpn::{ADMISSION_CLOSE, MEMBERSHIP_CLOSE};
 use aruna_core::auth::revocation_live;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
@@ -31,7 +32,6 @@ use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteR
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{Key, KeySpace, Value};
-use aruna_net::streams::{ADMISSION_CLOSE, MEMBERSHIP_CLOSE};
 use rand::seq::SliceRandom;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};

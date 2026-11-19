@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::alpn::{Alpn, AlpnRole};
+use aruna_core::alpn::{ADMISSION_CLOSE, Alpn, AlpnRole, MEMBERSHIP_CLOSE};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use iroh::Endpoint;
 use iroh::endpoint::{ClosedStream, Connection, ReadError, ReadToEndError, VarInt};
@@ -29,12 +29,6 @@ use crate::error::{NetError, Result};
 use crate::telemetry::{
     duration_ms, record_duration_ms, record_selected_path, warn_iroh_phase, warn_iroh_request,
 };
-
-/// Reason a node closes an open connection once its realm configuration stops admitting the peer.
-pub const MEMBERSHIP_CLOSE: &str = "realm membership";
-
-/// Reason a node refuses a new connection from a peer its realm configuration does not admit.
-pub const ADMISSION_CLOSE: &str = "realm admission";
 
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const INBOUND_CONNECTION_LIMIT: usize = 256;
