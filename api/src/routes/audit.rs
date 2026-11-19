@@ -13,18 +13,30 @@ use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use aruna_operations::metadata::audit::{AUDIT_DEADLINE_SECS, ListAuditError, ListAuditRequest};
-use aruna_operations::metadata::audit_entry::{AuditListOperation, outbound_admission};
+use aruna_operations::metadata::audit_entry::AuditListOperation;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+
+/// Realm-wide audit reads this node runs at once; one more answers unavailable.
+const AUDIT_OUTBOUND_LIMIT: usize = 16;
+static AUDIT_OUTBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_OUTBOUND_LIMIT)));
+
+/// A permit for one realm-wide audit read, or `None` while this node is saturated. The caller
+/// holds it while the read runs.
+pub fn outbound_admission() -> Option<OwnedSemaphorePermit> {
+    AUDIT_OUTBOUND_ADMISSION.clone().try_acquire_owned().ok()
+}
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(list_audit))
@@ -260,4 +272,19 @@ pub async fn list_audit(
             missing_overflow: page.missing_overflow,
         }),
     ))
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn outbound_saturates() {
+        let permits: Vec<_> = (0..AUDIT_OUTBOUND_LIMIT)
+            .map(|_| outbound_admission().unwrap())
+            .collect();
+        assert!(outbound_admission().is_none());
+        drop(permits);
+        assert!(outbound_admission().is_some());
+    }
 }

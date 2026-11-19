@@ -11,30 +11,17 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use tokio::sync::OwnedSemaphorePermit;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::audit::{
-    AUDIT_INBOUND_ADMISSION, AUDIT_OUTBOUND_ADMISSION, AUDIT_PAGE_LIMIT, AUDIT_PAGE_SIZE,
-    AuditAggregate, ListAuditError, ListAuditOperation, ListAuditRequest, LocalPageOperation,
-    decode_cursor,
+    AUDIT_PAGE_LIMIT, AUDIT_PAGE_SIZE, AuditAggregate, ListAuditError, ListAuditOperation,
+    ListAuditRequest, LocalPageOperation, decode_cursor,
 };
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::load_config::config_unavailable;
-
-/// A permit for one realm-wide audit read, or `None` while this node is saturated. The caller
-/// holds it while the read runs.
-pub fn outbound_admission() -> Option<OwnedSemaphorePermit> {
-    AUDIT_OUTBOUND_ADMISSION.clone().try_acquire_owned().ok()
-}
-
-/// A permit for serving one peer's audit page, or `None` while this node is saturated.
-pub fn inbound_admission() -> Option<OwnedSemaphorePermit> {
-    AUDIT_INBOUND_ADMISSION.clone().try_acquire_owned().ok()
-}
 
 #[derive(Debug, PartialEq)]
 enum ListStage {
