@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::{BTreeMap, HashSet};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -266,7 +267,7 @@ struct AcceptVersionOperation {
     routing: NodeRouting,
     limits: RoCrateLimits,
     paths: ManifestPaths,
-    event_id: Ulid,
+    ids: IdMint,
     now_ms: u64,
     step: AcceptStep,
 }
@@ -284,7 +285,7 @@ impl AcceptVersionOperation {
             routing,
             limits: limits.clone(),
             paths: (None, None),
-            event_id: Ulid::generate(),
+            ids: IdMint::default(),
             now_ms: 0,
             step: AcceptStep::Routing,
         }
@@ -333,7 +334,7 @@ impl AcceptVersionOperation {
         }
         let node_id = self.stream.local_node;
         Some(WatchEvent {
-            event_id: self.event_id,
+            event_id: self.ids.mint(self.now_ms),
             realm_id: manifest.auth_context.realm_id,
             kind: WatchEventKind::DataUploaded,
             path: watch_resource_path(group_id, node_id, &manifest.bucket, &manifest.key),
@@ -428,6 +429,10 @@ impl Operation for AcceptVersionOperation {
             AcceptStep::Emit => Ok(Next::Done(())),
             AcceptStep::Close => closed(result),
         }
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

@@ -1127,6 +1127,8 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::DelegationSign(_)) => "delegation_sign",
         Effect::Net(NetEffect::AvoidHolder { .. }) => "avoid_holder",
         Effect::Net(NetEffect::CursorSign(_)) => "cursor_sign",
+        Effect::Net(NetEffect::SealPosition(_)) => "seal_position",
+        Effect::Net(NetEffect::OpenPosition(_)) => "open_position",
         Effect::Net(NetEffect::Shard(_)) => "shard",
         Effect::Net(NetEffect::EnsureTopics { .. }) => "ensure_topics",
         Effect::Net(NetEffect::AllowTopicPeers { .. }) => "allow_topic_peers",
@@ -1163,6 +1165,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Compute(_) => "compute",
         Effect::Git(_) => "git",
         Effect::Outbound(_) => "outbound",
+        Effect::Plugin(_) => "plugin",
         Effect::Delay(_) => "delay",
         Effect::Job(_) => "job",
     }

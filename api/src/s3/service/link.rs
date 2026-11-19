@@ -11,6 +11,7 @@ use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::link::LinkTarget;
 use aruna_core::structs::storage::read_grant::READ_OPERATION;
 use aruna_drivers::driver::drive;
+use aruna_drivers::position::seal_cursor;
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::link::{
     AuthorizeTargetOperation, CreateLinkOperation, HeadTargetOperation, LinkCaller, LinkError,
@@ -19,7 +20,7 @@ use aruna_operations::s3::object::link::{
 use aruna_operations::s3::object::versions::{
     ListVersionsInput, ListVersionsItem, ListVersionsOperation, ListVersionsResult,
 };
-use aruna_operations::s3::object::visible::{SCAN_BUDGET, seal_cursor};
+use aruna_operations::s3::object::visible::SCAN_BUDGET;
 use s3s::dto::{ETag, ETagCondition, GetObjectOutput, StreamingBlob};
 use s3s::{S3Response, S3Result, s3_error};
 

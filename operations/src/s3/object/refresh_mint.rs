@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -77,6 +77,7 @@ enum MintState {
 /// head, and outputs whether it did. A caller folds these calls into its own transaction.
 #[derive(Debug, PartialEq)]
 pub(crate) struct MintSuccessorOperation {
+    now_ms: u64,
     refresh: ReferenceRefresh,
     observation: SourceMetadata,
     predecessor: BlobVersion,
@@ -93,6 +94,7 @@ impl MintSuccessorOperation {
         predecessor: BlobVersion,
     ) -> Self {
         Self {
+            now_ms: 0,
             refresh,
             observation,
             predecessor,
@@ -168,9 +170,9 @@ impl MintSuccessorOperation {
             return Ok(None);
         }
         let refresh = &self.refresh;
-        let now = SystemTime::now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         let hint = bucket.distribution.as_ref().map(DistributionBinding::hint);
-        let version_id = mint_version(hint);
+        let version_id = mint_version(ulid::Ulid::generate(), hint);
         let successor = BlobVersion::reference(
             source.clone(),
             self.observation.clone(),
@@ -307,6 +309,10 @@ impl Operation for MintSuccessorOperation {
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 }
 
 #[cfg(test)]
@@ -323,14 +329,7 @@ mod tests {
     use ulid::Ulid;
 
     fn observation(content_length: u64) -> SourceMetadata {
-        SourceMetadata {
-            content_length,
-            content_type: None,
-            etag: Some(format!("etag-{content_length}")),
-            last_modified: None,
-            source_version: None,
-            digests: Default::default(),
-        }
+        crate::tests::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
     }
 
     fn mint(version_id: Ulid) -> MintSuccessorOperation {

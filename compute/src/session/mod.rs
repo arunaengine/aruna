@@ -18,7 +18,7 @@ use tokio::time::{Duration, Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::ExecutorBackend;
-use aruna_core::time::unix_timestamp_millis;
+use aruna_clock::unix_timestamp_millis;
 use events::{BudgetVerdict, CellBudget, EventRing};
 
 use aruna_core::compute::session::{

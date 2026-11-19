@@ -213,6 +213,7 @@ impl ArunaS3Service {
                 VisibleError::Cursor => {
                     s3_error!(InternalError, "The listing cursor was not sealed")
                 }
+                VisibleError::Unopened => s3_error!(InvalidArgument, "Invalid continuation token"),
                 VisibleError::Io(error) => s3_error!(InternalError, "{error}"),
             })?;
         let (continuation_token, sealed) = match page.next {

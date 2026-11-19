@@ -127,6 +127,17 @@ pub fn link() -> RepositoryLink {
     }
 }
 
+/// The target of `link` before anything is published.
+pub fn target() -> aruna_core::repository::LinkTarget {
+    aruna_core::repository::LinkTarget {
+        link_id: link().link_id,
+        published_id: None,
+        parent_id: None,
+        revision_id: None,
+        files: Vec::new(),
+    }
+}
+
 /// A session on the endpoint of [`link`] whose calls do not watch a job.
 #[cfg(test)]
 pub(crate) fn session() -> Session {

@@ -6,13 +6,13 @@
 use std::future::Future;
 use std::time::Duration;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     DEAD_LETTER_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE, REFRESH_JOB_KEYSPACE,
     REPLICATION_JOB_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
-use aruna_core::time::unix_timestamp_millis;
 use byteview::ByteView;
 use tracing::{info, warn};
 use ulid::Ulid;

@@ -11,6 +11,8 @@ pub(crate) mod connectors;
 pub(crate) mod device;
 pub mod export;
 #[cfg(test)]
+pub(crate) mod groups;
+#[cfg(test)]
 pub(crate) mod import;
 pub mod locations;
 #[cfg(test)]
@@ -22,6 +24,8 @@ pub mod notifications;
 pub(crate) mod peers;
 #[cfg(test)]
 pub(crate) mod policy;
+#[cfg(test)]
+pub(crate) mod realm;
 #[cfg(test)]
 pub(crate) mod records;
 pub mod s3;

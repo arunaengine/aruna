@@ -439,7 +439,6 @@ mod tests {
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::node_info::NodeUrls;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::FjallStorage;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
     use ulid::Ulid;
@@ -701,15 +700,7 @@ mod tests {
     }
 
     fn test_ctx(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
+        crate::testing::path_context(root)
     }
 
     async fn write_config(ctx: &DriverContext, config: &RealmConfigDocument, local: NodeId) {

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::shared::write_value;
 use aruna_api::auth::RealmAuth;
 use aruna_api::error::ServerError;
 use aruna_api::routes::storage::deletion::{
@@ -47,23 +48,6 @@ struct Fixture {
     _directory: TempDir,
     state: Arc<ServerState>,
     auth: AuthContext,
-}
-
-async fn write_value(state: &ServerState, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-    let event = state
-        .get_ctx()
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
 }
 
 async fn setup() -> Fixture {

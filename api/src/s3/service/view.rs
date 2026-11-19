@@ -6,12 +6,13 @@
 use aruna_core::structs::execution::job::{JobId, JobRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_drivers::driver::drive;
+use aruna_drivers::position::{open_cursor, seal_cursor};
 use aruna_operations::jobs::workflow::input_view::{
     MAX_VIEW_KEYS, ReadManifestOperation, ViewEntry, ViewEntryOperation, ViewError, ViewFrom,
     ViewLister, creator, decode_token, encode_token, names_manifest, view_bucket, view_entries,
 };
 use aruna_operations::s3::object::get::GetObjectError;
-use aruna_operations::s3::object::visible::{is_sealed, open_cursor, seal_cursor};
+use aruna_operations::s3::object::visible::is_sealed;
 use percent_encoding::utf8_percent_encode;
 use s3s::dto::{
     CommonPrefix, ETag, ETagCondition, EncodingType, GetObjectInput, GetObjectOutput,

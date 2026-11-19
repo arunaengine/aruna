@@ -30,7 +30,6 @@ use rand::{RngExt, rng};
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use ulid::Ulid;
 
 use super::index::{
     MAX_ACTIVE_CREDENTIALS, decode_index, encode_index, owner_key, token_deletes, token_pages,
@@ -97,6 +96,10 @@ pub struct CreateUserConfig {
 /// Creates the credential, its owner index entry and audit rows in one transaction.
 #[derive(Debug, PartialEq)]
 pub struct CreateUserOperation {
+    /// The key id is minted when the run starts.
+    mint_key: bool,
+    now_ms: u64,
+    ids: IdMint,
     config: CreateUserConfig,
     key_id: String,
     encryption_key: CredentialEncryptionKey,
@@ -171,7 +174,10 @@ impl TokenPlan {
 
 impl CreateUserOperation {
     pub fn new(config: CreateUserConfig, encryption_key: CredentialEncryptionKey) -> Self {
-        Self::new_with_key(config, Ulid::generate().to_string(), encryption_key)
+        Self {
+            mint_key: true,
+            ..Self::new_with_key(config, String::new(), encryption_key)
+        }
     }
 
     pub fn new_with_key(
@@ -182,6 +188,9 @@ impl CreateUserOperation {
         Self {
             config,
             key_id,
+            mint_key: false,
+            now_ms: 0,
+            ids: IdMint::default(),
             encryption_key,
             pending_secret: None,
             access: None,
@@ -283,7 +292,7 @@ impl CreateUserOperation {
         let new_key = self.new_access()?.access_key.clone();
         let index = std::mem::take(&mut self.index);
         let mut read = read.into_iter();
-        let now = SystemTime::now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         let mut active = BTreeSet::new();
         let mut stale = Vec::new();
         for key in &index {
@@ -448,6 +457,10 @@ impl Operation for CreateUserOperation {
     }
 
     fn first(&mut self) -> CreateTurn {
+        // Minted once, so a rerun after a conflict keeps the key id.
+        if std::mem::take(&mut self.mint_key) {
+            self.key_id = self.ids.mint(self.now_ms).to_string();
+        }
         self.prepare()?;
         let reads = vec![
             (
@@ -482,6 +495,14 @@ impl Operation for CreateUserOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 
@@ -791,7 +812,6 @@ mod pure_tests {
     mod tokens {
         use super::*;
         use aruna_core::structs::storage::encryption::EncryptionMode;
-        use aruna_core::structs::storage::format::Compression;
 
         const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
 
@@ -800,17 +820,7 @@ mod pure_tests {
         }
 
         fn info() -> BucketInfo {
-            BucketInfo {
-                group_id: Ulid::from_bytes([3; 16]),
-                created_at: SystemTime::UNIX_EPOCH,
-                created_by: user(1),
-                cors_configuration: None,
-                storage_routing: Vec::new(),
-                placement_policies: Vec::new(),
-                placement_policy_generation: 0,
-                compression: Compression::Off,
-                distribution: None,
-            }
+            crate::tests::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
         }
 
         fn sealed() -> BucketEncryption {

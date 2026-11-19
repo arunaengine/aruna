@@ -457,7 +457,7 @@ pub(crate) fn map_io_error(error: std::io::Error) -> StagingSourceError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use futures::StreamExt;
     use std::collections::HashMap;
@@ -486,7 +486,7 @@ mod tests {
         ));
     }
 
-    fn access(root: &Path, path: &str) -> ResolvedSourceAccess {
+    pub(crate) fn access(root: &Path, path: &str) -> ResolvedSourceAccess {
         ResolvedSourceAccess::OpenDal {
             kind: SourceConnectorKind::LocalDirectory,
             config: HashMap::from([(

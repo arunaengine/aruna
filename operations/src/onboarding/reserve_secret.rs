@@ -18,7 +18,7 @@ use ulid::Ulid;
 use crate::onboarding::create_secret::{
     enrolled_devices, pending_devices, secret_pages, secret_record_key,
 };
-use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry, secret_state_key};
+use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReserveSecretInput {
@@ -287,16 +287,9 @@ impl Operation for ReserveSecretOperation {
     }
 
     fn first(&mut self) -> ReserveTurn {
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                ONBOARDING_KEYSPACE.to_string(),
-                secret_record_key(self.input.enrollment_id),
-            ),
-            (
-                ONBOARDING_KEYSPACE.to_string(),
-                secret_state_key(self.input.enrollment_id),
-            ),
-        ])))
+        Ok(Next::Call(crate::onboarding::secret_reads(
+            self.input.enrollment_id,
+        )))
     }
 
     fn next(&mut self, result: IoResult) -> ReserveTurn {

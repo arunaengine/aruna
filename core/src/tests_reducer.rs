@@ -48,14 +48,7 @@ pub(crate) fn role_definition(role_id: RoleId, name: &str) -> AdminRoleDefinitio
 }
 
 pub(crate) fn oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
-    OidcProviderConfig {
-        id: id.to_string(),
-        issuer: format!("https://issuer.example/{issuer_suffix}"),
-        audience: "aruna".to_string(),
-        discovery_url: format!(
-            "https://issuer.example/{issuer_suffix}/.well-known/openid-configuration"
-        ),
-    }
+    crate::testing::oidc_provider(id, issuer_suffix)
 }
 
 pub(crate) fn user_id_seed(seed: u8) -> UserId {

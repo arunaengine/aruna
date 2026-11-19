@@ -178,12 +178,7 @@ async fn local_setup() -> (Fixture, tokio::sync::mpsc::UnboundedReceiver<TaskKey
 }
 
 fn owner_auth(fixture: &Fixture) -> AuthContext {
-    AuthContext {
-        user_id: fixture.owner,
-        realm_id: fixture.realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(fixture.owner, fixture.realm_id)
 }
 
 fn sample_folder(id: Ulid, fixture: &Fixture, root: &str, state: FolderState) -> SyncedFolder {

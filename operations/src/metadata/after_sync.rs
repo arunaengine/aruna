@@ -14,7 +14,7 @@ use tracing::{error, warn};
 
 use crate::metadata::projection::{
     LoggedProjection, MetadataProjectionError, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
-    ProjectLoggedOperation, ProjectionWakeOperation, max_clock_skew,
+    ProjectLoggedOperation, ProjectionWakeOperation,
 };
 use crate::metadata::prune_queue::{
     MetadataGraphError, TombstoneProcessingResult, TombstonesOperation,
@@ -80,7 +80,7 @@ impl AfterSyncOperation {
     fn project(&mut self) -> Option<IoCall> {
         let events = std::mem::take(&mut self.events);
         if !events.is_empty() {
-            let project = ProjectEventsOperation::new(events, self.node_id, max_clock_skew());
+            let project = ProjectEventsOperation::new(events, self.node_id);
             return Some(IoCall::child(project));
         }
         let pairs: Vec<_> = std::mem::take(&mut self.targets)
@@ -96,7 +96,7 @@ impl AfterSyncOperation {
         if pairs.is_empty() {
             return None;
         }
-        let project = ProjectLoggedOperation::new(pairs, false, self.node_id, max_clock_skew());
+        let project = ProjectLoggedOperation::new(pairs, false, self.node_id);
         self.logged = true;
         Some(IoCall::child(project))
     }

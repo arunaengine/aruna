@@ -15,6 +15,7 @@ blake3 = { workspace = true }
 fjall = { workspace = true }
 thiserror = { workspace = true }
 crossfire = { workspace = true }
+aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
 ulid = { workspace = true }
 byteview = { workspace = true }

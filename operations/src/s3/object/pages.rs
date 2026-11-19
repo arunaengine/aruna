@@ -39,9 +39,8 @@ use crate::s3::object::range_list::{
     MemberAccess, RangeListError, RangeListOperation, RangeQuery, RangeTarget,
 };
 use crate::s3::object::visible::{
-    HiddenCursor, LinkShows, ListFailure, ListSource, Listed, ListingKeys, NextPage, RecordSource,
-    ShowRule, Shown, VisibleError, VisiblePage, VisiblePageOperation, after_entry, is_sealed,
-    open_cursor,
+    LinkShows, ListFailure, ListSource, Listed, ListingKeys, NextPage, RecordSource, ShowRule,
+    Shown, VisibleError, VisiblePage, VisiblePageOperation, after_entry, is_sealed,
 };
 
 /// Ranges one merged page visits at most, so its fan-out stays bounded.
@@ -221,17 +220,18 @@ pub fn listing_path(
 /// The local listing position a cursor of an unmerged listing names.
 fn local_token(
     request: &ListRequest,
-) -> Result<(Option<ListContinuationToken>, Option<HiddenCursor>), PageError> {
+) -> Result<(Option<ListContinuationToken>, Option<Vec<u8>>), PageError> {
     position_of(&request.bucket, request.cursor.as_deref())
 }
 
+/// Where a listing starts: after a key, or at the sealed hidden position its page opens.
 fn position_of(
     bucket: &str,
     cursor: Option<&str>,
-) -> Result<(Option<ListContinuationToken>, Option<HiddenCursor>), PageError> {
+) -> Result<(Option<ListContinuationToken>, Option<Vec<u8>>), PageError> {
     if let Some(cursor) = cursor.filter(|cursor| is_sealed(cursor)) {
-        let hidden = open_cursor(cursor).ok_or(PageError::Cursor)?;
-        return Ok((None, Some(hidden)));
+        let sealed = cursor::position_bytes(cursor).ok_or(PageError::Cursor)?;
+        return Ok((None, Some(sealed)));
     }
     match cursor.map(decode_resume).transpose()? {
         Some(Resume::After { key, group }) => {
@@ -275,6 +275,7 @@ fn visible_failure<E: std::fmt::Display, L: std::fmt::Display>(
         VisibleError::List(error) => PageError::internal(error),
         VisibleError::Shows(error) => PageError::internal(error),
         VisibleError::Cursor => PageError::Internal("listing cursor not sealed".into()),
+        VisibleError::Unopened => PageError::Cursor,
         VisibleError::Io(error) => PageError::internal(error),
     }
 }
@@ -323,7 +324,8 @@ struct LocalPartOperation<O> {
     group_id: Ulid,
     caller: Option<OwnedCaller>,
     input: Option<ListBucketInput>,
-    hidden: Option<HiddenCursor>,
+    /// The sealed hidden position the page opens and resumes at.
+    hidden: Option<Vec<u8>>,
     bounds: Option<(String, Option<String>)>,
     step: LocalStep,
     object: PhantomData<O>,
@@ -334,7 +336,7 @@ impl<O: PageObject> LocalPartOperation<O> {
         node: PageNode,
         (group_id, caller): (Ulid, Option<OwnedCaller>),
         input: ListBucketInput,
-        (hidden, bounds): (Option<HiddenCursor>, Option<(String, Option<String>)>),
+        (hidden, bounds): (Option<Vec<u8>>, Option<(String, Option<String>)>),
     ) -> Self {
         Self {
             node,
@@ -381,7 +383,10 @@ impl<O: PageObject> LocalPartOperation<O> {
         let source = RecordSource {
             bounds: self.bounds.take(),
         };
-        let page = VisiblePageOperation::new(source, rule, self.input()?, self.hidden.take());
+        let mut page = VisiblePageOperation::new(source, rule, self.input()?, None);
+        if let Some(sealed) = self.hidden.take() {
+            page = page.opening(sealed);
+        }
         self.step = LocalStep::Visible;
         Ok(Next::Call(IoCall::child(page)))
     }
@@ -644,7 +649,10 @@ impl<O: PageObject> RemotePartOperation<O> {
             keys: AccessKeys(access.clone()),
             object: PhantomData,
         };
-        let page: CheckedPage<O> = VisiblePageOperation::new(source, rule, input, hidden);
+        let mut page: CheckedPage<O> = VisiblePageOperation::new(source, rule, input, None);
+        if let Some(sealed) = hidden {
+            page = page.opening(sealed);
+        }
         Ok(IoCall::child(page))
     }
 
@@ -700,6 +708,7 @@ impl<O: PageObject> Operation for RemotePartOperation<O> {
                 Err(VisibleError::Cursor) => {
                     Err(PageError::Internal("listing cursor not sealed".into()))
                 }
+                Err(VisibleError::Unopened) => Err(PageError::Cursor),
             };
         }
         match result.child::<Option<RangePage>, RangeListError>()?? {
@@ -950,7 +959,7 @@ impl<O: PageObject> MergedPageOperation<O> {
             .map(|(key, group)| resume_token(bucket, key, group.as_deref()))
             .transpose()?;
         let hidden = (current.resumed.as_ref())
-            .map(|(_, _, cursor)| open_cursor(cursor).ok_or(PageError::Cursor))
+            .map(|(_, _, cursor)| cursor::position_bytes(cursor).ok_or(PageError::Cursor))
             .transpose()?;
         let range = &current.range;
         let bounds = Some((range.lower.clone(), range.upper.clone()));

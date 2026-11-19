@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
@@ -15,8 +15,6 @@ use aruna_core::rows::read_row;
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::telemetry::duration_ms;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use thiserror::Error;
@@ -204,6 +202,7 @@ enum RefreshStep {
 /// failed observation fails the refresh, which the queue retries later.
 #[derive(Debug, PartialEq)]
 pub struct RefreshReferenceOperation {
+    now_ms: u64,
     refresh: ReferenceRefresh,
     step: RefreshStep,
 }
@@ -213,6 +212,7 @@ type RefreshTurn = Result<Next<()>, RefreshRunError>;
 impl RefreshReferenceOperation {
     pub fn new(refresh: ReferenceRefresh) -> Self {
         Self {
+            now_ms: 0,
             refresh,
             step: RefreshStep::Apply,
         }
@@ -229,7 +229,8 @@ impl RefreshReferenceOperation {
         match observed {
             Ok(metadata) => {
                 self.refresh.metadata = Some(metadata);
-                self.refresh.refreshed_at = SystemTime::now().max(self.refresh.refreshed_at);
+                let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+                self.refresh.refreshed_at = now.max(self.refresh.refreshed_at);
                 self.apply()
             }
             // Work for a version that is gone or no longer resolvable is finished, not retried.
@@ -278,6 +279,10 @@ impl Operation for RefreshReferenceOperation {
             RefreshStep::Apply => self.applied(result.child::<bool, RefreshRunError>()?),
         }
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 }
 
 fn due_page(limit: usize) -> IoCall {
@@ -292,6 +297,7 @@ fn due_page(limit: usize) -> IoCall {
 /// Sets the drain timer for the earliest queued refresh, if any.
 #[derive(Debug, Default, PartialEq)]
 pub struct RestoreRefreshTimer {
+    now_ms: u64,
     setting: bool,
 }
 
@@ -324,9 +330,13 @@ impl Operation for RestoreRefreshTimer {
         self.setting = true;
         let reset = Effect::Task(TaskEffect::ResetTimer {
             key: TaskKey::DrainRefreshQueue,
-            after: due_after(unix_timestamp_millis(), due_at_ms),
+            after: due_after(self.now_ms, due_at_ms),
         });
         Ok(Next::Call(reset.into()))
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
 
@@ -429,8 +439,11 @@ enum DrainState {
 #[derive(Debug, PartialEq)]
 pub struct DrainRefreshOperation {
     state: DrainState,
-    started: Instant,
+    started_ms: u64,
+    /// The time of the scan; due jobs are those due by then.
     now_ms: u64,
+    /// The runner clock of the current step.
+    clock_ms: u64,
     rows: VecDeque<Key>,
     more_rows: bool,
     jobs: VecDeque<(Vec<u8>, ReferenceRefreshRecord)>,
@@ -456,8 +469,9 @@ impl DrainRefreshOperation {
     pub fn new() -> Self {
         Self {
             state: DrainState::ReadDue,
-            started: Instant::now(),
+            started_ms: 0,
             now_ms: 0,
+            clock_ms: 0,
             rows: VecDeque::new(),
             more_rows: false,
             jobs: VecDeque::new(),
@@ -520,7 +534,7 @@ impl DrainRefreshOperation {
     }
 
     fn start_jobs(&mut self) -> DrainTurn {
-        self.scan_ms = duration_ms(self.started.elapsed());
+        self.scan_ms = self.clock_ms.saturating_sub(self.started_ms);
         self.job_count = self.jobs.len();
         self.oldest_lag_ms = (self.jobs.iter())
             .map(|(_, job)| self.now_ms.saturating_sub(job.due_at_ms))
@@ -546,7 +560,7 @@ impl DrainRefreshOperation {
             return self.call(state, IoCall::child(settle));
         };
         let attempts = job.attempts.saturating_add(1);
-        let due_at_ms = unix_timestamp_millis().saturating_add(retry_delay_ms(attempts));
+        let due_at_ms = self.clock_ms.saturating_add(retry_delay_ms(attempts));
         let next = ReferenceRefreshRecord {
             refresh: job.refresh.clone(),
             due_at_ms,
@@ -567,14 +581,14 @@ impl DrainRefreshOperation {
                 succeeded = self.succeeded,
                 failed = self.failed,
                 scan_ms = self.scan_ms,
-                total_ms = duration_ms(self.started.elapsed()),
+                total_ms = self.clock_ms.saturating_sub(self.started_ms),
                 oldest_lag_ms = self.oldest_lag_ms,
                 has_more_due = self.has_more_due,
                 "Reference metadata refresh batch summary"
             );
         }
         let next_due_after = (self.next_due_ms.filter(|_| !self.has_more_due))
-            .map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms));
+            .map(|due_at_ms| due_after(self.clock_ms, due_at_ms));
         ReferenceDrainResult {
             processed: self.job_count,
             succeeded: self.succeeded,
@@ -590,8 +604,8 @@ impl Operation for DrainRefreshOperation {
     type Error = ReferenceRefreshError;
 
     fn first(&mut self) -> DrainTurn {
-        self.started = Instant::now();
-        self.now_ms = unix_timestamp_millis();
+        self.started_ms = self.clock_ms;
+        self.now_ms = self.clock_ms;
         Ok(Next::Call(due_page(REFRESH_SCAN_PAGE)))
     }
 
@@ -619,6 +633,10 @@ impl Operation for DrainRefreshOperation {
             }
         }
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.clock_ms = now_ms;
+    }
 }
 
 #[cfg(test)]
@@ -635,14 +653,7 @@ mod tests {
     use ulid::Ulid;
 
     fn observation(content_length: u64) -> SourceMetadata {
-        SourceMetadata {
-            content_length,
-            content_type: None,
-            etag: Some(format!("etag-{content_length}")),
-            last_modified: None,
-            source_version: None,
-            digests: Default::default(),
-        }
+        crate::tests::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
     }
 
     fn refresh(metadata: Option<SourceMetadata>, seconds: u64) -> ReferenceRefresh {

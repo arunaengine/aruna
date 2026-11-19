@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_blob::blob::{BlobHandle, GroupHold};
+use aruna_clock::unix_timestamp_millis;
 use aruna_compute::ExecutorRegistry;
 use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
@@ -17,7 +18,6 @@ use aruna_core::operation::SubOperation;
 use aruna_core::operation::{AfterConflict, EffectOperation, HoldScope, Runnable};
 use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, TxnId};
 use aruna_graph::GraphHandle;
 use aruna_net::NetHandle;
@@ -813,6 +813,7 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::Session(_)
         | Effect::Compute(_)
         | Effect::Outbound(_)
+        | Effect::Plugin(_)
         | Effect::SubOperation(_)
         | Effect::Background(_)
         | Effect::Group(_)

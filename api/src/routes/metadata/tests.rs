@@ -3664,7 +3664,7 @@ async fn lookup_hides_private() {
     let ctx = test.state.get_ctx();
     let request = aruna_operations::metadata::PersistentIdRequest::AddIdentifiers {
         identifiers,
-        occurred_at_ms: aruna_core::time::unix_timestamp_millis(),
+        occurred_at_ms: aruna_clock::unix_timestamp_millis(),
     };
     let node = (
         test.state.get_realm_id(),

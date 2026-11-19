@@ -92,7 +92,7 @@ impl HeartbeatTable {
             Held {
                 heartbeat,
                 received: Instant::now(),
-                received_at_ms: aruna_core::time::unix_timestamp_millis(),
+                received_at_ms: aruna_clock::unix_timestamp_millis(),
             },
         );
         true
@@ -113,7 +113,7 @@ impl HeartbeatTable {
             Held {
                 heartbeat,
                 received: Instant::now(),
-                received_at_ms: aruna_core::time::unix_timestamp_millis(),
+                received_at_ms: aruna_clock::unix_timestamp_millis(),
             },
         );
     }

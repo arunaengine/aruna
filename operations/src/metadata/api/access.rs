@@ -76,13 +76,7 @@ pub(crate) fn child_results<T: 'static, E: 'static>(
 }
 
 fn child_result<T: 'static, E: 'static>(member: GroupResult) -> Option<Result<T, E>> {
-    let GroupResult::Done(event) = member else {
-        return None;
-    };
-    match *event {
-        Event::Child(outcome) => outcome.take(),
-        _ => None,
-    }
+    member.child_outcome()
 }
 
 /// The read rules of a caller per group and the request policies per scope.
@@ -305,12 +299,7 @@ pub(crate) mod tests {
     }
 
     fn caller() -> AuthContext {
-        AuthContext {
-            user_id: UserId::local(Ulid::from_parts(8, 8), realm()),
-            realm_id: realm(),
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(UserId::local(Ulid::from_parts(8, 8), realm()), realm())
     }
 
     #[test]

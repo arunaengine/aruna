@@ -24,7 +24,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::Value;
 
 use super::resources::EmptyCheck;
-use crate::auth::permission_rules::{read_rules, rule_reads};
+use crate::auth::permission_rules::read_rules;
 
 /// Records this node's deletion decision, then syncs it to disk before it answers, so the
 /// coordinator never counts a confirmation a crash could lose.
@@ -206,8 +206,7 @@ impl PrepareWrite {
             true => Stage::RealmAuth,
             false => Stage::GroupAuth,
         };
-        let reads = rule_reads(&self.auth_path(realm)).map_err(unavailable)?;
-        Ok(Next::Call(IoCall::Read(reads)))
+        Ok(Next::Call(super::auth_call(&self.auth_path(realm))?))
     }
 
     fn authorized(&mut self, values: Vec<Option<Value>>) -> Result<Next<()>, GroupDeletionError> {

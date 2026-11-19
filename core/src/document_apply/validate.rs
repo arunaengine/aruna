@@ -642,7 +642,7 @@ pub fn validate_admin_event(
         return reject(&reason);
     }
 
-    if let Err(reason) = validate_shape(family, event) {
+    if let Err(reason) = validate_shape(family, event, rows.now_ms() / 1_000) {
         return reject(&reason);
     }
 
@@ -688,7 +688,8 @@ pub fn validate_admin_event(
         return reject("stored admin reducer state has the wrong target");
     }
     if let AdminDocumentOperation::ConfigTokenRevoked { token_hash, .. } = &event.op {
-        if revocation_origin_full(previous_state.as_ref(), event, token_hash) {
+        let now_secs = rows.now_ms() / 1_000;
+        if revocation_origin_full(previous_state.as_ref(), event, token_hash, now_secs) {
             return reject("revocation origin reached its live revocation cap");
         }
         return Ok(AdminEventValidation::Accepted);

@@ -22,7 +22,6 @@ use aruna_core::structs::storage::blob::{HiddenBlobEntry, HiddenBlobKey};
 use aruna_core::structs::storage::distribution::on_use::{
     ATTACHMENT_NAMESPACE, Attachment, CACHE_NAMESPACE, CacheEntry, attachment_key,
 };
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -73,9 +72,9 @@ fn failed(error: impl std::fmt::Display) -> MigrationError {
     MigrationError::failed(error)
 }
 
-/// Ends a sweep that used up its time; the next one goes on from the stored cursor.
-fn within_budget(started_ms: u64) -> Result<(), MigrationError> {
-    let spent = unix_timestamp_millis().saturating_sub(started_ms);
+/// Ends a sweep that used up its time at `now_ms`; the next one goes on from the stored cursor.
+fn within_budget(started_ms: u64, now_ms: u64) -> Result<(), MigrationError> {
+    let spent = now_ms.saturating_sub(started_ms);
     if spent >= SWEEP_BUDGET.as_millis() as u64 {
         return Err(MigrationError::Failed(
             "hidden sweep budget exhausted".to_string(),
@@ -150,6 +149,8 @@ enum SweepStep {
 /// Runs one page of the phase the stored cursor names and stores where the next run goes on.
 #[derive(Debug, PartialEq)]
 pub struct ProcessHiddenOperation {
+    /// The runner clock, read at the start for the sweep budget.
+    clock_ms: u64,
     now_ms: u64,
     started_ms: u64,
     step: SweepStep,
@@ -158,6 +159,7 @@ pub struct ProcessHiddenOperation {
 impl ProcessHiddenOperation {
     pub fn new(now_ms: u64) -> Self {
         Self {
+            clock_ms: 0,
             now_ms,
             started_ms: 0,
             step: SweepStep::Cursor,
@@ -222,7 +224,7 @@ impl Operation for ProcessHiddenOperation {
     type Error = MigrationError;
 
     fn first(&mut self) -> Turn<HiddenSweepOutcome> {
-        self.started_ms = unix_timestamp_millis();
+        self.started_ms = self.clock_ms;
         let read = read_row(NODE_STATE_KEYSPACE, HIDDEN_CURSOR_KEY.to_vec());
         Ok(Next::Call(read))
     }
@@ -242,6 +244,10 @@ impl Operation for ProcessHiddenOperation {
                 Ok(Next::Done(outcome))
             }
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.clock_ms = now_ms;
     }
 }
 
@@ -290,6 +296,7 @@ enum CleanupStep {
 /// Compensates the upload records of one page of cleanup rows and deletes their blobs.
 #[derive(Debug, PartialEq)]
 struct CleanupPageOperation {
+    clock_ms: u64,
     scope: PageScope,
     rows: VecDeque<(Key, Value)>,
     pass: PagePass,
@@ -299,6 +306,7 @@ struct CleanupPageOperation {
 impl CleanupPageOperation {
     fn new(scope: PageScope) -> Self {
         Self {
+            clock_ms: 0,
             scope,
             rows: VecDeque::new(),
             pass: PagePass::default(),
@@ -308,7 +316,7 @@ impl CleanupPageOperation {
 
     fn next_row(&mut self) -> Turn<PagePass> {
         while let Some((key, value)) = self.rows.pop_front() {
-            within_budget(self.scope.started_ms)?;
+            within_budget(self.scope.started_ms, self.clock_ms)?;
             let cleanup = match RoCrateUploadCleanup::from_bytes(&value) {
                 Ok(cleanup) => cleanup,
                 Err(error) => {
@@ -385,6 +393,10 @@ impl Operation for CleanupPageOperation {
             }
         }
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.clock_ms = now_ms;
+    }
 }
 
 /// Deletes one upload cleanup row; a failure leaves it for a later sweep.
@@ -419,6 +431,7 @@ enum UploadsStep {
 /// Claims and deletes the stale RO-Crate uploads of one page.
 #[derive(Debug, PartialEq)]
 struct UploadsPageOperation {
+    clock_ms: u64,
     scope: PageScope,
     rows: VecDeque<(Key, Value)>,
     pass: PagePass,
@@ -428,6 +441,7 @@ struct UploadsPageOperation {
 impl UploadsPageOperation {
     fn new(scope: PageScope) -> Self {
         Self {
+            clock_ms: 0,
             scope,
             rows: VecDeque::new(),
             pass: PagePass::default(),
@@ -437,7 +451,7 @@ impl UploadsPageOperation {
 
     fn next_row(&mut self) -> Turn<PagePass> {
         while let Some((key, value)) = self.rows.pop_front() {
-            within_budget(self.scope.started_ms)?;
+            within_budget(self.scope.started_ms, self.clock_ms)?;
             let record: RoCrateUploadRecord = match postcard::from_bytes(&value) {
                 Ok(record) => record,
                 Err(error) => {
@@ -505,6 +519,10 @@ impl Operation for UploadsPageOperation {
             }
         }
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.clock_ms = now_ms;
+    }
 }
 
 fn upload_is_live(record: &RoCrateUploadRecord, claimed_live: bool, now_ms: u64) -> bool {
@@ -533,6 +551,7 @@ enum HiddenStep {
 /// Deletes the old hidden blobs of one listing page that nothing protects.
 #[derive(Debug, PartialEq)]
 struct HiddenPageOperation {
+    clock_ms: u64,
     scope: PageScope,
     entries: VecDeque<HiddenBlobEntry>,
     pass: PagePass,
@@ -542,6 +561,7 @@ struct HiddenPageOperation {
 impl HiddenPageOperation {
     fn new(scope: PageScope) -> Self {
         Self {
+            clock_ms: 0,
             scope,
             entries: VecDeque::new(),
             pass: PagePass::default(),
@@ -572,7 +592,7 @@ impl HiddenPageOperation {
         let grace = ORPHAN_GRACE.as_millis() as u64;
         let cutoff_ms = self.scope.now_ms.saturating_sub(grace);
         while let Some(entry) = self.entries.pop_front() {
-            within_budget(self.scope.started_ms)?;
+            within_budget(self.scope.started_ms, self.clock_ms)?;
             if !hidden_is_old(&entry, cutoff_ms) {
                 continue;
             }
@@ -623,6 +643,10 @@ impl Operation for HiddenPageOperation {
                 self.next_entry()
             }
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.clock_ms = now_ms;
     }
 }
 
@@ -907,12 +931,10 @@ mod tests {
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::FjallStorage;
     use aruna_storage::StorageHandle;
     use byteview::ByteView;
     use serde::Serialize;
     use std::collections::HashMap;
-    use tempfile::tempdir;
 
     fn upload_record(
         upload_id: Ulid,
@@ -1028,21 +1050,7 @@ mod tests {
     }
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        (
-            dir,
-            DriverContext {
-                storage_handle: storage,
-                net_handle: None,
-                blob_handle: None,
-                graph_handle: None,
-                task_handle: None,
-                compute_handle: None,
-                outbound_handle: None,
-            },
-        )
+        crate::testing::temp_context()
     }
 
     async fn is_protected(
@@ -1068,7 +1076,7 @@ mod tests {
         let scope = PageScope {
             after: None,
             now_ms,
-            started_ms: unix_timestamp_millis(),
+            started_ms: aruna_core::time::unix_timestamp_millis(),
         };
         let pass = drive(UploadsPageOperation::new(scope), context).await?;
         Ok((pass.deleted, pass.next.is_some(), pass.pending))
@@ -1121,8 +1129,9 @@ mod tests {
 
     #[test]
     fn expired_budget_stops() {
-        assert!(within_budget(0).is_err());
-        assert!(within_budget(unix_timestamp_millis()).is_ok());
+        let budget = SWEEP_BUDGET.as_millis() as u64;
+        assert!(within_budget(1_000, 1_000 + budget).is_err());
+        assert!(within_budget(1_000, 999 + budget).is_ok());
     }
 
     fn hidden_location(namespace: Ulid, name: &str) -> BackendLocation {

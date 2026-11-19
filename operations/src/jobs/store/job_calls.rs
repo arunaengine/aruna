@@ -785,19 +785,25 @@ pub fn reserve_output_commits(
     job_id: JobId,
     destinations: Vec<(NodeId, String, String)>,
     hints: BTreeMap<(NodeId, String), SetHint>,
+    now_ms: u64,
 ) -> StoreCall<AttemptControl> {
-    control_of(
-        job_id,
-        move |_: &mut JobRecord, control: &mut AttemptControl| {
+    let build = move |first: Ulid| {
+        let (destinations, hints) = (destinations.clone(), hints.clone());
+        let edit = move |_: &mut JobRecord, control: &mut AttemptControl| {
+            let mut ids = IdMint::new(first.random());
             let mint = |(node_id, bucket, _): &(NodeId, String, String)| {
-                mint_version(hints.get(&(*node_id, bucket.clone())).copied())
+                let hint = hints.get(&(*node_id, bucket.clone())).copied();
+                mint_version(ids.mint(first.timestamp_ms()), hint)
             };
             match control.reserve_outputs(&destinations, mint) {
                 true => Ok(JobMutation::Persist),
                 false => Ok(JobMutation::Skip),
             }
-        },
-    )
+        };
+        MutateControlOperation::new(job_id, Vec::new(), edit)
+    };
+    let map = |changed: ControlChange| Ok(changed.control);
+    StoreCall::minted(now_ms, build, map, ATTEMPT_EXHAUSTED)
 }
 
 pub fn authorize_cleanup(

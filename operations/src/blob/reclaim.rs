@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::time::SystemTime;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -22,7 +23,6 @@ use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKe
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::groups::backends::backend_key;
@@ -91,6 +91,8 @@ fn parsed<T>(
 /// a concurrent write either loses its commit or pins the hash first.
 #[derive(Debug, PartialEq)]
 pub struct ReclaimBlobOperation {
+    now_ms: u64,
+    ids: IdMint,
     key: ReclaimCandidateKey,
     enqueued_at: SystemTime,
     sweep_time: SystemTime,
@@ -114,6 +116,8 @@ impl ReclaimBlobOperation {
 
     pub fn new(key: ReclaimCandidateKey, enqueued_at: SystemTime, sweep_time: SystemTime) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             key,
             enqueued_at,
             sweep_time,
@@ -305,7 +309,7 @@ impl ReclaimBlobOperation {
         let work = (BlobCleanupWork::DeleteBlob { location }).to_bytes()?;
         let row = (
             BLOB_CLEANUP_KEYSPACE.to_string(),
-            Ulid::generate().to_bytes().to_vec().into(),
+            self.ids.mint(self.now_ms).to_bytes().to_vec().into(),
             work.into(),
         );
         self.call(ReclaimState::QueueCleanup, IoCall::Write(vec![row]))
@@ -386,12 +390,21 @@ impl Operation for ReclaimBlobOperation {
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+    use ulid::Ulid;
 
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
 
@@ -474,19 +487,7 @@ mod tests {
     }
 
     async fn write(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.to_string(),
-                key: key.into(),
-                value: value.into(),
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
+        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     async fn read(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {

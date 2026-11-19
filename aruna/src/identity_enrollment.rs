@@ -5,13 +5,13 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::document::DocumentTarget;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingPhase,
     OnboardingSecret, OnboardingTicket, issuer_proof_message, node_proof_message,
 };
 use aruna_core::structs::identity::realm::{RealmId, StaticRealmEndpoint};
-use aruna_core::time::unix_timestamp_secs;
 use aruna_net::parse_endpoint_config;
 use base64::Engine;
 use crypto_box::{

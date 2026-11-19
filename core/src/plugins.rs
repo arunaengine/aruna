@@ -177,6 +177,76 @@ pub struct Released {
     pub fields: Option<SecretBytes>,
 }
 
+/// A call to the plugin host's node-wide state, which lives as long as the node process.
+#[derive(Debug, PartialEq)]
+pub enum PluginEffect {
+    /// Takes one host call of the install at `now_ms` from its rate; answers `Taken`.
+    TakeCall { install_id: Ulid, now_ms: u64 },
+    /// Takes one webhook request of the install at `now_ms` from its rate; answers `Taken`.
+    TakeHook { install_id: Ulid, now_ms: u64 },
+    /// Reserves memory for an artifact of `bytes` from the node's budget; answers `Reserved`.
+    Reserve { bytes: u64 },
+    /// Forgets the `named` accounts and answers when each `unnamed` one was first seen, at
+    /// `now_ms` for one seen now; answers `Seen`.
+    FirstSeen {
+        named: Vec<UserId>,
+        unnamed: Vec<UserId>,
+        now_ms: u64,
+    },
+}
+
+/// The answer of a [`PluginEffect`].
+#[derive(Debug, PartialEq)]
+pub enum PluginEvent {
+    /// Whether the call or request was within the install's rate.
+    Taken(bool),
+    /// The reservation, or `None` while the node spends its budget elsewhere.
+    Reserved(Option<MemoryPermit>),
+    /// When each asked unnamed account was first seen, in the asked order.
+    Seen(Vec<u64>),
+}
+
+/// Memory reserved for one artifact upload or assembly, given back when dropped.
+pub struct MemoryPermit {
+    mib: u32,
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl MemoryPermit {
+    /// A reservation of `mib` that `release` gives back.
+    pub fn new(mib: u32, release: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            mib,
+            release: Some(Box::new(release)),
+        }
+    }
+
+    /// MiB this reservation holds of the node's budget.
+    pub fn mib(&self) -> u32 {
+        self.mib
+    }
+}
+
+impl Drop for MemoryPermit {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+impl std::fmt::Debug for MemoryPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MemoryPermit({} MiB)", self.mib)
+    }
+}
+
+impl PartialEq for MemoryPermit {
+    fn eq(&self, other: &Self) -> bool {
+        self.mib == other.mib
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

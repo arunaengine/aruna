@@ -57,6 +57,7 @@ pub enum Event {
     Group(GroupEvent),
     Session(Box<crate::compute::session::SessionAnswer>),
     Outbound(OutboundEvent),
+    Plugin(crate::plugins::PluginEvent),
     /// Answers `Effect::Delay` once its time passed.
     Delayed,
     /// The adapter of this effect kind did not answer within the runner's hang limit.
@@ -92,6 +93,19 @@ pub enum GroupResult {
     Unfinished,
     /// The member is a storage transaction effect or a group, which a group cannot run.
     Refused,
+}
+
+impl GroupResult {
+    /// The result of a finished child member, or `None` for any other member or result type.
+    pub fn child_outcome<T: 'static, E: 'static>(self) -> Option<Result<T, E>> {
+        let GroupResult::Done(event) = self else {
+            return None;
+        };
+        match *event {
+            Event::Child(outcome) => outcome.take(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -538,6 +552,10 @@ pub enum NetEvent {
     HolderAvoided,
     /// The cursor signature, or `None` when this node cannot sign the cursor.
     CursorSigned(Option<iroh::Signature>),
+    /// The sealed position, or `None` when it could not be sealed.
+    PositionSealed(Option<Vec<u8>>),
+    /// The opened position, or `None` when this process did not seal it.
+    PositionOpened(Option<Vec<u8>>),
     /// The peer's last-contact time is refreshed.
     PeerContact,
     Shard(Box<ShardNetEvent>),
@@ -1076,6 +1094,8 @@ impl Event {
                     DelegationSign,
                     HolderAvoided,
                     CursorSigned,
+                    PositionSealed,
+                    PositionOpened,
                     Shard,
                     TopicPeers,
                     MissingTopicPeers,
@@ -1147,6 +1167,7 @@ impl Event {
             Event::Child(_) => "Event::Child",
             Event::Job(_) => "Event::Job",
             Event::Git(_) => "Event::Git",
+            Event::Plugin(_) => "Event::Plugin",
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(

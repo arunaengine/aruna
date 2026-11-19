@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord, ResourceEvent,
 };
@@ -49,6 +50,7 @@ pub(crate) fn route_resource_event(
     event: &ResourceEvent,
     ctx: RoutingContext<'_>,
     now_ms: u64,
+    ids: &mut IdMint,
 ) -> Vec<NotificationRecord> {
     let realm_id = ctx.realm_id;
     let mut records = Vec::new();
@@ -64,6 +66,7 @@ pub(crate) fn route_resource_event(
                         continue;
                     }
                     records.push(NotificationRecord::new(
+                        ids.mint(now_ms),
                         admin,
                         NotificationClass::Direct,
                         NotificationKind::GroupJoinRequested {
@@ -83,6 +86,7 @@ pub(crate) fn route_resource_event(
         } => {
             if affected_user != actor_user_id {
                 records.push(NotificationRecord::new(
+                    ids.mint(now_ms),
                     *affected_user,
                     NotificationClass::Direct,
                     NotificationKind::AddedToGroup {
@@ -98,6 +102,7 @@ pub(crate) fn route_resource_event(
                         continue;
                     }
                     records.push(NotificationRecord::new(
+                        ids.mint(now_ms),
                         admin,
                         NotificationClass::Direct,
                         NotificationKind::GroupMemberAdded {
@@ -117,6 +122,7 @@ pub(crate) fn route_resource_event(
         } => {
             if affected_user != actor_user_id {
                 records.push(NotificationRecord::new(
+                    ids.mint(now_ms),
                     *affected_user,
                     NotificationClass::Direct,
                     NotificationKind::RemovedFromGroup {
@@ -144,6 +150,7 @@ pub(crate) fn route_resource_event(
             managers.dedup();
             for manager in managers {
                 records.push(NotificationRecord::new(
+                    ids.mint(now_ms),
                     manager,
                     NotificationClass::Direct,
                     NotificationKind::SecretUseWidened {
@@ -160,6 +167,7 @@ pub(crate) fn route_resource_event(
             if let Some(realm_auth) = ctx.realm_auth {
                 for admin in realm_admin_ids(realm_auth) {
                     records.push(NotificationRecord::new(
+                        ids.mint(now_ms),
                         admin,
                         NotificationClass::Direct,
                         NotificationKind::NodeOnboarded {
@@ -256,6 +264,7 @@ mod pure_tests {
                 realm_id: REALM,
             },
             100,
+            &mut IdMint::new(1),
         );
         assert_eq!(
             records
@@ -322,6 +331,7 @@ mod pure_tests {
                 realm_id: REALM,
             },
             1,
+            &mut IdMint::new(1),
         );
         assert!(joins.is_empty());
 
@@ -344,6 +354,7 @@ mod pure_tests {
                 realm_id: REALM,
             },
             1,
+            &mut IdMint::new(1),
         );
         assert!(onboarded.is_empty());
     }
@@ -366,6 +377,7 @@ mod pure_tests {
                 realm_id: REALM,
             },
             1_000,
+            &mut IdMint::new(1),
         );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].recipient, admin);
@@ -391,6 +403,7 @@ mod pure_tests {
                 realm_id: REALM,
             },
             1_000,
+            &mut IdMint::new(1),
         );
 
         assert_eq!(records.len(), 2);
@@ -425,6 +438,7 @@ mod pure_tests {
                 realm_id: REALM,
             },
             1_000,
+            &mut IdMint::new(1),
         );
 
         assert!(
@@ -451,6 +465,7 @@ mod pure_tests {
                 realm_id: REALM,
             },
             1_000,
+            &mut IdMint::new(1),
         );
 
         assert_eq!(records.len(), 1);
@@ -477,6 +492,7 @@ mod pure_tests {
                 realm_id: REALM,
             },
             1_000,
+            &mut IdMint::new(1),
         );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].recipient, affected);
@@ -497,12 +513,13 @@ mod pure_tests {
                 realm_id: REALM,
             },
             1_000,
+            &mut IdMint::new(1),
         );
         assert!(self_removal.is_empty());
     }
 
     fn watch_subscription(owner: UserId, prefix: &str, mask: WatchEventMask) -> WatchSubscription {
-        WatchSubscription::new(owner, prefix.to_string(), mask, 1_000)
+        WatchSubscription::new(ulid::Ulid::new(), owner, prefix.to_string(), mask, 1_000)
     }
 
     fn upload_event(actor: UserId, path: &str) -> WatchEvent {
@@ -778,7 +795,7 @@ mod pure_tests {
             realm_id: REALM,
         };
         let recipients = |actor| {
-            let records = route_resource_event(&notice(actor), context(), 100);
+            let records = route_resource_event(&notice(actor), context(), 100, &mut IdMint::new(1));
             records
                 .iter()
                 .map(|record| record.recipient)

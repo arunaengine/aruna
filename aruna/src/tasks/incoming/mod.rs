@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::document::{
     DocumentOutboxEvent, DocumentOutboxRecord, DocumentSyncPublish, DocumentTarget,
@@ -20,7 +21,6 @@ use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_tasks::shutdown::Shutdown;
@@ -96,8 +96,9 @@ use aruna_operations::metadata::materialization_queue::{
 };
 use aruna_operations::metadata::projection::{
     DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
-    ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation, max_clock_skew,
+    ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation,
 };
+use aruna_operations::replication::catch_up::CatchUpCursors;
 
 /// Replays the whole event log into the registry projection, one page at a time.
 async fn replay_event_log(
@@ -107,7 +108,7 @@ async fn replay_event_log(
     let mut after = None;
     let mut projected = 0usize;
     loop {
-        let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
+        let page = ReplayPageOperation::new(after, local_node);
         let (count, next) = aruna_drivers::driver::drive(page, context).await?;
         projected = projected.saturating_add(count);
         match next {
@@ -267,6 +268,9 @@ pub(crate) struct OperationsTaskHandler {
     // Queued bucket the next migration run resumes after. Loss on restart is fine: the
     // next run starts at the head of the queue.
     migration_cursor: std::sync::Mutex<Option<Key>>,
+    // Where the replication drain's bootstrap work goes on. Loss on restart is fine: the
+    // next drain starts at the first set and range.
+    catch_up: std::sync::Mutex<CatchUpCursors>,
     wake_cursor: std::sync::Mutex<Option<Key>>,
     // Rotation state of the bounded outbox drain. Loss on restart is fine: the
     // next rotation opens at the head.
@@ -411,6 +415,7 @@ impl OperationsTaskHandler {
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             reclaim_cursor: std::sync::Mutex::new(None),
             migration_cursor: std::sync::Mutex::new(None),
+            catch_up: std::sync::Mutex::default(),
             wake_cursor: std::sync::Mutex::new(None),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             published_records: std::sync::Mutex::new(BTreeSet::new()),
@@ -982,7 +987,8 @@ impl OperationsTaskHandler {
                     warn!("Cannot record a timed bucket lock without net handle");
                     return;
                 };
-                let operation = LockBucketOperation::timed(ticket, net_handle.node_id());
+                let now_ms = aruna_core::time::unix_timestamp_millis();
+                let operation = LockBucketOperation::timed(ticket, net_handle.node_id(), now_ms);
                 if let Err(error) = drive(operation, &self.context).await {
                     warn!(error = %error, "Timed bucket lock failed");
                 }

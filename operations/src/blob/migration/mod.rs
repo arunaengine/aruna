@@ -12,6 +12,7 @@ pub mod queue;
 pub mod rewrite;
 pub mod shared;
 
+use aruna_core::id_mint::IdMint;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
@@ -147,6 +148,8 @@ type Turn = Result<Next<MigrateOutcome>, MigrateVersionError>;
 /// routing inputs to the storage and encoding a new write of its key gets.
 #[derive(Debug, PartialEq)]
 pub struct MigrateVersionOperation {
+    now_ms: u64,
+    ids: IdMint,
     version_key: VersionKey,
     target: Compression,
     now: SystemTime,
@@ -203,6 +206,8 @@ pub struct MigrateVersionOperation {
 impl MigrateVersionOperation {
     pub fn new(version_key: VersionKey, target: Compression, now: SystemTime) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             version_key,
             target,
             now,
@@ -559,10 +564,10 @@ impl MigrateVersionOperation {
             Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
             other => return self.unexpected(other),
         };
+        let attempt = self.attempt();
         let Some(plain) = self.plain.as_ref() else {
             return Err(MigrateVersionError::NotFinished);
         };
-        let attempt = self.attempt();
         let versioned = plain.same_name && version.is_some() && self.plain_owned;
         let (path, if_not_exists) = same_name_path(&plain.path, attempt, exists, versioned);
         self.plain_path = Some(PlainPath {
@@ -647,11 +652,13 @@ impl MigrateVersionOperation {
         self.new = Some(location);
         // An earlier attempt left this copy and its intents; the publication retires them,
         // after the provider upload that attempt recorded is settled.
-        self.written_intent = self.intent_keys(self.attempt());
+        let attempt = self.attempt();
+        self.written_intent = self.intent_keys(attempt);
+        let attempt = self.attempt();
         self.blob(
             MigrateState::SettleCopy,
             BlobEffect::SettleCopy {
-                attempt: self.attempt(),
+                attempt,
                 upload: None,
             },
         )
@@ -741,13 +748,11 @@ impl MigrateVersionOperation {
 
     /// A rename keeps one attempt id per old file, apart from the old file's own id, so a
     /// retry stores the same intents and names the same copy.
-    fn attempt(&self) -> Ulid {
-        match (self.renaming, self.old.as_ref()) {
-            (true, Some(old)) => Ulid::from(u128::from(old.ulid) ^ 1),
-            _ => self
-                .plain_path
-                .as_ref()
-                .map_or_else(Ulid::generate, |path| path.ulid),
+    fn attempt(&mut self) -> Ulid {
+        match (self.renaming, self.old.as_ref(), self.plain_path.as_ref()) {
+            (true, Some(old), _) => Ulid::from(u128::from(old.ulid) ^ 1),
+            (_, _, Some(path)) => path.ulid,
+            _ => self.ids.mint(self.now_ms),
         }
     }
 
@@ -1272,7 +1277,7 @@ impl MigrateVersionOperation {
             };
             writes.push((
                 BLOB_CLEANUP_KEYSPACE.to_string(),
-                Ulid::generate().to_bytes().to_vec().into(),
+                self.ids.mint(self.now_ms).to_bytes().to_vec().into(),
                 work.to_bytes()?.into(),
             ));
         }
@@ -1385,6 +1390,14 @@ impl Operation for MigrateVersionOperation {
         }
         self.owns_row = false;
         self.leave_calls()
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

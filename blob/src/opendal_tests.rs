@@ -4,6 +4,7 @@
 
 use super::*;
 use aruna_core::egress::EgressPolicy;
+use aruna_core::testing::EnvGuard;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,37 +38,8 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Restores every swapped variable on drop, so a test that panics first
-/// still hands the process environment back unchanged.
-struct EnvGuard {
-    previous: Vec<(String, Option<String>)>,
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.previous.drain(..) {
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-    }
-}
-
 fn swap_env(entries: &[(&str, Option<String>)]) -> EnvGuard {
-    EnvGuard {
-        previous: entries
-            .iter()
-            .map(|(key, value)| {
-                let previous = std::env::var(key).ok();
-                match value {
-                    Some(value) => unsafe { std::env::set_var(key, value) },
-                    None => unsafe { std::env::remove_var(key) },
-                }
-                ((*key).to_string(), previous)
-            })
-            .collect(),
-    }
+    EnvGuard::swap(entries)
 }
 
 /// Loopback endpoint that counts inbound connections and answers 404, so a

@@ -93,20 +93,7 @@ impl From<IoError> for LockError {
     }
 }
 
-impl From<AuditError> for LockError {
-    fn from(error: AuditError) -> Self {
-        match error {
-            AuditError::Conversion(error) => Self::Conversion(error),
-            AuditError::Storage(error) => Self::Storage(error),
-            AuditError::NotAuditTimer => Self::NotFinished,
-            AuditError::Unexpected(received) => Self::InvalidStateEvent {
-                state: "WriteAudit".to_string(),
-                expected: "the audit retry timer's answer",
-                received,
-            },
-        }
-    }
-}
+crate::s3::bucket::audit_retry::audit_failure!(LockError, "WriteAudit");
 
 type LockTurn = Result<Next<LockResult>, LockError>;
 
@@ -158,8 +145,8 @@ impl LockBucketOperation {
         }
     }
 
-    /// The node's own lock of one timed session, after its deadline passed.
-    pub fn timed(session: KeyTicket, node_id: NodeId) -> Self {
+    /// The node's own lock of one timed session at `now_ms`, after its deadline passed.
+    pub fn timed(session: KeyTicket, node_id: NodeId, now_ms: u64) -> Self {
         let mut operation = Self::new(LockInput {
             bucket: String::new(),
             group_id: Ulid::nil(),
@@ -167,7 +154,7 @@ impl LockBucketOperation {
             node_id,
             caller: None,
             session: Some(session),
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms,
         });
         operation.bucket_id = Some(session.key.bucket_id);
         operation
@@ -513,7 +500,7 @@ mod tests {
     #[test]
     fn locks_named_session() {
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let mut operation = LockBucketOperation::timed(ticket(2), node);
+        let mut operation = LockBucketOperation::timed(ticket(2), node, 1_000);
         // The node locks by session alone, without reading the bucket.
         let turn = operation.first();
         let lock = BlobEffect::LockKey {

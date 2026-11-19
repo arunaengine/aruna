@@ -29,6 +29,7 @@ use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_REKEY_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -55,10 +56,9 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -182,6 +182,8 @@ fn written(result: IoResult) -> Result<(), SealedCopyError> {
 
 #[derive(Debug, PartialEq)]
 pub struct SealedCopyOperation {
+    now_ms: u64,
+    ids: IdMint,
     input: SealedCopyInput,
     step: Step,
     /// Destination of this node; absent fails every governed copy closed.
@@ -222,7 +224,9 @@ impl SealedCopyOperation {
             gate_context: None,
             gated: None,
             refs: Vec::new(),
-            version_id: Ulid::generate(),
+            version_id: Ulid::nil(),
+            now_ms: 0,
+            ids: IdMint::default(),
             version: None,
             existing: None,
             binding: None,
@@ -394,7 +398,7 @@ impl SealedCopyOperation {
         let copy = AbeEffect::Copy {
             source,
             epoch,
-            write_id: Ulid::generate(),
+            write_id: self.ids.mint(self.now_ms),
             object_key: self.input.dest_key.clone(),
         };
         Ok(Next::Call(
@@ -516,7 +520,10 @@ impl SealedCopyOperation {
         let mut metadata = self.input.metadata.clone().unwrap_or(source.metadata);
         // A copy is never a release, even of a release crate.
         aruna_core::structs::storage::bucket_metadata::strip_release_keys(&mut metadata);
-        let mut version = BlobVersion::deleted(SystemTime::now(), self.input.user_id);
+        let mut version = BlobVersion::deleted(
+            SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
+            self.input.user_id,
+        );
         version.state = state;
         self.version = Some(
             version
@@ -579,7 +586,7 @@ impl SealedCopyOperation {
             (input.realm_id, input.group_id, input.node_id),
             (&input.bucket, &input.dest_key),
             self.version_id,
-            unix_timestamp_millis(),
+            self.now_ms,
         );
         let effect = write_version_effect(&self.dest_version(), &version)?;
         let effect = journaled(effect, &uploaded)?;
@@ -783,6 +790,7 @@ impl Operation for SealedCopyOperation {
     type Error = SealedCopyError;
 
     fn first(&mut self) -> Turn {
+        self.version_id = self.ids.mint(self.now_ms);
         self.step = Step::ReadBucket;
         let read = read_row(S3_BUCKET_KEYSPACE, self.input.bucket.as_bytes().to_vec());
         Ok(Next::Call(outside(read)))
@@ -843,6 +851,14 @@ impl Operation for SealedCopyOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

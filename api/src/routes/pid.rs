@@ -16,6 +16,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::holder_choice::{HolderCandidate, HolderChoiceOperation, pick};
 use aruna_core::metadata::AuthToken;
@@ -30,7 +31,6 @@ use aruna_core::structs::{
     PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
     PersistentIdStatus,
 };
-use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -162,7 +162,7 @@ async fn document_landing(
             ctx.as_ref(),
             state.get_node_id(),
             document_id,
-            aruna_core::time::unix_timestamp_millis(),
+            aruna_clock::unix_timestamp_millis(),
         )
         .await
         {

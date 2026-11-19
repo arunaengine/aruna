@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::plugin_host::worker::tests::worker;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::keyspaces::PLUGIN_OUTBOX_KEYSPACE;
 use aruna_core::plugin_runs::RunState;
 use aruna_core::plugin_runs::RunTrigger;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::plugins::flow_support::decide::event;
 use aruna_operations::plugins::flow_support::decide::runs;
 use aruna_operations::plugins::flow_support::matcher::journal;

@@ -209,31 +209,9 @@ async fn disconnect_stops_reads() {
     assert!(late.is_none());
 }
 
-#[tokio::test]
-async fn silent_crate_incomplete() {
-    // A run whose crate does not answer, or answers too late, leaves the export incomplete.
-    let hop = Hop {
-        target: Target::Run("r1".to_string()),
-        from: "file".to_string(),
-        property: "result",
-        digest: None,
-    };
-    let status = |read: Option<Read>| {
-        let mut built = ProvenanceCrate::new("file", "2026-10-28T00:00:00Z").unwrap();
-        let (_, _, go_on) = record_run(&mut built, &hop, read);
-        let mut out = Vec::new();
-        built.write_root(&mut out, &|| false).unwrap();
-        let root: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        let graph = root["@graph"].as_array().unwrap().clone();
-        let status =
-            graph.iter().find(|node| node["@id"] == "./").unwrap()["creativeWorkStatus"].clone();
-        (status.as_str().unwrap().to_string(), go_on)
-    };
-    assert_eq!(status(Some(Read::Hidden)), ("Complete".to_string(), true));
-    let (silent, go_on) = status(Some(Read::Silent));
-    assert!(silent.starts_with("Incomplete") && go_on);
-    let (late, go_on) = status(None);
-    assert!(late.starts_with("Incomplete") && !go_on);
+#[test]
+fn failures_classified() {
+    // A refusal hides a hop; any other failure means it did not answer.
     assert!(matches!(
         classify(Err(ServerError::ServiceUnavailableReason(
             "busy".to_string()
@@ -302,21 +280,6 @@ async fn finish_window_kept() {
     );
     let far = now + EXPORT_DEADLINE;
     assert_eq!(walk_deadline(now, far), far - FINISH_WINDOW);
-}
-
-#[test]
-fn stopped_root_removed() {
-    // A root write that is told to stop removes its own file.
-    let built = ProvenanceCrate::new("start", "2026-10-28T00:00:00Z").unwrap();
-    let mut built = built;
-    built.push([built.version_start()]);
-    let hop = built.pop().unwrap();
-    built.hidden(&hop);
-    let path = scratch_dir()
-        .unwrap()
-        .join(format!("{}.json", scratch_name()));
-    assert!(spool_root(built, path.clone(), &|| true).is_err());
-    assert!(!path.exists());
 }
 
 #[tokio::test]

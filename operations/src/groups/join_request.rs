@@ -381,6 +381,7 @@ impl JoinWrite {
                     realm_id: self.input.actor.realm_id,
                 },
                 self.input.now_ms,
+                &mut self.ids,
             )
         } else {
             Vec::new()

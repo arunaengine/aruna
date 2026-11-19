@@ -177,7 +177,6 @@ mod tests {
     use super::*;
     use crate::s3::bucket::dataset::BucketMetadataOperation;
     use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -188,13 +187,7 @@ mod tests {
     use ulid::Ulid;
 
     async fn write(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        let effect = StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        };
-        context.storage_handle.send_storage_effect(effect).await;
+        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     #[tokio::test]

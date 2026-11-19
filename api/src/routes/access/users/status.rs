@@ -5,9 +5,9 @@
 use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::time::unix_timestamp_secs;
 use aruna_drivers::driver::drive;
 use aruna_operations::users::account_status::{
     AccountStatusConfig, AccountStatusError, AccountStatusOperation,

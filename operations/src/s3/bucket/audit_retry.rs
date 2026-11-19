@@ -625,3 +625,25 @@ mod tests {
         );
     }
 }
+
+/// Converts audit retry failures into an operation error that names the state `$state`.
+macro_rules! audit_failure {
+    ($error:ty, $state:literal) => {
+        impl From<$crate::s3::bucket::audit_retry::AuditError> for $error {
+            fn from(error: $crate::s3::bucket::audit_retry::AuditError) -> Self {
+                use $crate::s3::bucket::audit_retry::AuditError;
+                match error {
+                    AuditError::Conversion(error) => Self::Conversion(error),
+                    AuditError::Storage(error) => Self::Storage(error),
+                    AuditError::NotAuditTimer => Self::NotFinished,
+                    AuditError::Unexpected(received) => Self::InvalidStateEvent {
+                        state: $state.to_string(),
+                        expected: "the audit retry timer's answer",
+                        received,
+                    },
+                }
+            }
+        }
+    };
+}
+pub(crate) use audit_failure;

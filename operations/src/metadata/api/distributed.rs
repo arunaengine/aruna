@@ -9,16 +9,21 @@ use super::{
 };
 use crate::metadata::local_query::QUERY_MAX_BYTES;
 
-pub(super) fn record_bucket_result(span: &Span, result: &Result<BucketPage, MetadataReadError>) {
-    match result {
-        Ok(page) => {
+/// Notes on `span` whether a node answered and how many hits it returned.
+pub(super) fn record_hits(span: &Span, hits: Option<usize>) {
+    match hits {
+        Some(count) => {
             span.record("result", "ok");
-            span.record("hit_count", page.hits.len() as u64);
+            span.record("hit_count", count as u64);
         }
-        Err(_) => {
+        None => {
             span.record("result", "error");
         }
     }
+}
+
+pub(super) fn record_bucket_result(span: &Span, result: &Result<BucketPage, MetadataReadError>) {
+    record_hits(span, result.as_ref().ok().map(|page| page.hits.len()))
 }
 
 pub(super) fn record_query_result(

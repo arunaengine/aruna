@@ -1015,13 +1015,7 @@ async fn sync_surfaces_errors() {
 }
 
 pub(super) async fn start_write_transaction(handle: &StorageHandle) -> Ulid {
-    match handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => panic!("unexpected storage event: {other:?}"),
-    }
+    handle.begin_write().await
 }
 
 #[tokio::test]

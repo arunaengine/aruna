@@ -387,6 +387,18 @@ impl StorageHandle {
         skip(self, effect),
         fields(operation = storage_effect_kind(&effect))
     )]
+    /// Starts a write transaction and returns its id; panics on any other answer.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn begin_write(&self) -> Ulid {
+        match self
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
     pub async fn send_storage_effect(&self, effect: StorageEffect) -> Event {
         Event::Storage(self.dispatch_storage_effect(effect).await)
     }

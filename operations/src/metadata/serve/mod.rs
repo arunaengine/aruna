@@ -14,6 +14,7 @@ mod writes;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::Here;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::realm_vault::RealmSecretRef;
 use aruna_core::structs::identity::realm::RealmId;
@@ -143,6 +144,9 @@ pub struct ServeRequestOperation {
     node: ServeNode,
     message: Option<MetadataTransportMessage>,
     waiting: Option<Waiting>,
+    /// The runner's time and the fresh ids of this run, for the ids a request needs.
+    now_ms: u64,
+    ids: IdMint,
 }
 
 type ServeTurn = Result<Next<ServedReply>, IoError>;
@@ -154,6 +158,8 @@ impl ServeRequestOperation {
             node,
             message: Some(message),
             waiting: None,
+            now_ms: 0,
+            ids: IdMint::new(0),
         }
     }
 
@@ -193,6 +199,14 @@ impl Operation for ServeRequestOperation {
     type Output = ServedReply;
     type Error = IoError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> ServeTurn {
         let peer = self.peer;
         let message = self.message.take().ok_or(IoError::Unexpected {
@@ -203,8 +217,9 @@ impl Operation for ServeRequestOperation {
             let read = CallerReadOperation::new(peer, self.node.clone(), message, reply);
             return self.call(Waiting::Reply, IoCall::child(read));
         }
+        let fresh = self.ids.mint(self.now_ms);
         let local = (self.node.local, self.node.here.as_ref());
-        let message = match forward_call(peer, local, message) {
+        let message = match forward_call(peer, local, message, fresh) {
             Ok(Forward::Call(call, reply)) => return self.call(Waiting::Forward(reply), call),
             Ok(Forward::Done(reply)) => return Ok(Next::Done((reply, None))),
             Err(message) => message,

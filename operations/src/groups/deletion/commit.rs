@@ -31,7 +31,7 @@ use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecr
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Key, Value};
 
-use crate::auth::permission_rules::{read_rules, rule_reads};
+use crate::auth::permission_rules::read_rules;
 use crate::groups::backends::{backend_key, index_prefix};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
@@ -282,8 +282,7 @@ impl CommitWrite {
             true => Stage::RealmAuth,
             false => Stage::GroupAuth,
         };
-        let reads = rule_reads(&self.auth_path(realm)).map_err(unavailable)?;
-        Ok(Next::Call(IoCall::Read(reads)))
+        Ok(Next::Call(super::auth_call(&self.auth_path(realm))?))
     }
 
     fn authorized(

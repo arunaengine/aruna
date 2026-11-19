@@ -40,7 +40,7 @@ impl CompleteUploadOperation {
         }
         let id = self
             .version_id
-            .unwrap_or_else(|| mint_version(self.set_hint));
+            .unwrap_or_else(|| mint_version(Ulid::generate(), self.set_hint));
         let (bucket, key) = (&self.input.bucket, &self.input.key);
         let target = self
             .routing
@@ -456,6 +456,7 @@ impl CompleteUploadOperation {
     pub(super) fn plain_records(
         &self,
         rule_exists: bool,
+        release: Ulid,
     ) -> Result<Vec<(String, Key, Value)>, aruna_core::errors::ConversionError> {
         let (Some(written), Some(output), Some(version_id)) = (
             self.composed_location.as_ref(),
@@ -481,7 +482,7 @@ impl CompleteUploadOperation {
             key: &self.input.key,
         };
         let mut writes = record.writes(rule_exists)?;
-        writes.extend(self.dedup_release().transpose()?);
+        writes.extend(self.dedup_release(release).transpose()?);
         Ok(writes)
     }
 }
@@ -1288,7 +1289,9 @@ mod tests {
         operation.next(row(None)).unwrap();
         assert_eq!(operation.final_location.as_ref(), Some(&old));
         // The assembled file is released after the commit, at its exact backend version.
-        let writes = operation.plain_records(true).unwrap();
+        let writes = operation
+            .plain_records(true, Ulid::from_bytes([9; 16]))
+            .unwrap();
         let release = writes
             .iter()
             .find(|(space, ..)| space == BLOB_CLEANUP_KEYSPACE)

@@ -45,6 +45,32 @@ pub fn path_context(root: &str) -> DriverContext {
     test_context(aruna_storage::FjallStorage::open(root).expect("open the test store"))
 }
 
+/// A storage-only driver context on a fresh temporary store.
+pub fn temp_context() -> (tempfile::TempDir, DriverContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let context = path_context(dir.path().to_str().expect("temp path"));
+    (dir, context)
+}
+
+/// Writes one value outside a transaction; panics on any other answer.
+pub async fn write_value(
+    storage: &StorageHandle,
+    key_space: &str,
+    key: impl Into<ByteView>,
+    value: impl Into<ByteView>,
+) {
+    let write = StorageEffect::Write {
+        key_space: key_space.to_string(),
+        key: key.into(),
+        value: value.into(),
+        txn_id: None,
+    };
+    match storage.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected storage event: {other:?}"),
+    }
+}
+
 /// Writes `writes` in one batch outside a transaction; panics on any other answer.
 pub async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
     match storage
@@ -166,12 +192,12 @@ pub fn sign_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
 pub async fn replay_event_log(
     context: &DriverContext,
 ) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
-    use crate::metadata::projection::{ReplayPageOperation, max_clock_skew};
+    use crate::metadata::projection::ReplayPageOperation;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let mut after = None;
     let mut projected = 0usize;
     loop {
-        let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
+        let page = ReplayPageOperation::new(after, local_node);
         let (count, next) = aruna_drivers::driver::drive(page, context).await?;
         projected = projected.saturating_add(count);
         match next {
@@ -188,9 +214,9 @@ pub async fn drain_projection_queue(
     crate::metadata::projection::PendingProjectionResult,
     crate::metadata::projection::MetadataProjectionError,
 > {
-    use crate::metadata::projection::{DrainProjectionOperation, max_clock_skew};
+    use crate::metadata::projection::DrainProjectionOperation;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let drain = DrainProjectionOperation::new(local_node, max_clock_skew());
+    let drain = DrainProjectionOperation::new(local_node);
     aruna_drivers::driver::drive(drain, context).await
 }
 
@@ -200,8 +226,8 @@ pub async fn project_create_events(
     events: Vec<aruna_core::metadata::MetadataEventRecord>,
     local_node_id: Option<aruna_core::NodeId>,
 ) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
-    use crate::metadata::projection::{ProjectEventsOperation, max_clock_skew};
-    let project = ProjectEventsOperation::new(events, local_node_id, max_clock_skew());
+    use crate::metadata::projection::ProjectEventsOperation;
+    let project = ProjectEventsOperation::new(events, local_node_id);
     aruna_drivers::driver::drive(project, context).await
 }
 
@@ -210,9 +236,9 @@ pub async fn project_logged_events(
     context: &DriverContext,
     targets: impl IntoIterator<Item = (ulid::Ulid, ulid::Ulid)>,
 ) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
-    use crate::metadata::projection::{ProjectLoggedOperation, max_clock_skew};
+    use crate::metadata::projection::ProjectLoggedOperation;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let project = ProjectLoggedOperation::new(targets, false, local_node, max_clock_skew());
+    let project = ProjectLoggedOperation::new(targets, false, local_node);
     Ok(aruna_drivers::driver::drive(project, context)
         .await?
         .projected)
@@ -349,5 +375,82 @@ pub async fn export_rocrate_jsonld(
             "unexpected metadata export event: {}",
             other.label()
         ))),
+    }
+}
+
+/// A refresh of `version_id` at `bucket`/`key` with `metadata`, by node 4 for a user of realm 9.
+pub fn reference_refresh(
+    bucket: String,
+    key: String,
+    version_id: ulid::Ulid,
+    metadata: aruna_core::structs::execution::source_access::SourceMetadata,
+    refreshed_at: std::time::SystemTime,
+) -> crate::s3::object::metadata::ReferenceRefresh {
+    crate::s3::object::metadata::ReferenceRefresh {
+        bucket,
+        key,
+        version_id,
+        metadata: Some(metadata),
+        refreshed_at,
+        node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+        auth_context: aruna_core::structs::identity::auth::AuthContext::new(
+            Default::default(),
+            RealmId([9u8; 32]),
+        ),
+    }
+}
+
+/// The stored user `user_id`; panics when the read answers anything else.
+pub async fn read_user(
+    context: &DriverContext,
+    user_id: aruna_core::UserId,
+) -> aruna_core::structs::identity::user::User {
+    let key = user_id.to_bytes().to_vec();
+    let value = read_value(
+        &context.storage_handle,
+        aruna_core::keyspaces::USER_KEYSPACE,
+        key,
+    )
+    .await
+    .expect("the user is stored");
+    aruna_core::structs::identity::user::User::from_bytes(&value).unwrap()
+}
+
+/// Claims of `user_id` issued by `realm_id`, valid for ten minutes from now.
+pub fn token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenClaims {
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    TokenClaims {
+        sub: user_id.to_string(),
+        iss: realm_id.to_string(),
+        iat: now,
+        exp: now + 600,
+        jti: ulid::Ulid::generate().to_string(),
+        sid: None,
+        session_kind: None,
+        restrictions: None,
+        issuer_pubkey: None,
+        delegation_signature: None,
+        name: None,
+        via: None,
+        auth_time: None,
+    }
+}
+
+/// An enabled or `disabled` S3 backend of group 1 that keeps its data on removal.
+pub fn group_storage(
+    backend_id: ulid::Ulid,
+    disabled: bool,
+) -> aruna_core::structs::storage::group_backend::GroupStorage {
+    aruna_core::structs::storage::group_backend::GroupStorage {
+        backend_id,
+        group_id: ulid::Ulid::from_bytes([1u8; 16]),
+        name: "tenant".to_string(),
+        kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
+        public_config: std::collections::HashMap::new(),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        updated_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        disabled,
+        cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
     }
 }

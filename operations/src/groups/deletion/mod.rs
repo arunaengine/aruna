@@ -13,6 +13,8 @@ mod resources;
 
 pub use check::{CheckGroupOperation, GroupBlockers};
 pub use coordinator::{DeleteGroupOperation, InstallOnboardingOperation};
+
+use aruna_core::structs::identity::group_delete::GroupDeletionError;
 pub(crate) use peer::ApplyRequestOperation;
 
 #[cfg(test)]
@@ -23,3 +25,10 @@ pub mod check_tests;
 mod recovery_tests;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod tests;
+
+/// The reads of the permission rules on `path`.
+fn auth_call(path: &str) -> Result<aruna_core::calls::IoCall, GroupDeletionError> {
+    crate::auth::permission_rules::rule_reads(path)
+        .map(aruna_core::calls::IoCall::Read)
+        .map_err(|error| GroupDeletionError::Unavailable(error.to_string()))
+}

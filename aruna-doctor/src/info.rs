@@ -284,7 +284,7 @@ fn env_key(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ConfigView, fetch_info, http_base_url};
-    use crate::tests::fixtures::{TestEnvGuard, env_lock};
+    use crate::tests::fixtures::env_lock;
     use aruna::config::load;
     use aruna::inbound::initialize_net_holder;
     use aruna::tasks::incoming::start_task_queues;
@@ -293,6 +293,7 @@ mod tests {
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::testing::EnvGuard;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::realm::announce_presence::{
@@ -307,7 +308,7 @@ mod tests {
 
     struct TestNode {
         _temp_dir: tempfile::TempDir,
-        _env_guard: TestEnvGuard,
+        _env_guard: EnvGuard,
         http_addr: std::net::SocketAddr,
         server_task: tokio::task::JoinHandle<()>,
         net: NetHandle,
@@ -327,7 +328,7 @@ mod tests {
         let blob_root = temp_dir.path().join("blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
 
-        let env_guard = TestEnvGuard::set(&[
+        let env_guard = EnvGuard::set(&[
             ("DATABASE_DIR", storage_path.to_str().unwrap().to_string()),
             ("CONTENT_DIR", blob_root.to_str().unwrap().to_string()),
             ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
@@ -459,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn onboarding_secret() {
         let _env_lock = env_lock().lock().await;
-        let _guard = TestEnvGuard::set(&[
+        let _guard = EnvGuard::set(&[
             ("DATABASE_DIR", "/tmp/storage".to_string()),
             ("ONBOARDING_SECRET", "secret".to_string()),
         ]);
@@ -472,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn doctor_matches_defaults() {
         let _env_lock = env_lock().lock().await;
-        let _guard = TestEnvGuard::set(&[
+        let _guard = EnvGuard::set(&[
             ("DATABASE_DIR", "/tmp/aruna-doctor-defaults".to_string()),
             (
                 "CONTENT_DIR",
@@ -480,7 +481,7 @@ mod tests {
             ),
             ("METADATA_REPLICATION_FACTOR", "0".to_string()),
         ]);
-        let _unset = TestEnvGuard::remove(&["BLOB_MAX_BUCKET_SIZE", "BLOB_MULTIPART_BUCKET"]);
+        let _unset = EnvGuard::remove(&["BLOB_MAX_BUCKET_SIZE", "BLOB_MULTIPART_BUCKET"]);
 
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
         let settings = aruna::settings::read_settings().unwrap();
@@ -508,11 +509,11 @@ mod tests {
         let _env_lock = env_lock().lock().await;
         // Load the `.env` file first, so it cannot restore CONTENT_DIR after the removal.
         let _ = dotenvy::var("CONTENT_DIR");
-        let _guard = TestEnvGuard::set(&[
+        let _guard = EnvGuard::set(&[
             ("DATABASE_DIR", "/tmp/aruna-doctor-content".to_string()),
             ("METADATA_REPLICATION_FACTOR", "0".to_string()),
         ]);
-        let _unset = TestEnvGuard::remove(&["CONTENT_DIR"]);
+        let _unset = EnvGuard::remove(&["CONTENT_DIR"]);
 
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
         let settings = aruna::settings::read_settings().unwrap();
@@ -524,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn doctor_relays() {
         let _env_lock = env_lock().lock().await;
-        let _guard = TestEnvGuard::set(&[(
+        let _guard = EnvGuard::set(&[(
             "P2P_ADDITIONAL_RELAY_URLS",
             "https://relay-a.example,https://relay-b.example".to_string(),
         )]);
@@ -543,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn reports_public_urls() {
         let _env_lock = env_lock().lock().await;
-        let _guard = TestEnvGuard::set(&[
+        let _guard = EnvGuard::set(&[
             ("API_PUBLIC_URL", "https://api.example.test".to_string()),
             ("S3_PUBLIC_URL", "https://s3.example.test".to_string()),
         ]);

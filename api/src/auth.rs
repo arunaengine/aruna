@@ -406,6 +406,14 @@ pub enum AuthorizationError {
     ReqwestError(#[from] reqwest::Error),
 }
 
+/// Awaits `future` and attributes its wall time to the named request stage.
+async fn time_stage<F: Future>(name: &'static str, future: F) -> F::Output {
+    let started = Instant::now();
+    let output = future.await;
+    aruna_core::telemetry::record_stage(name, started.elapsed());
+    output
+}
+
 #[cfg(test)]
 async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Option<AuthContext> {
     extract_auth_parts(state, headers).await.0
@@ -463,8 +471,7 @@ pub async fn auth_middleware(
     // Extract and validate token, get Option<AuthContext>
     // We clone headers to avoid borrowing issues with the async function
     let headers = request.headers().clone();
-    let (auth_ctx, bearer_token) =
-        aruna_core::telemetry::time_stage("auth", extract_auth_parts(&state, &headers)).await;
+    let (auth_ctx, bearer_token) = time_stage("auth", extract_auth_parts(&state, &headers)).await;
     record_auth_context(auth_ctx.as_ref());
 
     // Always insert (Some or None) - handlers decide if auth is required
@@ -666,7 +673,7 @@ pub(crate) async fn ensure_permission_with(
     required_permission: Permission,
     extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> ServerResult<()> {
-    aruna_core::telemetry::time_stage(
+    time_stage(
         "permission",
         drive(
             AuthorizeOperation::new(
@@ -1024,7 +1031,7 @@ mod test {
     }
 
     async fn revoke(driver_ctx: &Arc<DriverContext>, actor: Actor, token: &str) {
-        let now = aruna_core::time::unix_timestamp_secs();
+        let now = aruna_clock::unix_timestamp_secs();
         let token_owner = actor.user_id;
         drive(
             RevokeTokenOperation::new(RevokeTokenConfig {

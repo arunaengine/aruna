@@ -29,12 +29,7 @@ fn actor() -> Actor {
 }
 
 fn auth(user_id: UserId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id: REALM,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, REALM)
 }
 
 /// Management node 1 serves; node 2 is a server, node 3 a device of user 3.

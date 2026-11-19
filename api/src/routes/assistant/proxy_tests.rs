@@ -43,9 +43,9 @@ fn make_provider(
         secret: EncryptedS3Secret::empty(),
         models: Vec::new(),
         default_model: None,
-        created_at: aruna_core::time::unix_timestamp_secs(),
+        created_at: aruna_clock::unix_timestamp_secs(),
         status: AssistantProviderStatus::Ready,
-        token_obtained_at: Some(aruna_core::time::unix_timestamp_secs()),
+        token_obtained_at: Some(aruna_clock::unix_timestamp_secs()),
         login_expires_at: None,
         login_interval_seconds: None,
     };

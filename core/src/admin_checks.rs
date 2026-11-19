@@ -13,7 +13,6 @@ use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use crate::structs::identity::user::User;
 use crate::structs::storage::node_info::reserved_label;
-use crate::time::unix_timestamp_secs;
 use crate::types::GroupId;
 use crate::user::validation::{DEACTIVATED_ATTRIBUTE, INSTALL_ATTRIBUTE, SERVICE_GROUP_ATTRIBUTE};
 
@@ -103,15 +102,16 @@ impl AdminOperationFamily {
     }
 }
 
-/// The payload-shape rules of the operation's family.
+/// The payload-shape rules of the operation's family, at `now_secs` from the caller's stamp.
 pub fn validate_shape(
     family: AdminOperationFamily,
     event: &AdminDocumentEvent,
+    now_secs: u64,
 ) -> Result<(), String> {
     match family {
         AdminOperationFamily::Group => validate_group_shape(event),
         AdminOperationFamily::RealmAuthorization => validate_role_assignment(event),
-        AdminOperationFamily::RealmConfig => validate_config_shape(event),
+        AdminOperationFamily::RealmConfig => validate_config_shape(event, now_secs),
         AdminOperationFamily::User => Ok(()),
         AdminOperationFamily::Distribution => validate_distribution_shape(event),
     }
@@ -288,7 +288,7 @@ fn validate_group_shape(event: &AdminDocumentEvent) -> Result<(), String> {
 
 /// Payload-shape rules for the realm-config family: compute, candidate maps,
 /// transitions, grants, labels, strategies, policies, and revocations.
-fn validate_config_shape(event: &AdminDocumentEvent) -> Result<(), String> {
+fn validate_config_shape(event: &AdminDocumentEvent, now_secs: u64) -> Result<(), String> {
     match &event.op {
         AdminDocumentOperation::ConfigComputeSet { compute } => {
             // A malformed link or quota set would make every planner estimate
@@ -474,7 +474,7 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> Result<(), String> {
             if !crate::auth::valid_token_hash(token_hash) {
                 return Err("revoked bearer token hash is malformed".to_string());
             }
-            if !valid_revocation_expiry(*expires_at, unix_timestamp_secs()) {
+            if !valid_revocation_expiry(*expires_at, now_secs) {
                 return Err("revoked bearer token expiry exceeds the admission window".to_string());
             }
             // A token this realm issued may belong to a federated user of another realm.
@@ -514,11 +514,12 @@ pub fn revocation_origin_full(
     state: Option<&AdminDocumentState>,
     event: &AdminDocumentEvent,
     token_hash: &str,
+    now_secs: u64,
 ) -> bool {
     let Some(state) = state else {
         return false;
     };
-    let index = state.revocation_index(state.revocation_floor.max(unix_timestamp_secs()));
+    let index = state.revocation_index(state.revocation_floor.max(now_secs));
     index.origin(token_hash) != Some(event.origin_node_id)
         && index.count(&event.origin_node_id) >= REVOCATIONS_PER_ORIGIN
 }

@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
 use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -10,7 +12,6 @@ use aruna_core::cursor;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::link::LinkTarget;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::s3::object::link::{LinkCaller, LinkError, LinkNode, TargetVisibleOperation};
@@ -18,40 +19,18 @@ use crate::s3::object::list::{
     ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
     ListedObject,
 };
-use crate::s3::object::search_scan::{open_position, seal_position, sealed_position};
 
 /// Hidden entries one listing request examines at most. A page that reaches it ends early and
 /// its sealed cursor resumes there, so it bounds the work of one request, never its results.
 pub const SCAN_BUDGET: usize = 1_000;
 
-/// Starts a sealed cursor; no base64 token of a listing does. A marker key starting with it
-/// stays a key unless it has the whole shape of a sealed cursor.
-const SEALED_MARK: char = '~';
 /// The bytes a sealed position adds to its plain one: its tag, nonce and authentication tag.
 const SEALED_OVERHEAD: usize = 1 + 24 + 16;
-
-/// A listing position sealed with this node's key, so it names no entry; a restart of the
-/// node makes it invalid.
-pub fn seal_cursor(value: &impl Serialize) -> Option<String> {
-    let sealed = seal_position(&postcard::to_allocvec(value).ok()?).ok()?;
-    Some(format!("{SEALED_MARK}{}", cursor::encode(sealed)))
-}
 
 /// Whether `text` has the shape of a sealed cursor: the mark, then base64 of a sealed position.
 /// One that does not open, as after a restart of the node, is refused, never read as a key.
 pub fn is_sealed(text: &str) -> bool {
-    (text.strip_prefix(SEALED_MARK))
-        .and_then(|rest| cursor::decode(rest).ok())
-        .is_some_and(|sealed| sealed_position(&sealed) && sealed.len() > SEALED_OVERHEAD)
-}
-
-/// The position a sealed cursor of this node holds; `None` for any other text.
-pub fn open_cursor<T: DeserializeOwned>(text: &str) -> Option<T> {
-    let sealed = cursor::decode(text.strip_prefix(SEALED_MARK)?).ok()?;
-    if !sealed_position(&sealed) {
-        return None;
-    }
-    postcard::from_bytes(&open_position(&sealed).ok()?).ok()
+    cursor::position_bytes(text).is_some_and(|sealed| sealed.len() > SEALED_OVERHEAD)
 }
 
 /// Where a listing stands among hidden entries: after the last examined entry, and inside a
@@ -94,6 +73,8 @@ pub enum VisibleError<E, L = ListBucketError> {
     List(L),
     Shows(E),
     Cursor,
+    /// The sealed cursor the page resumes at does not open, as one of another process.
+    Unopened,
     Io(IoError),
 }
 
@@ -284,6 +265,10 @@ enum ProbeEnd {
 
 #[derive(Debug, PartialEq)]
 enum VisibleStep<O> {
+    /// The sealed cursor the page resumes at is opened.
+    Opened,
+    /// The cursor the page ends at is sealed.
+    Sealed,
     Page,
     Object(O, EntryPlace),
     ProbePage,
@@ -299,6 +284,8 @@ pub struct VisiblePageOperation<S: ListSource, R> {
     rule: R,
     input: ListBucketInput,
     hidden: Option<HiddenCursor>,
+    /// A sealed cursor the page resumes at, opened before the first listing.
+    opening: Option<Vec<u8>>,
     bucket: String,
     max: usize,
     budget: usize,
@@ -334,6 +321,7 @@ where
             bucket: input.bucket.clone(),
             input,
             hidden,
+            opening: None,
             budget: SCAN_BUDGET,
             page: VisiblePage::default(),
             last: None,
@@ -353,10 +341,31 @@ where
         self.done()
     }
 
-    fn sealed(&self, hidden: &HiddenCursor) -> Result<NextPage, VisibleError<R::Error, S::Error>> {
-        seal_cursor(hidden)
-            .map(NextPage::Sealed)
-            .ok_or(VisibleError::Cursor)
+    /// Resumes at the hidden position a sealed cursor holds once it is opened.
+    pub fn opening(mut self, sealed: Vec<u8>) -> Self {
+        self.opening = Some(sealed);
+        self
+    }
+
+    /// Ends the page at `hidden`, once this process sealed it.
+    fn seal_end(&mut self, hidden: &HiddenCursor) -> VisibleTurn<S, R> {
+        let position = postcard::to_allocvec(hidden).map_err(|_| VisibleError::Cursor)?;
+        self.step = VisibleStep::Sealed;
+        Ok(Next::Call(
+            Effect::Net(NetEffect::SealPosition(position)).into(),
+        ))
+    }
+
+    fn start(&mut self) -> VisibleTurn<S, R> {
+        let Some(hidden) = self.hidden.take() else {
+            return self.list_page();
+        };
+        self.input.continuation_token = hidden.position.clone();
+        self.input.start_after = None;
+        match hidden.pending.clone() {
+            Some((group, at)) => self.start_probe(group, at, ProbeFor::Hidden(hidden)),
+            None => self.list_page(),
+        }
     }
 
     fn after_last(&self) -> Option<NextPage> {
@@ -467,12 +476,12 @@ where
         let rest = !self.entries.is_empty() || self.more.is_some();
         let full = self.page.objects.len() + self.page.prefixes.len() >= self.max;
         if (full || self.budget == 0) && rest {
-            let next = match self.after_last() {
-                Some(next) => next,
-                None => self.sealed(&HiddenCursor {
+            let Some(next) = self.after_last() else {
+                let hidden = HiddenCursor {
                     position: Some(position),
                     pending: None,
-                })?,
+                };
+                return self.seal_end(&hidden).map(Some);
             };
             return self.end_at(next).map(Some);
         }
@@ -577,8 +586,7 @@ where
                     ProbeEnd::Empty => {}
                     ProbeEnd::Stopped(at) => {
                         let pending = Some((group, Some(at)));
-                        let next = self.sealed(&HiddenCursor { pending, ..hidden })?;
-                        return self.end_at(next);
+                        return self.seal_end(&HiddenCursor { pending, ..hidden });
                     }
                 }
                 self.input.continuation_token = Some(after_entry(&self.bucket, &group, true));
@@ -590,16 +598,16 @@ where
                     self.entry_done(place, true, 0)
                 }
                 ProbeEnd::Empty => self.entry_done(place, false, 0),
-                ProbeEnd::Stopped(at) => {
-                    let next = match self.after_last() {
-                        Some(next) => next,
-                        None => self.sealed(&HiddenCursor {
+                ProbeEnd::Stopped(at) => match self.after_last() {
+                    Some(next) => self.end_at(next),
+                    None => {
+                        let hidden = HiddenCursor {
                             position: self.input.continuation_token.clone(),
                             pending: Some((group, Some(at))),
-                        })?,
-                    };
-                    self.end_at(next)
-                }
+                        };
+                        self.seal_end(&hidden)
+                    }
+                },
             },
         }
     }
@@ -617,19 +625,32 @@ where
         if self.max == 0 {
             return self.done();
         }
-        let Some(hidden) = self.hidden.take() else {
-            return self.list_page();
-        };
-        self.input.continuation_token = hidden.position.clone();
-        self.input.start_after = None;
-        match hidden.pending.clone() {
-            Some((group, at)) => self.start_probe(group, at, ProbeFor::Hidden(hidden)),
-            None => self.list_page(),
+        if let Some(sealed) = self.opening.take() {
+            self.step = VisibleStep::Opened;
+            return Ok(Next::Call(
+                Effect::Net(NetEffect::OpenPosition(sealed)).into(),
+            ));
         }
+        self.start()
     }
 
     fn next(&mut self, result: IoResult) -> VisibleTurn<S, R> {
         match std::mem::replace(&mut self.step, VisibleStep::Page) {
+            VisibleStep::Opened => {
+                let opened = match result.event()? {
+                    Event::Net(NetEvent::PositionOpened(opened)) => opened,
+                    _ => None,
+                };
+                let hidden = opened.and_then(|plain| postcard::from_bytes(&plain).ok());
+                self.hidden = Some(hidden.ok_or(VisibleError::Unopened)?);
+                self.start()
+            }
+            VisibleStep::Sealed => match result.event()? {
+                Event::Net(NetEvent::PositionSealed(Some(sealed))) => {
+                    self.end_at(NextPage::Sealed(cursor::position_text(&sealed)))
+                }
+                _ => Err(VisibleError::Cursor),
+            },
             VisibleStep::Page => {
                 let list = self.source.take(result)?;
                 self.page_read(list)
@@ -732,6 +753,53 @@ mod tests {
         thread.spawn(steps).unwrap().join().unwrap();
     }
 
+    /// The call that seals `hidden` before a page ends there.
+    fn sealing(hidden: &HiddenCursor) -> VisibleTurn<Pages, Keys> {
+        let position = postcard::to_allocvec(hidden).unwrap();
+        Ok(Next::Call(
+            Effect::Net(NetEffect::SealPosition(position)).into(),
+        ))
+    }
+
+    /// The page a sealed answer ends, with the cursor that answer names.
+    fn sealed_end(list: &mut VisiblePageOperation<Pages, Keys>) -> VisiblePage<String> {
+        let sealed = vec![cursor::SEALED_POSITION, 7];
+        let answer = Event::Net(NetEvent::PositionSealed(Some(sealed.clone())));
+        let Ok(Next::Done(found)) = list.next(IoResult::Event(Box::new(answer))) else {
+            panic!("the sealed cursor ends the page");
+        };
+        let text = cursor::position_text(&sealed);
+        assert_eq!(found.next, Some(NextPage::Sealed(text)));
+        found
+    }
+
+    #[test]
+    fn sealed_cursor_resumes() {
+        let hidden = HiddenCursor {
+            position: Some(after_entry("b", "k", false)),
+            pending: None,
+        };
+        let sealed = vec![cursor::SEALED_POSITION, 9];
+        let list = VisiblePageOperation::new(Pages, Keys, input(5), None);
+        let mut list = list.opening(sealed.clone());
+        let open = Ok(Next::Call(
+            Effect::Net(NetEffect::OpenPosition(sealed)).into(),
+        ));
+        assert_eq!(list.first(), open);
+        let plain = postcard::to_allocvec(&hidden).unwrap();
+        let opened = Event::Net(NetEvent::PositionOpened(Some(plain)));
+        assert_eq!(
+            list.next(IoResult::Event(Box::new(opened))),
+            Ok(Next::Call(IoCall::Sync))
+        );
+        assert_eq!(list.input.continuation_token, hidden.position);
+        let mut foreign = VisiblePageOperation::new(Pages, Keys, input(5), None).opening(vec![1]);
+        foreign.first().unwrap();
+        let unopened = Event::Net(NetEvent::PositionOpened(None));
+        let answer = foreign.next(IoResult::Event(Box::new(unopened)));
+        assert_eq!(answer, Err(VisibleError::Unopened));
+    }
+
     fn hidden_run() -> Vec<String> {
         (0..=SCAN_BUDGET)
             .map(|index| format!("open/{index:06}"))
@@ -745,11 +813,13 @@ mod tests {
             let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
             let mut list = VisiblePageOperation::new(Pages, Keys, input(5), None);
             list.first().unwrap();
-            let Ok(Next::Done(found)) = list.next(page(&keys, &[], false)) else {
-                panic!("the budget ends the page");
+            let hidden = HiddenCursor {
+                position: Some(after_entry("b", "open/000999", false)),
+                pending: None,
             };
+            assert_eq!(list.next(page(&keys, &[], false)), sealing(&hidden));
+            let found = sealed_end(&mut list);
             assert!(found.objects.is_empty());
-            assert!(matches!(found.next, Some(NextPage::Sealed(_))));
         });
     }
 
@@ -761,11 +831,14 @@ mod tests {
             let mut list = VisiblePageOperation::new(Pages, Keys, input(5), None);
             list.first().unwrap();
             list.next(page(&[], &["open/"], false)).unwrap();
-            let Ok(Next::Done(found)) = list.next(page(&keys, &[], false)) else {
-                panic!("the budget ends the probe");
+            let at = after_entry("b", "open/000999", false).last_key;
+            let hidden = HiddenCursor {
+                position: None,
+                pending: Some(("open/".to_string(), Some(at))),
             };
+            assert_eq!(list.next(page(&keys, &[], false)), sealing(&hidden));
+            let found = sealed_end(&mut list);
             assert!(found.prefixes.is_empty());
-            assert!(matches!(found.next, Some(NextPage::Sealed(_))));
         });
     }
 
@@ -811,14 +884,12 @@ mod tests {
 
     #[test]
     fn tells_sealed_markers() {
-        // A sealed cursor opens here; one sealed elsewhere keeps its shape but does not open,
-        // and a key that merely starts with the mark is no sealed cursor.
-        let cursor = seal_cursor(&HiddenCursor::default()).unwrap();
+        // A sealed cursor has its shape, also one sealed elsewhere, and a key that merely starts
+        // with the mark is no sealed cursor.
+        let cursor = aruna_drivers::position::seal_cursor(&HiddenCursor::default()).unwrap();
         assert!(is_sealed(&cursor));
-        assert_eq!(open_cursor(&cursor), Some(HiddenCursor::default()));
         let foreign = format!("~{}", cursor::encode([0xFF; 64]));
         assert!(is_sealed(&foreign));
-        assert_eq!(open_cursor::<HiddenCursor>(&foreign), None);
         assert!(!is_sealed("~notes.txt"));
         assert!(!is_sealed("plain"));
     }

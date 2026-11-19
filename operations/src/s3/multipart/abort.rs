@@ -10,6 +10,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
@@ -325,6 +326,8 @@ enum DeleteStep {
 /// Deletes the upload's records and queues its part blobs for cleanup in one transaction.
 #[derive(Debug, PartialEq)]
 struct DeleteRecords {
+    now_ms: u64,
+    ids: IdMint,
     input: AbortUploadInput,
     parts: Vec<MultipartPart>,
     step: DeleteStep,
@@ -334,6 +337,8 @@ struct DeleteRecords {
 impl DeleteRecords {
     fn new(input: AbortUploadInput, parts: Vec<MultipartPart>) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             input,
             parts,
             step: DeleteStep::ReadRecord,
@@ -404,7 +409,7 @@ impl DeleteRecords {
             };
             writes.push((
                 BLOB_CLEANUP_KEYSPACE.to_string(),
-                Ulid::generate().to_bytes().to_vec().into(),
+                self.ids.mint(self.now_ms).to_bytes().to_vec().into(),
                 work.to_bytes()?.into(),
             ));
         }
@@ -446,6 +451,14 @@ impl Operation for DeleteRecords {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

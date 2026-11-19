@@ -56,20 +56,7 @@ impl From<IoError> for InstallError {
     }
 }
 
-impl From<AuditError> for InstallError {
-    fn from(error: AuditError) -> Self {
-        match error {
-            AuditError::Conversion(error) => Self::Conversion(error),
-            AuditError::Storage(error) => Self::Storage(error),
-            AuditError::NotAuditTimer => Self::NotFinished,
-            AuditError::Unexpected(received) => Self::InvalidStateEvent {
-                state: "WriteOutcome".to_string(),
-                expected: "the audit retry timer's answer",
-                received,
-            },
-        }
-    }
-}
+crate::s3::bucket::audit_retry::audit_failure!(InstallError, "WriteOutcome");
 
 type InstallTurn = Result<Next<UnlockStatus>, InstallError>;
 

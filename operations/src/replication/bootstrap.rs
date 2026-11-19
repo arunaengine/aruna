@@ -218,10 +218,12 @@ impl BootstrapPage {
             replicate_delete_markers: true,
             mode: ReplicationMode::Live,
         };
-        BlobJobRecord::new(input, Some(marker), config.now_ms).with_member(MemberTarget {
-            set_id: config.set_id,
-            member_id: config.member_id,
-        })
+        BlobJobRecord::new(input, Some(marker), config.now_ms, Ulid::generate()).with_member(
+            MemberTarget {
+                set_id: config.set_id,
+                member_id: config.member_id,
+            },
+        )
     }
 
     fn write(&mut self, mut writes: Vec<(String, Key, Value)>) -> Step {

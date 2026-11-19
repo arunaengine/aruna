@@ -160,6 +160,7 @@ type DropTurn = Result<Next<usize>, PromoteError>;
 /// it; none of them was registered. Outputs how many versions were deleted.
 #[derive(Debug, PartialEq)]
 pub struct DropReceivedOperation {
+    now_ms: u64,
     archive: ArchiveKey,
     claimed: Option<[u8; 32]>,
     origin: (RealmId, NodeId),
@@ -192,6 +193,7 @@ impl DropReceivedOperation {
         reason: String,
     ) -> Self {
         Self {
+            now_ms: 0,
             archive,
             claimed,
             origin,
@@ -220,10 +222,9 @@ impl DropReceivedOperation {
     }
 
     fn write_record(&mut self, claimed: [u8; 32]) -> DropTurn {
-        let now_ms = aruna_core::time::unix_timestamp_millis();
         let backend = self.archive.backend.clone();
         let reason = std::mem::take(&mut self.reason);
-        let record = BlobQuarantineRecord::new(claimed, backend, reason, now_ms);
+        let record = BlobQuarantineRecord::new(claimed, backend, reason, self.now_ms);
         let row = (
             BLOB_QUARANTINE_KEYSPACE.to_string(),
             record.key().into(),
@@ -347,6 +348,10 @@ impl Operation for DropReceivedOperation {
                 self.next_owner()
             }
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
 

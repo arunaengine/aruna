@@ -491,7 +491,7 @@ async fn deactivation_ends_credential() -> TestResult<()> {
 
     // Judged past the 366 day window the cutoff is gone, so a sweep then finds nothing; the
     // keys must be deleted before. A refused request deletes its key at once.
-    let now = aruna_core::time::unix_timestamp_secs();
+    let now = aruna_clock::unix_timestamp_secs();
     let later = now + MAX_TOKEN_LIFETIME + REVOCATION_GRACE_SECS + 1;
     let node_id = seed.net.node_id();
     let sweep = |now| {
@@ -1135,7 +1135,7 @@ async fn token_needs_credential() -> TestResult<()> {
             session: None,
         };
         let node = seed.net.node_id();
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
 
         // Once the credential expires, a holder can no longer publish its request.
         let action = KeyAction::Publish(grant.clone());

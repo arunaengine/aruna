@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::position::{open_position, seal_position};
 use aruna_blob::native::{body_stream, send_request};
 use std::sync::Arc;
 
@@ -194,7 +195,7 @@ fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Eve
 pub(super) fn note_contact(peer: NodeId, context: &DriverContext) -> Event {
     if let Some(net) = &context.net_handle {
         net.peer_contacts()
-            .note(peer, aruna_core::time::unix_timestamp_millis());
+            .note(peer, aruna_clock::unix_timestamp_millis());
     }
     Event::Net(NetEvent::PeerContact)
 }
@@ -332,6 +333,12 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
     };
     if let NetEffect::GrantedRead(read) = effect {
         return Event::Net(NetEvent::GrantedRead(granted_read(*read, context).await));
+    }
+    if let NetEffect::SealPosition(position) = effect {
+        return Event::Net(NetEvent::PositionSealed(seal_position(&position)));
+    }
+    if let NetEffect::OpenPosition(position) = effect {
+        return Event::Net(NetEvent::PositionOpened(open_position(&position)));
     }
     if let NetEffect::AvoidHolder { node_id, now_ms } = effect {
         context.avoid_holder(node_id, now_ms);

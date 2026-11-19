@@ -36,7 +36,7 @@ use crate::rate_limit::LocalKey;
 use crate::routes::shares::rfc3339;
 use crate::routes::storage::objects::{bearer_access, page_node};
 use crate::server::state::ServerState;
-use aruna_core::time::unix_timestamp_secs;
+use aruna_clock::unix_timestamp_secs;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::bearer_token::GrantValidOperation;
 

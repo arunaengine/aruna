@@ -228,7 +228,7 @@ impl PutObjectOperation {
         let set_hint = self.set_hint;
         let version_id = *self
             .version_id
-            .get_or_insert_with(|| mint_version(set_hint));
+            .get_or_insert_with(|| mint_version(Ulid::generate(), set_hint));
         // An import may register a listed write's version before the write commits it.
         if self.keep_head || self.listed_write() {
             return self.read_history(version_id);
@@ -359,7 +359,7 @@ impl PutObjectOperation {
             (config.realm_id, config.group_id, config.node_id),
             (&config.request.bucket, &config.request.key),
             version_id,
-            unix_timestamp_millis(),
+            self.now_ms,
         );
         rows.extend(journal_entries(&uploaded)?);
         self.call(PutObjectState::CreateVersionRecord, IoCall::Write(rows))

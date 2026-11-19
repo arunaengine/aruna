@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::jobs::repository::test_support::{body, child, link, remote, scope, session};
+use crate::jobs::repository::test_support::{body, child, link, remote, scope, session, target};
 use aruna_core::repository::remote::RemoteFailure;
 use serde_json::json;
 
@@ -13,16 +13,6 @@ fn refused(status: u16) -> IoResult {
 
 fn connected() -> IoResult {
     child::<_, TransferError>(Ok(session()))
-}
-
-fn target() -> LinkTarget {
-    LinkTarget {
-        link_id: link().link_id,
-        published_id: None,
-        parent_id: None,
-        revision_id: None,
-        files: Vec::new(),
-    }
 }
 
 fn destination(draft_id: Option<&str>) -> RepositoryDestination {

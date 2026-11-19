@@ -69,20 +69,7 @@ impl From<IoError> for ExtendError {
     }
 }
 
-impl From<AuditError> for ExtendError {
-    fn from(error: AuditError) -> Self {
-        match error {
-            AuditError::Conversion(error) => Self::Conversion(error),
-            AuditError::Storage(error) => Self::Storage(error),
-            AuditError::NotAuditTimer => Self::NotFinished,
-            AuditError::Unexpected(received) => Self::InvalidStateEvent {
-                state: "WriteAudit".to_string(),
-                expected: "the audit retry timer's answer",
-                received,
-            },
-        }
-    }
-}
+crate::s3::bucket::audit_retry::audit_failure!(ExtendError, "WriteAudit");
 
 type ExtendTurn = Result<Next<UnlockStatus>, ExtendError>;
 
@@ -595,7 +582,7 @@ mod tests {
 
     fn timed_lock() -> LockBucketOperation {
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let mut callback = LockBucketOperation::timed(session_ticket(), node);
+        let mut callback = LockBucketOperation::timed(session_ticket(), node, 1_000);
         callback.first().unwrap();
         callback
     }

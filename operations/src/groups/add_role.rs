@@ -73,6 +73,7 @@ pub struct AddRoleOperation {
     step: Step,
     added: Option<AddedRole>,
     now_ms: u64,
+    ids: IdMint,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -190,6 +191,7 @@ impl AddRoleOperation {
             step: Step::Check,
             added: None,
             now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -245,7 +247,7 @@ impl AddRoleOperation {
     /// The group and its document, with the drain wake and the new members' notices made after
     /// it; their failures are only logged, as the change is already durable.
     fn finish(
-        &self,
+        &mut self,
         added: AddedRole,
         drain: Option<IoCall>,
     ) -> Next<(Group, GroupAuthorizationDocument)> {
@@ -261,7 +263,7 @@ impl AddRoleOperation {
 
     /// The notices to the members the role newly added.
     fn added_notice(
-        &self,
+        &mut self,
         auth_doc: &GroupAuthorizationDocument,
         new_members: &[UserId],
     ) -> Option<IoCall> {
@@ -279,6 +281,7 @@ impl AddRoleOperation {
                         realm_id: self.input.actor.realm_id,
                     },
                     self.now_ms,
+                    &mut self.ids,
                 )
             })
             .collect::<Vec<_>>();
@@ -298,6 +301,10 @@ impl Operation for AddRoleOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn first(&mut self) -> Result<Next<(Group, GroupAuthorizationDocument)>, AddRoleError> {
@@ -690,25 +697,17 @@ pub mod test {
 
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
     use crate::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation, RoleAddition};
-    use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    };
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
-    use aruna_core::structs::execution::notification::{
-        NotificationOutboxRecord, NotificationRecord,
-    };
+    use aruna_core::structs::execution::notification::NotificationRecord;
     use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
@@ -740,45 +739,11 @@ pub mod test {
     }
 
     async fn setup_group(context: &DriverContext) -> (Actor, Group, GroupAuthorizationDocument) {
-        let realm_id = RealmId([0u8; 32]);
-        let actor = Actor {
-            node_id: node(1),
-            user_id: UserId::local(Ulid::generate(), realm_id),
-            realm_id,
-        };
-        drive(
-            CreateRealmOperation::new(CreateRealmConfig {
-                actor: actor.clone(),
-                realm_description: "Test realm".to_string(),
-                oidc_providers: Vec::new(),
-                node_location: None,
-                node_weight: None,
-                node_labels: Default::default(),
-            }),
-            context,
-        )
-        .await
-        .unwrap();
-        let (group, auth_doc) = drive(
-            CreateGroupOperation::new(CreateGroupConfig {
-                actor: actor.clone(),
-                display_name: "Test group".to_string(),
-                owner_cap: None,
-            }),
-            context,
-        )
-        .await
-        .unwrap();
-        (actor, group, auth_doc)
+        crate::tests::groups::setup_group(context).await
     }
 
     fn auth_context(actor: &Actor) -> AuthContext {
-        AuthContext {
-            user_id: actor.user_id,
-            realm_id: actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(actor.user_id, actor.realm_id)
     }
 
     fn named_role_ids(auth_doc: &GroupAuthorizationDocument, name: &str) -> HashSet<RoleId> {
@@ -790,27 +755,7 @@ pub mod test {
     }
 
     async fn read_notification_outbox(context: &DriverContext) -> Vec<NotificationRecord> {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
-                prefix: None,
-                start: None,
-                limit: 1024,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult { values, .. }) => values
-                .into_iter()
-                .map(|(_, value)| {
-                    postcard::from_bytes::<NotificationOutboxRecord>(&value)
-                        .unwrap()
-                        .record
-                })
-                .collect(),
-            other => panic!("unexpected storage event: {other:?}"),
-        }
+        crate::tests::groups::read_notification_outbox(context).await
     }
 
     #[test]
@@ -1287,28 +1232,7 @@ pub mod test {
     fn activated_config(
         actor: &Actor,
     ) -> aruna_core::structs::identity::realm::RealmConfigDocument {
-        let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(
-            actor.realm_id,
-            Vec::new(),
-            3,
-        );
-        config.ensure_node(
-            actor.node_id,
-            aruna_core::structs::identity::realm::RealmNodeKind::Server,
-        );
-        config
-            .strategies
-            .push(aruna_core::structs::placement::record::PlacementStrategy {
-                strategy_id: Ulid::from_bytes([5; 16]),
-                name: "default".to_string(),
-                replica_count: Some(1),
-                distinct_locations: false,
-                affinity: Vec::new(),
-                shard_count: 16,
-            });
-        config.default_strategy_id = Some(config.strategies[0].strategy_id);
-        config.snapshot_candidate_map();
-        config
+        crate::tests::groups::activated_config(actor)
     }
 
     fn role(actor: &Actor, group_id: Ulid) -> Role {

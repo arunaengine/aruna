@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::connectors::{ResolveConnectorInput, resolve_connector_effect};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
@@ -82,14 +81,9 @@ impl Operation for ReadSourceOperation {
     type Error = ReadSourceError;
 
     fn first(&mut self) -> Result<Next<ReadSourceResult>, ReadSourceError> {
-        Ok(Next::Call(IoCall::from(resolve_connector_effect(
-            ResolveConnectorInput {
-                group_id: self.input.group_id,
-                connector_id: self.input.connector_id,
-                source_path: self.input.source_path.clone(),
-                allow_root: false,
-            },
-        ))))
+        let (group, connector) = (self.input.group_id, self.input.connector_id);
+        let path = self.input.source_path.clone();
+        Ok(Next::Call(super::resolve_call(group, connector, path)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<ReadSourceResult>, ReadSourceError> {
