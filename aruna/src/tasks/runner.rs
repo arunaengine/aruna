@@ -58,248 +58,257 @@ use aruna_operations::jobs::{FLUSH_INTERVAL_MS, JOB_HEARTBEAT_MS, JOB_MAX_ATTEMP
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-impl JobsRuntime {
-    pub(crate) async fn claim_producer(&self) -> Option<RwLockReadGuard<'_, ()>> {
-        if !self.is_started() {
+pub(crate) async fn claim_producer(runtime: &JobsRuntime) -> Option<RwLockReadGuard<'_, ()>> {
+    if !runtime.is_started() {
+        return None;
+    }
+    let guard = runtime.claim_gate().read().await;
+    match runtime.is_draining() {
+        true => None,
+        false => Some(guard),
+    }
+}
+
+pub fn spawn_job(runtime: &Arc<JobsRuntime>, context: Arc<DriverContext>, record: JobRecord) {
+    let job_id = record.job_id;
+    // Claimed just as the drain was stopping: the lease goes straight back rather than
+    // rot until the sweep spends an attempt on it.
+    let release_context = context.clone();
+    let admission = runtime.admit(&record, unix_timestamp_millis(), move |token| {
+        tokio::spawn(async move {
+            let release = release_job(job_id, token, unix_timestamp_millis());
+            let _ = drive(release, &release_context).await;
+        })
+    });
+    let slot = match admission {
+        Admission::Run(slot) => slot,
+        Admission::Draining => return,
+        Admission::NoClaim => {
+            warn!(job_id = %job_id, "Spawned job has no claim token; skipping");
+            return;
+        }
+    };
+    let runtime = runtime.clone();
+    let shutdown = runtime.shutdown_signal();
+    let turns = runtime.turns();
+    let handlers = runtime.handlers();
+    tokio::spawn(async move {
+        // A panicking payload is turned into a failure inside `supervise`; this guard
+        // still runs `finish` on other unwinds, so a panic cannot leak the slot.
+        let _ = AssertUnwindSafe(run_job(
+            context.clone(),
+            record,
+            slot.claim_token,
+            (slot.cancel, slot.progress),
+            (shutdown, turns, handlers),
+        ))
+        .catch_unwind()
+        .await;
+        finish_job(&runtime, &context, job_id, slot.nonce).await;
+    });
+}
+
+/// Register an adopted external supervisor under the normal cap, cancellation,
+/// completion, and shutdown accounting. `false` leaves handoff to the caller.
+pub(crate) fn spawn_recovered<F, Fut>(
+    runtime: &Arc<JobsRuntime>,
+    context: Arc<DriverContext>,
+    record: &JobRecord,
+    supervisor: F,
+) -> bool
+where
+    F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let job_id = record.job_id;
+    let (nonce, cancel) = match runtime.admit_recovered(record, unix_timestamp_millis()) {
+        RecoveredAdmission::Run { nonce, cancel } => (nonce, cancel),
+        RecoveredAdmission::AlreadyRunning => return true,
+        RecoveredAdmission::Refused => return false,
+        RecoveredAdmission::NoClaim => {
+            warn!(job_id = %job_id, "Recovered job has no claim token; skipping");
+            return false;
+        }
+    };
+    let runtime = runtime.clone();
+    tokio::spawn(async move {
+        let _ = AssertUnwindSafe(supervisor(cancel)).catch_unwind().await;
+        finish_job(&runtime, &context, job_id, nonce).await;
+    });
+    true
+}
+
+/// Stop claiming, signal the jobs in flight, and give them `grace` to wind down.
+/// Whatever is still running then has its lease handed back, so a restart costs a
+/// job no attempt. Storage must outlive this call: releasing a lease writes.
+pub async fn shutdown_jobs(
+    runtime: &JobsRuntime,
+    context: &DriverContext,
+    grace: Duration,
+) -> JobShutdownReport {
+    runtime.close_admission();
+    let waiters = runtime.running_waiters();
+    let deadline = Instant::now() + grace;
+    let mut report = JobShutdownReport::default();
+    for (job_id, class, claim_token, mut completion) in waiters {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let _ = tokio::time::timeout(remaining, completion.changed()).await;
+        }
+        if !runtime.is_running(job_id) {
+            report.finished += 1;
+            continue;
+        }
+        let now_ms = unix_timestamp_millis();
+        let released = match class {
+            JobExecutionClass::InProcess => {
+                drive(release_job(job_id, claim_token, now_ms), context).await
+            }
+            JobExecutionClass::ExternalAttempt => {
+                drive(
+                    handoff_external_attempt(job_id, claim_token, now_ms),
+                    context,
+                )
+                .await
+            }
+        };
+        match released {
+            Ok(ReleaseOutcome::Released(_)) => report.released += 1,
+            Ok(ReleaseOutcome::Skipped) => report.skipped += 1,
+            Err(JobMutationError::TokenMismatch) => {
+                info!(job_id = %job_id, "Job was taken over elsewhere; leaving its lease");
+                report.skipped += 1;
+            }
+            Err(error) => {
+                warn!(job_id = %job_id, error = %error, "Failed to hand back job lease");
+                report.skipped += 1;
+            }
+        }
+    }
+    let _claim_producers = runtime.claim_gate().write().await;
+    // A claim that raced the drain stop released itself on a detached task; wait for
+    // those too, or the process can exit with the lease still held.
+    loop {
+        let pending_releases = runtime.take_releases();
+        if pending_releases.is_empty() {
+            break;
+        }
+        for release in pending_releases {
+            let _ = release.await;
+        }
+    }
+    info!(
+        finished = report.finished,
+        released = report.released,
+        skipped = report.skipped,
+        "Jobs runtime shut down"
+    );
+    report
+}
+
+pub(crate) async fn finish_job(
+    runtime: &JobsRuntime,
+    context: &DriverContext,
+    job_id: JobId,
+    nonce: u64,
+) {
+    runtime.retire(job_id, nonce);
+    if let Some(task_handle) = context.task_handle.as_ref()
+        && let Event::Task(TaskEvent::Error { message, .. }) =
+            task_handle.send_effect(schedule_drain_effect()).await
+    {
+        warn!(message = %message, "Failed to kick job drain after completion");
+    }
+}
+
+/// Block until the job is terminal or `timeout` elapses (local signal, else 250ms poll).
+pub async fn wait_for_terminal(
+    runtime: &JobsRuntime,
+    context: &DriverContext,
+    job_id: JobId,
+    timeout: Duration,
+) -> Option<JobState> {
+    let deadline = Instant::now() + timeout;
+    let mut receiver = runtime.completion_of(job_id);
+    loop {
+        if let Ok(Some(record)) = drive(read_job_record(job_id), context).await
+            && record.is_settled()
+        {
+            return Some(record.state);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return None;
         }
-        let guard = self.claim_gate().read().await;
-        match self.is_draining() {
-            true => None,
-            false => Some(guard),
+        let poll = remaining.min(WAIT_POLL_INTERVAL);
+        match receiver.as_mut() {
+            Some(rx) => {
+                let _ = tokio::time::timeout(poll, rx.changed()).await;
+            }
+            None => tokio::time::sleep(poll).await,
         }
     }
+}
 
-    pub fn spawn(self: &Arc<Self>, context: Arc<DriverContext>, record: JobRecord) {
-        let job_id = record.job_id;
-        // Claimed just as the drain was stopping: the lease goes straight back rather than
-        // rot until the sweep spends an attempt on it.
-        let release_context = context.clone();
-        let admission = self.admit(&record, unix_timestamp_millis(), move |token| {
-            tokio::spawn(async move {
-                let release = release_job(job_id, token, unix_timestamp_millis());
-                let _ = drive(release, &release_context).await;
-            })
-        });
-        let slot = match admission {
-            Admission::Run(slot) => slot,
-            Admission::Draining => return,
-            Admission::NoClaim => {
-                warn!(job_id = %job_id, "Spawned job has no claim token; skipping");
-                return;
-            }
-        };
-        let runtime = self.clone();
-        let shutdown = self.shutdown_signal();
-        let turns = self.turns();
-        let handlers = self.handlers();
-        tokio::spawn(async move {
-            // A panicking payload is turned into a failure inside `supervise`; this guard
-            // still runs `finish` on other unwinds, so a panic cannot leak the slot.
-            let _ = AssertUnwindSafe(run_job(
-                context.clone(),
-                record,
-                slot.claim_token,
-                (slot.cancel, slot.progress),
-                (shutdown, turns, handlers),
-            ))
-            .catch_unwind()
-            .await;
-            runtime.finish(&context, job_id, slot.nonce).await;
-        });
-    }
+/// At startup every claimed/running holder is definitionally dead. Re-queue
+/// the in-process ones and route external attempts to the reconcile hook,
+/// since a blind requeue would double-run; a restart costs them no attempt.
+pub async fn recover_stale_jobs(
+    runtime: &JobsRuntime,
+    context: &DriverContext,
+) -> Result<usize, String> {
+    recover_until_stopped(runtime, context, &CancellationToken::new(), || false).await
+}
 
-    /// Register an adopted external supervisor under the normal cap, cancellation,
-    /// completion, and shutdown accounting. `false` leaves handoff to the caller.
-    pub(crate) fn spawn_recovered<F, Fut>(
-        self: &Arc<Self>,
-        context: Arc<DriverContext>,
-        record: &JobRecord,
-        supervisor: F,
-    ) -> bool
-    where
-        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        let job_id = record.job_id;
-        let (nonce, cancel) = match self.admit_recovered(record, unix_timestamp_millis()) {
-            RecoveredAdmission::Run { nonce, cancel } => (nonce, cancel),
-            RecoveredAdmission::AlreadyRunning => return true,
-            RecoveredAdmission::Refused => return false,
-            RecoveredAdmission::NoClaim => {
-                warn!(job_id = %job_id, "Recovered job has no claim token; skipping");
-                return false;
-            }
-        };
-        let runtime = self.clone();
-        tokio::spawn(async move {
-            let _ = AssertUnwindSafe(supervisor(cancel)).catch_unwind().await;
-            runtime.finish(&context, job_id, nonce).await;
-        });
-        true
-    }
-
-    /// Stop claiming, signal the jobs in flight, and give them `grace` to wind down.
-    /// Whatever is still running then has its lease handed back, so a restart costs a
-    /// job no attempt. Storage must outlive this call: releasing a lease writes.
-    pub async fn shutdown(&self, context: &DriverContext, grace: Duration) -> JobShutdownReport {
-        self.close_admission();
-        let waiters = self.running_waiters();
-        let deadline = Instant::now() + grace;
-        let mut report = JobShutdownReport::default();
-        for (job_id, class, claim_token, mut completion) in waiters {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if !remaining.is_zero() {
-                let _ = tokio::time::timeout(remaining, completion.changed()).await;
-            }
-            if !self.is_running(job_id) {
-                report.finished += 1;
-                continue;
-            }
-            let now_ms = unix_timestamp_millis();
-            let released = match class {
-                JobExecutionClass::InProcess => {
-                    drive(release_job(job_id, claim_token, now_ms), context).await
-                }
-                JobExecutionClass::ExternalAttempt => {
-                    drive(
-                        handoff_external_attempt(job_id, claim_token, now_ms),
-                        context,
-                    )
-                    .await
-                }
-            };
-            match released {
-                Ok(ReleaseOutcome::Released(_)) => report.released += 1,
-                Ok(ReleaseOutcome::Skipped) => report.skipped += 1,
-                Err(JobMutationError::TokenMismatch) => {
-                    info!(job_id = %job_id, "Job was taken over elsewhere; leaving its lease");
-                    report.skipped += 1;
-                }
-                Err(error) => {
-                    warn!(job_id = %job_id, error = %error, "Failed to hand back job lease");
-                    report.skipped += 1;
-                }
-            }
+/// [`recover_stale_jobs`] with an explicit stop and a required-service
+/// failure probe. Both are checked before every recovery unit, so an accepted
+/// stop or observed failure lets the current unit finish and admits no next.
+pub async fn recover_until_stopped(
+    runtime: &JobsRuntime,
+    context: &DriverContext,
+    stop: &CancellationToken,
+    should_stop: impl Fn() -> bool,
+) -> Result<usize, String> {
+    let stopped = || stop.is_cancelled() || should_stop();
+    let now_ms = unix_timestamp_millis();
+    let mut job_ids = Vec::new();
+    let mut after = None;
+    loop {
+        if stopped() {
+            break;
         }
-        let _claim_producers = self.claim_gate().write().await;
-        // A claim that raced the drain stop released itself on a detached task; wait for
-        // those too, or the process can exit with the lease still held.
-        loop {
-            let pending_releases = self.take_releases();
-            if pending_releases.is_empty() {
-                break;
-            }
-            for release in pending_releases {
-                let _ = release.await;
-            }
-        }
-        info!(
-            finished = report.finished,
-            released = report.released,
-            skipped = report.skipped,
-            "Jobs runtime shut down"
-        );
-        report
-    }
-
-    pub(crate) async fn finish(&self, context: &DriverContext, job_id: JobId, nonce: u64) {
-        self.retire(job_id, nonce);
-        if let Some(task_handle) = context.task_handle.as_ref()
-            && let Event::Task(TaskEvent::Error { message, .. }) =
-                task_handle.send_effect(schedule_drain_effect()).await
-        {
-            warn!(message = %message, "Failed to kick job drain after completion");
-        }
-    }
-
-    /// Block until the job is terminal or `timeout` elapses (local signal, else 250ms poll).
-    pub async fn wait_for_terminal(
-        &self,
-        context: &DriverContext,
-        job_id: JobId,
-        timeout: Duration,
-    ) -> Option<JobState> {
-        let deadline = Instant::now() + timeout;
-        let mut receiver = self.completion_of(job_id);
-        loop {
-            if let Ok(Some(record)) = drive(read_job_record(job_id), context).await
-                && record.is_settled()
-            {
-                return Some(record.state);
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            let poll = remaining.min(WAIT_POLL_INTERVAL);
-            match receiver.as_mut() {
-                Some(rx) => {
-                    let _ = tokio::time::timeout(poll, rx.changed()).await;
-                }
-                None => tokio::time::sleep(poll).await,
-            }
-        }
-    }
-
-    /// At startup every claimed/running holder is definitionally dead. Re-queue
-    /// the in-process ones and route external attempts to the reconcile hook,
-    /// since a blind requeue would double-run; a restart costs them no attempt.
-    pub async fn recover_stale_jobs(&self, context: &DriverContext) -> Result<usize, String> {
-        self.recover_until_stopped(context, &CancellationToken::new(), || false)
+        let (page, next) = drive(LeasePageOperation::new(after), context)
             .await
+            .map_err(|error| error.to_string())?;
+        job_ids.extend(page);
+        match next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
     }
 
-    /// [`Self::recover_stale_jobs`] with an explicit stop and a required-service
-    /// failure probe. Both are checked before every recovery unit, so an accepted
-    /// stop or observed failure lets the current unit finish and admits no next.
-    pub async fn recover_until_stopped(
-        &self,
-        context: &DriverContext,
-        stop: &CancellationToken,
-        should_stop: impl Fn() -> bool,
-    ) -> Result<usize, String> {
-        let stopped = || stop.is_cancelled() || should_stop();
-        let now_ms = unix_timestamp_millis();
-        let mut job_ids = Vec::new();
-        let mut after = None;
-        loop {
-            if stopped() {
-                break;
-            }
-            let (page, next) = drive(LeasePageOperation::new(after), context)
-                .await
-                .map_err(|error| error.to_string())?;
-            job_ids.extend(page);
-            match next {
-                Some(next) => after = Some(next),
-                None => break,
-            }
+    let mut recovered = 0;
+    for job_id in job_ids {
+        if stopped() {
+            break;
         }
-
-        let mut recovered = 0;
-        for job_id in job_ids {
-            if stopped() {
-                break;
-            }
-            let recovery = drive(RecoverJobOperation::new(job_id, now_ms), context)
-                .await
-                .map_err(|error| error.to_string())?;
-            match recovery {
-                Recovery::Recovered => recovered += 1,
-                Recovery::Untouched => {}
-                Recovery::Reconcile(record) => {
-                    if let Some(reconciler) = self.reconciler() {
-                        reconciler.reconcile_lost_attempt(context, *record).await;
-                    }
+        let recovery = drive(RecoverJobOperation::new(job_id, now_ms), context)
+            .await
+            .map_err(|error| error.to_string())?;
+        match recovery {
+            Recovery::Recovered => recovered += 1,
+            Recovery::Untouched => {}
+            Recovery::Reconcile(record) => {
+                if let Some(reconciler) = runtime.reconciler() {
+                    reconciler.reconcile_lost_attempt(context, *record).await;
                 }
             }
         }
-        if recovered > 0 {
-            info!(recovered, "Re-queued stale in-flight jobs after restart");
-        }
-        Ok(recovered)
     }
+    if recovered > 0 {
+        info!(recovered, "Re-queued stale in-flight jobs after restart");
+    }
+    Ok(recovered)
 }
 
 enum SuperviseResult {
@@ -685,7 +694,7 @@ impl ComputeReconciler {
         let supervised = record.clone();
         let supervisor = move |cancel| resume_attempt(context, scope, supervised, phase, cancel);
         let registered = self.runtime.upgrade().is_some_and(|runtime| {
-            runtime.spawn_recovered(self.context.clone(), &record, supervisor)
+            spawn_recovered(&runtime, self.context.clone(), &record, supervisor)
         });
         if registered {
             return;
