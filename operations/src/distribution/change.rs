@@ -364,8 +364,9 @@ impl<T: ChangeAnswer> ChangeOperation<T> {
             Change::Transfer(range_id, to, role) => {
                 eligible_target(snapshot, range_id, to)?;
                 needs_coordinator(heard, snapshot, range_id, "the transfer")?;
+                let transfer_id = self.mint.mint(self.now_ms);
                 self.send(DistributionRequest::TransferPrepare {
-                    transfer_id: self.mint.mint(self.now_ms),
+                    transfer_id,
                     range_id,
                     to,
                     // The publisher raises it above every epoch its head names.

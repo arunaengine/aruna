@@ -184,6 +184,7 @@ impl ApplyActionOperation {
     }
 
     fn audit(&mut self) -> ActionTurn {
+        let minted = self.mint();
         let record = SyncActionRecord {
             entries: self.applied,
             outcome: match self.stale {
@@ -192,7 +193,7 @@ impl ApplyActionOperation {
                     reason: format!("{stale} entries changed since the owner saw them"),
                 },
             },
-            ..record_for(&self.input, ActionScope::AllPending, self.mint())
+            ..record_for(&self.input, ActionScope::AllPending, minted)
         };
         let row = action_entry(&record).map_err(|_| ActionError::Unavailable)?;
         self.record = Some(record);
@@ -347,7 +348,8 @@ impl EntryActionOperation {
         let scope = ActionScope::Entry {
             relative: self.relative.clone(),
         };
-        self.record = Some(record_for(&self.input, scope, self.mint()));
+        let minted = self.mint();
+        self.record = Some(record_for(&self.input, scope, minted));
         match self.input.kind {
             ActionKind::Replace => self.replace(base),
             ActionKind::KeepLocal => self.keep_local(&base),

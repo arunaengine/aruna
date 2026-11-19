@@ -197,13 +197,14 @@ impl PullMemberOperation {
 
     fn spread(&mut self, candidates: Vec<HolderCandidate>) -> MemberTurn {
         let replicas = self.replicas;
-        let chosen = pick(candidates, self.mint.mint(self.now_ms).random());
+        let (first, second) = (self.mint.mint(self.now_ms), self.mint.mint(self.now_ms));
+        let chosen = pick(candidates, first.random());
         let holders = &mut self.member()?.holders;
         let at = chosen.and_then(|chosen| holders.iter().position(|id| *id == chosen.node_id));
         match at {
             Some(at) => holders[..=at].rotate_right(1),
             None => {
-                let spread = (self.mint.mint(self.now_ms).random() % replicas as u128) as usize;
+                let spread = (second.random() % replicas as u128) as usize;
                 holders[..replicas].rotate_left(spread);
             }
         }
