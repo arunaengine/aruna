@@ -52,6 +52,7 @@ pub mod repository;
 pub mod revision_read;
 mod search_cursor;
 pub mod secondary_ids;
+pub mod serve;
 pub(crate) mod span_timing;
 pub mod stats;
 pub mod text_search;
