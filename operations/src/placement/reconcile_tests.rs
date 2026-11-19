@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::shard::genesis::{ResolveTopicsOperation, ResolvedTopics};
 use crate::tests::calls::{
     bucket_realm, called, child, node, runs_child, shard_effect, shard_event,
 };
 use aruna_core::effects::Effect;
+use aruna_core::events::GenesisProbe;
 use aruna_core::structs::placement::transition::{BucketPlan, PlacementTransition, TransitionPlan};
 use aruna_core::task::{TaskEffect, TaskKey};
 use ulid::Ulid;

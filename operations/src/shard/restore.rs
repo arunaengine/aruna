@@ -14,9 +14,7 @@ use irokle::TopicId;
 use tracing::{info, warn};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::placement::process_placements::{
-    EnsureGenesisOperation, ResolveTopicsOperation, ResolvedTopics,
-};
+use crate::shard::genesis::{EnsureGenesisOperation, ResolveTopicsOperation, ResolvedTopics};
 use crate::shard::pull::PullTopicsOperation;
 use crate::shard::recovery::{RecoveryError, RecoveryStop};
 use crate::shard::restore_plan::{

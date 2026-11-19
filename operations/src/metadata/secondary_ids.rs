@@ -8,7 +8,6 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdentifier};
-use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::metadata::id_mapping::{

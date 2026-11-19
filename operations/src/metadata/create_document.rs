@@ -36,7 +36,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
 use aruna_core::structured_id::{BucketId, ClockHealthError, PlacementHandle, StructuredId};
 use aruna_core::types::{GroupId, Key, Value};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 

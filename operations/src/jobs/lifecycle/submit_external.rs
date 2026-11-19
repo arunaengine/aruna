@@ -285,7 +285,7 @@ impl Operation for SubmitExternalOperation {
         validate_execution(&mut submission.spec, mode, bucket.as_deref())?;
         store_workspace(&mut submission.spec, mode, bucket)
             .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
-        self.labels = ids::required_labels(&self.submission.spec)
+        self.labels = job_request::required_labels(&self.submission.spec)
             .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
         let read = GetConfigOperation::new(self.node()?.realm_id);
         Ok(Next::Call(IoCall::child(read)))

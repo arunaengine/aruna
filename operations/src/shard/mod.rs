@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod client;
+pub(crate) mod genesis;
 pub mod incoming;
 pub(crate) mod manifest;
 pub(crate) mod pull;
