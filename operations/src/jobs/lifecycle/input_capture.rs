@@ -40,9 +40,8 @@ use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError, check_error};
 use crate::jobs::read_access::{SourceObject, SourceReadError, SourceReadOperation};
-use crate::s3::bucket::dataset::{
-    BucketMetadataError, BucketMetadataOperation, DatasetSummaryOperation,
-};
+use crate::metadata::forward::read::DatasetSummaryOperation;
+use crate::s3::bucket::dataset::{BucketMetadataError, BucketMetadataOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::access::MembersCheckOperation;
 use crate::s3::bucket::release::{BucketScope, MembersOutput, MembershipCaller, ReleaseError};
