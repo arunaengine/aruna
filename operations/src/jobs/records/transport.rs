@@ -7,9 +7,11 @@ use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, FetchCursor, JobRecordFrame, LaunchFrame, NetEffect, PageLimit};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
+use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
-use aruna_core::structs::execution::job::record_rows::PendingNeed;
+use aruna_core::structs::execution::job::record_keys::{id_key, record_key};
+use aruna_core::structs::execution::job::record_rows::{PendingNeed, from_bytes};
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind, LaunchIntent,
     Membership, PhysicalExecutionState, SubmissionId, membership,
@@ -18,6 +20,7 @@ use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 use tracing::warn;
+use ulid::Ulid;
 
 use super::RecordStoreError;
 use super::admit::Admission;
@@ -71,6 +74,12 @@ enum ServeStep {
     Append,
     Dashboard,
     Armed,
+    /// The stored spec a record names, then the stored launch a receipt binds.
+    BoundSpec {
+        digest: [u8; 32],
+        launch: Option<Ulid>,
+    },
+    BoundLaunch,
     Pages,
     Cancels,
     Stopped,
@@ -85,6 +94,15 @@ struct Accepted {
     rearms: bool,
     /// The records whose input pages this holder keeps before it acknowledges.
     paged: Vec<JobFamilyRecord>,
+    /// The stored records the record binds, read once for their pages: a retry may no longer
+    /// attach the spec or launch an earlier offer stored.
+    bound: Option<Bound>,
+}
+
+#[derive(Debug, PartialEq)]
+struct Bound {
+    spec: Option<[u8; 32]>,
+    launch: Option<Ulid>,
 }
 
 /// Serves one inbound record publish or page request from an authenticated peer. This node
@@ -319,11 +337,20 @@ impl ServeRecordOperation {
             .filter(|bound| bound.family() == family && binds_pages(&bound.record))
             .map(|bound| bound.record.clone())
             .collect();
+        let launch = match &envelope.record {
+            JobFamilyRecord::Receipt(receipt) => Some(receipt.launch_id),
+            _ => None,
+        };
+        let bound = Bound {
+            spec: envelope.record.bound_spec_digest(),
+            launch,
+        };
         self.accepted = Some(Box::new(Accepted {
             family,
             admission: Admission::Duplicate,
             rearms: rearms_witness(envelope),
             paged,
+            bound: Some(bound),
         }));
         self.step = ServeStep::Append;
         let append = AppendRecordOperation::new(AppendRecordConfig {
@@ -375,12 +402,48 @@ impl ServeRecordOperation {
         if let Some(refusal) = admission_refusal(&accepted.admission) {
             return self.fail(refusal);
         }
+        if let Some(bound) = accepted.bound.take() {
+            return self.read_bound(bound);
+        }
         if let Some(record) = accepted.paged.pop() {
             self.step = ServeStep::Pages;
             let keep = KeepPagesOperation::new(&record, peer, serving);
             return Ok(Next::Call(IoCall::child(keep)));
         }
         self.read_cancels()
+    }
+
+    fn read_bound(&mut self, bound: Bound) -> ServeNext {
+        let family = self.accepted()?.family;
+        if let Some(digest) = bound.spec {
+            self.step = ServeStep::BoundSpec {
+                digest,
+                launch: bound.launch,
+            };
+            let specs = LoadFamilyOperation::kind(family, JobRecordKind::Spec);
+            return Ok(Next::Call(IoCall::child(specs)));
+        }
+        let Some(launch_id) = bound.launch else {
+            return self.settle();
+        };
+        self.step = ServeStep::BoundLaunch;
+        let key = id_key(&family, JobRecordKind::Launch, launch_id.to_bytes(), 0);
+        let row = (FAMILY_RECORD_KEYSPACE.to_string(), record_key(&key));
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    /// Adds the stored records that carry input pages to those kept before the answer.
+    fn keep_bound(
+        &mut self,
+        records: impl IntoIterator<Item = JobFamilyRecord>,
+    ) -> Result<(), IoError> {
+        let accepted = self.accepted()?;
+        for record in records.into_iter().filter(binds_pages) {
+            if !accepted.paged.contains(&record) {
+                accepted.paged.push(record);
+            }
+        }
+        Ok(())
     }
 
     fn read_cancels(&mut self) -> ServeNext {
@@ -477,6 +540,24 @@ impl Operation for ServeRecordOperation {
                 }
                 self.settle()
             }
+            ServeStep::BoundSpec { digest, launch } => {
+                let Ok(specs) = result.child::<Vec<JobRecordEnvelope>, FamilyReadError>()? else {
+                    return self.fail(ServeError::Unavailable);
+                };
+                let named = (specs.into_iter().map(|envelope| envelope.record))
+                    .filter(|record| named_spec(record, digest));
+                self.keep_bound(named)?;
+                self.read_bound(Bound { spec: None, launch })
+            }
+            ServeStep::BoundLaunch => {
+                let value = result.value()?;
+                let stored = value.map(|value| from_bytes::<JobRecordEnvelope>(&value));
+                let Ok(stored) = stored.transpose() else {
+                    return self.fail(ServeError::Unavailable);
+                };
+                self.keep_bound(stored.map(|envelope| envelope.record))?;
+                self.settle()
+            }
             ServeStep::Pages => match result.child::<(), PageReadError>()? {
                 Ok(()) => self.settle(),
                 Err(error) => {
@@ -500,6 +581,10 @@ impl Operation for ServeRecordOperation {
             },
         }
     }
+}
+
+fn named_spec(record: &JobFamilyRecord, digest: [u8; 32]) -> bool {
+    matches!(record, JobFamilyRecord::Spec(spec) if spec.spec_digest == digest)
 }
 
 fn binds_pages(record: &JobFamilyRecord) -> bool {
@@ -700,6 +785,7 @@ mod pure_tests {
             admission: Admission::Duplicate,
             rearms: false,
             paged: Vec::new(),
+            bound: None,
         }));
         assert!(is_child(&serve.settle().unwrap()));
         assert_eq!(serve.step, ServeStep::Cancels);
@@ -746,6 +832,31 @@ mod pure_tests {
         let unread = child(Ok::<Option<WriterView>, IoError>(None));
         let unavailable = MetadataTransportMessage::ForwardedWriteUnavailable;
         assert_eq!(waiting().next(unread), Ok(Next::Done(unavailable)));
+    }
+
+    // A stored record's named spec is read once before the answer, then the cancels follow.
+    #[test]
+    fn reads_bound_spec() {
+        let family = Family::new([20u8; 32]);
+        let spec = family.spec();
+        let digest = spec.spec_digest;
+        let mut serve = ServeRecordOperation::new(node(2), record_request(&family), serving(), 5);
+        serve.accepted = Some(Box::new(Accepted {
+            family: family.family(),
+            admission: Admission::Authentic,
+            rearms: false,
+            paged: Vec::new(),
+            bound: Some(Bound {
+                spec: Some(digest),
+                launch: None,
+            }),
+        }));
+        let specs = LoadFamilyOperation::kind(family.family(), JobRecordKind::Spec);
+        assert_eq!(serve.settle(), Ok(Next::Call(IoCall::child(specs))));
+        let stored = family.sign(&family.holder, JobFamilyRecord::Spec(Box::new(spec)));
+        let read = child(Ok::<_, FamilyReadError>(vec![stored]));
+        assert!(is_child(&serve.next(read).unwrap()));
+        assert_eq!(serve.step, ServeStep::Cancels);
     }
 
     fn launch_offer(family: &Family) -> LaunchFrame {

@@ -232,16 +232,10 @@ fn bound_spec(
     envelope: &JobRecordEnvelope,
     specs: Vec<JobRecordEnvelope>,
 ) -> Option<JobRecordFrame> {
-    let named = match &envelope.record {
-        JobFamilyRecord::Spec(_) => return None,
-        JobFamilyRecord::Claim(claim) => Some(claim.spec_digest),
-        JobFamilyRecord::Budget(budget) => Some(budget.source_spec_digest),
-        JobFamilyRecord::Launch(launch) => Some(launch.spec_digest),
-        JobFamilyRecord::Receipt(receipt) => Some(receipt.spec_digest),
-        JobFamilyRecord::Output(output) => Some(output.spec_digest),
-        JobFamilyRecord::Cancel(cancel) => Some(cancel.spec_digest),
-        JobFamilyRecord::Update(_) | JobFamilyRecord::Stop(_) => None,
-    };
+    if matches!(envelope.record, JobFamilyRecord::Spec(_)) {
+        return None;
+    }
+    let named = envelope.record.bound_spec_digest();
     let spec = specs.into_iter().find(|stored| match &stored.record {
         JobFamilyRecord::Spec(spec) => named.is_none_or(|digest| digest == spec.spec_digest),
         _ => false,

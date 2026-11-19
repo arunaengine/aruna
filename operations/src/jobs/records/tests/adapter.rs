@@ -226,7 +226,8 @@ fn spec_pages(family: &Family) -> (PageManifest, Vec<InputPage>) {
 }
 
 // A claim offered with the paged spec it binds is acknowledged only once this holder keeps the
-// spec's pages, also when the offer is retried after both were admitted.
+// spec's pages, also when the offer is retried after both were admitted, with or without the
+// spec attached.
 #[tokio::test]
 async fn holds_attached_pages() {
     let (_dir, context, net, family) = fixture().await;
@@ -239,26 +240,81 @@ async fn holds_attached_pages() {
     let submission = spec.submission_id;
     let spec = JobFamilyRecord::Spec(Box::new(spec));
     let spec = JobRecordFrame::new(family.sign(&family.holder, spec)).expect("bounded");
-    let offer = || MetadataTransportMessage::ForwardJobRecord {
+    let offer = |attached| MetadataTransportMessage::ForwardJobRecord {
         placement: family.placement,
         record: Box::new(claim.clone()),
-        attached: vec![spec.clone()],
+        attached,
     };
     let peer = crate::tests::records::node(2);
 
-    let missing = serve_job_record(&context, peer, offer()).await;
+    let missing = serve_job_record(&context, peer, offer(vec![spec.clone()])).await;
     assert_eq!(missing, MetadataTransportMessage::ForwardedWriteUnavailable);
-    let retried = serve_job_record(&context, peer, offer()).await;
+    let retried = serve_job_record(&context, peer, offer(vec![spec.clone()])).await;
     assert_eq!(retried, MetadataTransportMessage::ForwardedWriteUnavailable);
+    // The sender attaches the spec only after a spec-needed answer, so a plain retry follows.
+    let plain = serve_job_record(&context, peer, offer(Vec::new())).await;
+    assert_eq!(plain, MetadataTransportMessage::ForwardedWriteUnavailable);
     let writes = crate::jobs::records::pages::page_rows(&submission, &pages).expect("page rows");
     let store = aruna_core::effects::StorageEffect::BatchWrite {
         writes,
         txn_id: None,
     };
     context.storage_handle.send_storage_effect(store).await;
-    let kept = serve_job_record(&context, peer, offer()).await;
+    let kept = serve_job_record(&context, peer, offer(Vec::new())).await;
     let accepted = MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) };
     assert_eq!(kept, accepted);
+    net.shutdown().await;
+}
+
+// A receipt retried alone is acknowledged only once this holder keeps the input pages of the
+// stored launch it binds, which an earlier offer left without them.
+#[tokio::test]
+async fn holds_launch_pages() {
+    let (_dir, context, net, family) = fixture().await;
+    let (manifest, pages) = spec_pages(&family);
+    let spec = fresh_spec(&family);
+    let mut launch = family.launch(&spec, family.holder.public(), 0);
+    launch.input_pages = Some(manifest);
+    let receipt = family.receipt(&launch, 1);
+    let frame = |key: &iroh::SecretKey, record| {
+        JobRecordFrame::new(family.sign(key, record)).expect("bounded record")
+    };
+    let budget = family.budget(&spec, family.holder.public());
+    let submission = spec.submission_id;
+    let offers = [
+        frame(&family.holder, JobFamilyRecord::Spec(Box::new(spec))),
+        frame(&family.holder, JobFamilyRecord::Budget(budget)),
+    ];
+    let offer = |record| MetadataTransportMessage::ForwardJobRecord {
+        placement: family.placement,
+        record: Box::new(record),
+        attached: Vec::new(),
+    };
+    let peer = crate::tests::records::node(2);
+    let accepted = MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) };
+    for record in offers {
+        assert_eq!(
+            serve_job_record(&context, peer, offer(record)).await,
+            accepted
+        );
+    }
+    let launch = frame(&family.holder, JobFamilyRecord::Launch(Box::new(launch)));
+    let missing = serve_job_record(&context, peer, offer(launch)).await;
+    assert_eq!(missing, MetadataTransportMessage::ForwardedWriteUnavailable);
+    let receipt = frame(&family.target, JobFamilyRecord::Receipt(Box::new(receipt)));
+
+    let waiting = serve_job_record(&context, peer, offer(receipt.clone())).await;
+    assert_eq!(waiting, MetadataTransportMessage::ForwardedWriteUnavailable);
+    let writes = crate::jobs::records::pages::page_rows(&submission, &pages).expect("page rows");
+    let store = aruna_core::effects::StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
+    };
+    context.storage_handle.send_storage_effect(store).await;
+    assert_eq!(
+        serve_job_record(&context, peer, offer(receipt)).await,
+        accepted
+    );
     net.shutdown().await;
 }
 

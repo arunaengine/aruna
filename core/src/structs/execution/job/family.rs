@@ -952,6 +952,22 @@ pub enum JobFamilyRecord {
 }
 
 impl JobFamilyRecord {
+    /// The digest of the spec this record names. A spec names none, and an update or a stop
+    /// reaches its spec only through the receipt it extends.
+    pub fn bound_spec_digest(&self) -> Option<[u8; 32]> {
+        match self {
+            JobFamilyRecord::Claim(claim) => Some(claim.spec_digest),
+            JobFamilyRecord::Budget(budget) => Some(budget.source_spec_digest),
+            JobFamilyRecord::Launch(launch) => Some(launch.spec_digest),
+            JobFamilyRecord::Receipt(receipt) => Some(receipt.spec_digest),
+            JobFamilyRecord::Output(output) => Some(output.spec_digest),
+            JobFamilyRecord::Cancel(cancel) => Some(cancel.spec_digest),
+            JobFamilyRecord::Spec(_) | JobFamilyRecord::Update(_) | JobFamilyRecord::Stop(_) => {
+                None
+            }
+        }
+    }
+
     pub fn kind(&self) -> JobRecordKind {
         match self {
             JobFamilyRecord::Spec(_) => JobRecordKind::Spec,
