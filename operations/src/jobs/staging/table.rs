@@ -318,7 +318,9 @@ impl ChunkReadOperation {
                     observation,
                     work: empty_work(),
                 });
-                Ok(Next::Call(job_call(JobEffect::FillGzip(kept.work))))
+                Ok(Next::Call(job_call(JobEffect::FillGzip(Box::new(
+                    kept.work,
+                )))))
             }
             None => self.open_gzip(),
         }
@@ -381,7 +383,10 @@ impl ChunkReadOperation {
             work: empty_work(),
         });
         self.step = ChunkStep::Fill { reused: false };
-        Next::Call(job_call(JobEffect::FillGzip(GzipWork { stream, cursor })))
+        Next::Call(job_call(JobEffect::FillGzip(Box::new(GzipWork {
+            stream,
+            cursor,
+        }))))
     }
 
     fn collected(

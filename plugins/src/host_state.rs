@@ -70,7 +70,7 @@ pub fn reserve(bytes: u64) -> Option<u32> {
             .filter(|total| *total <= MEMORY_MIB)
     };
     RESERVED
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, fits)
+        .try_update(Ordering::AcqRel, Ordering::Acquire, fits)
         .ok()?;
     Some(mib)
 }

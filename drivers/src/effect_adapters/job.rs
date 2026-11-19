@@ -115,7 +115,7 @@ pub(super) async fn dispatch_job(
         JobEffect::CollectUpTo { stream, limit } => {
             JobEvent::CollectedUpTo(collect_limited(stream, limit).await)
         }
-        JobEffect::FillGzip(work) => fill_gzip(work).await,
+        JobEffect::FillGzip(work) => fill_gzip(*work).await,
         JobEffect::StoppableStream(stream) => JobEvent::Stream(match host {
             Some(host) => stoppable_stream(host, stream),
             None => stream,

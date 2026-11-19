@@ -232,7 +232,8 @@ pub struct ArchiveSpool {
     pub mode: ImportMode,
 }
 
-/// One call to a repository, a provider or a stored artifact.
+/// One call to a repository, a provider or a stored artifact; built once per call, never stored.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum RemoteCall {
     /// Answers `Done` unless the job must stop.
@@ -309,6 +310,8 @@ impl FileDigests {
     }
 }
 
+/// One answer per call, never stored.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum RemoteAnswer {
     Done,

@@ -172,7 +172,7 @@ fn broken_gzip_reopens() {
     };
     assert_eq!(chunk.step, ChunkStep::Fill { reused: true });
     let broken = job_event(JobEvent::GzipFilled {
-        work: Box::new(work),
+        work,
         result: Err(GzipBroken::Stream("reset".to_string())),
     });
     assert!(matches!(
@@ -188,7 +188,7 @@ fn broken_gzip_reopens() {
         panic!("expected the new stream to fill");
     };
     let broken = job_event(JobEvent::GzipFilled {
-        work: Box::new(work),
+        work,
         result: Err(GzipBroken::Stream("reset".to_string())),
     });
     assert_eq!(

@@ -15,6 +15,8 @@ pub type Effects = SmallVec<[Effect; 4]>;
 pub type TxnId = Ulid;
 pub type Key = ByteView;
 pub type Value = ByteView;
+/// The rows of one page and the key to continue after.
+pub type PageRows = (Vec<(Key, Value)>, Option<Key>);
 pub type KeySpace = String;
 pub type GroupId = Ulid;
 pub type RoleId = Ulid;
