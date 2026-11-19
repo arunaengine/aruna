@@ -362,7 +362,7 @@ async fn import_records(
                 aruna_operations::replication::drain::ProcessBatchOperation::new(
                     aruna_operations::replication::page::deliver::MetadataPages,
                     aruna_drivers::driver::node_routing(&drain),
-                    (&drain).node_and_realm(),
+                    drain.node_and_realm(),
                 ),
                 &drain,
             )

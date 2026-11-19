@@ -197,9 +197,9 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
         None,
     );
     record.captured_inputs = captured_inputs;
-    drive(row_calls::insert_job(&record), &ctx).await.unwrap();
+    drive(row_calls::insert_job(&record), ctx).await.unwrap();
     let claim = job_calls::claim_job(job_id, node_id, unix_timestamp_millis());
-    let ClaimOutcome::Claimed(claimed) = drive(claim, &ctx).await.unwrap() else {
+    let ClaimOutcome::Claimed(claimed) = drive(claim, ctx).await.unwrap() else {
         panic!("claim failed");
     };
     (job_id, claimed)
@@ -271,7 +271,7 @@ async fn wait_state(
     let mut progress = None;
     let mut deadline = Instant::now() + idle;
     loop {
-        let record = drive(row_calls::read_job_record(job_id), &ctx)
+        let record = drive(row_calls::read_job_record(job_id), ctx)
             .await
             .ok()
             .flatten();
@@ -318,7 +318,7 @@ async fn wait_run_crate(
 ) -> Option<RunCrateStatus> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(Some(status)) = drive(row_calls::read_crate_status(job_id), &ctx).await
+        if let Ok(Some(status)) = drive(row_calls::read_crate_status(job_id), ctx).await
             && !matches!(
                 status,
                 RunCrateStatus::Pending | RunCrateStatus::Minted { .. }

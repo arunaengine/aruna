@@ -60,6 +60,7 @@ const REMOTE_BUCKET: &str = "lab-data";
 
 /// Binds a folder as the device API does: reserves it, then confirms its realm bucket under the
 /// folder's pass scope.
+#[allow(clippy::result_large_err)]
 async fn bind_folder(
     context: &std::sync::Arc<DriverContext>,
     input: BindFolderInput,

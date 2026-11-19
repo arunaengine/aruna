@@ -350,6 +350,28 @@ async fn seed_node_info(ctx: &DriverContext, config: &Config) -> Result<(), Stri
         .map_err(|error| error.to_string())
 }
 
+/// Replays the event log one page at a time, checking `should_continue` before each page. A
+/// stop accepted during a large replay ends at a page boundary with every completed page
+/// projected, so no in-flight projection step is abandoned.
+async fn replay_until_stopped(
+    context: &DriverContext,
+    mut should_continue: impl FnMut() -> bool,
+) -> Result<usize, MetadataProjectionError> {
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut after = None;
+    let mut projected = 0usize;
+    while should_continue() {
+        let page = ReplayPageOperation::new(after, local_node);
+        let (count, next) = drive(page, context).await?;
+        projected = projected.saturating_add(count);
+        match next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    Ok(projected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,26 +432,4 @@ mod tests {
         assert!(matches!(result, Ok(None)));
         net.shutdown().await;
     }
-}
-
-/// Replays the event log one page at a time, checking `should_continue` before each page. A
-/// stop accepted during a large replay ends at a page boundary with every completed page
-/// projected, so no in-flight projection step is abandoned.
-async fn replay_until_stopped(
-    context: &DriverContext,
-    mut should_continue: impl FnMut() -> bool,
-) -> Result<usize, MetadataProjectionError> {
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let mut after = None;
-    let mut projected = 0usize;
-    while should_continue() {
-        let page = ReplayPageOperation::new(after, local_node);
-        let (count, next) = drive(page, context).await?;
-        projected = projected.saturating_add(count);
-        match next {
-            Some(next) => after = Some(next),
-            None => break,
-        }
-    }
-    Ok(projected)
 }

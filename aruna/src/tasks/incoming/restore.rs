@@ -1049,6 +1049,41 @@ async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle
     }
 }
 
+/// One prune pass; the payload handlers decide first which due jobs stay for now.
+async fn prune_job_page(
+    context: &DriverContext,
+    handlers: &[Arc<dyn PayloadHandler>],
+) -> Result<JobPruneOutcome, String> {
+    let now_ms = unix_timestamp_millis();
+    let due = drive(PruneDueOperation::new(now_ms, JOB_PRUNE_PAGE), context)
+        .await
+        .map_err(|error| error.0)?;
+    let mut kept = BTreeSet::new();
+    for (job_id, payload) in due {
+        for handler in handlers {
+            if handler.keeps_job(context, &payload).await? {
+                kept.insert(job_id);
+            }
+        }
+    }
+    let prune = PruneJobsOperation::new(now_ms, JOB_PRUNE_PAGE, kept);
+    drive(prune, context).await.map_err(|error| error.0)
+}
+
+async fn arm_drain_timer(context: &DriverContext) {
+    let timer = DrainTimerOperation::new(unix_timestamp_millis());
+    if let Err(error) = drive(timer, context).await {
+        warn!(error = %error, "Failed to restore job drain timer");
+    }
+}
+
+async fn arm_prune_timer(context: &DriverContext) {
+    let timer = PruneTimerOperation::new(unix_timestamp_millis());
+    if let Err(error) = drive(timer, context).await {
+        warn!(error = %error, "Failed to restore job prune timer");
+    }
+}
+
 #[cfg(test)]
 mod stop_tests {
     use super::*;
@@ -1151,40 +1186,5 @@ mod stop_tests {
             "the later restore unit must not run after the stop"
         );
         drop(temp);
-    }
-}
-
-/// One prune pass; the payload handlers decide first which due jobs stay for now.
-async fn prune_job_page(
-    context: &DriverContext,
-    handlers: &[Arc<dyn PayloadHandler>],
-) -> Result<JobPruneOutcome, String> {
-    let now_ms = unix_timestamp_millis();
-    let due = drive(PruneDueOperation::new(now_ms, JOB_PRUNE_PAGE), context)
-        .await
-        .map_err(|error| error.0)?;
-    let mut kept = BTreeSet::new();
-    for (job_id, payload) in due {
-        for handler in handlers {
-            if handler.keeps_job(context, &payload).await? {
-                kept.insert(job_id);
-            }
-        }
-    }
-    let prune = PruneJobsOperation::new(now_ms, JOB_PRUNE_PAGE, kept);
-    drive(prune, context).await.map_err(|error| error.0)
-}
-
-async fn arm_drain_timer(context: &DriverContext) {
-    let timer = DrainTimerOperation::new(unix_timestamp_millis());
-    if let Err(error) = drive(timer, context).await {
-        warn!(error = %error, "Failed to restore job drain timer");
-    }
-}
-
-async fn arm_prune_timer(context: &DriverContext) {
-    let timer = PruneTimerOperation::new(unix_timestamp_millis());
-    if let Err(error) = drive(timer, context).await {
-        warn!(error = %error, "Failed to restore job prune timer");
     }
 }

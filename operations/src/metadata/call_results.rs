@@ -79,6 +79,7 @@ fn wrong_result(expected: &'static str, got: &IoResult) -> IoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::types::Key;
 
     #[test]
     fn unpacks_expected_results() {

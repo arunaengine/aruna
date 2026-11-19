@@ -304,7 +304,6 @@ async fn webhook_pair(realm_seed: u8) -> (Node, Node, UserId, RealmConfigDocumen
     let config = drive(GetConfigOperation::new(recipient.realm_id), &b.context)
         .await
         .inspect_err(config_unavailable)
-        .ok()
         .expect("realm config");
     (a, b, recipient, config)
 }

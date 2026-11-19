@@ -129,7 +129,7 @@ async fn drive_until_terminal(
     runtime: &Arc<JobsRuntime>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let batch = drain_job_batch(
-        &context,
+        context,
         node_id(1),
         JobClassBudget {
             in_process: 8,
@@ -143,8 +143,8 @@ async fn drive_until_terminal(
     }
 
     let (a, b) = tokio::join!(
-        wait_for_terminal(runtime, &context, job_a(), Duration::from_secs(60)),
-        wait_for_terminal(runtime, &context, job_b(), Duration::from_secs(60)),
+        wait_for_terminal(runtime, context, job_a(), Duration::from_secs(60)),
+        wait_for_terminal(runtime, context, job_b(), Duration::from_secs(60)),
     );
     if a.is_none() || b.is_none() {
         return Err("jobs did not reach terminal state after restart".into());

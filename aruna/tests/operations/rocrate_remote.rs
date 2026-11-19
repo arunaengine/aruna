@@ -691,7 +691,7 @@ async fn export_rows(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Vec<ExportReportRow>, Box<dyn std::error::Error>> {
-    let (entries, _next) = list_job_entries(&context, job_id, None, 100).await?;
+    let (entries, _next) = list_job_entries(context, job_id, None, 100).await?;
     entries
         .into_iter()
         .map(|(_, value)| postcard::from_bytes(value.as_ref()).map_err(Into::into))
