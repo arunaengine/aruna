@@ -6,13 +6,13 @@ use crate::device::edit::DeviceEditError;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::api::export_types::GetVisibleRequest;
-use crate::metadata::api::read::ensure_record_readable;
-use crate::metadata::api::read::load_live_record;
+use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::create_document::CreateDocumentOperation;
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
+use crate::metadata::live_records::LiveRecordOperation;
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
@@ -42,6 +42,7 @@ use crate::forward::transport::MetadataWriteError;
 use crate::forward::transport::forwarded_unavailable;
 use crate::forward::transport::read_error;
 use crate::forward::transport::reject;
+use crate::metadata::api::MetadataApiError;
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use crate::realm::load_config::config_unavailable;
 
@@ -166,23 +167,22 @@ pub(crate) async fn apply_forwarded_write(
                 Ok(auth)
                     if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
                 {
-                    let record = match load_live_record(context.as_ref(), *document_id).await {
-                        Ok(record) => record,
+                    let live = drive(LiveRecordOperation::new(*document_id), context.as_ref());
+                    let record = match live.await {
+                        Ok(Some(record)) => record,
+                        Ok(None) => {
+                            return MetadataTransportMessage::ForwardedValidationStatus {
+                                result: Err(read_error(MetadataApiError::NotFound)),
+                            };
+                        }
                         Err(error) => {
                             return MetadataTransportMessage::ForwardedValidationStatus {
-                                result: Err(read_error(error)),
+                                result: Err(read_error(error.into())),
                             };
                         }
                     };
-                    if let Err(error) = ensure_record_readable(
-                        context.as_ref(),
-                        realm_id,
-                        auth.as_ref(),
-                        &record,
-                        None,
-                    )
-                    .await
-                    {
+                    let readable = RecordReadableOperation::new(realm_id, auth, record.clone());
+                    if let Err(error) = drive(readable, context.as_ref()).await {
                         return MetadataTransportMessage::ForwardedValidationStatus {
                             result: Err(read_error(error)),
                         };

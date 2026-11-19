@@ -26,7 +26,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifier};
-use aruna_core::types::{GroupId, Key, TxnId, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{MetaResourceId, NodeId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -56,7 +56,7 @@ use super::search_cursor::{
     CursorEnvelopeError, MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchWatermark,
     SignedCursor, paginate, query_fingerprint,
 };
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::repository::{LIST_METADATA_SIZE, StorageReadError};
 use crate::s3::bucket::search::{BucketPage, BucketSearchHit};

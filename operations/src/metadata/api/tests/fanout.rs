@@ -207,27 +207,13 @@ async fn write_policy_denies() {
     )
     .await;
 
-    let denied = ensure_permission(
-        &test.context,
-        TEST_REALM_ID,
-        auth_for(user),
-        group_id,
-        path.clone(),
-        Permission::WRITE,
-        None,
-    )
-    .await;
+    let scope = (TEST_REALM_ID, group_id);
+    let write =
+        PathPermissionOperation::new(scope, auth_for(user), path.clone(), Permission::WRITE);
+    let denied = drive(write, &test.context).await;
     // The same role allows the read, so the denial comes from the policy.
-    let allowed = ensure_permission(
-        &test.context,
-        TEST_REALM_ID,
-        auth_for(user),
-        group_id,
-        path,
-        Permission::READ,
-        None,
-    )
-    .await;
+    let read = PathPermissionOperation::new(scope, auth_for(user), path, Permission::READ);
+    let allowed = drive(read, &test.context).await;
 
     assert!(matches!(denied, Err(MetadataApiError::Forbidden)));
     assert!(allowed.is_ok());

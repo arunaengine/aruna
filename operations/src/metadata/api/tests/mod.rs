@@ -25,7 +25,8 @@ use super::preflight_types::{
     MetadataIndexState, MetadataNodeFreshness, MetadataResolvedTarget, MetadataStorageOperation,
     ReferenceRequest, ReferenceTarget,
 };
-use super::read::ensure_permission;
+use super::readable::PathPermissionOperation;
+use crate::driver::drive;
 use super::search_types::SearchQueryRequest;
 
 use std::collections::BTreeMap;
