@@ -25,7 +25,6 @@ use crate::structs::storage::encryption::{
     BucketKeyRef, KeyTicket, ReadLease, SealedCopy, UnlockStatus,
 };
 use crate::structs::storage::multipart::{BackendUpload, PartPiece, WorkingShare};
-use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
 use crate::structs::storage::routing::GroupRoutingInputs;
 use crate::{
     document::DocumentNetEvent,
@@ -119,9 +118,6 @@ pub enum SubOperationEvent {
     AuthorizationResult {
         allowed: Result<bool, AuthorizationError>,
     },
-    RealmNodesResult {
-        result: Result<Vec<NodeId>, String>,
-    },
     DocumentSyncResult {
         result: Result<(), String>,
     },
@@ -130,15 +126,6 @@ pub enum SubOperationEvent {
     },
     VersionAccessResolved {
         result: Result<ResolvedSourceAccess, SourceResolutionError>,
-    },
-    ReplicationItemResult {
-        result: Result<ReplicationSuboperationResult, ReplicationItemError>,
-    },
-    ReplicationTransferResult {
-        result: Result<(), String>,
-    },
-    ReplicationApplyResult {
-        result: Result<(), String>,
     },
     LiveReplicationQueued {
         result: Result<(), String>,
@@ -169,20 +156,6 @@ pub enum SubOperationEvent {
     },
     KeyRequestsOpened {
         request_ids: Vec<Ulid>,
-    },
-    /// A key request run failed and may succeed on retry.
-    KeyRequestsFailed,
-    /// The key directory answer for one user.
-    KeysLooked {
-        lookup: crate::structs::storage::holders::KeyLookup,
-    },
-    /// Whether a bucket sealed a missing key copy for a holder's new user key.
-    CopySealed {
-        sealed: bool,
-    },
-    /// Whether one parked copy job woke; the row of its wait is gone either way.
-    CopyWoken {
-        result: Result<bool, String>,
     },
     /// The emission stored no notification; its failure as text.
     NotificationsFailed {
@@ -1127,13 +1100,9 @@ impl Event {
                     GroupWritten,
                     DepthLimitExceeded,
                     AuthorizationResult,
-                    RealmNodesResult,
                     DocumentSyncResult,
                     SourceConnectorResolved,
                     VersionAccessResolved,
-                    ReplicationItemResult,
-                    ReplicationTransferResult,
-                    ReplicationApplyResult,
                     LiveReplicationQueued,
                     RefreshQueued,
                     BucketCreated,
@@ -1144,10 +1113,6 @@ impl Event {
                     UserUpdated,
                     VaultHeld,
                     KeyRequestsOpened,
-                    KeyRequestsFailed,
-                    KeysLooked,
-                    CopySealed,
-                    CopyWoken,
                     NotificationsFailed,
                 }
             ),
