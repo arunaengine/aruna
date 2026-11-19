@@ -79,8 +79,9 @@ fn list_without_links() {
 
 #[test]
 fn lineage_refuses_opposite() {
-    let pushing = link();
-    let mut pulling = link();
+    let mut pushing = link();
+    pushing.remote.parent_id = Some("6".into());
+    let mut pulling = pushing.clone();
     pulling.link_id = Ulid::from_bytes([9; 16]);
     pulling.direction = LinkDirection::Pull(Box::new(pull_state()));
     let mut operation = EnsureLineageOperation::new(pushing);
