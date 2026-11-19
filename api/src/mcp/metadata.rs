@@ -1214,11 +1214,9 @@ mod authorization_tests {
                 .await
                 .unwrap();
         }
-        aruna_operations::metadata::materialization_queue::process_materialization_batch(
-            ctx.as_ref(),
-        )
-        .await
-        .unwrap();
+        aruna_operations::testing::process_materialization_batch(ctx.as_ref())
+            .await
+            .unwrap();
         // A text search sees only committed index updates.
         let graph = ctx.graph_handle.as_ref().unwrap();
         graph.flush_search_updates().await.unwrap();

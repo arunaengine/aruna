@@ -510,5 +510,5 @@ impl Operation for RoutedExportOperation {
 }
 
 #[cfg(test)]
-#[path = "routed_export_tests.rs"]
+#[path = "export_tests.rs"]
 mod call_tests;
