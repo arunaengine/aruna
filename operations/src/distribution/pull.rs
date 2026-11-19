@@ -37,7 +37,7 @@ use bytes::Bytes;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::held::{HeldElsewhere, PullRequest, admitted};
+use super::held::{HeldElsewhere, PullRequest, admitted, held_answer, held_call};
 use super::keep::{
     ClaimFillOperation, Claimed, KeepError, KeptCopy, PublishKeptOperation, Published,
 };
@@ -67,26 +67,6 @@ pub(crate) fn pinned(result: IoResult) -> Result<Blob, IoError> {
         Event::Blob(BlobEvent::PinnedRead { blob }) => Ok(blob),
         other => Err(IoError::Unexpected {
             expected: "BlobEvent::PinnedRead",
-            got: other.label(),
-        }),
-    }
-}
-
-/// Asks whether a read holds the kept copy at `backend_path`.
-pub(crate) fn held_call(backend_path: &str) -> IoCall {
-    let held = BlobEffect::ReadHeld {
-        backend_path: backend_path.to_string(),
-    };
-    IoCall::from(Effect::Blob(held))
-}
-
-/// The answer of a [`held_call`]; a node without a blob backend has no reads to hold a copy.
-pub(crate) fn held_answer(result: IoResult) -> Result<bool, IoError> {
-    match result.event()? {
-        Event::Blob(BlobEvent::ReadHeld { held }) => Ok(held),
-        Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => Ok(false),
-        other => Err(IoError::Unexpected {
-            expected: "BlobEvent::ReadHeld",
             got: other.label(),
         }),
     }

@@ -797,7 +797,7 @@ impl Operation for IsProtectedOperation {
         if namespace == ATTACHMENT_NAMESPACE || namespace == CACHE_NAMESPACE {
             // An evicted copy a read still holds stays until the read ends.
             self.step = ProtectStep::Held(namespace);
-            let held = crate::distribution::pull::held_call(&self.key.backend_path);
+            let held = crate::distribution::held::held_call(&self.key.backend_path);
             return Ok(Next::Call(held));
         }
         let key = namespace.to_bytes().to_vec();
@@ -807,7 +807,7 @@ impl Operation for IsProtectedOperation {
     fn next(&mut self, result: IoResult) -> Turn<bool> {
         match std::mem::replace(&mut self.step, ProtectStep::Job) {
             ProtectStep::Held(namespace) => {
-                if crate::distribution::pull::held_answer(result)? {
+                if crate::distribution::held::held_answer(result)? {
                     return Ok(Next::Done(true));
                 }
                 let Some((key_space, row_key)) = kept_row(&self.key, namespace) else {
