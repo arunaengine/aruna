@@ -206,7 +206,8 @@ async fn cleanup_waits_space() {
         key: b"filler".to_vec().into(),
         txn_id: None,
     };
-    let (filler_tx, _filler_rx) = super::handle::response_channel(super::handle::ResponseToken::empty());
+    let (filler_tx, _filler_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
     let filler_span = super::telemetry::storage_effect_span(&filler);
     let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
@@ -242,7 +243,8 @@ async fn ordinary_write_full() {
         key: b"filler".to_vec().into(),
         txn_id: None,
     };
-    let (filler_tx, _filler_rx) = super::handle::response_channel(super::handle::ResponseToken::empty());
+    let (filler_tx, _filler_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
     let filler_span = super::telemetry::storage_effect_span(&filler);
     let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
@@ -355,7 +357,8 @@ fn bulk_full_rejects() {
     let filler = read_effect();
     let span = super::telemetry::storage_effect_span(&filler);
     let guard = super::metrics::InFlightGuard::acquire(&metrics);
-    let (filler_tx, _filler_rx) = super::handle::response_channel(super::handle::ResponseToken::empty());
+    let (filler_tx, _filler_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
     assert!(
         storage
             .bulk_read_pool
@@ -367,7 +370,8 @@ fn bulk_full_rejects() {
     let target = read_effect();
     let span = super::telemetry::storage_effect_span(&target);
     let guard = super::metrics::InFlightGuard::acquire(&metrics);
-    let (target_tx, mut target_rx) = super::handle::response_channel(super::handle::ResponseToken::empty());
+    let (target_tx, mut target_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
     let mut slow = super::worker::SlowQueueAggregator::default();
     storage.forward_read(
         ((target, target_tx, span, Instant::now(), guard), None),
@@ -966,7 +970,8 @@ async fn deferred_respects_fence() {
     let (handle, receivers) = small_handle(1);
     let mut storage = worker(&dir, &handle);
     let filler = keyed_read("filler");
-    let (filler_tx, _filler_rx) = super::handle::response_channel(super::handle::ResponseToken::empty());
+    let (filler_tx, _filler_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
     let filler_span = super::telemetry::storage_effect_span(&filler);
     let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
@@ -1258,7 +1263,12 @@ fn duplicate_commit_safe() {
     );
 
     assert!(
-        super::handle::reserve_cleanup(&mut pending, txn_id, super::handle::CleanupKind::CommitQueued).is_err()
+        super::handle::reserve_cleanup(
+            &mut pending,
+            txn_id,
+            super::handle::CleanupKind::CommitQueued
+        )
+        .is_err()
     );
     assert!(matches!(
         pending.get(&txn_id).map(|entry| entry.kind),
@@ -1339,7 +1349,10 @@ fn unknown_commit_runs() {
         StorageEvent::TransactionCommitted { txn_id: committed } if *committed == txn_id
     ));
     assert!(storage.txns.is_empty());
-    assert!(storage.observe_cleanup(Some((txn_id, super::handle::CleanupKind::CommitQueued)), &event));
+    assert!(storage.observe_cleanup(
+        Some((txn_id, super::handle::CleanupKind::CommitQueued)),
+        &event
+    ));
     super::handle::finish_cleanup(&storage.transaction_cleanup, txn_id);
     assert!(storage.transaction_cleanup.lock().unwrap().is_empty());
 }
@@ -1485,8 +1498,18 @@ fn queued_commit_fences() {
             queued: false,
         },
     );
-    assert!(super::handle::reserve_cleanup(&mut pending, txn_id, super::handle::CleanupKind::CommitQueued).is_ok());
-    assert!(super::handle::reserve_cleanup(&mut pending, txn_id, super::handle::CleanupKind::Abort).is_err());
+    assert!(
+        super::handle::reserve_cleanup(
+            &mut pending,
+            txn_id,
+            super::handle::CleanupKind::CommitQueued
+        )
+        .is_ok()
+    );
+    assert!(
+        super::handle::reserve_cleanup(&mut pending, txn_id, super::handle::CleanupKind::Abort)
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1508,7 +1531,8 @@ async fn commit_full_aborts() {
         key: b"filler".to_vec().into(),
         txn_id: None,
     };
-    let (filler_tx, _filler_rx) = super::handle::response_channel(super::handle::ResponseToken::empty());
+    let (filler_tx, _filler_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
     let filler_span = super::telemetry::storage_effect_span(&filler);
     let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
