@@ -8,7 +8,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, PageLimit, StorageEffect};
 use aruna_core::events::{JobRecordRejection, LaunchDecline};
 use aruna_core::handle::Handle;
-use aruna_core::structs::execution::job::JobFamilyRecord;
+use aruna_core::structs::execution::job::{InputPage, JobFamilyRecord, PageManifest};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -184,14 +184,11 @@ async fn refuses_absent_scheduler() {
     net.shutdown().await;
 }
 
-#[tokio::test]
-async fn holds_bound_pages() {
-    // A holder acknowledges a spec that binds input pages only once it keeps those pages, so
-    // the publisher retries until every holder can serve them after the admitting node is gone.
+/// One captured input of a spec as its input pages.
+fn spec_pages(family: &Family) -> (PageManifest, Vec<InputPage>) {
     use aruna_core::structs::execution::job::{
         CapturedInput, InputContent, InputMode, InputSelection, InputSource, PageEntries, paginate,
     };
-    let (_dir, context, net, family) = fixture().await;
     let version_id = ulid::Ulid::from_parts(1, 1);
     let pair = (
         InputSelection {
@@ -225,7 +222,52 @@ async fn holds_bound_pages() {
             served_by: None,
         },
     );
-    let (manifest, pages) = paginate(&[pair], PageEntries::Spec).expect("pages");
+    paginate(&[pair], PageEntries::Spec).expect("pages")
+}
+
+// A claim offered with the paged spec it binds is acknowledged only once this holder keeps the
+// spec's pages, also when the offer is retried after both were admitted.
+#[tokio::test]
+async fn holds_attached_pages() {
+    let (_dir, context, net, family) = fixture().await;
+    let (manifest, pages) = spec_pages(&family);
+    let mut spec = fresh_spec(&family);
+    spec.input_pages = Some(manifest);
+    let spec = spec.store_digest().expect("spec digest stored");
+    let claim = JobFamilyRecord::Claim(family.claim(&spec));
+    let claim = JobRecordFrame::new(family.sign(&family.holder, claim)).expect("bounded");
+    let submission = spec.submission_id;
+    let spec = JobFamilyRecord::Spec(Box::new(spec));
+    let spec = JobRecordFrame::new(family.sign(&family.holder, spec)).expect("bounded");
+    let offer = || MetadataTransportMessage::ForwardJobRecord {
+        placement: family.placement,
+        record: Box::new(claim.clone()),
+        attached: vec![spec.clone()],
+    };
+    let peer = crate::tests::records::node(2);
+
+    let missing = serve_job_record(&context, peer, offer()).await;
+    assert_eq!(missing, MetadataTransportMessage::ForwardedWriteUnavailable);
+    let retried = serve_job_record(&context, peer, offer()).await;
+    assert_eq!(retried, MetadataTransportMessage::ForwardedWriteUnavailable);
+    let writes = crate::jobs::records::pages::page_rows(&submission, &pages).expect("page rows");
+    let store = aruna_core::effects::StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
+    };
+    context.storage_handle.send_storage_effect(store).await;
+    let kept = serve_job_record(&context, peer, offer()).await;
+    let accepted = MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) };
+    assert_eq!(kept, accepted);
+    net.shutdown().await;
+}
+
+#[tokio::test]
+async fn holds_bound_pages() {
+    // A holder acknowledges a spec that binds input pages only once it keeps those pages, so
+    // the publisher retries until every holder can serve them after the admitting node is gone.
+    let (_dir, context, net, family) = fixture().await;
+    let (manifest, pages) = spec_pages(&family);
     let mut spec = fresh_spec(&family);
     spec.input_pages = Some(manifest);
     let spec = spec.store_digest().expect("spec digest stored");

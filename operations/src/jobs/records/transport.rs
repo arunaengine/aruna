@@ -83,7 +83,8 @@ struct Accepted {
     family: JobFamilyId,
     admission: Admission,
     rearms: bool,
-    paged: Option<JobFamilyRecord>,
+    /// The records whose input pages this holder keeps before it acknowledges.
+    paged: Vec<JobFamilyRecord>,
 }
 
 /// Serves one inbound record publish or page request from an authenticated peer. This node
@@ -311,11 +312,18 @@ impl ServeRecordOperation {
             return self.fail(ServeError::Unavailable);
         };
         let envelope = record.envelope();
+        let family = envelope.family();
+        // The pages of an attached spec or launch are held before the offer is acknowledged too.
+        let paged = (attached.iter().map(JobRecordFrame::envelope))
+            .chain([envelope])
+            .filter(|bound| bound.family() == family && binds_pages(&bound.record))
+            .map(|bound| bound.record.clone())
+            .collect();
         self.accepted = Some(Box::new(Accepted {
-            family: envelope.family(),
+            family,
             admission: Admission::Duplicate,
             rearms: rearms_witness(envelope),
-            paged: binds_pages(&envelope.record).then(|| envelope.record.clone()),
+            paged,
         }));
         self.step = ServeStep::Append;
         let append = AppendRecordOperation::new(AppendRecordConfig {
@@ -367,7 +375,7 @@ impl ServeRecordOperation {
         if let Some(refusal) = admission_refusal(&accepted.admission) {
             return self.fail(refusal);
         }
-        if let Some(record) = accepted.paged.take() {
+        if let Some(record) = accepted.paged.pop() {
             self.step = ServeStep::Pages;
             let keep = KeepPagesOperation::new(&record, peer, serving);
             return Ok(Next::Call(IoCall::child(keep)));
@@ -470,7 +478,7 @@ impl Operation for ServeRecordOperation {
                 self.settle()
             }
             ServeStep::Pages => match result.child::<(), PageReadError>()? {
-                Ok(()) => self.read_cancels(),
+                Ok(()) => self.settle(),
                 Err(error) => {
                     warn!(error = %error, "Job record input pages unavailable");
                     self.fail(ServeError::Unavailable)
@@ -691,7 +699,7 @@ mod pure_tests {
             family: family.family(),
             admission: Admission::Duplicate,
             rearms: false,
-            paged: None,
+            paged: Vec::new(),
         }));
         assert!(is_child(&serve.settle().unwrap()));
         assert_eq!(serve.step, ServeStep::Cancels);
