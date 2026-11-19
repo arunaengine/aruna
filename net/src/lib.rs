@@ -548,7 +548,6 @@ impl NetHandle {
         &self.inner.avoided_holders
     }
 
-    /// Time since the last heartbeat of `node`, or since this node started without one.
     /// When this node last saw each authorized peer.
     pub fn peer_contacts(&self) -> contacts::PeerContacts {
         self.inner.peer_contacts.clone()
@@ -571,6 +570,7 @@ impl NetHandle {
         matches
     }
 
+    /// Time since the last heartbeat of `node`, or since this node started without one.
     pub fn heartbeat_silence(&self, node: NodeId) -> Duration {
         self.inner.heartbeats.silence(&node)
     }
