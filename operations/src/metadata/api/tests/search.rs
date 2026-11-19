@@ -1,4 +1,4 @@
-//! Tests bucket and object search fan-out: partial results, denials, deadlines and caps.
+//! Tests object search planning and the assembly of its pages.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -9,378 +9,6 @@ use super::super::search::{
 };
 
 use super::super::search_types::RangeLayout;
-
-#[tokio::test]
-async fn bucket_fanout_partial() {
-    let directory = tempdir().unwrap();
-    let context = DriverContext {
-        storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    };
-    let local = iroh::SecretKey::from_bytes(&[41u8; 32]).public();
-    let healthy = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
-    let failed = iroh::SecretKey::from_bytes(&[43u8; 32]).public();
-    let local_call: MetadataNodeCall<usize> = metadata_node_call((), |(), _| async move { Ok(1) });
-    let remote_call: MetadataNodeCall<usize> =
-        metadata_node_call(failed, |failed, node_id| async move {
-            if node_id == failed {
-                Err(MetadataReadError::Unavailable)
-            } else {
-                Ok(2)
-            }
-        });
-
-    let (parts, stats) = run_metadata_fanout(
-        &context,
-        RealmId::from_bytes([9u8; 32]),
-        local,
-        MetadataFanoutScope::new(
-            Some(ApiQueryMode::Distributed),
-            Some(vec![local, healthy, failed]),
-            true,
-        ),
-        MetadataFanoutOperation::BucketSearch,
-        local_call,
-        remote_call,
-        |_, _| {},
-        map_read_error,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(parts, vec![(local, 1), (healthy, 2)]);
-    assert_eq!(stats.nodes_queried, 3);
-    assert_eq!(stats.nodes_failed, 1);
-    assert_eq!(stats.failed_partitions, vec![failed]);
-}
-
-#[tokio::test]
-async fn object_fanout_reports() {
-    let directory = tempdir().unwrap();
-    let context = DriverContext {
-        storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    };
-    let local = iroh::SecretKey::from_bytes(&[81u8; 32]).public();
-    let healthy = iroh::SecretKey::from_bytes(&[82u8; 32]).public();
-    let failed = iroh::SecretKey::from_bytes(&[83u8; 32]).public();
-    let local_call: MetadataNodeCall<usize> = metadata_node_call((), |(), _| async move { Ok(1) });
-    let remote_call: MetadataNodeCall<usize> =
-        metadata_node_call(failed, |failed, node_id| async move {
-            if node_id == failed {
-                Err(MetadataReadError::Unavailable)
-            } else {
-                Ok(2)
-            }
-        });
-
-    let (parts, stats) = run_metadata_fanout(
-        &context,
-        RealmId::from_bytes([19u8; 32]),
-        local,
-        MetadataFanoutScope::new(
-            Some(ApiQueryMode::Distributed),
-            Some(vec![local, healthy, failed]),
-            ObjectQueryMode::DistributedBestEffort.allow_partial(),
-        ),
-        MetadataFanoutOperation::ObjectSearch,
-        local_call,
-        remote_call,
-        |_, _| {},
-        map_read_error,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(parts, vec![(local, 1), (healthy, 2)]);
-    assert_eq!(stats.nodes_queried, 3);
-    assert_eq!(stats.nodes_failed, 1);
-    assert_eq!(stats.failed_partitions, vec![failed]);
-}
-
-#[tokio::test]
-async fn object_fanout_strict() {
-    let directory = tempdir().unwrap();
-    let context = DriverContext {
-        storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    };
-    let local = iroh::SecretKey::from_bytes(&[84u8; 32]).public();
-    let failed = iroh::SecretKey::from_bytes(&[85u8; 32]).public();
-    let local_call: MetadataNodeCall<usize> = metadata_node_call((), |(), _| async move { Ok(1) });
-    let remote_call: MetadataNodeCall<usize> =
-        metadata_node_call(
-            (),
-            |(), _| async move { Err(MetadataReadError::Unavailable) },
-        );
-
-    let result = run_metadata_fanout(
-        &context,
-        RealmId::from_bytes([20u8; 32]),
-        local,
-        MetadataFanoutScope::new(
-            Some(ApiQueryMode::Distributed),
-            Some(vec![local, failed]),
-            ObjectQueryMode::DistributedStrict.allow_partial(),
-        ),
-        MetadataFanoutOperation::ObjectSearch,
-        local_call,
-        remote_call,
-        |_, _| {},
-        map_read_error,
-    )
-    .await;
-
-    assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
-}
-
-#[tokio::test]
-async fn bucket_denial_wins() {
-    let directory = tempdir().unwrap();
-    let context = DriverContext {
-        storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    };
-    let local = iroh::SecretKey::from_bytes(&[49u8; 32]).public();
-    let denied = iroh::SecretKey::from_bytes(&[50u8; 32]).public();
-    let local_call: MetadataNodeCall<Vec<BucketSearchHit>> =
-        metadata_node_call((), |(), _| async move { Ok(Vec::new()) });
-    let remote_call: MetadataNodeCall<Vec<BucketSearchHit>> =
-        metadata_node_call(denied, |denied, node_id| async move {
-            if node_id == denied {
-                Err(MetadataReadError::Forbidden)
-            } else {
-                Ok(Vec::new())
-            }
-        });
-
-    let result = run_metadata_fanout(
-        &context,
-        RealmId::from_bytes([12u8; 32]),
-        local,
-        MetadataFanoutScope::new(
-            Some(ApiQueryMode::Distributed),
-            Some(vec![local, denied]),
-            true,
-        ),
-        MetadataFanoutOperation::BucketSearch,
-        local_call,
-        remote_call,
-        |_, _| {},
-        map_read_error,
-    )
-    .await;
-
-    assert!(matches!(result, Err(MetadataApiError::Forbidden)));
-}
-
-#[tokio::test]
-async fn fanout_missing_fails() {
-    let directory = tempdir().unwrap();
-    let context = DriverContext {
-        storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    };
-    let local = iroh::SecretKey::from_bytes(&[47u8; 32]).public();
-    let stale = iroh::SecretKey::from_bytes(&[48u8; 32]).public();
-    let local_call: MetadataNodeCall<usize> = metadata_node_call((), |(), _| async move { Ok(1) });
-    let remote_call: MetadataNodeCall<usize> =
-        metadata_node_call(stale, |stale, node_id| async move {
-            if node_id == stale {
-                Err(MetadataReadError::NotFound)
-            } else {
-                Ok(2)
-            }
-        });
-
-    let result = run_metadata_fanout(
-        &context,
-        RealmId::from_bytes([11u8; 32]),
-        local,
-        MetadataFanoutScope::new(
-            Some(ApiQueryMode::Distributed),
-            Some(vec![local, stale]),
-            true,
-        ),
-        MetadataFanoutOperation::Search,
-        local_call,
-        remote_call,
-        |_, _| {},
-        map_read_error,
-    )
-    .await;
-
-    assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
-}
-
-#[tokio::test(start_paused = true)]
-async fn search_deadline_partial() {
-    // A node that never answers must not stall search fanout: the overall
-    // deadline fails its partition and the reachable nodes still answer.
-    let directory = tempdir().unwrap();
-    let context = DriverContext {
-        storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    };
-    let local = iroh::SecretKey::from_bytes(&[44u8; 32]).public();
-    let healthy = iroh::SecretKey::from_bytes(&[45u8; 32]).public();
-    let hanging = iroh::SecretKey::from_bytes(&[46u8; 32]).public();
-    let local_call: MetadataNodeCall<usize> = metadata_node_call((), |(), _| async move { Ok(1) });
-    let remote_call: MetadataNodeCall<usize> =
-        metadata_node_call(hanging, |hanging, node_id| async move {
-            if node_id == hanging {
-                std::future::pending::<Result<usize, MetadataReadError>>().await
-            } else {
-                Ok(2)
-            }
-        });
-
-    let (parts, stats) = run_metadata_fanout(
-        &context,
-        RealmId::from_bytes([10u8; 32]),
-        local,
-        MetadataFanoutScope::new(
-            Some(ApiQueryMode::Distributed),
-            Some(vec![local, healthy, hanging]),
-            true,
-        ),
-        MetadataFanoutOperation::Search,
-        local_call,
-        remote_call,
-        |_, _| {},
-        map_read_error,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(parts, vec![(local, 1), (healthy, 2)]);
-    assert_eq!(stats.nodes_queried, 3);
-    assert_eq!(stats.nodes_failed, 1);
-    assert_eq!(stats.failed_partitions, vec![hanging]);
-}
-
-#[tokio::test]
-async fn capped_fanout_incomplete() {
-    // More realm nodes than the fanout cap truncates the node set, which a
-    // caller that refused partial results must not receive as complete.
-    let directory = tempdir().unwrap();
-    let context = DriverContext {
-        storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    };
-    let nodes = (0..=QUERY_MAX_NODES)
-        .map(|index| iroh::SecretKey::from_bytes(&[60 + index as u8; 32]).public())
-        .collect::<Vec<_>>();
-    let local = nodes[0];
-    let local_call: MetadataNodeCall<usize> = metadata_node_call((), |(), _| async move { Ok(1) });
-    let remote_call: MetadataNodeCall<usize> = metadata_node_call((), |(), _| async move { Ok(2) });
-
-    let result = run_metadata_fanout(
-        &context,
-        RealmId::from_bytes([13u8; 32]),
-        local,
-        MetadataFanoutScope::new(Some(ApiQueryMode::Distributed), Some(nodes), false),
-        MetadataFanoutOperation::Search,
-        local_call,
-        remote_call,
-        |_, _| {},
-        map_read_error,
-    )
-    .await;
-
-    assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
-}
-
-#[tokio::test]
-async fn names_capped_nodes() {
-    // The nodes the cap leaves out are named, and skipping the asked ones reaches them next.
-    let directory = tempdir().unwrap();
-    let context = DriverContext {
-        storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    };
-    let nodes = (0..=QUERY_MAX_NODES)
-        .map(|index| iroh::SecretKey::from_bytes(&[60 + index as u8; 32]).public())
-        .collect::<Vec<_>>();
-    let local = nodes[0];
-    let fanout = |skip: Vec<NodeId>| {
-        let call = || -> MetadataNodeCall<NodeId> {
-            metadata_node_call((), |(), node_id| async move { Ok(node_id) })
-        };
-        let scope =
-            MetadataFanoutScope::new(Some(ApiQueryMode::Distributed), Some(nodes.clone()), true)
-                .with_skip(skip);
-        run_metadata_fanout(
-            &context,
-            RealmId::from_bytes([13u8; 32]),
-            local,
-            scope,
-            MetadataFanoutOperation::BucketSearch,
-            call(),
-            call(),
-            |_, _| {},
-            map_read_error,
-        )
-    };
-    let (first, stats) = fanout(Vec::new()).await.unwrap();
-    assert_eq!(first.len(), QUERY_MAX_NODES);
-    let [left_out] = stats.omitted[..] else {
-        panic!("one node is left out: {:?}", stats.omitted);
-    };
-    let asked: Vec<NodeId> = first.iter().map(|(node_id, _)| *node_id).collect();
-    assert!(!asked.contains(&left_out));
-    let (second, stats) = fanout(asked).await.unwrap();
-    assert!(second.iter().any(|(node_id, _)| *node_id == left_out));
-    assert!(stats.omitted.is_empty());
-}
 
 fn object_search_request(realm_id: RealmId, query: &str, limit: usize) -> SearchQueryRequest {
     SearchQueryRequest {
@@ -430,7 +58,6 @@ fn search_plan_limits() {
 #[test]
 fn search_assembly_order() {
     let realm_id = RealmId::from_bytes([72u8; 32]);
-    let test = metadata_test();
     let first = iroh::SecretKey::from_bytes(&[73u8; 32]).public();
     let second = iroh::SecretKey::from_bytes(&[74u8; 32]).public();
     let plan = ObjectSearchPlan {
@@ -528,7 +155,7 @@ fn search_assembly_order() {
         ..page(second, None)
     };
     let parts = vec![(first, page(first, Some("a"))), (second, unsearched)];
-    let refused = assemble_object_execution(&test.context, &strict, partitions(), parts, stats());
+    let refused = assemble_object_execution((&strict, first), partitions(), parts, stats());
     let Err(MetadataApiError::SearchIncomplete(reason)) = refused else {
         panic!("a strict search with an unsearched range is refused");
     };
@@ -548,9 +175,8 @@ fn search_assembly_order() {
         mode: ObjectQueryMode::DistributedBestEffort,
         ..strict
     };
-    let execution = assemble_object_execution(
-        &test.context,
-        &plan,
+    let (execution, cursor) = assemble_object_execution(
+        (&plan, first),
         partitions(),
         vec![
             (first, page(first, Some("a"))),
@@ -558,7 +184,7 @@ fn search_assembly_order() {
         ],
         stats(),
     )
-    .expect("exhausted partitions assemble without a net handle");
+    .expect("exhausted partitions assemble");
 
     assert_eq!(
         execution
@@ -576,7 +202,7 @@ fn search_assembly_order() {
             .all(|partition| !partition.truncated)
     );
     assert!(execution.complete);
-    assert!(execution.next_cursor.is_none());
+    assert!(cursor.is_none());
 
     // Changed keys of finished pages add to the total the earlier pages carried.
     let changed = |node_id, key: Option<&str>, changed: &str| SearchNodePage {
@@ -591,8 +217,8 @@ fn search_assembly_order() {
         (first, changed(first, Some("b"), "a")),
         (second, changed(second, None, "z")),
     ];
-    let execution = assemble_object_execution(&test.context, &plan, carried, parts, stats())
-        .expect("exhausted partitions assemble without a net handle");
+    let (execution, _) = assemble_object_execution((&plan, first), carried, parts, stats())
+        .expect("exhausted partitions assemble");
     assert_eq!(execution.page_changed, 2);
     assert_eq!(execution.changed_keys, Some(5));
 
@@ -630,8 +256,8 @@ fn search_assembly_order() {
     ];
     for (carried, [left, right], kept) in cases {
         let parts = vec![(first, left), (second, right)];
-        let execution = assemble_object_execution(&test.context, &plan, carried, parts, stats())
-            .expect("exhausted partitions assemble without a net handle");
+        let (execution, _) = assemble_object_execution((&plan, first), carried, parts, stats())
+            .expect("exhausted partitions assemble");
         assert_eq!(execution.complete, kept);
         assert_eq!(execution.layout_changed, !kept);
         assert_eq!(execution.changed_keys, kept.then_some(0));
@@ -641,8 +267,7 @@ fn search_assembly_order() {
         ..plan
     };
     let parts = vec![(first, laid(first, 1, 2)), (second, page(second, None))];
-    let refused =
-        assemble_object_execution(&test.context, &strict, seen(1, 1, false), parts, stats());
+    let refused = assemble_object_execution((&strict, first), seen(1, 1, false), parts, stats());
     assert!(matches!(
         refused,
         Err(MetadataApiError::SearchIncomplete(_))

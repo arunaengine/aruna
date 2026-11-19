@@ -14,8 +14,6 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use lru::LruCache;
 
-use super::api::fanout_types::MetadataFanoutStats;
-
 /// Backstop staleness of a cached result. Matches the visibility cache TTL so
 /// a query never promises fresher data than the listing path does.
 pub(super) const QUERY_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -77,6 +75,17 @@ pub(super) fn credential_digest(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct QueryCacheKey([u8; 32]);
+
+impl QueryCacheKey {
+    /// The key as an effect carries it.
+    pub(super) fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub(super) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum LocalScopeKind {
@@ -165,6 +174,20 @@ pub(super) fn remote_key(input: &RemoteKeyInput<'_>) -> QueryCacheKey {
 pub(super) struct CacheStamp {
     generation: u64,
     applies: u64,
+}
+
+impl CacheStamp {
+    /// The stamp as an operation carries it between the read and the store.
+    pub(super) fn parts(self) -> [u64; 2] {
+        [self.generation, self.applies]
+    }
+
+    pub(super) fn from_parts([generation, applies]: [u64; 2]) -> Self {
+        Self {
+            generation,
+            applies,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -295,45 +318,6 @@ impl MetadataQueryCache {
     }
 }
 
-/// Caches a fan-out result only when every partition answered. A partial
-/// answer would pin the missing partitions for the whole TTL and could not be
-/// replayed with an honest envelope.
-pub(super) fn store_complete(
-    cache: &MetadataQueryCache,
-    key: QueryCacheKey,
-    results: &MetadataQueryResults,
-    stats: &MetadataFanoutStats,
-    stamp: CacheStamp,
-    generation: u64,
-    now: Instant,
-) -> bool {
-    if stats.nodes_failed > 0 || stats.discovery_failed || !stats.failed_partitions.is_empty() {
-        return false;
-    }
-    cache.insert(
-        key,
-        CachedQuery {
-            results: Arc::new(results.clone()),
-            nodes_queried: stats.nodes_queried,
-        },
-        stamp,
-        generation,
-        now,
-    )
-}
-
-/// Fan-out envelope replayed from a cached entry: only complete results are
-/// cached, so no partition can be reported as failed.
-pub(super) fn cached_stats(cached: &CachedQuery) -> MetadataFanoutStats {
-    MetadataFanoutStats {
-        nodes_queried: cached.nodes_queried,
-        nodes_failed: 0,
-        failed_partitions: Vec::new(),
-        discovery_failed: false,
-        omitted: Vec::new(),
-    }
-}
-
 fn results_bytes(results: &MetadataQueryResults) -> usize {
     const CELL_OVERHEAD: usize = 48;
     match results {
@@ -384,16 +368,6 @@ mod pure_tests {
         CachedQuery {
             results: Arc::new(results),
             nodes_queried: 1,
-        }
-    }
-
-    fn complete_stats() -> MetadataFanoutStats {
-        MetadataFanoutStats {
-            nodes_queried: 2,
-            nodes_failed: 0,
-            failed_partitions: Vec::new(),
-            discovery_failed: false,
-            omitted: Vec::new(),
         }
     }
 
@@ -544,50 +518,5 @@ mod pure_tests {
                 .is_some()
         );
         assert!(cache.get(&key("q"), stamp, now + TTL).is_none());
-    }
-
-    #[test]
-    fn partial_result_uncached() {
-        let cache = cache();
-        let stamp = cache.stamp(1);
-        let now = Instant::now();
-        let results = rows(2);
-        for stats in [
-            MetadataFanoutStats {
-                nodes_failed: 1,
-                ..complete_stats()
-            },
-            MetadataFanoutStats {
-                discovery_failed: true,
-                ..complete_stats()
-            },
-            MetadataFanoutStats {
-                failed_partitions: vec![NodeId::from_bytes(&[1u8; 32]).expect("node id")],
-                ..complete_stats()
-            },
-        ] {
-            assert!(!store_complete(
-                &cache,
-                key("q"),
-                &results,
-                &stats,
-                stamp,
-                1,
-                now
-            ));
-            assert!(cache.get(&key("q"), stamp, now).is_none());
-        }
-        assert!(store_complete(
-            &cache,
-            key("q"),
-            &results,
-            &complete_stats(),
-            stamp,
-            1,
-            now
-        ));
-        let hit = cache.get(&key("q"), stamp, now).expect("complete result");
-        assert_eq!(cached_stats(&hit).nodes_queried, 2);
-        assert_eq!(cached_stats(&hit).nodes_failed, 0);
     }
 }

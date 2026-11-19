@@ -10,7 +10,7 @@ use super::{
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::feed_walks::IndexProgress;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetadataSearchRequest {
     pub auth: Option<AuthContext>,
     pub bearer_token: Option<String>,
@@ -24,7 +24,7 @@ pub struct MetadataSearchRequest {
     pub target_nodes: Option<Vec<NodeId>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetadataSearchExecution {
     pub hits: Vec<MetadataSearchHit>,
     pub next_cursor: Option<String>,
@@ -32,7 +32,7 @@ pub struct MetadataSearchExecution {
     pub fanout_stats: MetadataFanoutStats,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BucketSearchRequest {
     pub auth: AuthContext,
     pub bearer_token: Option<String>,
@@ -53,7 +53,7 @@ pub struct BucketSearchRequest {
     pub database: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BucketSearchExecution {
     pub hits: Vec<BucketSearchHit>,
     /// Continues the listing; `None` once every node reached its end.
@@ -81,7 +81,7 @@ impl ObjectQueryMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchQueryRequest {
     pub auth: AuthContext,
     pub bearer_token: Option<String>,
@@ -94,14 +94,14 @@ pub struct SearchQueryRequest {
     pub target_nodes: Option<Vec<NodeId>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ObjectPartitionCoverage {
     pub node_id: NodeId,
     pub observed_at: SystemTime,
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ObjectExecution {
     pub hits: Vec<ObjectInventoryHit>,
     pub next_cursor: Option<String>,
@@ -126,7 +126,7 @@ pub struct ObjectExecution {
     pub layout_changed: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct ObjectPartitionState {
     pub(super) node_id: NodeId,
     pub(super) start_after: Option<Vec<u8>>,

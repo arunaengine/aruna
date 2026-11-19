@@ -841,6 +841,9 @@ pub enum NetEffect {
         node_id: crate::NodeId,
         now_ms: u64,
     },
+    /// Signs the signing bytes of a search cursor; only a cursor naming this node as signer.
+    /// Answers `NetEvent::CursorSigned`.
+    CursorSign(Vec<u8>),
     /// Checks a forwarded caller's token for a write from `peer`; answers
     /// `NetEvent::WritePeerAuth`.
     WritePeerAuth(Box<WritePeerRequest>),

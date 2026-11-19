@@ -17,7 +17,6 @@ pub(crate) mod data_links;
 pub mod delete_document;
 pub mod device_pull;
 pub mod forward;
-pub(crate) mod frames;
 pub mod get_document;
 pub mod global_entries;
 pub(crate) mod graph_deleted;
@@ -42,9 +41,9 @@ pub(crate) mod prune_jobs;
 pub mod prune_queue;
 pub mod public_preview;
 mod query_cache;
-mod queue_storage;
 pub(crate) mod raw_events;
 pub mod raw_revision;
+pub(crate) mod read_peer;
 pub mod realm_counts;
 pub mod record_reads;
 pub mod repository;
@@ -52,13 +51,11 @@ pub mod revision_read;
 mod search_cursor;
 pub mod secondary_ids;
 pub mod stats;
-pub mod timestamp_index;
 pub(crate) mod timestamp_sweep;
 pub mod update_document;
 pub mod update_entry;
 pub(crate) mod updated_page;
 pub mod visibility_index;
-pub mod warmup;
 pub mod write_peer;
 
 /// The phase-time and identity samples a metadata operation stamps records
@@ -110,9 +107,9 @@ pub use builtin::builtin_shapes;
 pub use contact::{PEER_CONTACT_WINDOW, PeerContacts};
 pub(crate) use handle::search_local_filtered;
 pub use handle::{
-    MetadataHandle, MetadataHandleOptions, export_rocrate_jsonld, list_cached_group,
-    list_cached_records, query_authorized_local, search_authorized_local, send_metadata_effect,
-    warm_caches,
+    MetadataHandle, MetadataHandleOptions, accept_pull, export_rocrate_jsonld, list_cached_group,
+    list_cached_records, pull_status, query_authorized_local, search_authorized_local,
+    send_metadata_effect, warm_caches,
 };
 pub(crate) use message_kind::transport_message_kind;
 pub use protocol::{

@@ -11,7 +11,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::metadata::{
-    MetadataBatch, MetadataBatchSource, MetadataQueryResults, MetadataSearchHit,
+    MetadataBatch, MetadataBatchSource, MetadataError, MetadataQueryResults, MetadataSearchHit,
     ProfileValidationFinding, ProfileValidationStatus,
 };
 use aruna_core::structs::execution::job::SubmissionId;
@@ -897,6 +897,24 @@ impl From<aruna_core::calls::IoError> for MetadataReadError {
     }
 }
 
+/// The read verdict of a failed graph effect: a missing graph is not found, all else unavailable.
+pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
+    match error {
+        MetadataError::GraphNotFound => MetadataReadError::NotFound,
+        MetadataError::InvalidInput(_)
+        | MetadataError::ChannelClosed
+        | MetadataError::InvalidEffect
+        | MetadataError::HandleMissing
+        | MetadataError::TaskJoin(_)
+        | MetadataError::Validation(_)
+        | MetadataError::ProfileValidation(_)
+        | MetadataError::Persist(_)
+        | MetadataError::Storage(_)
+        | MetadataError::Backend(_)
+        | MetadataError::MissingDependencies(_) => MetadataReadError::Unavailable,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteAuthError {
     Unauthorized,
@@ -981,7 +999,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::metadata::frames::{read_message_budget, read_message_cap};
+    use crate::metadata::handle::frames::{read_message_budget, read_message_cap};
     use aruna_core::UserId;
     use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
     use aruna_core::metadata::MAX_TOKEN_LEN;

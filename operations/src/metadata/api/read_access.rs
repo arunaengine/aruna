@@ -51,7 +51,7 @@ fn group(members: Vec<Effect>) -> IoCall {
 }
 
 /// Runs `operations` as one group of children, at most [`FANOUT_LIMIT`] at a time.
-pub(super) fn children<O, K>(operations: Vec<O>) -> IoCall
+pub(crate) fn children<O, K>(operations: Vec<O>) -> IoCall
 where
     O: Runnable<K> + 'static,
     K: 'static,
@@ -63,7 +63,7 @@ where
 
 /// The child results of a group from [`children`], in order; `None` for a member that did not
 /// finish or answered with another type.
-pub(super) fn child_results<T: 'static, E: 'static>(
+pub(crate) fn child_results<T: 'static, E: 'static>(
     result: IoResult,
 ) -> Result<Vec<Option<Result<T, E>>>, MetadataApiError> {
     let IoResult::Group(GroupEvent::Finished { results }) = result else {
@@ -305,7 +305,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nothing_listed_reads_nothing() {
+    fn empty_reads_nothing() {
         let mut access = ReadAccessOperation::new(realm(), None, &[]);
         assert_eq!(access.first(), Ok(Next::Done(ReadAccess::default())));
     }
@@ -337,7 +337,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn failed_rules_hide_private() {
+    fn failed_rules_hide() {
         let records = [record(true), record(false)];
         let access = access_for(&records, Some(caller()));
         assert!(access.shows(&records[0]));

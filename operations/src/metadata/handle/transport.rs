@@ -1,38 +1,32 @@
-//! Frames metadata messages on streams and sends remote requests like query, search and sync.
+//! Frames metadata messages on streams and sends the remaining requests to peers.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::metadata::message_kind::transport_message_kind;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::metadata::{MetadataError, MetadataQueryResults, MetadataSearchHit};
+use aruna_core::metadata::MetadataError;
 use aruna_core::telemetry::record_elapsed_ms;
-use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_net::streams::{BiStream, RecvStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, timeout_at};
 use tracing::{Span, field};
-use ulid::Ulid;
 
-use super::effects::record_query_counts;
+use super::frames::{
+    read_message, read_message_budget, read_message_cap, write_encoded_message, write_message,
+};
 use super::{
     METADATA_CHUNK_SIZE, METADATA_ENVELOPE_BYTES, METADATA_IO_TIMEOUT, MetadataHandle,
     MetadataInner, MetadataRequestError, PAGE_ANSWER_TIMEOUT,
-};
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::metadata::frames::{
-    read_message, read_message_budget, read_message_cap, write_encoded_message, write_message,
 };
 use crate::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, decode_message, encode_message, frame_class,
     response_cap,
 };
-use crate::s3::bucket::search::BucketPage;
-use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
 use aruna_core::metadata::AuthToken;
 use aruna_core::telemetry::record_error;
 
@@ -441,130 +435,6 @@ async fn send_remote_request(
 }
 
 impl MetadataHandle {
-    #[tracing::instrument(
-        name = "metadata.query.remote",
-        level = "debug",
-        skip(self, auth_token, sparql),
-        fields(
-            peer = ?node_id,
-            query_len = sparql.len() as u64,
-            graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
-            elapsed_ms = field::Empty,
-            result = field::Empty,
-            row_count = field::Empty,
-            triple_count = field::Empty,
-        )
-        )]
-    pub(crate) async fn query_remote_graphs(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        graph_iris: Option<Vec<String>>,
-        sparql: String,
-    ) -> Result<MetadataQueryResults, MetadataReadError> {
-        let started = Instant::now();
-        let span = Span::current();
-        let result = match send_remote_request(
-            &self.inner,
-            &span,
-            node_id,
-            MetadataTransportMessage::QueryGraphs {
-                auth_token,
-                graph_iris,
-                sparql,
-            },
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::QueryResults { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        };
-        record_elapsed_ms(&span, "elapsed_ms", started);
-        match &result {
-            Ok(results) => {
-                span.record("result", results.kind());
-                record_query_counts(&span, results);
-            }
-            Err(error) => record_error(&span, &format!("{error:?}")),
-        }
-        result
-    }
-
-    #[tracing::instrument(
-        name = "metadata.search.remote",
-        level = "debug",
-        skip(self, auth_token, query),
-        fields(
-            peer = ?node_id,
-            query_len = query.len() as u64,
-            limit = limit as u64,
-            graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
-            elapsed_ms = field::Empty,
-            result = field::Empty,
-            hit_count = field::Empty,
-        )
-    )]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn search_remote_graphs(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        graph_iris: Option<Vec<String>>,
-        query: String,
-        limit: usize,
-        group_id: Option<GroupId>,
-    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
-        self.search_remote(
-            node_id, auth_token, graph_iris, query, limit, group_id, None,
-        )
-        .await
-    }
-
-    /// Asks one node which readable documents its reverse index lists for the identifier.
-    pub(crate) async fn request_data_links(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        request: crate::metadata::api::links::types::LinkNodeRequest,
-    ) -> Result<crate::metadata::api::links::types::LinkNodePage, MetadataReadError> {
-        match send_remote_request(
-            &self.inner,
-            &Span::current(),
-            node_id,
-            MetadataTransportMessage::DataLinks {
-                auth_token,
-                request: Box::new(request),
-            },
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::DataLinkResults { result } => result.map(|page| *page),
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    pub(crate) async fn request_set_preview(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        (set_id, limit): (Ulid, usize),
-    ) -> Result<crate::metadata::api::links::types::SetPreviewPage, MetadataReadError> {
-        let request = MetadataTransportMessage::SetPreview {
-            auth_token,
-            set_id,
-            limit,
-        };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::SetPreviewResults { result } => result.map(|page| *page),
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
     /// Hands the management node `node_id` one chunk of a plugin artifact to keep; `true` once
     /// it holds the whole, checked artifact.
     pub(crate) async fn request_store_artifact(
@@ -578,245 +448,6 @@ impl MetadataHandle {
             .map_err(|_| MetadataReadError::Unavailable)?
         {
             MetadataTransportMessage::ArtifactStored { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    pub(crate) async fn request_identifier_lookup(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        kind: aruna_core::structs::secondary_id::SecondaryIdKind,
-        value: String,
-        endpoint: Option<String>,
-    ) -> Result<Vec<crate::metadata::secondary_ids::IdentifierMatch>, MetadataReadError> {
-        let span = Span::current();
-        match send_remote_request(
-            &self.inner,
-            &span,
-            node_id,
-            MetadataTransportMessage::LookupIdentifier {
-                auth_token,
-                kind,
-                value,
-                endpoint,
-            },
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::IdentifierMatches { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    #[tracing::instrument(
-        name = "metadata.bucket_search.remote",
-        level = "debug",
-        skip(self, auth_token, query),
-        fields(
-            peer = ?node_id,
-            query_len = query.len() as u64,
-            limit = limit as u64,
-            elapsed_ms = field::Empty,
-            result = field::Empty,
-            hit_count = field::Empty,
-        )
-    )]
-    pub(crate) async fn request_bucket_search(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        (query, key, extras, limit): (String, Option<String>, Option<PolicyRequestExtras>, usize),
-        (group_id, database): (Option<GroupId>, bool),
-        start_after: Option<Vec<u8>>,
-    ) -> Result<BucketPage, MetadataReadError> {
-        let started = Instant::now();
-        let span = Span::current();
-        let result = match send_remote_request(
-            &self.inner,
-            &span,
-            node_id,
-            MetadataTransportMessage::SearchBuckets {
-                auth_token,
-                query,
-                key,
-                extras,
-                limit,
-                group_id,
-                start_after,
-                database,
-            },
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::BucketSearchResults { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        };
-        record_elapsed_ms(&span, "elapsed_ms", started);
-        match &result {
-            Ok(page) => {
-                span.record("result", "ok");
-                span.record("hit_count", page.hits.len() as u64);
-            }
-            Err(error) => record_error(&span, &format!("{error:?}")),
-        }
-        result
-    }
-
-    #[tracing::instrument(
-        name = "metadata.object_search.remote",
-        level = "debug",
-        skip(self, auth_token, query, start_after),
-        fields(
-            peer = ?node_id,
-            query_len = query.len() as u64,
-            limit = limit as u64,
-            elapsed_ms = field::Empty,
-            result = field::Empty,
-            hit_count = field::Empty,
-        )
-    )]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn request_object_search(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        query: String,
-        key_match: ObjectKeyMatch,
-        bucket: Option<String>,
-        limit: usize,
-        start_after: Option<Vec<u8>>,
-        as_of: SystemTime,
-    ) -> Result<SearchNodePage, MetadataReadError> {
-        let started = Instant::now();
-        let span = Span::current();
-        let result = match send_remote_request(
-            &self.inner,
-            &span,
-            node_id,
-            MetadataTransportMessage::SearchObjects {
-                auth_token,
-                query,
-                key_match,
-                bucket,
-                limit,
-                start_after,
-                as_of,
-            },
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::ObjectSearchResults { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        };
-        record_elapsed_ms(&span, "elapsed_ms", started);
-        match &result {
-            Ok(page) => {
-                span.record("result", "ok");
-                span.record("hit_count", page.hits.len() as u64);
-            }
-            Err(error) => record_error(&span, &format!("{error:?}")),
-        }
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn search_remote_filtered(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        graph_iris: Option<Vec<String>>,
-        query: String,
-        limit: usize,
-        predicate_iri: String,
-        object_iri: String,
-        group_id: Option<GroupId>,
-    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
-        self.search_remote(
-            node_id,
-            auth_token,
-            graph_iris,
-            query,
-            limit,
-            group_id,
-            Some((predicate_iri, object_iri)),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn search_remote(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        graph_iris: Option<Vec<String>>,
-        query: String,
-        limit: usize,
-        group_id: Option<GroupId>,
-        iri_filter: Option<(String, String)>,
-    ) -> Result<Vec<MetadataSearchHit>, MetadataReadError> {
-        let started = Instant::now();
-        let span = Span::current();
-        let message = match iri_filter {
-            Some((predicate_iri, object_iri)) => MetadataTransportMessage::FilteredSearchGraphs {
-                auth_token,
-                graph_iris,
-                query,
-                limit,
-                predicate_iri,
-                object_iri,
-                group_id,
-            },
-            None => MetadataTransportMessage::SearchGraphs {
-                auth_token,
-                graph_iris,
-                query,
-                limit,
-                group_id,
-            },
-        };
-        let result = match send_remote_request(&self.inner, &span, node_id, message)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::SearchResults { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        };
-        record_elapsed_ms(&span, "elapsed_ms", started);
-        match &result {
-            Ok(hits) => {
-                span.record("result", "ok");
-                span.record("hit_count", hits.len() as u64);
-            }
-            Err(error) => record_error(&span, &format!("{error:?}")),
-        }
-        result
-    }
-
-    pub(crate) async fn request_remote_preflight(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        request: super::super::api::preflight_types::ReferenceNodeRequest,
-    ) -> Result<super::super::api::preflight_types::ReferenceNodeExecution, MetadataReadError> {
-        match send_remote_request(
-            &self.inner,
-            &Span::current(),
-            node_id,
-            MetadataTransportMessage::ReferencePreflight {
-                auth_token,
-                request: Box::new(request),
-            },
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::ReferencePreflightResults { result } => {
-                result.map(|result| *result)
-            }
             _ => Err(MetadataReadError::Unavailable),
         }
     }

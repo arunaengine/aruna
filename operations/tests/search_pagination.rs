@@ -15,8 +15,9 @@ use aruna_core::structs::storage::blob::{
     BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::metadata::api::fanout::search_buckets_distributed;
-use aruna_operations::metadata::api::search::search_objects;
+use aruna_operations::driver::drive;
+use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
+use aruna_operations::metadata::api::object_search::search_objects;
 use aruna_operations::metadata::api::search_types::{
     BucketSearchRequest, ObjectQueryMode, SearchQueryRequest,
 };
@@ -105,42 +106,58 @@ async fn distributed_search_routes() -> TestResult<()> {
     seed_object(origin, &realm, "reads/a.fastq", 1).await?;
     seed_object(origin, &realm, "reads/b.fastq", 2).await?;
 
-    let first = search_objects(
+    let first = drive(
+        search_objects(
+            realm.realm_id,
+            origin.node_id(),
+            SearchQueryRequest {
+                auth: realm.auth_context(),
+                bearer_token: Some(realm.bearer_string()),
+                query: "reads/".to_string(),
+                key_match: ObjectKeyMatch::Prefix,
+                bucket: Some("data".to_string()),
+                limit: 1,
+                cursor: None,
+                mode: ObjectQueryMode::DistributedBestEffort,
+                target_nodes: Some(vec![origin.node_id()]),
+            },
+            origin
+                .context
+                .as_ref()
+                .storage_handle
+                .range_indexes()
+                .is_some(),
+        ),
         origin.context.as_ref(),
-        realm.realm_id,
-        origin.node_id(),
-        SearchQueryRequest {
-            auth: realm.auth_context(),
-            bearer_token: Some(realm.bearer_string()),
-            query: "reads/".to_string(),
-            key_match: ObjectKeyMatch::Prefix,
-            bucket: Some("data".to_string()),
-            limit: 1,
-            cursor: None,
-            mode: ObjectQueryMode::DistributedBestEffort,
-            target_nodes: Some(vec![origin.node_id()]),
-        },
     )
     .await?;
     assert_eq!(first.hits.len(), 1);
     assert_eq!(first.hits[0].key, "reads/a.fastq");
     let cursor = first.next_cursor.expect("the first page is truncated");
 
-    let second = search_objects(
+    let second = drive(
+        search_objects(
+            realm.realm_id,
+            responder.node_id(),
+            SearchQueryRequest {
+                auth: realm.auth_context(),
+                bearer_token: Some(realm.bearer_string()),
+                query: "reads/".to_string(),
+                key_match: ObjectKeyMatch::Prefix,
+                bucket: Some("data".to_string()),
+                limit: 1,
+                cursor: Some(cursor),
+                mode: ObjectQueryMode::DistributedBestEffort,
+                target_nodes: None,
+            },
+            responder
+                .context
+                .as_ref()
+                .storage_handle
+                .range_indexes()
+                .is_some(),
+        ),
         responder.context.as_ref(),
-        realm.realm_id,
-        responder.node_id(),
-        SearchQueryRequest {
-            auth: realm.auth_context(),
-            bearer_token: Some(realm.bearer_string()),
-            query: "reads/".to_string(),
-            key_match: ObjectKeyMatch::Prefix,
-            bucket: Some("data".to_string()),
-            limit: 1,
-            cursor: Some(cursor),
-            mode: ObjectQueryMode::DistributedBestEffort,
-            target_nodes: None,
-        },
     )
     .await?;
     assert_eq!(second.hits.len(), 1);
@@ -148,22 +165,24 @@ async fn distributed_search_routes() -> TestResult<()> {
     assert!(second.next_cursor.is_none());
     assert!(second.complete);
 
-    let buckets = search_buckets_distributed(
+    let buckets = drive(
+        search_buckets_distributed(
+            realm.realm_id,
+            responder.node_id(),
+            BucketSearchRequest {
+                auth: realm.auth_context(),
+                bearer_token: Some(realm.bearer_string()),
+                query: "data".to_string(),
+                key: None,
+                extras: None,
+                limit: 10,
+                group_id: None,
+                cursor: None,
+                target_nodes: Some(vec![origin.node_id()]),
+                database: false,
+            },
+        ),
         responder.context.as_ref(),
-        realm.realm_id,
-        responder.node_id(),
-        BucketSearchRequest {
-            auth: realm.auth_context(),
-            bearer_token: Some(realm.bearer_string()),
-            query: "data".to_string(),
-            key: None,
-            extras: None,
-            limit: 10,
-            group_id: None,
-            cursor: None,
-            target_nodes: Some(vec![origin.node_id()]),
-            database: false,
-        },
     )
     .await?;
     assert_eq!(buckets.hits.len(), 1);
@@ -230,12 +249,8 @@ async fn policy_keeps_member() -> TestResult<()> {
     };
     let origin = realm.node(0);
     let shown = |request| {
-        search_buckets_distributed(
-            origin.context.as_ref(),
-            realm.realm_id,
-            origin.node_id(),
-            request,
-        )
+        let search = search_buckets_distributed(realm.realm_id, origin.node_id(), request);
+        drive(search, origin.context.as_ref())
     };
     let plain = shown(search(None)).await?;
     let nodes: Vec<_> = plain.hits.iter().map(|hit| hit.node_id).collect();

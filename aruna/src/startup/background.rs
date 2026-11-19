@@ -18,10 +18,10 @@ use aruna_operations::jobs::lifecycle::outbox::timers::{
     LifecycleTimersOperation, lifecycle_timers,
 };
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::warmup::spawn_metadata_warmup;
 use aruna_operations::node::recovery_run::RecoveryConfig;
 use aruna_operations::shard::recovery::RecoveryStatus;
 use aruna_operations::tasks::incoming::TaskQueues;
+use aruna_operations::tasks::metadata_sweeps::spawn_metadata_warmup;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;

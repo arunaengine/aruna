@@ -2,18 +2,35 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use aruna_core::events::Event;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults};
 use aruna_core::telemetry::{record_elapsed_ms, record_error};
+use tokio::sync::Semaphore;
 use tracing::{Instrument, Span, debug_span, field};
 
+use super::MetadataHandle;
 use super::lifecycle::{effect_rejects_deleted, list_local_records, metadata_graph_deleted};
 use super::search::list_visible_graphs;
-use super::{MetadataHandle, metadata_graph_fence};
 use crate::driver::DriverContext;
-use crate::metadata::protocol::MetadataReadError;
+use crate::metadata::query_cache::{CacheStamp, CachedQuery, QueryCacheKey};
+
+const GRAPH_FENCE_SHARDS: usize = 32;
+
+// Craqle already serializes same-graph writes internally. This bounded fence
+// extends that ordering over the lifecycle read performed by the Aruna handle.
+static METADATA_GRAPH_FENCES: LazyLock<[Semaphore; GRAPH_FENCE_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| Semaphore::new(1)));
+
+pub(crate) fn metadata_graph_fence(graph_iri: &str) -> &'static Semaphore {
+    let hash = blake3::hash(graph_iri.as_bytes());
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&hash.as_bytes()[..8]);
+    let shard = u64::from_be_bytes(prefix) as usize;
+    &METADATA_GRAPH_FENCES[shard % GRAPH_FENCE_SHARDS]
+}
 
 /// Runs one metadata effect on this node's graph store and answers with its event.
 pub async fn send_metadata_effect(context: &DriverContext, effect: MetadataEffect) -> Event {
@@ -47,7 +64,36 @@ async fn run_effect(
     effect: MetadataEffect,
 ) -> MetadataEvent {
     let cache = &metadata.inner.visibility_cache;
+    let queries = metadata.query_cache();
     match effect {
+        MetadataEffect::QueryCacheGet { key } => {
+            let stamp = queries.stamp(cache.current_generation());
+            let entry = queries.get(&QueryCacheKey::from_bytes(key), stamp, Instant::now());
+            let entry = entry.map(|cached| ((*cached.results).clone(), cached.nodes_queried));
+            return MetadataEvent::QueryCacheEntry {
+                stamp: stamp.parts(),
+                entry,
+            };
+        }
+        MetadataEffect::QueryCachePut {
+            key,
+            stamp,
+            results,
+            nodes_queried,
+        } => {
+            let cached = CachedQuery {
+                results: std::sync::Arc::new(results),
+                nodes_queried,
+            };
+            let generation = cache.current_generation();
+            let key = QueryCacheKey::from_bytes(key);
+            let stamp = CacheStamp::from_parts(stamp);
+            queries.insert(key, cached, stamp, generation, Instant::now());
+            return MetadataEvent::QueryCacheEntry {
+                stamp: stamp.parts(),
+                entry: None,
+            };
+        }
         MetadataEffect::CacheGeneration => {
             return MetadataEvent::CacheGeneration {
                 generation: cache.current_generation(),
@@ -146,17 +192,36 @@ async fn run_effect(
             graph_iris,
             query,
             limit,
+            group_id,
+            conforms_to,
         } => {
-            match super::search::search_authorized_local(
-                context,
-                auth_context,
-                graph_iris,
-                query,
-                limit,
-                None,
-            )
-            .await
-            {
+            let searched = match conforms_to {
+                Some(object_iri) => {
+                    super::search::search_local_filtered(
+                        context,
+                        auth_context,
+                        graph_iris,
+                        query,
+                        limit,
+                        aruna_core::entity_patch::DCTERMS_CONFORMS_IRI.to_string(),
+                        object_iri,
+                        group_id,
+                    )
+                    .await
+                }
+                None => {
+                    super::search::search_authorized_local(
+                        context,
+                        auth_context,
+                        graph_iris,
+                        query,
+                        limit,
+                        group_id,
+                    )
+                    .await
+                }
+            };
+            match searched {
                 Ok(hits) => MetadataEvent::SearchResult { hits },
                 Err(error) => MetadataEvent::Error {
                     graph_iri: None,
@@ -302,22 +367,5 @@ pub(super) fn record_query_counts(span: &Span, results: &MetadataQueryResults) {
         MetadataQueryResults::Graph(triples) => {
             span.record("triple_count", triples.len() as u64);
         }
-    }
-}
-
-pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
-    match error {
-        MetadataError::GraphNotFound => MetadataReadError::NotFound,
-        MetadataError::InvalidInput(_)
-        | MetadataError::ChannelClosed
-        | MetadataError::InvalidEffect
-        | MetadataError::HandleMissing
-        | MetadataError::TaskJoin(_)
-        | MetadataError::Validation(_)
-        | MetadataError::ProfileValidation(_)
-        | MetadataError::Persist(_)
-        | MetadataError::Storage(_)
-        | MetadataError::Backend(_)
-        | MetadataError::MissingDependencies(_) => MetadataReadError::Unavailable,
     }
 }

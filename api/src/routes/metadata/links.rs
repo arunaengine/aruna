@@ -7,6 +7,7 @@ use std::sync::Arc;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::link::{DataLink, LinkScope};
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::links::types::{
     LINKS_MAX_LIMIT, LinkDocument, LinkNodeRequest, LinkPage, LinkQuery,
 };
@@ -251,16 +252,10 @@ pub async fn bucket_links(
         (Some(key), None) => {
             let path = object_permission_path(realm_id, info.group_id, node_id, &bucket, &key);
             ensure_permission(&state, &auth, path, Permission::READ).await?;
-            file_queries(
-                state.get_ctx().as_ref(),
-                realm_id,
-                node_id,
-                &bucket,
-                &key,
-                params.version_id,
-            )
-            .await
-            .map_err(map_api_error)?
+            let queries = file_queries((realm_id, node_id), &bucket, &key, params.version_id);
+            drive(queries, state.get_ctx().as_ref())
+                .await
+                .map_err(map_api_error)?
         }
         (None, Some(prefix)) => {
             let path = bucket_permission_path(realm_id, info.group_id, node_id, &bucket);
@@ -304,16 +299,11 @@ async fn run(
     bearer_token: Option<ValidatedBearer>,
     request: LinkNodeRequest,
 ) -> ServerResult<Json<DataLinksResponse>> {
-    let page = links_distributed(
-        state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        Some(auth),
-        bearer_token_string(bearer_token),
-        request,
-    )
-    .await
-    .map_err(map_api_error)?;
+    let node = (state.get_realm_id(), state.get_node_id());
+    let links = links_distributed(node, Some(auth), bearer_token_string(bearer_token), request);
+    let page = drive(links, state.get_ctx().as_ref())
+        .await
+        .map_err(map_api_error)?;
     Ok(Json(page.into()))
 }
 
@@ -398,17 +388,11 @@ pub async fn file_part_of(
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     let path = object_permission_path(realm_id, info.group_id, node_id, &bucket, &params.key);
     ensure_permission(&state, &auth, path, Permission::READ).await?;
-    let found = part_of(
-        state.get_ctx().as_ref(),
-        realm_id,
-        node_id,
-        Some(auth),
-        bearer_token_string(bearer_token),
-        &bucket,
-        &params.key,
-    )
-    .await
-    .map_err(map_api_error)?;
+    let caller = (Some(auth), bearer_token_string(bearer_token));
+    let found = part_of((realm_id, node_id), caller, &bucket, &params.key);
+    let found = drive(found, state.get_ctx().as_ref())
+        .await
+        .map_err(map_api_error)?;
     let encoded: String = url::form_urlencoded::byte_serialize(params.key.as_bytes()).collect();
     Ok(Json(PartOfResponse {
         datasets: found
@@ -506,9 +490,12 @@ pub async fn part_target(
     let link = DataLink::parse(params.id.trim())
         .filter(|link| link.scope().is_some())
         .ok_or_else(|| ServerError::BadRequestReason("id names no bucket or prefix".to_string()))?;
-    let target = resolve_part(state.get_ctx().as_ref(), state.get_node_id(), link)
-        .await
-        .map_err(map_api_error)?;
+    let target = drive(
+        resolve_part(state.get_node_id(), link),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(map_api_error)?;
     // Signed out, a part of another node's bucket resolves only as that node answers.
     if let Some(owner) = target.node_id.filter(|owner| *owner != state.get_node_id())
         && signed_out

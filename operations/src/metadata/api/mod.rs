@@ -3,13 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
@@ -28,24 +26,19 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifier};
-use aruna_core::telemetry::record_elapsed_ms;
-use aruna_core::types::{GroupId, Key, TxnId, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{MetaResourceId, NodeId};
-use futures_util::future::BoxFuture;
-use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{Span, debug_span, field, warn};
+use tracing::{Span, debug_span, field};
 use ulid::Ulid;
 
-use self::distributed_types::{
-    object_search_fingerprint, record_object_result, record_preflight_node,
-};
+use self::distributed_types::object_search_fingerprint;
 
 use self::fanout_types::forwarded_bearer;
 
-use self::fanout_types::{MetadataFanoutOperation, MetadataNodeCall};
-use self::fanout_types::{fanout_bearer, metadata_node_call, query_union_safe};
+use self::fanout_types::MetadataFanoutOperation;
+use self::fanout_types::{fanout_bearer, query_union_safe};
 #[cfg(test)]
 use self::list_types::{
     ANONYMOUS_METADATA_LIMIT, ESTIMATE_MIN_LIMIT, LIST_METADATA_LIMIT, MAX_METADATA_LIMIT,
@@ -60,20 +53,14 @@ use super::protocol::{
     MetadataTransportMessage,
 };
 use super::search_cursor::{
-    CursorEnvelopeError, MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchCursorError,
-    SearchPageCursor, SearchWatermark, SignedCursor, merge_search_hits, paginate,
-    query_fingerprint, resume_fetch_limit,
+    CursorEnvelopeError, MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchWatermark,
+    SignedCursor, paginate, query_fingerprint,
 };
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::blob::permission_paths::ResolvePathsOperation;
+use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::repository::{LIST_METADATA_SIZE, StorageReadError};
-use crate::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::search::{BucketPage, BucketSearchHit, SearchBucketsInput};
-use crate::s3::object::search::{
-    ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput,
-};
+use crate::s3::bucket::search::{BucketPage, BucketSearchHit};
+use crate::s3::object::search::{ObjectInventoryHit, ObjectKeyMatch, SearchNodePage};
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT};
 use aruna_core::placement::selector::{
@@ -85,6 +72,7 @@ use aruna_core::placement::{
 };
 
 mod bucket_page;
+pub mod bucket_search;
 mod distributed;
 pub mod distributed_types;
 pub mod document_query;
@@ -93,21 +81,28 @@ pub mod export_types;
 pub mod fanout;
 pub mod fanout_types;
 mod head_versions;
-mod join;
+pub mod identifier_fanout;
 pub mod links;
 pub mod list;
 pub mod list_types;
+pub mod node_fanout;
+pub mod object_search;
 pub mod path;
 pub mod path_types;
 mod prefix_scan;
 pub mod preflight;
+pub mod preflight_fanout;
+pub(crate) mod preflight_local;
+mod preflight_targets;
 pub mod preflight_types;
+pub mod query_fanout;
 pub mod read;
 pub(crate) mod read_access;
 pub mod read_types;
 pub(crate) mod readable;
 pub mod references;
 pub mod search;
+pub mod search_fanout;
 pub mod search_types;
 pub(crate) mod title;
 

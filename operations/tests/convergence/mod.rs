@@ -10,7 +10,7 @@ use std::time::Duration;
 use aruna_core::types::GroupId;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::metadata::materialization_queue::materialization_jobs_exist;
+use aruna_operations::testing::materialization_jobs_exist;
 use tokio::time::{Instant, sleep, timeout};
 use ulid::Ulid;
 
@@ -107,7 +107,7 @@ pub async fn wait_empty_queues(contexts: &[Arc<DriverContext>]) -> Result<(), St
     wait_for_convergence("materialization queues never drained", || async {
         let mut busy = 0usize;
         for context in contexts {
-            if materialization_jobs_exist(&context.storage_handle)
+            if materialization_jobs_exist(context)
                 .await
                 .map_err(|error| format!("materialization probe failed: {error:?}"))?
             {

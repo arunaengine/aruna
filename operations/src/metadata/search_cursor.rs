@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use aruna_core::NodeId;
 use aruna_core::cursor;
+use aruna_core::cursor::SEARCH_CURSOR_CONTEXT;
 use aruna_core::metadata::MetadataSearchHit;
 use aruna_core::types::GroupId;
 use serde::de::DeserializeOwned;
@@ -20,7 +21,6 @@ pub const SEARCH_MAX_PAGE: usize = 100;
 pub const MAX_PAGINATION_DEPTH: usize = 1000;
 
 const SEARCH_CURSOR_VERSION: u8 = 2;
-const SIGNATURE_CONTEXT: &[u8] = b"aruna.metadata.search.cursor.v2";
 // Cursors are signed, but keep a resume cap to bound fan-out if a trusted signer
 // issues an unexpectedly large continuation.
 const MAX_RESUME_NODES: usize = 64;
@@ -78,7 +78,8 @@ impl<P: Serialize> SignedCursor<P> {
         })
     }
 
-    fn signing_bytes(&self, context: &[u8]) -> Result<Vec<u8>, postcard::Error> {
+    /// The bytes the signer signs, under the signature context of this cursor kind.
+    pub(crate) fn signing_bytes(&self, context: &[u8]) -> Result<Vec<u8>, postcard::Error> {
         cursor_signing_bytes(
             context,
             self.version,
@@ -87,6 +88,11 @@ impl<P: Serialize> SignedCursor<P> {
             &self.payload,
         )
     }
+}
+
+/// The signature a cursor carries until the node signs its signing bytes.
+pub(crate) fn blank_signature(_: &[u8]) -> iroh::Signature {
+    iroh::Signature::from_bytes(&[0; 64])
 }
 
 impl<P: Serialize + DeserializeOwned> SignedCursor<P> {
@@ -188,7 +194,7 @@ impl SignedCursor<SearchCursorPayload> {
         }
         Self::build_signed(
             SEARCH_CURSOR_VERSION,
-            SIGNATURE_CONTEXT,
+            SEARCH_CURSOR_CONTEXT,
             fingerprint,
             SearchCursorPayload { watermark, resume },
             signer,
@@ -197,7 +203,7 @@ impl SignedCursor<SearchCursorPayload> {
     }
 
     pub fn decode(raw: &str, authorized_signers: &[NodeId]) -> Result<Self, SearchCursorError> {
-        Self::decode_verified(raw, SIGNATURE_CONTEXT, authorized_signers, |cursor| {
+        Self::decode_verified(raw, SEARCH_CURSOR_CONTEXT, authorized_signers, |cursor| {
             if cursor.version != SEARCH_CURSOR_VERSION
                 || cursor.payload.resume.len() > MAX_RESUME_NODES
             {
@@ -633,7 +639,7 @@ mod pure_tests {
             resume,
         };
         let signing_bytes = cursor_signing_bytes(
-            SIGNATURE_CONTEXT,
+            SEARCH_CURSOR_CONTEXT,
             SEARCH_CURSOR_VERSION,
             *secret.public().as_bytes(),
             [0u8; 32],

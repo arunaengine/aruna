@@ -482,3 +482,7 @@ pub(crate) mod state_machine_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "timestamp_index_tests.rs"]
+mod index_tests;

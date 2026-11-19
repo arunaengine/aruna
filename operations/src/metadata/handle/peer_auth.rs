@@ -20,7 +20,6 @@ use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::metadata::contact::PeerContacts;
-use crate::metadata::protocol::MetadataReadError;
 use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
 use aruna_core::metadata::AuthToken;
@@ -42,49 +41,6 @@ impl MetadataHandle {
             true,
         )
         .await
-    }
-
-    pub(crate) async fn authorize_read_peer(
-        &self,
-        peer: NodeId,
-        auth_token: Option<AuthToken>,
-        require_trusted: bool,
-    ) -> Result<Option<AuthContext>, MetadataReadError> {
-        let auth = match auth_token {
-            Some(token @ AuthToken::Bearer(_)) => {
-                Some(self.authorize_write_peer(peer, Some(token)).await.map_err(
-                    |error| match error {
-                        WritePeerError::Unauthorized => MetadataReadError::Unauthorized,
-                        WritePeerError::Unavailable(_) => MetadataReadError::Unavailable,
-                    },
-                )?)
-            }
-            token => self
-                .authorize_remote_peer(peer, token)
-                .await
-                .map_err(|_| MetadataReadError::Unavailable)?,
-        };
-        let realm_id = self
-            .inner
-            .net_handle
-            .as_ref()
-            .map(|net| *net.realm_id())
-            .ok_or(MetadataReadError::Unavailable)?;
-        if auth.as_ref().is_some_and(|auth| auth.realm_id != realm_id) {
-            return Err(MetadataReadError::Forbidden);
-        }
-        if require_trusted {
-            ensure_peer_configured(
-                &self.inner.storage_handle,
-                peer,
-                realm_id,
-                PeerTrust::Vouched(None),
-            )
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?;
-        }
-        self.note_peer_contact(peer);
-        Ok(auth)
     }
 
     pub(crate) async fn authorize_write_peer(
@@ -215,71 +171,6 @@ pub(super) async fn remote_auth_context(
         .await
         .map(Some)
         .map_err(|error| MetadataError::Backend(format!("invalid metadata auth token: {error}")))
-}
-
-pub(super) async fn bucket_search_auth(
-    state: &AuthValidationState,
-    storage_handle: &StorageHandle,
-    peer: NodeId,
-    local_realm_id: Option<RealmId>,
-    auth_token: Option<AuthToken>,
-) -> Result<AuthContext, MetadataReadError> {
-    let Some(AuthToken::Bearer(token)) = auth_token else {
-        return Err(MetadataReadError::Unauthorized);
-    };
-    let auth = state
-        .validate(token.as_str())
-        .await
-        .map_err(|_| MetadataReadError::Unauthorized)?;
-    let Some(local_realm_id) = local_realm_id else {
-        return Err(MetadataReadError::Unavailable);
-    };
-    if auth.realm_id != local_realm_id {
-        return Err(MetadataReadError::Forbidden);
-    }
-    ensure_peer_configured(storage_handle, peer, auth.realm_id, PeerTrust::Member)
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?;
-    Ok(auth)
-}
-
-/// A bucket search without a bearer reads as Everyone, and only from a configured member.
-pub(super) async fn search_reader_auth(
-    state: &AuthValidationState,
-    storage_handle: &StorageHandle,
-    peer: NodeId,
-    local_realm_id: Option<RealmId>,
-    auth_token: Option<AuthToken>,
-) -> Result<AuthContext, MetadataReadError> {
-    if auth_token.is_some() {
-        return bucket_search_auth(state, storage_handle, peer, local_realm_id, auth_token).await;
-    }
-    let realm_id = local_realm_id.ok_or(MetadataReadError::Unavailable)?;
-    ensure_peer_configured(storage_handle, peer, realm_id, PeerTrust::Member)
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?;
-    Ok(AuthContext::anonymous(realm_id))
-}
-
-/// A release membership request: a bearer this node validates itself, from a realm
-/// infrastructure node only, never a device.
-pub(super) async fn release_auth(
-    state: &AuthValidationState,
-    storage_handle: &StorageHandle,
-    peer: NodeId,
-    local_realm_id: Option<RealmId>,
-    auth_token: Option<AuthToken>,
-) -> Result<AuthContext, MetadataReadError> {
-    let auth = bucket_search_auth(state, storage_handle, peer, local_realm_id, auth_token).await?;
-    ensure_peer_configured(
-        storage_handle,
-        peer,
-        auth.realm_id,
-        PeerTrust::Vouched(None),
-    )
-    .await
-    .map_err(|_| MetadataReadError::Forbidden)?;
-    Ok(auth)
 }
 
 pub(super) async fn authorize_peer(

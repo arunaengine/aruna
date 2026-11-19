@@ -27,7 +27,6 @@ use aruna_storage::key_index::RangeIndexes;
 use ulid::Ulid;
 
 use super::contact::PeerContacts;
-use super::materialization_queue::metadata_graph_fence;
 use super::query_cache::MetadataQueryCache;
 use crate::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeyCache, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
@@ -39,15 +38,19 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::TokenClaims;
 
 mod effects;
-pub(crate) use self::effects::metadata_read_error;
+mod forward_serve;
+pub(crate) mod frames;
+use self::effects::metadata_graph_fence;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
 pub use self::lifecycle::{list_cached_group, list_cached_records, warm_caches};
+pub use self::pull_serve::{accept_pull, pull_status};
 pub use self::query::query_authorized_local;
 pub use self::search::search_authorized_local;
 pub(crate) use self::search::search_local_filtered;
 mod ingress;
 mod lifecycle;
 mod peer_auth;
+mod pull_serve;
 mod query;
 mod search;
 mod sync;
@@ -207,7 +210,7 @@ struct MetadataInner {
     query_cache: MetadataQueryCache,
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
     peer_contacts: PeerContacts,
-    sync_pulls: crate::metadata::device_pull::PullRegistry,
+    sync_pulls: self::pull_serve::PullRegistry,
     #[cfg(feature = "test-hooks")]
     drop_ack: AtomicBool,
     #[cfg(feature = "test-hooks")]
@@ -394,7 +397,7 @@ impl MetadataHandle {
     }
 
     /// The device pulls this node is running.
-    pub(crate) fn sync_pulls(&self) -> &crate::metadata::device_pull::PullRegistry {
+    pub(crate) fn sync_pulls(&self) -> &self::pull_serve::PullRegistry {
         &self.inner.sync_pulls
     }
 

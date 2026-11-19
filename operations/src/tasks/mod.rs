@@ -9,6 +9,7 @@ pub mod job_host;
 pub mod job_node;
 pub mod job_reconcile;
 pub mod job_runner;
+pub mod metadata_sweeps;
 pub(crate) mod queue_backoff;
 pub mod queue_lag;
 pub mod rocrate_jobs;

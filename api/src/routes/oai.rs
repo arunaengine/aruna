@@ -26,7 +26,8 @@ use aruna_operations::metadata::api::export_types::{
 use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::visibility_index::{
-    VisibilityError, earliest_visible, effective_datestamp, visible_page,
+    AnonReadableOperation, EarliestVisibleOperation, EffectiveDatestampOperation, VisibilityError,
+    VisiblePageOperation,
 };
 
 use crate::forwarded::external_base_url;
@@ -370,7 +371,7 @@ fn validate_pairs(pairs: &[(String, String)]) -> Result<OaiParams, OaiFault> {
 }
 
 async fn identify(ctx: &DriverContext, base_url: &str) -> Result<String, OaiFault> {
-    let earliest = match earliest_visible(ctx).await {
+    let earliest = match drive(EarliestVisibleOperation::new(), ctx).await {
         Ok(Some(updated_at_ms)) => {
             format_from(updated_at_ms).unwrap_or_else(|| EARLIEST_FALLBACK.to_string())
         }
@@ -414,9 +415,8 @@ async fn list(
     let (from_ms, until_ms, start_cursor) = resolve_window(params)?;
     // One entry beyond the page is the visible lookahead: a token is only issued
     // when another record actually exists.
-    let page = visible_page(ctx.as_ref(), from_ms, until_ms, start_cursor, PAGE_SIZE + 1)
-        .await
-        .map_err(visibility_fault)?;
+    let page = VisiblePageOperation::new((from_ms, until_ms), start_cursor, PAGE_SIZE + 1);
+    let page = drive(page, ctx.as_ref()).await.map_err(visibility_fault)?;
     // Empty partial batches continue; only an exhausted initial window yields `noRecordsMatch`.
     // An emptied continuation closes with a terminal token to preserve the partial harvest.
     if page.entries.is_empty() && !page.more && params.resumption_token.is_none() {
@@ -611,7 +611,8 @@ async fn get_record(
     if !anon_can_read(ctx.as_ref(), &record).await? {
         return Err(protocol("idDoesNotExist", "Unknown identifier"));
     }
-    record.updated_at_ms = effective_datestamp(ctx.as_ref(), &record)
+    let datestamp = EffectiveDatestampOperation::new(record.clone());
+    record.updated_at_ms = drive(datestamp, ctx.as_ref())
         .await
         .map_err(visibility_fault)?;
     Ok(format!(
@@ -626,9 +627,8 @@ async fn anon_can_read(
     ctx: &DriverContext,
     record: &MetadataRegistryRecord,
 ) -> Result<bool, OaiFault> {
-    aruna_operations::metadata::visibility_index::anon_readable(ctx, record)
-        .await
-        .map_err(visibility_fault)
+    let readable = AnonReadableOperation::new(record.clone());
+    drive(readable, ctx).await.map_err(visibility_fault)
 }
 
 fn render_header(record: &MetadataRegistryRecord) -> String {

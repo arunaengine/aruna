@@ -5,18 +5,20 @@
 
 // Prefix lookups probe only the prefix lengths a bucket's postings use.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::Mutex;
-use tokio::time::Instant;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
-use aruna_core::effects::{IterStart, StorageEffect};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::keyspaces::{
-    DATA_LINK_KEYSPACE, DEAD_LETTER_KEYSPACE, DISTRIBUTION_KEYSPACE, DOCUMENT_LINK_KEYSPACE,
-    MATERIALIZATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE, VERSION_INDEX_KEYSPACE,
+    DATA_LINK_KEYSPACE, DISTRIBUTION_KEYSPACE, DOCUMENT_LINK_KEYSPACE, S3_BUCKET_KEYSPACE,
+    VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataError;
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
+use aruna_core::rows::all_values;
+use aruna_core::structs::identity::realm::NodeRealm;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::data::link::unverified_key;
@@ -26,20 +28,20 @@ use aruna_core::structs::storage::data::link::{
 };
 use aruna_core::structs::storage::distribution::inventory::index_key;
 use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
-use aruna_storage::StorageHandle;
+use aruna_core::types::Key;
 use byteview::ByteView;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_version, resolved};
-use crate::driver::{DriverContext, drive_until};
+use crate::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_bounded};
+use crate::metadata::call_results::page_rows;
 
 const PAGE_SIZE: usize = 256;
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const SCHEMA_BASES: [&str; 2] = ["http://schema.org/", "https://schema.org/"];
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub(crate) enum DataLinkError {
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -55,8 +57,17 @@ impl From<DataLinkError> for MetadataError {
     }
 }
 
+impl From<IoError> for DataLinkError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            error => Self::UnexpectedEvent(error.to_string()),
+        }
+    }
+}
+
 /// The rows one materialization writes and the stale rows of the document it deletes.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct LinkRows {
     pub writes: Vec<(String, ByteView, ByteView)>,
     pub deletes: Vec<(String, ByteView)>,
@@ -120,93 +131,6 @@ pub(crate) fn project_links(
     links
 }
 
-/// Replaces the document's postings: writes the projection and deletes every older row of
-/// the document that the projection does not write again.
-pub(crate) async fn plan_link_rows(
-    storage: &StorageHandle,
-    document_id: Ulid,
-    links: &BTreeMap<DataLink, LinkPosting>,
-) -> Result<LinkRows, DataLinkError> {
-    let mut rows = LinkRows::default();
-    let mut written = HashSet::new();
-    for (link, posting) in links {
-        let key = posting_key(&link.key(), document_id);
-        rows.writes.push((
-            DATA_LINK_KEYSPACE.to_string(),
-            key.clone().into(),
-            posting.to_bytes()?.into(),
-        ));
-        rows.writes.push((
-            DOCUMENT_LINK_KEYSPACE.to_string(),
-            document_key(document_id, &key).into(),
-            ByteView::from(Vec::new()),
-        ));
-        written.insert(key);
-    }
-    for key in document_rows(storage, DOCUMENT_LINK_KEYSPACE, document_id).await? {
-        if !written.contains(&key) {
-            rows.deletes.push((
-                DOCUMENT_LINK_KEYSPACE.to_string(),
-                document_key(document_id, &key).into(),
-            ));
-            rows.deletes
-                .push((DATA_LINK_KEYSPACE.to_string(), key.into()));
-        }
-    }
-    Ok(rows)
-}
-
-/// The posting keys a document has rows for, from its per-document rows in `key_space`.
-pub(crate) async fn document_rows(
-    storage: &StorageHandle,
-    key_space: &str,
-    document_id: Ulid,
-) -> Result<Vec<Vec<u8>>, DataLinkError> {
-    let prefix = ByteView::from(document_id.to_bytes().to_vec());
-    let mut start = None;
-    let mut keys = Vec::new();
-    loop {
-        let (values, next) =
-            iter_page(storage, key_space, Some(prefix.clone()), start, PAGE_SIZE).await?;
-        keys.extend(
-            values
-                .into_iter()
-                .filter_map(|(key, _)| key.get(16..).map(<[u8]>::to_vec)),
-        );
-        match next {
-            Some(next) => start = Some(IterStart::After(next)),
-            None => break,
-        }
-    }
-    Ok(keys)
-}
-
-pub(crate) async fn iter_page(
-    storage: &StorageHandle,
-    key_space: &str,
-    prefix: Option<ByteView>,
-    start: Option<IterStart>,
-    limit: usize,
-) -> Result<(Vec<(ByteView, ByteView)>, Option<ByteView>), DataLinkError> {
-    match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix,
-            start,
-            limit,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Ok((values, next_start_after)),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
-    }
-}
-
 /// One lookup's shared allowance of storage seeks and posting rows; an exhausted budget
 /// makes the answer incomplete, never a scan.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -229,134 +153,6 @@ impl LinkBudget {
     }
 }
 
-/// At most this many distribution records are read to verify one document's versions.
-const MAX_SETS: usize = 4096;
-
-/// Adds a derived posting per version link: verified in its set when a local member's version
-/// id index holds it (only then does it carry a set), otherwise unverified and counted.
-pub(crate) async fn associate_versions(
-    storage: &StorageHandle,
-    links: &mut BTreeMap<DataLink, LinkPosting>,
-) -> Result<(), DataLinkError> {
-    let versions: Vec<_> = links
-        .iter()
-        .filter_map(|(link, posting)| match link {
-            DataLink::Version {
-                realm_id,
-                version_id,
-            } => Some((*realm_id, *version_id, posting.clone())),
-            _ => None,
-        })
-        .collect();
-    if versions.is_empty() {
-        return Ok(());
-    }
-    let members = local_members(storage).await?;
-    for (realm_id, version_id, posting) in versions {
-        let sets = local_sets(storage, &members, version_id).await?;
-        for set_id in &sets {
-            let link = DataLink::SetVersion {
-                realm_id,
-                set_id: *set_id,
-                version_id,
-            };
-            links.insert(link, posting.clone());
-        }
-        if sets.is_empty() {
-            links.insert(
-                DataLink::Unverified {
-                    realm_id,
-                    version_id,
-                },
-                posting,
-            );
-        }
-    }
-    Ok(())
-}
-
-/// The sets among `members` whose version id index on this node holds `version_id`.
-async fn local_sets(
-    storage: &StorageHandle,
-    members: &BTreeMap<SetHint, Vec<Ulid>>,
-    version_id: Ulid,
-) -> Result<Vec<Ulid>, DataLinkError> {
-    let mut sets = Vec::new();
-    for set_id in members
-        .get(&SetHint::of_version(version_id))
-        .into_iter()
-        .flatten()
-    {
-        let key = index_key(*set_id, version_id);
-        if read_value(storage, VERSION_INDEX_KEYSPACE, key)
-            .await?
-            .is_some()
-        {
-            sets.push(*set_id);
-        }
-    }
-    Ok(sets)
-}
-
-/// Unverified version links one background pass tries to verify.
-const RETRY_PAGE: usize = 16;
-/// The unverified posting the next pass continues after; a restart begins again at the start.
-static RETRY_CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-
-/// Tries a page of the version links no member could verify at materialization: through a
-/// local member's index, else by asking the set's members. A verified link gains its set
-/// posting; a version no set holds stops counting. Returns whether more links follow.
-pub(crate) async fn retry_unverified(context: &DriverContext) -> Result<bool, DataLinkError> {
-    let storage = &context.storage_handle;
-    let start = (RETRY_CURSOR.lock().ok())
-        .and_then(|cursor| cursor.clone())
-        .map(|after| IterStart::After(after.into()));
-    let prefix = ByteView::from(unverified_key());
-    let (rows, next) =
-        iter_page(storage, DATA_LINK_KEYSPACE, Some(prefix), start, RETRY_PAGE).await?;
-    let members = match rows.is_empty() {
-        true => BTreeMap::new(),
-        false => local_members(storage).await?,
-    };
-    for (key, value) in rows {
-        let Some((realm_id, version_id, document_id)) = unverified_parts(&key) else {
-            continue;
-        };
-        let local = local_sets(storage, &members, version_id).await?;
-        let verified = match local.first() {
-            Some(set_id) => Some(Some(*set_id)),
-            None => {
-                let deadline = Instant::now() + RESOLVE_BUDGET;
-                match resolved(
-                    drive_until(
-                        resolve_version(context.node_and_realm(), version_id, deadline),
-                        context,
-                        deadline,
-                    )
-                    .await,
-                ) {
-                    GlobalResolution::Found(found) => Some(Some(found.set_id)),
-                    GlobalResolution::NotFound => Some(None),
-                    GlobalResolution::Unavailable | GlobalResolution::Ambiguous => None,
-                }
-            }
-        };
-        let Some(set_id) = verified else {
-            continue;
-        };
-        let link = set_id.map(|set_id| DataLink::SetVersion {
-            realm_id,
-            set_id,
-            version_id,
-        });
-        settle_unverified(storage, (&key, &value), document_id, link).await?;
-    }
-    if let Ok(mut cursor) = RETRY_CURSOR.lock() {
-        *cursor = next.as_ref().map(|next| next.to_vec());
-    }
-    Ok(next.is_some())
-}
-
 /// The realm, version and document of an unverified posting key.
 fn unverified_parts(key: &[u8]) -> Option<(RealmId, Ulid, Ulid)> {
     let rest = key.strip_prefix(unverified_key().as_slice())?;
@@ -370,162 +166,608 @@ fn unverified_parts(key: &[u8]) -> Option<(RealmId, Ulid, Ulid)> {
     ))
 }
 
-/// Replaces an unverified posting by its set posting, or drops it, while the document's
-/// materialization has not replaced it meanwhile.
-async fn settle_unverified(
-    storage: &StorageHandle,
-    (key, value): (&ByteView, &ByteView),
-    document_id: Ulid,
-    link: Option<DataLink>,
-) -> Result<(), DataLinkError> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
-    };
-    let current = match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: DATA_LINK_KEYSPACE.to_string(),
-            key: key.clone(),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Err(DataLinkError::UnexpectedEvent(other.label().to_string()));
-        }
-    };
-    let mut writes = Vec::new();
-    if let Some(link) = link {
-        let posting = posting_key(&link.key(), document_id);
-        let row = document_key(document_id, &posting);
-        writes.push((
-            DOCUMENT_LINK_KEYSPACE.to_string(),
-            row.into(),
-            ByteView::from(Vec::new()),
-        ));
-        writes.push((
-            DATA_LINK_KEYSPACE.to_string(),
-            posting.into(),
-            value.clone(),
-        ));
+fn page_call(key_space: &str, prefix: Vec<u8>, after: Option<Key>) -> IoCall {
+    IoCall::Page {
+        space: key_space.to_string(),
+        prefix: Key::from(prefix),
+        after,
+        limit: PAGE_SIZE,
     }
-    let deletes = vec![
-        (DATA_LINK_KEYSPACE.to_string(), key.clone()),
-        (
-            DOCUMENT_LINK_KEYSPACE.to_string(),
-            document_key(document_id, key).into(),
-        ),
-    ];
-    let effects = match current.as_ref() == Some(value) {
-        true => vec![
-            StorageEffect::BatchWrite {
-                writes,
-                txn_id: Some(txn_id),
-            },
-            StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            },
-            StorageEffect::CommitTransaction { txn_id },
-        ],
-        false => vec![StorageEffect::AbortTransaction { txn_id }],
-    };
-    for effect in effects {
-        match storage.send_storage_effect(effect).await {
-            // A materialization that won the race keeps its own rows.
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }) => return Ok(()),
-            Event::Storage(StorageEvent::Error { error }) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error.into());
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
+/// The posting keys a document has rows for, from its per-document rows in `key_space`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct DocumentRowsOperation {
+    key_space: &'static str,
+    document_id: Ulid,
+    keys: Vec<Vec<u8>>,
+}
+
+impl DocumentRowsOperation {
+    pub(crate) fn new(key_space: &'static str, document_id: Ulid) -> Self {
+        Self {
+            key_space,
+            document_id,
+            keys: Vec::new(),
+        }
+    }
+
+    fn page(&self, after: Option<Key>) -> IoCall {
+        page_call(self.key_space, self.document_id.to_bytes().to_vec(), after)
+    }
+}
+
+impl Operation for DocumentRowsOperation {
+    type Output = Vec<Vec<u8>>;
+    type Error = DataLinkError;
+
+    fn first(&mut self) -> Result<Next<Vec<Vec<u8>>>, DataLinkError> {
+        Ok(Next::Call(self.page(None)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<Vec<u8>>>, DataLinkError> {
+        let (rows, next) = page_rows(result)?;
+        let keys = rows
+            .into_iter()
+            .filter_map(|(key, _)| key.get(16..).map(<[u8]>::to_vec));
+        self.keys.extend(keys);
+        match next {
+            Some(next) => Ok(Next::Call(self.page(Some(next)))),
+            None => Ok(Next::Done(std::mem::take(&mut self.keys))),
+        }
+    }
+}
+
+/// Replaces the document's postings: writes the projection and deletes every older row of the
+/// document that the projection does not write again.
+#[derive(Debug, PartialEq)]
+pub(crate) struct LinkRowsOperation {
+    document_id: Ulid,
+    links: BTreeMap<DataLink, LinkPosting>,
+}
+
+impl LinkRowsOperation {
+    pub(crate) fn new(document_id: Ulid, links: BTreeMap<DataLink, LinkPosting>) -> Self {
+        Self { document_id, links }
+    }
+}
+
+impl Operation for LinkRowsOperation {
+    type Output = LinkRows;
+    type Error = DataLinkError;
+
+    fn first(&mut self) -> Result<Next<LinkRows>, DataLinkError> {
+        let rows = DocumentRowsOperation::new(DOCUMENT_LINK_KEYSPACE, self.document_id);
+        Ok(Next::Call(IoCall::child(rows)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<LinkRows>, DataLinkError> {
+        let existing = result.child::<Vec<Vec<u8>>, DataLinkError>()??;
+        let document_id = self.document_id;
+        let mut rows = LinkRows::default();
+        let mut written = HashSet::new();
+        for (link, posting) in &self.links {
+            let key = posting_key(&link.key(), document_id);
+            rows.writes.push((
+                DATA_LINK_KEYSPACE.to_string(),
+                key.clone().into(),
+                posting.to_bytes()?.into(),
+            ));
+            rows.writes.push((
+                DOCUMENT_LINK_KEYSPACE.to_string(),
+                document_key(document_id, &key).into(),
+                ByteView::from(Vec::new()),
+            ));
+            written.insert(key);
+        }
+        for key in existing {
+            if !written.contains(&key) {
+                rows.deletes.push((
+                    DOCUMENT_LINK_KEYSPACE.to_string(),
+                    document_key(document_id, &key).into(),
+                ));
+                rows.deletes
+                    .push((DATA_LINK_KEYSPACE.to_string(), key.into()));
+            }
+        }
+        Ok(Next::Done(rows))
+    }
+}
+
+/// At most this many distribution records are read to verify one document's versions.
+const MAX_SETS: usize = 4096;
+
 /// The sets this node holds a bound member bucket of, by hint.
-async fn local_members(
-    storage: &StorageHandle,
-) -> Result<BTreeMap<SetHint, Vec<Ulid>>, DataLinkError> {
-    let mut members = BTreeMap::<SetHint, Vec<Ulid>>::new();
-    let mut start = None;
-    let mut seen = 0usize;
-    loop {
-        let (values, next) =
-            iter_page(storage, DISTRIBUTION_KEYSPACE, None, start, PAGE_SIZE).await?;
-        for (_, value) in values {
-            seen += 1;
-            let Ok(view) = DistributionView::from_bytes(&value) else {
-                continue;
-            };
-            let snapshot = view.snapshot();
-            let set_id = snapshot.set_id();
-            let bucket = read_value(
-                storage,
-                S3_BUCKET_KEYSPACE,
-                snapshot.config.bucket.as_bytes().to_vec(),
-            )
-            .await?
-            .map(|value| BucketInfo::from_bytes(&value))
-            .transpose()?;
-            if bucket
-                .and_then(|info| info.distribution)
-                .is_some_and(|binding| binding.set_id == set_id)
-            {
-                members
+#[derive(Debug, PartialEq, Default)]
+pub(crate) struct LocalMembersOperation {
+    seen: usize,
+    next: Option<Key>,
+    sets: Vec<(Ulid, String)>,
+    members: BTreeMap<SetHint, Vec<Ulid>>,
+}
+
+impl LocalMembersOperation {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Operation for LocalMembersOperation {
+    type Output = BTreeMap<SetHint, Vec<Ulid>>;
+    type Error = DataLinkError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, DataLinkError> {
+        Ok(Next::Call(page_call(
+            DISTRIBUTION_KEYSPACE,
+            Vec::new(),
+            None,
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, DataLinkError> {
+        if self.sets.is_empty() {
+            let (rows, next) = page_rows(result)?;
+            self.seen += rows.len();
+            self.next = next;
+            for (_, value) in rows {
+                let Ok(view) = DistributionView::from_bytes(&value) else {
+                    continue;
+                };
+                let snapshot = view.snapshot();
+                self.sets
+                    .push((snapshot.set_id(), snapshot.config.bucket.clone()));
+            }
+            if self.sets.is_empty() {
+                return self.paged();
+            }
+            let reads = (self.sets.iter())
+                .map(|(_, bucket)| {
+                    (
+                        S3_BUCKET_KEYSPACE.to_string(),
+                        Key::from(bucket.as_bytes().to_vec()),
+                    )
+                })
+                .collect();
+            return Ok(Next::Call(IoCall::Read(reads)));
+        }
+        let values = all_values(result)?;
+        for ((set_id, _), value) in std::mem::take(&mut self.sets).into_iter().zip(values) {
+            let bucket = value
+                .map(|value| BucketInfo::from_bytes(&value))
+                .transpose()?;
+            let bound = (bucket.and_then(|info| info.distribution))
+                .is_some_and(|binding| binding.set_id == set_id);
+            if bound {
+                self.members
                     .entry(SetHint::of_set(set_id))
                     .or_default()
                     .push(set_id);
             }
         }
-        match next {
-            Some(next) if seen < MAX_SETS => start = Some(IterStart::After(next)),
-            _ => return Ok(members),
+        self.paged()
+    }
+}
+
+impl LocalMembersOperation {
+    fn paged(&mut self) -> Result<Next<BTreeMap<SetHint, Vec<Ulid>>>, DataLinkError> {
+        match self.next.take() {
+            Some(next) if self.seen < MAX_SETS => Ok(Next::Call(page_call(
+                DISTRIBUTION_KEYSPACE,
+                Vec::new(),
+                Some(next),
+            ))),
+            _ => Ok(Next::Done(std::mem::take(&mut self.members))),
         }
     }
 }
 
-async fn read_value(
-    storage: &StorageHandle,
-    key_space: &str,
-    key: Vec<u8>,
-) -> Result<Option<ByteView>, DataLinkError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
+/// The version index rows of `version_id` in each candidate set of `members`.
+fn set_reads(
+    members: &BTreeMap<SetHint, Vec<Ulid>>,
+    version_id: Ulid,
+) -> Vec<(Ulid, (String, Key))> {
+    let candidates = members
+        .get(&SetHint::of_version(version_id))
+        .into_iter()
+        .flatten();
+    candidates
+        .map(|set_id| {
+            let key = Key::from(index_key(*set_id, version_id));
+            (*set_id, (VERSION_INDEX_KEYSPACE.to_string(), key))
         })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
+        .collect()
+}
+
+/// Adds a derived posting per version link: verified in its set when a local member's version
+/// id index holds it (only then does it carry a set), otherwise unverified and counted.
+#[derive(Debug, PartialEq)]
+pub(crate) struct AssociateVersionsOperation {
+    links: BTreeMap<DataLink, LinkPosting>,
+    /// The candidate set of each version index row read, in read order.
+    candidates: Vec<(RealmId, Ulid, Ulid)>,
+}
+
+impl AssociateVersionsOperation {
+    pub(crate) fn new(links: BTreeMap<DataLink, LinkPosting>) -> Self {
+        Self {
+            links,
+            candidates: Vec::new(),
+        }
+    }
+
+    fn versions(&self) -> Vec<(RealmId, Ulid)> {
+        (self.links.keys())
+            .filter_map(|link| match link {
+                DataLink::Version {
+                    realm_id,
+                    version_id,
+                } => Some((*realm_id, *version_id)),
+                _ => None,
+            })
+            .collect()
     }
 }
 
-/// Queued and parked materializations on this node, each counted up to `cap`: postings of
-/// such documents may be missing or stale.
-pub(crate) async fn unsettled_documents(
-    storage: &StorageHandle,
-    cap: usize,
-) -> Result<(usize, usize), DataLinkError> {
-    let (pending, _) = iter_page(storage, MATERIALIZATION_JOB_KEYSPACE, None, None, cap).await?;
-    let (failed, _) = iter_page(storage, DEAD_LETTER_KEYSPACE, None, None, cap).await?;
-    Ok((pending.len(), failed.len()))
+type Links = BTreeMap<DataLink, LinkPosting>;
+
+impl Operation for AssociateVersionsOperation {
+    type Output = Links;
+    type Error = DataLinkError;
+
+    fn first(&mut self) -> Result<Next<Links>, DataLinkError> {
+        if self.versions().is_empty() {
+            return Ok(Next::Done(std::mem::take(&mut self.links)));
+        }
+        Ok(Next::Call(IoCall::child(LocalMembersOperation::new())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Links>, DataLinkError> {
+        if self.candidates.is_empty() {
+            let members = result.child::<BTreeMap<SetHint, Vec<Ulid>>, DataLinkError>()??;
+            let mut reads = Vec::new();
+            for (realm_id, version_id) in self.versions() {
+                for (set_id, read) in set_reads(&members, version_id) {
+                    self.candidates.push((realm_id, version_id, set_id));
+                    reads.push(read);
+                }
+            }
+            if reads.is_empty() {
+                return Ok(Next::Done(self.associated(&[])));
+            }
+            return Ok(Next::Call(IoCall::Read(reads)));
+        }
+        let values = all_values(result)?;
+        let candidates = std::mem::take(&mut self.candidates);
+        let found: Vec<_> = (candidates.into_iter().zip(values))
+            .filter(|(_, value)| value.is_some())
+            .map(|(candidate, _)| candidate)
+            .collect();
+        Ok(Next::Done(self.associated(&found)))
+    }
+}
+
+impl AssociateVersionsOperation {
+    fn associated(&mut self, found: &[(RealmId, Ulid, Ulid)]) -> Links {
+        let mut links = std::mem::take(&mut self.links);
+        for (realm_id, version_id) in self.versions_of(&links) {
+            let Some(posting) = links
+                .get(&DataLink::Version {
+                    realm_id,
+                    version_id,
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            let sets: Vec<_> = (found.iter())
+                .filter(|(realm, version, _)| *realm == realm_id && *version == version_id)
+                .map(|(_, _, set_id)| *set_id)
+                .collect();
+            for set_id in &sets {
+                let link = DataLink::SetVersion {
+                    realm_id,
+                    set_id: *set_id,
+                    version_id,
+                };
+                links.insert(link, posting.clone());
+            }
+            if sets.is_empty() {
+                links.insert(
+                    DataLink::Unverified {
+                        realm_id,
+                        version_id,
+                    },
+                    posting,
+                );
+            }
+        }
+        links
+    }
+
+    fn versions_of(&self, links: &Links) -> Vec<(RealmId, Ulid)> {
+        (links.keys())
+            .filter_map(|link| match link {
+                DataLink::Version {
+                    realm_id,
+                    version_id,
+                } => Some((*realm_id, *version_id)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Unverified version links one background pass tries to verify.
+const RETRY_PAGE: usize = 16;
+
+/// One unverified posting a pass tries to settle.
+#[derive(Debug, PartialEq)]
+struct Unverified {
+    key: ByteView,
+    value: ByteView,
+    realm_id: RealmId,
+    version_id: Ulid,
+    document_id: Ulid,
+}
+
+#[derive(Debug, PartialEq)]
+enum RetryStage {
+    Page,
+    Members,
+    Local(Unverified),
+    Remote(Unverified),
+    Settle,
+}
+
+/// Tries a page of the version links no member could verify at materialization: through a local
+/// member's index, else by asking the set's members. A verified link gains its set posting; a
+/// version no set holds stops counting. Answers the posting to continue after, if more follow.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RetryUnverifiedOperation {
+    ids: NodeRealm,
+    after: Option<Vec<u8>>,
+    next: Option<Vec<u8>>,
+    pending: VecDeque<Unverified>,
+    members: BTreeMap<SetHint, Vec<Ulid>>,
+    stage: RetryStage,
+}
+
+impl RetryUnverifiedOperation {
+    /// `after` is where the previous pass stopped; `None` starts at the first posting.
+    pub(crate) fn new(ids: NodeRealm, after: Option<Vec<u8>>) -> Self {
+        Self {
+            ids,
+            after,
+            next: None,
+            pending: VecDeque::new(),
+            members: BTreeMap::new(),
+            stage: RetryStage::Page,
+        }
+    }
+
+    /// Checks the next posting against this node's member indexes.
+    fn check(&mut self) -> Result<Next<Option<Vec<u8>>>, DataLinkError> {
+        let Some(posting) = self.pending.pop_front() else {
+            return Ok(Next::Done(self.next.take()));
+        };
+        let reads: Vec<_> = (set_reads(&self.members, posting.version_id).into_iter())
+            .map(|(_, read)| read)
+            .collect();
+        if reads.is_empty() {
+            return self.ask(posting);
+        }
+        self.stage = RetryStage::Local(posting);
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    /// Asks the set's members, bounded by the resolve budget.
+    fn ask(&mut self, posting: Unverified) -> Result<Next<Option<Vec<u8>>>, DataLinkError> {
+        let resolve = resolve_bounded(self.ids, posting.version_id);
+        let member = Effect::SubOperation(boxed_suboperation(resolve, |result| {
+            Event::Child(ChildOutcome::new(result))
+        }));
+        self.stage = RetryStage::Remote(posting);
+        Ok(Next::Call(IoCall::Group(EffectGroup {
+            members: vec![member],
+            limit: 1,
+            form: GroupForm::All {
+                deadline: Some(RESOLVE_BUDGET),
+            },
+        })))
+    }
+
+    fn settle(
+        &mut self,
+        posting: Unverified,
+        set_id: Option<Ulid>,
+    ) -> Result<Next<Option<Vec<u8>>>, DataLinkError> {
+        let link = set_id.map(|set_id| DataLink::SetVersion {
+            realm_id: posting.realm_id,
+            set_id,
+            version_id: posting.version_id,
+        });
+        let settle =
+            SettleUnverifiedOperation::new((posting.key, posting.value), posting.document_id, link);
+        self.stage = RetryStage::Settle;
+        Ok(Next::Call(IoCall::child(settle)))
+    }
+}
+
+impl Operation for RetryUnverifiedOperation {
+    type Output = Option<Vec<u8>>;
+    type Error = DataLinkError;
+
+    fn first(&mut self) -> Result<Next<Option<Vec<u8>>>, DataLinkError> {
+        Ok(Next::Call(IoCall::Page {
+            space: DATA_LINK_KEYSPACE.to_string(),
+            prefix: Key::from(unverified_key()),
+            after: self.after.take().map(Key::from),
+            limit: RETRY_PAGE,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<Vec<u8>>>, DataLinkError> {
+        match std::mem::replace(&mut self.stage, RetryStage::Settle) {
+            RetryStage::Page => {
+                let (rows, next) = page_rows(result)?;
+                self.next = next.map(|next| next.to_vec());
+                for (key, value) in rows {
+                    if let Some((realm_id, version_id, document_id)) = unverified_parts(&key) {
+                        self.pending.push_back(Unverified {
+                            key,
+                            value,
+                            realm_id,
+                            version_id,
+                            document_id,
+                        });
+                    }
+                }
+                if self.pending.is_empty() {
+                    return Ok(Next::Done(self.next.take()));
+                }
+                self.stage = RetryStage::Members;
+                Ok(Next::Call(IoCall::child(LocalMembersOperation::new())))
+            }
+            RetryStage::Members => {
+                self.members = result.child::<BTreeMap<SetHint, Vec<Ulid>>, DataLinkError>()??;
+                self.check()
+            }
+            RetryStage::Local(posting) => {
+                let reads = set_reads(&self.members, posting.version_id);
+                let values = all_values(result)?;
+                let local = (reads.into_iter().zip(values))
+                    .find(|(_, value)| value.is_some())
+                    .map(|((set_id, _), _)| set_id);
+                match local {
+                    Some(set_id) => self.settle(posting, Some(set_id)),
+                    None => self.ask(posting),
+                }
+            }
+            RetryStage::Remote(posting) => {
+                let found = match result {
+                    IoResult::Group(GroupEvent::Finished { results }) => (results
+                        .into_iter()
+                        .next())
+                    .and_then(|member| match member {
+                        GroupResult::Done(event) => match *event {
+                            Event::Child(outcome) => outcome.take::<GlobalResolution, IoError>(),
+                            _ => None,
+                        },
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+                match found.and_then(Result::ok) {
+                    Some(GlobalResolution::Found(found)) => {
+                        self.settle(posting, Some(found.set_id))
+                    }
+                    Some(GlobalResolution::NotFound) => self.settle(posting, None),
+                    _ => self.check(),
+                }
+            }
+            RetryStage::Settle => {
+                match result.child::<(), DataLinkError>()? {
+                    Ok(()) | Err(DataLinkError::Storage(StorageError::TransactionConflict)) => {}
+                    Err(error) => return Err(error),
+                }
+                self.check()
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum SettleStage {
+    Read,
+    Written(Vec<(String, ByteView)>),
+    Deleted,
+}
+
+/// Replaces an unverified posting by its set posting, or drops it, while the document's
+/// materialization has not replaced it meanwhile, all in one transaction.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SettleUnverifiedOperation {
+    key: ByteView,
+    value: ByteView,
+    document_id: Ulid,
+    link: Option<DataLink>,
+    stage: SettleStage,
+}
+
+impl SettleUnverifiedOperation {
+    pub(crate) fn new(
+        (key, value): (ByteView, ByteView),
+        document_id: Ulid,
+        link: Option<DataLink>,
+    ) -> Self {
+        Self {
+            key,
+            value,
+            document_id,
+            link,
+            stage: SettleStage::Read,
+        }
+    }
+}
+
+impl Operation for SettleUnverifiedOperation {
+    type Output = ();
+    type Error = DataLinkError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    // A materialization that won the race keeps its own rows; the caller treats the lost
+    // transaction as settled instead of running this again.
+    fn is_conflict(_error: &DataLinkError) -> bool {
+        false
+    }
+
+    fn first(&mut self) -> Result<Next<()>, DataLinkError> {
+        let read = (DATA_LINK_KEYSPACE.to_string(), self.key.clone());
+        Ok(Next::Call(IoCall::Read(vec![read])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, DataLinkError> {
+        match std::mem::replace(&mut self.stage, SettleStage::Deleted) {
+            SettleStage::Read => {
+                let current = result.value()?;
+                if current.as_ref() != Some(&self.value) {
+                    return Ok(Next::Done(()));
+                }
+                let document_id = self.document_id;
+                let mut writes = Vec::new();
+                if let Some(link) = &self.link {
+                    let posting = posting_key(&link.key(), document_id);
+                    let row = document_key(document_id, &posting);
+                    let empty = ByteView::from(Vec::new());
+                    writes.push((DOCUMENT_LINK_KEYSPACE.to_string(), row.into(), empty));
+                    writes.push((
+                        DATA_LINK_KEYSPACE.to_string(),
+                        posting.into(),
+                        self.value.clone(),
+                    ));
+                }
+                let document_row = document_key(document_id, &self.key).into();
+                let deletes = vec![
+                    (DATA_LINK_KEYSPACE.to_string(), self.key.clone()),
+                    (DOCUMENT_LINK_KEYSPACE.to_string(), document_row),
+                ];
+                self.stage = SettleStage::Written(deletes);
+                Ok(Next::Call(IoCall::Write(writes)))
+            }
+            SettleStage::Written(deletes) => {
+                result.done()?;
+                self.stage = SettleStage::Deleted;
+                Ok(Next::Call(IoCall::Delete(deletes)))
+            }
+            SettleStage::Deleted => {
+                result.done()?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

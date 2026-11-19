@@ -71,7 +71,7 @@ pub struct LinkNodePage {
 }
 
 /// The merged answer of every metadata node.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LinkPage {
     pub documents: Vec<LinkDocument>,
     pub next_after: Option<Ulid>,
@@ -99,7 +99,7 @@ pub struct SetPreviewPage {
 
 /// A set's deletion preview over every metadata node: each node's first page of the postings
 /// that name the set, merged by document id.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SetPreview {
     pub documents: Vec<LinkDocument>,
     /// A node holds more postings of the set than its first page.
@@ -238,7 +238,7 @@ pub const PART_OF_LIMIT: usize = 10;
 
 /// The datasets whose live linked parts contain a file: its derived `isPartOf`, computed now
 /// and never stored per file.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PartOf {
     pub datasets: Vec<LinkDocument>,
     /// More datasets exist than this answer names.

@@ -18,7 +18,7 @@ use aruna_core::structs::storage::metadata_registry::{
 };
 use aruna_core::types::{Key, Value};
 use aruna_operations::metadata::repository::create_outbox_entries;
-use aruna_operations::metadata::visibility_index::{CANDIDATE_BUDGET, rebuild_index};
+use aruna_operations::metadata::visibility_index::{CANDIDATE_BUDGET, RebuildIndexOperation};
 use std::collections::{HashMap, HashSet};
 
 struct Fixture {
@@ -212,7 +212,9 @@ async fn seed_records(fixture: &Fixture, count: u64, public: bool) {
     for index in 0..count {
         store_record(fixture, &registry_record(fixture, index, public)).await;
     }
-    rebuild_index(&fixture.ctx).await.unwrap();
+    drive(RebuildIndexOperation::new(), &fixture.ctx)
+        .await
+        .unwrap();
 }
 
 fn list_params(token: Option<&str>) -> OaiParams {
@@ -291,7 +293,9 @@ async fn denied_prefix_continues() {
     for index in tail..tail + 3 {
         store_record(&fixture, &registry_record(&fixture, index, true)).await;
     }
-    rebuild_index(&fixture.ctx).await.unwrap();
+    drive(RebuildIndexOperation::new(), &fixture.ctx)
+        .await
+        .unwrap();
     seed_group(&fixture, denied, vec![deny_read()]).await;
 
     let first = list_page(&fixture, None).await.unwrap();
@@ -315,7 +319,9 @@ async fn earliest_skips_denied() {
         store_record(&fixture, &record_in(&fixture, denied, index, true)).await;
     }
     store_record(&fixture, &registry_record(&fixture, tail, true)).await;
-    rebuild_index(&fixture.ctx).await.unwrap();
+    drive(RebuildIndexOperation::new(), &fixture.ctx)
+        .await
+        .unwrap();
     seed_group(&fixture, denied, vec![deny_read()]).await;
 
     let body = identify(&fixture.ctx, "https://example.test/api/v1/oai")
@@ -342,7 +348,9 @@ async fn empty_continuation_terminates() {
         &registry_record(&fixture, PAGE_SIZE as u64, false),
     )
     .await;
-    rebuild_index(&fixture.ctx).await.unwrap();
+    drive(RebuildIndexOperation::new(), &fixture.ctx)
+        .await
+        .unwrap();
 
     let second = list_page(&fixture, Some(&token)).await.unwrap();
     assert_eq!(
@@ -368,7 +376,9 @@ async fn frozen_window_ends() {
     let mut moved = registry_record(&fixture, 0, true);
     moved.updated_at_ms = later + 1;
     store_record(&fixture, &moved).await;
-    rebuild_index(&fixture.ctx).await.unwrap();
+    drive(RebuildIndexOperation::new(), &fixture.ctx)
+        .await
+        .unwrap();
 
     let second = list_page(&fixture, Some(&token)).await.unwrap();
     assert_eq!(second.matches("<header>").count(), 1);

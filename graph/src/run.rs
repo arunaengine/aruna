@@ -69,10 +69,25 @@ impl GraphHandle {
             | MetadataEffect::CacheGeneration
             | MetadataEffect::CacheRecords { .. }
             | MetadataEffect::UncacheRecord { .. }
-            | MetadataEffect::CachedGroup { .. } => {
+            | MetadataEffect::CachedGroup { .. }
+            | MetadataEffect::QueryCacheGet { .. }
+            | MetadataEffect::QueryCachePut { .. } => {
                 return MetadataEvent::Error {
                     graph_iri: None,
                     error: MetadataError::InvalidEffect,
+                };
+            }
+            MetadataEffect::MergeRows { job, budget } => {
+                let result = crate::merge::run_merge(job, budget).await;
+                return MetadataEvent::RowsMerged { result };
+            }
+            MetadataEffect::IriReferences { graph_iri } => {
+                return match self.iri_references(graph_iri).await {
+                    Ok(references) => MetadataEvent::IriReferences { references },
+                    Err(error) => MetadataEvent::Error {
+                        graph_iri: None,
+                        error,
+                    },
                 };
             }
             MetadataEffect::DescribeTitle {
@@ -960,9 +975,13 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::CacheRecords { .. }
         | MetadataEffect::UncacheRecord { .. }
         | MetadataEffect::CachedGroup { .. }
+        | MetadataEffect::QueryCacheGet { .. }
+        | MetadataEffect::QueryCachePut { .. }
         | MetadataEffect::ExportSummaryAt { .. }
         | MetadataEffect::DescribeTitle { .. }
+        | MetadataEffect::IriReferences { .. }
         | MetadataEffect::FlushGraph
+        | MetadataEffect::MergeRows { .. }
         | MetadataEffect::CachedRecords => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs

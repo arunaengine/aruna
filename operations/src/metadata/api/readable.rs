@@ -1,4 +1,4 @@
-//! Decides whether a caller may read one metadata registry record.
+//! Decides whether a caller may read one metadata registry record or act on one path.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -11,6 +11,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::telemetry::record_stage;
+use aruna_core::types::GroupId;
 
 use super::MetadataApiError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
@@ -122,6 +123,91 @@ impl Operation for RecordReadableOperation {
     }
 }
 
+fn path_error(error: AuthorizationError) -> MetadataApiError {
+    match error {
+        AuthorizationError::InvalidRealmId
+        | AuthorizationError::InvalidGroupId
+        | AuthorizationError::GroupNotFound
+        | AuthorizationError::DocNotFound => MetadataApiError::Forbidden,
+        other => MetadataApiError::Internal(other.to_string()),
+    }
+}
+
+/// Whether the caller holds `permission` on a path of `group_id` and the realm and group
+/// policies allow it, all read in one batch; every denial is forbidden.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PathPermissionOperation {
+    realm_id: RealmId,
+    group_id: GroupId,
+    check: CheckPermissionsConfig,
+    now_ms: u64,
+    started_ms: u64,
+}
+
+impl PathPermissionOperation {
+    pub(crate) fn new(
+        (realm_id, group_id): (RealmId, GroupId),
+        auth: AuthContext,
+        path: String,
+        permission: Permission,
+    ) -> Self {
+        let check = CheckPermissionsConfig {
+            auth_context: auth,
+            path,
+            required_permission: permission,
+        };
+        Self {
+            realm_id,
+            group_id,
+            check,
+            now_ms: 0,
+            started_ms: 0,
+        }
+    }
+}
+
+impl Operation for PathPermissionOperation {
+    type Output = ();
+    type Error = MetadataApiError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<()>, MetadataApiError> {
+        self.started_ms = self.now_ms;
+        if self.check.auth_context.realm_id != self.realm_id {
+            return Err(MetadataApiError::Forbidden);
+        }
+        let mut reads = self.check.reads().map_err(path_error)?;
+        reads.extend(policy_reads(self.realm_id, Some(self.group_id)));
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataApiError> {
+        let elapsed = self.now_ms.saturating_sub(self.started_ms);
+        record_stage("permission", Duration::from_millis(elapsed));
+        let mut values = all_values(result)?;
+        let rules = self.check.reads().map_err(path_error)?.len();
+        let policies = values.split_off(rules.min(values.len()));
+        if !self.check.allowed(values).map_err(path_error)? {
+            return Err(MetadataApiError::Forbidden);
+        }
+        // Policies must see the permission the RBAC check enforced; a fixed read would let a
+        // write-deny policy pass unevaluated.
+        let request = policy_request_with(
+            &self.check.path,
+            &self.check.required_permission,
+            Some(&self.check.auth_context),
+            PolicyRequestExtras::operation("metadata.read"),
+        );
+        read_policies(self.realm_id, Some(self.group_id), policies)
+            .and_then(|evaluator| evaluator.evaluate(&request))
+            .map_err(|_| MetadataApiError::Forbidden)?;
+        Ok(Next::Done(()))
+    }
+}
+
 #[cfg(test)]
 mod call_tests {
     use super::*;
@@ -212,5 +298,37 @@ mod call_tests {
         // Missing rules allow nothing.
         let answer = IoResult::Values(vec![None; reads.len()]);
         assert!(check.next(answer).is_err());
+    }
+
+    #[test]
+    fn foreign_path_forbidden() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let foreign = auth(RealmId::from_bytes([9; 32]));
+        let path = "aruna/data".to_string();
+        let group = (realm_id, Ulid::from_parts(2, 2));
+        let mut check = PathPermissionOperation::new(group, foreign, path, Permission::WRITE);
+        assert_eq!(check.first(), Err(MetadataApiError::Forbidden));
+    }
+
+    #[test]
+    fn path_reads_rules_policies() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let group_id = Ulid::from_parts(2, 2);
+        let path = record(false).permission_path;
+        let mut check = PathPermissionOperation::new(
+            (realm_id, group_id),
+            auth(realm_id),
+            path,
+            Permission::WRITE,
+        );
+        let Ok(Next::Call(IoCall::Read(reads))) = check.first() else {
+            panic!("expected one batch read");
+        };
+        let policies = policy_reads(realm_id, Some(group_id));
+        assert!(reads.ends_with(&policies));
+        assert!(reads.len() > policies.len());
+        // Missing rules deny the write.
+        let values = IoResult::Values(vec![None; reads.len()]);
+        assert!(check.next(values).is_err());
     }
 }

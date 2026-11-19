@@ -36,7 +36,8 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
-use aruna_operations::metadata::api::fanout::lookup_identifier_distributed;
+use aruna_operations::metadata::api::identifier_fanout::lookup_identifier_distributed;
+use aruna_operations::metadata::identifier_lookup::IdentifierQuery;
 use aruna_operations::metadata::persistent_id::forward::{
     PidRouteOperation, outcome_mapping, outcome_resolution, outcome_status,
 };
@@ -763,16 +764,20 @@ pub(crate) async fn lookup_identifier(
         .transpose()
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?
         .filter(|_| kind != SecondaryIdKind::Doi);
-    let (matches, incomplete) = lookup_identifier_distributed(
-        state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        auth,
-        bearer_token.map(|carrier| carrier.as_str().to_string()),
-        (kind, value, endpoint),
-    )
-    .await
-    .map_err(map_api_error)?;
+    let bearer = bearer_token.map(|carrier| carrier.as_str().to_string());
+    let query = IdentifierQuery {
+        kind,
+        value,
+        endpoint,
+    };
+    let lookup = lookup_identifier_distributed(
+        (state.get_realm_id(), state.get_node_id()),
+        (auth, bearer),
+        query,
+    );
+    let (matches, incomplete) = drive(lookup, state.get_ctx().as_ref())
+        .await
+        .map_err(map_api_error)?;
     match (matches.is_empty(), incomplete) {
         (true, true) => Err(ServerError::ServiceUnavailable),
         (true, false) => Err(ServerError::NotFound),

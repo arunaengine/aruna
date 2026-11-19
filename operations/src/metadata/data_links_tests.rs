@@ -3,9 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::structs::identity::realm::RealmId;
+use crate::driver::{DriverContext, drive};
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::storage::data::link::{set_versions_key, truncated_key};
 use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_storage::StorageHandle;
 use tempfile::tempdir;
 
 const GRAPH: &str = "https://example.org/graph/1";
@@ -103,10 +106,49 @@ pub(crate) async fn apply_rows(
 
 /// The rows of the data link keyspace below `prefix`.
 async fn rows_below(storage: &StorageHandle, prefix: Vec<u8>) -> Vec<(ByteView, ByteView)> {
-    let (rows, _) = iter_page(storage, DATA_LINK_KEYSPACE, Some(prefix.into()), None, 64)
-        .await
-        .unwrap();
-    rows
+    let scan = StorageEffect::Iter {
+        key_space: DATA_LINK_KEYSPACE.to_string(),
+        prefix: Some(prefix.into()),
+        start: None,
+        limit: 64,
+        txn_id: None,
+    };
+    match storage.send_storage_effect(scan).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        other => panic!("expected the rows, got {}", other.label()),
+    }
+}
+
+fn context(storage: &StorageHandle) -> DriverContext {
+    DriverContext::storage_only(storage.clone())
+}
+
+async fn plan_link_rows(
+    storage: &StorageHandle,
+    document_id: Ulid,
+    links: &BTreeMap<DataLink, LinkPosting>,
+) -> Result<LinkRows, DataLinkError> {
+    let rows = LinkRowsOperation::new(document_id, links.clone());
+    drive(rows, &context(storage)).await
+}
+
+async fn document_rows(
+    storage: &StorageHandle,
+    key_space: &'static str,
+    document_id: Ulid,
+) -> Result<Vec<Vec<u8>>, DataLinkError> {
+    let rows = DocumentRowsOperation::new(key_space, document_id);
+    drive(rows, &context(storage)).await
+}
+
+async fn settle_unverified(
+    storage: &StorageHandle,
+    (key, value): (&ByteView, &ByteView),
+    document_id: Ulid,
+    link: Option<DataLink>,
+) -> Result<(), DataLinkError> {
+    let settle = SettleUnverifiedOperation::new((key.clone(), value.clone()), document_id, link);
+    drive(settle, &context(storage)).await
 }
 
 async fn stored(rows: LinkRows, storage: &StorageHandle) {

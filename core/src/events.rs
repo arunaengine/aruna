@@ -525,6 +525,8 @@ pub enum NetEvent {
     ),
     /// The holder is skipped in holder choices for a while.
     HolderAvoided,
+    /// The cursor signature, or `None` when this node cannot sign the cursor.
+    CursorSigned(Option<iroh::Signature>),
     /// The caller a forwarded token stands for, or why it is not accepted from that peer.
     WritePeerAuth(Result<Box<crate::structs::identity::auth::AuthContext>, PeerAuthRefusal>),
     /// The JSON-LD summary of a dataset, or why it could not be read.
@@ -906,7 +908,10 @@ impl MetadataEvent {
                 BatchMerged,
                 CacheGeneration,
                 CachedGroup,
+                QueryCacheEntry,
                 DocumentTitle,
+                IriReferences,
+                RowsMerged,
                 GraphFlushed,
                 ProfileShapes,
                 ProfileChecked,
@@ -1039,6 +1044,7 @@ impl Event {
                     GrantSign,
                     DelegationSign,
                     HolderAvoided,
+                    CursorSigned,
                     Shard,
                     TopicPeers,
                     DeletePlanSigned,

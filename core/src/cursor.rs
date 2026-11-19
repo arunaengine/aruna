@@ -28,6 +28,24 @@ impl From<CursorError> for ConversionError {
     }
 }
 
+/// The signature context of metadata search cursors.
+pub const SEARCH_CURSOR_CONTEXT: &[u8] = b"aruna.metadata.search.cursor.v2";
+/// The signature context of object search cursors.
+pub const OBJECT_CURSOR_CONTEXT: &[u8] = b"aruna.object.search.cursor.v1";
+
+/// Whether `bytes` are the signing bytes of a search cursor naming `signer`: a cursor context,
+/// its separator and version byte, then the signer key.
+pub fn names_signer(bytes: &[u8], signer: &[u8; 32]) -> bool {
+    [SEARCH_CURSOR_CONTEXT, OBJECT_CURSOR_CONTEXT]
+        .iter()
+        .any(|context| {
+            let start = context.len() + 2;
+            bytes.starts_with(context)
+                && bytes.get(context.len()) == Some(&0)
+                && bytes.get(start..start + 32) == Some(signer.as_slice())
+        })
+}
+
 /// The cursor text for `bytes`.
 pub fn encode(bytes: impl AsRef<[u8]>) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
@@ -50,7 +68,10 @@ pub fn decode_value<T: DeserializeOwned>(text: impl AsRef<[u8]>) -> Result<T, Cu
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, decode_value, encode, encode_value};
+    use super::{
+        OBJECT_CURSOR_CONTEXT, SEARCH_CURSOR_CONTEXT, decode, decode_value, encode, encode_value,
+        names_signer,
+    };
 
     #[test]
     fn keeps_existing_text() {
@@ -64,5 +85,18 @@ mod tests {
     fn rejects_bad_text() {
         assert!(decode("a+8=").is_err());
         assert!(decode_value::<Vec<u8>>("Ag").is_err());
+    }
+
+    #[test]
+    fn cursor_names_signer() {
+        let bytes = |context: &[u8], signer: [u8; 32]| {
+            [context, &[0u8, 1][..], &signer[..], &[7u8; 40][..]].concat()
+        };
+        for context in [SEARCH_CURSOR_CONTEXT, OBJECT_CURSOR_CONTEXT] {
+            assert!(names_signer(&bytes(context, [3; 32]), &[3; 32]));
+            assert!(!names_signer(&bytes(context, [4; 32]), &[3; 32]));
+        }
+        assert!(!names_signer(&bytes(b"aruna.other", [3; 32]), &[3; 32]));
+        assert!(!names_signer(SEARCH_CURSOR_CONTEXT, &[3; 32]));
     }
 }

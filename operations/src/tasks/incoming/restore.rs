@@ -57,9 +57,9 @@ async fn durable_rearm_loop(
         // Dead letters retry on a minute-scale backoff, so sweeping every rearm
         // tick would scan the keyspace far more often than it can yield work.
         if ticks.is_multiple_of(DEAD_LETTER_TICKS) {
-            sweep_dead_letters(&context.storage_handle).await;
+            sweep_dead_letters(&context).await;
         }
-        restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
+        restore_materialization_timer(&context, &task_handle).await;
         restore_graph_prune(&context, &task_handle).await;
         restore_notification_prune(&context, &task_handle).await;
         arm_drain_timer(&context).await;
@@ -153,9 +153,27 @@ pub(super) fn drain_delay(result: &MetadataDrainResult) -> Duration {
 
 // Parked materialization jobs come back on their own backoff, so a node that hit
 // the failure cap during a storm converges again without an operator or restart.
-async fn sweep_dead_letters(storage: &aruna_storage::StorageHandle) {
-    if let Err(error) = requeue_dead_letters(&storage.bulk()).await {
+async fn sweep_dead_letters(context: &DriverContext) {
+    if let Err(error) = drive(RequeueParkedOperation::new(), &context.bulk()).await {
         warn!(error = ?error, "Failed to requeue metadata materialization dead letters");
+    }
+}
+
+async fn restore_materialization_timer(context: &DriverContext, task_handle: &TaskHandle) {
+    match drive(NextTimerOperation::new(), &context.bulk()).await {
+        Ok(None) => {}
+        Ok(Some(after)) => {
+            let effect = Effect::Task(TaskEffect::ResetTimer {
+                key: TaskKey::DrainMaterializationQueue,
+                after,
+            });
+            if let Event::Task(TaskEvent::Error { message, .. }) =
+                task_handle.send_effect(effect).await
+            {
+                warn!(message = %message, "Failed to restore metadata materialization timer");
+            }
+        }
+        Err(error) => warn!(error = ?error, "Failed to scan metadata materialization jobs"),
     }
 }
 
@@ -319,11 +337,11 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        sweep_dead_letters(&context.storage_handle).await;
+        sweep_dead_letters(&context).await;
         if stopped() {
             return;
         }
-        restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
+        restore_materialization_timer(&context, &task_handle).await;
         if stopped() {
             return;
         }
@@ -470,7 +488,14 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_materialization_queue(&self) {
         let bulk = self.context.bulk();
-        match process_materialization_batch(&bulk).await {
+        let node = crate::git::GitNode {
+            ids: bulk.node_and_realm(),
+            routing: node_routing(&bulk),
+        };
+        let concurrency = materialization_group_concurrency();
+        let batch =
+            MaterializationBatchOperation::new(node, concurrency, bulk.task_handle.is_some());
+        match drive(batch, &bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainMaterializationQueue, drain_delay(&result))
                     .await;
@@ -482,7 +507,7 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => match materialization_jobs_exist(&bulk.storage_handle).await {
+            Ok(_) => match drive(JobsExistOperation::new(), &bulk).await {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(

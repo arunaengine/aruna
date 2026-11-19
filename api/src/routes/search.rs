@@ -14,11 +14,10 @@ use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
-use aruna_operations::metadata::api::fanout::search_buckets_distributed;
+use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
-use aruna_operations::metadata::api::search::{
-    search_metadata as run_search_metadata, search_objects,
-};
+use aruna_operations::metadata::api::object_search::search_objects;
+use aruna_operations::metadata::api::search_fanout::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
     ObjectExecution, ObjectQueryMode, SearchQueryRequest,
@@ -482,25 +481,27 @@ pub async fn bucket_search(
     }
     let group_id = params.group_id.as_deref().map(parse_group_id).transpose()?;
     let bearer = bearer_token.map(|carrier| carrier.as_str().to_string());
-    let result = search_buckets_distributed(
+    let result = drive(
+        search_buckets_distributed(
+            state.get_realm_id(),
+            state.get_node_id(),
+            BucketSearchRequest {
+                auth: auth.clone(),
+                bearer_token: bearer.clone(),
+                query: query.to_string(),
+                key: None,
+                extras: None,
+                limit: params
+                    .limit
+                    .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                    .clamp(1, MAX_BUCKET_LIMIT),
+                group_id,
+                cursor: params.cursor,
+                target_nodes: None,
+                database: params.database,
+            },
+        ),
         state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        BucketSearchRequest {
-            auth: auth.clone(),
-            bearer_token: bearer.clone(),
-            query: query.to_string(),
-            key: None,
-            extras: None,
-            limit: params
-                .limit
-                .unwrap_or(DEFAULT_SEARCH_LIMIT)
-                .clamp(1, MAX_BUCKET_LIMIT),
-            group_id,
-            cursor: params.cursor,
-            target_nodes: None,
-            database: params.database,
-        },
     )
     .await
     .map_err(map_api_error)?;
@@ -644,28 +645,36 @@ pub async fn object_search(
         ObjectMatchMode::Prefix => ObjectKeyMatch::Prefix,
         ObjectMatchMode::Metadata => ObjectKeyMatch::Metadata,
     };
-    let result = search_objects(
-        state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        SearchQueryRequest {
-            auth,
-            bearer_token: bearer_token.map(|carrier| carrier.as_str().to_string()),
-            query: query.to_string(),
-            key_match,
-            bucket,
-            limit: params
-                .limit
-                .unwrap_or(DEFAULT_SEARCH_LIMIT)
-                .clamp(1, MAX_SEARCH_LIMIT),
-            cursor: params.cursor,
-            mode: match mode {
-                ObjectMode::Local => ObjectQueryMode::Local,
-                ObjectMode::DistributedBestEffort => ObjectQueryMode::DistributedBestEffort,
-                ObjectMode::DistributedStrict => ObjectQueryMode::DistributedStrict,
+    let result = drive(
+        search_objects(
+            state.get_realm_id(),
+            state.get_node_id(),
+            SearchQueryRequest {
+                auth,
+                bearer_token: bearer_token.map(|carrier| carrier.as_str().to_string()),
+                query: query.to_string(),
+                key_match,
+                bucket,
+                limit: params
+                    .limit
+                    .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                    .clamp(1, MAX_SEARCH_LIMIT),
+                cursor: params.cursor,
+                mode: match mode {
+                    ObjectMode::Local => ObjectQueryMode::Local,
+                    ObjectMode::DistributedBestEffort => ObjectQueryMode::DistributedBestEffort,
+                    ObjectMode::DistributedStrict => ObjectQueryMode::DistributedStrict,
+                },
+                target_nodes: None,
             },
-            target_nodes: None,
-        },
+            state
+                .get_ctx()
+                .as_ref()
+                .storage_handle
+                .range_indexes()
+                .is_some(),
+        ),
+        state.get_ctx().as_ref(),
     )
     .await
     .map_err(map_api_error)?;
@@ -947,22 +956,24 @@ async fn run_buckets(
     if !requested {
         return Ok(None);
     }
-    let result = search_buckets_distributed(
+    let result = drive(
+        search_buckets_distributed(
+            state.get_realm_id(),
+            state.get_node_id(),
+            BucketSearchRequest {
+                auth: auth.clone(),
+                bearer_token: bearer_token.clone(),
+                query: query.to_string(),
+                key: None,
+                extras: None,
+                limit: limit.min(MAX_BUCKET_LIMIT),
+                group_id: None,
+                cursor: None,
+                target_nodes: None,
+                database: false,
+            },
+        ),
         state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        BucketSearchRequest {
-            auth: auth.clone(),
-            bearer_token: bearer_token.clone(),
-            query: query.to_string(),
-            key: None,
-            extras: None,
-            limit: limit.min(MAX_BUCKET_LIMIT),
-            group_id: None,
-            cursor: None,
-            target_nodes: None,
-            database: false,
-        },
     )
     .await
     .map_err(map_api_error)?;
@@ -1057,22 +1068,24 @@ async fn run_documents(
         return Ok(None);
     }
     let ctx = state.get_ctx();
-    let result = run_search_metadata(
+    let result = drive(
+        run_search_metadata(
+            state.get_realm_id(),
+            state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(auth.clone()),
+                bearer_token,
+                graph_iris: None,
+                query: query.to_string(),
+                conforms_to,
+                group_id,
+                limit: Some(limit),
+                cursor,
+                mode: map_query_mode(mode),
+                target_nodes: None,
+            },
+        ),
         ctx.as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        MetadataSearchRequest {
-            auth: Some(auth.clone()),
-            bearer_token,
-            graph_iris: None,
-            query: query.to_string(),
-            conforms_to,
-            group_id,
-            limit: Some(limit),
-            cursor,
-            mode: map_query_mode(mode),
-            target_nodes: None,
-        },
     )
     .await
     .map_err(map_api_error)?;

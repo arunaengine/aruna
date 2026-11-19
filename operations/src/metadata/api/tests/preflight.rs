@@ -1,4 +1,4 @@
-//! Tests reference preflight fan-out reporting, cursor pagination, plan limits and failures.
+//! Tests reference preflight cursor pagination, plan limits, target resolution and failures.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,10 +7,13 @@ use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
 use aruna_core::structs::storage::blob::CurrentVersionPointer;
 
 use super::super::preflight::{
-    assemble_preflight_execution, index_state, plan_preflight_request, resolve_all_preflight,
-    resolve_preflight_targets, resolve_preflight_versions, verify_preflight_cursor,
-    version_targets, visible_prefix,
+    PreflightCursorPlan, PreflightPlan, assemble_preflight_execution, index_state,
+    plan_preflight_request, version_targets, visible_prefix,
 };
+use super::super::preflight_targets::{ResolveTargetsOperation, ResolveVersionsOperation};
+use super::super::preflight_types::preflight_fingerprint;
+use super::super::search_fanout::resume_cursor;
+use crate::driver::drive;
 
 // Documents not materialized yet have no postings, so their absence is never reported current.
 #[test]
@@ -36,89 +39,6 @@ fn unsettled_not_current() {
         index_state(Returned::Mixed, false, false),
         MetadataIndexState::Mixed
     );
-}
-
-#[tokio::test]
-async fn preflight_fanout_reports() {
-    let directory = tempdir().unwrap();
-    let context = DriverContext {
-        storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    };
-    let local = iroh::SecretKey::from_bytes(&[61u8; 32]).public();
-    let healthy = iroh::SecretKey::from_bytes(&[62u8; 32]).public();
-    let failed = iroh::SecretKey::from_bytes(&[63u8; 32]).public();
-    let result_for = |node_id| ReferenceNodeExecution {
-        visible_references: Vec::new(),
-        targets: Vec::new(),
-        freshness: MetadataNodeFreshness {
-            node_id,
-            index_state: MetadataIndexState::Current,
-            oldest_status_updated: None,
-        },
-        path_style_available: true,
-        saturated: false,
-    };
-    let local_call: MetadataNodeCall<ReferenceNodeExecution> = metadata_node_call(
-        (),
-        move |(), node_id| async move { Ok(result_for(node_id)) },
-    );
-    let remote_call: MetadataNodeCall<ReferenceNodeExecution> =
-        metadata_node_call(failed, move |failed, node_id| async move {
-            if node_id == failed {
-                Err(MetadataReadError::Unavailable)
-            } else {
-                Ok(result_for(node_id))
-            }
-        });
-
-    let (parts, stats) = run_metadata_fanout(
-        &context,
-        RealmId::from_bytes([19u8; 32]),
-        local,
-        MetadataFanoutScope::new(
-            Some(ApiQueryMode::Distributed),
-            Some(vec![local, healthy, failed]),
-            true,
-        ),
-        MetadataFanoutOperation::ReferencePreflight,
-        local_call.clone(),
-        remote_call.clone(),
-        record_preflight_node,
-        map_read_error,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(parts.len(), 2);
-    assert_eq!(stats.nodes_queried, 3);
-    assert_eq!(stats.nodes_failed, 1);
-    assert_eq!(stats.failed_partitions, vec![failed]);
-
-    let strict = run_metadata_fanout(
-        &context,
-        RealmId::from_bytes([19u8; 32]),
-        local,
-        MetadataFanoutScope::new(
-            Some(ApiQueryMode::Distributed),
-            Some(vec![local, healthy, failed]),
-            false,
-        ),
-        MetadataFanoutOperation::ReferencePreflight,
-        local_call,
-        remote_call,
-        record_preflight_node,
-        map_read_error,
-    )
-    .await;
-
-    assert!(matches!(strict, Err(MetadataApiError::ServiceUnavailable)));
 }
 
 #[test]
@@ -268,6 +188,15 @@ async fn preflight_stage_failures() {
     let test = metadata_test();
     let realm_id = RealmId::from_bytes([78u8; 32]);
     let local_node_id = iroh::SecretKey::from_bytes(&[79u8; 32]).public();
+    let resolve = |plan: &PreflightPlan, target| {
+        let resolve = ResolveTargetsOperation::new(
+            (realm_id, local_node_id),
+            plan.auth.clone(),
+            target,
+            None,
+        );
+        drive(resolve, &test.context)
+    };
 
     let (plan, target) = plan_preflight_request(
         realm_id,
@@ -275,46 +204,23 @@ async fn preflight_stage_failures() {
     )
     .expect("plan");
     assert!(matches!(
-        resolve_preflight_targets(
-            &test.context,
-            realm_id,
-            local_node_id,
-            &plan.auth,
-            target,
-            None
-        )
-        .await,
+        resolve(&plan, target).await,
         Err(MetadataApiError::BadRequest)
     ));
 
-    let (mut plan, target) = plan_preflight_request(
+    let (plan, target) = plan_preflight_request(
         realm_id,
         preflight_request(realm_id, vec![content_w3id([2u8; 32])], None),
     )
     .expect("plan");
-    let resolved = resolve_preflight_targets(
-        &test.context,
-        realm_id,
-        local_node_id,
-        &plan.auth,
-        target,
-        None,
-    )
-    .await
-    .expect("content w3ids resolve without storage");
-    plan.cursor = Some("not-a-cursor".to_string());
-    plan.mode = Some(ApiQueryMode::Local);
-    let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
+    let resolved = resolve(&plan, target)
+        .await
+        .expect("content w3ids resolve without storage");
+    let fingerprint = preflight_fingerprint(&resolved.targets, Some(ApiQueryMode::Local));
+    let asked = (None, ApiQueryMode::Local, local_node_id);
+    let signers = [local_node_id];
     assert!(matches!(
-        verify_preflight_cursor(
-            &test.context,
-            realm_id,
-            local_node_id,
-            &plan,
-            &resolved,
-            deadline
-        )
-        .await,
+        resume_cursor(("not-a-cursor", &signers), fingerprint, asked, None),
         Err(MetadataApiError::InvalidCursor(_))
     ));
 
@@ -323,26 +229,16 @@ async fn preflight_stage_failures() {
         preflight_request(realm_id, vec![content_w3id([3u8; 32])], None),
     )
     .expect("plan");
-    let partial_resolved = resolve_preflight_targets(
-        &test.context,
-        realm_id,
-        local_node_id,
-        &partial_plan.auth,
-        target,
-        None,
-    )
-    .await
-    .expect("content w3ids resolve");
-    let cursor = verify_preflight_cursor(
-        &test.context,
-        realm_id,
-        local_node_id,
-        &partial_plan,
-        &partial_resolved,
-        deadline,
-    )
-    .await
-    .expect("first page has no cursor");
+    let partial_resolved = resolve(&partial_plan, target)
+        .await
+        .expect("content w3ids resolve");
+    let cursor = PreflightCursorPlan {
+        fingerprint: preflight_fingerprint(&partial_resolved.targets, partial_plan.mode),
+        watermark: None,
+        resume: HashMap::new(),
+        target_nodes: None,
+        discovery_failed: false,
+    };
     let part = ReferenceNodeExecution {
         visible_references: Vec::new(),
         targets: Vec::new(),
@@ -355,7 +251,7 @@ async fn preflight_stage_failures() {
         saturated: false,
     };
     let denied = assemble_preflight_execution(
-        &test.context,
+        local_node_id,
         partial_resolved,
         &partial_plan,
         cursor,
@@ -403,23 +299,45 @@ async fn write_versions(test: &MetadataTest, key: &str, count: u8, head: bool) {
     }
 }
 
+/// The versions a bucket operation on `prefix` of the `genes` bucket would touch.
+async fn versions(
+    test: &MetadataTest,
+    prefix: Option<&str>,
+    operation: MetadataStorageOperation,
+) -> Result<(Vec<(VersionKey, BlobVersion)>, bool), MetadataApiError> {
+    let resolve = ResolveVersionsOperation::new("genes", prefix, operation);
+    drive(resolve, &test.context).await
+}
+
 #[tokio::test]
 async fn large_scope_bounded() {
     let test = metadata_test();
     for index in 0..130 {
         write_versions(&test, &format!("big/{index:03}"), 1, true).await;
     }
-    let (heads, complete) = resolve_preflight_versions(&test.context, "genes", None)
-        .await
-        .expect("large bucket resolves");
+    let (heads, complete) = versions(
+        &test,
+        None,
+        MetadataStorageOperation::LatestVersionTombstone,
+    )
+    .await
+    .expect("large bucket resolves");
     assert_eq!((heads.len(), complete), (128, false));
-    let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("big/"))
-        .await
-        .expect("large prefix resolves");
+    let (versions, complete) = versions(
+        &test,
+        Some("big/"),
+        MetadataStorageOperation::AllVersionsPurge,
+    )
+    .await
+    .expect("large prefix resolves");
     assert_eq!((versions.len(), complete), (128, false));
-    let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("big/12"))
-        .await
-        .expect("small prefix resolves");
+    let (versions, complete) = versions(
+        &test,
+        Some("big/12"),
+        MetadataStorageOperation::AllVersionsPurge,
+    )
+    .await
+    .expect("small prefix resolves");
     assert_eq!((versions.len(), complete), (10, true));
 }
 
@@ -429,15 +347,23 @@ async fn exact_key_purge() {
     write_versions(&test, "a", 3, true).await;
     write_versions(&test, "solo", 2, true).await;
     write_versions(&test, "zeta", 4, true).await;
-    let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("solo"))
-        .await
-        .expect("exact key resolves");
+    let (versions, complete) = versions(
+        &test,
+        Some("solo"),
+        MetadataStorageOperation::AllVersionsPurge,
+    )
+    .await
+    .expect("exact key resolves");
     assert!(complete);
     assert_eq!(versions.len(), 2);
     assert!(versions.iter().all(|(key, _)| key.key == "solo"));
-    let (heads, complete) = resolve_preflight_versions(&test.context, "genes", Some("solo"))
-        .await
-        .expect("exact head resolves");
+    let (heads, complete) = versions(
+        &test,
+        Some("solo"),
+        MetadataStorageOperation::LatestVersionTombstone,
+    )
+    .await
+    .expect("exact head resolves");
     assert_eq!((heads.len(), complete), (1, true));
 }
 
@@ -450,18 +376,26 @@ async fn headless_versions_purge() {
     let long = format!("dir/{}", "x".repeat(1100));
     write_versions(&test, &long, 1, false).await;
     write_versions(&test, &format!("other/{}", "x".repeat(1100)), 1, false).await;
-    let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("dir/"))
-        .await
-        .expect("prefix resolves");
+    let (versions, complete) = versions(
+        &test,
+        Some("dir/"),
+        MetadataStorageOperation::AllVersionsPurge,
+    )
+    .await
+    .expect("prefix resolves");
     let mut keys: Vec<_> = versions.iter().map(|(key, _)| key.key.as_str()).collect();
     keys.sort();
     assert!(complete);
     assert_eq!(keys, ["dir/a", "dir/a", "dir/bb", long.as_str()]);
-    let (versions, complete) = resolve_all_preflight(&test.context, "genes", Some("dir/bb"))
-        .await
-        .expect("headless key resolves");
+    let (versions, complete) = versions(
+        &test,
+        Some("dir/bb"),
+        MetadataStorageOperation::AllVersionsPurge,
+    )
+    .await
+    .expect("headless key resolves");
     assert_eq!((versions.len(), complete), (1, true));
-    let (versions, complete) = resolve_all_preflight(&test.context, "genes", None)
+    let (versions, complete) = versions(&test, None, MetadataStorageOperation::AllVersionsPurge)
         .await
         .expect("bucket resolves");
     assert_eq!((versions.len(), complete), (6, true));

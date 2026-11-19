@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::fanout::run_metadata_fanout;
 use super::list::{GroupRecordsOperation, ListVisibleOperation, PendingRecordsOperation};
 use super::list_types::check_policy_limit;
 use super::*;
@@ -26,7 +25,8 @@ use super::preflight_types::{
     MetadataIndexState, MetadataNodeFreshness, MetadataResolvedTarget, MetadataStorageOperation,
     ReferenceRequest, ReferenceTarget,
 };
-use super::read::ensure_permission;
+use super::readable::PathPermissionOperation;
+use crate::driver::drive;
 use super::search_types::SearchQueryRequest;
 
 use std::collections::BTreeMap;

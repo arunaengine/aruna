@@ -24,8 +24,8 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_graph::GraphHandle;
 use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::{MetadataHandle, send_metadata_effect};
+use aruna_operations::testing::process_materialization_batch;
 use aruna_storage::{FjallStorage, StorageHandle};
 use craqle::{
     CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateEntityRequest,

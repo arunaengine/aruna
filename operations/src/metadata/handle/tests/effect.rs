@@ -4,7 +4,7 @@
 
 use super::auth::{auth_storage, node_id_seed};
 use super::*;
-use crate::metadata::protocol::MetadataReadError;
+use crate::metadata::protocol::{MetadataReadError, metadata_read_error};
 use aruna_core::metadata::MetadataBatch;
 use aruna_core::metadata::MetadataBatchSource;
 use aruna_core::metadata::MetadataCrateRequest;

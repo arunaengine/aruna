@@ -25,6 +25,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
+use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
@@ -41,10 +42,7 @@ use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
 use aruna_operations::metadata::update_entry::UpdateEntryOperation;
-use aruna_operations::metadata::{
-    MetadataHandle, materialization_queue::process_materialization_batch,
-};
-use aruna_operations::testing::drain_projection_queue;
+use aruna_operations::testing::{drain_projection_queue, process_materialization_batch};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;

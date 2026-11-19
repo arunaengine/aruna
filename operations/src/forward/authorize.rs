@@ -97,6 +97,14 @@ impl ForwardedCallerOperation {
         }
     }
 
+    /// The caller `auth_token` names, which `peer` must act for.
+    pub(crate) fn owner_token(peer: NodeId, realm_id: RealmId, auth_token: AuthToken) -> Self {
+        Self {
+            owner_bound: true,
+            ..Self::for_token(peer, realm_id, Some(auth_token))
+        }
+    }
+
     /// The caller of a request whose peer need not act for that user.
     pub(crate) fn for_token(
         peer: NodeId,

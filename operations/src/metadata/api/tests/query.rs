@@ -4,8 +4,13 @@
 
 use super::*;
 
-use super::super::distributed::{fetch_ties, merge_ordered, order_solutions, ordered_query};
-use super::super::join::{JOIN_SIDE_ROWS, join_plan, join_rows};
+use super::super::distributed::ordered_query;
+use super::super::query_fanout::{Partition, TieFetchOperation};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
+use aruna_core::metadata::{MergeJob, MergeOutput, MetadataEffect, MetadataError, MetadataEvent};
+use aruna_core::operation::Operation;
 
 const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
@@ -26,8 +31,17 @@ fn merge_parts(
         .collect();
     let limit = query_select_limit(query);
     let merged = match ordered_query(query).unwrap() {
-        Some((_, order)) => order_solutions(parts, &order, &Default::default())
-            .and_then(|rows| aggregate_query_results(vec![rows], MetadataQueryForm::Select, limit)),
+        Some(partition) => {
+            let job = MergeJob::Order {
+                partition,
+                results: parts,
+            };
+            let Ok(MergeOutput::Rows(rows)) = aruna_graph::merge::merge(job, &Default::default())
+            else {
+                panic!("expected merged rows");
+            };
+            aggregate_query_results(vec![rows], MetadataQueryForm::Select, limit)
+        }
         None => aggregate_query_results(parts, MetadataQueryForm::Select, limit),
     };
     let Ok(MetadataQueryResults::Solutions(rows)) = merged else {
@@ -193,7 +207,7 @@ fn partition_rows(query: &str, objects: &[(&str, String)]) -> Vec<BTreeMap<Strin
 #[test]
 fn ties_cut_consistently() {
     let query = "SELECT DISTINCT ?s ?k WHERE { ?s <urn:k> ?k } ORDER BY ?k LIMIT 1";
-    let (partition, _) = ordered_query(query).unwrap().unwrap();
+    let partition = ordered_query(query).unwrap().unwrap();
     assert!(ensure_query_form(&partition).is_ok());
     let one = format!("\"1\"^^<{INTEGER}>");
     let first: Vec<_> = ["z", "y", "x", "w", "a"]
@@ -215,7 +229,7 @@ fn ties_cut_consistently() {
 fn equal_values_cut() {
     // Tied engine picks vary per process, so distinct trials make a wrong cut show reliably.
     let query = "SELECT DISTINCT ?n WHERE { ?s <urn:k> ?n } ORDER BY ?n LIMIT 1";
-    let (partition, _) = ordered_query(query).unwrap().unwrap();
+    let partition = ordered_query(query).unwrap().unwrap();
     assert!(ensure_query_form(&partition).is_ok());
     let xsd = "http://www.w3.org/2001/XMLSchema#";
     for value in 1..=20 {
@@ -259,72 +273,6 @@ fn partition_query_bounded() {
         panic!("expected a refused partition query");
     };
     assert!(message.contains("too long to run across the realm"));
-}
-
-fn large_partition(prefix: &str) -> MetadataQueryResults {
-    let value = format!("\"{}\"", "x".repeat(1024 * 1024));
-    MetadataQueryResults::Solutions(
-        (0..5)
-            .map(|index| solution_row(&[("s", &format!("<urn:{prefix}{index}>")), ("v", &value)]))
-            .collect(),
-    )
-}
-
-#[test]
-fn merge_refuses_oversize() {
-    let order = ordered_query("SELECT DISTINCT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?s LIMIT 5")
-        .unwrap()
-        .unwrap()
-        .1;
-    let parts = vec![large_partition("a"), large_partition("b")];
-    let merged = order_solutions(parts, &order, &Default::default());
-    assert!(matches!(merged, Err(MetadataApiError::BadRequest)));
-}
-
-#[test]
-fn merge_stops_cancelled() {
-    let order = ordered_query("SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY ?s")
-        .unwrap()
-        .unwrap()
-        .1;
-    let parts = vec![MetadataQueryResults::Solutions(vec![solution_row(&[(
-        "s", "<urn:a>",
-    )])])];
-    let cancel = spareval::CancellationToken::new();
-    cancel.cancel();
-    let merged = order_solutions(parts, &order, &cancel);
-    assert!(matches!(merged, Err(MetadataApiError::ServiceUnavailable)));
-}
-
-#[tokio::test]
-async fn merge_past_deadline() {
-    let order = ordered_query("SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY ?s")
-        .unwrap()
-        .unwrap()
-        .1;
-    let parts = vec![MetadataQueryResults::Solutions(vec![solution_row(&[(
-        "s", "<urn:a>",
-    )])])];
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-    let merged = merge_ordered(parts, order, tokio::time::Instant::now(), permits).await;
-    assert!(matches!(merged, Err(MetadataApiError::ServiceUnavailable)));
-}
-
-#[tokio::test]
-async fn merge_waits_permit() {
-    let order = ordered_query("SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY ?s")
-        .unwrap()
-        .unwrap()
-        .1;
-    // A row the merge cannot parse would answer an internal error if the merge ever ran.
-    let parts = vec![MetadataQueryResults::Solutions(vec![solution_row(&[(
-        "s",
-        "not a term",
-    )])])];
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
-    let merged = merge_ordered(parts, order, deadline, permits).await;
-    assert!(matches!(merged, Err(MetadataApiError::ServiceUnavailable)));
 }
 
 #[test]
@@ -414,25 +362,83 @@ fn query_validation_enforces() {
     );
 }
 
-async fn fetch_partition(query: &str, objects: &[(&str, String)]) -> Vec<BTreeMap<String, String>> {
-    let (partition, order) = ordered_query(query).unwrap().unwrap();
-    let ties = query_select_limit(query).map(|limit| (order, limit));
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-    let fetched = fetch_ties(partition, ties, deadline, permits, |text| async move {
+#[test]
+fn partition_query_widest() {
+    // Tie fetches raise LIMIT up to the row limit, so the widest partition text must still fit.
+    let query = |fill: usize| {
+        format!(
+            "SELECT DISTINCT ?s WHERE {{ ?s ?p ?o FILTER(?o != \"{}\") }} ORDER BY ?s LIMIT 1",
+            "x".repeat(fill)
+        )
+    };
+    let base = ordered_query(&query(0)).unwrap().unwrap().len();
+    let fill = QUERY_MAX_BYTES - base;
+    assert!(matches!(
+        ordered_query(&query(fill)),
+        Err(MetadataApiError::InvalidQuery(_))
+    ));
+    let widest = QUERY_MAX_ROWS.to_string().len() - 1;
+    let partition = ordered_query(&query(fill - widest)).unwrap().unwrap();
+    assert_eq!(partition.len() + widest, QUERY_MAX_BYTES);
+}
+
+/// Runs a tie fetch on one partition, answering each query with `answer` and each tie count with
+/// the graph merge, and returns its result with the query texts it ran.
+fn run_fetch(
+    query: &str,
+    limit: Option<usize>,
+    answer: impl Fn(&str) -> Result<MetadataQueryResults, MetadataError>,
+) -> (Result<MetadataQueryResults, MetadataReadError>, Vec<String>) {
+    let partition = Partition::Local(None);
+    let mut fetch = TieFetchOperation::new(partition, (None, query.to_string()), limit, u64::MAX);
+    let mut runs = Vec::new();
+    fetch.stamp(0);
+    let mut next = fetch.first();
+    loop {
+        let effect = match next {
+            Ok(Next::Done(results)) => return (Ok(results), runs),
+            Ok(Next::Call(IoCall::Effect(effect))) => *effect,
+            Err(error) => return (Err(error), runs),
+            Ok(_) => panic!("expected one effect per step"),
+        };
+        let event = match effect {
+            Effect::Metadata(MetadataEffect::QueryGraphs { sparql, .. }) => {
+                let result = answer(&sparql);
+                runs.push(sparql);
+                match result {
+                    Ok(results) => MetadataEvent::QueryResult { results },
+                    Err(error) => MetadataEvent::Error {
+                        graph_iri: None,
+                        error,
+                    },
+                }
+            }
+            Effect::Metadata(MetadataEffect::MergeRows { job, .. }) => MetadataEvent::RowsMerged {
+                result: aruna_graph::merge::merge(job, &Default::default()),
+            },
+            _ => panic!("expected a query or a merge"),
+        };
+        fetch.stamp(0);
+        next = fetch.next(IoResult::Event(Box::new(Event::Metadata(event))));
+    }
+}
+
+fn fetch_partition(query: &str, objects: &[(&str, String)]) -> Vec<BTreeMap<String, String>> {
+    let partition = ordered_query(query).unwrap().unwrap();
+    let limit = query_select_limit(query);
+    let (fetched, _) = run_fetch(&partition, limit, |text| {
         Ok(MetadataQueryResults::Solutions(partition_rows(
-            &text, objects,
+            text, objects,
         )))
-    })
-    .await;
+    });
     let Ok(MetadataQueryResults::Solutions(rows)) = fetched else {
         panic!("expected solutions");
     };
     rows
 }
 
-#[tokio::test]
-async fn canonical_ties_merge() {
+#[test]
+fn canonical_ties_merge() {
     // spareval reads these pairs as one value and datatype, but results keep each original term.
     let query = "SELECT DISTINCT ?k WHERE { ?s <urn:k> ?k } ORDER BY ?k LIMIT 1";
     let xsd = "http://www.w3.org/2001/XMLSchema#";
@@ -454,8 +460,8 @@ async fn canonical_ties_merge() {
                     (subjects[0], preferred.clone()),
                     (subjects[1], other.clone()),
                 ];
-                let first = fetch_partition(query, &objects).await;
-                let second = fetch_partition(query, &[("m", other.clone())]).await;
+                let first = fetch_partition(query, &objects);
+                let second = fetch_partition(query, &[("m", other.clone())]);
                 for parts in [vec![first.clone(), second.clone()], vec![second, first]] {
                     assert_eq!(
                         merge_parts(query, parts),
@@ -467,8 +473,8 @@ async fn canonical_ties_merge() {
     }
 }
 
-#[tokio::test]
-async fn tie_group_whole() {
+#[test]
+fn tie_group_whole() {
     let query = "SELECT DISTINCT ?k WHERE { ?s <urn:k> ?k } ORDER BY ?k LIMIT 2";
     let xsd = "http://www.w3.org/2001/XMLSchema#";
     let tied = [
@@ -482,7 +488,7 @@ async fn tie_group_whole() {
         .zip(tied.iter().cloned())
         .collect();
     objects.push(("e", format!("\"2\"^^<{xsd}integer>")));
-    let mut rows = fetch_partition(query, &objects).await;
+    let mut rows = fetch_partition(query, &objects);
     rows.sort();
     let mut expected: Vec<_> = tied
         .iter()
@@ -493,69 +499,58 @@ async fn tie_group_whole() {
 }
 
 #[test]
-fn merge_refuses_ties() {
-    // Every partition may now return a tie group past LIMIT, so only the byte budget bounds it.
-    let order = ordered_query("SELECT DISTINCT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?s LIMIT 1")
-        .unwrap()
-        .unwrap()
-        .1;
-    let parts = vec![large_partition("a"), large_partition("b")];
-    let merged = order_solutions(parts, &order, &Default::default());
-    assert!(matches!(merged, Err(MetadataApiError::BadRequest)));
-}
-
-#[tokio::test]
-async fn unordered_runs_once() {
-    let query = "SELECT DISTINCT ?s WHERE { ?s ?p ?o } LIMIT 1".to_string();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-    let runs = std::sync::Mutex::new(Vec::new());
+fn unordered_runs_once() {
+    let query = "SELECT DISTINCT ?s WHERE { ?s ?p ?o } LIMIT 1";
     let rows = vec![
         solution_row(&[("s", "<urn:a>")]),
         solution_row(&[("s", "<urn:b>")]),
     ];
-    let fetched = fetch_ties(query.clone(), None, deadline, permits, |text| {
-        runs.lock().unwrap().push(text);
-        let rows = rows.clone();
-        async move { Ok(MetadataQueryResults::Solutions(rows)) }
-    })
-    .await;
-    assert_eq!(*runs.lock().unwrap(), vec![query]);
+    let (fetched, runs) = run_fetch(query, None, |_| {
+        Ok(MetadataQueryResults::Solutions(rows.clone()))
+    });
+    assert_eq!(runs, vec![query.to_string()]);
     assert_eq!(fetched, Ok(MetadataQueryResults::Solutions(rows)));
 }
 
-/// Runs a partition like craqle, which refuses results over its row limit instead of cutting them.
-async fn capped_partition(query: &str, objects: &[(&str, String)]) -> MetadataQueryResults {
-    let (partition, order) = ordered_query(query).unwrap().unwrap();
-    let ties = query_select_limit(query).map(|limit| (order, limit));
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-    fetch_ties(partition, ties, deadline, permits, |text| async move {
-        let rows = partition_rows(&text, objects);
-        match rows.len() > QUERY_MAX_ROWS {
-            true => Err(MetadataReadError::Unavailable),
-            false => Ok(MetadataQueryResults::Solutions(rows)),
-        }
-    })
-    .await
-    .unwrap()
+#[test]
+fn failed_fetch_unavailable() {
+    let query = ordered_query("SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY ?s LIMIT 1");
+    let (fetched, runs) = run_fetch(&query.unwrap().unwrap(), Some(1), |_| {
+        Err(MetadataError::Backend("storage".to_string()))
+    });
+    assert_eq!(runs.len(), 1);
+    assert_eq!(fetched, Err(MetadataReadError::Unavailable));
 }
 
-#[tokio::test]
-async fn row_limit_fetch() {
+/// Runs a partition like craqle, which refuses results over its row limit instead of cutting them.
+fn capped_partition(query: &str, objects: &[(&str, String)]) -> MetadataQueryResults {
+    let partition = ordered_query(query).unwrap().unwrap();
+    let limit = query_select_limit(query);
+    let (fetched, _) = run_fetch(&partition, limit, |text| {
+        let rows = partition_rows(text, objects);
+        match rows.len() > QUERY_MAX_ROWS {
+            true => Err(MetadataError::Backend("too many rows".to_string())),
+            false => Ok(MetadataQueryResults::Solutions(rows)),
+        }
+    });
+    fetched.unwrap()
+}
+
+#[test]
+fn row_limit_fetch() {
     let query =
         format!("SELECT DISTINCT ?k WHERE {{ ?s <urn:k> ?k }} ORDER BY ?k LIMIT {QUERY_MAX_ROWS}");
     let objects: Vec<_> = (0..QUERY_MAX_ROWS + 5)
         .map(|index| ("s", format!("\"{index}\"^^<{INTEGER}>")))
         .collect();
-    let MetadataQueryResults::Solutions(rows) = capped_partition(&query, &objects).await else {
+    let MetadataQueryResults::Solutions(rows) = capped_partition(&query, &objects) else {
         panic!("expected solutions");
     };
     assert_eq!(rows.len(), QUERY_MAX_ROWS);
 }
 
-#[tokio::test]
-async fn ties_stop_limit() {
+#[test]
+fn ties_stop_limit() {
     // The tie group at the cut runs past the row limit, so the partition keeps what fits.
     let limit = QUERY_MAX_ROWS - 1;
     let query = format!("SELECT DISTINCT ?k WHERE {{ ?s <urn:k> ?k }} ORDER BY ?k LIMIT {limit}");
@@ -568,118 +563,8 @@ async fn ties_stop_limit() {
         ("s", format!("\"1\"^^<{xsd}integer>")),
         ("s", format!("\"01\"^^<{xsd}integer>")),
     ]);
-    let MetadataQueryResults::Solutions(rows) = capped_partition(&query, &objects).await else {
+    let MetadataQueryResults::Solutions(rows) = capped_partition(&query, &objects) else {
         panic!("expected solutions");
     };
     assert_eq!(rows.len(), QUERY_MAX_ROWS);
-}
-
-#[test]
-fn partition_query_widest() {
-    // Tie fetches raise LIMIT up to the row limit, so the widest partition text must still fit.
-    let query = |fill: usize| {
-        format!(
-            "SELECT DISTINCT ?s WHERE {{ ?s ?p ?o FILTER(?o != \"{}\") }} ORDER BY ?s LIMIT 1",
-            "x".repeat(fill)
-        )
-    };
-    let base = ordered_query(&query(0)).unwrap().unwrap().0.len();
-    let fill = QUERY_MAX_BYTES - base;
-    assert!(matches!(
-        ordered_query(&query(fill)),
-        Err(MetadataApiError::InvalidQuery(_))
-    ));
-    let widest = QUERY_MAX_ROWS.to_string().len() - 1;
-    let (partition, _) = ordered_query(&query(fill - widest)).unwrap().unwrap();
-    assert_eq!(partition.len() + widest, QUERY_MAX_BYTES);
-}
-
-/// The rows `query` returns on one shard holding `triples`.
-fn shard_rows(query: &str, triples: &[(&str, &str, &str)]) -> Vec<BTreeMap<String, String>> {
-    let mut dataset = oxrdf::Dataset::new();
-    for (subject, predicate, object) in triples {
-        dataset.insert(&oxrdf::Quad::new(
-            oxrdf::NamedNode::new_unchecked(*subject),
-            oxrdf::NamedNode::new_unchecked(*predicate),
-            object.parse::<oxrdf::Term>().unwrap(),
-            oxrdf::GraphName::DefaultGraph,
-        ));
-    }
-    let query = spargebra::SparqlParser::new().parse_query(query).unwrap();
-    let evaluator = spareval::QueryEvaluator::new();
-    let Ok(spareval::QueryResults::Solutions(solutions)) =
-        evaluator.prepare(&query).execute(&dataset)
-    else {
-        panic!("expected solutions");
-    };
-    solutions
-        .map(|solution| {
-            let solution = solution.unwrap();
-            solution
-                .iter()
-                .map(|(variable, term)| (variable.as_str().to_string(), term.to_string()))
-                .collect()
-        })
-        .collect()
-}
-
-const JOIN_QUERY: &str = "SELECT DISTINCT ?dataset ?name WHERE { \
-    ?dataset <urn:hasPart> ?file . ?file <urn:name> ?name } LIMIT 10";
-
-#[test]
-fn join_finds_split() {
-    // A dataset on one shard names a file whose name lives on another shard.
-    let first = [
-        ("urn:d1", "urn:hasPart", "<urn:f1>"),
-        ("urn:d2", "urn:hasPart", "<urn:f2>"),
-    ];
-    let second = [
-        ("urn:f1", "urn:name", "\"reads.fastq\""),
-        ("urn:f3", "urn:name", "\"other.txt\""),
-    ];
-    assert!(shard_rows(JOIN_QUERY, &first).is_empty());
-    assert!(shard_rows(JOIN_QUERY, &second).is_empty());
-    let union = shard_rows(JOIN_QUERY, &[first.as_slice(), &second].concat());
-    assert_eq!(union.len(), 1);
-
-    let plan = join_plan(JOIN_QUERY).unwrap();
-    assert!(plan.sides.iter().all(|side| query_union_safe(side)));
-    let side = |query: &str| [shard_rows(query, &first), shard_rows(query, &second)].concat();
-    let (left, right) = (side(&plan.sides[0]), side(&plan.sides[1]));
-    let cancel = spareval::CancellationToken::new();
-    let joined = join_rows(&plan, left.clone(), right.clone(), &cancel).unwrap();
-    assert_eq!(joined, union);
-    // A join past its deadline stops instead of holding the merge permit.
-    cancel.cancel();
-    let stopped = join_rows(&plan, left, right, &cancel);
-    assert!(matches!(stopped, Err(MetadataApiError::ServiceUnavailable)));
-}
-
-#[test]
-fn join_plan_rejects() {
-    for query in [
-        "SELECT ?s WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x }",
-        "SELECT DISTINCT ?s WHERE { ?s <urn:a> ?o . ?x <urn:b> ?y }",
-        "SELECT DISTINCT ?s WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x . ?x <urn:c> ?y }",
-        "SELECT DISTINCT ?s WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x } ORDER BY ?s",
-        "SELECT DISTINCT ?s WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x } OFFSET 1",
-        "SELECT DISTINCT ?s WHERE { ?s <urn:a> _:b . _:b <urn:b> ?x }",
-        "SELECT DISTINCT ?s WHERE { ?s <urn:a> ?o OPTIONAL { ?o <urn:b> ?x } }",
-        "SELECT DISTINCT ?s FROM <urn:g> WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x }",
-        "ASK WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x }",
-    ] {
-        assert!(join_plan(query).is_none(), "{query}");
-    }
-}
-
-#[test]
-fn join_refuses_oversize() {
-    // A side past its bound refuses the join rather than answering from a cut input.
-    let plan = join_plan(JOIN_QUERY).unwrap();
-    let rows = (0..=JOIN_SIDE_ROWS)
-        .map(|index| solution_row(&[("dataset", &format!("<urn:d{index}>")), ("file", "<urn:f>")]))
-        .collect();
-    let cancel = spareval::CancellationToken::new();
-    let refused = join_rows(&plan, rows, Vec::new(), &cancel);
-    assert!(matches!(refused, Err(MetadataApiError::InvalidQuery(_))));
 }
