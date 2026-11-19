@@ -4,7 +4,6 @@
 
 use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
-use aruna_core::jobs::ByteStream;
 use aruna_core::structs::storage::distribution::DistributionRevision;
 
 use super::*;
@@ -71,6 +70,37 @@ fn refusal(status: u16, code: Option<&str>) -> MemberRefusal {
         code: code.map(str::to_string),
         message: String::new(),
     }
+}
+
+fn rest_read(stream: bool) -> MemberReadOperation {
+    let ask = RestAsk {
+        local: node(1),
+        path: "/x".to_string(),
+        bearer: None,
+        headers: Vec::new(),
+        stream,
+    };
+    let binding = DistributionBinding {
+        set_id: set(),
+        member_id: Ulid::from_bytes([4; 16]),
+        incarnation: 0,
+        revision: DistributionRevision::default(),
+    };
+    MemberReadOperation::rest(binding, "a", ask)
+}
+
+fn rest_routed(read: &mut MemberReadOperation, holders: Vec<NodeId>) {
+    read.first().unwrap();
+    let route = ReadRoute::Holder {
+        range_id: range(),
+        node_id: node(2),
+    };
+    read.next(child::<_, GuardError>(Ok(route))).unwrap();
+    read.next(child::<_, IoError>(Ok(holders))).unwrap();
+}
+
+fn rest_answer(answer: RestAnswer) -> IoResult {
+    child::<_, IoError>(Ok(answer))
 }
 
 fn refused(status: u16, code: Option<&str>) -> IoResult {
@@ -255,20 +285,19 @@ fn delegated_miss_stays() {
     assert_eq!(answer, Ok(Next::Done(MemberRead::Local(None))));
 }
 
-fn fetch(object: MemberKey, copy_read: bool) -> MemberFetchOperation {
-    MemberFetchOperation {
-        ids: Some((node(1), realm())),
-        caller: caller(),
-        target: MemberTarget {
-            set_id: set(),
-            range_id: range(),
-            node_id: node(2),
-        },
-        object,
-        copy_read,
-        now_ms: 10_000,
-        step: FetchStep::Urls,
+fn fetch(object: MemberKey, copy_read: bool) -> MemberCallOperation {
+    let target = MemberTarget {
+        set_id: set(),
+        range_id: range(),
+        node_id: node(2),
+    };
+    let mut request = object.request();
+    if copy_read {
+        (request.headers).push((COPY_READ_HEADER.to_string(), "1".to_string()));
     }
+    let mut call = MemberCallOperation::read(Some((node(1), realm())), caller(), target, request);
+    call.stamp(10_000);
+    call
 }
 
 fn urls(s3: Option<&str>) -> IoResult {
@@ -321,7 +350,8 @@ fn fetch_binds_request() {
     let Effect::Outbound(OutboundEffect::MemberFetch(request)) = *effect else {
         panic!("the read is sent");
     };
-    assert!(!request.head);
+    assert_eq!(request.method, MemberMethod::Get);
+    assert_eq!(request.answer_limit, Some(ANSWER_LIMIT));
     assert_eq!(request.url, format!("http://s3/spire/a%20b?{query}"));
     let expected = [
         ("accept", ACCEPT_ANY),
@@ -357,7 +387,7 @@ fn head_keeps_headers() {
 #[test]
 fn silent_member_avoided() {
     let mut get = fetch(MemberKey::get("spire", "a", None), false);
-    get.step = FetchStep::Answer;
+    get.step = CallStep::Answer;
     let avoid = NetEffect::AvoidHolder {
         node_id: node(2),
         now_ms: 10_000,
@@ -372,7 +402,7 @@ fn silent_member_avoided() {
 #[test]
 fn late_member_named() {
     let mut get = fetch(MemberKey::get("spire", "a", None), false);
-    get.step = FetchStep::Answer;
+    get.step = CallStep::Answer;
     get.next(member_answer(MemberAnswer::Late)).unwrap();
     let answer = get.next(event(Event::Net(NetEvent::HolderAvoided)));
     assert_eq!(answer, Err(get.unreached(true)));
@@ -381,11 +411,10 @@ fn late_member_named() {
 #[test]
 fn refusal_keeps_holder() {
     let mut get = fetch(MemberKey::get("spire", "a", None), false);
-    get.step = FetchStep::Answer;
+    get.step = CallStep::Answer;
     let answer = get.next(member_answer(MemberAnswer::Refused {
         status: 403,
-        code: Some("AccessDenied".to_string()),
-        message: String::new(),
+        body: "<Error><Code>AccessDenied</Code></Error>".to_string(),
     }));
     assert_eq!(answer, Err(refusal(403, Some("AccessDenied"))));
 }
@@ -398,5 +427,129 @@ fn unpublished_member_avoided() {
         get.next(urls(None)),
         Ok(Next::Call(IoCall::Effect(_)))
     ));
-    assert!(matches!(get.step, FetchStep::Avoid(_)));
+    assert!(matches!(get.step, CallStep::Avoid(_)));
+}
+
+#[test]
+fn write_signs_body() {
+    let target = MemberTarget {
+        set_id: set(),
+        range_id: range(),
+        node_id: node(2),
+    };
+    let chunks = futures_util::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
+    let request = MemberRequest {
+        method: MemberMethod::Put,
+        operation: "PutObject",
+        bucket: "spire".to_string(),
+        key: "a".to_string(),
+        query: None,
+        headers: vec![("content-length".to_string(), "5".to_string())],
+        body: MemberPayload::Stream(ByteStream::new(chunks), None),
+    };
+    let ids = Some((node(1), realm()));
+    let mut put = MemberCallOperation::write(ids, caller(), target, request);
+    put.first().unwrap();
+    let Ok(Next::Call(IoCall::Effect(effect))) = put.next(urls(Some("http://s3"))) else {
+        panic!("the delegation is signed");
+    };
+    let Effect::Net(NetEffect::DelegationSign(delegation)) = *effect else {
+        panic!("the delegation is signed");
+    };
+    assert!(matches!(delegation.payload, Payload::Framed { .. }));
+    // The framed body is longer by its trailer, which the delegation binds.
+    let length = (5 + TRAILER_BYTES).to_string();
+    let bound = [("accept", ACCEPT_ANY), ("content-length", length.as_str())];
+    let digest = request_digest("PUT", "spire", "a", None, &bound);
+    assert_eq!(delegation.request_digest, digest);
+}
+
+#[test]
+fn write_failure_kept() {
+    let target = MemberTarget {
+        set_id: set(),
+        range_id: range(),
+        node_id: node(2),
+    };
+    let request = MemberKey::get("spire", "a", None).request();
+    let ids = Some((node(1), realm()));
+    let mut put = MemberCallOperation::write(ids, caller(), target, request);
+    put.step = CallStep::Answer;
+    let answer = put.next(member_answer(MemberAnswer::Silent));
+    assert_eq!(answer, Err(put.unreached(false)));
+}
+
+#[test]
+fn text_reads_body() {
+    let mut text = MemberTextOperation::of_body(body());
+    assert!(matches!(text.first(), Ok(Next::Call(IoCall::Effect(_)))));
+    let collected = JobEvent::CollectedUpTo(Ok(Some(b"page".to_vec())));
+    let answer = text.next(event(Event::Job(collected)));
+    assert_eq!(answer, Ok(Next::Done("page".to_string())));
+}
+
+#[test]
+fn oversized_text_broken() {
+    let mut text = MemberTextOperation::of_body(body());
+    text.first().unwrap();
+    let answer = text.next(event(Event::Job(JobEvent::CollectedUpTo(Ok(None)))));
+    assert!(matches!(answer, Err(MemberRefusal::Broken(_))));
+}
+
+#[test]
+fn rest_copies_precede() {
+    let mut read = rest_read(false);
+    rest_routed(&mut read, vec![node(1), node(3), node(2)]);
+    assert_eq!(read.holder, Some(node(3)));
+    let refused = RestAnswer::Refused {
+        status: 404,
+        body: r#"{"error":"missing"}"#.to_string(),
+    };
+    read.next(rest_answer(refused)).unwrap();
+    assert_eq!(read.holder, Some(node(2)));
+    let answer = read.next(rest_answer(RestAnswer::Body(body())));
+    assert!(matches!(answer, Ok(Next::Done(MemberRead::Remote { .. }))));
+}
+
+#[test]
+fn rest_coordinator_decides() {
+    let mut read = rest_read(false);
+    rest_routed(&mut read, Vec::new());
+    let refused = RestAnswer::Refused {
+        status: 404,
+        body: r#"{"error":"missing"}"#.to_string(),
+    };
+    let failure = read.next(rest_answer(refused)).unwrap_err();
+    assert_eq!(failure.refusal.status(), 404);
+}
+
+#[test]
+fn rest_silence_exhausts() {
+    let mut read = rest_read(true);
+    rest_routed(&mut read, Vec::new());
+    let failure = read.next(rest_answer(RestAnswer::Silent)).unwrap_err();
+    let expected = MemberRefusal::NoHolder {
+        set_id: set(),
+        range_id: range(),
+    };
+    assert_eq!(failure.refusal, expected);
+}
+
+#[test]
+fn rest_stream_continues() {
+    let mut read = rest_read(true);
+    rest_routed(&mut read, vec![node(3)]);
+    let mut miss = body();
+    miss.status = 404;
+    read.next(rest_answer(RestAnswer::Body(miss))).unwrap();
+    assert_eq!(read.holder, Some(node(2)));
+}
+
+#[test]
+fn rest_miss_forwards() {
+    let mut read = rest_read(false).after_miss(false);
+    read.first().unwrap();
+    read.next(at_coordinator(Some((range(), node(2))))).unwrap();
+    assert_eq!(read.holder, Some(node(2)));
+    assert_eq!(read.step, ReadStep::RestAnswer);
 }
