@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::input::{CapturedInput, InputContent, InputSelection};
+use super::input::{CapturedInput, InputSelection};
 use super::*;
 use crate::scheduling::PlannedInput;
 
@@ -168,6 +168,7 @@ pub fn launch_entries(pages: Vec<InputPage>) -> Result<Vec<PlannedInput>, PageEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structs::execution::job::input::InputContent;
 
     fn pin(index: u32, padding: usize) -> PlannedInput {
         PlannedInput {
