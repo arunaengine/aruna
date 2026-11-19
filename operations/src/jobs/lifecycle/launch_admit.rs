@@ -18,7 +18,7 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::scheduling::{PlannedInput, hosts_session};
+use aruna_core::scheduling::{PlannedInput, backend_verdict, hosts_session};
 use aruna_core::structs::execution::job::{
     ExecutionClaim, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobId, JobPayload,
     JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
@@ -666,12 +666,7 @@ impl AdmitLaunchOperation {
         if self.node.config_digest != Some(capability.config_digest) {
             return Err(LaunchUndecided);
         }
-        // Session support is runtime state, such as a Docker daemon that moved, so a backend
-        // without it leaves the offer undecided instead of refused.
-        let network = network_access(spec);
-        if session_of(&spec.payload).is_some()
-            && !hosts_session(&capability.kind, capability.session, network)
-        {
+        if !hosts_offer(spec, &capability) || !suits_offer(spec, &capability) {
             return Err(LaunchUndecided);
         }
         let read = ReadInfoOperation::new(vec![self.node.local]);
@@ -1005,6 +1000,24 @@ fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
     records.iter().any(|envelope| {
         matches!(&envelope.record, JobFamilyRecord::Cancel(_)) && envelope.family() == family
     })
+}
+
+/// Whether the backend can host the offered session now. Session support is runtime state, such
+/// as a Docker daemon that moved, so a miss leaves the offer undecided instead of refused.
+pub(crate) fn hosts_offer(spec: &LogicalJobSpec, capability: &ExecutorCapability) -> bool {
+    session_of(&spec.payload).is_none()
+        || hosts_session(&capability.kind, capability.session, network_access(spec))
+}
+
+/// Whether the backend's allow-list, walltime maximum and suitability admit the offered run.
+/// They are node config a restart can change, so a miss leaves the offer undecided.
+pub(crate) fn suits_offer(spec: &LogicalJobSpec, capability: &ExecutorCapability) -> bool {
+    let session = session_of(&spec.payload).is_some();
+    let walltime_ms = spec.resources.max_walltime_ms;
+    let (groups, suitability) = (&capability.groups, &capability.suitability);
+    let group_id = spec.payload.group_id;
+    let maximum = capability.max_walltime_ms;
+    backend_verdict(groups, maximum, suitability, group_id, session, walltime_ms).is_none()
 }
 
 #[cfg(test)]
