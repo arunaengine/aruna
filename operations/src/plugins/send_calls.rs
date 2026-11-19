@@ -82,13 +82,13 @@ pub struct SendCall {
 
 impl SendCall {
     pub fn new(
-        scope: &RunScope,
+        (scope, holder): (&RunScope, Ulid),
         ask: ConnectionAsk,
         (body, intent): (Vec<u8>, Option<CallIntent>),
         max_bytes: usize,
     ) -> Self {
         Self {
-            ready: Some(ReadyConnection::new(scope, ask)),
+            ready: Some(ReadyConnection::new((scope, holder), ask)),
             run_id: scope.run.run_id,
             body,
             intent,
@@ -212,13 +212,13 @@ pub struct TransferCall {
 
 impl TransferCall {
     pub fn new(
-        scope: &RunScope,
+        (scope, holder): (&RunScope, Ulid),
         ask: ConnectionAsk,
         (transfer, intent): (Transfer, CallIntent),
         place: ((u64, Ulid), ServingNode),
     ) -> Self {
         Self {
-            ready: Some(ReadyConnection::new(scope, ask)),
+            ready: Some(ReadyConnection::new((scope, holder), ask)),
             scope: scope.clone(),
             intent,
             transfer: Some(transfer),

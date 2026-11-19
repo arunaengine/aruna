@@ -51,6 +51,8 @@ use ulid::Ulid;
 /// The host side of one run.
 pub struct RunBroker {
     ctx: Arc<DriverContext>,
+    /// This broker's id, which keys the secrets it holds apart from other attempts of the run.
+    holder: Ulid,
     /// The values handed to the code, removed from the text the run keeps.
     pub(super) shown: Mutex<Vec<SecretFields>>,
     scope: RunScope,
@@ -65,6 +67,7 @@ impl RunBroker {
         let mut lines = scope.run.clone();
         lines.log.clear();
         Self {
+            holder: Ulid::generate(),
             shown: Mutex::default(),
             ctx,
             log: Mutex::new(lines),
@@ -177,10 +180,11 @@ impl RunBroker {
 
 }
 
-/// The secrets a run held stay in the plugin host state only while the run lives.
+/// The secrets this broker held stay in the plugin host state only while it lives.
 impl Drop for RunBroker {
     fn drop(&mut self) {
-        aruna_plugins::host_state::forget_run(self.scope.run.run_id.into());
+        let holder = (self.scope.run.run_id.into(), self.holder.into());
+        aruna_plugins::host_state::forget_held(holder);
     }
 }
 
@@ -342,7 +346,7 @@ impl Broker for RunBroker {
     ) -> Result<Response, HostError> {
         let ask = Self::ask(&request);
         let parts = (request.body, request.intent.as_ref().map(call_intent));
-        let send = SendCall::new(&self.scope, ask, parts, cx.max_bytes);
+        let send = SendCall::new((&self.scope, self.holder), ask, parts, cx.max_bytes);
         let answer = drive(send, &self.ctx).await;
         answer.map_err(|failure| self.failed(failure))
     }
@@ -381,7 +385,8 @@ impl Broker for RunBroker {
             intent: None,
         };
         let parts = (transfer, call_intent(&download.intent));
-        let call = TransferCall::new(&self.scope, Self::ask(&request), parts, self.minted());
+        let held_by = (&self.scope, self.holder);
+        let call = TransferCall::new(held_by, Self::ask(&request), parts, self.minted());
         let started = drive(call, &self.ctx).await;
         started.map_err(|failure| self.failed(failure))
     }
@@ -419,13 +424,15 @@ impl Broker for RunBroker {
         };
         // The same checks as a request the run sends itself, with its secret released.
         let parts = (transfer, call_intent(&upload.intent));
-        let call = TransferCall::new(&self.scope, Self::ask(&request), parts, self.minted());
+        let held_by = (&self.scope, self.holder);
+        let call = TransferCall::new(held_by, Self::ask(&request), parts, self.minted());
         let started = drive(call, &self.ctx).await;
         started.map_err(|failure| self.failed(failure))
     }
 
     async fn jobs_get(&self, _cx: &CallContext, id: &str) -> Result<JobStatus, HostError> {
-        Ok(drive(ReadJob::new(&self.scope, id), &self.ctx).await?)
+        let read = ReadJob::new((&self.scope, self.holder), id);
+        Ok(drive(read, &self.ctx).await?)
     }
 
     async fn jobs_outputs(
@@ -493,7 +500,8 @@ impl Broker for RunBroker {
     }
 
     async fn secret_value(&self, _cx: &CallContext, slot: &str) -> Result<Vec<Field>, HostError> {
-        let fields = drive(SecretValue::new(&self.scope, slot), &self.ctx).await?;
+        let value = SecretValue::new((&self.scope, self.holder), slot);
+        let fields = drive(value, &self.ctx).await?;
         let values = (fields.names())
             .filter_map(|name| {
                 let value = fields.get(name)?.to_string();

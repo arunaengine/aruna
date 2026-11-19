@@ -683,14 +683,17 @@ enum ReadPhase {
 #[derive(Debug, PartialEq)]
 pub struct ReadJob {
     scope: RunScope,
+    holder: Ulid,
     id: String,
     phase: ReadPhase,
 }
 
 impl ReadJob {
-    pub fn new(scope: &RunScope, id: &str) -> Self {
+    /// The state of job `id` for the run's broker `holder`.
+    pub fn new((scope, holder): (&RunScope, Ulid), id: &str) -> Self {
         Self {
             scope: scope.clone(),
+            holder,
             id: id.to_string(),
             phase: ReadPhase::Admit,
         }
@@ -737,7 +740,7 @@ impl Operation for ReadJob {
                     return Ok(Next::Done(without_reply(*status)));
                 };
                 self.phase = ReadPhase::Shown(status);
-                let shown = ReplyShown::new(&self.scope, context);
+                let shown = ReplyShown::new((&self.scope, self.holder), context);
                 Ok(Next::Call(IoCall::child(shown)))
             }
             ReadPhase::Shown(status) => match result.child::<bool, CallError>()?? {

@@ -65,7 +65,8 @@ fn ready(exposure: ResponseExposure) -> IoResult {
 }
 
 fn send(intent: Option<CallIntent>) -> SendCall {
-    let mut send = SendCall::new(&scope(), ask(), (Vec::new(), intent), 1024);
+    let holder = (&scope(), Ulid::from_parts(8, 1));
+    let mut send = SendCall::new(holder, ask(), (Vec::new(), intent), 1024);
     assert!(is_child(&send.first()), "the request is checked first");
     send
 }
@@ -116,7 +117,8 @@ fn send_records_outcome() {
 
 fn transfer(transfer: Transfer) -> TransferCall {
     let place = ((5, Ulid::from_parts(5, 5)), None);
-    let mut call = TransferCall::new(&scope(), ask(), (transfer, intent()), place);
+    let holder = (&scope(), Ulid::from_parts(8, 1));
+    let mut call = TransferCall::new(holder, ask(), (transfer, intent()), place);
     assert!(is_child(&call.first()));
     call
 }

@@ -65,14 +65,15 @@ enum ObtainPhase {
     Hold(Box<Released>),
 }
 
-/// One checked release of a slot's secret for run `run_id`. The request names the newest value
-/// the run holds, so a fresh check may answer without its fields; fields that come are kept for
-/// the run in the plugin host state.
+/// One checked release of a slot's secret for run `run_id` and its broker `holder`. The request
+/// names the newest value the holder keeps, so a fresh check may answer without its fields;
+/// fields that come are kept for the holder in the plugin host state.
 #[derive(Debug, PartialEq)]
 pub struct ObtainSecret {
     config: Arc<RealmConfigDocument>,
     local: NodeId,
     run_id: Ulid,
+    holder: Ulid,
     slot: String,
     phase: ObtainPhase,
 }
@@ -80,7 +81,7 @@ pub struct ObtainSecret {
 impl ObtainSecret {
     pub fn new(
         (config, local): (Arc<RealmConfigDocument>, NodeId),
-        run_id: Ulid,
+        (run_id, holder): (Ulid, Ulid),
         mut request: ReleaseRequest,
     ) -> Self {
         request.run_id = Some(run_id);
@@ -88,6 +89,7 @@ impl ObtainSecret {
             config,
             local,
             run_id,
+            holder,
             slot: request.slot.clone(),
             phase: ObtainPhase::Held(request),
         }
@@ -103,8 +105,12 @@ impl Operation for ObtainSecret {
     type Error = CallError;
 
     fn first(&mut self) -> Result<Next<Self::Output>, CallError> {
-        let (run_id, slot) = (self.run_id, self.slot.clone());
-        let held = PluginEffect::HeldValue { run_id, slot };
+        let (run_id, holder, slot) = (self.run_id, self.holder, self.slot.clone());
+        let held = PluginEffect::HeldValue {
+            run_id,
+            holder,
+            slot,
+        };
         Ok(Next::Call(Self::plugin_call(held)))
     }
 
@@ -123,6 +129,7 @@ impl Operation for ObtainSecret {
                 let mut released = released.map_err(|failure| call_failure(failure.0))?;
                 let hold = PluginEffect::HoldValue {
                     run_id: self.run_id,
+                    holder: self.holder,
                     slot: self.slot.clone(),
                     value_id: released.value_id,
                     fields: released.fields.take(),
@@ -343,7 +350,7 @@ pub struct InjectSecret {
 impl InjectSecret {
     pub fn new(
         call: &ConfiguredCall,
-        (local, run_id): (NodeId, Ulid),
+        (local, holder): (NodeId, (Ulid, Ulid)),
         slot: &str,
         outgoing: OutgoingRequest,
     ) -> Self {
@@ -355,7 +362,7 @@ impl InjectSecret {
             held: None,
             run_id: None,
         };
-        let obtain = ObtainSecret::new((call.config.clone(), local), run_id, request);
+        let obtain = ObtainSecret::new((call.config.clone(), local), holder, request);
         Self {
             obtain: Some(obtain),
             outgoing: Some(outgoing),
@@ -403,15 +410,16 @@ pub struct ReadyRequest {
 #[derive(Debug, PartialEq)]
 pub struct ReadyConnection {
     prepare: Option<PrepareConnection>,
-    place: (NodeId, Ulid),
+    place: (NodeId, (Ulid, Ulid)),
     context: Option<RequestContext>,
 }
 
 impl ReadyConnection {
-    pub fn new(scope: &RunScope, ask: ConnectionAsk) -> Self {
+    /// The request of `ask` for the run's broker `holder`.
+    pub fn new((scope, holder): (&RunScope, Ulid), ask: ConnectionAsk) -> Self {
         Self {
             prepare: Some(PrepareConnection::new(scope, ask)),
-            place: (scope.local, scope.run.run_id),
+            place: (scope.local, (scope.run.run_id, holder)),
             context: None,
         }
     }
@@ -464,15 +472,15 @@ impl Operation for ReadyConnection {
 #[derive(Debug, PartialEq)]
 pub struct ReplyShown {
     check: Option<CheckReply>,
-    place: (NodeId, Ulid),
+    place: (NodeId, (Ulid, Ulid)),
     injecting: bool,
 }
 
 impl ReplyShown {
-    pub fn new(scope: &RunScope, context: &RequestContext) -> Self {
+    pub fn new((scope, holder): (&RunScope, Ulid), context: &RequestContext) -> Self {
         Self {
             check: Some(CheckReply::new(scope, context)),
-            place: (scope.local, scope.run.run_id),
+            place: (scope.local, (scope.run.run_id, holder)),
             injecting: false,
         }
     }
@@ -509,16 +517,16 @@ impl Operation for ReplyShown {
 #[derive(Debug, PartialEq)]
 pub struct SecretValue {
     check: Option<CheckConfigured>,
-    place: (NodeId, Ulid),
+    place: (NodeId, (Ulid, Ulid)),
     slot: String,
     obtaining: bool,
 }
 
 impl SecretValue {
-    pub fn new(scope: &RunScope, slot: &str) -> Self {
+    pub fn new((scope, holder): (&RunScope, Ulid), slot: &str) -> Self {
         Self {
             check: Some(CheckConfigured::secret(scope, slot)),
-            place: (scope.local, scope.run.run_id),
+            place: (scope.local, (scope.run.run_id, holder)),
             slot: slot.to_string(),
             obtaining: false,
         }
@@ -548,9 +556,9 @@ impl Operation for SecretValue {
             held: None,
             run_id: None,
         };
-        let (local, run_id) = self.place;
+        let (local, holder) = self.place;
         self.obtaining = true;
-        let obtain = ObtainSecret::new((call.config, local), run_id, request);
+        let obtain = ObtainSecret::new((call.config, local), holder, request);
         Ok(Next::Call(IoCall::child(obtain)))
     }
 }

@@ -193,12 +193,18 @@ pub enum PluginEffect {
         unnamed: Vec<UserId>,
         now_ms: u64,
     },
-    /// The newest value write id run `run_id` holds the fields of for `slot`; answers `Held`.
-    HeldValue { run_id: Ulid, slot: String },
-    /// Keeps `fields` as value `value_id` of the run's `slot` when given; answers `Fields` with
-    /// the fields the run holds for that value.
+    /// The newest value write id whose fields `holder`, one broker of run `run_id`, holds for
+    /// `slot`; answers `Held`.
+    HeldValue {
+        run_id: Ulid,
+        holder: Ulid,
+        slot: String,
+    },
+    /// Keeps `fields` as value `value_id` of the holder's `slot` when given; answers `Fields` with
+    /// the fields the holder keeps for that value.
     HoldValue {
         run_id: Ulid,
+        holder: Ulid,
         slot: String,
         value_id: Ulid,
         fields: Option<SecretBytes>,

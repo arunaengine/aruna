@@ -90,9 +90,15 @@ mod operations {
 
     fn obtain(run_id: Ulid) -> ObtainSecret {
         let place = (Arc::new(fixtures::realm_nodes()), node(3));
-        let mut obtain = ObtainSecret::new(place, run_id, request("a"));
+        let holder = Ulid::from_parts(8, 1);
+        let mut obtain = ObtainSecret::new(place, (run_id, holder), request("a"));
         let slot = "a".to_string();
-        let held = Effect::Plugin(PluginEffect::HeldValue { run_id, slot });
+        let held = PluginEffect::HeldValue {
+            run_id,
+            holder,
+            slot,
+        };
+        let held = Effect::Plugin(held);
         assert_eq!(obtain.first(), Ok(Next::Call(IoCall::Effect(Box::new(held)))));
         obtain
     }
@@ -113,6 +119,7 @@ mod operations {
         let fields = None;
         let expected = PluginEffect::HoldValue {
             run_id,
+            holder: Ulid::from_parts(8, 1),
             slot,
             value_id,
             fields,
