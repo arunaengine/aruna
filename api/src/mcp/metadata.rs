@@ -9,7 +9,7 @@ use super::{
     parse_ulid, request_auth, server_error, tool_extras,
 };
 use crate::lookup::actor;
-use aruna_core::metadata_api::{CreateDocumentPayload, RoCrateExportView, UpdateDocumentMutation};
+use aruna_core::metadata::api::{CreateDocumentPayload, RoCrateExportView, UpdateDocumentMutation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_drivers::driver::drive;
@@ -1040,7 +1040,7 @@ mod authorization_tests {
         seed_group_docs, seed_realm_auth, test_state, test_storage, write_doc,
     };
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::metadata_api::CreateDocumentPayload;
+    use aruna_core::metadata::api::CreateDocumentPayload;
     use aruna_core::structs::identity::auth::{
         Actor, NodeCapabilities, PathRestriction, Permission,
     };

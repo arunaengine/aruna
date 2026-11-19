@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::metadata::AuthToken;
-use aruna_core::metadata_api::ExportMetadataResult;
+use aruna_core::metadata::api::ExportMetadataResult;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_drivers::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
@@ -23,7 +23,7 @@ use aruna_operations::plugins::install::{pick_version, read_manifest};
 use std::collections::BTreeMap;
 
 use super::*;
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::read_types::DocumentQueryRequest;
 use aruna_operations::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};

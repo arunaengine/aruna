@@ -5,7 +5,7 @@
 
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
-use aruna_core::metadata_api::{RoCrateExportView, UpdateDocumentMutation};
+use aruna_core::metadata::api::{RoCrateExportView, UpdateDocumentMutation};
 use aruna_core::outbound::{ConnectionAnswer, ConnectionError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun, StateRemoval, StateWrite};

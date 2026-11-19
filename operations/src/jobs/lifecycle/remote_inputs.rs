@@ -16,8 +16,9 @@ use aruna_core::structs::execution::job::{CapturedInput, InputSelection, Submiss
 
 use super::submission_rules::{batch_len, resolve_answer};
 use crate::jobs::submit::SubmitJobError;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 
 /// Upper bound of one resolve request; the transport's own step limits end it earlier.
 const RESOLVE_DEADLINE: Duration = Duration::from_secs(60);
@@ -109,7 +110,7 @@ fn resolve_reply(
         MetadataTransportMessage::ResolvedJobInputs { result } => Ok(result),
         other => Err(format!(
             "the node answered {}",
-            crate::metadata::transport_message_kind(&other)
+            aruna_core::metadata::protocol::transport_message_kind(&other)
         )),
     }
 }

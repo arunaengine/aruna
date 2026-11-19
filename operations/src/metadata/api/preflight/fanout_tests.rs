@@ -6,7 +6,7 @@ use super::super::super::MetadataFanoutStats;
 use super::super::super::preflight_types::ReferenceTarget;
 use super::*;
 use aruna_core::UserId;
-use aruna_core::metadata_api::{MetadataIndexState, MetadataNodeFreshness};
+use aruna_core::metadata::api::{MetadataIndexState, MetadataNodeFreshness};
 
 fn realm() -> RealmId {
     RealmId::from_bytes([1; 32])

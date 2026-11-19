@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 
 use super::*;
-use crate::metadata::protocol::encode_message;
+use aruna_core::metadata::protocol::encode_message;
 
 fn peer() -> NodeId {
     iroh::SecretKey::from_bytes(&[1; 32]).public()

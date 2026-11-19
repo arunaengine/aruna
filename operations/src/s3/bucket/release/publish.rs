@@ -48,7 +48,6 @@ use crate::distribution::routing::local_fence;
 use crate::distribution::status::{StatusError, read_view};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::metadata::protocol::MetadataReadError;
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -59,6 +58,7 @@ use crate::s3::object::origin::{OriginError, OriginView, ReadOriginOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::request_policy::PolicyRequestExtras;
 
 #[derive(Debug, Error, PartialEq)]

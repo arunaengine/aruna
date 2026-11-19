@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use super::*;
 use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
-use aruna_core::metadata_api::{MetadataIndexState, MetadataResolvedTarget};
+use aruna_core::metadata::api::{MetadataIndexState, MetadataResolvedTarget};
 
 const LOCATION: &str = "s3://genes/dir/a";
 

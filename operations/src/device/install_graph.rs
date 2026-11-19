@@ -17,7 +17,7 @@ use tracing::warn;
 
 use super::replica::{ReplicaRecord, ReplicaState, replica_entry, replica_key};
 use crate::metadata::deletion_guard::metadata_call;
-use crate::metadata::protocol::GraphState;
+use aruna_core::metadata::protocol::GraphState;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum InstallError {

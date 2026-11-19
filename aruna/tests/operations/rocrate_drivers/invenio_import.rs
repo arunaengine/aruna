@@ -619,7 +619,7 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Adds a contextual entity through the normal update, without materializing it.
 async fn add_note(fixture: &Fixture, name: &str) -> Result<Ulid, Box<dyn std::error::Error>> {
-    use aruna_core::metadata_api::UpdateDocumentMutation;
+    use aruna_core::metadata::api::UpdateDocumentMutation;
     use aruna_operations::metadata::update_document::{
         UpdateDocumentConfig, UpdateDocumentOperation,
     };

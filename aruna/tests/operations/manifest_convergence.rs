@@ -4,7 +4,7 @@
 
 use crate::metadata_calls::read_mapping;
 use aruna_core::document::{DocumentTarget, ShardManifest, ShardManifestEntry};
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::placement::{
     PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, strategy_for_target,

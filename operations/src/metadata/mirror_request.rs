@@ -14,10 +14,11 @@ use aruna_core::rows::event;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::types::GroupId;
 
-use crate::metadata::message_kind::transport_message_kind;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use crate::sync::mirror_repair::RECONCILE_GRACE;
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_message, encode_message, metadata_request,
+    transport_message_kind,
+};
 use aruna_core::request_policy::PolicyRequestExtras;
 
 /// A mirror request ends before repair could treat its create as abandoned.

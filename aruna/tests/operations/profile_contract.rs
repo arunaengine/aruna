@@ -12,11 +12,12 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, EVENT_LOG_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::ProfileValidationStatus;
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
+use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::metadata::{
     CRATE_PROFILE_IRI, INVENIO_PROFILE_IRI, MetadataEffect, MetadataError, MetadataEvent,
     ProfileValidationSeverity, ProfileValidationState, ZENODO_PROFILE_IRI,
 };
-use aruna_core::metadata_api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::storage_entries::event_log_prefix;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -26,7 +27,6 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, mint_local_document,
 };

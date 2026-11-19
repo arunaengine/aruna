@@ -12,9 +12,8 @@ use aruna_core::structs::execution::job::JobFamilyRecord;
 
 use super::{OfferLaunchOperation, OfferOutcome};
 use crate::jobs::lifecycle::LifecycleError;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::tests::records::{Family, node};
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_request};
 
 fn launch(family: &Family) -> LaunchFrame {
     let intent = family.launch(&family.spec(), family.holder.public(), 0);

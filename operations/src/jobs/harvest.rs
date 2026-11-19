@@ -58,7 +58,7 @@ use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperat
 use crate::metadata::forward::routed::write::RouteDeleteOperation;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
 use aruna_core::jobs::JobRunOutcome;
-use aruna_core::metadata_api::{CreateDocumentPayload, UpdateDocumentMutation};
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.

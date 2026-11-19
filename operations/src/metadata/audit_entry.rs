@@ -19,8 +19,8 @@ use crate::metadata::audit::{
     AUDIT_PAGE_LIMIT, AUDIT_PAGE_SIZE, AuditAggregate, ListAuditError, ListAuditOperation,
     ListAuditRequest, LocalPageOperation, decode_cursor,
 };
-use crate::metadata::protocol::MetadataReadError;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::request_policy::PolicyRequestExtras;
 
 #[derive(Debug, PartialEq)]

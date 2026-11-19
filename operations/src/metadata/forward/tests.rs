@@ -12,7 +12,6 @@ use crate::forward::routing::holds_metadata_id;
 use crate::forward::routing::write_route;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::protocol::MetadataReadError;
 use crate::realm::peer_trust::peer_acts_for;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
@@ -20,6 +19,7 @@ use aruna_core::StructuredId;
 use aruna_core::UserId;
 use aruna_core::metadata::MetadataMergedRevision;
 use aruna_core::metadata::ProfileValidationStatus;
+use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -309,7 +309,7 @@ fn response_records_checked() {
         document_id: Ulid::nil(),
         document_path: "/docs/one/".to_string(),
         public: true,
-        payload: aruna_core::metadata_api::CreateDocumentPayload::Scaffold {
+        payload: aruna_core::metadata::api::CreateDocumentPayload::Scaffold {
             name: "one".to_string(),
             description: String::new(),
             date_published: "2026-01-01".to_string(),

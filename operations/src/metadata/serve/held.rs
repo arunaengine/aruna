@@ -22,8 +22,8 @@ use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage as Message};
 use crate::metadata::read_peer::ReadPeerOperation;
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage as Message};
 
 /// A forwarded record read; a status read may ask for a fresh validation.
 #[derive(Clone, Copy, Debug, PartialEq)]

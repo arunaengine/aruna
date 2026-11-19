@@ -30,8 +30,8 @@ use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::persistent_id::forward::pid_authority_node;
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message};
 
 /// How long one holder may take to answer a forwarded device edit, which it merges and commits.
 const BATCH_FORWARD_TIMEOUT: Duration = Duration::from_secs(120);

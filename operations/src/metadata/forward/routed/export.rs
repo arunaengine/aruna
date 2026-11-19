@@ -26,10 +26,10 @@ use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::deletion_guard::metadata_call;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::is_sync_eligible;
-use aruna_core::metadata_api::{ExportMetadataResult, MetadataRawView, RoCrateExportView};
+use aruna_core::metadata::api::{ExportMetadataResult, MetadataRawView, RoCrateExportView};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 type ExportTurn = Result<Next<ExportMetadataResult>, MetadataApiError>;
 

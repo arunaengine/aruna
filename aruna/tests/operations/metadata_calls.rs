@@ -7,6 +7,7 @@ use std::sync::Arc;
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::protocol::{PersistentIdRequest, PersistentIdResolution};
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmId;
@@ -28,7 +29,6 @@ use aruna_operations::metadata::persistent_id::MappingReadOperation;
 use aruna_operations::metadata::persistent_id::forward::{
     PidRouteOperation, outcome_mapping, outcome_resolution, outcome_submission, submission_error,
 };
-use aruna_operations::metadata::{PersistentIdRequest, PersistentIdResolution};
 use ulid::Ulid;
 
 fn local_node(context: &DriverContext) -> Option<NodeId> {
@@ -80,7 +80,7 @@ async fn pid_request(
     (realm_id, document_id): (RealmId, Ulid),
     request: PersistentIdRequest,
     caller: (Option<AuthToken>, Option<AuthContext>),
-) -> Result<aruna_operations::metadata::PersistentIdOutcome, MetadataApiError> {
+) -> Result<aruna_core::metadata::protocol::PersistentIdOutcome, MetadataApiError> {
     let node = (realm_id, local_node(context));
     drive(
         PidRouteOperation::new(node, document_id, request, caller),
@@ -184,7 +184,7 @@ pub async fn route_metadata_update(
     record: Option<&MetadataRegistryRecord>,
     document_id: Ulid,
     public: Option<bool>,
-    mutation: aruna_core::metadata_api::UpdateDocumentMutation,
+    mutation: aruna_core::metadata::api::UpdateDocumentMutation,
     expected_revision: Option<Ulid>,
     token: Option<AuthToken>,
     commit_message: Option<String>,

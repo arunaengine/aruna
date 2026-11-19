@@ -39,11 +39,11 @@ use super::{
     plan_preflight_request,
 };
 use crate::forward::transport::read_error;
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::search_cursor::{SearchCursor, resume_fetch_limit};
-use aruna_core::metadata_api::{
+use aruna_core::metadata::api::{
     MetadataResolvedTarget, ReferenceNodeExecution, ReferenceNodeRequest,
 };
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 
 /// How the preflight fanout asks each node, deeper for nodes a cursor resumes.
 #[derive(Debug, PartialEq)]

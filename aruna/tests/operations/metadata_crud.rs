@@ -15,10 +15,10 @@ use aruna_core::keyspaces::{
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
     REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataEffect, MetadataEventPayload, MetadataEventRecord,
 };
-use aruna_core::metadata_api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::placement::{
     PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
 };

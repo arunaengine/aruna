@@ -20,7 +20,7 @@ use crate::routes::repository::links::{
     connector, ensure_capable, ensure_requirements, validate_record_id,
 };
 use crate::server::state::ServerState;
-use aruna_core::metadata_api::UpdateDocumentMutation;
+use aruna_core::metadata::api::UpdateDocumentMutation;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::job::ExportRoCrateSpec;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};

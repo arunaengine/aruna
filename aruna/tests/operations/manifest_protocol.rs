@@ -4,7 +4,7 @@
 
 use aruna_core::StructuredId;
 use aruna_core::document::{DocumentTarget, ShardManifest};
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};

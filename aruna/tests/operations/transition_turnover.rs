@@ -6,7 +6,7 @@ use crate::topology;
 
 use crate::metadata_calls::route_metadata_update;
 use aruna_core::StructuredId;
-use aruna_core::metadata_api::UpdateDocumentMutation;
+use aruna_core::metadata::api::UpdateDocumentMutation;
 use aruna_core::placement::holds_placement;
 use aruna_core::placement::transition::preview_transition;
 use aruna_core::structs::placement::transition::TransitionLimits;

@@ -33,7 +33,7 @@ use crate::metadata::iri_index::{
     BacklinkError, BacklinkPage, BacklinksOperation, IriFreshness, iri_freshness, status_rows,
 };
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
-use aruna_core::metadata_api::{
+use aruna_core::metadata::api::{
     MetadataNodeFreshness, MetadataPreflightLocation, MetadataVisibleReference,
     ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,
 };

@@ -35,8 +35,8 @@ use super::rows::{
 };
 use super::runs::{Admission, RunError, event_run};
 use crate::document_repository::GetConfigOperation;
-use crate::metadata::protocol::MetadataReadError;
 use crate::realm::mutate_placement::node_kind;
+use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::plugin_runs::Outcome;
 
 /// The decision a resend of an event gets, with its anchor for the dedup retention.

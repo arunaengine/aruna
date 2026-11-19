@@ -35,12 +35,12 @@ use super::copies_needed;
 use super::copy_rows::{StoreCopy, chunk_count, chunk_of};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::protocol::{
-    METADATA_IO_TIMEOUT, MetadataTransportMessage, decode_message, encode_message, metadata_request,
-};
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
+use aruna_core::metadata::protocol::{
+    METADATA_IO_TIMEOUT, MetadataTransportMessage, decode_message, encode_message, metadata_request,
 };
 
 #[derive(Debug, Error, PartialEq)]

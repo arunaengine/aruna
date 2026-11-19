@@ -58,7 +58,7 @@ use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperat
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use aruna_core::metadata_api::{
+use aruna_core::metadata::api::{
     CreateDocumentPayload, ExportMetadataResult, RoCrateExportView, UpdateDocumentMutation,
 };
 

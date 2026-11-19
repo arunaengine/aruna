@@ -32,7 +32,7 @@ use crate::device::replica::{ReplicaRecord, mark_edited};
 use crate::device::replica_store::store_replica;
 use crate::device::sync_status::read_publish_entries;
 use crate::metadata::deletion_guard::metadata_call;
-use aruna_core::metadata_api::UpdateDocumentMutation;
+use aruna_core::metadata::api::UpdateDocumentMutation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DeviceEditError {
@@ -644,8 +644,8 @@ mod tests {
         (dir, context, record)
     }
 
-    fn contact(name: &str) -> aruna_core::metadata_api::UpdateDocumentMutation {
-        aruna_core::metadata_api::UpdateDocumentMutation::UpsertContextualEntity {
+    fn contact(name: &str) -> aruna_core::metadata::api::UpdateDocumentMutation {
+        aruna_core::metadata::api::UpdateDocumentMutation::UpsertContextualEntity {
             jsonld: format!(r##"{{"@id":"#{name}","@type":"Person","name":"{name}"}}"##),
         }
     }

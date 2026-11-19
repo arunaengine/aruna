@@ -25,7 +25,7 @@ use crate::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, submission_verdict,
 };
 use crate::metadata::repository::{schedule_materialization, schedule_projection};
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
 
 /// Mints a metadata document id from the realm config: from a local held bucket and a
 /// pre-provisioned binding, or with the blind placement a job-produced or forwarded document

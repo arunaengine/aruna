@@ -27,7 +27,7 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::placement::transition::{TransitionRequest, plan_transition};
 use aruna_core::placement::{
     PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,

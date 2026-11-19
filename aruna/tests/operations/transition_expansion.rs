@@ -6,7 +6,7 @@ use crate::topology;
 use aruna_drivers::driver::drive;
 
 use aruna_core::StructuredId;
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_operations::metadata::create_document::{

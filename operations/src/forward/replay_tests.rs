@@ -167,7 +167,7 @@ fn replay_needs_acceptance() {
         document_id: id,
         document_path: "docs/one".to_string(),
         public: true,
-        payload: aruna_core::metadata_api::CreateDocumentPayload::Scaffold {
+        payload: aruna_core::metadata::api::CreateDocumentPayload::Scaffold {
             name: "one".to_string(),
             description: String::new(),
             date_published: "2026-01-01".to_string(),

@@ -14,7 +14,7 @@ use super::{
     MetadataSearchHit, NodeId, NodeSearchResult, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, RealmId,
     SearchCursor, SearchWatermark, Ulid, Value, VersionKey, paginate,
 };
-use aruna_core::metadata_api::{
+use aruna_core::metadata::api::{
     MetadataIndexState, MetadataPreflightLocation, MetadataResolvedTarget, MetadataVisibleReference,
     ReferenceNodeExecution,
 };

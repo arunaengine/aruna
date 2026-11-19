@@ -38,13 +38,13 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::document_repository::{config_of, realm_config};
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::pull_refusal;
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::dataset::DatasetSummaryOperation;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::request_policy::PolicyRequestExtras;
 
 impl From<PublishError> for PublishRefusal {

@@ -7,7 +7,7 @@ use super::{
     ApiQueryMode, AuthContext, ConversionError, Deserialize, HashSet, NodeId, RealmConfigDocument,
     Serialize,
 };
-use aruna_core::metadata_api::{
+use aruna_core::metadata::api::{
     MetadataNodeFreshness, MetadataPreflightLocation, MetadataResolvedTarget,
     MetadataVisibleReference,
 };

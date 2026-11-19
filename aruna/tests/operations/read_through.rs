@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::metadata_calls::get_metadata_routed;
 use crate::metadata_calls::route_metadata_update;
 use aruna_core::StructuredId;
-use aruna_core::metadata_api::{RoCrateExportView, UpdateDocumentMutation};
+use aruna_core::metadata::api::{RoCrateExportView, UpdateDocumentMutation};
 use aruna_operations::device::drain::drain_publish_queue;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::device::replica_store::read_replica;

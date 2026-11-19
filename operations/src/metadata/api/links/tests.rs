@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::merge_pages;
-use aruna_core::metadata_api::{LinkDocument, LinkHit, LinkNodePage};
+use aruna_core::metadata::api::{LinkDocument, LinkHit, LinkNodePage};
 use ulid::Ulid;
 
 fn document(seed: u8, link: &str) -> LinkDocument {

@@ -25,7 +25,7 @@ use aruna_core::job_request::{self, RequestIdentity, SubmissionRequest, Submissi
 
 /// What one resolve request or answer may carry: half a transport message, so the bearer and
 /// the envelope always fit beside it.
-const RESOLVE_BATCH_BYTES: usize = crate::metadata::protocol::MAX_MESSAGE_SIZE / 2;
+const RESOLVE_BATCH_BYTES: usize = aruna_core::metadata::protocol::MAX_MESSAGE_SIZE / 2;
 
 /// Adds `item` to a batch of `size` encoded bytes when it still fits one resolve batch.
 pub(super) fn fits(size: &mut usize, item: &impl Serialize) -> bool {

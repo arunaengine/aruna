@@ -14,7 +14,7 @@ use crate::metadata::{
     serialize_jsonld_object, with_global_ids,
 };
 use crate::server::state::ServerState;
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_drivers::driver::drive;

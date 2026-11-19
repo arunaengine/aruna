@@ -24,7 +24,7 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::{
     CreateDocumentError, mint_forward_document, mint_local_document, resolve_metadata_id,
 };
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
 
 /// A create of a given document on one pinned node, kept so that a retry sends the very same
 /// arguments to the very same node.

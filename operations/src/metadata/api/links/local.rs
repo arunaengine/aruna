@@ -29,7 +29,7 @@ use crate::metadata::api::title::DocumentTitleOperation;
 use crate::metadata::call_results::page_rows;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
-use aruna_core::metadata_api::{
+use aruna_core::metadata::api::{
     LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkQuery, SetPreviewPage,
 };
 

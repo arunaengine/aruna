@@ -26,7 +26,7 @@ use super::{
     LONG_KEY_ROWS, MAX_TARGET_VERSIONS, ResolvedPreflightTargets, decode_version, version_targets,
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_core::metadata_api::MetadataResolvedTarget;
+use aruna_core::metadata::api::MetadataResolvedTarget;
 
 type Versions = Vec<(VersionKey, BlobVersion)>;
 

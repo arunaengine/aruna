@@ -12,13 +12,13 @@ use aruna_core::keyspaces::{
     METADATA_CHECKPOINT_KEYSPACE, METADATA_INDEX_KEYSPACE, RAW_BUDGET_KEYSPACE,
     REALM_CONFIG_KEYSPACE,
 };
+use aruna_core::metadata::api::UpdateDocumentMutation;
 use aruna_core::metadata::{
     EVENT_LIMIT, MaterializationStatusRecord, MetadataActor, MetadataBatch, MetadataBatchSource,
     MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
     MetadataLifecycleRecord, MetadataMaterializationRecord, ProfileValidationStatus,
     RAW_BYTES_LIMIT, RawOriginBudget, raw_quotas,
 };
-use aruna_core::metadata_api::UpdateDocumentMutation;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
 use aruna_core::storage_entries::{

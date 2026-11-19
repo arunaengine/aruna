@@ -20,9 +20,11 @@ use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::forward::profile_export::ProfileLocalOperation;
 use crate::metadata::forward::read::admits_profile_peer;
 use crate::metadata::forward::routed::export::{ExportWithinOperation, ensure_export_limit};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, metadata_body_limit};
 use crate::metadata::read_peer::ReadPeerOperation;
-use aruna_core::metadata_api::ExportMetadataResult;
+use aruna_core::metadata::api::ExportMetadataResult;
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, metadata_body_limit,
+};
 
 /// A forwarded export.
 #[derive(Debug, PartialEq)]

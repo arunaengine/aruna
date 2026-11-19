@@ -15,7 +15,7 @@ use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use crate::metadata::update_entry::UpdateEntryOperation;
-use aruna_core::metadata_api::UpdateDocumentMutation;
+use aruna_core::metadata::api::UpdateDocumentMutation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CheckpointError {

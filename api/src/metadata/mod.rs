@@ -12,12 +12,12 @@ use crate::error::{ServerError, ServerResult};
 use crate::lookup::origin_holds;
 use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
-use aruna_core::metadata::{
-    MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
-};
-use aruna_core::metadata_api::{
+use aruna_core::metadata::api::{
     CreateDocumentPayload, ExportMetadataResult,
     RoCrateExportView as OperationMetadataRoCrateExportView,
+};
+use aruna_core::metadata::{
+    MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};

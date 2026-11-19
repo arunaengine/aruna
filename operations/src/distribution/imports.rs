@@ -34,8 +34,8 @@ use crate::connectors::list_connectors::{
 };
 use crate::forward::transport::{peer_answer, peer_call};
 use crate::jobs::staging::{ReadCheckpointOperation, StagingStoreError, handed_checkpoint};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 /// Job rows one scan page reads.
 const JOB_PAGE: usize = 256;

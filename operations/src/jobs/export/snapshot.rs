@@ -22,7 +22,7 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::forward::routed::export::RoutedExportOperation;
 use crate::metadata::pid_read::ReadPidOperation;
-use aruna_core::metadata_api::{ExportMetadataResult, RoCrateExportView};
+use aruna_core::metadata::api::{ExportMetadataResult, RoCrateExportView};
 
 fn unexpected_view() -> ExportFailure {
     ExportFailure::Permanent("metadata export returned an unexpected view".to_string())

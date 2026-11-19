@@ -21,7 +21,7 @@ use aruna_core::job_request::{SubmissionScope, submission_of};
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_core::metadata_api::{
+use aruna_core::metadata::api::{
     CreateDocumentPayload, ExportMetadataResult, RoCrateExportView, UpdateDocumentMutation,
 };
 use aruna_core::placement::resolve_shard_holders;

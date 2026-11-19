@@ -26,7 +26,7 @@ use super::readable::PathPermissionOperation;
 use super::search_types::SearchQueryRequest;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
-use aruna_core::metadata_api::{
+use aruna_core::metadata::api::{
     ExportMetadataResult, MetadataIndexState, MetadataNodeFreshness, MetadataResolvedTarget,
     RoCrateExportView,
 };

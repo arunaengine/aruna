@@ -26,7 +26,7 @@ use ulid::Ulid;
 
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::forward::read::{summary_answer, summary_export};
-use aruna_core::metadata_api::ExportMetadataResult;
+use aruna_core::metadata::api::ExportMetadataResult;
 
 /// Why the metadata of a bucket could not be read.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

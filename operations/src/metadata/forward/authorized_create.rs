@@ -35,10 +35,10 @@ use crate::metadata::create_document::{
     mint_forward_document, mint_local_document,
 };
 use crate::metadata::create_entry::CreateEntryOperation;
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::load_config::config_unavailable;
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Errors of the shared authorized create flow. Every variant maps onto the

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{AuthContext, Ulid};
-use aruna_core::metadata_api::RoCrateExportView;
+use aruna_core::metadata::api::RoCrateExportView;
 
 /// Data entities a page holds when the request names no limit, and at most.
 pub(crate) const PAGE_DEFAULT: usize = 100;

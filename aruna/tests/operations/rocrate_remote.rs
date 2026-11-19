@@ -25,7 +25,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
     PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
     ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, JobId, JobPayload,

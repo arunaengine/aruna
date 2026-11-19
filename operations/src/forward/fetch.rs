@@ -12,15 +12,14 @@ use aruna_core::events::{
     Event, GroupEvent, GroupResult, MetadataAnswer, NetEvent, PeerRequestError,
 };
 use aruna_core::metadata::MetadataError;
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_answer, encode_message, metadata_request,
+};
 use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{debug, warn};
-
-use crate::metadata::protocol::{
-    MetadataTransportMessage, decode_answer, encode_message, metadata_request,
-};
 
 /// What one holder's answer means to the fetch.
 #[derive(Debug, PartialEq)]

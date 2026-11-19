@@ -8,7 +8,7 @@ use crate::realm::peer_trust::PeerTrust;
 use crate::realm::peer_trust::ensure_peer_trust;
 use aruna_core::NodeId;
 use aruna_core::metadata::ProfileValidationStatus;
-use aruna_core::metadata_api::{ExportMetadataResult, RoCrateExportView};
+use aruna_core::metadata::api::{ExportMetadataResult, RoCrateExportView};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::dataset_description::{DatasetSummaryRequest, DescriptionError};

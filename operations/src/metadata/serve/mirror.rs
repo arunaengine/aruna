@@ -18,7 +18,6 @@ use aruna_core::types::GroupId;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::write_peer::WritePeerOperation;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -27,6 +26,7 @@ use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, GetRelationshipOperation, RemoveOutgoingOperation,
     StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::request_policy::PolicyRequestExtras;
 
 pub(crate) fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> bool {

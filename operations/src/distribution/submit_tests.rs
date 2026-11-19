@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::distribution::test_record::{member, realm, record, secret};
-use crate::metadata::protocol::encode_message;
+use aruna_core::metadata::protocol::encode_message;
 
 fn node(seed: u8) -> NodeId {
     secret(seed).public()

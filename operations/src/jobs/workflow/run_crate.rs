@@ -60,7 +60,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageReadError;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::metadata::AuthToken;
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::operation::Operation;
 use aruna_core::replication_protocol::{LocationSummary, LocationSummaryRequest};
 use aruna_core::structs::identity::realm::RealmConfigDocument;

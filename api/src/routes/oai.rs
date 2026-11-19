@@ -15,7 +15,7 @@ use ulid::Ulid;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aruna_core::metadata_api::{ExportMetadataResult, RoCrateExportView};
+use aruna_core::metadata::api::{ExportMetadataResult, RoCrateExportView};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_drivers::driver::DriverContext;

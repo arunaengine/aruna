@@ -9,7 +9,7 @@ use aruna_core::document::{DocumentSyncPublish, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::metadata_api::CreateDocumentPayload;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::placement::{build_view, resolve_holders, resolve_shard_holders};
 use aruna_core::reducer::AdminDocumentState;

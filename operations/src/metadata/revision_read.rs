@@ -9,11 +9,11 @@ use aruna_core::keyspaces::{
     DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
     RAW_REVISION_KEYSPACE,
 };
+use aruna_core::metadata::api::MetadataRawView;
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord, MetadataEventRecord,
     MetadataLifecycleRecord, MetadataRawRevision, resolve_raw_revision,
 };
-use aruna_core::metadata_api::MetadataRawView;
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     document_lifecycle_key, graph_lifecycle_key, materialization_status_key, raw_revision_key,

@@ -26,8 +26,8 @@ use super::peer::{ask_peer, peer_answer};
 use super::secret_use::{ReleaseFailure, ReleaseSecret};
 use super::unavailable;
 use super::work::WorkRow;
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::mutate_placement::is_management;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 
 /// The fields one run holds, by slot, with the value write id they belong to. They are reused
 /// only when a fresh check answers that this value is still current.

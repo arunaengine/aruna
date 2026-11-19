@@ -20,13 +20,14 @@ use super::PAGE_RECORDS;
 use super::apply::{ApplyInput, PageApplyOperation, page_answer};
 use super::build::{BuildError, BuildInput, Built, PageBuildOperation};
 use super::plan::PageError;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use crate::queue_backoff::{min_due_at, retry_delay_ms};
 use crate::replication::members::{
     BoundRecord, BoundRecordOperation, RecordError, member_publication,
 };
 use crate::replication::queue::BlobQueueError;
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 use aruna_core::replication_protocol::{PageAnswer, ReferencePage};
 use aruna_core::structs::storage::replication_queue::BlobJobRecord;
 use aruna_core::structs::storage::replication_queue::MemberTarget;

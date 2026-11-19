@@ -26,11 +26,10 @@ use super::{
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::peer_reply;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::realm::get_nodes::{
     GetNodesError, GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_request};
 
 fn child_member<O>(operation: O) -> Effect
 where

@@ -23,11 +23,11 @@ use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::profile::rules::PROFILE_DOCUMENT_PREFIX;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::metadata::raw_events::RawReadError;
 use crate::metadata::revision_read::RawDisplayOperation;
 use crate::realm::peer_trust::is_sync_eligible;
-use aruna_core::metadata_api::{ExportMetadataResult, MetadataRawView, RoCrateExportView};
+use aruna_core::metadata::api::{ExportMetadataResult, MetadataRawView, RoCrateExportView};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 type ExportTurn = Result<Next<ExportMetadataResult>, MetadataReadError>;
 

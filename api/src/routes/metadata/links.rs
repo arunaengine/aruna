@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::metadata_api::{LinkDocument, LinkNodeRequest, LinkQuery};
+use aruna_core::metadata::api::{LinkDocument, LinkNodeRequest, LinkQuery};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::link::{DataLink, LinkScope};

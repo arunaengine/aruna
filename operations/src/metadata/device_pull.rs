@@ -47,7 +47,6 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{ForwardAuthError, ForwardedCallerOperation};
 use crate::forward::fetch::{peer_call, peer_reply};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation, QueueLiveOperation};
@@ -66,6 +65,7 @@ use crate::s3::object::versions::{
 };
 use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};
 use crate::staging::offered_directory::OfferedDirectoryError;
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message};
 use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use aruna_core::request_policy::PolicyRequestExtras;
 

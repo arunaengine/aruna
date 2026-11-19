@@ -18,7 +18,7 @@ use crate::metadata::raw_events::RawReadError;
 use crate::metadata::record_reads::RecordMaterializedOperation;
 use crate::metadata::revision_read::RawDisplayOperation;
 use aruna_core::errors::StorageReadError;
-use aruna_core::metadata_api::{ExportMetadataResult, MetadataRawView, RoCrateExportView};
+use aruna_core::metadata::api::{ExportMetadataResult, MetadataRawView, RoCrateExportView};
 
 type ExportTurn = Result<Next<ExportMetadataResult>, MetadataApiError>;
 

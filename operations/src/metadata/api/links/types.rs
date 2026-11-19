@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::metadata_api::{LinkDocument, LinkNodePage, SetPreviewPage};
+use aruna_core::metadata::api::{LinkDocument, LinkNodePage, SetPreviewPage};
 use aruna_core::structs::storage::data::link::DataLink;
 use ulid::Ulid;
 

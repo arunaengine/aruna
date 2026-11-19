@@ -23,9 +23,6 @@ use crate::metadata::api::links::local::{LinksLocalOperation, SetPreviewOperatio
 use crate::metadata::api::preflight::local::references_preflight_local;
 use crate::metadata::identifier_lookup::{IdentifierLookupOperation, IdentifierQuery};
 use crate::metadata::local_query::LocalQueryOperation;
-use crate::metadata::protocol::{
-    MetadataReadError, MetadataTransportMessage as Message, metadata_read_error,
-};
 use crate::metadata::read_peer::{PeerReader, ReadPeerOperation, SearchPeerOperation};
 use crate::metadata::search_cursor::MAX_PAGINATION_DEPTH;
 use crate::metadata::text_search::LocalSearchOperation;
@@ -35,8 +32,11 @@ use crate::s3::bucket::release::publish::{HolderAnswerOperation, PublishError};
 use crate::s3::bucket::search::{SearchBucketsError, SearchBucketsInput};
 use crate::s3::object::search::{SearchObjectsError, SearchObjectsInput};
 use crate::s3::object::search_scan::SearchObjectsOperation;
-use aruna_core::metadata_api::{
+use aruna_core::metadata::api::{
     IdentifierMatch, LinkNodePage, ReferenceNodeExecution, ReferenceNodeRequest, SetPreviewPage,
+};
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage as Message, metadata_read_error,
 };
 use aruna_core::search::{BucketPage, SearchNodePage};
 

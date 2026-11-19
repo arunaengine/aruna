@@ -24,7 +24,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
-use aruna_core::metadata_api::{CreateDocumentPayload, UpdateDocumentMutation};
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::{
