@@ -1806,6 +1806,18 @@ pub enum MetadataError {
     MissingDependencies(String),
 }
 
+/// A runner failure in a metadata operation: a lost conflict or a storage failure keeps its
+/// storage cause, anything else is a backend failure.
+impl From<crate::calls::IoError> for MetadataError {
+    fn from(error: crate::calls::IoError) -> Self {
+        match error {
+            crate::calls::IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            crate::calls::IoError::Storage(error) => Self::Storage(error),
+            error => Self::Backend(error.to_string()),
+        }
+    }
+}
+
 impl MetadataError {
     /// A missing graph is a durable registry row whose materialization has not
     /// caught up, which the read API already reports as service unavailable. Only a

@@ -46,6 +46,7 @@ pub mod raw_revision;
 pub(crate) mod read_peer;
 pub mod realm_counts;
 pub mod record_reads;
+pub mod registry_cache;
 pub mod repository;
 pub mod revision_read;
 mod search_cursor;

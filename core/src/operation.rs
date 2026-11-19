@@ -32,6 +32,8 @@ pub enum HoldScope {
     GitRepository(ulid::Ulid),
     /// Publishing local runs on this node, so a repeated request cannot mint a second crate.
     RunPublish,
+    /// Filling this node's registry cache, so two fills never read the registry at once.
+    RegistryFill,
 }
 
 /// One use case as decisions without I/O: `first` and `next` return the next call or the
