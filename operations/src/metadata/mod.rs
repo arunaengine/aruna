@@ -52,13 +52,11 @@ pub mod revision_read;
 mod search_cursor;
 pub mod secondary_ids;
 pub mod stats;
-pub mod timestamp_index;
 pub(crate) mod timestamp_sweep;
 pub mod update_document;
 pub mod update_entry;
 pub(crate) mod updated_page;
 pub mod visibility_index;
-pub mod warmup;
 pub mod write_peer;
 
 /// The phase-time and identity samples a metadata operation stamps records
