@@ -81,13 +81,9 @@ impl Operation for ReadSourceOperation {
     type Error = ReadSourceError;
 
     fn first(&mut self) -> Result<Next<ReadSourceResult>, ReadSourceError> {
-        let input = &self.input;
-        let call = super::resolve_call(
-            input.group_id,
-            input.connector_id,
-            input.source_path.clone(),
-        );
-        Ok(Next::Call(call))
+        let (group, connector) = (self.input.group_id, self.input.connector_id);
+        let path = self.input.source_path.clone();
+        Ok(Next::Call(super::resolve_call(group, connector, path)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<ReadSourceResult>, ReadSourceError> {

@@ -70,7 +70,27 @@ pub(crate) async fn setup_group(
 
 /// Every notification in the outbox.
 pub(crate) async fn read_notification_outbox(context: &DriverContext) -> Vec<NotificationRecord> {
-    crate::tests::groups::read_notification_outbox(context).await
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 1024,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values
+            .into_iter()
+            .map(|(_, value)| {
+                postcard::from_bytes::<NotificationOutboxRecord>(&value)
+                    .unwrap()
+                    .record
+            })
+            .collect(),
+        other => panic!("unexpected storage event: {other:?}"),
+    }
 }
 
 /// A realm config with the actor's node as a server and one default strategy.
