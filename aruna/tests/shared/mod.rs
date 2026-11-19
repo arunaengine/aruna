@@ -17,8 +17,12 @@ use aruna::settings::read_settings_from;
 use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::cors::CorsConfig;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
-use aruna_api::routes::credentials::{CreatePathRestriction, CreateS3Request, CreateS3Response};
-use aruna_api::routes::groups::{CreateGroupRequest, CreateGroupResponse, GroupInfoResponse};
+use aruna_api::routes::access::credentials::{
+    CreatePathRestriction, CreateS3Request, CreateS3Response,
+};
+use aruna_api::routes::access::groups::{
+    CreateGroupRequest, CreateGroupResponse, GroupInfoResponse,
+};
 use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};

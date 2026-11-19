@@ -4,6 +4,7 @@
 
 use crate::auth::RealmAuth;
 use crate::error::ServerResult;
+use crate::metadata::model::*;
 use crate::metadata::*;
 use crate::routes::metadata::documents::*;
 use crate::server::state::ServerState;

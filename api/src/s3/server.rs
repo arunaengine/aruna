@@ -4,13 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod activity;
-mod body;
+pub(crate) mod body;
 mod classification;
 mod keepalive;
 mod post;
 mod response;
 
-pub(crate) use body::DeleteObjectsBody;
+use body::DeleteObjectsBody;
 
 use self::activity::{
     ActiveRequestGuard, ConnectionActivity, should_watch_idle, spawn_response_watch,

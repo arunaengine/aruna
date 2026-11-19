@@ -581,7 +581,7 @@ async fn by_version(
     let mut headers = HeaderMap::new();
     if let Some(named) = named {
         let value = named.to_string().parse().unwrap();
-        headers.insert(crate::routes::storage::relay::RELAY_NODE_HEADER, value);
+        headers.insert(aruna_operations::s3::object::member_rest::RELAY_NODE_HEADER, value);
     }
     get_version_origin(
         State(node.state.clone()),

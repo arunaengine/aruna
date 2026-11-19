@@ -158,7 +158,7 @@ impl McpServer {
         let response = crate::metadata::run_document_list(
             &self.state,
             Some(auth.clone()),
-            crate::metadata::ListMetadataQuery {
+            crate::metadata::model::ListMetadataQuery {
                 group_id: None,
                 path_prefix: Some("profiles/".to_string()),
                 include: Some("summary".to_string()),
@@ -286,7 +286,7 @@ impl McpServer {
         .await
         .map_err(crate::metadata::map_api_error)
         .map_err(search_error)?;
-        let response = crate::metadata::SearchResultsResponse {
+        let response = crate::metadata::model::SearchResultsResponse {
             hits: result
                 .hits
                 .into_iter()
@@ -360,7 +360,7 @@ impl McpServer {
             .await
             .map_err(crate::metadata::map_metadata_error)
             .map_err(server_error)?;
-        let response = crate::metadata::ProfilePreviewResponse::from(preview);
+        let response = crate::metadata::model::ProfilePreviewResponse::from(preview);
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -412,7 +412,7 @@ impl McpServer {
         )
         .await
         .ok();
-        let summary = crate::metadata::MetadataDocumentSummary::from(&record);
+        let summary = crate::metadata::model::MetadataDocumentSummary::from(&record);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,
         )))
@@ -462,7 +462,7 @@ impl McpServer {
         .await
         .map_err(crate::metadata::map_write_error)
         .map_err(update_error)?;
-        let summary = crate::metadata::MetadataDocumentSummary::from(&updated);
+        let summary = crate::metadata::model::MetadataDocumentSummary::from(&updated);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,
         )))
@@ -778,8 +778,8 @@ pub(crate) async fn load_raw(
     authorize_document(server, auth, document, tool_extras(tool, input)?)
         .await
         .map_err(document_error)?;
-    let params = crate::metadata::RoCrateExportParams {
-        view: Some(crate::metadata::MetadataRoCrateView::Raw),
+    let params = crate::metadata::model::RoCrateExportParams {
+        view: Some(crate::metadata::model::MetadataRoCrateView::Raw),
         limit: None,
         offset: None,
         after: None,
@@ -813,7 +813,7 @@ pub(crate) async fn load_raw(
     let response = crate::metadata::map_export_response(
         export,
         &params,
-        crate::metadata::MetadataRoCrateView::Raw,
+        crate::metadata::model::MetadataRoCrateView::Raw,
     )
     .map_err(server_error)?;
     Ok((

@@ -12,7 +12,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use crate::shared::write_value;
 use aruna_api::auth::RealmAuth;
 use aruna_api::error::ServerError;
-use aruna_api::routes::bucket_usage::{UsageQuery, get_bucket_usage};
+use aruna_api::routes::storage::bucket::usage::{UsageQuery, get_bucket_usage};
 use aruna_api::routes::storage::routing::{
     BucketRoutingRequest, get_bucket_routing, put_bucket_routing,
 };

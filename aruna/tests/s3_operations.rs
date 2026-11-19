@@ -4,7 +4,7 @@
 
 use crate::shared;
 
-use aruna_api::routes::credentials::CreatePathRestriction;
+use aruna_api::routes::access::credentials::CreatePathRestriction;
 use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::group_permission_path;

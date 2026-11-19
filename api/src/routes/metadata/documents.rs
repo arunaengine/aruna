@@ -6,11 +6,13 @@ use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::actor;
-use crate::metadata::{
+use crate::metadata::model::{
     CreateMetadataRequest, CreateMetadataResponse, ListMetadataQuery, ListMetadataResponse,
-    MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, commit_message,
-    crate_entities, ensure_readable_files, forwarded_auth_token, local_write_record, map_api_error,
-    map_write_error, parse_document_id, run_create_metadata, run_document_list,
+    MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse,
+};
+use crate::metadata::{
+    commit_message, crate_entities, ensure_readable_files, forwarded_auth_token, local_write_record,
+    map_api_error, map_write_error, parse_document_id, run_create_metadata, run_document_list,
     serialize_jsonld_object, with_global_ids,
 };
 use crate::server::state::ServerState;

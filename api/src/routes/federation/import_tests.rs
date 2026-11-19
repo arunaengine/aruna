@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::auth::UnrestrictedAuth;
-use crate::routes::federation::export::{GRANT_HEADER, encode_header};
+use crate::routes::federation::export::encode_header;
 use crate::routes::rocrate_import::{UploadRoCrateResponse, upload_rocrate};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
@@ -33,7 +33,7 @@ use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::federation::import::{
-    BoundUploadOperation, ReadImportOperation, WriteImportOperation,
+    BoundUploadOperation, GRANT_HEADER, ReadImportOperation, WriteImportOperation,
 };
 use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;

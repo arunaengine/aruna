@@ -8,7 +8,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 
 use crate::job_service::{read_artifact_routed, read_owned_job, submit_export_job};
 use crate::jobs::job_urls;
-use crate::metadata::{SubmitExportResponse, load_document_record, parse_document_id};
+use crate::metadata::model::SubmitExportResponse;
+use crate::metadata::{load_document_record, parse_document_id};
 use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
@@ -71,7 +72,7 @@ pub struct FederatedExportRequest {
     pub files: Vec<String>,
 }
 
-pub(crate) use aruna_operations::federation::import::GRANT_HEADER;
+use aruna_operations::federation::import::GRANT_HEADER;
 /// Header carrying a signed import intent as unpadded base64url JSON.
 pub(crate) const INTENT_HEADER: &str = "x-aruna-import-intent";
 const PUSH_TIMEOUT: Duration = Duration::from_secs(30 * 60);

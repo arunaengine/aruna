@@ -14,7 +14,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{RepositoryExportRequest, SubmitExportRequest, SubmitExportResponse};
+use crate::metadata::model::{RepositoryExportRequest, SubmitExportRequest, SubmitExportResponse};
 use crate::server::state::ServerState;
 
 use super::rocrate_import::{

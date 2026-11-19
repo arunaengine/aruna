@@ -8,9 +8,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::job_service::{
-    ArtifactLookup, JobReportLookup, OwnedArtifact, RoutedCancelOutcome, cancel_job_routed,
-    delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,
-    resolve_job_owner,
+    cancel_job_routed, delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed,
+    read_report_routed, resolve_job_owner,
 };
 use crate::jobs::family_report;
 use aruna_core::NodeId;
@@ -30,6 +29,9 @@ use aruna_operations::jobs::command::{
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
 use aruna_operations::jobs::export::grant::AdmitGrantOperation;
+use aruna_operations::jobs::job_artifacts::{ArtifactLookup, OwnedArtifact};
+use aruna_operations::jobs::job_cancel::RoutedCancelOutcome;
+use aruna_operations::jobs::job_reports::JobReportLookup;
 use aruna_operations::jobs::local_run::LocalExecutionError;
 use aruna_operations::jobs::store::RunDelete;
 use axum::body::Body;
@@ -1280,7 +1282,7 @@ pub async fn get_job_report(
         &state.get_ctx(),
         &auth,
         job_id,
-        crate::job_service::ReportQuery {
+        aruna_operations::jobs::job_reports::ReportQuery {
             expected_digest,
             last_key,
             limit,

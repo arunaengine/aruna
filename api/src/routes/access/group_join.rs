@@ -432,7 +432,7 @@ async fn decide_join(
     let key_requests = match aruna_core::UserId::from_string(&request.user_id) {
         Ok(member) if request.status == "approved" => {
             let members = vec![member];
-            crate::routes::storage::abe::member_requests(&state, &actor, group_id, members).await
+            crate::routes::storage::abe::records::member_requests(&state, &actor, group_id, members).await
         }
         _ => Vec::new(),
     };

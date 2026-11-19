@@ -739,7 +739,7 @@ mod test {
         extract_auth_parts, handle_token, map_authorize_error,
     };
     use crate::error::{ServerError, TokenError};
-    use crate::server::ServerState;
+    use crate::server::state::ServerState;
     use aruna_core::UserId;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};

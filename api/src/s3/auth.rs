@@ -4,11 +4,11 @@
 
 use super::scope::resolve_scope;
 use super::server::S3OpLabel;
-use super::service::forwarded_digest;
+use super::service::forward::forwarded_digest;
 use super::util::{anonymous_read_allowed, operation_permission, public_read_allowed};
 use crate::object_key::ObjectKey;
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
-use crate::s3::service::InputView;
+use crate::s3::service::view::InputView;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};

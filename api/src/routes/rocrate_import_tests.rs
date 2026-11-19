@@ -207,13 +207,13 @@ fn invenio_openapi_contract() {
     }
     let request =
         serde_json::json!({"group_id": "group", "connector_id": "connector", "metadata": {}});
-    let default: crate::metadata::RepositoryExportRequest =
+    let default: crate::metadata::model::RepositoryExportRequest =
         serde_json::from_value(request.clone()).unwrap();
     assert!(!default.publish);
     assert!(!default.public_files);
     let mut configured = request;
     configured["publish"] = serde_json::json!(true);
-    let configured: crate::metadata::RepositoryExportRequest =
+    let configured: crate::metadata::model::RepositoryExportRequest =
         serde_json::from_value(configured).unwrap();
     assert!(configured.publish);
 }
@@ -242,7 +242,7 @@ fn invenio_mode_contract() {
 
 #[test]
 fn invenio_login_private() {
-    let request: crate::metadata::RepositoryExportRequest =
+    let request: crate::metadata::model::RepositoryExportRequest =
         serde_json::from_value(serde_json::json!({
             "group_id": "group", "connector_id": "connector", "access_token": "author-private-token"
         }))

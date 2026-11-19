@@ -8,9 +8,7 @@ pub(crate) mod location;
 mod locks;
 mod snapshot;
 mod transport;
-mod versions;
-
-pub(crate) use versions::expected;
+pub(crate) mod versions;
 
 use crate::auth::UnrestrictedAuth;
 use crate::auth::map_authorize_error;

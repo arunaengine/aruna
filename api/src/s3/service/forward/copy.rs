@@ -31,9 +31,10 @@ use s3s::dto::{
 };
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
 
-use super::{Forward, ForwardBody, ForwardRequest, header, passed_headers, xml_field};
+use super::{ForwardBody, ForwardRequest, header, passed_headers, xml_field};
 use crate::s3::error::{IntoS3Error, guard_error};
 use crate::s3::service::ArunaS3Service;
+use aruna_operations::s3::object::member_read::MemberTarget as Forward;
 
 /// The source a member streams: one whole version, or one byte range for a part.
 pub(in crate::s3::service) struct CopySource<'a> {

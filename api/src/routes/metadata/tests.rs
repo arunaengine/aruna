@@ -9,6 +9,7 @@ use super::rocrate::*;
 use super::validation::*;
 use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
+use crate::metadata::model::*;
 use crate::metadata::*;
 use crate::server::state::ServerState;
 use crate::tests::metadata_fixtures::{

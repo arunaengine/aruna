@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod model;
+pub mod model;
 
-pub use model::*;
+use model::*;
 
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};

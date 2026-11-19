@@ -8,7 +8,7 @@
 pub(super) mod copy;
 pub(super) mod list;
 pub(super) mod parts;
-pub(super) mod reads;
+pub(crate) mod reads;
 mod uploads;
 mod versions;
 
@@ -31,7 +31,7 @@ use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{upload_route, upload_tag, upload_tags};
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
-pub(crate) use aruna_operations::s3::object::member_read::MemberTarget as Forward;
+use aruna_operations::s3::object::member_read::MemberTarget as Forward;
 pub(super) use aruna_operations::s3::object::member_read::{
     MemberPayload as ForwardBody, MemberRequest as ForwardRequest, TrailerChecksum,
 };

@@ -15,7 +15,7 @@ use aruna_operations::distribution::status::node_reach;
 use aruna_operations::s3::object::member_read::{
     MemberFailure, MemberRead, MemberReadOperation, MemberRefusal, MemberTextOperation,
 };
-pub(crate) use aruna_operations::s3::object::member_rest::RELAY_NODE_HEADER;
+use aruna_operations::s3::object::member_rest::RELAY_NODE_HEADER;
 use aruna_operations::s3::object::member_rest::{
     RestAnswer, RestAsk, RestCall, RestCallOperation, rest_url,
 };

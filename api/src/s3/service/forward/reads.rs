@@ -24,10 +24,11 @@ use s3s::dto::{
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
 use ulid::Ulid;
 
-use super::{Forward, ForwardRequest, passed_headers, passed_query, refused_error, unix_secs};
+use super::{ForwardRequest, passed_headers, passed_query, refused_error, unix_secs};
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
 use crate::s3::service::ArunaS3Service;
+use aruna_operations::s3::object::member_read::MemberTarget as Forward;
 
 /// How long an anonymous caller's stand-in credential lasts; the delegation is shorter.
 const ANONYMOUS_SECS: u64 = 60;

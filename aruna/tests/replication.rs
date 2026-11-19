@@ -4,8 +4,8 @@
 
 use crate::shared;
 
-use aruna_api::routes::credentials::CreatePathRestriction;
-use aruna_api::routes::groups::AddMemberRequest;
+use aruna_api::routes::access::credentials::CreatePathRestriction;
+use aruna_api::routes::access::groups::AddMemberRequest;
 use aruna_api::routes::info::{RealmInfoResponse, RealmQuotaConfig, RealmQuotaOverride};
 use aruna_api::routes::sync::{
     ApiReferenceHandling, ApiSyncMode, CreateSyncRequest, SyncDetailResponse,

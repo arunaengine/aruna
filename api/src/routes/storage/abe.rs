@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod content;
-mod records;
+pub(crate) mod records;
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -20,8 +20,6 @@ use axum::extract::{Query, State};
 use axum::{Extension, Json};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, StatusCode};
-pub(crate) use records::ScopeView;
-pub(crate) use records::{epoch_due, epoch_run, member_requests};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;

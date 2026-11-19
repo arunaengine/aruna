@@ -1529,7 +1529,7 @@ async fn copy_read_marked() {
     copy_rows(&members, 1, 2).await;
     let binding = members.nodes[0].bucket().await.distribution.unwrap();
     let snapshot = snapshot_of(&members.nodes[0].service, &binding).await;
-    let copy = super::Forward {
+    let copy = aruna_operations::s3::object::member_read::MemberTarget {
         set_id: binding.set_id,
         range_id: snapshot.config.ranges[1].range_id,
         node_id: members.nodes[2].node_id(),

@@ -5,6 +5,7 @@
 use aruna_api::auth::RealmAuth;
 use aruna_api::auth::ValidatedBearer;
 use aruna_api::error::ServerError;
+use aruna_api::metadata::model::*;
 use aruna_api::metadata::*;
 use aruna_api::routes::metadata::documents::*;
 use aruna_api::routes::metadata::rocrate::*;

@@ -5,7 +5,7 @@
 use super::{DeviceDraft, preview_draft};
 use crate::auth::OwnerAuth;
 use crate::error::ServerError;
-use crate::metadata::ProfilePreviewRequest;
+use crate::metadata::model::ProfilePreviewRequest;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
