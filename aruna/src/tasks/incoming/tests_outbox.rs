@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::harness::*;
+use super::support::*;
 use super::*;
 use crate::tasks::incoming::restore::start_task_queues;
 use aruna_clock::testing::poll_until;

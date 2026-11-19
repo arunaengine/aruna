@@ -8,6 +8,7 @@ use crate::topology;
 use aruna_core::structs::storage::format::Compression;
 use std::time::SystemTime;
 
+use crate::convergence::wait_for_convergence;
 use aruna::tasks::incoming::folder_pass::{reconcile_folder, reconcile_folders};
 use aruna_clock::testing::poll_until;
 use aruna_core::UserId;
@@ -52,7 +53,7 @@ use aruna_operations::staging::offered_directory::{
 };
 use aruna_operations::transfer::origin::ReadOriginOperation;
 use futures_util::StreamExt;
-use topology::{TestResult, Topology, wait_for_convergence, wait_until};
+use topology::{TestResult, Topology, wait_until};
 use ulid::Ulid;
 
 const MANAGEMENT_NODES: usize = 2;

@@ -29,10 +29,11 @@ use aruna_operations::sync::replicate_documents::{
 use aruna_operations::users::read_document::ReadUserOperation;
 use ulid::Ulid;
 
+use crate::convergence::wait_for_convergence;
 use aruna_operations::auth::bearer_token::TokenRevokedOperation;
 use topology::{
     TestNode, TestResult, Topology, read_group_auth, read_group_record, read_realm_auth,
-    read_realm_config, replicate_config, spawn_node, wait_for_convergence, write,
+    read_realm_config, replicate_config, spawn_node, write,
 };
 
 const MANAGEMENT_NODES: usize = 2;
