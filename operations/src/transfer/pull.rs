@@ -45,7 +45,7 @@ use crate::distribution::keep::{
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectResult};
-use crate::s3::object::read::HolderFailures;
+use crate::transfer::read::HolderFailures;
 use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use aruna_core::structs::storage::object_read::ResolvedObjectRange;
 

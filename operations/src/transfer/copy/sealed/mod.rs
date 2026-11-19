@@ -14,12 +14,12 @@ use crate::placement::policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::s3::abe_copies::{copy_row, still_active};
-use crate::s3::abe_rekey::RekeyProgress;
 use crate::s3::object::put::abe::{abe_reads, keyed, located_rows, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_published, publication_rows};
 use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
+use crate::transfer::abe_rekey::RekeyProgress;
 use aruna_core::UserId;
 use aruna_core::blob_records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,

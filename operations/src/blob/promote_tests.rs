@@ -690,8 +690,8 @@ fn claim_mismatch_unregistered() {
 pub(crate) mod received {
     use super::*;
     use crate::blob::unlocked::{DropReceivedOperation, PromoteUnlockedOperation};
-    use crate::s3::object::copy::sealed::{SealedCopyInput, SealedCopyOperation};
-    use crate::s3::object::copy::test::{seed_authority, seed_bucket};
+    use crate::transfer::copy::sealed::{SealedCopyInput, SealedCopyOperation};
+    use crate::transfer::copy::test::{seed_authority, seed_bucket};
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};

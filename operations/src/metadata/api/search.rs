@@ -14,7 +14,7 @@ use super::{
     SignedCursor, SystemTime, object_search_fingerprint, select_fanout_nodes,
 };
 use crate::metadata::search_cursor::blank_signature;
-use crate::s3::object::search_scan::changed_until;
+use crate::transfer::search_scan::changed_until;
 use aruna_core::cursor::OBJECT_CURSOR_CONTEXT;
 use aruna_core::structs::storage::distribution::search::IndexProgress;
 

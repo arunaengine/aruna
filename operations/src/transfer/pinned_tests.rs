@@ -232,7 +232,7 @@ fn purge() -> RefuseScopeOperation {
 
 fn view(keys: &[&str]) -> IoResult {
     let files = (keys.iter())
-        .map(|key| crate::s3::bucket::release::view::PinnedFile {
+        .map(|key| crate::transfer::release::view::PinnedFile {
             key: key.to_string(),
             version_id: Ulid::from_bytes([6; 16]),
             size: 1,

@@ -3,19 +3,33 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod abe_rekey;
+pub mod archive;
 pub mod balance;
+pub mod bucket_jobs;
+pub mod bucket_storage;
 pub mod change;
 pub mod charged_ranges;
+pub mod copy;
 pub mod create;
+pub mod discovery;
 pub mod feed_walks;
 pub mod forward;
+pub mod key_status;
 pub mod lifecycle;
+pub mod origin;
+pub mod part_copy;
+pub mod pinned;
 pub mod pull;
 pub(crate) mod purge_steps;
+pub mod read;
 mod refresh;
+pub mod release;
 pub mod replica_shares;
+pub(crate) mod search_scan;
 pub mod sharding;
 pub mod source_keep;
 pub mod status;
 pub mod status_view;
+pub mod sweeps;
 pub mod usage;

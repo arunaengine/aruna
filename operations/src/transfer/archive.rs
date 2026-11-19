@@ -40,7 +40,7 @@ use crate::s3::object::pages::{
     listing_path,
 };
 use crate::s3::object::range_list::{DelegatedCaller, MemberAccess};
-use crate::s3::object::read::GetRoutedOperation;
+use crate::transfer::read::GetRoutedOperation;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::request_policy::PolicyRequestExtras;
 

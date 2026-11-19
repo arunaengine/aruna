@@ -21,7 +21,7 @@ use thiserror::Error;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::peer_trust::is_sync_eligible;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
-use crate::s3::object::read::GetRoutedOperation;
+use crate::transfer::read::GetRoutedOperation;
 use aruna_core::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, decode_message, encode_message, metadata_request,
 };

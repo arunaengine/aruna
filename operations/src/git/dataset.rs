@@ -31,7 +31,7 @@ use super::{GitError, download, lfs, location, publish};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::s3::object::copy::{
+use crate::transfer::copy::{
     CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopyResultData,
     CopySourceConditions,
 };

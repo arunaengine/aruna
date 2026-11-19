@@ -59,13 +59,13 @@ use crate::s3::object::head_source::{
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use crate::s3::object::read::GetRoutedOperation;
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::s3::usage::QuotaGateError;
 use crate::staging::page::rows::MAX_PAGE_ENTRIES;
 use crate::staging::read_source::{
     ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
 };
+use crate::transfer::read::GetRoutedOperation;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;

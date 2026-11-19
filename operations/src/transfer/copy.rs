@@ -8,9 +8,6 @@ use crate::distribution::held::record_only;
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::s3::fence_store::FenceCheckOperation;
-use crate::s3::object::copy::sealed::{
-    SealedCopyError, SealedCopyInput, SealedCopyOperation, SealedCopyResult,
-};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, reference_archive};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -18,11 +15,14 @@ use crate::s3::object::head::{
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use crate::s3::object::read::{ReadSourceOperation, TokenRead};
 use crate::s3::object::reference::{
     MaterializeReferenceError, ReferenceWrite, WriteReferenceOperation,
 };
 use crate::s3::purge_fence::PurgeFenceError;
+use crate::transfer::copy::sealed::{
+    SealedCopyError, SealedCopyInput, SealedCopyOperation, SealedCopyResult,
+};
+use crate::transfer::read::{ReadSourceOperation, TokenRead};
 use aruna_core::UserId;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};

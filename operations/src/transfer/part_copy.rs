@@ -10,12 +10,12 @@ use crate::s3::fence_store::FenceCheckOperation;
 use crate::s3::multipart::part_upload::{
     UploadPartError, UploadPartInput, UploadPartOperation, UploadPartResult,
 };
-use crate::s3::object::copy::{
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
+use crate::s3::purge_fence::PurgeFenceError;
+use crate::transfer::copy::{
     CopySourceConditions, evaluate_source_conditions, source_etag, source_modified,
 };
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
-use crate::s3::object::read::{ReadSourceOperation, TokenRead};
-use crate::s3::purge_fence::PurgeFenceError;
+use crate::transfer::read::{ReadSourceOperation, TokenRead};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};

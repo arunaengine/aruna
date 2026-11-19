@@ -52,12 +52,12 @@ use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperat
 use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::update_document::UpdateDocumentError;
-use crate::s3::bucket::release::BucketScope;
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation, BulkDeleteOutcome,
 };
-use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
+use crate::transfer::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
+use crate::transfer::release::BucketScope;
 use aruna_core::errors::StorageReadError;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};

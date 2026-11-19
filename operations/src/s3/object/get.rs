@@ -1907,7 +1907,7 @@ pub(crate) fn reference_archive(key: BucketKeyRef) -> ArchiveKey {
     ArchiveKey::new(key.bucket_id, BackendRef::node_default())
 }
 
-pub(super) fn locked(error: BucketKeyError) -> GetObjectError {
+pub(crate) fn locked(error: BucketKeyError) -> GetObjectError {
     GetObjectError::ConversionError(ConversionError::BucketKey(error))
 }
 

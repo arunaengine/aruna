@@ -34,7 +34,6 @@ use aruna_core::types::{Key, Value};
 use bytes::Bytes;
 use tracing::warn;
 
-use super::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, locked};
 use crate::abe::envelope::EnvelopeOperation;
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::blob::promote::{PromoteError, PromotePendingOperation, Promotion};
@@ -43,6 +42,9 @@ use crate::distribution::held::{HeldElsewhere, PullRequest};
 use crate::distribution::source_plan::SourceKeep;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
+use crate::s3::object::get::{
+    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, locked,
+};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
@@ -795,7 +797,7 @@ impl Operation for ReadObjectOperation {
 
 /// Promotes a pending archive under a read lease, as an unlock would.
 #[derive(Debug, PartialEq)]
-pub(super) struct PromoteLeasedOperation {
+pub(crate) struct PromoteLeasedOperation {
     origin: (RealmId, NodeId),
     archive: ArchiveKey,
     lease: Option<ReadLease>,
@@ -805,7 +807,7 @@ pub(super) struct PromoteLeasedOperation {
 }
 
 impl PromoteLeasedOperation {
-    pub(super) fn new(
+    pub(crate) fn new(
         origin: (RealmId, NodeId),
         archive: ArchiveKey,
         lease: ReadLease,
@@ -961,15 +963,15 @@ impl Operation for ObjectInfoOperation {
 /// One holder-backed read: the local version facts plus the caller's scoped
 /// credential, so the routed result is never less constrained than the record.
 #[derive(Debug, PartialEq)]
-pub(super) struct RoutedRead {
-    pub(super) user_id: UserId,
-    pub(super) realm_id: RealmId,
-    pub(super) blake3: [u8; 32],
-    pub(super) version_id: Option<Ulid>,
-    pub(super) metadata: HashMap<String, String>,
-    pub(super) version_created_at: Option<SystemTime>,
-    pub(super) source_policies: Vec<PlacementPolicyRef>,
-    pub(super) restrictions: Option<Vec<PathRestriction>>,
+pub(crate) struct RoutedRead {
+    pub(crate) user_id: UserId,
+    pub(crate) realm_id: RealmId,
+    pub(crate) blake3: [u8; 32],
+    pub(crate) version_id: Option<Ulid>,
+    pub(crate) metadata: HashMap<String, String>,
+    pub(crate) version_created_at: Option<SystemTime>,
+    pub(crate) source_policies: Vec<PlacementPolicyRef>,
+    pub(crate) restrictions: Option<Vec<PathRestriction>>,
 }
 
 /// How the consulted holders failed, folded so the final answer keeps the most
@@ -990,7 +992,7 @@ pub(crate) struct HolderFailures {
 }
 
 impl HolderFailures {
-    pub(super) fn record(&mut self, error: BaoReadError) {
+    pub(crate) fn record(&mut self, error: BaoReadError) {
         self.contacted = true;
         match error {
             BaoReadError::Refused(BaoReadRefusal::NotFound) => {}
@@ -1237,7 +1239,7 @@ fn routed_result(
     }
 }
 
-pub(super) fn routed_info(
+pub(crate) fn routed_info(
     read: &RoutedRead,
     size: u64,
     etag: Option<String>,

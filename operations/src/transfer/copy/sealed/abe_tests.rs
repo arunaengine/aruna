@@ -9,8 +9,8 @@ use crate::document_repository::GetConfigError;
 use crate::s3::abe_copies::{
     CompleteCopiesError, CompleteCopiesOperation, CopyEnvelopeOperation, CopyOutcome, copy_row,
 };
-use crate::s3::abe_rekey::{PageEnd, PageScope, RekeyPage};
 use crate::s3::object::put::abe::located_rows;
+use crate::transfer::abe_rekey::{PageEnd, PageScope, RekeyPage};
 use aruna_core::calls::CallRun;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::compute::SecretBytes;

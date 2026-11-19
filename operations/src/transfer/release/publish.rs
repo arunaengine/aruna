@@ -52,10 +52,10 @@ use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::object::list::{
     ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
 };
-use crate::s3::object::origin::{OriginError, OriginView, ReadOriginOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use crate::transfer::origin::{OriginError, OriginView, ReadOriginOperation};
 use crate::transfer::status::read_view;
 use crate::transfer::status_view::StatusError;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};

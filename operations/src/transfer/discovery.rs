@@ -2,11 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::shared::{
-    Claim, PathIntents, PathIntentsOperation, ReadSharedOperation, SharedRule, TakenPathsOperation,
-    claim_file,
-};
-use super::{ImportRuleError, ReadEarlierOperation, validate_folder};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::{BucketAccess, BucketAccessOperation};
 use crate::blob::migration::misplaced::{
@@ -16,6 +11,11 @@ use crate::blob::migration::shared::MigrationError;
 use crate::blob::request::BlobRequest;
 use crate::groups::backends::query::{GetBackendOperation, GroupQueryError};
 use crate::groups::fence::group_fence_key;
+use crate::s3::imports::shared::{
+    Claim, PathIntents, PathIntentsOperation, ReadSharedOperation, SharedRule, TakenPathsOperation,
+    claim_file,
+};
+use crate::s3::imports::{ImportRuleError, ReadEarlierOperation, validate_folder};
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::BlobEffect;
@@ -106,7 +106,7 @@ pub fn check_rules(rules: &[DiscoveryRule]) -> Result<(), ImportRuleError> {
         let nested = rules.iter().enumerate().find(|(other, them)| {
             *other != index
                 && rule.storage_folder().is_some()
-                && super::folders_overlap(&rule.folder, &them.folder)
+                && crate::s3::imports::folders_overlap(&rule.folder, &them.folder)
         });
         if let Some((_, them)) = nested {
             return Err(ImportRuleError::Invalid(format!(

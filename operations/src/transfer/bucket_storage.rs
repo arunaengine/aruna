@@ -4,11 +4,11 @@
 
 use crate::groups::backends::query::{GetBackendOperation, GroupQueryError};
 use crate::groups::storage_routing::{GroupInputsError, GroupInputsOperation};
-use crate::s3::bucket::bucket_jobs::{ActiveJob, ActiveJobError, ActiveJobOperation};
 use crate::s3::bucket::list::{
     ListBucketsError, ListBucketsInput, ListBucketsOperation, ListBucketsResult,
 };
 use crate::s3::imports::{ImportRuleError, ListImportsOperation};
+use crate::transfer::bucket_jobs::{ActiveJob, ActiveJobError, ActiveJobOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;

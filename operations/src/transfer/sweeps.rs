@@ -20,7 +20,7 @@ use crate::s3::bucket::holders::{LookupError, LookupKeysOperation, Lookups};
 use crate::s3::bucket::key::recovery::{
     RecoveryInput, RecoveryNoticeError, RecoveryNoticeOperation,
 };
-use crate::s3::key_status::{KeySnapshot, KeyStatusError, KeyStatusOperation};
+use crate::transfer::key_status::{KeySnapshot, KeyStatusError, KeyStatusOperation};
 
 /// Encryption rows one sweep page reads.
 const SWEEP_PAGE: usize = 1_000;

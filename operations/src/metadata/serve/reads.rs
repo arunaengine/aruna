@@ -27,10 +27,10 @@ use crate::metadata::read_peer::{PeerReader, ReadPeerOperation, SearchPeerOperat
 use crate::metadata::search_cursor::MAX_PAGINATION_DEPTH;
 use crate::metadata::text_search::LocalSearchOperation;
 use crate::s3::bucket::local_search::LocalBucketSearch;
-use crate::s3::bucket::release::publish::{HolderAnswerOperation, PublishError};
 use crate::s3::bucket::search::{SearchBucketsError, SearchBucketsInput};
 use crate::s3::object::search::{SearchObjectsError, SearchObjectsInput};
-use crate::s3::object::search_scan::SearchObjectsOperation;
+use crate::transfer::release::publish::{HolderAnswerOperation, PublishError};
+use crate::transfer::search_scan::SearchObjectsOperation;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::metadata::api::{
     IdentifierMatch, LinkNodePage, ReferenceNodeExecution, ReferenceNodeRequest, SetPreviewPage,
