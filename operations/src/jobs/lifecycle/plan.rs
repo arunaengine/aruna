@@ -31,7 +31,7 @@ use ulid::Ulid;
 use super::advertised::{Advertised, AdvertisementsOperation};
 use super::ids;
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::enforcement::{policy_reads, read_policies};
+use crate::auth::enforcement::{PolicyEvaluator, compiled_policies, policy_reads, read_policies};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::placement::policy::{PolicySetError, PolicySetResolver, Resolutions, ResolveMode};
@@ -85,6 +85,7 @@ enum PlanStep {
     Holders(usize),
     Policies,
     PolicyRows,
+    PolicyCompile,
     Grant(NodeId),
 }
 
@@ -173,10 +174,24 @@ impl BuildPlanOperation {
         Ok(Next::Call(IoCall::Read(rows)))
     }
 
-    /// Evaluates the request policies for every candidate node; missing state fails closed.
-    fn judge_policies(&mut self, values: Vec<Option<Value>>) {
+    /// Compiles the group's request policy sets; missing state fails every node closed.
+    fn compile_policies(&mut self, values: Vec<Option<Value>>) -> PlanNext {
         let spec = &self.round.spec;
-        let evaluator = read_policies(spec.realm_id, Some(spec.group_id), values).ok();
+        match read_policies(spec.realm_id, Some(spec.group_id), values) {
+            Ok(sets) => {
+                self.step = PlanStep::PolicyCompile;
+                Ok(Next::Call(sets.compile()))
+            }
+            Err(_) => {
+                self.judge_policies(None);
+                self.grant()
+            }
+        }
+    }
+
+    /// Evaluates the request policies for every candidate node; missing state fails closed.
+    fn judge_policies(&mut self, evaluator: Option<PolicyEvaluator>) {
+        let spec = &self.round.spec;
         for node in &self.targets {
             let allows = evaluator.as_ref().is_some_and(|evaluator| {
                 let check = write_check(spec, *node);
@@ -273,9 +288,9 @@ impl Operation for BuildPlanOperation {
                 });
                 self.targets()
             }
-            PlanStep::PolicyRows => {
-                let values = row_values(result)?;
-                self.judge_policies(values);
+            PlanStep::PolicyRows => self.compile_policies(row_values(result)?),
+            PlanStep::PolicyCompile => {
+                self.judge_policies(compiled_policies(result).ok());
                 self.grant()
             }
             PlanStep::Grant(node) => {

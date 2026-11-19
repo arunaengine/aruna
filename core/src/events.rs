@@ -482,6 +482,8 @@ pub enum StorageEvent {
     RealmOpened {
         result: Result<SecretBytes, crate::realm_vault::RealmVaultError>,
     },
+    /// The compiled policy sets, in the order the effect named them.
+    PoliciesCompiled(crate::request_policy::CompiledSets),
 }
 
 #[derive(Debug, PartialEq)]
@@ -1048,6 +1050,7 @@ impl Event {
                     VaultResult,
                     Error,
                     RealmOpened,
+                    PoliciesCompiled,
                 }
             ),
             Event::Net(event) => variant_label!(

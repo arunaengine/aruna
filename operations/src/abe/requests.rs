@@ -257,7 +257,7 @@ impl KeyOperation {
                         .map(|k| (k.record_id, k.public_key, k.fingerprint)),
                 };
                 KeyRequest {
-                    request_id: Ulid::generate(),
+                    request_id: self.ids.mint(self.now),
                     requesting_user: self.recipient(),
                     recipient_user: self.recipient(),
                     recipient_record: key.map(|k| k.0),
@@ -455,7 +455,7 @@ impl KeyOperation {
     }
     /// Scans the recipient's grants again for the next batch of `request`'s scope.
     pub(super) fn next_batch(&mut self, mut request: KeyRequest) -> KeyTurn {
-        request.request_id = Ulid::generate();
+        request.request_id = self.ids.mint(self.now);
         request.created_at_ms = self.now;
         let prefix = request.prefix();
         self.request = Some(request);

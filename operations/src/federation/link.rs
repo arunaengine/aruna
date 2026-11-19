@@ -499,6 +499,7 @@ mod tests {
             nonce,
             None,
             now,
+            ulid::Ulid::from_bytes([7; 16]),
         );
         let home = NodeCapabilities::management_node(home_key()).unwrap();
         Signed::sign(payload.unwrap(), &home).unwrap()

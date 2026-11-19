@@ -203,8 +203,9 @@ impl Operation for ReadAccessOperation {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::auth::enforcement::{policy_reads, read_policies};
+    use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
     use crate::auth::permission_rules::CollectedRole;
+    use crate::tests::calls::compiled;
     use aruna_core::UserId;
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -247,7 +248,8 @@ pub(crate) mod tests {
         (records.iter())
             .map(|record| {
                 let rows = policy_rows(record.group_id);
-                let evaluator = read_policies(realm(), Some(record.group_id), rows).unwrap();
+                let sets = read_policies(realm(), Some(record.group_id), rows).unwrap();
+                let evaluator = compiled_policies(compiled(sets.compile())).unwrap();
                 ((record.realm_id, record.group_id), evaluator)
             })
             .collect()

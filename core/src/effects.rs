@@ -737,6 +737,9 @@ pub enum StorageEffect {
     },
     /// Opens a secret sealed to the realm keys. Only a node that holds them answers with it.
     RealmOpen(Box<crate::realm_vault::RealmSealed>),
+    /// Compiles each request policy set, a set of the same content once. Answers
+    /// `PoliciesCompiled` in the same order.
+    CompilePolicies(Vec<Vec<crate::request_policy::RequestPolicy>>),
 }
 
 impl StorageEffect {

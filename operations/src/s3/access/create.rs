@@ -10,6 +10,7 @@ use aruna_core::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError,
 };
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ACCESS_OWNER_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
@@ -113,6 +114,8 @@ pub struct CreateUserOperation {
     pages: Option<PrefixPages>,
     /// The administrator who issues this credential for another account, audited with it.
     issuer: Option<UserId>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 /// The encrypted buckets a new credential reads with its token, and the audit rows of each.
@@ -191,6 +194,8 @@ impl CreateUserOperation {
             stale: Vec::new(),
             pages: None,
             issuer: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -405,7 +410,9 @@ impl CreateUserOperation {
         ];
         if let Some(actor) = self.issuer {
             let action = AdminAuditAction::ServiceCredentialIssued;
-            let mut audit = AdminAuditRecord::new(action, actor, self.config.user_identity);
+            let audit_id = self.ids.mint(self.now_ms);
+            let mut audit =
+                AdminAuditRecord::new(audit_id, action, actor, self.config.user_identity);
             audit.group_id = Some(self.config.group_id);
             audit.session_id = Some(access.access_key.clone());
             writes.extend(audit.entries()?);
@@ -429,6 +436,14 @@ impl CreateUserOperation {
 impl Operation for CreateUserOperation {
     type Output = (String, Secret, UserAccess);
     type Error = CreateUserError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> CreateTurn {
         self.prepare()?;

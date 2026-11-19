@@ -822,7 +822,12 @@ pub async fn resolve(
             version: kept.version,
             install_id: served.install_id,
         }),
-        ..AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, actor, target)
+        ..AdminAuditRecord::new(
+            Ulid::generate(),
+            AdminAuditAction::PluginRunResolved,
+            actor,
+            target,
+        )
     };
     let ids = (served.install_id, run_id);
     let resolve = resolve_run(ids, parsed.done, &audit, unix_timestamp_millis());
@@ -856,7 +861,7 @@ async fn run_audit(
             version: kept.version,
             install_id: served.install_id,
         }),
-        ..AdminAuditRecord::new(action, actor, target)
+        ..AdminAuditRecord::new(Ulid::generate(), action, actor, target)
     })
 }
 

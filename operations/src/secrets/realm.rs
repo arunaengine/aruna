@@ -84,6 +84,8 @@ pub struct RealmSecretOperation {
     stage: Stage,
     notices: bool,
     result: Option<Option<SecretRecord>>,
+    /// The run's random value; it varies the nonce of each sealed value.
+    entropy: u128,
 }
 
 impl RealmSecretOperation {
@@ -93,6 +95,7 @@ impl RealmSecretOperation {
             stage: Stage::Read,
             notices: false,
             result: None,
+            entropy: 0,
         }
     }
 
@@ -135,9 +138,9 @@ impl RealmSecretOperation {
             let realm_id = self.input.actor.realm_id;
             let sealed = (self.input.vault_key).seal(
                 &realm_id,
-                reference.entry,
-                reference.revision,
+                (reference.entry, reference.revision),
                 &fields.encode()?,
+                self.entropy,
             )?;
             operations.push(AdminDocumentOperation::ConfigVaultSet {
                 entry: reference.entry,
@@ -255,6 +258,10 @@ impl RealmSecretOperation {
 impl Operation for RealmSecretOperation {
     type Output = Option<SecretRecord>;
     type Error = RealmSecretError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.entropy = entropy;
+    }
 
     fn first(&mut self) -> Result<Next<Self::Output>, RealmSecretError> {
         let document = self.document();

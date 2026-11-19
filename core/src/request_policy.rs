@@ -8,6 +8,7 @@
 use cel_interpreter::{Context, Program, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use ulid::Ulid;
 
 /// Maximum number of policies one scope may carry.
@@ -299,6 +300,28 @@ impl CompiledPolicy {
             name: self.name.clone(),
             reason,
         }
+    }
+}
+
+/// Compiled policy sets in the order they were asked for, shared by content through a cache.
+#[derive(Clone)]
+pub struct CompiledSets(pub Vec<Result<Arc<CompiledPolicySet>, PolicyCompileError>>);
+
+impl std::fmt::Debug for CompiledSets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CompiledSets").field(&self.0.len()).finish()
+    }
+}
+
+/// Sets of the same content come from one cache entry, so equal sets are one `Arc`.
+impl PartialEq for CompiledSets {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && (self.0.iter().zip(&other.0)).all(|pair| match pair {
+                (Ok(left), Ok(right)) => Arc::ptr_eq(left, right),
+                (Err(left), Err(right)) => left == right,
+                _ => false,
+            })
     }
 }
 

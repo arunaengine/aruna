@@ -1275,8 +1275,12 @@ mod pure_tests {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let original = stored_user(user_id);
-        let mut record =
-            AdminAuditRecord::new(AdminAuditAction::AccountDeactivated, user_id, user_id);
+        let mut record = AdminAuditRecord::new(
+            Ulid::from_parts(1, 1),
+            AdminAuditAction::AccountDeactivated,
+            user_id,
+            user_id,
+        );
         record.group_id = Some(Ulid::from_bytes([4u8; 16]));
         let mut operation = write(input(realm_id, user_id, user_id));
         operation.audit = Some(record.clone());
