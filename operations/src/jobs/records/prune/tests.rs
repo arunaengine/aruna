@@ -98,7 +98,7 @@ fn tombstone_pages_bodies() {
     let stored = Some(Value::from(to_bytes(&tombstone).unwrap().as_slice()));
     let mut prune = PruneFamilyOperation::new(family(), 7, None);
     prune.first().unwrap();
-    let pages = IoCall::child(super::super::prune_pages::PrunePagesOperation::new(family()));
+    let pages = IoCall::child(super::pages::PrunePagesOperation::new(family()));
     let read = prune.next(IoResult::Values(vec![slot(7), stored]));
     assert_eq!(read, Ok(Next::Call(pages)));
     // Without own input pages left the body pages follow.

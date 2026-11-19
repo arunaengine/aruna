@@ -16,8 +16,8 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::types::Key;
 
-use super::pages::{page_key, stored_page};
-use super::prune::{FAMILY_PRUNE_PAGE, PruneError};
+use super::{FAMILY_PRUNE_PAGE, PruneError};
+use crate::jobs::records::pages::{page_key, stored_page};
 
 /// One chain of pages being walked, and whether the pruned family names it.
 #[derive(Debug, PartialEq)]

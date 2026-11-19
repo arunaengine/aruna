@@ -16,10 +16,8 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 
-use super::prune::{
-    FAMILY_PRUNE_PAGE, FamilyPruneOutcome, PruneCommitOperation, PruneError, PruneStep,
-};
-use super::prune_family::PruneFamilyOperation;
+use super::family::PruneFamilyOperation;
+use super::{FAMILY_PRUNE_PAGE, FamilyPruneOutcome, PruneCommitOperation, PruneError, PruneStep};
 
 /// Works through the due rows of the family prune index at the run's time.
 #[derive(Debug, PartialEq)]
