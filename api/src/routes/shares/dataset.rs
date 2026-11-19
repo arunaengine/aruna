@@ -236,7 +236,11 @@ async fn local_parts(
                 let deadline = Instant::now() + RESOLVE_TIMEOUT;
                 let resolved = resolved(
                     drive_until(
-                        resolve_version(state.get_ctx().node_and_realm(), *version_id, deadline),
+                        resolve_version(
+                            state.get_ctx().node_and_realm(),
+                            *version_id,
+                            RESOLVE_TIMEOUT,
+                        ),
                         &state.get_ctx(),
                         deadline,
                     )
@@ -302,7 +306,7 @@ async fn member_content(
     let deadline = Instant::now() + RESOLVE_TIMEOUT;
     let found = content_resolved(
         drive_until(
-            resolve_content(state.get_ctx().node_and_realm(), hash, deadline),
+            resolve_content(state.get_ctx().node_and_realm(), hash, RESOLVE_TIMEOUT),
             &state.get_ctx(),
             deadline,
         )

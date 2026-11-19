@@ -8,6 +8,7 @@
 
 use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -26,7 +27,6 @@ use aruna_core::structs::storage::distribution::{
 };
 use aruna_core::types::Key;
 use thiserror::Error;
-use tokio::time::Instant;
 use ulid::Ulid;
 
 use crate::distribution::counts::MAX_SETS;
@@ -41,7 +41,7 @@ pub const MAX_PROBES: usize = 16;
 /// At most this many versions of one content identity are read from one index or returned.
 pub const MAX_CONTENT_VERSIONS: usize = 16;
 /// How long resolving one id inside a longer request may take.
-pub const RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+pub const RESOLVE_BUDGET: Duration = Duration::from_secs(5);
 
 /// Set records one page reads.
 const SET_PAGE: usize = 256;
@@ -403,7 +403,9 @@ struct AskSetOperation {
     snapshot: DistributionSnapshot,
     version_id: Ulid,
     probes: usize,
-    deadline: Option<Instant>,
+    /// Runner time in milliseconds after which no further member is asked.
+    deadline_ms: Option<u64>,
+    now_ms: u64,
     step: AskStep,
     local_proves: bool,
     complete: bool,
@@ -418,14 +420,15 @@ impl AskSetOperation {
         ids: NodeRealm,
         snapshot: DistributionSnapshot,
         version_id: Ulid,
-        (probes, deadline): (usize, Option<Instant>),
+        (probes, deadline_ms): (usize, Option<u64>),
     ) -> Self {
         Self {
             ids,
             snapshot,
             version_id,
             probes,
-            deadline,
+            deadline_ms,
+            now_ms: 0,
             step: AskStep::Bound,
             local_proves: false,
             complete: true,
@@ -468,9 +471,7 @@ impl AskSetOperation {
         let Some((_, realm_id)) = self.ids else {
             return self.answer(SetAnswer::Unknown);
         };
-        let late = self
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline);
+        let late = (self.deadline_ms).is_some_and(|deadline| self.now_ms >= deadline);
         if self.probes >= MAX_PROBES || late {
             return self.answer(SetAnswer::Unknown);
         }
@@ -520,6 +521,15 @@ impl Operation for AskSetOperation {
             },
         }
     }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+}
+
+/// The runner time `within` after `now_ms`.
+fn deadline_after(now_ms: u64, within: Duration) -> u64 {
+    now_ms.saturating_add(u64::try_from(within.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Resolves a version id within its deadline; the caller runs it with the same deadline, so a
@@ -528,7 +538,10 @@ impl Operation for AskSetOperation {
 pub struct ResolveVersionOperation {
     ids: NodeRealm,
     version_id: Ulid,
-    deadline: Option<Instant>,
+    /// How long the run may ask members, counted from its start.
+    within: Option<Duration>,
+    deadline_ms: Option<u64>,
+    now_ms: u64,
     candidates: VecDeque<DistributionSnapshot>,
     current: Option<DistributionSnapshot>,
     probes: usize,
@@ -536,13 +549,13 @@ pub struct ResolveVersionOperation {
     complete: bool,
 }
 
-/// The resolution of `version_id` by `deadline`; see [`ResolveVersionOperation`].
+/// The resolution of `version_id` within `within`; see [`ResolveVersionOperation`].
 pub fn resolve_version(
     ids: NodeRealm,
     version_id: Ulid,
-    deadline: Instant,
+    within: Duration,
 ) -> ResolveVersionOperation {
-    ResolveVersionOperation::new(ids, version_id, Some(deadline))
+    ResolveVersionOperation::new(ids, version_id, Some(within))
 }
 
 /// The resolution of `version_id` for a caller whose own group deadline bounds the run.
@@ -566,11 +579,13 @@ pub fn version_found(run: Result<GlobalResolution, IoError>) -> Option<ResolvedV
 type Resolving = Result<Next<GlobalResolution>, IoError>;
 
 impl ResolveVersionOperation {
-    pub(crate) fn new(ids: NodeRealm, version_id: Ulid, deadline: Option<Instant>) -> Self {
+    pub(crate) fn new(ids: NodeRealm, version_id: Ulid, within: Option<Duration>) -> Self {
         Self {
             ids,
             version_id,
-            deadline,
+            within,
+            deadline_ms: None,
+            now_ms: 0,
             candidates: VecDeque::new(),
             current: None,
             probes: 0,
@@ -587,7 +602,7 @@ impl ResolveVersionOperation {
                 (None, false) => GlobalResolution::Unavailable,
             }));
         };
-        let budget = (self.probes, self.deadline);
+        let budget = (self.probes, self.deadline_ms);
         let ask = AskSetOperation::new(self.ids, snapshot.clone(), self.version_id, budget);
         self.current = Some(snapshot);
         Ok(Next::Call(IoCall::child(ask)))
@@ -599,6 +614,7 @@ impl Operation for ResolveVersionOperation {
     type Error = IoError;
 
     fn first(&mut self) -> Resolving {
+        self.deadline_ms = (self.within).map(|within| deadline_after(self.now_ms, within));
         let hint = SetHint::of_version(self.version_id);
         let scan = ScanSetsOperation::new(SetFilter::Hinted(hint), MAX_CANDIDATES);
         Ok(Next::Call(IoCall::child(scan)))
@@ -637,6 +653,10 @@ impl Operation for ResolveVersionOperation {
             SetAnswer::Unknown => self.complete = false,
         }
         self.next_set()
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
 
@@ -782,7 +802,10 @@ enum ContentStep {
 pub struct ResolveContentOperation {
     ids: NodeRealm,
     identity: [u8; 32],
-    deadline: Instant,
+    /// How long the run may ask members, counted from its start.
+    within: Duration,
+    deadline_ms: u64,
+    now_ms: u64,
     step: ContentStep,
     sets: VecDeque<DistributionSnapshot>,
     current: Option<DistributionSnapshot>,
@@ -792,16 +815,18 @@ pub struct ResolveContentOperation {
     resolution: ContentResolution,
 }
 
-/// The resolution of a content identity by `deadline`; see [`ResolveContentOperation`].
+/// The resolution of a content identity within `within`; see [`ResolveContentOperation`].
 pub fn resolve_content(
     ids: NodeRealm,
     identity: [u8; 32],
-    deadline: Instant,
+    within: Duration,
 ) -> ResolveContentOperation {
     ResolveContentOperation {
         ids,
         identity,
-        deadline,
+        within,
+        deadline_ms: 0,
+        now_ms: 0,
         step: ContentStep::Sets,
         sets: VecDeque::new(),
         current: None,
@@ -867,7 +892,7 @@ impl ResolveContentOperation {
                 return self.next_group(local);
             }
         };
-        if self.probes >= MAX_PROBES || Instant::now() >= self.deadline {
+        if self.probes >= MAX_PROBES || self.now_ms >= self.deadline_ms {
             self.resolution.incomplete = true;
             return self.done();
         }
@@ -889,6 +914,7 @@ impl Operation for ResolveContentOperation {
     type Error = IoError;
 
     fn first(&mut self) -> ResolvingContent {
+        self.deadline_ms = deadline_after(self.now_ms, self.within);
         let scan = ScanSetsOperation::new(SetFilter::All, MAX_SETS);
         Ok(Next::Call(IoCall::child(scan)))
     }
@@ -952,6 +978,10 @@ impl Operation for ResolveContentOperation {
                 self.next_probe(self.local()?)
             }
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 }
 
