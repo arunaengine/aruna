@@ -658,9 +658,8 @@ mod outbox_pass {
     }
 
     #[test]
-    fn only_local_holds() {
-        let local = pass(OutboxRoute::Local).hold_scope();
-        assert_eq!(local, Some(HoldScope::PluginAdmissions));
+    fn outbox_holds_nothing() {
+        assert_eq!(pass(OutboxRoute::Local).hold_scope(), None);
         assert_eq!(pass(OutboxRoute::Remote).hold_scope(), None);
     }
 

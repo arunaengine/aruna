@@ -437,10 +437,6 @@ impl Operation for NotifyDue {
     type Output = usize;
     type Error = RunError;
 
-    fn hold_scope(&self) -> Option<HoldScope> {
-        Some(HoldScope::PluginAdmissions)
-    }
-
     fn first(&mut self) -> Result<Next<usize>, RunError> {
         let due = self.due.take().ok_or(IoError::Unfinished)?;
         Ok(Next::Call(IoCall::child(due)))

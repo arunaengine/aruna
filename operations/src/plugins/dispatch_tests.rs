@@ -14,7 +14,7 @@ use crate::plugins::runs::{TimerRow, list_runs, read_run};
 use crate::plugins::test_support::installed;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_RUNS_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugin_runs::SourceKind;
 use aruna_core::plugin_runs::{RUNS_QUEUED, timer_key};
 
@@ -257,12 +257,17 @@ mod operations {
     #[test]
     fn start_queues_run() {
         let mut run = start("{}", 3);
-        assert_eq!(run.hold_scope(), Some(HoldScope::PluginAdmissions));
+        // Only the admission holds; a parent holding too would wait for itself.
+        assert_eq!(run.hold_scope(), None);
         assert!(is_child(&checked(&mut run)));
         let Ok(Next::Done(queued)) = run.next(child_result(Ok::<(), RunError>(()))) else {
             panic!("the admission ends the start");
         };
         assert_eq!(queued.install_id, fixtures::install().install_id);
+        assert_eq!(
+            admit(queued).hold_scope(),
+            Some(HoldScope::PluginAdmissions)
+        );
     }
 
     #[test]
@@ -279,7 +284,9 @@ mod operations {
         let every = json!({ "triggers": { "every": { "interval": "1h" } } });
         let config = fixtures::config(&fixtures::install(), every);
         let mut timers = EnqueueTimers::new(&config, fixtures::node(3), 5_000);
-        assert_eq!(timers.hold_scope(), Some(HoldScope::PluginAdmissions));
+        assert_eq!(timers.hold_scope(), None);
+        let timer = enqueue_timer(&fixtures::install(), "every".to_string(), HOUR, 5_000);
+        assert_eq!(timer.hold_scope(), Some(HoldScope::PluginAdmissions));
         assert!(is_child(&timers.first()));
         let queued = child_result(Ok::<bool, StoreError>(true));
         assert_eq!(timers.next(queued), Ok(Next::Done(1)));
