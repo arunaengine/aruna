@@ -51,6 +51,7 @@ use aruna_core::structs::storage::abe::{AbeEffect, AbeError};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey,
+    strong_validator,
 };
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::encryption::{
@@ -1968,9 +1969,3 @@ pub(super) fn locked(error: BucketKeyError) -> GetObjectError {
 #[cfg(test)]
 #[path = "get_tests.rs"]
 mod test;
-
-/// Whether an ETag can bind a read through `If-Match`: present and not weak.
-pub(crate) fn strong_validator(etag: Option<&str>) -> bool {
-    etag.map(str::trim)
-        .is_some_and(|etag| !etag.is_empty() && !etag.starts_with("W/"))
-}

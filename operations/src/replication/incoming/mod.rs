@@ -11,7 +11,6 @@ use crate::placement::policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::error::ReplicationError;
-use crate::replication::queue::schedule_blob_drain;
 use crate::s3::abe_copies::copy_row;
 use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::object::put::abe::{abe_reads, keyed, located_rows, parse_abe};
@@ -73,9 +72,9 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
 };
-use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::replication_queue::live_obligation_entry;
+use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, schedule_blob_drain};
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
 };

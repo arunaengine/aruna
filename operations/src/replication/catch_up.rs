@@ -29,12 +29,13 @@ use super::bootstrap::{
     ReadCursorOperation,
 };
 use super::members::{ReadRecordOperation, RecordError};
-use super::queue::{BlobQueueError, schedule_blob_drain};
+use super::queue::BlobQueueError;
 use crate::distribution::lifecycle::SettleMarkerOperation;
 use crate::distribution::purge_steps::PurgeError;
 use crate::distribution::submit::SubmitOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::storage::distribution::request::PublishRefusal;
+use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
 
 /// Sets and pages one drain works on at most.
 const SET_BATCH: usize = 16;
