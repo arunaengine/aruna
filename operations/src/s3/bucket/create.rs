@@ -250,7 +250,7 @@ impl CreateBucketOperation {
         )
         .in_bucket(&self.bucket, RowChange::Kept);
         self.state = CreateBucketState::UpdateUsage;
-        let call = update.start_calls().into_call();
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.usage_update = Some(update);
         Ok(Next::Call(call))
     }

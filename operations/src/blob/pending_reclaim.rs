@@ -132,7 +132,7 @@ impl ReclaimPendingOperation {
         };
         let mut update = UsageCounterUpdate::for_stored(stored);
         self.state = State::UpdateUsage;
-        let call = update.start_calls().into_call();
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.usage = Some(update);
         Ok(Next::Call(call))
     }

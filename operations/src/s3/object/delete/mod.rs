@@ -819,7 +819,7 @@ impl DeleteObjectOperation {
         if update.is_noop() {
             return self.write_delete_audit();
         }
-        let call = update.start_calls().into_call();
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.usage_update = Some(update);
         self.call(DeleteObjectState::UpdateUsage, call)
     }

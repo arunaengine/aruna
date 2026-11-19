@@ -5,6 +5,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BlobVersion;
@@ -43,6 +44,8 @@ type Step = Result<Next<PageAnswer>, PageError>;
 /// scheduled after the commit.
 #[derive(Debug, PartialEq)]
 pub struct PageApplyOperation {
+    now_ms: u64,
+    ids: IdMint,
     input: ApplyInput,
     state: ApplyState,
     items: Vec<PageItem>,
@@ -55,6 +58,8 @@ pub struct PageApplyOperation {
 impl PageApplyOperation {
     pub fn new(input: ApplyInput) -> Self {
         Self {
+            now_ms: 0,
+            ids: IdMint::default(),
             input,
             state: ApplyState::ReadGuards,
             items: Vec::new(),
@@ -77,7 +82,7 @@ impl PageApplyOperation {
     fn write_rows(&mut self, previous: Vec<Option<BlobVersion>>) -> Step {
         let guards = self.guards.as_ref().ok_or(PageError::NotFinished)?;
         let page = &self.input.page;
-        let here = (self.input.realm_id, self.input.local);
+        let here = (self.input.realm_id, self.input.local, self.now_ms);
         let rows = page_rows(page, &self.items, &self.plans, (guards, previous), here)?;
         // Nothing to store: the page ends with its answer and the transaction writes nothing.
         if rows.written == 0 {
@@ -139,7 +144,9 @@ impl Operation for PageApplyOperation {
                 result.done()?;
                 self.state = ApplyState::UpdateUsage;
                 let usage = self.usage.as_mut().ok_or(PageError::NotFinished)?;
-                Ok(Next::Call(usage.start_calls().into_call()))
+                Ok(Next::Call(
+                    usage.start_calls(self.ids.mint(self.now_ms)).into_call(),
+                ))
             }
             ApplyState::UpdateUsage => self.usage_step(result),
         }
@@ -147,6 +154,14 @@ impl Operation for PageApplyOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 

@@ -303,7 +303,9 @@ impl Operation for CopyEnvelopeOperation {
                 result.done()?;
                 let usage = self.usage.as_mut().ok_or(AbeError::Context)?;
                 self.state = State::Usage;
-                Ok(Next::Call(usage.start_calls().into_call()))
+                Ok(Next::Call(
+                    usage.start_calls(self.ids.mint(self.now_ms)).into_call(),
+                ))
             }
             State::Usage => self.usage_step(result),
         }

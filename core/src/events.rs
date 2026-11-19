@@ -556,6 +556,8 @@ pub enum NetEvent {
     PositionSealed(Option<Vec<u8>>),
     /// The opened position, or `None` when this process did not seal it.
     PositionOpened(Option<Vec<u8>>),
+    /// The drawn secret; its `Debug` print never shows it.
+    SecretDrawn(crate::compute::Secret),
     /// The peer's last-contact time is refreshed.
     PeerContact,
     Shard(Box<ShardNetEvent>),
@@ -1096,6 +1098,7 @@ impl Event {
                     CursorSigned,
                     PositionSealed,
                     PositionOpened,
+                    SecretDrawn,
                     Shard,
                     TopicPeers,
                     MissingTopicPeers,

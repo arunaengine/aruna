@@ -84,6 +84,8 @@ fn entry_metadata(entry: &SourceEntry) -> SourceMetadata {
 struct VersionChange {
     calls: VecDeque<IoCall>,
     usage: UsageCounterUpdate,
+    /// The dirty-marker generation the host minted for the usage update.
+    generation: Ulid,
     counting: bool,
 }
 
@@ -94,7 +96,7 @@ impl VersionChange {
         key: &str,
         (pointer, version_id): (Option<&CurrentVersionPointer>, Ulid),
         write: Effect,
-        usage: UsageCounterUpdate,
+        (usage, generation): (UsageCounterUpdate, Ulid),
     ) -> Result<Self, OfferError> {
         let next = CurrentVersionPointer::next_for(pointer, version_id)?;
         let alias = HeadAliasContext::new(
@@ -109,6 +111,7 @@ impl VersionChange {
         Ok(Self {
             calls: calls.collect(),
             usage,
+            generation,
             counting: false,
         })
     }
@@ -121,7 +124,7 @@ impl VersionChange {
             return None;
         }
         self.counting = true;
-        Some(self.usage.start_calls().into_call())
+        Some(self.usage.start_calls(self.generation).into_call())
     }
 
     /// The call after `result`, or `None` once the change is staged.
@@ -256,6 +259,7 @@ impl ObserveFileOperation {
         };
         let usage = UsageCounterUpdate::for_group(scope.group_id, delta)
             .in_bucket(&scope.bucket, RowChange::AddedVersion);
+        let usage = (usage, self.mint.mint(self.now_ms));
         let mut change =
             VersionChange::new(scope, &self.path, (pointer, version_id), write, usage)?;
         let call = change.next_call().ok_or(IoError::Unfinished)?;
@@ -348,6 +352,7 @@ impl TombstoneOperation {
         let usage = UsageCounterUpdate::for_group(scope.group_id, delta)
             .in_bucket(&scope.bucket, RowChange::AddedMarker);
         let pointer = self.rows.pointer.as_ref();
+        let usage = (usage, self.mint.mint(self.now_ms));
         let mut change = VersionChange::new(scope, &self.key, (pointer, version_id), write, usage)?;
         let call = change.next_call().ok_or(IoError::Unfinished)?;
         self.change = Some(change);
