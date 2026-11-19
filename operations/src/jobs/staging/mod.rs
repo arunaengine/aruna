@@ -316,8 +316,8 @@ pub(crate) mod pure_tests {
     use super::walk::{directory_list_path, record_failure};
     use super::*;
     use aruna_core::staging_checkpoint::{
-        LANE_ROWS, MAX_ERROR_SAMPLE, ReadCheckpointOperation, handed_checkpoint, initial_checkpoint,
-        main_read,
+        LANE_ROWS, MAX_ERROR_SAMPLE, ReadCheckpointOperation, handed_checkpoint,
+        initial_checkpoint, main_read,
     };
     use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
     use aruna_test_support::staging::test_spec;

@@ -5,7 +5,9 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StagingSourceError;
-use aruna_core::native_reference::{NativeAuthority, NativeReferenceReject, NativeReferenceRequest};
+use aruna_core::native_reference::{
+    NativeAuthority, NativeReferenceReject, NativeReferenceRequest,
+};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::source_access::SourceMetadata;

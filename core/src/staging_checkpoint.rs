@@ -145,10 +145,7 @@ pub fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
 /// Where a job taken over by a range's new coordinator goes on: the former position without
 /// counters, errors or directory queue. A flat walk keeps its cursor and rereads its manifest;
 /// a manifest read, a table or a directory walk, whose queue stays behind, starts over.
-pub fn handed_checkpoint(
-    spec: &StagingJobSpec,
-    at: &StagingJobCheckpoint,
-) -> StagingJobCheckpoint {
+pub fn handed_checkpoint(spec: &StagingJobSpec, at: &StagingJobCheckpoint) -> StagingJobCheckpoint {
     let mut next = initial_checkpoint(spec);
     // The table is read again from its start, pinned to what the former job first read.
     if let (Some(table), Some(read)) = (next.table.as_mut(), at.table.as_ref()) {

@@ -96,10 +96,7 @@ mod tests {
     #[test]
     fn starts_alias_reads() {
         let mut op = ResolvePathsOperation::new([7u8; 32]);
-        assert_eq!(
-            op.transaction(),
-            crate::operation::TransactionMode::None
-        );
+        assert_eq!(op.transaction(), crate::operation::TransactionMode::None);
         assert!(matches!(
             op.first(),
             Ok(Next::Call(IoCall::Page { space, limit, .. }))

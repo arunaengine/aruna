@@ -75,7 +75,9 @@ impl Operation for HeadSourceOperation {
     fn first(&mut self) -> Result<Next<HeadSourceResult>, HeadSourceError> {
         let (group, connector) = (self.input.group_id, self.input.connector_id);
         let path = self.input.source_path.clone();
-        Ok(Next::Call(super::resolve_call(group, connector, path)))
+        Ok(Next::Call(crate::connectors::resolver::resolve_call(
+            group, connector, path,
+        )))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<HeadSourceResult>, HeadSourceError> {

@@ -16,8 +16,7 @@ use ulid::Ulid;
 #[tokio::test]
 async fn resolves_empty_hash() {
     let random_path = tempdir().unwrap();
-    let storage_handle =
-        storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
     let context = DriverContext {
         storage_handle,
         net_handle: None,
@@ -37,8 +36,7 @@ async fn resolves_empty_hash() {
 #[tokio::test]
 async fn resolves_existing_aliases() {
     let random_path = tempdir().unwrap();
-    let storage_handle =
-        storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
     let context = DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,

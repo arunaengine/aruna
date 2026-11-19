@@ -288,7 +288,10 @@ mod tests {
     fn failed_snapshot_kept() {
         let mut drain = snapshotting();
         let failed = child(Err::<(), _>(GitError::Unavailable));
-        assert_eq!(drain.next(failed), Ok(Next::Done(Some(CAPTURE_RETRY_AFTER))));
+        assert_eq!(
+            drain.next(failed),
+            Ok(Next::Done(Some(CAPTURE_RETRY_AFTER)))
+        );
         let mut rerun = snapshotting();
         assert_eq!(rerun.next(child(Ok::<(), GitError>(()))), delete_mark());
     }

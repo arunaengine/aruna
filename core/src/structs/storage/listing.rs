@@ -10,6 +10,8 @@ use crate::structs::execution::source_access::SourceMetadata;
 use crate::structs::storage::blob::BackendLocation;
 use crate::structs::storage::multipart::MultipartUpload;
 
+/// Listings hold far more versions than delete markers, so the version stays inline.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ListVersionsItem {
     Version {

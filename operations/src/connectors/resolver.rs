@@ -280,6 +280,21 @@ impl Operation for ResolveBindingOperation {
     }
 }
 
+/// Resolves the connector of a source path below its root.
+pub(crate) fn resolve_call(
+    group_id: aruna_core::types::GroupId,
+    connector_id: ulid::Ulid,
+    source_path: String,
+) -> aruna_core::calls::IoCall {
+    let input = ResolveConnectorInput {
+        group_id,
+        connector_id,
+        source_path,
+        allow_root: false,
+    };
+    aruna_core::calls::IoCall::from(resolve_connector_effect(input))
+}
+
 pub fn resolve_connector_effect(input: ResolveConnectorInput) -> Effect {
     Effect::SubOperation(boxed_suboperation(
         ResolveConnectorOperation::new(input),
