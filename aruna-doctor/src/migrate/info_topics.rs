@@ -192,7 +192,7 @@ pub(super) mod tests {
         SYNC_QUARANTINE_KEYSPACE,
     };
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_operations::sync::outbox_record::new_outbox_record;
+    use aruna_operations::sync::outbox_record::new_identified_record;
     use irokle::oplog::Oplog;
     use irokle::{Ed25519Signer, ReplicationPolicy, Signer, TopicGenesis, actor_id_for};
     use tempfile::tempdir;
@@ -237,8 +237,15 @@ pub(super) mod tests {
             bytes: vec![1],
             change,
         };
-        let record =
-            new_outbox_record(node(1), target, Vec::new(), event, PlacementRef::NIL, false);
+        let record = new_identified_record(
+            Ulid::generate(),
+            node(1),
+            target,
+            Vec::new(),
+            event,
+            PlacementRef::NIL,
+            false,
+        );
         postcard::to_allocvec(&record).unwrap()
     }
 

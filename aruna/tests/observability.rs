@@ -935,7 +935,7 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{SYNC_OUTBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_operations::sync::outbox_record::{new_outbox_record, outbox_write_entry};
+    use aruna_operations::sync::outbox_record::{new_identified_record, outbox_write_entry};
 
     let storage = env.open_storage().await;
     clear_space(&storage, SYNC_OUTBOX_KEYSPACE).await?;
@@ -944,7 +944,8 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     let config = load_realm(&storage).await?;
     let node_id = iroh::SecretKey::from_bytes(&state.net_secret_key).public();
     let placement = PlacementRef::NIL;
-    let record = new_outbox_record(
+    let record = new_identified_record(
+        ulid::Ulid::generate(),
         node_id,
         DocumentTarget::NodeInfo {
             realm_id: config.realm_id,

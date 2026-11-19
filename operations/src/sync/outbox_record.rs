@@ -71,25 +71,6 @@ pub(crate) fn revocation_index_key(record: &DocumentOutboxRecord) -> Option<Key>
         .then(|| outbox_key(record))
 }
 
-pub fn new_outbox_record(
-    node_id: NodeId,
-    target: DocumentTarget,
-    peers: Vec<NodeId>,
-    event: DocumentOutboxEvent,
-    admin_placement: PlacementRef,
-    allow_genesis: bool,
-) -> DocumentOutboxRecord {
-    new_identified_record(
-        Ulid::generate(),
-        node_id,
-        target,
-        peers,
-        event,
-        admin_placement,
-        allow_genesis,
-    )
-}
-
 /// `admin_placement` is only consulted for `AdminOperation` records (which carry
 /// no envelope change); `Upsert`/`Delete` always take their ref from the event's
 /// change so the record and its envelope can never diverge.

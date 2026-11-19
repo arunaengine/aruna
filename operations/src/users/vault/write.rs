@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox_record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
 use aruna_core::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
 
 /// One change a user makes to their own vault records.
@@ -414,8 +416,10 @@ impl AppendVaultOperation {
         }
         let mut writes = Vec::new();
         let mut deletes = Vec::new();
-        let outbox = |target, bytes, change| -> Result<(KeySpace, Key, Value), AppendVaultError> {
-            let record = new_outbox_record(
+        type Entry = (KeySpace, Key, Value);
+        let mut outbox = |target, bytes, change| -> Result<Entry, AppendVaultError> {
+            let record = new_identified_record(
+                self.ids.mint(self.config.now_ms),
                 self.config.node_id,
                 target,
                 planned.holders.clone(),
