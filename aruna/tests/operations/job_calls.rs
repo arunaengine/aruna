@@ -23,9 +23,7 @@ use ulid::Ulid;
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::execution::job::{
-    ArtifactRef, ExportRoCrateSpec, ImportRoCrateSpec, JobId, JobRecord,
-};
+use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, JobId, JobRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
@@ -149,33 +147,18 @@ pub async fn prune_job_batch(context: &DriverContext) -> Result<JobPruneOutcome,
     drive(prune, context).await.map_err(|error| error.0)
 }
 
+/// Submits an import of `spec` without an idempotency key, served by this context's node.
 pub async fn submit_rocrate_import(
     context: &DriverContext,
     spec: ImportRoCrateSpec,
     owner_node_id: NodeId,
-    idempotency_key: Option<String>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
+    let serving = context.node_and_realm();
     let submit = SubmitLocalOperation::rocrate_import(
         spec,
         owner_node_id,
-        idempotency_key,
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    drive(submit, context).await
-}
-
-pub async fn submit_export_job(
-    context: &DriverContext,
-    spec: ExportRoCrateSpec,
-    owner_node_id: NodeId,
-    idempotency_key: Option<String>,
-) -> Result<SubmitJobResult, SubmitJobError> {
-    let submit = SubmitLocalOperation::rocrate_export(
-        spec,
-        owner_node_id,
-        idempotency_key,
-        context.node_and_realm(),
+        None,
+        serving,
         unix_timestamp_millis(),
     );
     drive(submit, context).await
