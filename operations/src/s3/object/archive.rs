@@ -34,12 +34,14 @@ use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::list::ListedObject;
-use crate::s3::object::member_read::{MemberCaller, MemberKey, MemberRead, MemberReadOperation};
+use crate::s3::object::member_read::{
+    MemberFailure, MemberKey, MemberRead, MemberReadOperation, MemberRefusal,
+};
 use crate::s3::object::pages::{
     Caller, ListRequest, ObjectPage, ObjectPageOperation, PageError, PageNode, PageObject,
     listing_path,
 };
-use crate::s3::object::range_list::MemberAccess;
+use crate::s3::object::range_list::{DelegatedCaller, MemberAccess};
 use crate::s3::object::read::GetRoutedOperation;
 
 /// Bucket names never contain `_`, so these paths cannot meet a `bucket/key` path.
@@ -362,6 +364,18 @@ fn unexpected_job() -> IoError {
     IoError::Unexpected {
         expected: "the archive event of the running step",
         got: "another job event",
+    }
+}
+
+/// The entry status of a key no member would serve.
+fn member_status(failure: MemberFailure) -> EntryStatus {
+    let MemberRefusal::Refused { code, .. } = failure.refusal else {
+        return EntryStatus::Unavailable;
+    };
+    match code.as_deref() {
+        Some("NoSuchKey" | "NoSuchVersion" | "MethodNotAllowed") => EntryStatus::Missing,
+        Some("AccessDenied") => EntryStatus::Denied,
+        _ => EntryStatus::Unavailable,
     }
 }
 
@@ -922,16 +936,14 @@ impl ResolveKeyOperation {
         let Some(binding) = self.info.distribution.clone() else {
             return self.head();
         };
-        let caller = MemberCaller {
-            auth: self.auth.clone(),
+        let caller = DelegatedCaller {
+            user_id: self.auth.user_id,
             group_id: self.info.group_id,
+            credential_id: String::new(),
+            restrictions: self.auth.path_restrictions.clone(),
             credential_expiry: self.expiry,
         };
-        let object = MemberKey {
-            bucket: self.bucket.clone(),
-            key: self.key.clone(),
-            version: self.requested,
-        };
+        let object = MemberKey::get(&self.bucket, &self.key, self.requested);
         let read = MemberReadOperation::new(self.node.ids, caller, binding, object);
         self.step = ResolveStep::Member;
         Ok(Next::Call(IoCall::child(read)))
@@ -976,14 +988,13 @@ impl Operation for ResolveKeyOperation {
                 access_status(result.child::<(), AuthorizeError>()?)?;
                 self.member_read()
             }
-            ResolveStep::Member => match result.child::<MemberRead, EntryStatus>()?? {
-                MemberRead::Remote {
-                    version,
-                    blob,
-                    stale,
-                } => Ok(Next::Done(Pinned {
-                    version,
-                    blob: Some(blob),
+            ResolveStep::Member => match result
+                .child::<MemberRead, MemberFailure>()?
+                .map_err(member_status)?
+            {
+                MemberRead::Remote { body, stale } => Ok(Next::Done(Pinned {
+                    version: body.version().ok_or(EntryStatus::Unavailable)?,
+                    blob: Some(body.stream),
                     stale,
                 })),
                 MemberRead::Local(range_id) => {
