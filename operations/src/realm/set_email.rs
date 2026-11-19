@@ -15,7 +15,6 @@ use aruna_core::realm_vault::{
     RealmVaultRecord,
 };
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
@@ -23,7 +22,7 @@ use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::types::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use thiserror::Error;
@@ -32,6 +31,7 @@ use tracing::{info, warn};
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::mutate_placement::is_management;
+use crate::realm::write_stage::{WriteStage, WriteStep};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -170,24 +170,13 @@ impl Operation for SetEmailOperation {
     }
 }
 
-/// What the email write transaction waits for.
-#[derive(Debug, PartialEq)]
-enum Stage {
-    Read,
-    Write,
-    Delete,
-}
-
 /// Reads the realm config and its admin state, then stores the profile, its vault entries and the
 /// queued admin events in one write transaction.
 #[derive(Debug, PartialEq)]
 struct EmailWrite {
     config: Arc<SetEmailConfig>,
-    stage: Stage,
+    write: WriteStage,
     profile: Option<Option<RealmEmailProfile>>,
-    deletes: Vec<(KeySpace, Key)>,
-    now_ms: u64,
-    ids: IdMint,
     entropy: u128,
 }
 
@@ -195,11 +184,8 @@ impl EmailWrite {
     fn new(config: Arc<SetEmailConfig>) -> Self {
         Self {
             config,
-            stage: Stage::Read,
+            write: WriteStage::default(),
             profile: None,
-            deletes: Vec::new(),
-            now_ms: 0,
-            ids: IdMint::default(),
             entropy: 0,
         }
     }
@@ -241,7 +227,7 @@ impl EmailWrite {
                     stale.remove(&password.entry);
                 }
                 let profile = RealmEmailProfile {
-                    revision: self.ids.mint(self.now_ms),
+                    revision: self.write.ids.mint(self.write.now_ms),
                     host: input.host.trim().to_string(),
                     port: input.port,
                     tls: input.tls,
@@ -249,7 +235,7 @@ impl EmailWrite {
                     from: input.from.trim().to_string(),
                     password,
                     changed_by: self.config.actor.user_id,
-                    changed_at_ms: self.now_ms,
+                    changed_at_ms: self.write.now_ms,
                 };
                 if !profile.valid() {
                     return Err(SetEmailError::InvalidProfile {
@@ -293,11 +279,11 @@ impl EmailWrite {
                 let entry = match current.and_then(|current| current.password) {
                     Some(password) => password.entry,
                     None => {
-                        let id = self.ids.mint(self.now_ms);
+                        let id = self.write.ids.mint(self.write.now_ms);
                         RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, id)
                     }
                 };
-                let revision = self.ids.mint(self.now_ms);
+                let revision = self.write.ids.mint(self.write.now_ms);
                 let realm_id = self.config.actor.realm_id;
                 let vault_key = &self.config.vault_key;
                 let sealed = vault_key.seal(&realm_id, (entry, revision), secret, self.entropy)?;
@@ -308,7 +294,7 @@ impl EmailWrite {
                         revision,
                         sealed,
                         changed_by: self.config.actor.user_id,
-                        changed_at_ms: self.now_ms,
+                        changed_at_ms: self.write.now_ms,
                     }),
                 });
                 Ok(Some(RealmSecretRef { entry, revision }))
@@ -355,7 +341,7 @@ impl EmailWrite {
             events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 operation,
-                self.ids.mint(self.now_ms),
+                self.write.ids.mint(self.write.now_ms),
             )?);
         }
         document.email = reducer_state.materialized_realm_email();
@@ -387,8 +373,7 @@ impl EmailWrite {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.profile = Some(profile);
-        self.deletes = stale_conflict_deletes;
-        self.stage = Stage::Write;
+        self.write.written(stale_conflict_deletes, false);
         Ok(Next::Call(IoCall::Write(writes)))
     }
 
@@ -405,11 +390,11 @@ impl Operation for EmailWrite {
     type Error = SetEmailError;
 
     fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
+        self.write.now_ms = now_ms;
     }
 
     fn seed(&mut self, entropy: u128) {
-        self.ids = IdMint::new(entropy);
+        self.write.ids = IdMint::new(entropy);
         self.entropy = entropy;
     }
 
@@ -427,22 +412,10 @@ impl Operation for EmailWrite {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetEmailError> {
-        match self.stage {
-            Stage::Read => {
-                let [document, reducer] = values::<2>(result)?;
-                self.emit_document_write(document, reducer)
-            }
-            Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
-                self.stage = Stage::Delete;
-                Ok(Next::Call(IoCall::Delete(std::mem::take(
-                    &mut self.deletes,
-                ))))
-            }
-            Stage::Write | Stage::Delete => {
-                done(result)?;
-                self.finish()
-            }
+        match self.write.step(result)? {
+            WriteStep::Read([document, reducer]) => self.emit_document_write(document, reducer),
+            WriteStep::Call(call) => Ok(Next::Call(call)),
+            WriteStep::Done => self.finish(),
         }
     }
 }
