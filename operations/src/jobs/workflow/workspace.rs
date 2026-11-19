@@ -10,10 +10,11 @@ use aruna_core::compute::{BackendError, MAX_OUTPUT_MATCHES, output_suffix};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::id::NodeId;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{
-    AttemptControl, InputSelection, InputSource, JobError, JobRecord, MAX_EXECUTION_OUTPUTS,
-    OutputDestination, OutputObject, OutputSelection,
+use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
+use aruna_core::structs::execution::job::input::{
+    InputSelection, InputSource, OutputDestination, OutputSelection,
 };
+use aruna_core::structs::execution::job::local::{AttemptControl, JobError, JobRecord, OutputObject};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
@@ -431,9 +432,9 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
-    use aruna_core::structs::execution::job::{
-        InputMode, JobErrorKind, JobId, JobPayload, OutputCommitIntent,
-    };
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::{InputMode, JobPayload};
+    use aruna_core::structs::execution::job::local::{JobErrorKind, OutputCommitIntent};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{
@@ -448,7 +449,7 @@ mod tests {
 
     use aruna_core::calls::Next;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::execution::job::{CapturedInput, ExecutionSpec};
+    use aruna_core::structs::execution::job::input::{CapturedInput, ExecutionSpec};
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::storage::blob::bucket_permission_path;
     use aruna_core::structs::storage::distribution::source_root::RootEntry;
@@ -1032,7 +1033,7 @@ mod tests {
 
         assert_eq!(
             error.kind,
-            aruna_core::structs::execution::job::JobErrorKind::Permanent
+            aruna_core::structs::execution::job::local::JobErrorKind::Permanent
         );
         assert!(
             error
@@ -1113,7 +1114,7 @@ mod tests {
     // the run record reads it.
     #[tokio::test]
     async fn served_sources_kept() {
-        use aruna_core::structs::execution::job::{CapturedInput, InputContent};
+        use aruna_core::structs::execution::job::input::{CapturedInput, InputContent};
         let test_context = aruna_test_support::staging::setup_driver_context().await;
         let context = &test_context.driver_context;
         let realm_id = RealmId([1; 32]);
@@ -1148,7 +1149,7 @@ mod tests {
             releases_complete: true,
             grant: None,
         });
-        record.claim = Some(aruna_core::structs::execution::job::JobClaim {
+        record.claim = Some(aruna_core::structs::execution::job::local::JobClaim {
             holder_node_id: node_id,
             claim_token: Ulid::from_bytes([8; 16]),
             lease_expires_ms: u64::MAX,
@@ -1239,7 +1240,7 @@ mod tests {
 
         assert_eq!(
             over.kind,
-            aruna_core::structs::execution::job::JobErrorKind::Permanent
+            aruna_core::structs::execution::job::local::JobErrorKind::Permanent
         );
         assert!(
             over.message
@@ -1288,7 +1289,7 @@ mod tests {
             destination_key: "in/data.csv".to_string(),
             source_node_id: node_id,
             version_id: version,
-            content: aruna_core::structs::execution::job::InputContent::Blake3([0; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([0; 32]),
             bytes: 4,
             policies: vec![policy],
             source_group_id: Default::default(),
@@ -1352,7 +1353,7 @@ mod tests {
         let error = merge_outputs(inventoried, vec![output("overflow")]).unwrap_err();
         assert_eq!(
             error.kind,
-            aruna_core::structs::execution::job::JobErrorKind::Permanent
+            aruna_core::structs::execution::job::local::JobErrorKind::Permanent
         );
     }
 
@@ -1480,7 +1481,7 @@ mod tests {
 
         assert_eq!(
             error.kind,
-            aruna_core::structs::execution::job::JobErrorKind::Permanent
+            aruna_core::structs::execution::job::local::JobErrorKind::Permanent
         );
         assert!(
             error.message.contains("results/report.txt"),
@@ -1495,7 +1496,7 @@ mod tests {
         let error = expand_selection(&output, vec!["/other/a.txt".to_string()], &[]).unwrap_err();
         assert_eq!(
             error.kind,
-            aruna_core::structs::execution::job::JobErrorKind::Permanent
+            aruna_core::structs::execution::job::local::JobErrorKind::Permanent
         );
 
         let mut output = output;
@@ -1503,7 +1504,7 @@ mod tests {
         let error = expand_selection(&output, vec!["/out/a.txt".to_string()], &[]).unwrap_err();
         assert_eq!(
             error.kind,
-            aruna_core::structs::execution::job::JobErrorKind::Permanent
+            aruna_core::structs::execution::job::local::JobErrorKind::Permanent
         );
     }
 
@@ -1518,7 +1519,7 @@ mod tests {
         let error = insert_output(&mut outputs, &mut keys, output("overflow")).unwrap_err();
         assert_eq!(
             error.kind,
-            aruna_core::structs::execution::job::JobErrorKind::Permanent
+            aruna_core::structs::execution::job::local::JobErrorKind::Permanent
         );
         assert_eq!(outputs.len(), MAX_EXECUTION_OUTPUTS);
     }

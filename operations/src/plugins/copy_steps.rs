@@ -10,7 +10,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::structs::execution::job::KeyWait;
+use aruna_core::structs::execution::job::key_wait::KeyWait;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::VersionKey;
 use aruna_core::structs::storage::encryption::BucketKeyError;

@@ -7,7 +7,7 @@ use crate::jobs::repository::push::creator_auth;
 use crate::jobs::repository::test_support::{child, job_scope, link, remote, scope, session};
 use aruna_core::repository::remote::{RemoteAnswer, RemoteFailure, StopReason};
 use aruna_core::repository::{ImportOptions, RepositoryPull};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::input::{
     ImportMetadataTarget, ImportRoCrateTarget, RoCrateLimits,
 };
 use serde_json::json;

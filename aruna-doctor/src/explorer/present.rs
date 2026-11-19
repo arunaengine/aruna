@@ -6,8 +6,8 @@
 use aruna_core::compute::quota::{ComputeDepartureReport, JobReservationRecord};
 use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::onboarding::OnboardingSecretRecord;
+use aruna_core::structs::execution::job::family::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::execution::job::record_rows::OutboxEntry;
-use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};

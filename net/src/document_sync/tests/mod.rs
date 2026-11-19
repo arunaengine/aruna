@@ -5,7 +5,6 @@
 use super::storage::*;
 use super::*;
 use crate::test_support::test_endpoint;
-use ::irokle::sync::SyncData;
 use aruna_clock::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::admin_checks::{has_write_permission, revocation_origin_known};
 use aruna_core::admin_documents::{
@@ -48,7 +47,7 @@ use aruna_core::storage_entries::{
     reducer_conflict_key, reducer_state_entry, reducer_state_key, registry_write_entries,
     subject_index_key, subject_index_value,
 };
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::notification_watch::WatchInterestDigest;
 use aruna_core::structs::identity::auth::{Actor, Permission, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument, owner_group_key};
@@ -80,6 +79,7 @@ use aruna_core::sync_checks::{
     validate_watch_upsert,
 };
 use aruna_core::user::id::UserId;
+use ::irokle::sync::SyncData;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use tempfile::TempDir;

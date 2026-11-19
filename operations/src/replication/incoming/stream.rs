@@ -12,7 +12,7 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, schedule_watch_drain, watch_event_entry,
     watch_resource_path,

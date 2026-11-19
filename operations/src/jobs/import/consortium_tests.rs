@@ -10,7 +10,7 @@ use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::rocrate_archive::{file_id_candidates, payload_entries, signature_entry};
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::user::id::UserId;

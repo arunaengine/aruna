@@ -17,7 +17,7 @@ use aruna_core::repository::rules::{
     target_files,
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::ArtifactRef;
+use aruna_core::structs::execution::job::input::ArtifactRef;
 use serde_json::Value;
 
 use super::{Action, TransferError, ensure_supported, not_supported, remote_answer, remote_call};

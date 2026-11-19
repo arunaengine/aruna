@@ -11,7 +11,7 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::WaitTarget;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::KeyWait;
+use aruna_core::structs::execution::job::key_wait::KeyWait;
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::encryption::ReadLease;
 

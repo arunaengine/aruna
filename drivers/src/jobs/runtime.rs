@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use aruna_core::heartbeat::RunningJobs;
 use aruna_core::jobs::{JobKind, RunningJobView};
-use aruna_core::structs::execution::job::{JobExecutionClass, JobId, JobRecord};
+use aruna_core::structs::execution::job::identity::{JobExecutionClass, JobId};
+use aruna_core::structs::execution::job::local::JobRecord;
 use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -455,7 +456,7 @@ mod tests {
     use super::*;
     use crate::testing::import_record;
     use aruna_core::jobs::JobTarget;
-    use aruna_core::structs::execution::job::JobProgress;
+    use aruna_core::structs::execution::job::local::JobProgress;
     use ulid::Ulid;
 
     // Staging and both import kinds count as imports in the node telemetry.

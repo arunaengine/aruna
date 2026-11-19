@@ -17,7 +17,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobLocationKey, BucketInfo, HashIndex};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};

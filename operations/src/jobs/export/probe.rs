@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::jobs::JobEffect;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::ReasonCode;
+use aruna_core::structs::execution::job::input::ReasonCode;
 
 use super::open::OpenCandidateOperation;
 use super::resolve::ExportCandidate;

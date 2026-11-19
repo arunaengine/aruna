@@ -14,9 +14,10 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{
-    ExecutionSpec, JobId, JobPayload, JobRecord, JobResultPayload, JobState, OutputObject,
-    RunCrateStatus,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::local::{
+    JobRecord, JobResultPayload, OutputObject, RunCrateStatus,
 };
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
@@ -364,7 +365,7 @@ async fn crate_stays_local() -> TestResult<()> {
     storage
         .send_storage_effect(StorageEffect::Delete {
             key_space: aruna_core::keyspaces::JOB_KEYSPACE.to_string(),
-            key: aruna_core::structs::execution::job::job_record_key(job_id),
+            key: aruna_core::structs::execution::job::local::job_record_key(job_id),
             txn_id: None,
         })
         .await;
@@ -441,7 +442,7 @@ async fn checks_empty_target() -> TestResult<()> {
 #[tokio::test]
 async fn crate_redrive_links() -> TestResult<()> {
     use aruna_core::keyspaces::RUN_LINK_KEYSPACE;
-    use aruna_core::structs::execution::job::run_crate_key;
+    use aruna_core::structs::execution::job::local::run_crate_key;
     let realm = Topology::spawn(2, 1, 1).await?;
     let group_id = realm.seed_group().await?;
     let server = realm.node(0);

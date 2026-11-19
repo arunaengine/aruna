@@ -6,7 +6,7 @@ use super::*;
 use crate::jobs::store::job_calls::{CancelRequestOutcome, ClaimOutcome};
 use crate::jobs::store::park_wake::{AwaitOutcome, ParkJobOperation, SatisfyWaitOperation};
 use crate::jobs::store::row_calls::{WAKE_PAGE, park_mutation};
-use aruna_core::structs::execution::job::KeyWait;
+use aruna_core::structs::execution::job::key_wait::KeyWait;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_drivers::driver::DriverContext;

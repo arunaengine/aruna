@@ -7,9 +7,10 @@ use std::sync::Arc;
 use aruna_core::effects::{JobRecordFrame, LaunchFrame};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobId, JobRecordKind, JobState, PhysicalExecutionState,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordKind, PhysicalExecutionState,
 };
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::user::id::UserId;
 
@@ -374,9 +375,8 @@ async fn unrecorded_deletion_kept() {
     use crate::jobs::job_reads::tests::delete_owned_run;
     use crate::jobs::store::RunDelete;
     use crate::tests::records::secret;
-    use aruna_core::structs::execution::job::{
-        ComputeResources, ExecutionSpec, JobPayload, JobRecord,
-    };
+    use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::JobRecord;
     use aruna_test_support::jobs::insert_job;
     let family = Family::new([45u8; 32]);
     let job_id = family.spec().job_id;

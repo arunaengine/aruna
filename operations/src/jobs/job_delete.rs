@@ -4,7 +4,9 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobState, cleanup_job_id};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{JobRecord, cleanup_job_id};
 use aruna_core::structs::identity::auth::AuthContext;
 use tracing::warn;
 

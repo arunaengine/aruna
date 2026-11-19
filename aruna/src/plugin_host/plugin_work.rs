@@ -8,9 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::structs::execution::job::{
-    JobError, JobPayload, JobResultPayload, PluginWorkAction, PluginWorkSpec,
-};
+use aruna_core::structs::execution::job::input::{JobPayload, PluginWorkAction, PluginWorkSpec};
+use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_plugin_types::calls::{ErrorKind, HostError};
 use futures_util::future::BoxFuture;
 use ulid::Ulid;

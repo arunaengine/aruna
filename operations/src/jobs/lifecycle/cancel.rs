@@ -10,10 +10,11 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    CancelAuthority, ExecutionClaim, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId,
-    JobProjection, JobRecordEnvelope, JobRecordKind, LogicalJobSpec,
+use aruna_core::structs::execution::job::family::{
+    CancelAuthority, ExecutionClaim, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobProjection,
+    JobRecordEnvelope, JobRecordKind, LogicalJobSpec,
 };
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use tracing::{debug, warn};
@@ -655,7 +656,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{Family, REALM, node};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::JobRecord;
+    use aruna_core::structs::execution::job::local::JobRecord;
     use ulid::Ulid;
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
@@ -682,7 +683,7 @@ mod tests {
         let spec = family.spec();
         JobRecord::new(
             job(),
-            aruna_core::structs::execution::job::JobPayload::Execution(spec.payload),
+            aruna_core::structs::execution::job::input::JobPayload::Execution(spec.payload),
             spec.created_by,
             node(1),
             1,

@@ -40,7 +40,7 @@ use crate::row_plan::{PlanOperation, PlanRows, RowPlan};
 use crate::storage_entries::{
     document_lifecycle_key, registry_delete_entries, registry_write_entries, sync_revision_key,
 };
-use crate::structs::execution::job::JobId;
+use crate::structs::execution::job::identity::JobId;
 use crate::structs::persistent_id::{PersistentIdMapping, PersistentIdRevision};
 use crate::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyPublicationClaim,

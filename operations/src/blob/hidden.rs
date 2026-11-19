@@ -15,9 +15,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
-use aruna_core::structs::execution::job::{
-    JobId, JobRecord, JobResultPayload, RoCrateUploadCleanup, RoCrateUploadRecord, job_record_key,
-};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{RoCrateUploadCleanup, RoCrateUploadRecord};
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload, job_record_key};
 use aruna_core::structs::storage::blob::{HiddenBlobEntry, HiddenBlobKey};
 use aruna_core::structs::storage::distribution::on_use::{
     ATTACHMENT_NAMESPACE, Attachment, CACHE_NAMESPACE, CacheEntry, attachment_key,
@@ -920,9 +920,10 @@ mod tests {
     use super::*;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
-    use aruna_core::structs::execution::job::{
-        ArtifactRef, ExportRoCrateResult, ExportRoCrateSpec, JobPayload, JobState,
-        RoCrateCheckpointRefs, RoCrateLimits, RoCrateMediaType,
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::input::{
+        ArtifactRef, ExportRoCrateResult, ExportRoCrateSpec, JobPayload, RoCrateCheckpointRefs,
+        RoCrateLimits, RoCrateMediaType,
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;

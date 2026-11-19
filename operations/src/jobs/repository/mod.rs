@@ -15,7 +15,8 @@ use aruna_core::repository::remote::{
     JobStop, NodeScope, RemoteAnswer, RemoteCall, RemoteFailure, RemoteRequest, StopReason,
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{ImportRoCrateSource, ImportRoCrateSpec, JobId};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ImportRoCrateSource, ImportRoCrateSpec};
 use ulid::Ulid;
 
 use crate::harvest::read_connector::ConnectorView;

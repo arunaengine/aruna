@@ -9,9 +9,10 @@ use aruna_core::keyspaces::DOCUMENT_INDEX_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::{decoded, read_row};
 use aruna_core::storage_entries::metadata_document_key;
-use aruna_core::structs::execution::job::{
-    JobId, JobPayload, JobRecord, JobState, KeyWait, RunCrateStatus, StagingJobCheckpoint,
-};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{JobPayload, StagingJobCheckpoint};
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::local::{JobRecord, RunCrateStatus};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{JobOwnerError, RealmConfigDocument};
 use aruna_core::structs::placement::policy::document::group_admin_path;

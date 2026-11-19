@@ -369,7 +369,7 @@ mod tests {
         let shutdown = aruna_tasks::shutdown::Shutdown::new();
         initialize_net_holder(
             context.clone(),
-            aruna_core::structs::execution::job::RoCrateLimits::default(),
+            aruna_core::structs::execution::job::input::RoCrateLimits::default(),
             jobs_runtime.clone(),
             &shutdown,
         );

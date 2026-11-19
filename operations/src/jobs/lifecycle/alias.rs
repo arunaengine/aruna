@@ -5,10 +5,11 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::FAMILY_ALIAS_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::family::JobFamilyId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::record_keys::{
     MAX_ALIAS_FAMILIES, alias_family, alias_prefix,
 };
-use aruna_core::structs::execution::job::{JobFamilyId, JobId};
 
 use crate::jobs::route::JobRouteError;
 
@@ -56,10 +57,11 @@ mod state_machine_tests {
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::FAMILY_ALIAS_KEYSPACE;
     use aruna_core::operation::Operation;
+    use aruna_core::structs::execution::job::family::{JobFamilyId, SubmissionId};
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::execution::job::record_keys::{
         MAX_ALIAS_FAMILIES, alias_key, alias_prefix,
     };
-    use aruna_core::structs::execution::job::{JobFamilyId, JobId, SubmissionId};
     use aruna_core::types::{Key, Value};
 
     use super::AliasFamilyOperation;

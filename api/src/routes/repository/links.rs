@@ -526,7 +526,7 @@ pub(in crate::routes) async fn view(
 
 pub(in crate::routes) async fn job_response(
     state: &ServerState,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let urls = job_urls(state, job_id).await?;
     Ok((

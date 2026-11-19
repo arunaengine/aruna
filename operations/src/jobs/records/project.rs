@@ -8,20 +8,21 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_ALIAS_KEYSPACE, FAMILY_PROJECTION_KEYSPACE};
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::execution::job::{
-    JobFamilyId, JobId, JobProjection, JobRecord, JobRecordEnvelope, JobRecordKey, JobState,
-    LogicalJobState, job_record_key, validate_transition,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyId, JobProjection, JobRecordEnvelope, JobRecordKey, LogicalJobState,
 };
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::local::{JobRecord, job_record_key, validate_transition};
 use aruna_core::types::{Key, Value};
 use tracing::debug;
 
 use super::reduce::reduce_family;
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE, RecordStoreError};
-use aruna_core::structs::execution::job::JobWrites;
 use aruna_core::structs::execution::job::record_keys::{
     MAX_ALIAS_FAMILIES, alias_family, alias_prefix, family_prefix, record_key,
 };
 use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes, to_bytes};
+use aruna_core::structs::execution::job::rows::JobWrites;
 
 /// Aliases one family may bridge into local job rows.
 const MAX_BRIDGED_ALIASES: usize = 64;
@@ -241,7 +242,7 @@ impl ProjectFamilyOperation {
                     .iter()
                     .filter(|execution| {
                         execution.role
-                            == aruna_core::structs::execution::job::ExecutionRole::DuplicateSuccess
+                            == aruna_core::structs::execution::job::family::ExecutionRole::DuplicateSuccess
                     })
                     .count()
             })

@@ -24,7 +24,7 @@ use ulid::Ulid;
 pub struct PlannedInput {
     pub destination_key: String,
     pub version_id: Ulid,
-    pub content: crate::structs::execution::job::InputContent,
+    pub content: crate::structs::execution::job::input::InputContent,
     pub bytes: u64,
     pub policies: Vec<crate::structs::placement::policy::PlacementPolicyRef>,
     /// `None` when the target already holds the exact compliant copy.

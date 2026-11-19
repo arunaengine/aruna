@@ -11,7 +11,7 @@ use aruna_core::operation::Operation;
 use aruna_core::repository::RepositoryPull;
 use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::input::{
     ImportReportDetail, ImportReportRow, ImportRoCrateSource, ReasonCode,
 };
 use aruna_core::structs::execution::notification_watch::{

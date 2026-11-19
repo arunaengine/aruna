@@ -18,7 +18,7 @@ use crate::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataError, MetadataQueryResults, MetadataSearchHit,
     ProfileValidationFinding, ProfileValidationStatus,
 };
-use crate::structs::execution::job::SubmissionId;
+use crate::structs::execution::job::family::SubmissionId;
 use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
 use crate::structs::path_claim::PathClaimRecord;
 use crate::structs::persistent_id::{PersistentIdFailure, PersistentIdMapping};
@@ -613,7 +613,7 @@ pub enum MetadataTransportMessage {
     /// A staging job the former coordinator of a range hands over in transfer `transfer_id`.
     StagingSpec {
         transfer_id: Ulid,
-        job_id: crate::structs::execution::job::JobId,
+        job_id: crate::structs::execution::job::identity::JobId,
     },
     StagingSpecResult {
         result: Result<Box<HandedImport>, MetadataReadError>,
@@ -639,11 +639,11 @@ pub enum MetadataTransportMessage {
     },
     /// One input page of a job family by its digest; only realm infrastructure nodes ask.
     JobInputPage {
-        submission: crate::structs::execution::job::SubmissionId,
+        submission: crate::structs::execution::job::family::SubmissionId,
         digest: [u8; 32],
     },
     InputPageResult {
-        page: Option<Box<crate::structs::execution::job::InputPage>>,
+        page: Option<Box<crate::structs::execution::job::pages::InputPage>>,
     },
     /// Inputs an ingress asks their source node to resolve and grant, under the caller's bearer.
     ResolveJobInputs {
@@ -653,8 +653,8 @@ pub enum MetadataTransportMessage {
     ResolvedJobInputs {
         result: Result<
             Vec<(
-                crate::structs::execution::job::InputSelection,
-                crate::structs::execution::job::CapturedInput,
+                crate::structs::execution::job::input::InputSelection,
+                crate::structs::execution::job::input::CapturedInput,
             )>,
             crate::jobs::SubmissionRefusal,
         >,

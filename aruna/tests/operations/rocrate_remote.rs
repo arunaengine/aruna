@@ -26,10 +26,12 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{
-    ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, JobId, JobPayload,
-    JobRecord, JobResultPayload, ReasonCode, RoCrateLimits,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, JobPayload, ReasonCode,
+    RoCrateLimits,
 };
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{

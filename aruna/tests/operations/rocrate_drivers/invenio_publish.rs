@@ -143,7 +143,7 @@ async fn busy_reservation_retries() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = claim_context(&fixture, job_id, record.payload).await?;
     assert!(matches!(
         Box::pin(run_export_job(&ctx, &spec)).await,
-        JobRunOutcome::Failed(error) if error.kind == aruna_core::structs::execution::job::JobErrorKind::Retryable
+        JobRunOutcome::Failed(error) if error.kind == aruna_core::structs::execution::job::local::JobErrorKind::Retryable
     ));
     let (waiting, _) = current(&fixture, &link).await;
     // The draft is on the link before its DOI, so the retry continues it.
@@ -217,7 +217,7 @@ async fn revive_checks_lineage() -> Result<(), Box<dyn std::error::Error>> {
     pull.direction = LinkDirection::Pull(Box::new(LinkPull {
         auto_update: false,
         options: Default::default(),
-        target: aruna_core::structs::execution::job::ImportRoCrateTarget {
+        target: aruna_core::structs::execution::job::input::ImportRoCrateTarget {
             bucket: "research".into(),
             prefix: "zenodo".into(),
         },

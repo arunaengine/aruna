@@ -34,7 +34,7 @@ use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::id::NodeId;
 use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels, method_label};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketCorsConfiguration;
 use aruna_drivers::driver::{DriverContext, drive};

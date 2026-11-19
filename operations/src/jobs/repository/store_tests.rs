@@ -94,7 +94,7 @@ fn pull_state() -> aruna_core::repository::link::LinkPull {
     aruna_core::repository::link::LinkPull {
         auto_update: false,
         options: Default::default(),
-        target: aruna_core::structs::execution::job::ImportRoCrateTarget {
+        target: aruna_core::structs::execution::job::input::ImportRoCrateTarget {
             bucket: "b".into(),
             prefix: String::new(),
         },

@@ -2,11 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{
-    JobFamilyId, JobId, JobRecordError, JobRecordKey, JobRecordKind, RECORD_KEY_BYTES, SubmissionId,
-};
 use crate::effects::{FetchCursor, FrameBoundsError};
 use crate::id::NodeId;
+use crate::structs::execution::job::family::{
+    JobFamilyId, JobRecordError, JobRecordKey, JobRecordKind, RECORD_KEY_BYTES, SubmissionId,
+};
+use crate::structs::execution::job::identity::JobId;
 use crate::types::Key;
 
 /// Encoded width of a conflict row key: record key plus the rejected digest.

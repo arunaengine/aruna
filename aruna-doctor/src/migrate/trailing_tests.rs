@@ -9,7 +9,7 @@ use crate::error::CliError;
 use aruna_core::id::NodeId;
 use aruna_core::secrets::{SecretName, SecretScope};
 use aruna_core::structs::execution::harvest::{HarvestSelector, HarvestSource};
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::admin_audit::{
     AdminAuditAction, AdminAuditRecord, PluginAudit, SecretAudit,
 };

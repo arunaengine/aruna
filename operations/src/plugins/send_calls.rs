@@ -10,7 +10,7 @@ use aruna_core::outbound::{ConnectionAnswer, ConnectionError};
 use aruna_core::plugin_runs::CallIntent;
 use aruna_core::secrets::{ResponseExposure, SecretFields};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
-use aruna_core::structs::execution::job::UploadForm;
+use aruna_core::structs::execution::job::input::UploadForm;
 use aruna_plugin_types::calls::{ErrorKind, Field, HostError, Response};
 use ulid::Ulid;
 

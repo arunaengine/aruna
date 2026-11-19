@@ -15,7 +15,7 @@ use aruna_core::repository::remote::{
 };
 use aruna_core::repository::{ExportIdentity, RepositoryDestination, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
+use aruna_core::structs::execution::job::input::{ArtifactRef, ExportRoCrateSpec};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::secondary_id::IdentifierOrigin;
 use serde_json::{Value, json};

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
-use aruna_core::structs::execution::job::ExecutionSpec;
+use aruna_core::structs::execution::job::input::ExecutionSpec;
 
 use super::super::fixtures::{BUCKET, child, compute, facts, is_child, node, realm, record, spec};
 use super::*;

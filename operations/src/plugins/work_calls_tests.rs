@@ -2,12 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::PluginWorkAction;
-
 use super::*;
 use crate::plugins::rows::tests::{child_result, values_result};
 use crate::plugins::work::WorkKind;
 use crate::plugins::work::tests::sample_install;
+use aruna_core::structs::execution::job::input::PluginWorkAction;
 
 fn spec(install: &PluginInstall) -> PluginWorkSpec {
     PluginWorkSpec {

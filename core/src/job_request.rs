@@ -12,10 +12,10 @@ use crate::compute::runtimes::{
 use crate::errors::{ConversionError, StorageError};
 use crate::id::NodeId;
 use crate::id_mint::IdMint;
-use crate::structs::execution::job::{
-    CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, JobId, SubmissionId,
-    WorkspaceMode,
-};
+use crate::structs::execution::job::family::{EffectiveResources, JobFamilyId, SubmissionId};
+use crate::structs::execution::job::identity::JobId;
+use crate::structs::execution::job::input::{CapturedInput, ExecutionSpec};
+use crate::structs::execution::job::local::WorkspaceMode;
 use crate::structs::placement::policy::{MAX_SELECTOR_LABELS, PlacementPolicyRef};
 use crate::structs::placement::record::{LabelMatch, shard_for_subject};
 use crate::structured_id::clock_health::ClockHealthError;
@@ -79,7 +79,7 @@ pub struct SubmissionRequest {
     pub output_policies: Vec<PlacementPolicyRef>,
     /// Inputs too large to travel inline: the lists are empty and the sender keeps the pages.
     /// The identity is always computed from the full lists.
-    pub input_pages: Option<crate::structs::execution::job::PageManifest>,
+    pub input_pages: Option<crate::structs::execution::job::pages::PageManifest>,
 }
 
 /// The replicated identity of one request.
@@ -358,7 +358,7 @@ pub enum SubmitJobError {
     #[error("compute quota denied: {0}")]
     QuotaDenied(#[from] crate::compute::quota::QuotaDenied),
     #[error(transparent)]
-    Composition(#[from] crate::structs::execution::job::CompositionError),
+    Composition(#[from] crate::structs::execution::job::input::CompositionError),
     #[error("active RO-Crate job limit reached ({limit})")]
     ActiveJobLimit { limit: u32 },
     #[error(transparent)]
@@ -418,7 +418,7 @@ pub struct SubmitJobResult {
 
 #[cfg(test)]
 mod tests {
-    use crate::structs::execution::job::ComputeResources;
+    use crate::structs::execution::job::input::ComputeResources;
 
     use super::*;
 

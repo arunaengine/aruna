@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::id_mint::IdMint;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structured_id::clock_health::ClockHealthError;
 use aruna_core::structured_id::{BucketId, PlacementHandle};

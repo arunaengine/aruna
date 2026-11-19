@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aruna_core::injection::OutgoingRequest;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::UploadForm;
+use aruna_core::structs::execution::job::input::UploadForm;
 use bytes::Bytes;
 use futures_util::StreamExt;
 

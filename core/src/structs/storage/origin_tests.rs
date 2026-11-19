@@ -286,7 +286,8 @@ fn credentials_stripped() {
 // A run's workspace credential writes as its job; any other credential uploads.
 #[test]
 fn workspace_writes_job() {
-    use crate::structs::execution::job::{JobId, workspace_credential_id};
+    use crate::structs::execution::job::identity::JobId;
+    use crate::structs::execution::job::local::workspace_credential_id;
     let user = UserId::new(Ulid::from_bytes([8; 16]), RealmId::from_bytes([1; 32]));
     let job_id = JobId::from_bytes([5; 16]);
     let access_key = workspace_credential_id(job_id);

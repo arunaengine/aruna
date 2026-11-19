@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::job_service::submit_purge_job;
-use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, object_permission_path,
@@ -1009,7 +1009,7 @@ pub struct PurgeJobResponse {
 
 async fn purge_job(
     state: &ServerState,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let context = state.get_ctx();
     let record = crate::job_service::read_job_record(&context, job_id)
@@ -1074,7 +1074,7 @@ pub async fn get_purge(
 
 async fn purge_ended(
     state: &ServerState,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
 ) -> ServerResult<bool> {
     let record = crate::job_service::read_job_record(&state.get_ctx(), job_id)
         .await

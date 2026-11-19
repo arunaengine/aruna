@@ -14,9 +14,10 @@ use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::{
-    JobId, StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase,
-    StagingJobSpec, StagingWalk,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase, StagingJobSpec,
+    StagingWalk,
 };
 use aruna_core::structs::execution::source_access::{
     DigestOrigin, DigestScope, ListRequest, SourceDigest, SourceEntry, SourceEntryKind,
@@ -80,7 +81,7 @@ pub(super) fn start_prefix_walk(
     });
     // The prefix's manifest is read before its first page, so every page can look it up.
     checkpoint.manifest = spec.checksum_manifest.as_ref().map(|name| {
-        aruna_core::structs::execution::job::ManifestRead {
+        aruna_core::structs::execution::job::input::ManifestRead {
             source_path: format!("{}{name}", directory_list_path(&prefix.source_prefix)),
             offset: 0,
             observation: None,

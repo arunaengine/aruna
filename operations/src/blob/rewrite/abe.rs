@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::storage::abe::{
     AbeEffect, AbeError, AbeEvent, EnvelopePlan, envelope_charge,
 };

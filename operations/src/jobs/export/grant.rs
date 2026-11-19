@@ -16,7 +16,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::rows::{decode, decoded, read_row, values};
-use aruna_core::structs::execution::job::{ExportSelection, JobId};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::ExportSelection;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};

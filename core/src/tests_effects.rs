@@ -3,16 +3,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::compute::ExecutionTargetId;
-use crate::structs::execution::job::JobRecordEnvelope;
+use crate::structs::execution::job::family::JobRecordEnvelope;
 use crate::structs::identity::realm::RealmId;
 use ulid::Ulid;
 
 /// Test fixture shared with the event frames: one signed output record whose
 /// encoded size grows with the output count and key width.
 pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::execution::job::{
-        ExecutionOutputRecord, JobFamilyRecord, JobId, OutputObject, OutputSet, SubmissionId,
+    use crate::structs::execution::job::family::{
+        ExecutionOutputRecord, JobFamilyRecord, OutputSet, SubmissionId,
     };
+    use crate::structs::execution::job::identity::JobId;
+    use crate::structs::execution::job::local::OutputObject;
 
     let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
     let execution_id = Ulid::from_bytes([7u8; 16]);
@@ -44,7 +46,8 @@ pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvel
 
 /// One signed launch whose encoded size grows with the executor-kind width.
 pub(crate) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::execution::job::{JobFamilyRecord, JobId, LaunchIntent, SubmissionId};
+    use crate::structs::execution::job::family::{JobFamilyRecord, LaunchIntent, SubmissionId};
+    use crate::structs::execution::job::identity::JobId;
     use crate::structs::placement::record::PlacementRef;
 
     let secret = iroh::SecretKey::from_bytes(&[4u8; 32]);
@@ -76,7 +79,8 @@ pub(crate) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
 
 /// One signed receipt whose encoded size grows with the executor-kind width.
 pub(crate) fn sized_receipt(kind_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::execution::job::{ExecutionReceipt, JobFamilyRecord, JobId, SubmissionId};
+    use crate::structs::execution::job::family::{ExecutionReceipt, JobFamilyRecord, SubmissionId};
+    use crate::structs::execution::job::identity::JobId;
 
     let secret = iroh::SecretKey::from_bytes(&[6u8; 32]);
     let record = JobFamilyRecord::Receipt(Box::new(ExecutionReceipt {

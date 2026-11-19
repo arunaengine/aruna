@@ -9,7 +9,7 @@ use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{OutgoingMail, SmtpSettings};
 use aruna_core::structs::execution::email::{EmailDeliverySpec, EmailPreference};
-use aruna_core::structs::execution::job::{JobError, JobResultPayload};
+use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 

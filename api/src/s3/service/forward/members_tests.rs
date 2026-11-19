@@ -426,7 +426,8 @@ async fn copy_streams_source() {
 // A copy signed with a run's workspace credential records the run, on every copy path.
 #[tokio::test]
 async fn copy_records_run() {
-    use aruna_core::structs::execution::job::{JobId, workspace_credential_id};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::local::workspace_credential_id;
     use aruna_core::structs::storage::origin::VersionOrigin;
     let members = members(3, &["h", "p"], 0).await;
     let job_id = JobId::from_bytes([7; 16]);

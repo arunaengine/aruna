@@ -12,7 +12,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{RoCrateLimits, RoCrateUploadRecord};
+use aruna_core::structs::execution::job::input::{RoCrateLimits, RoCrateUploadRecord};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{

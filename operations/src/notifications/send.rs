@@ -11,7 +11,7 @@ use aruna_core::operation::Operation;
 use aruna_core::outbound::{
     HttpPost, MailRequest, OutboundEffect, OutboundError, OutboundEvent, OutgoingMail, SmtpSettings,
 };
-use aruna_core::structs::execution::job::JobError;
+use aruna_core::structs::execution::job::local::JobError;
 use aruna_core::structs::execution::webhook::{
     DELIVERY_HEADER, SIGNATURE_HEADER, WebhookDeliverySpec, sign_delivery,
 };

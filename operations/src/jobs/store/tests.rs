@@ -14,11 +14,15 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::identity::LEASE_INDEX_PREFIX;
+use aruna_core::structs::execution::job::input::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportRow, ImportRoCrateResult,
-    ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, LEASE_INDEX_PREFIX,
-    RoCrateLimits, encode_dedup_value, job_schedule_key, parse_schedule_key, pid_dedup_key,
+    ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, RoCrateLimits,
 };
+use aruna_core::structs::execution::job::local::{
+    encode_dedup_value, parse_schedule_key, pid_dedup_key,
+};
+use aruna_core::structs::execution::job::rows::job_schedule_key;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::persistent_id::MintPersistentSpec;
@@ -194,7 +198,7 @@ async fn adopt_spares_live() {
             live_token,
             AttemptIntent {
                 attempt_no: 0,
-                external_name: aruna_core::structs::execution::job::attempt_external_name(
+                external_name: aruna_core::structs::execution::job::local::attempt_external_name(
                     job_id, 0,
                 ),
                 executor_kind: "docker".to_string(),
@@ -1262,7 +1266,7 @@ async fn terminal_clears_dedup() {
     );
     let keys = schedule_keys(&context).await;
     assert_eq!(keys.len(), 1);
-    assert!(keys[0].starts_with(aruna_core::structs::execution::job::PRUNE_INDEX_PREFIX));
+    assert!(keys[0].starts_with(aruna_core::structs::execution::job::identity::PRUNE_INDEX_PREFIX));
 }
 
 #[tokio::test]
@@ -1647,7 +1651,7 @@ async fn terminal_enqueues_cleanup() {
     let token = Ulid::from_bytes([0xCA; 16]);
     let intent = AttemptIntent {
         attempt_no: 2,
-        external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 2),
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 2),
         executor_kind: "docker".to_string(),
         pinned_image:
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -2241,7 +2245,7 @@ async fn attempt_intent_persists() {
 
     let intent = AttemptIntent {
         attempt_no: 1,
-        external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 1),
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 1),
         executor_kind: "docker".to_string(),
         pinned_image:
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -2284,7 +2288,7 @@ async fn cancel_blocks_intent() {
 
     let intent = AttemptIntent {
         attempt_no: 0,
-        external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 0),
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 0),
         executor_kind: "docker".to_string(),
         pinned_image:
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -2314,7 +2318,7 @@ async fn cancel_blocks_running() {
         .unwrap();
     let intent = AttemptIntent {
         attempt_no: 0,
-        external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 0),
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 0),
         executor_kind: "docker".to_string(),
         pinned_image:
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -2365,7 +2369,7 @@ fn sample_launch() -> LaunchRecord {
 fn plain_intent(job_id: JobId) -> AttemptIntent {
     AttemptIntent {
         attempt_no: 0,
-        external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 0),
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 0),
         executor_kind: "docker".to_string(),
         pinned_image:
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"

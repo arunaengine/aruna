@@ -9,7 +9,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::repository::RepositoryRecord;
 use aruna_core::repository::link::{LinkDirection, LinkFailure, LinkPull, LinkRemote};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::user::id::UserId;
@@ -550,7 +550,7 @@ fn pulling() -> RepositoryLink {
     link.direction = LinkDirection::Pull(Box::new(LinkPull {
         auto_update: false,
         options: Default::default(),
-        target: aruna_core::structs::execution::job::ImportRoCrateTarget {
+        target: aruna_core::structs::execution::job::input::ImportRoCrateTarget {
             bucket: "research".into(),
             prefix: "zenodo".into(),
         },

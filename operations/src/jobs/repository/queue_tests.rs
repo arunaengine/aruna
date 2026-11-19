@@ -307,7 +307,7 @@ fn limited_push_retries() {
 fn queued_job(job_id: JobId) -> JobRecord {
     JobRecord::new(
         job_id,
-        aruna_core::structs::execution::job::JobPayload::Probe {
+        aruna_core::structs::execution::job::input::JobPayload::Probe {
             steps: 1,
             step_sleep_ms: 0,
             fail_at: None,

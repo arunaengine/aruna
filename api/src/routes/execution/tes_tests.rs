@@ -12,7 +12,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{JobError, OutputObject};
+use aruna_core::structs::execution::job::local::{JobError, OutputObject};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
@@ -232,7 +232,7 @@ fn maps_submit_errors() {
     // must keep the status the native submit surface answers with.
     use aruna_core::compute::quota::{QuotaDenied, QuotaDimension, QuotaScope};
     use aruna_core::job_request::SubmitJobError;
-    use aruna_core::structs::execution::job::CompositionError;
+    use aruna_core::structs::execution::job::input::CompositionError;
     use aruna_core::structured_id::clock_health::ClockHealthError;
 
     let cases = [
@@ -1008,10 +1008,11 @@ fn view_projections() {
 /// The replicated family behind one succeeded distributed task.
 fn family_fixture() -> aruna_operations::jobs::lifecycle::report::FamilyReport {
     use aruna_core::jobs::{JobKind, JobStatusView};
-    use aruna_core::structs::execution::job::{
-        EffectiveResources, JobAdmissionRecord, JobProgress, JobRetryPolicy, LogicalJobSpec,
-        LogicalJobState, OutputObject, SubmissionId, WorkspaceMode,
+    use aruna_core::structs::execution::job::family::{
+        EffectiveResources, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
+        SubmissionId,
     };
+    use aruna_core::structs::execution::job::local::{JobProgress, OutputObject, WorkspaceMode};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_operations::jobs::lifecycle::report::FamilyReport;
@@ -1056,7 +1057,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::report::FamilyReport {
         group_id: payload.group_id,
         created_by,
         created_at_ms: 10,
-        retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
+        retention_ms: aruna_core::structs::execution::job::identity::RETENTION_MS,
         payload,
         request_digest: [7u8; 32],
         spec_digest: [8u8; 32],
@@ -1159,11 +1160,11 @@ fn family_pins_inputs() {
         name: None,
         description: None,
     }];
-    report.spec.captured_inputs = vec![aruna_core::structs::execution::job::CapturedInput {
+    report.spec.captured_inputs = vec![aruna_core::structs::execution::job::input::CapturedInput {
         destination_key: "dir/a.txt".to_string(),
         source_node_id: holder,
         version_id: version,
-        content: aruna_core::structs::execution::job::InputContent::Blake3([1; 32]),
+        content: aruna_core::structs::execution::job::input::InputContent::Blake3([1; 32]),
         bytes: 1,
         policies: Vec::new(),
         source_group_id: Ulid::from_bytes([5u8; 16]),
@@ -1192,7 +1193,7 @@ fn family_pins_inputs() {
 #[test]
 fn family_preserves_versions() {
     // TES preserves canonical output versions and reports none before canonical success.
-    use aruna_core::structs::execution::job::LogicalJobState;
+    use aruna_core::structs::execution::job::family::LogicalJobState;
 
     let report = family_fixture();
     let version_id = Ulid::from_bytes([9u8; 16]);
@@ -1940,11 +1941,11 @@ fn projects_input_identity() {
         unpinned.inputs[0].url.as_deref(),
         Some("s3://src/in/data.csv")
     );
-    record.captured_inputs = vec![aruna_core::structs::execution::job::CapturedInput {
+    record.captured_inputs = vec![aruna_core::structs::execution::job::input::CapturedInput {
         destination_key: "in/data.csv".to_string(),
         source_node_id: holder,
         version_id: version,
-        content: aruna_core::structs::execution::job::InputContent::Blake3([1; 32]),
+        content: aruna_core::structs::execution::job::input::InputContent::Blake3([1; 32]),
         bytes: 1,
         policies: Vec::new(),
         source_group_id: Ulid::from_bytes([5u8; 16]),

@@ -36,7 +36,7 @@ use aruna_core::placement::resolver::{
 use aruna_core::placement::transition::{TransitionRequest, plan_transition};
 use aruna_core::placement::{bucket_membership, choose_origin_bucket, resolve_shard_holders};
 use aruna_core::reducer::AdminDocumentState;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, TokenClaims};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{

@@ -4,7 +4,8 @@
 
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
 use crate::id::NodeId;
-use crate::structs::execution::job::{EffectiveResources, InputContent, SubmissionId};
+use crate::structs::execution::job::family::{EffectiveResources, SubmissionId};
+use crate::structs::execution::job::input::InputContent;
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::compute_config::ComputeConfigError;
 use crate::structs::placement::policy::{

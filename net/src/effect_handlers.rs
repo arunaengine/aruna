@@ -15,7 +15,7 @@ use aruna_core::events::{
 };
 use aruna_core::id::{DhtKeyId, hex_prefix};
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::execution::job::{ExecutionClaim, JobRecordEnvelope};
+use aruna_core::structs::execution::job::family::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::delegation::{Delegation, SignedDelegation};
 use aruna_core::structs::storage::distribution::snapshot::{SignedSnapshot, SnapshotClaim};
@@ -711,7 +711,7 @@ mod tests {
     // Only a record naming this node as publisher is signed, and its signature verifies.
     #[test]
     fn signs_own_execution() {
-        use aruna_core::structs::execution::job::{
+        use aruna_core::structs::execution::job::family::{
             ExecutionUpdate, JobFamilyRecord, PhysicalExecutionState, SubmissionId,
         };
         let key = iroh::SecretKey::from_bytes(&[3; 32]);

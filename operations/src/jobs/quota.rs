@@ -14,7 +14,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::ADMISSION_QUOTA_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::EffectiveResources;
+use aruna_core::structs::execution::job::family::EffectiveResources;
 use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::node_info::AdvertisementEpoch;

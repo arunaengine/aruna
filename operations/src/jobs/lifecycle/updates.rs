@@ -14,10 +14,13 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::JOB_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::{
-    ExecutionClaim, ExecutionUpdate, JobErrorKind, JobFamilyRecord, JobId, JobRecord,
-    JobRecordBody, JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState,
-    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage, job_record_key,
+use aruna_core::structs::execution::job::family::{
+    ExecutionClaim, ExecutionUpdate, JobFamilyRecord, JobRecordBody, JobRecordEnvelope,
+    JobRecordKind, PhysicalExecutionResult, PhysicalExecutionState, ResultMessage,
+};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::local::{
+    JobErrorKind, JobRecord, JobResultPayload, job_record_key,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -629,9 +632,10 @@ mod pure_tests {
     use super::*;
     use crate::tests::records::{Family, node, payload, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{
-        EffectiveResources, ExecutionReceipt, JobError, JobId, JobPayload,
-    };
+    use aruna_core::structs::execution::job::family::{EffectiveResources, ExecutionReceipt};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::JobError;
     use aruna_core::types::Value;
 
     fn child<T, E>(result: Result<T, E>) -> IoResult

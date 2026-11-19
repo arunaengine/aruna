@@ -16,8 +16,9 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::JobKind;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::request_policy::PolicyRequestExtras;
-use aruna_core::structs::execution::job::{
-    CompositionError, ExportReportRow, ImportReportRow, JobId, SYSTEM_ENTRY_PREFIX,
+use aruna_core::structs::execution::job::identity::{JobId, SYSTEM_ENTRY_PREFIX};
+use aruna_core::structs::execution::job::input::{
+    CompositionError, ExportReportRow, ImportReportRow,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
@@ -1139,7 +1140,7 @@ fn decode_report_row(
             serde_json::to_value(row)
         }
         JobKind::Execution => {
-            use aruna_core::structs::execution::job::{SessionReportDetail, SessionReportRow};
+            use aruna_core::structs::execution::job::input::{SessionReportDetail, SessionReportRow};
 
             let row: SessionReportRow = postcard::from_bytes(value)
                 .map_err(|error| ServerError::InternalError(error.into()))?;

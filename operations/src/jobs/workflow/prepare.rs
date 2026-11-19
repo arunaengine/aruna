@@ -15,7 +15,8 @@ use aruna_core::compute::{
 };
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{ExecutionSpec, JobError, JobRecord, WorkspaceMode};
+use aruna_core::structs::execution::job::input::ExecutionSpec;
+use aruna_core::structs::execution::job::local::{JobError, JobRecord, WorkspaceMode};
 
 use super::DEFAULT_WALLTIME;
 use super::compute::{compute_answer, compute_call};

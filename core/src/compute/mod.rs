@@ -23,7 +23,7 @@ use crate::effects::{Effect, NetEffect};
 use crate::events::{Event, NetEvent};
 use crate::id::NodeId;
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::execution::job::EffectiveResources;
+use crate::structs::execution::job::family::EffectiveResources;
 use crate::structs::placement::policy::{MAX_KIND_LEN, PlacementPolicyError, PlacementSubject};
 
 pub mod effect;

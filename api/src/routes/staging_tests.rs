@@ -445,7 +445,9 @@ async fn batch_rejects_node() {
 // Every job store state reads as itself or its collapsed class; nothing settled reads as running.
 #[test]
 fn job_states_mapped() {
-    use aruna_core::structs::execution::job::{JobId, JobRecord, StagingJobSpec};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::StagingJobSpec;
+    use aruna_core::structs::execution::job::local::JobRecord;
     let realm_id = aruna_core::structs::identity::realm::RealmId([1; 32]);
     let user_id = UserId::new(Ulid::from_bytes([2; 16]), realm_id);
     let spec = StagingJobSpec {

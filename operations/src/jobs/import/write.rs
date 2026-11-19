@@ -9,7 +9,7 @@ use aruna_core::jobs::{ArchiveEntryRead, ByteStream, JobEffect, JobEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::ImportReportRow;
+use aruna_core::structs::execution::job::input::ImportReportRow;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -204,7 +204,7 @@ impl WriteEntryOperation {
         if put.version_id != entry.version_id {
             let mut row = entry_report(&entry);
             row.entry_key = format!("divergent/{}", entry.path);
-            row.code = aruna_core::structs::execution::job::ReasonCode::Failed;
+            row.code = aruna_core::structs::execution::job::input::ReasonCode::Failed;
             row.message = Some(format!(
                 "object write returned version {} instead of the planned {}; \
                  the written version was left in place",
@@ -448,7 +448,7 @@ impl Operation for WriteEntryOperation {
                 written(result)?;
                 let code = self.entry()?.code;
                 let checkpoint = &mut self.checkpoint;
-                use aruna_core::structs::execution::job::ReasonCode;
+                use aruna_core::structs::execution::job::input::ReasonCode;
                 match code {
                     ReasonCode::Imported => {
                         checkpoint.imported = checkpoint.imported.saturating_add(1)

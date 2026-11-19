@@ -5,7 +5,7 @@
 
 use aruna_core::effects::FrameBoundsError;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::structs::execution::job::JobRecordError;
+use aruna_core::structs::execution::job::family::JobRecordError;
 use aruna_core::structs::identity::realm::JobFamilyError;
 use thiserror::Error;
 

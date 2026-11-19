@@ -8,9 +8,13 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
-use aruna_core::structs::execution::job::{
-    CopyJobSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
-    StagingJobCheckpoint, StagingJobSpec, WorkspaceMode, pid_dedup_key, user_dedup_key,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CopyJobSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobPayload, StagingJobCheckpoint,
+    StagingJobSpec,
+};
+use aruna_core::structs::execution::job::local::{
+    JobRecord, WorkspaceMode, pid_dedup_key, user_dedup_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::persistent_id::MintPersistentSpec;

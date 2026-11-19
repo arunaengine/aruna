@@ -9,10 +9,9 @@ use aruna_core::jobs::ProgressReporter;
 use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 use aruna_core::search::ObjectKeyMatch;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::StagingJobSpec;
-use aruna_core::structs::execution::job::{
-    JobClaim, JobId, JobPayload, JobProgress, JobRecord, StagingJobPrefix,
-};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{JobPayload, StagingJobPrefix, StagingJobSpec};
+use aruna_core::structs::execution::job::local::{JobClaim, JobProgress, JobRecord};
 use aruna_core::structs::execution::source_access::{
     ResolvedSourceAccess, ResolvedSourceConnector, SourceMetadata,
 };
@@ -651,9 +650,9 @@ pub async fn write_object(
 }
 
 /// A staging spec with one reference prefix that the staging tests vary.
-pub fn test_spec() -> aruna_core::structs::execution::job::StagingJobSpec {
+pub fn test_spec() -> aruna_core::structs::execution::job::input::StagingJobSpec {
     let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
-    aruna_core::structs::execution::job::StagingJobSpec {
+    aruna_core::structs::execution::job::input::StagingJobSpec {
         auth_context: aruna_core::structs::identity::auth::AuthContext {
             user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([2; 16]), realm_id),
             realm_id,
@@ -671,7 +670,7 @@ pub fn test_spec() -> aruna_core::structs::execution::job::StagingJobSpec {
         ),
         strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
         items: Vec::new(),
-        prefixes: vec![aruna_core::structs::execution::job::StagingJobPrefix {
+        prefixes: vec![aruna_core::structs::execution::job::input::StagingJobPrefix {
             source_prefix: "refseq".to_string(),
             target_prefix: String::new(),
         }],

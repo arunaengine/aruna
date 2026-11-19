@@ -394,7 +394,7 @@ mod tests {
     // A key under a permanent purge gets no successor; the refresh fails and is retried.
     #[test]
     fn purge_fence_suspends() {
-        use aruna_core::structs::execution::job::JobId;
+        use aruna_core::structs::execution::job::identity::JobId;
         use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
         let version_id = Ulid::from_bytes([2; 16]);
         let mut operation = mint(version_id);

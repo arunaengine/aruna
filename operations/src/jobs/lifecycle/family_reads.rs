@@ -10,10 +10,13 @@ use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::{Operation, boxed_retry};
-use aruna_core::structs::execution::job::{
-    ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobProjection, JobRecord,
-    JobRecordEnvelope, LogicalJobSpec, PhysicalExecutionState, ProjectedExecution,
+use aruna_core::structs::execution::job::family::{
+    ExecutionRole, JobFamilyId, JobFamilyRecord, JobProjection, JobRecordEnvelope, LogicalJobSpec,
+    PhysicalExecutionState, ProjectedExecution,
 };
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::user::id::UserId;

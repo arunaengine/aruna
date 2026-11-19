@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::federation::Signed;
-use aruna_core::structs::execution::job::{ExportSelection, JobId};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::ExportSelection;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::transfer::{ExportGrant, GrantError, GrantRecord};

@@ -964,7 +964,7 @@ mod tests {
         use aruna_api::cors::CorsConfig;
         use aruna_api::s3::server::{S3Server, S3ServerTimeouts};
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_drivers::driver::DriverContext;
         use std::sync::Arc;

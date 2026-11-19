@@ -17,7 +17,9 @@ use aruna_core::repository::link::{
 };
 use aruna_core::repository::remote::NodeScope;
 use aruna_core::rows::PrefixPages;
-use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::ExportRoCrateSpec;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::TaskEvent;

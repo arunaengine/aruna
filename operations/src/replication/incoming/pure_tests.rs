@@ -33,7 +33,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::replication_protocol::{
     MAX_VALUE_BYTES, MaterializedBlobInfo, VersionReplicationManifest, VersionReplicationMessage,
 };
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};

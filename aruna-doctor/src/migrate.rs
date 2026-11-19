@@ -37,13 +37,13 @@ use aruna_core::realm_vault::RealmVaultRecord;
 use aruna_core::secrets::SecretRecord;
 use aruna_core::structs::execution::email::RealmEmailProfile;
 use aruna_core::structs::execution::harvest::HarvestSource;
-use aruna_core::structs::execution::job::record_rows::{
-    ConflictRecord, PendingNeed, PendingRecord,
-};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+};
+use aruna_core::structs::execution::job::record_rows::{
+    ConflictRecord, PendingNeed, PendingRecord,
 };
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
@@ -1076,12 +1076,12 @@ mod tests {
         FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::node_vault::NodeVaultKey;
-    use aruna_core::structs::execution::job::record_rows::{
-        PendingNeed, PendingRecord, ProjectionCache,
-    };
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::family::{
         ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
+    };
+    use aruna_core::structs::execution::job::record_rows::{
+        PendingNeed, PendingRecord, ProjectionCache,
     };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};

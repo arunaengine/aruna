@@ -11,9 +11,10 @@ use aruna_core::effects::{JobRecordFrame, ReceiptFrame};
 use aruna_core::events::LaunchDecline;
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordKind, LaunchIntent,
-};
+use aruna_core::structs::execution::job::family::{JobFamilyRecord, JobRecordKind, LaunchIntent};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::types::Key;
 use tokio::sync::Barrier;
 use ulid::Ulid;

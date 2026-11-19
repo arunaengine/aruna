@@ -20,7 +20,8 @@ use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, DELETE_CLAIM_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE, RENAMED_ROW_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{JobError, JobId};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::JobError;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, BackendImportSpec, ExternalObject, ImportedObject,
     PathIdentity, WriteIntent, object_key, version_key,

@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::types::Key;
 

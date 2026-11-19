@@ -6,10 +6,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use aruna_core::archive_path::{KeyLayout, StorageKey, safe_zip_path, synthesized_path};
 use aruna_core::metadata::MetadataValidationViolation;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::input::{
     ArtifactRef, ExportOmissionCounts, ExportReportDetail, ExportReportRow, ExportRoCrateSpec,
-    JobError, ReasonCode,
+    ReasonCode,
 };
+use aruna_core::structs::execution::job::local::JobError;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::data::identity::{DataIdentity, ObjectLocation, content_id};
 use oxrdf::{NamedOrBlankNode, Term};

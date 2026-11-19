@@ -24,7 +24,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobResultPayload};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
@@ -1336,7 +1338,7 @@ async fn purge_keeps_released() {
     assert!(row().await.is_some());
 
     // The failed file purge ends, which drops its fence; a bucket purge then checks alike.
-    let error = aruna_core::structs::execution::job::JobError::permanent("pinned");
+    let error = aruna_core::structs::execution::job::local::JobError::permanent("pinned");
     fail_job(
         &context.driver,
         job.job_id,

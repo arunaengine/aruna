@@ -369,7 +369,7 @@ async fn holder_copy_refuses() {
         last_push: None,
         active_job: None,
         sequence: 0,
-        limits: aruna_core::structs::execution::job::RoCrateLimits::default(),
+        limits: aruna_core::structs::execution::job::input::RoCrateLimits::default(),
         created_at: now,
         updated_at: now,
         generation: 1,
@@ -714,7 +714,7 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
         last_push: None,
         active_job: None,
         sequence: 0,
-        limits: aruna_core::structs::execution::job::RoCrateLimits::default(),
+        limits: aruna_core::structs::execution::job::input::RoCrateLimits::default(),
         created_at: now,
         updated_at: now,
         generation: 0,
@@ -723,7 +723,7 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
         direction: LinkDirection::Pull(Box::new(LinkPull {
             auto_update: false,
             options: Default::default(),
-            target: aruna_core::structs::execution::job::ImportRoCrateTarget {
+            target: aruna_core::structs::execution::job::input::ImportRoCrateTarget {
                 bucket: "research".into(),
                 prefix: "zenodo".into(),
             },

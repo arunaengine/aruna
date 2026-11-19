@@ -999,7 +999,7 @@ mod tests {
                 Ulid::from_bytes([4; 16]),
                 aruna_core::structs::identity::realm::RealmId([5; 32]),
             ),
-            aruna_core::structs::execution::job::JobId::from_bytes([6; 16]),
+            aruna_core::structs::execution::job::identity::JobId::from_bytes([6; 16]),
             false,
             "/private/document".to_string(),
             aruna_core::structs::persistent_id::PersistentIdRevision {
@@ -1101,7 +1101,7 @@ mod tests {
             document_id,
             false,
             user_id,
-            aruna_core::structs::execution::job::JobId::from_bytes([6; 16]),
+            aruna_core::structs::execution::job::identity::JobId::from_bytes([6; 16]),
             frozen,
             path.clone(),
             revision,

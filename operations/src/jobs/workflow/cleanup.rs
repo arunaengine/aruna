@@ -6,8 +6,9 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::effect::{ComputeAnswer, ComputeRequest};
 use aruna_core::compute::{BackendError, ExecutorKind, FenceContext, TombstoneSpec};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    AttemptControl, AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, AttemptIntent, JobError, JobErrorKind, JobResultPayload,
 };
 use aruna_core::structs::storage::blob::UserAccess;
 use ulid::Ulid;
@@ -285,9 +286,10 @@ mod tests {
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USER_ACCESS_KEYSPACE};
-    use aruna_core::structs::execution::job::{
-        ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobProgress, JobRecord, JobState,
-        WorkspaceMode,
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::{
+        JobClaim, JobProgress, JobRecord, WorkspaceMode,
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{

@@ -20,7 +20,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::rows::{SettleMarkerOperation, read_row};
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::accounting::{

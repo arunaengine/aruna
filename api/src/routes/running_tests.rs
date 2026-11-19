@@ -7,7 +7,7 @@ use crate::server::state::ServerState;
 use crate::tests::routes::{seed_group_docs, test_storage};
 use aruna_core::jobs::{JobKind, JobTarget, RunningJobView};
 use aruna_core::keys::generate_signing_key;
-use aruna_core::structs::execution::job::JobProgress;
+use aruna_core::structs::execution::job::local::JobProgress;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::user::id::UserId;

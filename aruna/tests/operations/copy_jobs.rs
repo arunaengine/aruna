@@ -8,8 +8,9 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::jobs::ProgressReporter;
-use aruna_core::structs::execution::job::{CopyJobSpec, JobResultPayload};
-use aruna_core::structs::execution::job::{JobErrorKind, JobId, JobProgress};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::CopyJobSpec;
+use aruna_core::structs::execution::job::local::{JobErrorKind, JobProgress, JobResultPayload};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{

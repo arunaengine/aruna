@@ -11,9 +11,11 @@ use aruna_core::repository::link::{
 use aruna_core::repository::remote::NodeScope;
 use aruna_core::repository::{RepositoryPull, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{
-    ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobRecord, JobState,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
 };
+use aruna_core::structs::execution::job::local::JobRecord;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

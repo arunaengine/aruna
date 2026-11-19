@@ -14,8 +14,10 @@ use aruna_core::compute::{
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobEvent, JobStops};
-use aruna_core::structs::execution::job::{
-    AttemptControl, AttemptIntent, ExecutionSpec, JobClaim, JobId, JobPayload, JobRecord,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, AttemptIntent, JobClaim, JobRecord,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::routing::NodeRouting;

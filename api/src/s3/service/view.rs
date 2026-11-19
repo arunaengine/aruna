@@ -3,7 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::{JobId, JobRecord};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_drivers::driver::drive;
 use aruna_drivers::position::{open_cursor, seal_cursor};

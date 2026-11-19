@@ -17,7 +17,7 @@ use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, OBJECT_METADATA_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
@@ -1574,7 +1574,7 @@ mod tests {
         use crate::blob::promote::tests::received::{fixture, pending};
         use aruna_core::events::BlobEvent;
         use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::storage::blob::{ArchiveKey, HashIndex};
 
         let (_temp, context, plan, _) = fixture().await;

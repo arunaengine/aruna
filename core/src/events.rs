@@ -697,7 +697,7 @@ pub enum StatementSignEvent {
 /// that names this node as publisher.
 #[derive(Debug, PartialEq)]
 pub enum ExecutionSignEvent {
-    Signed(Box<crate::structs::execution::job::JobRecordEnvelope>),
+    Signed(Box<crate::structs::execution::job::family::JobRecordEnvelope>),
     Unavailable(String),
 }
 

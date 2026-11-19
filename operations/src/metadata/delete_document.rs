@@ -477,7 +477,7 @@ mod call_tests {
         DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, METADATA_AUDIT_KEYSPACE,
         PRUNE_JOB_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
     };
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
     use aruna_core::structs::persistent_id::PersistentIdStatus;
     use aruna_core::structs::placement::record::PlacementStrategy;

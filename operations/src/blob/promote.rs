@@ -18,7 +18,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::abe::EnvelopeArchive;
 use aruna_core::structs::storage::blob::{

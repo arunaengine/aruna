@@ -5,10 +5,10 @@
 use std::collections::BTreeMap;
 
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordError, JobRecordKey, LocalExecution,
-    RecordVerdict,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKey, LocalExecution, RecordVerdict,
 };
+use aruna_core::structs::execution::job::identity::JobId;
 use tracing::warn;
 
 use super::verify::{EvidenceSet, FamilyView};

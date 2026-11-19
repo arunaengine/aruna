@@ -17,9 +17,9 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::jobs::{JobReport, JobStops};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    JobError, JobExecutionClass, JobId, JobPayload, JobRecord, JobState,
-};
+use aruna_core::structs::execution::job::identity::{JobExecutionClass, JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{JobError, JobRecord};
 use aruna_core::task::TaskEvent;
 use futures_util::future::{BoxFuture, FutureExt};
 use tokio::sync::RwLockReadGuard;

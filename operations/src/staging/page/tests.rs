@@ -15,9 +15,9 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{
-    JobClaim, JobId, JobPayload, JobRecord, StagingJobCheckpoint, StagingJobPhase,
-};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{JobPayload, StagingJobCheckpoint, StagingJobPhase};
+use aruna_core::structs::execution::job::local::{JobClaim, JobRecord};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::{
     SourceConnector, SourceConnectorKind, SourceConnectorSecret,
@@ -171,7 +171,7 @@ fn record(claim_token: Ulid) -> JobRecord {
 }
 
 fn claim(record: &JobRecord) -> Option<Value> {
-    let guard = aruna_core::structs::execution::job::ClaimGuard::of(record)?;
+    let guard = aruna_core::structs::execution::job::rows::ClaimGuard::of(record)?;
     value(guard.to_bytes().unwrap())
 }
 

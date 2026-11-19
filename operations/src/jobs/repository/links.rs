@@ -21,7 +21,7 @@ use aruna_core::repository::link::{
 };
 use aruna_core::rows::values;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use ulid::Ulid;

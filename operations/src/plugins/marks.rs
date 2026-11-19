@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

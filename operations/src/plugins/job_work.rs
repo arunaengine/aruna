@@ -10,9 +10,9 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
-use aruna_core::structs::execution::job::{
-    JobId, JobPayload, JobRecord, PluginWorkSpec, RETENTION_MS, WorkspaceMode,
-};
+use aruna_core::structs::execution::job::identity::{JobId, RETENTION_MS};
+use aruna_core::structs::execution::job::input::{JobPayload, PluginWorkSpec};
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::user::id::UserId;
 use aruna_plugin_types::calls::{ErrorKind, Field, HostError, JobStatus};

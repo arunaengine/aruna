@@ -29,11 +29,13 @@ use aruna_core::keyspaces::{
     ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
     ExportRoCrateSpec, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
-    ImportRoCrateSpec, ImportRoCrateTarget, JobErrorKind, JobId, JobPayload, JobRecord,
-    JobResultPayload, ReasonCode, RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord,
+    ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, ReasonCode, RoCrateLimits, RoCrateMediaType,
+    RoCrateUploadRecord,
 };
+use aruna_core::structs::execution::job::local::{JobErrorKind, JobRecord, JobResultPayload};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -2239,7 +2241,7 @@ async fn triple_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 
 async fn artifact_bytes(
     fixture: &Fixture,
-    artifact: &aruna_core::structs::execution::job::ArtifactRef,
+    artifact: &aruna_core::structs::execution::job::input::ArtifactRef,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut read =
         read_artifact_range(fixture.context.as_ref(), artifact, 0..artifact.size).await?;

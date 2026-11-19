@@ -17,7 +17,7 @@ use super::ImportMode;
 use crate::credential_encryption::CredentialEncryptionKey;
 use crate::id::NodeId;
 use crate::structs::checksum::Hasher;
-use crate::structs::execution::job::{ArtifactRef, RoCrateLimits};
+use crate::structs::execution::job::input::{ArtifactRef, RoCrateLimits};
 use crate::structs::execution::source_access::SourceMetadata;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::BackendLocation;

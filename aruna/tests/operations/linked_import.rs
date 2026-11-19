@@ -19,7 +19,9 @@ use aruna_core::keyspaces::{
     GROUP_KEYSPACE, IMPORT_INTENT_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobResultPayload};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{

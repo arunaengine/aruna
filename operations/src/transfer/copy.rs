@@ -1640,7 +1640,7 @@ pub(crate) mod test {
         // A reference of a locked encrypting bucket is not preserved into another bucket, where
         // its external bytes would be readable without the source's key.
         use aruna_core::compute::{SecretBytes, SharedSecret};
-        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::storage::encryption::{
             BucketKeyError, EncryptionMode, TokenCredential,
         };

@@ -15,10 +15,11 @@ use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::native_reference::GrantedBody;
 use aruna_core::operation::Operation;
 use aruna_core::stream::ByteStream;
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputContent, InputMode, InputSelection, InputSource, JobId, JobPayload,
-    JobRecord, credential_job_id,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, InputContent, InputMode, InputSelection, InputSource, JobPayload,
 };
+use aruna_core::structs::execution::job::local::{JobRecord, credential_job_id};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketEncryption;
@@ -858,7 +859,7 @@ mod tests {
         assert_eq!(decode_token("in-a", &token).as_deref(), Some("db/sub/"));
         assert_eq!(decode_token("in-b", &token), None);
         let job = JobId::from_bytes([3; 16]);
-        let access = aruna_core::structs::execution::job::workspace_credential_id(job);
+        let access = aruna_core::structs::execution::job::local::workspace_credential_id(job);
         assert_eq!(view_job(&access, &view_bucket(job)), Some(job));
         assert_eq!(view_job(&access, "in-other"), None);
         assert_eq!(view_job("AKIAOTHER", &view_bucket(job)), None);

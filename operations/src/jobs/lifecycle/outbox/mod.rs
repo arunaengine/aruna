@@ -18,7 +18,7 @@ use aruna_core::events::{
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::FAMILY_OUTBOX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobRecordKey;
+use aruna_core::structs::execution::job::family::JobRecordKey;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskKey};
 use tracing::{debug, warn};
@@ -307,7 +307,7 @@ mod tests {
     fn config(family: &Family, holders: Vec<NodeId>) -> PublishRecordConfig {
         let envelope = family.sign(
             &family.holder,
-            aruna_core::structs::execution::job::JobFamilyRecord::Spec(Box::new(family.spec())),
+            aruna_core::structs::execution::job::family::JobFamilyRecord::Spec(Box::new(family.spec())),
         );
         let key = envelope.key();
         PublishRecordConfig {

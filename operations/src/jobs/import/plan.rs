@@ -12,9 +12,8 @@ use aruna_core::operation::Operation;
 use aruna_core::rocrate_archive::{
     ArchiveInspection, file_id_candidates, payload_entries, signature_entry,
 };
-use aruna_core::structs::execution::job::{
-    ImportReportDetail, ImportReportRow, ReasonCode, rocrate_plan_key,
-};
+use aruna_core::structs::execution::job::input::{ImportReportDetail, ImportReportRow, ReasonCode};
+use aruna_core::structs::execution::job::local::rocrate_plan_key;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::distribution::hint::{SetHint, with_hint};

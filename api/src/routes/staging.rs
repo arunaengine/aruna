@@ -22,10 +22,12 @@ use aruna_core::id::NodeId;
 use aruna_core::job_request::SubmitJobError;
 use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 use aruna_core::staging_checkpoint::ReadCheckpointOperation;
-use aruna_core::structs::execution::job::{
-    JobPayload, JobRecord, JobState, StagingJobCheckpoint, StagingJobItem, StagingJobPhase,
-    StagingJobPrefix, StagingJobSpec,
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::execution::job::input::{
+    JobPayload, StagingJobCheckpoint, StagingJobItem, StagingJobPhase, StagingJobPrefix,
+    StagingJobSpec,
 };
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::execution::source_access::{ListRequest, SourceEntry, SourceEntryKind};
 use aruna_core::structs::execution::staging::{SourceMapping, StagingStrategy};
 use aruna_core::structs::execution::table::{
@@ -1111,7 +1113,7 @@ pub async fn get_staging_job(
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     AxumPath(job_id): AxumPath<String>,
 ) -> ServerResult<(StatusCode, Json<StagingJobResponse>)> {
-    let job_id = aruna_core::structs::execution::job::JobId::from_str(&job_id)
+    let job_id = aruna_core::structs::execution::job::identity::JobId::from_str(&job_id)
         .map_err(|_| ServerError::BadRequest)?;
     // The owner is the sole 404 authority; a non-owner routes or reports 503.
     let (record, checkpoint) = read_staging_routed(

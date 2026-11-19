@@ -9,8 +9,9 @@ use crate::calls::{IoCall, IoError, IoResult, Next};
 use crate::keyspaces::STAGING_STATE_KEYSPACE;
 use crate::operation::Operation;
 use crate::rows::values;
-use crate::structs::execution::job::{
-    JobId, ManifestRead, StagingJobCheckpoint, StagingJobPhase, StagingJobSpec,
+use crate::structs::execution::job::identity::JobId;
+use crate::structs::execution::job::input::{
+    ManifestRead, StagingJobCheckpoint, StagingJobPhase, StagingJobSpec,
 };
 use crate::types::{Key, Value};
 

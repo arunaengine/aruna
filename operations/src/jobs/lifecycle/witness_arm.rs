@@ -12,10 +12,10 @@ use aruna_core::keyspaces::{DEADLINE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
 use aruna_core::scheduling::ExecutionPlan;
-use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind,
 };
+use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn deadlines_ordered() {
         let family = JobFamilyId {
-            submission_id: aruna_core::structs::execution::job::SubmissionId([1; 32]),
+            submission_id: aruna_core::structs::execution::job::family::SubmissionId([1; 32]),
             request_digest: [2; 32],
         };
         assert!(deadline_key(&family, 1) < deadline_key(&family, 2));

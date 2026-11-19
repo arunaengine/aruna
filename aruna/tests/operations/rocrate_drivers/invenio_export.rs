@@ -182,7 +182,7 @@ async fn invenio_export_recovers() -> Result<(), Box<dyn std::error::Error>> {
         match run_export_job(&ctx, &spec).await {
             JobRunOutcome::Failed(error) => assert_eq!(
                 error.kind,
-                aruna_core::structs::execution::job::JobErrorKind::Retryable
+                aruna_core::structs::execution::job::local::JobErrorKind::Retryable
             ),
             _ => panic!("lost repository response did not request a retry"),
         }
@@ -267,7 +267,7 @@ async fn invenio_retries_versions() -> Result<(), Box<dyn std::error::Error>> {
     match run_export_job(&ctx, &spec).await {
         JobRunOutcome::Failed(error) => assert_eq!(
             error.kind,
-            aruna_core::structs::execution::job::JobErrorKind::Retryable
+            aruna_core::structs::execution::job::local::JobErrorKind::Retryable
         ),
         _ => panic!("unavailable source record did not request a retry"),
     }
@@ -336,7 +336,7 @@ async fn invenio_recovers_metadata() -> Result<(), Box<dyn std::error::Error>> {
         match run_export_job(&ctx, &spec).await {
             JobRunOutcome::Failed(error) => assert_eq!(
                 error.kind,
-                aruna_core::structs::execution::job::JobErrorKind::Retryable
+                aruna_core::structs::execution::job::local::JobErrorKind::Retryable
             ),
             _ => panic!("lost metadata reply did not fail"),
         }

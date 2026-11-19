@@ -12,7 +12,7 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::jobs::{JobEffect, JobEvent, JobReport};
 use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobResultPayload;
+use aruna_core::structs::execution::job::local::JobResultPayload;
 use aruna_core::structs::storage::backend_import::{BackendImportCheckpoint, ExternalObject};
 use aruna_core::structs::storage::blob::BackendRef;
 use byteview::ByteView;

@@ -4,7 +4,7 @@
 
 use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use aruna_core::compute::{AttemptPhase, ExecutorKind};
-use aruna_core::structs::execution::job::ExecutionSpec;
+use aruna_core::structs::execution::job::input::ExecutionSpec;
 
 use super::super::fixtures::{
     child, compute, is_child, job, record, scope_of, spec, status, stops, token,

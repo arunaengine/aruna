@@ -5,10 +5,11 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    EffectiveResources, ExecutionReceipt, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope,
+use aruna_core::structs::execution::job::family::{
+    EffectiveResources, ExecutionReceipt, JobFamilyRecord, JobRecordBody, JobRecordEnvelope,
     JobRecordKind, PhysicalExecutionState,
 };
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 

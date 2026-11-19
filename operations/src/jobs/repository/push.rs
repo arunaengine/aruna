@@ -10,7 +10,9 @@ use aruna_core::repository::link::{LinkStatus, LinkTarget, PushOutcome, Reposito
 use aruna_core::repository::remote::NodeScope;
 use aruna_core::repository::{RepositoryDestination, RepositoryRecord};
 use aruna_core::rows::{decode, encode, values};
-use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobError, JobErrorKind, JobId};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::ExportRoCrateSpec;
+use aruna_core::structs::execution::job::local::{JobError, JobErrorKind};
 use aruna_core::structs::identity::auth::AuthContext;
 use byteview::ByteView;
 use ulid::Ulid;

@@ -10,10 +10,12 @@ use aruna_core::calls::IoError;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::WaitTarget;
 use aruna_core::metadata::MetadataValidationViolation;
-use aruna_core::structs::execution::job::{
-    ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, JobId, KeyWait,
-    ReasonCode, RoCrateCheckpointRefs,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, ReasonCode,
+    RoCrateCheckpointRefs,
 };
+use aruna_core::structs::execution::job::key_wait::KeyWait;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;

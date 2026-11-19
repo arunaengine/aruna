@@ -25,10 +25,13 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{
-    AttemptControl, AttemptIntent, CapturedInput, ExecutionSpec, InputMode, InputSelection,
-    InputSource, JobClaim, JobError, JobId, JobPayload, JobRecord, JobState, OutputDestination,
-    OutputObject, OutputSelection, WorkspaceMode,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ExecutionSpec, InputMode, InputSelection, InputSource, JobPayload,
+    OutputDestination, OutputSelection,
+};
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, AttemptIntent, JobClaim, JobError, JobRecord, OutputObject, WorkspaceMode,
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -245,7 +248,7 @@ async fn capture_inputs(harness: &Harness, spec: &ExecutionSpec) -> Vec<Captured
                 .resolved_version_id
                 .or(head.version_id)
                 .expect("input has a version"),
-            content: aruna_core::structs::execution::job::InputContent::Blake3(
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3(
                 <[u8; 32]>::try_from(
                     location
                         .hashes
@@ -784,7 +787,7 @@ async fn run_capture(
     mode: InputMode,
     key: &str,
     workspace: Option<&str>,
-) -> Vec<aruna_core::structs::execution::job::OutputObject> {
+) -> Vec<aruna_core::structs::execution::job::local::OutputObject> {
     let pinned = put_version(harness, b"input-bytes", None).await;
     let mut spec = pinned_spec(harness, pinned.version_id, mode);
     spec.file_outputs.push(OutputSelection {

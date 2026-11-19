@@ -7,7 +7,7 @@ use crate::jobs::repository::push::creator_auth;
 use crate::jobs::repository::test_support::{
     artifact, body, child, job_scope, link, remote, scope, session,
 };
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::input::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateTarget,
 };
 

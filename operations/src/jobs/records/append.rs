@@ -15,7 +15,7 @@ use aruna_core::keyspaces::{
     FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};

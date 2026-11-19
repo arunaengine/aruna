@@ -13,9 +13,9 @@ use aruna_core::jobs::{JobRequest, JobResponse, WireArtifact, WireRange};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{
-    ArtifactRef, ExportRoCrateSpec, JobId, JobPayload, JobRecord, JobResultPayload, JobState,
-};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{ArtifactRef, ExportRoCrateSpec, JobPayload};
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload};
 use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use ulid::Ulid;

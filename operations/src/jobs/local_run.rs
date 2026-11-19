@@ -8,9 +8,9 @@ use aruna_core::compute::ResourceEnvelope;
 use aruna_core::id::NodeId;
 use aruna_core::node_state::{DrainState, DrainStateError, DrainStateOperation};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    ExecutionSpec, InputMode, InputSource, JobPayload, JobRecord, JobState, WorkspaceMode,
-};
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::execution::job::input::{ExecutionSpec, InputMode, InputSource, JobPayload};
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::user::id::UserId;
 use thiserror::Error;
@@ -424,10 +424,10 @@ mod tests {
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
         FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
-    use aruna_core::structs::execution::job::InputSelection;
-    use aruna_core::structs::execution::job::{
-        InputSource, JobPayload, OutputDestination, OutputSelection, WorkspaceMode,
+    use aruna_core::structs::execution::job::input::{
+        InputSelection, InputSource, JobPayload, OutputDestination, OutputSelection,
     };
+    use aruna_core::structs::execution::job::local::WorkspaceMode;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::structs::storage::blob::{
@@ -601,7 +601,7 @@ mod tests {
         let InputSource::S3 { version_id, .. } = &run.config.spec.inputs[0].source;
         assert_eq!(version_id.as_deref(), Some(version.to_string().as_str()));
         let job = SubmitJobResult {
-            job_id: aruna_core::structs::execution::job::JobId::from_bytes([1; 16]),
+            job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([1; 16]),
             created: true,
         };
         let answer = run.next(outcome::<_, SubmitJobError>(Ok(job.clone())));

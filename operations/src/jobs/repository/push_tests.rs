@@ -10,7 +10,7 @@ use crate::jobs::repository::test_support::{
 };
 use aruna_core::repository::credential::RepositoryCredential;
 use aruna_core::repository::link::LinkFailure;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use serde::Serialize;
 
 fn destination() -> RepositoryDestination {

@@ -20,8 +20,9 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{
-    CollisionPolicy, ComputeResources, ExecutionSpec, JobId, SessionReportDetail, SessionReportRow,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CollisionPolicy, ComputeResources, ExecutionSpec, SessionReportDetail, SessionReportRow,
 };
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;

@@ -31,7 +31,9 @@ use aruna_core::secrets::{
     SecretSettings, UseRule,
 };
 use aruna_core::storage_entries::reducer_state_key;
-use aruna_core::structs::execution::job::{JobId, JobProgress, PluginWorkAction, PluginWorkSpec};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{PluginWorkAction, PluginWorkSpec};
+use aruna_core::structs::execution::job::local::JobProgress;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,

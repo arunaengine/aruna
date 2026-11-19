@@ -17,11 +17,11 @@ use aruna_core::keyspaces::PLAN_EXPLAIN_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::ExecutionPlan;
 use aruna_core::scheduling::inputs::MAX_PLAN_CANDIDATES;
-use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     ExecutionClaim, JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,
     PhysicalExecutionState, WitnessBudgetRecord,
 };
+use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::PlacementDecision;
 use aruna_core::types::{Key, Value};
@@ -46,7 +46,7 @@ use crate::jobs::records::verify::FamilyView;
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::store_call::{RowBatch, RowRead};
 use crate::realm::load_config::config_unavailable;
-use aruna_core::structs::execution::job::PageManifest;
+use aruna_core::structs::execution::job::pages::PageManifest;
 
 /// Wall-clock budget of one launch offer.
 const OFFER_DEADLINE: Duration = Duration::from_secs(30);

@@ -5,9 +5,13 @@
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    AttemptIntent, ExecutionReceipt, JobClaim, JobFamilyRecord, JobId, JobPayload, JobRecord,
-    JobResultPayload, JobState, LogicalJobState, OutputObject, PhysicalExecutionState,
+use aruna_core::structs::execution::job::family::{
+    ExecutionReceipt, JobFamilyRecord, LogicalJobState, PhysicalExecutionState,
+};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    AttemptIntent, JobClaim, JobRecord, JobResultPayload, OutputObject,
 };
 use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
@@ -286,7 +290,7 @@ async fn bumps_dashboard_once() {
 
 async fn publish_terminal(
     ctx: &aruna_drivers::driver::DriverContext,
-    record: &aruna_core::structs::execution::job::JobRecord,
+    record: &aruna_core::structs::execution::job::local::JobRecord,
 ) -> bool {
     let publish = PublishTerminalOperation::new(
         record.clone(),

@@ -17,7 +17,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::rows::{PrefixPages, read_row, values};
-use aruna_core::structs::execution::job::{JobError, JobId, JobRecord, JobState, job_record_key};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::local::{JobError, JobRecord, job_record_key};
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, import_key, object_prefix, read_patterns,

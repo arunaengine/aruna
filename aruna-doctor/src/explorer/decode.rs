@@ -19,11 +19,11 @@ use aruna_core::keyspaces::{
     UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
+use aruna_core::structs::execution::job::family::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::execution::job::record_keys::alias_family;
 use aruna_core::structs::execution::job::record_rows::{
     ConflictRecord, OutboxEntry, PendingNeed, PendingRecord, ProjectionCache,
 };
-use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::{
@@ -523,7 +523,7 @@ fn decode_explain_key(key: &[u8]) -> DecodedField {
 
 fn family_from_key(key: &[u8]) -> Option<JobFamilyId> {
     Some(JobFamilyId {
-        submission_id: aruna_core::structs::execution::job::SubmissionId(
+        submission_id: aruna_core::structs::execution::job::family::SubmissionId(
             key.get(..32)?.try_into().ok()?,
         ),
         request_digest: key.get(32..64)?.try_into().ok()?,
@@ -975,12 +975,12 @@ mod tests {
         UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
+    use aruna_core::structs::execution::job::family::{JobFamilyId, JobRecordEnvelope};
     use aruna_core::structs::execution::job::record_rows::PROJECTION_CACHE_VERSION;
     use aruna_core::structs::execution::job::record_rows::{
         ConflictRecord, PendingNeed, PendingRecord,
     };
     use aruna_core::structs::execution::job::record_rows::{OutboxEntry, ProjectionCache};
-    use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::node_state::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -1053,7 +1053,7 @@ mod tests {
 
     fn test_family() -> JobFamilyId {
         JobFamilyId {
-            submission_id: aruna_core::structs::execution::job::SubmissionId([9u8; 32]),
+            submission_id: aruna_core::structs::execution::job::family::SubmissionId([9u8; 32]),
             request_digest: [8u8; 32],
         }
     }
@@ -1066,10 +1066,10 @@ mod tests {
         let family = test_family();
         JobRecordEnvelope::sign(
             RealmId::from_bytes([2u8; 32]),
-            aruna_core::structs::execution::job::JobFamilyRecord::Claim(
-                aruna_core::structs::execution::job::SubmissionClaim {
+            aruna_core::structs::execution::job::family::JobFamilyRecord::Claim(
+                aruna_core::structs::execution::job::family::SubmissionClaim {
                     submission_id: family.submission_id,
-                    job_id: aruna_core::structs::execution::job::JobId::from_bytes(
+                    job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes(
                         Ulid::from_bytes([5u8; 16]).to_bytes(),
                     ),
                     request_digest: family.request_digest,
@@ -1104,7 +1104,7 @@ mod tests {
 
         let pending = PendingRecord {
             envelope: envelope.clone(),
-            need: PendingNeed::Evidence(aruna_core::structs::execution::job::JobRecordKind::Spec),
+            need: PendingNeed::Evidence(aruna_core::structs::execution::job::family::JobRecordKind::Spec),
             first_seen_ms: 12,
             attempts: 2,
         };
@@ -1188,11 +1188,11 @@ mod tests {
         let execution_id = Ulid::from_bytes([1u8; 16]);
         let reservation = JobReservationRecord {
             execution_id,
-            job_id: aruna_core::structs::execution::job::JobId::from_bytes(
+            job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes(
                 Ulid::from_bytes([5u8; 16]).to_bytes(),
             ),
-            logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([5u8; 16]),
-            resources: aruna_core::structs::execution::job::EffectiveResources {
+            logical_job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([5u8; 16]),
+            resources: aruna_core::structs::execution::job::family::EffectiveResources {
                 cpu_cores: 2,
                 ram_bytes: 1024,
                 disk_bytes: 2048,

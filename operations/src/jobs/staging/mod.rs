@@ -21,7 +21,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::staging_checkpoint::checkpoint_key;
-use aruna_core::structs::execution::job::{JobId, StagingJobCheckpoint, StagingJobSpec};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{StagingJobCheckpoint, StagingJobSpec};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::types::{Key, KeySpace, Value};
@@ -377,7 +378,7 @@ pub(crate) mod pure_tests {
     // queue stayed with the former coordinator; counters start at zero.
     #[test]
     fn handed_job_resumes() {
-        use aruna_core::structs::execution::job::StagingWalk;
+        use aruna_core::structs::execution::job::input::StagingWalk;
         let spec = test_spec();
         let walk = StagingWalk {
             source_path: "refseq/".to_string(),
@@ -417,7 +418,7 @@ pub(crate) mod pure_tests {
     // reads its manifest again from the start before its next page.
     #[test]
     fn handed_manifest_rereads() {
-        use aruna_core::structs::execution::job::StagingWalk;
+        use aruna_core::structs::execution::job::input::StagingWalk;
         let spec = StagingJobSpec {
             checksum_manifest: Some("SHA256SUMS".to_string()),
             ..test_spec()
@@ -444,7 +445,7 @@ pub(crate) mod pure_tests {
     // An uploaded table read to its end while folders still wait keeps its version on handover.
     #[test]
     fn handed_table_pinned() {
-        use aruna_core::structs::execution::job::TableRead;
+        use aruna_core::structs::execution::job::input::TableRead;
         let mut spec = test_spec();
         spec.prefixes.clear();
         let rows = serde_json::json!({ "kind": "folder", "source": "{p}", "target": "{p}" });

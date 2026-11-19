@@ -9,11 +9,11 @@ use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
-use aruna_core::structs::execution::job::record_rows::PendingNeed;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
     PhysicalExecutionState, SubmissionId,
 };
+use aruna_core::structs::execution::job::record_rows::PendingNeed;
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -530,7 +530,7 @@ mod pure_tests {
     use super::*;
     use crate::jobs::job_reads::tests::{child, is_child};
     use crate::tests::records::{Family, node};
-    use aruna_core::structs::execution::job::JobRecordBody;
+    use aruna_core::structs::execution::job::family::JobRecordBody;
 
     fn record_request(family: &Family) -> MetadataTransportMessage {
         let spec = family.spec();

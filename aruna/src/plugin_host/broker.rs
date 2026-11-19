@@ -9,7 +9,7 @@ use aruna_core::metadata::api::{RoCrateExportView, UpdateDocumentMutation};
 use aruna_core::plugin_runs::{LogLine, PluginRun, StateRemoval, StateWrite};
 use aruna_core::secrets::SecretFields;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
-use aruna_core::structs::execution::job::UploadForm;
+use aruna_core::structs::execution::job::input::UploadForm;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::records::pages::ServingNode;
 use aruna_operations::plugins::admitted::{

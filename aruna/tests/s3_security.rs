@@ -329,9 +329,9 @@ async fn protocol_errors_mapped() -> TestResult<()> {
 // gateway's own S3 auth path, and nothing else.
 #[tokio::test]
 async fn workspace_credential_writes() -> TestResult<()> {
-    use aruna_core::structs::execution::job::{
-        ComputeResources, ExecutionSpec, JobId, JobPayload, JobRecord, WorkspaceMode,
-    };
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
     use aruna_drivers::driver::drive;
     use aruna_operations::jobs::workflow::credential::{MintCredentialOperation, RunIdentity};
 

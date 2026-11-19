@@ -8,10 +8,10 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    ExecutionSpec, JobId, JobPayload, MAX_EXECUTION_OUTPUTS, OutputDestination, WorkspaceMode,
-    user_dedup_key,
-};
+use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload, OutputDestination};
+use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::{
     DEFAULT_SHARD_COUNT, FIRST_GRANTABLE_HANDLE, shard_for_subject,
@@ -32,7 +32,7 @@ pub(crate) fn validate_execution(
     workspace_mode: WorkspaceMode,
     workspace_bucket: Option<&str>,
 ) -> Result<(), SubmitJobError> {
-    spec.inputs = aruna_core::structs::execution::job::plan_composition(
+    spec.inputs = aruna_core::structs::execution::job::input::plan_composition(
         spec.inputs.clone(),
         spec.collision_policy,
     )?;

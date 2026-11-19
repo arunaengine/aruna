@@ -5,11 +5,13 @@
 use aruna_core::calls::{IoCall, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
     ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
-    ImportRoCrateTarget, JobId, JobPayload, JobRecord, JobState, MAX_EXECUTION_OUTPUTS,
-    OutputDestination, RoCrateLimits, WorkspaceMode, user_dedup_key,
+    ImportRoCrateTarget, JobPayload, OutputDestination, RoCrateLimits,
 };
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode, user_dedup_key};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
@@ -132,7 +134,7 @@ async fn caps_declared_outputs() {
         file_outputs: Vec::new(),
         workspace_outputs: (0..=MAX_EXECUTION_OUTPUTS)
             .map(
-                |index| aruna_core::structs::execution::job::WorkspaceOutput {
+                |index| aruna_core::structs::execution::job::input::WorkspaceOutput {
                     container_path: format!("/out/{index}"),
                     dest_key: format!("out/{index}"),
                 },
@@ -178,15 +180,15 @@ fn refuses_pathless_input() {
         env: Default::default(),
         resources: Default::default(),
         executor_constraint: None,
-        inputs: vec![aruna_core::structs::execution::job::InputSelection {
-            source: aruna_core::structs::execution::job::InputSource::S3 {
+        inputs: vec![aruna_core::structs::execution::job::input::InputSelection {
+            source: aruna_core::structs::execution::job::input::InputSource::S3 {
                 bucket: "data".to_string(),
                 key: "in.txt".to_string(),
                 version_id: None,
             },
             source_node_id: None,
             dest_key: "in.txt".to_string(),
-            mode: aruna_core::structs::execution::job::InputMode::Snapshot,
+            mode: aruna_core::structs::execution::job::input::InputMode::Snapshot,
             container_path: None,
             name: None,
             description: None,
@@ -223,7 +225,7 @@ fn refuses_shared_destination() {
         resources: Default::default(),
         executor_constraint: None,
         inputs: Vec::new(),
-        file_outputs: vec![aruna_core::structs::execution::job::OutputSelection {
+        file_outputs: vec![aruna_core::structs::execution::job::input::OutputSelection {
             container_path: "/out/result.txt".to_string(),
             path_prefix: None,
             destination: OutputDestination::S3 {
@@ -234,7 +236,7 @@ fn refuses_shared_destination() {
             name: None,
             description: None,
         }],
-        workspace_outputs: vec![aruna_core::structs::execution::job::WorkspaceOutput {
+        workspace_outputs: vec![aruna_core::structs::execution::job::input::WorkspaceOutput {
             container_path: "/result.txt".to_string(),
             dest_key: "result.txt".to_string(),
         }],

@@ -268,7 +268,7 @@ async fn drain_retries_queueing() {
     let remaining = outbox_rows(&storage).await;
     assert!(remaining.is_empty());
     let key = format!("webhook/{}", record.notification_id);
-    let key = aruna_core::structs::execution::job::user_dedup_key(recipient, &key);
+    let key = aruna_core::structs::execution::job::local::user_dedup_key(recipient, &key);
     let queued = aruna_test_support::jobs::find_dedup_plan(
         &aruna_drivers::testing::test_context(storage.clone()),
         recipient,

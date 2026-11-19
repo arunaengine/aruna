@@ -9,7 +9,7 @@ use aruna_core::calls::ChildOutcome;
 use aruna_core::realm_vault::{RealmSecretRef, RealmVaultEntry, RealmVaultPurpose};
 use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
-use aruna_core::structs::execution::job::JobErrorKind;
+use aruna_core::structs::execution::job::local::JobErrorKind;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };

@@ -6,10 +6,12 @@ use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ADMISSION_QUOTA_KEYSPACE, FAMILY_OUTBOX_KEYSPACE};
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputMode, InputSelection, InputSource, JobFamilyRecord, JobId, JobState,
-    LogicalJobSpec, SubmissionClaim, WorkspaceMode,
+use aruna_core::structs::execution::job::family::{JobFamilyRecord, LogicalJobSpec, SubmissionClaim};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, InputMode, InputSelection, InputSource,
 };
+use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_net::NetHandle;
@@ -301,7 +303,7 @@ fn identity_is_deterministic() {
         destination_key: "reads.fastq".to_string(),
         source_node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         version_id: Ulid::from_bytes([1u8; 16]),
-        content: aruna_core::structs::execution::job::InputContent::Blake3([2u8; 32]),
+        content: aruna_core::structs::execution::job::input::InputContent::Blake3([2u8; 32]),
         bytes: 3,
         policies: Vec::new(),
         source_group_id: Default::default(),

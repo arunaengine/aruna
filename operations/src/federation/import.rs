@@ -17,11 +17,14 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{HttpMethod, HttpRequest, OutboundEffect, OutboundEvent};
 use aruna_core::rows::{decode, decoded, read_row, values};
-use aruna_core::structs::execution::job::{
-    ImportRoCrateSource, ImportRoCrateSpec, JobRecord, RoCrateUploadRecord, dedup_index_key,
-    job_record_key, parse_dedup_value, upload_key as stored_upload_key, upload_stale,
-    user_dedup_key,
+use aruna_core::structs::execution::job::input::{
+    ImportRoCrateSource, ImportRoCrateSpec, RoCrateUploadRecord, upload_key as stored_upload_key,
+    upload_stale,
 };
+use aruna_core::structs::execution::job::local::{
+    JobRecord, job_record_key, parse_dedup_value, user_dedup_key,
+};
+use aruna_core::structs::execution::job::rows::dedup_index_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
@@ -800,7 +803,7 @@ pub(crate) mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::RealmDescriptor;
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::input::{
         ImportMetadataTarget, ImportRoCrateTarget, RoCrateLimits,
     };
     use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -1472,7 +1475,7 @@ pub(crate) mod tests {
             },
             blake3: [0; 32],
             size: record().grant.payload.artifact_size,
-            media_type: aruna_core::structs::execution::job::RoCrateMediaType::Zip,
+            media_type: aruna_core::structs::execution::job::input::RoCrateMediaType::Zip,
             expires_at_ms,
             claimed_by: None,
         }

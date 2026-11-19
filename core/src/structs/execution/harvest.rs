@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::errors::ConversionError;
-use crate::structs::execution::job::JobId;
+use crate::structs::execution::job::identity::JobId;
 use crate::types::GroupId;
 use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};

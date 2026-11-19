@@ -4,7 +4,7 @@
 
 use crate::lane_jobs::run_staging_job;
 use aruna_core::bucket_read::GetBucketOperation;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::table::SEARCH_EXACT_KEY;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_test_support::staging::{
@@ -15,13 +15,13 @@ use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::structs::execution::job::JobResultPayload;
+use aruna_core::structs::execution::job::local::JobResultPayload;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use aruna_clock::testing::poll_until;
 use aruna_core::jobs::JobRunOutcome;
-use aruna_core::structs::execution::job::StagingJobSpec;
+use aruna_core::structs::execution::job::input::StagingJobSpec;
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::context::JobContext;
 

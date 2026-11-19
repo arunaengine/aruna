@@ -6,9 +6,11 @@
 use aruna_core::events::PeerAuthRefusal;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::SubmissionRefusal;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputContent, InputSelection, SubmissionId, WorkspaceMode,
+use aruna_core::structs::execution::job::family::SubmissionId;
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ExecutionSpec, InputContent, InputSelection,
 };
+use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
@@ -59,7 +61,7 @@ pub(super) fn answers_input(
     (selection, captured): &(InputSelection, CapturedInput),
     node: NodeId,
 ) -> bool {
-    use aruna_core::structs::execution::job::InputSource;
+    use aruna_core::structs::execution::job::input::InputSource;
     let pin = |input: &InputSelection| {
         let InputSource::S3 { version_id, .. } = &input.source;
         version_id
@@ -140,7 +142,7 @@ pub(super) fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
 /// be present here. Local presence is the admitting holder's check.
 pub(super) fn reference_shape(spec: &ExecutionSpec) -> Result<(), SubmitJobError> {
     for input in &spec.inputs {
-        let aruna_core::structs::execution::job::InputSource::S3 {
+        let aruna_core::structs::execution::job::input::InputSource::S3 {
             bucket,
             key,
             version_id,
@@ -220,7 +222,7 @@ pub(super) fn source_error(reference: &str, error: SourceReadError) -> SubmitJob
 
 /// An input the caller names on another node must name its exact version there too.
 pub(super) fn exact_version(input: &InputSelection) -> Result<(), SubmitJobError> {
-    let aruna_core::structs::execution::job::InputSource::S3 {
+    let aruna_core::structs::execution::job::input::InputSource::S3 {
         bucket,
         key,
         version_id,
@@ -235,7 +237,7 @@ pub(super) fn exact_version(input: &InputSelection) -> Result<(), SubmitJobError
 
 /// A directory input names a key prefix, marked by its trailing `/`.
 pub(super) fn is_directory(input: &InputSelection) -> bool {
-    let aruna_core::structs::execution::job::InputSource::S3 { key, .. } = &input.source;
+    let aruna_core::structs::execution::job::input::InputSource::S3 { key, .. } = &input.source;
     key.ends_with('/') && input.dest_key.ends_with('/')
 }
 

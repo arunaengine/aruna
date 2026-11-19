@@ -281,7 +281,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
     use aruna_core::storage_entries::registry_write_entries;
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::persistent_id::PersistentIdStatus;

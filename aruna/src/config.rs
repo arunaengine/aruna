@@ -9,7 +9,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::onboarding::OnboardingPhase;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::{
     DynamicDiscoveryMethod, OidcProviderConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId,

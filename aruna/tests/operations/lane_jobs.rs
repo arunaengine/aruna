@@ -5,8 +5,8 @@
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::staging_checkpoint::{LANE_ROWS, parse_lanes};
-use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::execution::job::StagingJobSpec;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::StagingJobSpec;
 use aruna_drivers::jobs::context::JobContext;
 use aruna_test_support::staging::spec;
 use ulid::Ulid;
@@ -89,7 +89,7 @@ async fn prefix_split_lanes() {
 #[tokio::test]
 async fn denied_file_counted() {
     use aruna_core::jobs::JobRunOutcome;
-    use aruna_core::structs::execution::job::JobResultPayload;
+    use aruna_core::structs::execution::job::local::JobResultPayload;
     let keys = (0..20).map(|index| format!("a/{index:04}")).collect();
     let (endpoint, server) = s3_listing(keys).await;
     let (ctx, spec, _dir) = job_context(endpoint, &[("a", "ta")], Some("ta/0007")).await;
@@ -124,7 +124,8 @@ async fn job_context(
     denied: Option<&str>,
 ) -> (JobContext, StagingJobSpec, tempfile::TempDir) {
     use aruna_core::jobs::ProgressReporter;
-    use aruna_core::structs::execution::job::{JobClaim, JobPayload, JobProgress, JobRecord};
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::{JobClaim, JobProgress, JobRecord};
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::blob::object_permission_path;
     use aruna_drivers::driver::drive;
@@ -202,7 +203,7 @@ async fn import(keys: Vec<String>, prefixes: &[(&str, &str)]) -> u64 {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::jobs::JobRunOutcome;
     use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
-    use aruna_core::structs::execution::job::JobResultPayload;
+    use aruna_core::structs::execution::job::local::JobResultPayload;
     use aruna_core::structs::storage::blob::BlobHeadKey;
 
     let (endpoint, server) = s3_listing(keys.clone()).await;

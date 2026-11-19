@@ -14,7 +14,7 @@ use aruna_core::compute::runtimes::{
     SessionRuntime, quick_runtime,
 };
 use aruna_core::compute::session::{EndReason, SessionAnswer, SessionRequest};
-use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{CONTENT_TYPE_KEY, key_content_type};
 use aruna_drivers::driver::drive;
@@ -978,7 +978,7 @@ pub(super) fn request_bearer(parts: &http::request::Parts) -> Option<crate::auth
 
 /// A malformed job id is absence to the shared parser, which reads to a caller
 /// as a missing job rather than a wrong argument.
-fn parse_job(id: &str) -> Result<aruna_core::structs::execution::job::JobId, CallToolResult> {
+fn parse_job(id: &str) -> Result<aruna_core::structs::execution::job::identity::JobId, CallToolResult> {
     crate::jobs::parse_job_id(id).map_err(|_| {
         bad_request(
             "id must be a 26-character job ULID such as 01JZ8Y6T0K4W7M2N9Q5R3S8V1X; read job_id \
@@ -989,7 +989,7 @@ fn parse_job(id: &str) -> Result<aruna_core::structs::execution::job::JobId, Cal
 
 fn parse_job_state(
     value: &str,
-) -> Result<aruna_core::structs::execution::job::JobState, CallToolResult> {
+) -> Result<aruna_core::structs::execution::job::identity::JobState, CallToolResult> {
     crate::jobs::parse_state(value).map_err(|_| {
         bad_request(
             "state must be one of queued, claimed, preparing, ready, running, cancelling, \

@@ -4,13 +4,14 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::execution::job::{JobId, RunCrateStatus};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::RunCrateStatus;
 use ulid::Ulid;
 
 use super::admission_race::{commit_receipt, config, envelope, seed};
 use crate::jobs::store::row_calls::delete_rows;
 use crate::tests::records::{Family, context};
-use aruna_core::structs::execution::job::prune_delete_entries;
+use aruna_core::structs::execution::job::rows::prune_delete_entries;
 use aruna_test_support::jobs::read_job_record;
 use aruna_test_support::jobs::{put_crate_outcome, read_crate_status, read_run_link};
 
@@ -38,7 +39,7 @@ async fn run_link_lasts() {
     let written = RunCrateStatus::Written {
         resource: document_id.to_string(),
     };
-    let completed = aruna_core::structs::execution::job::RunLink {
+    let completed = aruna_core::structs::execution::job::local::RunLink {
         run_crate: Some(document_id),
         ..link
     };

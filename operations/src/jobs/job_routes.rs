@@ -7,7 +7,7 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse, JobStatusView};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::user::id::UserId;

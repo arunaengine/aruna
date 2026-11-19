@@ -15,11 +15,11 @@ mod tests {
     use aruna_core::job_request::{SubmitJobError, store_workspace};
     use aruna_core::jobs::SubmissionRefusal;
     use aruna_core::metadata::protocol::MetadataTransportMessage;
-    use aruna_core::structs::execution::job::OutputDestination;
-    use aruna_core::structs::execution::job::{CapturedInput, WorkspaceMode};
-    use aruna_core::structs::execution::job::{
-        InputContent, InputMode, InputSelection, InputSource, OutputSelection, WorkspaceOutput,
+    use aruna_core::structs::execution::job::input::{
+        CapturedInput, InputContent, InputMode, InputSelection, InputSource, OutputDestination,
+        OutputSelection, WorkspaceOutput,
     };
+    use aruna_core::structs::execution::job::local::WorkspaceMode;
     use aruna_core::structs::identity::auth::{AuthContext, Permission};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::storage::dataset_description::DatasetDescription;

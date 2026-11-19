@@ -9,7 +9,10 @@ use aruna_core::jobs::{JobRequest, JobResponse, JobStatusView, WireArtifact, Wir
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobRecord, KeyWait};
+use aruna_core::structs::execution::job::family::JobFamilyId;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::user::id::UserId;
@@ -634,7 +637,8 @@ impl Operation for JobRequestOperation {
 mod pure_tests {
     use super::*;
     use crate::jobs::job_reads::tests::{auth_of, child, is_child, job_id, node, owner, realm};
-    use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::local::{JobProgress, WorkspaceMode};
     use ulid::Ulid;
 
     use aruna_core::jobs::JobKind;
@@ -694,7 +698,7 @@ mod pure_tests {
     #[test]
     fn owner_gate_applies() {
         let family = JobFamilyId {
-            submission_id: aruna_core::structs::execution::job::SubmissionId([7u8; 32]),
+            submission_id: aruna_core::structs::execution::job::family::SubmissionId([7u8; 32]),
             request_digest: [8u8; 32],
         };
         let mut serve = authed(status_request());
@@ -826,7 +830,7 @@ mod pure_tests {
         let mut serve = cancel();
         serve.step = CancelStep::Runs;
         serve.family = Some(JobFamilyId {
-            submission_id: aruna_core::structs::execution::job::SubmissionId([7u8; 32]),
+            submission_id: aruna_core::structs::execution::job::family::SubmissionId([7u8; 32]),
             request_digest: [8u8; 32],
         });
         let none = child(Ok::<_, JobRouteError>(Vec::<JobId>::new()));

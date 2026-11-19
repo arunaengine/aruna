@@ -22,9 +22,9 @@ use aruna_core::storage_entries::{
     commit_message_entry, create_acceptance_entry, create_acceptance_key, metadata_document_key,
     profile_validation_entry, raw_budget_entry,
 };
-use aruna_core::structs::execution::job::{
-    JobPayload, JobRecord, RETENTION_MS, WorkspaceMode, pid_dedup_key,
-};
+use aruna_core::structs::execution::job::identity::RETENTION_MS;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode, pid_dedup_key};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::persistent_id::{MintPersistentSpec, PersistentIdMapping};
@@ -675,7 +675,7 @@ impl CreateCommitOperation {
         );
         job.workspace_mode = WorkspaceMode::None;
         job.retention_ms = RETENTION_MS;
-        let mut writes = aruna_core::structs::execution::job::job_insert_entries(&job)?;
+        let mut writes = aruna_core::structs::execution::job::rows::job_insert_entries(&job)?;
         let route = mapping_route_for(
             realm_config,
             create_event.record.realm_id,

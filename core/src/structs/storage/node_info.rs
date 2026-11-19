@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn rejects_unbounded_demand() {
         use crate::compute::quota::{DemandFamily, DemandGroup};
-        use crate::structs::execution::job::{EffectiveResources, SubmissionId};
+        use crate::structs::execution::job::family::{EffectiveResources, SubmissionId};
 
         let mut document = document(node(1), epoch(1, 1));
         document.demand.groups = vec![DemandGroup {

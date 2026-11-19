@@ -130,7 +130,7 @@ impl Operation for GrantedReadOperation {
 mod tests {
     use super::*;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::execution::job::SubmissionId;
+    use aruna_core::structs::execution::job::family::SubmissionId;
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::storage::read_grant::ReadGrant;
     use aruna_core::structs::storage::replication::VersionedObjectArn;

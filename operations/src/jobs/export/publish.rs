@@ -13,7 +13,7 @@ use aruna_core::repository::link::LinkFailure;
 use aruna_core::repository::{RepositoryDestination, RepositoryRecord};
 use aruna_core::rocrate_archive::ArchiveInspection;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{ArtifactRef, ExportReportRow, ExportRoCrateSpec};
+use aruna_core::structs::execution::job::input::{ArtifactRef, ExportReportRow, ExportRoCrateSpec};
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use byteview::ByteView;
 

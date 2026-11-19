@@ -34,25 +34,16 @@ use crate::structured_id::{
 use crate::types::{GroupId, Key};
 use crate::user::id::UserId;
 
-mod family;
-mod identity;
-mod input;
-mod key_wait;
-mod launch;
-mod local;
-mod pages;
+pub mod family;
+pub mod identity;
+pub mod input;
+pub mod key_wait;
+pub mod launch;
+pub mod local;
+pub mod pages;
 pub mod record_keys;
 pub mod record_rows;
-mod rows;
-
-pub use family::*;
-pub use identity::*;
-pub use input::*;
-pub use key_wait::*;
-pub use launch::*;
-pub use local::*;
-pub use pages::*;
-pub use rows::*;
+pub mod rows;
 
 #[cfg(test)]
 mod tests;

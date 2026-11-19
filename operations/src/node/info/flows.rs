@@ -1164,12 +1164,12 @@ mod tests {
     }
 
     fn reservation() -> JobReservationRecord {
-        let job_id = aruna_core::structs::execution::job::JobId::from_bytes([1; 16]);
+        let job_id = aruna_core::structs::execution::job::identity::JobId::from_bytes([1; 16]);
         JobReservationRecord {
             execution_id: Ulid::nil(),
             job_id,
             logical_job_id: job_id,
-            resources: aruna_core::structs::execution::job::EffectiveResources {
+            resources: aruna_core::structs::execution::job::family::EffectiveResources {
                 cpu_cores: 1,
                 ram_bytes: 1,
                 disk_bytes: 0,

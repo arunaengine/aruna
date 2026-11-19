@@ -6,7 +6,8 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::ROCRATE_UPLOAD_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::{JobId, RoCrateUploadRecord, upload_key};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{RoCrateUploadRecord, upload_key};
 use byteview::ByteView;
 use ulid::Ulid;
 

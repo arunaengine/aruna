@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use thiserror::Error;
@@ -189,10 +189,10 @@ mod tests {
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
         PATHS_INDEX_KEYSPACE,
     };
-    use aruna_core::structs::execution::job::CapturedInput;
-    use aruna_core::structs::execution::job::{
-        JobError, JobId, JobPayload, JobRecord, JobState, KeyWait,
-    };
+    use aruna_core::structs::execution::job::identity::{JobId, JobState};
+    use aruna_core::structs::execution::job::input::{CapturedInput, JobPayload};
+    use aruna_core::structs::execution::job::key_wait::KeyWait;
+    use aruna_core::structs::execution::job::local::{JobError, JobRecord};
     use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, HashIndex, VersionKey};
     use aruna_core::structs::storage::encryption::BucketEncryption;
     use aruna_core::time::unix_timestamp_millis;
@@ -585,7 +585,7 @@ mod tests {
             destination_key: "in".to_string(),
             source_node_id: node,
             version_id: Ulid::from_bytes([6; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([9; 32]),
             bytes: 100,
             policies: Vec::new(),
             source_group_id: Default::default(),
@@ -614,7 +614,7 @@ mod tests {
             destination_key: "in".to_string(),
             source_node_id,
             version_id: Ulid::from_bytes([6; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3(blake3),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3(blake3),
             bytes: 100,
             policies: Vec::new(),
             source_group_id: Default::default(),
@@ -653,7 +653,7 @@ mod tests {
         use crate::jobs::workflow::workspace::LOCKED_INPUT;
         use crate::replication::bao_read::BaoReadError;
         use aruna_core::replication_protocol::BaoReadRefusal;
-        use aruna_core::structs::execution::job::JobError;
+        use aruna_core::structs::execution::job::local::JobError;
         use aruna_test_support::jobs::read_key_waits;
 
         // The input copy is not converted yet; the locked bucket key still parks the job.
@@ -672,7 +672,7 @@ mod tests {
             destination_key: "in".to_string(),
             source_node_id: node,
             version_id: Ulid::from_bytes([6; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([9; 32]),
             bytes: 100,
             policies: Vec::new(),
             source_group_id: Default::default(),

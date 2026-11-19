@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, JobRecordFrame, NetEffect, PageLimit};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::SubmissionId;
+use aruna_core::structs::execution::job::family::SubmissionId;
 use aruna_core::structs::placement::record::PlacementRef;
 use tracing::{debug, warn};
 

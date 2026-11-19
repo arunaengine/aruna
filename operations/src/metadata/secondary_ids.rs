@@ -157,7 +157,7 @@ pub(crate) mod tests {
     use aruna_core::calls::IoError;
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, SECONDARY_ID_KEYSPACE};
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::persistent_id::PersistentIdRevision;
     use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};

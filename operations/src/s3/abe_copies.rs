@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, read_row};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::abe::{
     AbeEffect, AbeError, AbeEvent, EnvelopeArchive, ObjectEnvelope, PendingCopy,

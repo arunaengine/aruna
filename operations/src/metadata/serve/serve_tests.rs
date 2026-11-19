@@ -65,7 +65,7 @@ fn promotion_check_answered() {
 fn staging_spec_refused() {
     let request = MetadataTransportMessage::StagingSpec {
         transfer_id: ulid::Ulid::from_bytes([3u8; 16]),
-        job_id: aruna_core::structs::execution::job::JobId::from_bytes([4u8; 16]),
+        job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([4u8; 16]),
     };
     let mut serve = ServeRequestOperation::new(node(2), local(), request);
     assert!(runs_child(serve.first()));

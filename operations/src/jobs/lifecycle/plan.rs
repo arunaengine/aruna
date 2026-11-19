@@ -13,9 +13,9 @@ use aruna_core::scheduling::inputs::{
     InputHolder, MAX_INPUT_HOLDERS, MAX_TARGET_SCAN, PlanRequest, ResolvedInput, TargetCandidate,
 };
 use aruna_core::scheduling::scan::Planner;
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputSource, LogicalJobSpec, WorkspaceMode,
-};
+use aruna_core::structs::execution::job::family::LogicalJobSpec;
+use aruna_core::structs::execution::job::input::{CapturedInput, InputSource};
+use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::node_subject::storage_subject;
@@ -577,7 +577,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
     use aruna_core::scheduling::plan_execution;
-    use aruna_core::structs::execution::job::{InputMode, InputSelection};
+    use aruna_core::structs::execution::job::input::{InputMode, InputSelection};
     use aruna_core::structs::storage::node_info::{
         AdvertisementEpoch, NodeUrls, NodeUtilization, node_info_key,
     };

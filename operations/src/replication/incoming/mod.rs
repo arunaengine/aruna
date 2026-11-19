@@ -41,7 +41,7 @@ use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::replication_protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use aruna_core::rows::read_row;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::NODE_SUBJECT_KEY;

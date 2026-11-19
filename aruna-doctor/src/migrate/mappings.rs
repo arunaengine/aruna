@@ -96,7 +96,7 @@ mod tests {
     use crate::migrate::tests::{read, write};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, SECONDARY_ID_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::persistent_id::{
         LegacyMapping, PersistentIdMapping, PersistentIdRevision, persistent_id_change,

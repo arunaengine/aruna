@@ -10,12 +10,15 @@ use aruna_core::id::NodeId;
 use aruna_core::repository::link::LinkFailure;
 use aruna_core::repository::{ExportIdentity, RepositoryRecord};
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
-use aruna_core::structs::execution::job::{
-    ArtifactRef, AttemptIntent, CapturedInput, CopyJobSpec, ExecutionSpec, ExportOmissionCounts,
+use aruna_core::structs::execution::job::identity::{JobExecutionClass, JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    ArtifactRef, CapturedInput, CopyJobSpec, ExecutionSpec, ExportOmissionCounts,
     ExportRoCrateResult, ExportRoCrateSpec, ImportRoCrateResult, ImportRoCrateSpec, InputContent,
-    JobClaim, JobError, JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord,
-    JobResultPayload, JobState, OutputObject, RoCrateLimits, WorkspaceMode, encode_dedup_value,
-    parse_dedup_value,
+    JobPayload, RoCrateLimits,
+};
+use aruna_core::structs::execution::job::local::{
+    AttemptIntent, JobClaim, JobError, JobProgress, JobRecord, JobResultPayload, OutputObject,
+    WorkspaceMode, encode_dedup_value, parse_dedup_value,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::persistent_id::MintPersistentSpec;
@@ -608,11 +611,14 @@ mod tests {
     use crate::migrate::tests::{read, write};
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{JOB_KEYSPACE, JOB_STATE_KEYSPACE};
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::identity::{JobId, JobState};
+    use aruna_core::structs::execution::job::input::{
         CapturedInput, ExecutionSpec, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
-        InputContent, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState,
-        RoCrateLimits, job_record_key,
+        InputContent, JobPayload, RoCrateLimits,
+    };
+    use aruna_core::structs::execution::job::local::{
+        JobProgress, JobRecord, JobResultPayload, job_record_key,
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
@@ -811,7 +817,7 @@ mod tests {
         // Sessions stored without the display name, or without the linked login, gain empty
         // fields; the plan digest and the dedup row follow the rewritten payload.
         use aruna_core::keyspaces::DEDUP_INDEX_KEYSPACE;
-        use aruna_core::structs::execution::job::{encode_dedup_value, parse_dedup_value};
+        use aruna_core::structs::execution::job::local::{encode_dedup_value, parse_dedup_value};
         use aruna_core::structs::identity::auth::{SessionKind, SessionRef};
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");

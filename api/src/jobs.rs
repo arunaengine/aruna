@@ -14,11 +14,13 @@ use aruna_core::id::NodeId;
 use aruna_core::job_request::{SubmissionScope, SubmitJobError};
 use aruna_core::metadata::AuthToken;
 use aruna_core::request_policy::PolicyRequestExtras;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
     CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec, InputMode, InputSelection,
-    InputSource, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
-    OutputSelection, WorkspaceMode, WorkspaceOutput,
+    InputSource, OutputDestination, OutputSelection, WorkspaceOutput,
 };
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_core::user::id::UserId;
@@ -43,7 +45,7 @@ use crate::error::ServerError;
 use crate::error::ServerResult;
 use crate::server::state::ServerState;
 use aruna_core::jobs::JobStatusView;
-use aruna_core::structs::execution::job::KeyWait;
+use aruna_core::structs::execution::job::key_wait::KeyWait;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use serde::Deserialize;
@@ -999,7 +1001,7 @@ pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
 }
 
 pub(crate) fn output_response(
-    output: &aruna_core::structs::execution::job::OutputObject,
+    output: &aruna_core::structs::execution::job::local::OutputObject,
     endpoint_url: Option<&String>,
 ) -> JobOutputResponse {
     JobOutputResponse {

@@ -6,9 +6,11 @@ use super::*;
 use crate::jobs::staging::pure_tests::{child_answer, test_run};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::execution::job::{
-    JobClaim, JobId, JobPayload, JobRecord, StagingJobPhase, StagingJobPrefix, StagingJobSpec,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    JobPayload, StagingJobPhase, StagingJobPrefix, StagingJobSpec,
 };
+use aruna_core::structs::execution::job::local::{JobClaim, JobRecord};
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;

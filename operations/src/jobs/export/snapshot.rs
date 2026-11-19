@@ -9,7 +9,7 @@ use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::repository::ExportIdentity;
-use aruna_core::structs::execution::job::{ExportRoCrateSpec, ReasonCode};
+use aruna_core::structs::execution::job::input::{ExportRoCrateSpec, ReasonCode};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::persistent_id::PersistentIdMapping;
 use serde_json::Value as JsonValue;

@@ -15,7 +15,7 @@ use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, PENDING_PROJECTION_KEYSPACE};
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::metadata::protocol::PersistentIdResolution;
 use aruna_core::storage_entries::pending_projection_key;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::persistent_id::{
     PersistentIdMapping, PersistentIdRevision, PersistentIdStatus, persistent_id_key,
 };

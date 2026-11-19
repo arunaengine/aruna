@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, VecDeque};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{InputSelection, InputSource};
+use aruna_core::structs::execution::job::input::{InputSelection, InputSource};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -451,7 +451,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{node, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::InputMode;
+    use aruna_core::structs::execution::job::input::InputMode;
     use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
     use aruna_core::structs::storage::format::Compression;
 

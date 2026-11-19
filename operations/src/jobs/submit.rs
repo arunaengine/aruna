@@ -14,9 +14,12 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{AfterConflict, Operation, TransactionMode};
 use aruna_core::rows::values;
 use aruna_core::structs::execution::harvest::HarvestSource;
-use aruna_core::structs::execution::job::{
-    ActiveJobKind, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
-    RoCrateUploadRecord, WorkspaceMode, job_active_prefix, job_record_key, parse_dedup_value,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    ImportRoCrateSource, ImportRoCrateSpec, JobPayload, RoCrateUploadRecord,
+};
+use aruna_core::structs::execution::job::local::{
+    ActiveJobKind, JobRecord, WorkspaceMode, job_active_prefix, job_record_key, parse_dedup_value,
 };
 use aruna_core::structs::storage::backend_import::{BackendImport, import_key};
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -31,8 +34,8 @@ use super::import::upload::claim_upload;
 use crate::harvest::repository::source_key;
 use crate::s3::imports::cron::is_running;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult, UploadClaimError};
-use aruna_core::structs::execution::job::upload_key;
-use aruna_core::structs::execution::job::{dedup_index_key, job_insert_entries};
+use aruna_core::structs::execution::job::input::upload_key;
+use aruna_core::structs::execution::job::rows::{dedup_index_key, job_insert_entries};
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_drain_effect() -> Effect {
@@ -541,10 +544,12 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{JOB_INDEX_KEYSPACE, JOB_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::input::{
         ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
-        ImportRoCrateSpec, ImportRoCrateTarget, JobState, RoCrateLimits, encode_dedup_value,
+        ImportRoCrateSpec, ImportRoCrateTarget, RoCrateLimits,
     };
+    use aruna_core::structs::execution::job::local::encode_dedup_value;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
@@ -633,7 +638,7 @@ mod tests {
             owner_node_id: node_id(7),
             dedup_key,
             now_ms: 1_000,
-            retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::identity::RETENTION_MS,
             workspace_mode: WorkspaceMode::None,
             workspace_bucket: None,
             active_cap: None,

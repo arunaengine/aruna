@@ -18,8 +18,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::JobRecord;
-use aruna_core::structs::execution::job::job_record_key;
+use aruna_core::structs::execution::job::local::{JobRecord, job_record_key};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::backend_import::{BackendImport, ImportedObject, object_key};
 use aruna_core::structs::storage::blob::{

@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::rows::{PrefixPages, read_row, values};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobQuarantineRecord, BlobVersion, BucketInfo, VersionKey,
