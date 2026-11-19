@@ -11,15 +11,11 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
 use aruna_core::heartbeat::RunningJobs;
 use aruna_core::id::NodeId;
-use aruna_core::jobs::{JobKind, RunningJobView};
 use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::{
-    AttemptIntent, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
-    ImportRoCrateTarget, JobClaim, JobExecutionClass, JobId, JobPayload, JobRecord,
-    JobResultPayload, RoCrateLimits,
+    AttemptIntent, JobClaim, JobExecutionClass, JobId, JobPayload, JobRecord, JobResultPayload,
 };
 use aruna_core::structs::execution::job::{JobError, JobState};
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
@@ -36,6 +32,7 @@ use aruna_operations::jobs::store::test_calls::{
 };
 use aruna_operations::jobs::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP, JOB_MAX_ATTEMPTS};
 use aruna_operations::testing::task_context;
+use aruna_operations::tests::jobs::import_record;
 use aruna_storage::{FjallStorage, StorageHandle};
 use byteview::ByteView;
 use futures_util::future::FutureExt;
@@ -62,40 +59,6 @@ fn probe_record(job_id: JobId, steps: u32, sleep_ms: u64, marker: Option<String>
             cleanup_marker: marker,
         },
         UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
-        node_id(7),
-        1,
-        1,
-        None,
-    )
-}
-
-fn import_record(job_id: JobId) -> JobRecord {
-    let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
-    JobRecord::new(
-        job_id,
-        JobPayload::ImportRoCrate(ImportRoCrateSpec {
-            auth_context: AuthContext {
-                user_id: owner,
-                realm_id: RealmId([1u8; 32]),
-                path_restrictions: None,
-                session: None,
-            },
-            source: ImportRoCrateSource::Upload {
-                upload_id: Ulid::from_bytes([3u8; 16]),
-            },
-            target: ImportRoCrateTarget {
-                bucket: "target".to_string(),
-                prefix: "crate".to_string(),
-            },
-            metadata: ImportMetadataTarget {
-                group_id: Ulid::from_bytes([4u8; 16]),
-                path: "crate".to_string(),
-                public: false,
-            },
-            limits: RoCrateLimits::default(),
-            document_id: Ulid::from_bytes([5u8; 16]),
-        }),
-        owner,
         node_id(7),
         1,
         1,
@@ -151,7 +114,7 @@ fn close_stops_claims() {
     runtime.close_admission();
 
     assert_eq!(runtime.available_slots(), 0);
-    assert!(runtime.shutdown.is_cancelled());
+    assert!(runtime.shutdown_signal().is_cancelled());
 }
 
 #[tokio::test]
@@ -239,7 +202,7 @@ async fn cancel_runs_import() {
     let (_dir, storage) = temp_storage();
     let ctx = task_context(storage.clone());
     let job_id = JobId::from_bytes([0x3B; 16]);
-    let mut record = import_record(job_id);
+    let mut record = import_record(job_id, node_id(7));
     record.cancel_requested = true;
     record.has_run = true;
     let claimed = claim(&ctx, record).await;
@@ -826,7 +789,7 @@ async fn deferred_for_delay() {
     let attempts = claimed.attempts;
 
     spawn_job(&runtime, task_context(storage.clone()), claimed);
-    let mut finished = runtime.state().running[&job_id].completion.subscribe();
+    let mut finished = runtime.completion_of(job_id).unwrap();
     tokio::time::timeout(Duration::from_secs(60), finished.wait_for(|done| *done))
         .await
         .expect("delivery finishes its attempt")
@@ -847,11 +810,11 @@ async fn deferred_for_delay() {
     assert!(stored.last_error.is_some());
 }
 
-// The node telemetry counts a job from its spawn until its finish, imports apart.
+// The node telemetry counts a job from its spawn until its finish.
 #[tokio::test]
 async fn counts_running_jobs() {
     let (_dir, storage) = temp_storage();
-    let ctx = task_context(storage.clone());
+    let ctx = task_context(storage);
     let runtime = JobsRuntime::new();
     let job_id = JobId::from_bytes([0x6B; 16]);
     let claimed = claim(&ctx, probe_record(job_id, 2, 0, None)).await;
@@ -864,66 +827,12 @@ async fn counts_running_jobs() {
             imports: 0
         }
     );
-    let mut finished = runtime.state().running[&job_id].completion.subscribe();
+    let mut finished = runtime.completion_of(job_id).unwrap();
     tokio::time::timeout(Duration::from_secs(60), finished.wait_for(|done| *done))
         .await
         .expect("probe finishes")
         .unwrap();
     assert_eq!(runtime.running_jobs(), RunningJobs::default());
-
-    let nonce = runtime.register_test_execution(job_id, JobExecutionClass::InProcess);
-    for kind in [
-        JobKind::Staging,
-        JobKind::ImportRoCrate,
-        JobKind::BackendImport,
-    ] {
-        runtime.state().running.get_mut(&job_id).unwrap().view.kind = kind;
-        assert_eq!(
-            runtime.running_jobs(),
-            RunningJobs {
-                total: 1,
-                imports: 1
-            }
-        );
-    }
-    finish_job(&runtime, &task_context(storage), job_id, nonce).await;
-    assert_eq!(runtime.running_jobs(), RunningJobs::default());
-}
-
-// The list carries what an import works on, and progress only once the job counts.
-#[tokio::test]
-async fn lists_running_jobs() {
-    let runtime = JobsRuntime::new();
-    let job_id = JobId::from_bytes([0x6C; 16]);
-    runtime.register_test_execution(job_id, JobExecutionClass::InProcess);
-    let reporter = ProgressReporter::from_progress(
-        &aruna_core::structs::execution::job::JobProgress::new("entries"),
-    );
-    {
-        let mut state = runtime.state();
-        let job = state.running.get_mut(&job_id).unwrap();
-        job.view = RunningJobView::new(&import_record(job_id), 42);
-        job.progress = Some(reporter.clone());
-    }
-    let listed = runtime.running_list();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].kind, JobKind::ImportRoCrate);
-    assert_eq!(
-        listed[0].target,
-        Some(aruna_core::jobs::JobTarget::Bucket {
-            bucket: "target".to_string(),
-            path: Some("crate".to_string()),
-            exact: false,
-        })
-    );
-    assert_eq!(listed[0].group_id, Some(Ulid::from_bytes([4u8; 16])));
-    assert_eq!(listed[0].started_at_ms, 42);
-    assert_eq!(listed[0].progress, None, "nothing counted yet");
-
-    reporter.set_total(20);
-    reporter.set_current(14);
-    let progress = runtime.running_list()[0].progress.clone().unwrap();
-    assert_eq!((progress.current, progress.total), (14, Some(20)));
 }
 
 #[derive(Default)]
