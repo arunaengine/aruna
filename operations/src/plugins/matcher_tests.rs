@@ -111,7 +111,10 @@ async fn rows_commit_once() {
     match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED))
         .await
         .unwrap();
-    journal(&fixture, &created(&install, "D2").0).await;
+    // Rows of one millisecond have no set order, so the later event gets a later time.
+    let mut later = created(&install, "D2").0;
+    (later.journaled_ms, later.anchor_ms) = (2, 2);
+    journal(&fixture, &later).await;
     assert_eq!(
         match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED)).await,
         Ok(1)
