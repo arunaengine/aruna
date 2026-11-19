@@ -18,7 +18,7 @@ use aruna_core::structs::execution::job::record_keys::kind_prefix;
 use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
 use aruna_core::structs::execution::job::{
     CancelAuthority, JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordKind,
-    LogicalJobSpec, LogicalJobState, SubmissionId,
+    LogicalJobSpec, LogicalJobState, SubmissionId, tagged,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -28,7 +28,6 @@ use tracing::warn;
 
 use super::records::{ReadEntry, RecordError};
 use super::rows::{StoreError, unexpected};
-use super::screen::tagged;
 use crate::jobs::lifecycle::cancel::{
     CancelFamilyOperation, CancelLocalRunsOperation, PublishCancelOperation,
 };

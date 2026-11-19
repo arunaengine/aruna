@@ -10,9 +10,9 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::execution::job::{
-    ExecutionSpec, InputSource, JobFamilyId, OutputDestination, PLUGIN_INSTALL_TAG, PLUGIN_WORK_TAG,
+    ExecutionSpec, InputSource, JobFamilyId, OutputDestination, TagError, named_install, tagged,
 };
 use aruna_core::structs::identity::auth::Permission as Access;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -27,13 +27,6 @@ use super::grants::InstallScope;
 use super::rows::{decode, read_call, values};
 use super::task_row::{TaskRow, task_place};
 use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState};
-
-/// The install and work a task job names in its reserved tags.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Tagged {
-    pub install_id: Ulid,
-    pub work_id: Ulid,
-}
 
 /// Why a task job does not pass; `Unavailable` decides nothing and is asked again.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -56,42 +49,19 @@ pub enum ScreenError {
     Pending,
 }
 
+impl From<TagError> for ScreenError {
+    fn from(error: TagError) -> Self {
+        match error {
+            TagError::Malformed => Self::Malformed,
+            TagError::NoOutput => Self::NoOutput,
+            TagError::Install(state) => Self::Install(state),
+        }
+    }
+}
+
 impl From<IoError> for ScreenError {
     fn from(error: IoError) -> Self {
         Self::Unavailable(error.to_string())
-    }
-}
-
-/// The install and work of a tagged spec; `None` for an ordinary job.
-pub fn tagged(spec: &ExecutionSpec) -> Option<Result<Tagged, ScreenError>> {
-    let install = spec.tags.get(PLUGIN_INSTALL_TAG);
-    let work = spec.tags.get(PLUGIN_WORK_TAG);
-    if install.is_none() && work.is_none() {
-        return None;
-    }
-    let parse = |value: Option<&String>| Ulid::from_string(value?).ok();
-    Some(match (parse(install), parse(work)) {
-        _ if spec.file_outputs.is_empty() => Err(ScreenError::NoOutput),
-        (Some(install_id), Some(work_id)) => Ok(Tagged {
-            install_id,
-            work_id,
-        }),
-        _ => Err(ScreenError::Malformed),
-    })
-}
-
-/// The install a tagged job names, and the node that alone may run it.
-pub fn named_install(
-    config: &RealmConfigDocument,
-    tagged: Tagged,
-) -> Result<&PluginInstall, ScreenError> {
-    let install = (config.installs.iter())
-        .find(|install| install.install_id == tagged.install_id)
-        .ok_or(ScreenError::Install("removed or conflicting"))?;
-    match (install.state, install.paused) {
-        (InstallState::Active, false) => Ok(install),
-        (_, true) => Err(ScreenError::Install("paused")),
-        (state, _) => Err(ScreenError::Install(state.as_str())),
     }
 }
 
@@ -211,7 +181,7 @@ impl Operation for ScreenTask {
 
     fn first(&mut self) -> Result<Next<PluginInstall>, ScreenError> {
         let tagged = tagged(&self.spec).ok_or(ScreenError::Malformed)??;
-        let install = named_install(&self.config, tagged)?;
+        let install = named_install(&self.config.installs, tagged)?;
         if install.account != self.created_by || install.group_id != self.spec.group_id {
             return Err(ScreenError::Account);
         }

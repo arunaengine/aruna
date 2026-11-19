@@ -2484,3 +2484,70 @@ fn horizon_bounds_pending() {
     );
     assert_eq!(spec_freshness(now - 1, now, None), Freshness::Fresh);
 }
+
+/// A plain job spec with its plugin task tags set to `install` and `work`.
+fn task_spec(install: &str, work: &str) -> ExecutionSpec {
+    let mut spec = sample_spec().payload;
+    spec.tags
+        .insert(PLUGIN_INSTALL_TAG.to_string(), install.to_string());
+    spec.tags
+        .insert(PLUGIN_WORK_TAG.to_string(), work.to_string());
+    spec
+}
+
+// The task tags name an install and a work only with an output; a broken tag is malformed.
+#[test]
+fn reads_task_tags() {
+    let (install_id, work_id) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
+    assert_eq!(tagged(&sample_spec().payload), None);
+    let mut spec = task_spec(&install_id.to_string(), &work_id.to_string());
+    assert_eq!(tagged(&spec), Some(Err(TagError::NoOutput)));
+    spec.file_outputs.push(OutputSelection {
+        container_path: "/out/".to_string(),
+        path_prefix: None,
+        destination_node_id: None,
+        destination: OutputDestination::S3 {
+            bucket: "results".to_string(),
+            key: "maps/".to_string(),
+        },
+        name: None,
+        description: None,
+    });
+    let named = Tagged {
+        install_id,
+        work_id,
+    };
+    assert_eq!(tagged(&spec), Some(Ok(named)));
+    spec.tags
+        .insert(PLUGIN_WORK_TAG.to_string(), "not a ulid".to_string());
+    assert_eq!(tagged(&spec), Some(Err(TagError::Malformed)));
+    spec.tags.remove(PLUGIN_INSTALL_TAG);
+    assert_eq!(tagged(&spec), Some(Err(TagError::Malformed)));
+}
+
+// Only an active install that is not paused runs a task.
+#[test]
+fn names_active_install() {
+    use crate::plugin_installs::{InstallState, tests::install};
+    let mut installs = vec![install()];
+    let named = Tagged {
+        install_id: Ulid::from_bytes([1; 16]),
+        work_id: Ulid::nil(),
+    };
+    let removed = Err(TagError::Install("removed or conflicting"));
+    assert_eq!(named_install(&installs, named), removed);
+    let named = Tagged {
+        install_id: installs[0].install_id,
+        ..named
+    };
+    assert!(named_install(&installs, named).is_ok());
+    installs[0].paused = true;
+    assert_eq!(
+        named_install(&installs, named),
+        Err(TagError::Install("paused"))
+    );
+    installs[0].paused = false;
+    installs[0].state = InstallState::Removing;
+    let state = Err(TagError::Install(InstallState::Removing.as_str()));
+    assert_eq!(named_install(&installs, named), state);
+}

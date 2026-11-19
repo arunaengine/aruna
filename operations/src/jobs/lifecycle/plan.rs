@@ -12,7 +12,7 @@ use aruna_core::scheduling::{
     ResolvedInput, TargetCandidate,
 };
 use aruna_core::structs::execution::job::{
-    CapturedInput, InputSource, LogicalJobSpec, WorkspaceMode, object_count,
+    CapturedInput, InputSource, LogicalJobSpec, WorkspaceMode, named_install, object_count, tagged,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -35,7 +35,7 @@ use crate::auth::enforcement::{PolicyEvaluator, compiled_policies, policy_reads,
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::placement::policy::{PolicySetError, PolicySetResolver, Resolutions, ResolveMode};
-use crate::plugins::screen::{ScreenError, ScreenTask, named_install, tagged};
+use crate::plugins::screen::{ScreenError, ScreenTask};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
 use aruna_core::operation::Operation;
@@ -401,7 +401,7 @@ struct Scan {
 /// install is gone. `None` for an ordinary job.
 fn plugin_target(config: &RealmConfigDocument, spec: &LogicalJobSpec) -> Option<Option<NodeId>> {
     let tagged = tagged(&spec.payload)?;
-    let install = tagged.and_then(|tagged| named_install(config, tagged));
+    let install = tagged.and_then(|tagged| named_install(&config.installs, tagged));
     Some(install.ok().map(|install| install.receiver))
 }
 

@@ -1,10 +1,12 @@
-//! Tests the task check: the reserved tags, the named install, the paths a task job reads and
-//! writes, and the calls and results of the screen and the receiver's admission.
+//! Tests the task check: the paths a task job reads and writes, and the calls and results of
+//! the screen and the receiver's admission.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::plugin_installs::InstallState;
 use aruna_core::structs::execution::job::{
     InputMode, InputSelection, InputSource, JobFamilyId, JobId, OutputDestination, OutputSelection,
+    PLUGIN_INSTALL_TAG, PLUGIN_WORK_TAG,
 };
 use aruna_core::structs::identity::realm::RealmId;
 
@@ -38,35 +40,6 @@ fn with_output() -> ExecutionSpec {
         description: None,
     });
     spec
-}
-
-#[test]
-fn refuses_outputless() {
-    // A task without an output names no path its `jobs.run` grant is checked on, so no stage
-    // admits it.
-    let mut spec = payload();
-    let (install_id, work_id) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
-    tags(&mut spec, &install_id.to_string(), &work_id.to_string());
-    assert!(matches!(tagged(&spec), Some(Err(_))));
-}
-
-#[test]
-fn reads_task_tags() {
-    let mut spec = with_output();
-    assert_eq!(tagged(&spec), None);
-    let (install_id, work_id) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
-    tags(&mut spec, &install_id.to_string(), &work_id.to_string());
-    assert_eq!(
-        tagged(&spec),
-        Some(Ok(Tagged {
-            install_id,
-            work_id
-        }))
-    );
-    tags(&mut spec, &install_id.to_string(), "not a ulid");
-    assert_eq!(tagged(&spec), Some(Err(ScreenError::Malformed)));
-    spec.tags.remove(PLUGIN_INSTALL_TAG);
-    assert_eq!(tagged(&spec), Some(Err(ScreenError::Malformed)));
 }
 
 #[test]
@@ -205,32 +178,6 @@ fn fences_by_row() {
         ..row
     };
     assert!(refused(Some(&former), adopted));
-}
-
-#[test]
-fn names_active_install() {
-    let mut config = RealmConfigDocument::default_for_realm(REALM, Vec::new());
-    let tagged = Tagged {
-        install_id: Ulid::from_bytes([1; 16]),
-        work_id: Ulid::nil(),
-    };
-    assert!(matches!(
-        named_install(&config, tagged),
-        Err(ScreenError::Install(_))
-    ));
-    config.installs.push(install());
-    assert!(named_install(&config, tagged).is_ok());
-    config.installs[0].paused = true;
-    assert_eq!(
-        named_install(&config, tagged),
-        Err(ScreenError::Install("paused"))
-    );
-    config.installs[0].paused = false;
-    config.installs[0].state = InstallState::Removing;
-    assert!(matches!(
-        named_install(&config, tagged),
-        Err(ScreenError::Install(_))
-    ));
 }
 
 fn family() -> JobFamilyId {

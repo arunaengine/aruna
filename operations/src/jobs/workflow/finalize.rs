@@ -16,7 +16,7 @@ use aruna_core::jobs::JobEvent;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     AttemptControl, JobError, JobErrorKind, JobProgress, JobRecord, JobResultPayload,
-    MAX_MESSAGE_BYTES, OutputObject, PLUGIN_REPORT_TAG, tail_str,
+    MAX_MESSAGE_BYTES, OutputObject, PLUGIN_REPORT_TAG, tagged, tail_str,
 };
 use tracing::{info, warn};
 
@@ -37,7 +37,6 @@ use crate::jobs::store::job_calls::{
 };
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::{read_attempt_control, read_job_record};
-use crate::plugins::screen::tagged;
 use crate::plugins::task_report::KeepReport;
 
 /// What a run is being finalized for.

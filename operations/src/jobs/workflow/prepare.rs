@@ -18,7 +18,7 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::execution::job::{
-    ExecutionSpec, JobError, JobFamilyId, JobRecord, PLUGIN_REPORT_TAG, WorkspaceMode,
+    ExecutionSpec, JobError, JobFamilyId, JobRecord, PLUGIN_REPORT_TAG, WorkspaceMode, tagged,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
@@ -35,7 +35,7 @@ use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::ids::session_of;
 use crate::jobs::route::JobRouteError;
-use crate::plugins::screen::{AdmitTask, ScreenError, ScreenTask, tagged};
+use crate::plugins::screen::{AdmitTask, ScreenError, ScreenTask};
 
 pub const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 
