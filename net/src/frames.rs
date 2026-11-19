@@ -41,22 +41,24 @@ impl FrameError {
     }
 }
 
-// The class byte, length and payload of one frame no larger than `cap`.
-async fn read_frame(recv: &mut RecvStream, cap: usize) -> Result<Vec<u8>, String> {
+// The payload of one answer frame no larger than `cap`; an answer travels in its request's class.
+async fn read_frame(recv: &mut RecvStream, class: u8, cap: usize) -> Result<Vec<u8>, String> {
     let mut header = [0u8; 5];
     recv.read_exact(&mut header)
         .await
         .map_err(|error| error.to_string())?;
+    if header[0] != class {
+        return Err("answer frame class differs from the request's".to_string());
+    }
     let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
     if length > cap {
         return Err("answer frame exceeds its cap".to_string());
     }
-    let mut frame = vec![0u8; length + 1];
-    frame[0] = header[0];
-    recv.read_exact(&mut frame[1..])
+    let mut payload = vec![0u8; length];
+    recv.read_exact(&mut payload)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(frame)
+    Ok(payload)
 }
 
 fn close(stream: &mut BiStream) {
@@ -66,7 +68,7 @@ fn close(stream: &mut BiStream) {
 
 impl NetHandle {
     /// Sends `frame` to `peer` in the class `shape` names and answers with the answer frame's
-    /// class byte and payload, followed by the body when `shape` caps one.
+    /// payload, followed by the body when `shape` caps one.
     pub async fn frame_request(
         &self,
         peer: NodeId,
@@ -97,7 +99,7 @@ impl NetHandle {
         }
         let mut answer = match timeout(
             shape.answer_wait,
-            read_frame(&mut stream.1, shape.answer_cap),
+            read_frame(&mut stream.1, shape.class, shape.answer_cap),
         )
         .await
         {

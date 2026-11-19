@@ -5,13 +5,14 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, NetEffect};
 use aruna_core::events::{Event, LaunchDecline, MetadataAnswer, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use tracing::{debug, warn};
 
 use super::LifecycleError;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 
 /// What a target answered to one offer.
@@ -57,11 +58,11 @@ impl Operation for OfferLaunchOperation {
             return Ok(Next::Done(OfferOutcome::Unavailable));
         };
         Ok(Next::Call(IoCall::Effect(Box::new(Effect::Net(
-            NetEffect::MetadataRequest(Box::new(MetadataRequestEffect {
-                peer: self.target,
+            NetEffect::MetadataRequest(Box::new(metadata_request(
+                self.target,
                 frame,
-                timeout: self.timeout,
-            })),
+                self.timeout,
+            ))),
         )))))
     }
 

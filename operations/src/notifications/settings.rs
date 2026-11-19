@@ -9,7 +9,7 @@ use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SecretBytes;
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{
@@ -21,6 +21,7 @@ use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use tracing::warn;
 
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, decode_message, encode_message,
 };
@@ -208,11 +209,7 @@ impl DeliveryOperation {
             Ok(frame) => frame,
             Err(error) => return self.refused(node, &error),
         };
-        let request = MetadataRequestEffect {
-            peer: node,
-            frame,
-            timeout: OPEN_TIMEOUT,
-        };
+        let request = metadata_request(node, frame, OPEN_TIMEOUT);
         Ok(Next::Call(IoCall::from(Effect::Net(
             NetEffect::MetadataRequest(Box::new(request)),
         ))))

@@ -7,6 +7,7 @@ use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::delete_document::DeleteDocumentError;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::update_document::UpdateDocumentError;
 use aruna_core::calls::IoError;
 use thiserror::Error;
@@ -145,11 +146,7 @@ pub(crate) fn peer_call_within(
 ) -> Result<aruna_core::calls::IoCall, String> {
     let frame =
         crate::metadata::protocol::encode_message(message).map_err(|error| error.to_string())?;
-    let request = aruna_core::effects::MetadataRequestEffect {
-        peer,
-        frame,
-        timeout,
-    };
+    let request = metadata_request(peer, frame, timeout);
     let effect = aruna_core::effects::Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(
         Box::new(request),
     ));

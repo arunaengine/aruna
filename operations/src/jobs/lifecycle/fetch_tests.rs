@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, JobRecordFrame, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, JobRecordFrame, NetEffect};
 use aruna_core::events::{
     Event, JobRecordPage, JobRecordRejection, MetadataAnswer, NetEvent, PeerRequestError,
 };
@@ -16,6 +16,7 @@ use aruna_core::structs::execution::job::JobFamilyRecord;
 
 use super::FetchFamilyOperation;
 use crate::jobs::lifecycle::LifecycleError;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage, encode_message};
 use crate::tests::records::{Family, node};
 
@@ -45,11 +46,7 @@ fn ask(
     timeout: Duration,
 ) -> Next<(Option<NodeId>, Vec<JobRecordFrame>)> {
     Next::Call(IoCall::Effect(Box::new(Effect::Net(
-        NetEffect::MetadataRequest(Box::new(MetadataRequestEffect {
-            peer,
-            frame: frame(family),
-            timeout,
-        })),
+        NetEffect::MetadataRequest(Box::new(metadata_request(peer, frame(family), timeout))),
     ))))
 }
 

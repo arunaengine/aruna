@@ -145,11 +145,7 @@ fn open_call(peer: NodeId) -> Result<Next<Delivery>, IoError> {
         target,
         bytes: SecretBytes::new(on_setting()),
     };
-    let request = MetadataRequestEffect {
-        peer,
-        frame: encode_message(&message).unwrap(),
-        timeout: OPEN_TIMEOUT,
-    };
+    let request = metadata_request(peer, encode_message(&message).unwrap(), OPEN_TIMEOUT);
     Ok(Next::Call(IoCall::from(Effect::Net(
         NetEffect::MetadataRequest(Box::new(request)),
     ))))

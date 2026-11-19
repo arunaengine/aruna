@@ -4,7 +4,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::metadata::{AuthToken, MetadataError, ProfileValidationStatus};
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -25,6 +25,7 @@ use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, encode_message};
 use crate::realm::load_config::config_unavailable;
 
@@ -190,13 +191,11 @@ impl RoutedStatusOperation {
                 true => Effect::SubOperation(boxed_suboperation(self.local(None), |result| {
                     Event::Child(ChildOutcome::new(result))
                 })),
-                false => Effect::Net(NetEffect::MetadataRequest(Box::new(
-                    MetadataRequestEffect {
-                        peer: *holder,
-                        frame: frame.clone(),
-                        timeout: READ_PEER_TIMEOUT,
-                    },
-                ))),
+                false => Effect::Net(NetEffect::MetadataRequest(Box::new(metadata_request(
+                    *holder,
+                    frame.clone(),
+                    READ_PEER_TIMEOUT,
+                )))),
             })
             .collect();
         self.holders = holders;

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{InputResolveRequest, SubmissionRefusal};
@@ -16,6 +16,7 @@ use aruna_core::structs::execution::job::{CapturedInput, InputSelection, Submiss
 
 use super::submission_rules::{batch_len, resolve_answer};
 use crate::jobs::submit::SubmitJobError;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 
 /// Upper bound of one resolve request; the transport's own step limits end it earlier.
@@ -93,11 +94,7 @@ impl RemoteInputsOperation {
         let frame = encode_message(&message).map_err(|error| {
             SubmitJobError::PlacementUnavailable(format!("input node {}: {error}", self.node))
         })?;
-        let request = MetadataRequestEffect {
-            peer: self.node,
-            frame,
-            timeout: RESOLVE_DEADLINE,
-        };
+        let request = metadata_request(self.node, frame, RESOLVE_DEADLINE);
         let effect = Effect::Net(NetEffect::MetadataRequest(Box::new(request)));
         Ok(Next::Call(IoCall::Effect(Box::new(effect))))
     }

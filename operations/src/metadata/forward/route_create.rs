@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
@@ -27,6 +27,7 @@ use crate::metadata::create_document::{
     mint_forward_document,
 };
 use crate::metadata::create_entry::CreateEntryOperation;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{
     MetadataTransportMessage, WriteAuthError, decode_message, encode_message,
 };
@@ -171,11 +172,7 @@ impl RouteCreateOperation {
             );
             return Err(MetadataWriteError::Undeliverable(detail));
         };
-        let request = MetadataRequestEffect {
-            peer,
-            frame: self.frame.clone(),
-            timeout: FORWARD_CREATE_TIMEOUT,
-        };
+        let request = metadata_request(peer, self.frame.clone(), FORWARD_CREATE_TIMEOUT);
         let effect = Effect::Net(NetEffect::MetadataRequest(Box::new(request)));
         Ok(Next::Call(IoCall::Effect(Box::new(effect))))
     }

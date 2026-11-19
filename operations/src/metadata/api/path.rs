@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use aruna_core::calls::ChildOutcome;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::operation::{Operation, boxed_suboperation};
 
@@ -30,6 +30,7 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer, read_answer};
 use crate::metadata::protocol::encode_message;
 
+use crate::metadata::protocol::metadata_request;
 use aruna_core::StructuredId;
 
 pub(super) fn select_forward_peers(
@@ -403,11 +404,7 @@ impl LookupPathOperation {
                 config_digest,
             };
             let frame = encode_message(&message).map_err(MetadataApiError::Internal)?;
-            let request = MetadataRequestEffect {
-                peer: selection.node_id,
-                frame,
-                timeout,
-            };
+            let request = metadata_request(selection.node_id, frame, timeout);
             members.push(Effect::Net(NetEffect::MetadataRequest(Box::new(request))));
         }
         self.config = Some(config);

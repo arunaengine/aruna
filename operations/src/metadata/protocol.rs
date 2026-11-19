@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_PAGE_BYTES};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
+use aruna_core::effects::{FrameShape, MetadataRequestEffect};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataError, MetadataQueryResults, MetadataSearchHit,
@@ -30,6 +30,7 @@ use aruna_core::structs::{
     SyncPull, SyncPullStatus, SyncRefusal, SyncRelationship, SyncVersionPage,
 };
 use aruna_core::types::GroupId;
+use aruna_core::{NodeId, UserId};
 use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -937,6 +938,92 @@ pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u
     Ok(bytes)
 }
 
+/// How long one stream step of a metadata request may take.
+pub(crate) const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a sender waits for a member's answer to a reference page.
+pub(crate) const PAGE_ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
+/// The bytes an export body may carry beyond its metadata.
+pub(crate) const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The largest export body for `metadata_bytes` of metadata.
+pub(crate) fn metadata_body_limit(metadata_bytes: u64) -> u64 {
+    metadata_bytes.saturating_add(METADATA_ENVELOPE_BYTES)
+}
+
+/// How a request travels and the bounds its answer is read within; an export is followed by a
+/// body of at most its metadata plus the envelope.
+pub(crate) fn request_shape(message: &MetadataTransportMessage) -> FrameShape {
+    let body_cap = match message {
+        MetadataTransportMessage::ForwardExportDocument { metadata_bytes, .. } => {
+            Some(metadata_body_limit(*metadata_bytes))
+        }
+        // The channel carries one Profile document; the holder caps the body.
+        MetadataTransportMessage::ForwardExportProfile { .. } => {
+            Some(metadata_body_limit(u64::MAX))
+        }
+        _ => None,
+    };
+    // A member answers a reference page only after its one commit, which takes longer.
+    let answer_wait = match message {
+        MetadataTransportMessage::ReferencePage { .. } => PAGE_ANSWER_TIMEOUT,
+        _ => METADATA_IO_TIMEOUT,
+    };
+    FrameShape {
+        class: frame_class(message),
+        io_wait: METADATA_IO_TIMEOUT,
+        answer_wait,
+        answer_cap: response_cap(message),
+        body_cap,
+    }
+}
+
+/// The effect that sends one encoded request to `peer`, with the bounds its answer is read
+/// within; a frame that does not decode carries no shape and is never sent.
+pub(crate) fn metadata_request(
+    peer: NodeId,
+    frame: Vec<u8>,
+    timeout: Duration,
+) -> MetadataRequestEffect {
+    let shape = decode_message(&frame)
+        .ok()
+        .map(|message| request_shape(&message));
+    MetadataRequestEffect {
+        peer,
+        frame,
+        timeout,
+        shape,
+    }
+}
+
+/// Decodes the answer a peer request read. An export header is followed by its body, which is
+/// read back into one export answer.
+pub(crate) fn decode_answer(bytes: &[u8]) -> Result<MetadataTransportMessage, String> {
+    let answer = decode_message(bytes).map_err(|error| error.to_string())?;
+    let MetadataTransportMessage::ForwardedExport { result } = answer else {
+        return Ok(answer);
+    };
+    let (_, body) = postcard::take_from_bytes::<MetadataTransportMessage>(bytes)
+        .map_err(|error| error.to_string())?;
+    let result = match result {
+        Err(error) => Err(error),
+        Ok(length) => {
+            let length = usize::try_from(length).map_err(|error| error.to_string())?;
+            let body = body
+                .get(..length)
+                .ok_or_else(|| "metadata export body ends early".to_string())?;
+            let export = postcard::from_bytes(body).map_err(|error| error.to_string())?;
+            Ok(Box::new(export))
+        }
+    };
+    Ok(MetadataTransportMessage::ExportAnswer { result })
+}
+
+/// Test hook: the answer a target sends once it stored a sync mirror, for the net handle to drop.
+#[cfg(feature = "test-hooks")]
+pub fn mirror_created_answer() -> Vec<u8> {
+    encode_message(&MetadataTransportMessage::SyncMirrorCreated).unwrap_or_default()
+}
+
 /// Decodes one frame. A realm node that predates `node_places` or `node_names` ends its realm
 /// documents before them, and an empty map is one zero byte; only that exact reply is padded.
 pub(crate) fn decode_message(bytes: &[u8]) -> Result<MetadataTransportMessage, postcard::Error> {
@@ -999,7 +1086,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::metadata::handle::frames::{read_message_budget, read_message_cap};
+    use crate::metadata::handle::frames::read_message_budget;
     use aruna_core::UserId;
     use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
     use aruna_core::metadata::MAX_TOKEN_LEN;
@@ -1304,6 +1391,15 @@ mod tests {
         assert!(AuthToken::bearer(oversized).is_err());
     }
 
+    async fn read_capped(
+        reader: &mut tokio::io::DuplexStream,
+        cap: usize,
+    ) -> Result<MetadataTransportMessage, String> {
+        let budget = Arc::new(Semaphore::new(MAX_MESSAGE_SIZE));
+        let read = read_message_budget(reader, cap, &budget).await;
+        read.map(|(message, _)| message)
+    }
+
     #[tokio::test]
     async fn audit_frame_rejects() {
         let (mut writer, mut reader) = tokio::io::duplex(16);
@@ -1311,7 +1407,7 @@ mod tests {
         writer.write_all(&[AUDIT_FRAME]).await.unwrap();
         writer.write_all(&length.to_be_bytes()).await.unwrap();
 
-        let error = read_message_cap(&mut reader, audit_frame_cap())
+        let error = read_capped(&mut reader, audit_frame_cap())
             .await
             .unwrap_err();
         assert_eq!(error, "metadata frame exceeds maximum size");
@@ -1506,9 +1602,7 @@ mod tests {
         writer.write_all(&bytes).await.unwrap();
 
         assert_eq!(
-            read_message_cap(&mut reader, audit_frame_cap())
-                .await
-                .unwrap(),
+            read_capped(&mut reader, audit_frame_cap()).await.unwrap(),
             message
         );
     }
@@ -1546,7 +1640,7 @@ mod tests {
         writer.write_all(&bytes).await.unwrap();
 
         assert_eq!(
-            read_message_cap(&mut reader, MAX_MESSAGE_SIZE)
+            read_capped(&mut reader, MAX_MESSAGE_SIZE)
                 .await
                 .unwrap_err(),
             "metadata audit frame exceeds maximum size"
@@ -1571,7 +1665,7 @@ mod tests {
         writer.write_all(&bytes).await.unwrap();
 
         assert_eq!(
-            read_message_cap(&mut reader, MAX_MESSAGE_SIZE)
+            read_capped(&mut reader, MAX_MESSAGE_SIZE)
                 .await
                 .unwrap_err(),
             "metadata frame class does not match message"

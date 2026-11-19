@@ -564,7 +564,7 @@ impl NetHandle {
     #[cfg(feature = "test-hooks")]
     pub(crate) fn take_dropped(&self, answer: &[u8]) -> bool {
         let mut dropped = self.inner.dropped_answer.lock();
-        let matches = dropped.as_deref() == answer.get(1..);
+        let matches = dropped.as_deref() == Some(answer);
         if matches {
             dropped.take();
         }
@@ -1107,14 +1107,12 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::DocumentSync(_)) => "document_sync",
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Net(NetEffect::JobControl(_)) => "job_control",
-        Effect::Net(NetEffect::AuditPage(_)) => "audit_page",
         Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
         Effect::Net(NetEffect::SignDeletePlan(_)) => "sign_delete_plan",
         Effect::Net(NetEffect::VaultSign(_)) => "vault_sign",
         Effect::Net(NetEffect::SnapshotSign(_)) => "snapshot_sign",
         Effect::Net(NetEffect::StatementSign(_)) => "statement_sign",
         Effect::Net(NetEffect::ExecutionSign(_)) => "execution_sign",
-        Effect::Net(NetEffect::ArtifactStore(_)) => "artifact_store",
         Effect::Net(NetEffect::MetadataRequest(_)) => "metadata_request",
         Effect::Net(NetEffect::RefreshDocumentPeers(_)) => "refresh_document_peers",
         Effect::Net(NetEffect::GrantedRead(_)) => "granted_read",

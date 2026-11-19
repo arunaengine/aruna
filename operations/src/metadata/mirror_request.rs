@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
@@ -16,6 +16,7 @@ use aruna_core::types::GroupId;
 
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::message_kind::transport_message_kind;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use crate::sync::mirror_repair::RECONCILE_GRACE;
 
@@ -92,11 +93,7 @@ impl Operation for MirrorRequestOperation {
 
     fn first(&mut self) -> Result<Next<()>, MetadataError> {
         let frame = self.frame.clone().map_err(MetadataError::Backend)?;
-        let request = MetadataRequestEffect {
-            peer: self.peer,
-            frame,
-            timeout: MIRROR_REQUEST_TIMEOUT,
-        };
+        let request = metadata_request(self.peer, frame, MIRROR_REQUEST_TIMEOUT);
         let effect = Effect::Net(NetEffect::MetadataRequest(Box::new(request)));
         Ok(Next::Call(IoCall::Effect(Box::new(effect))))
     }

@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
@@ -18,6 +18,7 @@ use tracing::{debug, warn};
 use super::admit_here::AcceptedSubmission;
 use super::ids::{RequestIdentity, SubmissionRequest};
 use crate::jobs::submit::SubmitJobError;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 
 /// Upper bound of one forwarded request; the transport's own step limits end it earlier.
@@ -72,11 +73,7 @@ impl ForwardSubmissionOperation {
                 "no job family holder accepted the submission".to_string(),
             ));
         };
-        let request = MetadataRequestEffect {
-            peer,
-            frame: frame.clone(),
-            timeout: FORWARD_DEADLINE,
-        };
+        let request = metadata_request(peer, frame.clone(), FORWARD_DEADLINE);
         self.asked = Some(peer);
         let effect = Effect::Net(NetEffect::MetadataRequest(Box::new(request)));
         Ok(Next::Call(IoCall::Effect(Box::new(effect))))

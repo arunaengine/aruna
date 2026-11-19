@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -26,6 +26,7 @@ use super::{
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::peer_reply;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::realm::get_nodes::{
     GetNodesError, GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
@@ -202,11 +203,7 @@ pub(super) fn peer_request(
     timeout: Duration,
 ) -> Effect {
     let frame = encode_message(message).unwrap_or_default();
-    let request = MetadataRequestEffect {
-        peer: node,
-        frame,
-        timeout,
-    };
+    let request = metadata_request(node, frame, timeout);
     Effect::Net(NetEffect::MetadataRequest(Box::new(request)))
 }
 

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::keyspaces::INPUT_PAGE_KEYSPACE;
 use aruna_core::operation::Operation;
@@ -26,6 +26,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use crate::realm::peer_trust::is_sync_eligible;
 
@@ -148,11 +149,7 @@ impl LoadChainOperation {
             match encode_message(&message) {
                 Ok(frame) => {
                     self.step = Some(ChainStep::Fetch(digest, peer));
-                    let request = MetadataRequestEffect {
-                        peer: *node,
-                        frame,
-                        timeout: FETCH_DEADLINE,
-                    };
+                    let request = metadata_request(*node, frame, FETCH_DEADLINE);
                     let effect = Effect::Net(NetEffect::MetadataRequest(Box::new(request)));
                     return Ok(Next::Call(IoCall::Effect(Box::new(effect))));
                 }

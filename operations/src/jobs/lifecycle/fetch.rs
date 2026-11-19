@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, JobRecordFrame, MetadataRequestEffect, NetEffect, PageLimit};
+use aruna_core::effects::{Effect, JobRecordFrame, NetEffect, PageLimit};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
@@ -14,6 +14,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use tracing::{debug, warn};
 
 use super::LifecycleError;
+use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{
     JobPageReply, MetadataTransportMessage, decode_message, encode_message,
 };
@@ -65,11 +66,11 @@ impl FetchFamilyOperation {
             return Next::Done((None, Vec::new()));
         }
         Next::Call(IoCall::Effect(Box::new(Effect::Net(
-            NetEffect::MetadataRequest(Box::new(MetadataRequestEffect {
-                peer: *peer,
-                frame: frame.clone(),
-                timeout: self.remaining,
-            })),
+            NetEffect::MetadataRequest(Box::new(metadata_request(
+                *peer,
+                frame.clone(),
+                self.remaining,
+            ))),
         ))))
     }
 }
