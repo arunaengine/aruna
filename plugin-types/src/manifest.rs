@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::connection::{Address, Connection};
 use crate::permission::{Import, Permission};
+use crate::recipe::Recipe;
 use crate::trigger::{Trigger, TriggerKind};
 
 /// Host interface package every artifact manifest must name.
@@ -106,6 +107,10 @@ pub struct Manifest {
     pub connections: BTreeMap<String, Connection>,
     #[serde(default)]
     pub triggers: BTreeMap<TriggerKind, Trigger>,
+    /// Container tasks the plugin may start, by name; left out when empty, so a manifest
+    /// without tasks keeps its bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub recipes: BTreeMap<String, Recipe>,
     #[serde(default)]
     pub permissions: Requests,
 }
@@ -132,6 +137,8 @@ pub enum ManifestError {
     InvalidConnection(String, &'static str),
     #[error("trigger `{kind}`: {why}", kind = .0.as_str(), why = .1)]
     InvalidTrigger(TriggerKind, &'static str),
+    #[error("task `{0}`: {1}")]
+    InvalidTask(String, &'static str),
     #[error("`{0}` names no secret slot of a fitting kind")]
     InvalidSlot(String),
     #[error("trigger `{kind}` needs permission `{needs}`", kind = .0.as_str(), needs = .1)]
@@ -184,8 +191,11 @@ impl Manifest {
         bounded("settings", self.settings.len())?;
         bounded("secret slots", self.secrets.len())?;
         bounded("connections", self.connections.len())?;
+        bounded("tasks", self.recipes.len())?;
         let names = self.settings.keys().chain(self.secrets.keys());
-        let names = names.chain(self.connections.keys());
+        let names = names
+            .chain(self.connections.keys())
+            .chain(self.recipes.keys());
         if let Some(name) = names.into_iter().find(|name| !valid_name(name)) {
             return Err(ManifestError::InvalidName(name.clone()));
         }
@@ -206,6 +216,13 @@ impl Manifest {
         }
         for (kind, trigger) in &self.triggers {
             self.check_trigger(*kind, trigger)?;
+        }
+        for (name, recipe) in &self.recipes {
+            let invalid = |why| ManifestError::InvalidTask(name.clone(), why);
+            recipe.check().map_err(invalid)?;
+            if !self.requested().contains(&Permission::JobsRun) {
+                return Err(invalid("a task needs permission `jobs.run`"));
+            }
         }
         self.check_permissions()
     }

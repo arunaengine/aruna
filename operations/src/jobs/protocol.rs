@@ -172,6 +172,8 @@ pub struct ServeCancelOperation {
     token: AuthToken,
     job_id: JobId,
     serving: ServingNode,
+    /// The node that asked; `None` for a caller on this node.
+    peer: Option<NodeId>,
     now_ms: u64,
     step: CancelStep,
     family: Option<JobFamilyId>,
@@ -204,6 +206,7 @@ impl ServeCancelOperation {
             token,
             job_id,
             serving,
+            peer: None,
             now_ms,
             step: CancelStep::Alias,
             family: None,
@@ -212,6 +215,12 @@ impl ServeCancelOperation {
             stopped: None,
             running: Vec::new(),
         }
+    }
+
+    /// A cancel another node asked for.
+    pub fn from_peer(mut self, peer: NodeId) -> Self {
+        self.peer = Some(peer);
+        self
     }
 
     fn done(&mut self, response: JobResponse) -> AnswerNext {
@@ -255,7 +264,8 @@ impl ServeCancelOperation {
             Some(self.token.clone()),
             self.serving,
             self.now_ms,
-        );
+        )
+        .from_peer(self.peer);
         Ok(Next::Call(IoCall::child(cancel)))
     }
 
@@ -547,7 +557,8 @@ impl JobRequestOperation {
             JobRequest::Cancel {
                 job_id, auth_token, ..
             } => {
-                let serve = ServeCancelOperation::new(auth, auth_token, job_id, serving, now_ms);
+                let serve = ServeCancelOperation::new(auth, auth_token, job_id, serving, now_ms)
+                    .from_peer(self.peer);
                 (RequestStep::Served, IoCall::child(serve))
             }
             JobRequest::Record { job_id, .. } => (

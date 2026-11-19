@@ -9,6 +9,7 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::SubmissionRefusal;
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionSpec, InputContent, InputSelection, SubmissionId, WorkspaceMode,
+    object_count,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -59,20 +60,25 @@ pub(super) fn answers_input(
     node: NodeId,
 ) -> bool {
     use aruna_core::structs::execution::job::InputSource;
-    let pin = |input: &InputSelection| {
-        let InputSource::S3 { version_id, .. } = &input.source;
-        version_id
-            .as_deref()
-            .and_then(|v| Ulid::from_string(v).ok())
+    let pin = |input: &InputSelection| match &input.source {
+        InputSource::S3 { version_id, .. } => {
+            (version_id.as_deref()).and_then(|v| Ulid::from_string(v).ok())
+        }
+        InputSource::Inline { .. } => None,
     };
-    let InputSource::S3 { bucket, key, .. } = &asked.source;
+    let InputSource::S3 { bucket, key, .. } = &asked.source else {
+        return false;
+    };
     // A source asked without a version is answered at the version captured there.
     let same_source = |selection: &InputSelection| {
         let InputSource::S3 {
             bucket: answered,
             key: answered_key,
             ..
-        } = &selection.source;
+        } = &selection.source
+        else {
+            return false;
+        };
         answered == bucket
             && answered_key == key
             && pin(asked).is_none_or(|v| pin(selection) == Some(v))
@@ -143,7 +149,12 @@ pub(super) fn reference_shape(spec: &ExecutionSpec) -> Result<(), SubmitJobError
             bucket,
             key,
             version_id,
-        } = &input.source;
+        } = &input.source
+        else {
+            return Err(SubmitJobError::InvalidWorkspace(
+                "inline inputs are for plugin tasks only".to_string(),
+            ));
+        };
         if bucket.trim().is_empty() || key.trim().is_empty() {
             return Err(SubmitJobError::InvalidWorkspace(
                 "input reference needs a bucket and a key".to_string(),
@@ -223,7 +234,10 @@ pub(super) fn exact_version(input: &InputSelection) -> Result<(), SubmitJobError
         bucket,
         key,
         version_id,
-    } = &input.source;
+    } = &input.source
+    else {
+        return Ok(());
+    };
     match version_id.as_deref().map(Ulid::from_string) {
         Some(Ok(_)) => Ok(()),
         _ => Err(SubmitJobError::InvalidWorkspace(format!(
@@ -234,7 +248,9 @@ pub(super) fn exact_version(input: &InputSelection) -> Result<(), SubmitJobError
 
 /// A directory input names a key prefix, marked by its trailing `/`.
 pub(super) fn is_directory(input: &InputSelection) -> bool {
-    let aruna_core::structs::execution::job::InputSource::S3 { key, .. } = &input.source;
+    let aruna_core::structs::execution::job::InputSource::S3 { key, .. } = &input.source else {
+        return false;
+    };
     key.ends_with('/') && input.dest_key.ends_with('/')
 }
 
@@ -334,7 +350,7 @@ pub(super) fn peer_refusal(refusal: PeerAuthRefusal) -> SubmissionRefusal {
 /// from the node it names, and every output pinned to that ingress.
 pub(super) fn forwarded_request_fits(request: &SubmissionRequest, ingress: NodeId) -> bool {
     let (spec, captured) = (&request.spec, &request.captured_inputs);
-    captured.len() == spec.inputs.len()
+    captured.len() == object_count(&spec.inputs)
         && captured.iter().all(|captured| {
             spec.inputs
                 .iter()

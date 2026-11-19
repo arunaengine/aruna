@@ -281,13 +281,13 @@ async fn peer_request(
                 .await
                 .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
         }
-        MetadataTransportMessage::ForwardClosureQuery { launch } => {
+        MetadataTransportMessage::QueryLaunchClosure { launch } => {
             use aruna_operations::jobs::lifecycle::closure::{
                 AnswerClosureOperation, ClosureError,
             };
             let answer = AnswerClosureOperation::new(*launch, context.node_and_realm(), Some(peer));
             Ok(match Box::pin(drive(answer, context.as_ref())).await {
-                Ok(answer) => MetadataTransportMessage::ForwardedClosureQuery { answer },
+                Ok(answer) => MetadataTransportMessage::LaunchClosureAnswered { answer },
                 Err(ClosureError::Outsider) => {
                     let refused = "closure query from outside the realm".to_string();
                     MetadataTransportMessage::Reject(refused)
@@ -317,6 +317,22 @@ async fn peer_request(
                 );
             let result = Box::pin(aruna_drivers::driver::drive(admit, context.as_ref())).await;
             Ok(MetadataTransportMessage::ForwardedJobSubmission { result })
+        }
+        MetadataTransportMessage::QuerySubmissionClaim {
+            submission_id,
+            admit_by,
+        } => {
+            use aruna_operations::jobs::lifecycle::closure::ServeClosureOperation;
+            let answer = match context.node_and_realm() {
+                Some((_, realm_id)) => {
+                    let question = (submission_id, admit_by);
+                    let serve = ServeClosureOperation::new(realm_id, peer, question);
+                    let answered = Box::pin(drive(serve, context.as_ref())).await;
+                    answered.unwrap_or(aruna_core::jobs::ClosureAnswer::Undecided)
+                }
+                None => aruna_core::jobs::ClosureAnswer::Undecided,
+            };
+            Ok(MetadataTransportMessage::SubmissionClaimAnswered { answer })
         }
         MetadataTransportMessage::ResolveJobInputs {
             auth_token,

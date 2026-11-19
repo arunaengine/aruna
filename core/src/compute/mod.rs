@@ -635,6 +635,9 @@ pub struct TaskSpec {
     pub output_paths: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub secret_env: BTreeMap<String, Secret>,
+    /// Values released from the secret vault for this attempt, by env name; never stored and
+    /// delivered in every staging mode, apart from the S3 credential.
+    pub vault_env: BTreeMap<String, Secret>,
     pub resources: ResourceRequest,
     pub workspace: Option<WorkspaceBinding>,
     pub security: SecurityContext,
@@ -660,6 +663,7 @@ impl TaskSpec {
             output_paths: Vec::new(),
             env: BTreeMap::new(),
             secret_env: BTreeMap::new(),
+            vault_env: BTreeMap::new(),
             resources: ResourceRequest::default(),
             workspace: None,
             security: SecurityContext::default(),
@@ -694,7 +698,28 @@ impl TaskSpec {
                 env.insert(key.clone(), value.expose().to_string());
             }
         }
+        for (key, value) in &self.vault_env {
+            env.insert(key.clone(), value.expose().to_string());
+        }
         env
+    }
+
+    /// Refuses a released value whose env name is not a plain variable name or would shadow
+    /// the task's own env, its credential or a name Aruna or S3 tools read.
+    pub fn check_vault_env(&self) -> Result<(), String> {
+        for name in self.vault_env.keys() {
+            let plain = !name.is_empty()
+                && !name.as_bytes()[0].is_ascii_digit()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            let reserved = name.starts_with("ARUNA_") || name.starts_with("AWS_");
+            let taken = self.env.contains_key(name) || self.secret_env.contains_key(name);
+            if !plain || reserved || taken {
+                return Err(format!("`{name}` cannot carry a released secret"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -965,6 +990,33 @@ pub struct TombstoneEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vault_env_checked() {
+        // A released value reaches the task in every staging mode, never under a taken name.
+        let spec = |name: &str| {
+            let mut spec = TaskSpec::new(AttemptRef::new("job", 0), "image");
+            spec.env.insert("MODE".to_string(), "fast".to_string());
+            spec.vault_env
+                .insert(name.to_string(), Secret::new("canary-5e1f"));
+            spec
+        };
+        let good = spec("WEBIN_PASSWORD");
+        assert_eq!(good.check_vault_env(), Ok(()));
+        assert_eq!(good.staging_mode, StagingMode::Files);
+        assert_eq!(good.effective_env()["WEBIN_PASSWORD"], "canary-5e1f");
+        assert!(!format!("{good:?}").contains("canary"));
+        for taken in [
+            "MODE",
+            "ARUNA_JOB_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "1PASS",
+            "A-B",
+            "",
+        ] {
+            assert!(spec(taken).check_vault_env().is_err(), "{taken}");
+        }
+    }
 
     #[test]
     fn secret_bytes_redacted() {

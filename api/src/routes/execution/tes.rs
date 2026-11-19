@@ -581,8 +581,8 @@ naming a different one; a bearer token requires that tag.
 - Exactly one executor whose `command` is the full argv.
 - `id`, `state`, `logs` and `creation_time` are read only, as are the derived tags
   `aruna-engine.org/job-id`, `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind`
-  and `aruna-engine.org/estimated-transfer-bytes`; naming one is refused with error code
-  `reserved_tag`.
+  and `aruna-engine.org/estimated-transfer-bytes`; naming one, or any tag starting with
+  `aruna-engine.org/plugin-` (set only on plugin tasks), is refused with error code `reserved_tag`.
 - Input urls must be `s3://bucket/key` or a versioned object ARN, output urls `s3://bucket/key`;
   container paths must be absolute, canonical and
   may not overlap between inputs and outputs; at most 1024 outputs, the same bound the immutable
@@ -1325,6 +1325,13 @@ fn validate_task_shape(task: &TesTask) -> Result<&TesExecutor, TesError> {
             "reserved_tag",
         ));
     }
+    if let Some(key) = aruna_core::structs::execution::job::plugin_tag(&task.tags) {
+        return Err(TesError::coded(
+            StatusCode::BAD_REQUEST,
+            format!("tag `{key}` is reserved for plugin tasks"),
+            "reserved_tag",
+        ));
+    }
     let executor = match task.executors.as_slice() {
         [executor] => executor,
         [] => {
@@ -1527,16 +1534,18 @@ fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesErr
     // A directory names a key prefix, which admission expands into its objects.
     let mut dest_key = input.path[1..].to_string();
     if input.kind == TesFileType::Directory {
-        let InputSource::S3 {
+        if let InputSource::S3 {
             key, version_id, ..
-        } = &mut source;
-        if version_id.is_some() {
-            return Err(TesError::bad_request(
-                "a directory input names an s3:// prefix, not one version",
-            ));
-        }
-        if !key.ends_with('/') {
-            key.push('/');
+        } = &mut source
+        {
+            if version_id.is_some() {
+                return Err(TesError::bad_request(
+                    "a directory input names an s3:// prefix, not one version",
+                ));
+            }
+            if !key.ends_with('/') {
+                key.push('/');
+            }
         }
         dest_key.push('/');
     }
@@ -1798,7 +1807,11 @@ fn input_url(record: &JobRecord, input: &InputSelection, realm_id: RealmId) -> S
         bucket,
         key,
         version_id,
-    } = &input.source;
+    } = &input.source
+    else {
+        // Only plugin tasks carry inline bytes; they have no url to show.
+        return String::new();
+    };
     let captured =
         (record.captured_inputs.iter()).find(|captured| captured.destination_key == input.dest_key);
     let pinned = match captured {

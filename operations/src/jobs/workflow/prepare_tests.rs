@@ -203,3 +203,57 @@ fn failures_end_preparation() {
     let failed = child(Err::<WorkspaceCredential, _>(error.clone()));
     assert_eq!(unminted.next(failed), Err(error));
 }
+
+fn task_spec() -> ExecutionSpec {
+    use aruna_core::structs::execution::job::{
+        OutputDestination, OutputSelection, PLUGIN_INSTALL_TAG, PLUGIN_WORK_TAG,
+    };
+    let mut spec = spec();
+    let id = ulid::Ulid::from_parts(1, 1).to_string();
+    spec.tags.insert(PLUGIN_INSTALL_TAG.to_string(), id.clone());
+    spec.tags.insert(PLUGIN_WORK_TAG.to_string(), id);
+    spec.file_outputs.push(OutputSelection {
+        container_path: "/out/**".to_string(),
+        path_prefix: Some("/out".to_string()),
+        destination_node_id: None,
+        destination: OutputDestination::S3 {
+            bucket: "results".to_string(),
+            key: "maps".to_string(),
+        },
+        name: None,
+        description: None,
+    });
+    spec
+}
+
+// A plugin task checks its install again at every attempt start; it needs its reservation and
+// the family the receiver adopted, and a launch before adoption retries.
+#[test]
+fn task_checked_again() {
+    let mut prepare = prepare_of(task_spec(), record(), "", false);
+    assert!(is_child(&prepare.first()));
+    let config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
+    assert!(is_child(
+        &prepare.next(child(Ok::<_, GetConfigError>(config.clone())))
+    ));
+    let none = child(Ok::<Vec<JobReservationRecord>, LifecycleError>(Vec::new()));
+    let refused = prepare.next(none).unwrap_err();
+    assert_eq!(
+        refused.kind,
+        aruna_core::structs::execution::job::JobErrorKind::Permanent
+    );
+
+    let mut pending = prepare_of(task_spec(), record(), "", false);
+    pending.step = PrepareStep::TaskAdmit;
+    let answer = child(Err::<PluginInstall, _>(ScreenError::Pending));
+    let retried = pending.next(answer).unwrap_err();
+    assert_eq!(
+        retried.kind,
+        aruna_core::structs::execution::job::JobErrorKind::Retryable
+    );
+    pending.step = PrepareStep::TaskAdmit;
+    let admitted = child(Ok::<_, ScreenError>(
+        crate::plugins::screen::tests::install(),
+    ));
+    assert!(matches!(pending.next(admitted), Ok(Next::Call(_))));
+}

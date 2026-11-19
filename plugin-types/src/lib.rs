@@ -8,4 +8,5 @@ pub mod calls;
 pub mod connection;
 pub mod manifest;
 pub mod permission;
+pub mod recipe;
 pub mod trigger;

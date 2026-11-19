@@ -22,6 +22,8 @@ use tracing::warn;
 use super::broker::RunBroker;
 use super::{read_config, ready_artifact};
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_operations::jobs::lifecycle::closure::SweepClosuresOperation;
+use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::plugins::attempt::{
     AttemptStart, BeginAttempt, ClaimRuns, ClaimedRuns, FinishRun, guest_access, revocation,
 };
@@ -41,6 +43,8 @@ use aruna_operations::plugins::matcher::MatchJournal;
 use aruna_operations::plugins::prune::{PruneAudit, prune_hooks};
 use aruna_operations::plugins::replay::{PlanReplays, RunReplays};
 use aruna_operations::plugins::runs::{Ended, PruneRuns, TICK};
+use aruna_operations::plugins::task_cancel::CancelOrphans;
+use aruna_operations::plugins::task_pass::SettleTasks;
 use aruna_operations::plugins::waiting::RecheckWaiting;
 use aruna_operations::plugins::work::prune_work;
 
@@ -141,6 +145,25 @@ impl Worker {
             Some(error) => Err(error.to_string()),
             None => Ok(started),
         }
+    }
+
+    /// Follows this node's plugin task families: settles, adopts, resends and proves absence.
+    async fn follow_tasks(&self) -> Result<usize, String> {
+        let fresh = self.ctx.fresh_heartbeats();
+        let Some(node) = ingress_node(self.ctx.node_and_realm(), fresh, unix_timestamp_millis())
+        else {
+            return Ok(0);
+        };
+        let settled = drive(SettleTasks::new(node), &self.ctx).await;
+        settled.map_err(|error| error.to_string())
+    }
+
+    /// Cancels the queued task families of removed installs this node holds.
+    async fn cancel_orphans(&self) -> Result<usize, String> {
+        let config = read_config(&self.ctx, self.realm_id).await;
+        let config = config.map_err(|error| error.to_string())?;
+        let cancelled = drive(CancelOrphans::new(Arc::new(config), self.local), &self.ctx).await;
+        cancelled.map_err(|error| error.to_string())
     }
 
     /// Delivers the ends of jobs whose starting run succeeded as `job_finished` runs.
@@ -362,6 +385,9 @@ pub fn spawn_worker(
                 if let Err(error) = drive(SettleWork::new(now), &worker.ctx).await {
                     warn!(%error, "Could not keep the summaries of finished plugin work");
                 }
+                if let Err(error) = worker.follow_tasks().await {
+                    warn!(%error, "Could not follow the families of plugin tasks");
+                }
                 if let Err(error) = worker.notify(now).await {
                     warn!(%error, "Could not deliver finished plugin jobs");
                 }
@@ -385,6 +411,12 @@ pub fn spawn_worker(
                 }
                 if let Err(error) = drive(SweepMarks::new(), &worker.ctx).await {
                     warn!(%error, "Could not drop the marks of absent object versions");
+                }
+                if let Err(error) = drive(SweepClosuresOperation::new(now), &worker.ctx).await {
+                    warn!(%error, "Could not drop expired submission closure rows");
+                }
+                if let Err(error) = worker.cancel_orphans().await {
+                    warn!(%error, "Could not cancel the task families of removed installs");
                 }
                 if let Err(error) = worker.sweep(now).await {
                     warn!(%error, "Could not delete stale plugin event rows");

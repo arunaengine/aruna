@@ -82,6 +82,8 @@ pub(super) struct ResolveInputsOperation {
     links: BTreeMap<String, VersionedObjectArn>,
     captured: Vec<CapturedInput>,
     answered: Vec<InputSelection>,
+    /// A plugin task's inline bytes, which name no object and are never resolved.
+    inline: Vec<InputSelection>,
 }
 
 type ResolveNext = Result<Next<ResolvedInputs>, SubmitJobError>;
@@ -101,6 +103,7 @@ impl ResolveInputsOperation {
             links: BTreeMap::new(),
             captured: Vec::new(),
             answered: Vec::new(),
+            inline: Vec::new(),
         }
     }
 
@@ -170,6 +173,7 @@ impl ResolveInputsOperation {
             .collect();
         let mut inputs = std::mem::take(&mut self.here);
         inputs.append(&mut self.answered);
+        inputs.append(&mut self.inline);
         let captured = inputs
             .iter()
             .filter_map(|input| by_key.remove(&input.dest_key))
@@ -193,6 +197,10 @@ impl Operation for ResolveInputsOperation {
 
     fn first(&mut self) -> ResolveNext {
         for input in std::mem::take(&mut self.spec.inputs) {
+            if input.source.is_inline() {
+                self.inline.push(input);
+                continue;
+            }
             match input.source_node_id.filter(|node| *node != self.local()) {
                 Some(node) => {
                     exact_version(&input)?;

@@ -53,6 +53,7 @@ use crate::jobs::records::pages::{
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::submit::{mint_configured_job, schedule_drain_effect};
+use crate::plugins::screen::tagged;
 use crate::secrets::owner::WriterView;
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
@@ -186,6 +187,9 @@ pub(crate) fn classify(error: &LifecycleError) -> CommitVerdict {
         | LifecycleError::Store(_)
         | LifecycleError::IdempotencyConflict { .. }
         | LifecycleError::QuotaDenied(_)
+        | LifecycleError::AdmissionClosed
+        // The next offer's task check refuses an ended task for good.
+        | LifecycleError::TaskEnded
         | LifecycleError::NotFinished
         | LifecycleError::UnexpectedEvent { .. } => CommitVerdict::Faulted,
     }
@@ -358,7 +362,7 @@ impl PullFamilyOperation {
                 holders.retain(|holder| *holder != scheduler);
                 holders.truncate(MAX_RECORD_HOLDERS.saturating_sub(1));
                 holders.insert(0, scheduler);
-                let family = (family.submission_id, family.request_digest);
+                let family = (family.submission_id, Some(family.request_digest));
                 FetchFamilyOperation::new(placement, holders, family, FETCH_DEADLINE)
             });
         Self {
@@ -783,6 +787,9 @@ impl AdmitLaunchOperation {
             subject_digest: prepared.subject_digest,
             record: Box::new(prepared.record),
             now_ms: node.now_ms,
+            fence: tagged(&spec.payload)
+                .and_then(Result::ok)
+                .map(|task| (task.install_id, task.work_id)),
         };
         let commit = CommitReceiptOperation::new(config, intent);
         self.call(AdmitStep::Commit, IoCall::child(commit))
@@ -910,6 +917,10 @@ fn materialize_local(
 ) -> Result<JobRecord, LaunchDecline> {
     let mut payload = spec.payload.clone();
     for input in &mut payload.inputs {
+        // Inline bytes travel in the spec; nothing pins them.
+        if input.source.is_inline() {
+            continue;
+        }
         let Some(pin) = intent
             .inputs
             .iter()
@@ -917,8 +928,9 @@ fn materialize_local(
         else {
             return Err(LaunchDecline::Unauthorized);
         };
-        let InputSource::S3 { version_id, .. } = &mut input.source;
-        *version_id = Some(pin.version_id.to_string());
+        if let InputSource::S3 { version_id, .. } = &mut input.source {
+            *version_id = Some(pin.version_id.to_string());
+        }
         // The plan picked which holder the bytes come from; no source means the
         // target already holds the compliant copy.
         input.source_node_id = pin.source_node_id.or(Some(local));
@@ -1263,7 +1275,10 @@ mod tests {
         };
         let InputSource::S3 {
             version_id: pinned, ..
-        } = &payload.inputs[0].source;
+        } = &payload.inputs[0].source
+        else {
+            panic!("the input names an object");
+        };
         let expected_version = version_id.to_string();
         assert_eq!(pinned.as_deref(), Some(expected_version.as_str()));
         assert_eq!(payload.resources.cpu_cores, Some(spec.resources.cpu_cores));

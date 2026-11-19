@@ -105,6 +105,7 @@ pub async fn write_record(
         expected,
         install: Some(install.clone()),
         audit,
+        proven: Default::default(),
     });
     drive(write, ctx).await?;
     Ok(install)

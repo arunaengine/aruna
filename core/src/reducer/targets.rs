@@ -438,6 +438,29 @@ impl AdminDocumentState {
         entries.into_values().collect()
     }
 
+    /// What the realm config holds at one install's path, deletions and conflicts included,
+    /// which [`Self::materialized_installs`] leaves out.
+    pub fn install_entry(&self, install_id: &ulid::Ulid) -> InstallEntry {
+        let path = crate::reducer::plugin_install_path(install_id);
+        let parse = |value: &Option<String>| {
+            (value.as_deref()).and_then(|value| serde_json::from_str(value).ok())
+        };
+        if let Some(conflict) = self.conflicts.get(&path) {
+            return InstallEntry::Conflict {
+                deletion: conflict.values.iter().any(|value| value.value.is_none()),
+                installs: conflict
+                    .values
+                    .iter()
+                    .filter_map(|value| parse(&value.value))
+                    .collect(),
+            };
+        }
+        match self.user_subject_ids.get(&path) {
+            None => InstallEntry::Absent,
+            Some(version) => InstallEntry::Settled(parse(&version.value).map(Box::new)),
+        }
+    }
+
     /// Plugin install records sorted by install id. A deleted or conflicting one is absent.
     pub fn materialized_installs(&self) -> Vec<crate::plugin_installs::PluginInstall> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
@@ -839,4 +862,18 @@ impl AdminDocumentState {
             })
             .collect()
     }
+}
+
+/// An install's path in the realm config: never written, settled (`None` is the deletion
+/// `remove_install` writes), or in conflict between candidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallEntry {
+    Absent,
+    Settled(Option<Box<crate::plugin_installs::PluginInstall>>),
+    Conflict {
+        /// One candidate is the deletion.
+        deletion: bool,
+        /// The candidates that hold a record.
+        installs: Vec<crate::plugin_installs::PluginInstall>,
+    },
 }

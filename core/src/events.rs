@@ -837,19 +837,6 @@ impl TryFrom<PlacementDecision> for DeclinedPolicy {
     }
 }
 
-/// How a target answers whether it ever accepted one launch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ClosureAnswer {
-    /// The target holds a receipt for exactly this launch.
-    Receipt(Box<crate::effects::ReceiptFrame>),
-    /// No receipt, and the launch window passed on the target's clock, so none can follow.
-    NeverAccepted,
-    /// The target pruned the family after every execution it ran there had stopped.
-    Pruned,
-    /// The window has not passed on the target's clock yet; ask again later.
-    TooEarly,
-}
-
 /// Why an execution target refused a launch offer. The policy detail travels
 /// with the decline in its own bounded wrapper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -48,6 +48,7 @@ pub struct StageEntry {
 
 impl StageLayout {
     pub fn from_spec(spec: &TaskSpec) -> Result<Self, BackendError> {
+        spec.check_vault_env().map_err(BackendError::InvalidSpec)?;
         match spec.staging_mode {
             StagingMode::Files if !spec.reaches_s3() && !spec.secret_env.is_empty() => {
                 return Err(BackendError::InvalidSpec(
@@ -335,6 +336,18 @@ mod tests {
         spec.secret_env
             .insert("access_key_id".to_string(), Secret::new("key"));
 
+        assert!(StageLayout::from_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn files_vault_env() {
+        // Released values go in every staging mode; only the S3 credential stays out of Files.
+        let mut spec = TaskSpec::new(AttemptRef::new("job", 0), "image");
+        spec.vault_env
+            .insert("WEBIN_PASSWORD".to_string(), Secret::new("value"));
+        assert!(StageLayout::from_spec(&spec).is_ok());
+        spec.vault_env
+            .insert("AWS_ACCESS_KEY_ID".to_string(), Secret::new("value"));
         assert!(StageLayout::from_spec(&spec).is_err());
     }
 }

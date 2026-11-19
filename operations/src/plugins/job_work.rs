@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -12,7 +13,8 @@ use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::structs::execution::job::{
-    JobId, JobPayload, JobRecord, PluginWorkSpec, RETENTION_MS, WorkspaceMode,
+    JobFamilyId, JobId, JobPayload, JobProjection, JobRecord, LogicalJobState, PluginWorkSpec,
+    RETENTION_MS, WorkspaceMode,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_plugin_types::calls::{ErrorKind, Field, HostError, JobStatus};
@@ -23,15 +25,20 @@ use ulid::Ulid;
 
 use super::check::{CallError, RunScope};
 use super::grants::short_path;
-use super::rows::{Rows, StoreError, decode, delete_rows, scan_rows};
+use super::install::{config_answer, config_call};
+use super::rows::{Rows, StoreError, decode, delete_rows, read_call, scan_rows, values};
 use super::submit::{PrepareWork, PreparedWork, WORK_ACTIVE, WorkRequest};
+use super::task_cancel::CancelTask;
+use super::task_row::{TaskRow, task_place};
 use super::unavailable;
 use super::work::{
     SendBoundary, Summary, WorkChange, WorkKind, WorkRow, WorkState, dedup_key, index_key,
     install_at, summary_of, update_work, work_scan, work_state,
 };
 use super::work_calls::JobRow;
+use crate::jobs::lifecycle::family_reads::{FamilyProjectionOperation, FamilyView};
 use crate::jobs::records::pages::ServingNode;
+use crate::jobs::route::JobRouteError;
 use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
@@ -62,6 +69,7 @@ pub struct JobState {
     local: NodeId,
     id: String,
     row: Option<Box<WorkRow>>,
+    now_ms: u64,
 }
 
 impl JobState {
@@ -71,6 +79,7 @@ impl JobState {
             local,
             id: id.to_string(),
             row: None,
+            now_ms: 0,
         }
     }
 
@@ -130,19 +139,49 @@ impl Operation for JobState {
         ))))
     }
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn next(&mut self, result: IoResult) -> Result<Next<JobStatus>, CallError> {
         if let Some(row) = self.row.take() {
+            if row.kind == WorkKind::Recipe {
+                let projected = result.child::<Option<FamilyView>, JobRouteError>()?;
+                let projected = projected.ok().flatten();
+                let projection = projected.and_then(|(projected, _)| projected.projection);
+                let mut status = self.status(&row, None);
+                status.state = task_state(projection.as_ref()).to_string();
+                return Ok(Next::Done(status));
+            }
             let record = record_answer(result)?.map_err(call_unavailable)?;
             return Ok(Next::Done(self.status(&row, record.as_ref())));
         }
         let row = result.child::<WorkRow, CallError>()??;
         match (&row.summary, row.job) {
+            // A task's family lives at its holders; the receiver shows its last pulled state.
+            (None, Some(alias)) if row.kind == WorkKind::Recipe => {
+                self.row = Some(Box::new(row));
+                let read = FamilyProjectionOperation::new(alias, self.now_ms);
+                Ok(Next::Call(IoCall::child(read)))
+            }
             (None, Some(job)) => {
                 self.row = Some(Box::new(row));
                 Ok(Next::Call(record_call(job)))
             }
             _ => Ok(Next::Done(self.status(&row, None))),
         }
+    }
+}
+
+/// The state a task shows from its family's projection.
+fn task_state(projection: Option<&JobProjection>) -> &'static str {
+    match projection.map(|projection| projection.state) {
+        None | Some(LogicalJobState::Queued) => "queued",
+        Some(LogicalJobState::Running) => "running",
+        Some(LogicalJobState::Indeterminate) => "error",
+        Some(LogicalJobState::Succeeded) => "succeeded",
+        Some(LogicalJobState::Failed) => "failed",
+        Some(LogicalJobState::Cancelled) => "cancelled",
     }
 }
 
@@ -203,6 +242,9 @@ enum CancelPhase {
     Row,
     Reconcile,
     Cancel,
+    Task(Box<WorkRow>),
+    Config(JobId, JobFamilyId),
+    Family,
 }
 
 /// Asks the job of `id` to stop. A job that ended, or whose record is gone, has nothing left to
@@ -230,6 +272,17 @@ impl CancelWork {
         self.phase = CancelPhase::Cancel;
         Next::Call(cancel_call(job, self.now_ms))
     }
+
+    /// A task is cancelled through its family; one whose send is not settled cannot stop yet.
+    fn cancel_task(&mut self, row: &WorkRow, task: Option<TaskRow>) -> Result<Next<()>, CallError> {
+        match (row.state, row.job, task.and_then(|task| task.family)) {
+            (WorkState::Dispatched, Some(alias), Some(family)) => {
+                self.phase = CancelPhase::Config(alias, family);
+                Ok(Next::Call(config_call(self.install.account.realm_id)))
+            }
+            _ => Err(call_unavailable("the task is not admitted yet")),
+        }
+    }
 }
 
 impl Operation for CancelWork {
@@ -244,11 +297,17 @@ impl Operation for CancelWork {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, CallError> {
-        match self.phase {
+        match std::mem::replace(&mut self.phase, CancelPhase::Row) {
             CancelPhase::Row => {
                 let row = result.child::<WorkRow, CallError>()??;
                 match (row.state, row.job) {
                     (WorkState::Settled, _) => Ok(Next::Done(())),
+                    _ if row.kind == WorkKind::Recipe => {
+                        let read =
+                            read_call(vec![task_place(self.install.install_id, row.work_id)]);
+                        self.phase = CancelPhase::Task(Box::new(row));
+                        Ok(Next::Call(read))
+                    }
                     (_, Some(job)) => Ok(self.cancel(job)),
                     (_, None) => {
                         self.phase = CancelPhase::Reconcile;
@@ -268,6 +327,27 @@ impl Operation for CancelWork {
                     Err(error) => Err(call_unavailable(error.to_string())),
                 }
             }
+            CancelPhase::Task(row) => {
+                let [task] = values::<1>(result).map_err(|error| call_unavailable(error.0))?;
+                let task = task.map(|bytes| decode::<TaskRow>(&bytes)).transpose();
+                let task = task.map_err(|error| call_unavailable(error.0))?;
+                self.cancel_task(&row, task)
+            }
+            CancelPhase::Config(alias, family) => {
+                let config = config_answer(result);
+                let config = config.map_err(|error| call_unavailable(error.to_string()))?;
+                let install = &self.install;
+                let task = (install.account, alias, family);
+                let cancel = CancelTask::new(Arc::new(config), install.receiver, task);
+                self.phase = CancelPhase::Family;
+                Ok(Next::Call(IoCall::child(cancel)))
+            }
+            CancelPhase::Family => match result.child::<bool, IoError>()? {
+                Ok(true) => Ok(Next::Done(())),
+                _ => Err(call_unavailable(
+                    "no holder of the task's family accepted the cancel yet",
+                )),
+            },
         }
     }
 }
@@ -306,6 +386,10 @@ impl SettleWork {
             let Some(install_id) = install_at(&key) else {
                 continue;
             };
+            // A task settles from its family, never from a local job record.
+            if row.kind == WorkKind::Recipe {
+                continue;
+            }
             match (row.state, row.job) {
                 (WorkState::Dispatched, Some(job)) => {
                     self.phase = SettlePhase::Record(install_id, row.work_id);
@@ -431,6 +515,10 @@ impl RetireWork {
                 continue;
             }
             let row: WorkRow = decode(&value)?;
+            // A task's family is retired by its own submission and cancel rules, never by dedup.
+            if row.kind == WorkKind::Recipe {
+                continue;
+            }
             let item = RetiredRow {
                 key,
                 install_id,

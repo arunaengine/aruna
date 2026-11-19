@@ -43,9 +43,11 @@ use super::outgoing::{outgoing, request_context};
 use super::rate::{take_call, taken};
 use super::rows::StoreError;
 use super::submit::WorkRequest;
+use super::task_start::{StartTask, TaskRequest};
 use super::unavailable;
 use super::work::RequestContext;
 use crate::forward::transport::MetadataWriteError;
+use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::records::pages::ServingNode;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::{
@@ -1315,6 +1317,13 @@ impl Operation for CheckReply {
     }
 }
 
+/// What a native call starts: work with its minted ids, or a container task.
+#[derive(Debug, PartialEq)]
+enum NativeWork {
+    Work(WorkRequest, (u64, Ulid), ServingNode),
+    Task(Box<TaskRequest>, IngressNode),
+}
+
 #[derive(Debug, PartialEq)]
 enum NativePhase {
     Begin,
@@ -1329,9 +1338,7 @@ enum NativePhase {
 pub struct NativeCall {
     scope: RunScope,
     intent: CallIntent,
-    request: Option<WorkRequest>,
-    minted: (u64, Ulid),
-    serving: ServingNode,
+    work: Option<NativeWork>,
     phase: NativePhase,
 }
 
@@ -1345,18 +1352,37 @@ impl NativeCall {
         Self {
             scope: scope.clone(),
             intent,
-            request: Some(request),
-            minted,
-            serving,
+            work: Some(NativeWork::Work(request, minted, serving)),
+            phase: NativePhase::Begin,
+        }
+    }
+
+    /// Starts the container task of `request` through the run's call history.
+    pub fn task(
+        scope: &RunScope,
+        intent: CallIntent,
+        request: TaskRequest,
+        node: IngressNode,
+    ) -> Self {
+        Self {
+            scope: scope.clone(),
+            intent,
+            work: Some(NativeWork::Task(Box::new(request), node)),
             phase: NativePhase::Begin,
         }
     }
 
     fn start(&mut self) -> Result<Next<String>, CallFailure> {
-        let request = self.request.take().ok_or(IoError::Unfinished)?;
-        let start = StartWork::new(&self.scope, request, self.minted, self.serving);
+        let start = match self.work.take().ok_or(IoError::Unfinished)? {
+            NativeWork::Work(request, minted, serving) => {
+                IoCall::child(StartWork::new(&self.scope, request, minted, serving))
+            }
+            NativeWork::Task(request, node) => {
+                IoCall::child(StartTask::new(&self.scope, *request, node))
+            }
+        };
         self.phase = NativePhase::Start;
-        Ok(Next::Call(IoCall::child(start)))
+        Ok(Next::Call(start))
     }
 }
 

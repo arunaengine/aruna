@@ -572,6 +572,8 @@ pub enum CancelAuthority {
     /// The stored submitter deleted the finished run; every holder rechecks this and then
     /// answers the run as absent.
     Deletion,
+    /// A holder saw the plugin install of a task removed; its signature is that statement.
+    InstallRemoved,
 }
 
 /// Replicated cancellation intent for one `(submission_id, request_digest)`
@@ -1437,8 +1439,10 @@ impl JobRecordEnvelope {
                 }
             }
             // The publishing holder's signature is its statement that it checked
-            // group cancel permission; the payload field alone grants nothing.
-            CancelAuthority::GroupAdmin => Ok(RecordVerdict::Authentic),
+            // group cancel permission, or the install's removal; the field alone grants nothing.
+            CancelAuthority::GroupAdmin | CancelAuthority::InstallRemoved => {
+                Ok(RecordVerdict::Authentic)
+            }
         }
     }
 }

@@ -145,7 +145,12 @@ impl LocalRunOperation {
                 bucket,
                 key,
                 version_id,
-            } = &input.source;
+            } = &input.source
+            else {
+                return Err(LocalExecutionError::Unsupported(
+                    "inline inputs are for plugin tasks only",
+                ));
+            };
             if remote.is_some() {
                 remote_version(bucket, key, version_id.as_deref())?;
                 continue;
@@ -173,7 +178,12 @@ impl LocalRunOperation {
             bucket,
             key,
             version_id,
-        } = &mut input.source;
+        } = &mut input.source
+        else {
+            return Err(LocalExecutionError::Unsupported(
+                "inline inputs are for plugin tasks only",
+            ));
+        };
         let pinned = match head {
             Ok(head) => head.resolved_version_id.or(head.version_id).or(version),
             Err(
@@ -598,7 +608,9 @@ mod tests {
         let answer = run.next(outcome::<_, HeadObjectError>(Ok(found)));
         assert!(matches!(answer, Ok(Next::Call(IoCall::Child(_)))));
         assert_eq!(run.step, RunStep::Submit);
-        let InputSource::S3 { version_id, .. } = &run.config.spec.inputs[0].source;
+        let InputSource::S3 { version_id, .. } = &run.config.spec.inputs[0].source else {
+            panic!("the input names an object");
+        };
         assert_eq!(version_id.as_deref(), Some(version.to_string().as_str()));
         let job = SubmitJobResult {
             job_id: aruna_core::structs::execution::job::JobId::from_bytes([1; 16]),
@@ -1095,7 +1107,9 @@ mod tests {
         let JobPayload::Execution(spec) = &records[0].payload else {
             panic!("expected an execution payload");
         };
-        let InputSource::S3 { version_id, .. } = &spec.inputs[0].source;
+        let InputSource::S3 { version_id, .. } = &spec.inputs[0].source else {
+            panic!("the input names an object");
+        };
         assert_eq!(version_id.as_deref(), Some(version.to_string().as_str()));
     }
 }

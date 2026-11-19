@@ -151,11 +151,23 @@ fn unsupported_manifests() {
         json!({ "triggers": { "webhook": {} } }),
         json!({ "permissions": { "optional": ["secrets.value"] } }),
     ];
+    let open = ComputeQuota::default();
     for extra in cases {
-        assert_eq!(check_supported(&manifest(extra.clone())), Ok(()), "{extra}");
+        let checked = check_supported(&manifest(extra.clone()), &open);
+        assert_eq!(checked, Ok(()), "{extra}");
     }
-    let jobs = manifest(json!({ "permissions": { "optional": ["jobs.run"] } }));
-    assert!(check_supported(&jobs).is_err());
+    // Tasks are supported, within the group's per-job limits.
+    let image = format!("harbor.example/map@sha256:{}", "a".repeat(64));
+    let tasks = manifest(json!({
+        "permissions": { "required": ["jobs.run"] },
+        "recipes": { "map": { "image": image, "cpu": 8, "memory": 1024, "time": 60 } }
+    }));
+    assert_eq!(check_supported(&tasks, &open), Ok(()));
+    let small = ComputeQuota {
+        job_cpu_cores: Some(4),
+        ..ComputeQuota::default()
+    };
+    assert!(check_supported(&tasks, &small).is_err());
 }
 
 #[test]

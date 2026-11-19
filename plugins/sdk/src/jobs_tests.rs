@@ -147,3 +147,27 @@ fn finished_subject() {
     );
     assert_eq!(fake.calls(), ["job j1"]);
 }
+
+#[test]
+fn task_starts() {
+    let fake = install(&[]);
+    let reads = Object {
+        path: "raw/run-7/a.fq".into(),
+        url: "s3://raw/run-7/a.fq".into(),
+        size: 4,
+        version: "v3".into(),
+        marked: false,
+    };
+    let job = crate::task("map")
+        .parameter("reference", "GCF_000005845.2")
+        .object("/in/a.fq", &reads)
+        .input("/in/reads/", "raw/run-7/")
+        .file("/in/samples.tsv", "a.fq\tA\n")
+        .output("/out/results/", "results/run-7/")
+        .start()
+        .unwrap();
+    assert_eq!((job.id.as_str(), job.kind.as_str()), ("job-1", "task"));
+    let sent = "task map reference=GCF_000005845.2 /in/a.fq=raw/run-7/a.fq@v3,/in/reads/=raw/run-7/@- \
+                /in/samples.tsv=a.fq\tA\n /out/results/=results/run-7/";
+    assert_eq!(fake.calls().last().map(String::as_str), Some(sent));
+}

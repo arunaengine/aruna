@@ -591,8 +591,8 @@ export class Job {
   }
 }
 
-/** Jobs the install started: copies, downloads and uploads now, tasks later. A start answers the
- * job at once; `job_finished` delivers it once it ended and the run that started it succeeded. */
+/** Jobs the install started: copies, downloads, uploads and tasks. A start answers the job at once;
+ * `job_finished` delivers it once it ended and the run that started it succeeded. */
 export const jobs = {
   /** The job `id` of the install, as it stands now. */
   get(id) {
@@ -607,9 +607,40 @@ export const jobs = {
 };
 loaders.set("job_finished", (event) => jobs.get(event.resource));
 
+/** A container task the manifest declares under `[tasks.<name>]`. */
+export class Task {
+  constructor(name) {
+    this.name = name;
+  }
+
+  /** Starts the task and answers its `Job` at once. `parameters` fill the `{name}` parts of the
+   * command, one argument each; `inputs` map container paths to objects or bucket paths (a path
+   * ending in `/` gives every object below it); `files` map container paths to small text or
+   * bytes (64 KiB together); `outputs` map container directories to bucket path prefixes. */
+  start({ parameters, inputs, files, outputs } = {}) {
+    const pinned = Object.entries(inputs ?? {}).map(([path, source]) =>
+      typeof source === "string" ? [path, source, null] : [path, source.path, source.version ?? null],
+    );
+    const encoder = new TextEncoder();
+    const written = Object.entries(files ?? {}).map(([path, content]) => [
+      path,
+      typeof content === "string" ? encoder.encode(content) : new Uint8Array(content),
+    ]);
+    const values = Object.entries(parameters ?? {}).map(([name, value]) => [name, String(value)]);
+    const request = { task: this.name, parameters: values, inputs: pinned, files: written };
+    const id = calls().jobTask({ ...request, outputs: pairs(outputs) });
+    return new Job({ id, kind: "task" });
+  }
+}
+
+/** The task `name` the manifest declares. */
+export function task(name) {
+  return new Task(name);
+}
+
 export default {
-  on, run, settings, log, datasets, objects, jobs, service, secret, state,
-  Dataset, Job, Object: BucketObject, Reply, Request, Service, SyncEvent,
+  on, run, settings, log, datasets, objects, jobs, service, secret, state, task,
+  Dataset, Job, Object: BucketObject, Reply, Request, Service, SyncEvent, Task,
   ArunaError, Conflict, Fail, InvalidCall, InvalidInput, LimitReached, NotAllowed, NotFound, Retry,
   ServiceError, Unavailable, UnknownOutcome,
 };

@@ -214,7 +214,9 @@ async fn capture_inputs(
 ) -> Vec<CapturedInput> {
     let mut captured = Vec::with_capacity(spec.inputs.len());
     for input in &spec.inputs {
-        let InputSource::S3 { bucket, key, .. } = &input.source;
+        let InputSource::S3 { bucket, key, .. } = &input.source else {
+            panic!("the input names an object");
+        };
         let head = drive(
             HeadObjectOperation::new(HeadObjectInput {
                 bucket: bucket.clone(),

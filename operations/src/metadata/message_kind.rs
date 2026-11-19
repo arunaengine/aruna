@@ -151,8 +151,10 @@ pub fn transport_message_kind(message: &MetadataTransportMessage) -> &'static st
         MetadataTransportMessage::CheckNodeSecret { .. } => "check_node_secret",
         MetadataTransportMessage::NodeSecretChecked { .. } => "node_secret_checked",
         MetadataTransportMessage::ForwardedGraphPending { .. } => "forwarded_graph_pending",
-        MetadataTransportMessage::ForwardClosureQuery { .. } => "forward_closure_query",
-        MetadataTransportMessage::ForwardedClosureQuery { .. } => "forwarded_closure_query",
+        MetadataTransportMessage::QueryLaunchClosure { .. } => "query_launch_closure",
+        MetadataTransportMessage::LaunchClosureAnswered { .. } => "launch_closure_answered",
         MetadataTransportMessage::ExportAnswer { .. } => "export_answer",
+        MetadataTransportMessage::QuerySubmissionClaim { .. } => "query_submission_claim",
+        MetadataTransportMessage::SubmissionClaimAnswered { .. } => "submission_claim_answered",
     }
 }

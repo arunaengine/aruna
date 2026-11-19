@@ -337,7 +337,9 @@ impl RecordCrateOperation {
     ) -> Self {
         let inputs = (spec.inputs.iter())
             .filter_map(|input| {
-                let InputSource::S3 { bucket, key, .. } = &input.source;
+                let InputSource::S3 { bucket, key, .. } = &input.source else {
+                    return None;
+                };
                 let captured = (parent.captured_inputs.iter())
                     .find(|captured| captured.destination_key == input.dest_key)?;
                 Some(CrateInput {
@@ -953,7 +955,9 @@ fn build_crate_jsonld(
     let mut part_ids = Vec::new();
     let mut files = Vec::new();
     for input in &spec.inputs {
-        let InputSource::S3 { bucket, key, .. } = &input.source;
+        let InputSource::S3 { bucket, key, .. } = &input.source else {
+            continue;
+        };
         let name = input.name.clone().unwrap_or_else(|| input.dest_key.clone());
         let captured = record
             .captured_inputs

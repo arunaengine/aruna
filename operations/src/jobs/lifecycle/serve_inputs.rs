@@ -131,7 +131,10 @@ impl ServeInputsOperation {
         };
         captured.link = link;
         // An input asked without a version is pinned to the one captured here.
-        let InputSource::S3 { version_id, .. } = &mut input.source;
+        let InputSource::S3 { version_id, .. } = &mut input.source else {
+            let reason = "inline inputs are never resolved".to_string();
+            return Err(SubmissionRefusal::Invalid { reason });
+        };
         version_id.get_or_insert_with(|| captured.version_id.to_string());
         let answer = (input, captured);
         if !fits(&mut self.size, &answer) {
@@ -307,7 +310,9 @@ mod tests {
         let Ok(Next::Done(answers)) = done else {
             panic!("the input is answered: {done:?}");
         };
-        let InputSource::S3 { version_id, .. } = &answers[0].0.source;
+        let InputSource::S3 { version_id, .. } = &answers[0].0.source else {
+            panic!("the input names an object");
+        };
         assert_eq!(version_id.as_deref(), Some(version.as_str()));
         assert_eq!(answers[0].0.source_node_id, Some(node(1)));
     }

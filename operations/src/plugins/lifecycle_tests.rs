@@ -598,3 +598,44 @@ mod operations {
         assert_eq!(remove.next(failed), Err(step));
     }
 }
+
+fn conflicted() -> RemoveConflicted {
+    use aruna_core::structs::identity::auth::Actor;
+    let install = crate::plugins::fixtures::install();
+    let actor = Actor {
+        node_id: install.receiver,
+        user_id: install.granted_by,
+        realm_id: install.account.realm_id,
+    };
+    let caller = InstallCaller::new(&actor, &AuthContext::from(&actor), 5);
+    let proven = BTreeSet::from([install.group_id]);
+    RemoveConflicted::new(caller, (install.install_id, proven))
+}
+
+// Only a conflict with a deletion is removed this way; every candidate is torn down first.
+#[test]
+fn conflict_torn_down() {
+    use crate::plugins::fixtures::is_child;
+    use crate::plugins::rows::tests::child_result;
+    let mut absent = conflicted();
+    assert!(is_child(&absent.first()));
+    let none = child_result(Ok::<_, RecordError>(InstallEntry::Absent));
+    assert_eq!(absent.next(none), Err(InstallError::NotFound));
+    let mut remove = conflicted();
+    remove.first().unwrap();
+    let conflict = InstallEntry::Conflict {
+        deletion: true,
+        installs: vec![crate::plugins::fixtures::install()],
+    };
+    let entry = child_result(Ok::<_, RecordError>(conflict));
+    assert!(is_child(&remove.next(entry)));
+    assert!(is_child(
+        &remove.next(child_result(Ok::<_, AccountError>(())))
+    ));
+    assert!(is_child(
+        &remove.next(child_result(Ok::<_, RulesFailure>(())))
+    ));
+    assert_eq!(remove.phase, ConflictPhase::Deleted);
+    let deleted = child_result(Ok::<Option<PluginInstall>, RecordError>(None));
+    assert_eq!(remove.next(deleted), Ok(Next::Done(())));
+}

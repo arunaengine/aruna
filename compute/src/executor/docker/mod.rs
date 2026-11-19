@@ -2558,4 +2558,15 @@ mod tests {
             status.phase
         );
     }
+
+    #[test]
+    fn passes_vault_env() {
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        let password = aruna_core::compute::Secret::new("canary-5e1f");
+        spec.vault_env
+            .insert("WEBIN_PASSWORD".to_string(), password);
+        let body = build_config(&DockerConfig::default(), &fence(), &spec);
+        let env = body.env.unwrap();
+        assert!(env.contains(&"WEBIN_PASSWORD=canary-5e1f".to_string()));
+    }
 }

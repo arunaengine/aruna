@@ -150,7 +150,8 @@ pub fn job_manifest(
             }
         }
     }
-    if spec.staging_mode == StagingMode::DirectS3 || spec.reaches_s3() {
+    if spec.staging_mode == StagingMode::DirectS3 || spec.reaches_s3() || !spec.vault_env.is_empty()
+    {
         env_from.push(json!({"secretRef":{"name":secret_name(&name)}}));
     }
     // Tools write caches relative to the working directory, so the non-root
@@ -198,7 +199,9 @@ pub fn job_manifest(
     let mut env = spec
         .env
         .iter()
-        .filter(|(name, _)| !spec.secret_env.contains_key(*name))
+        .filter(|(name, _)| {
+            !spec.secret_env.contains_key(*name) && !spec.vault_env.contains_key(*name)
+        })
         .map(|(name, value)| json!({"name":name,"value":value}))
         .collect::<Vec<_>>();
     env.push(json!({"name":"ARUNA_JOB_ID","value":spec.attempt.job_id}));
@@ -553,9 +556,9 @@ pub fn secret_manifest(
     config: &KubernetesConfig,
     spec: &TaskSpec,
 ) -> Result<Secret, BackendError> {
-    let mut values = spec
-        .secret_env
-        .iter()
+    // Released values ride the same Secret, never the pod spec.
+    let mut values = (spec.secret_env.iter())
+        .chain(&spec.vault_env)
         .map(|(key, value)| (key.clone(), value.expose().to_string()))
         .collect::<BTreeMap<_, _>>();
     // The CSI driver reads the data mount credential under its own key names.
@@ -1942,5 +1945,27 @@ mod tests {
         let error = policy_manifests(&config).expect_err("a missing file is refused");
 
         assert!(error.to_string().contains("missing.yaml"), "{error}");
+    }
+
+    #[test]
+    fn vault_env_secret() {
+        // A released value rides the attempt's Secret in Files staging; the pod spec never
+        // holds it.
+        let mut spec = TaskSpec::new(AttemptRef::new("job", 1), "image");
+        let password = Secret::new("canary-5e1f");
+        spec.vault_env
+            .insert("WEBIN_PASSWORD".to_string(), password);
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job =
+            serde_json::to_value(job_manifest(&context(), &spec, &config(), &layout).unwrap())
+                .unwrap();
+        assert!(!job.to_string().contains("canary"));
+        let container = &job["spec"]["template"]["spec"]["containers"][0];
+        assert_eq!(
+            container["envFrom"][0]["secretRef"]["name"],
+            "aruna-job-a1-env"
+        );
+        let secret = secret_manifest(&context(), &config(), &spec).unwrap();
+        assert_eq!(secret.string_data.unwrap()["WEBIN_PASSWORD"], "canary-5e1f");
     }
 }

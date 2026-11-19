@@ -252,6 +252,58 @@ mod operations {
         child_result(Ok::<(), StoreError>(()))
     }
 
+    fn task_row() -> WorkRow {
+        let mut task = dispatched();
+        task.kind = WorkKind::Recipe;
+        task
+    }
+
+    // A task shows its family's state, read from the projection this node holds.
+    #[test]
+    fn task_state_projected() {
+        let install = fixtures::install();
+        let mut state = JobState::new((&install, node(3)), "id");
+        state.first().unwrap();
+        assert!(is_child(&state.next(row_result(task_row()))));
+        let none = child_result(Ok::<Option<FamilyView>, JobRouteError>(None));
+        let Ok(Next::Done(status)) = state.next(none) else {
+            panic!("the projection ends the status");
+        };
+        assert_eq!(
+            (status.state.as_str(), status.kind.as_str()),
+            ("queued", "task")
+        );
+    }
+
+    // A task whose family was not adopted yet cannot be cancelled yet.
+    #[test]
+    fn task_cancel_waits() {
+        let mut cancel = cancel();
+        let read = cancel.next(row_result(task_row()));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Read(_)))));
+        let refused = cancel.next(crate::plugins::rows::tests::values_result(vec![None]));
+        let Err(CallError(error)) = refused else {
+            panic!("an unadopted task cannot stop yet");
+        };
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+    }
+
+    // Task rows follow their family, so neither upkeep pass touches them.
+    #[test]
+    fn upkeep_skips_tasks() {
+        let mut task = dispatched();
+        task.kind = WorkKind::Recipe;
+        let mut settle = SettleWork::new(5);
+        settle.first().unwrap();
+        assert_eq!(settle.next(scanned(&[task.clone()])), Ok(Next::Done(0)));
+        let mut config = fixtures::config(&fixtures::install(), json!({}));
+        config.installs.clear();
+        let mut retire = RetireWork::new(&config, 5);
+        retire.first().unwrap();
+        assert!(is_child(&retire.next(scanned(&[task]))));
+        assert_eq!(retire.next(deleted()), Ok(Next::Done(0)));
+    }
+
     #[test]
     fn retire_keeps_live() {
         let config = fixtures::config(&fixtures::install(), json!({}));

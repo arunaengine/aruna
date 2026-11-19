@@ -1155,11 +1155,11 @@ impl ExecutorBackend for KubernetesBackend {
         }
         self.remove_helpers(context).await?;
         self.remove_marker(context).await?;
-        if spec.reaches_s3() {
+        if spec.reaches_s3() || !spec.vault_env.is_empty() {
             self.ensure_secret(context, spec).await?;
-            if session_mount(spec, &self.config).is_some() {
-                self.ensure_data(context, spec).await?;
-            }
+        }
+        if spec.reaches_s3() && session_mount(spec, &self.config).is_some() {
+            self.ensure_data(context, spec).await?;
         }
         match spec.staging_mode {
             StagingMode::Files => {

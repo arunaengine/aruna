@@ -172,7 +172,7 @@ pub struct RunScriptInput {
     pub target: Option<ExecutionTarget>,
     /// Extra tags recorded on the run, for example who started it. A key under
     /// `aruna-engine.org/label/` demands a matching target label. The runtime
-    /// sets its own network tag and keeps it.
+    /// sets its own network tag and keeps it; `aruna-engine.org/plugin-` keys are refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<std::collections::BTreeMap<String, String>>,
 }

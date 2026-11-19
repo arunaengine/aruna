@@ -12,7 +12,7 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::SubmissionId;
+use aruna_core::structs::execution::job::{SubmissionId, plugin_tag};
 use tracing::{debug, warn};
 
 use super::admit_here::AcceptedSubmission;
@@ -35,6 +35,10 @@ pub(super) struct ForwardSubmissionOperation {
     has_token: bool,
     holders: VecDeque<NodeId>,
     asked: Option<NodeId>,
+    /// A plugin task, whose sender must tell a refusal from a lost answer.
+    tracked: bool,
+    /// A holder may have committed the request without its answer arriving.
+    lost: bool,
 }
 
 type ForwardNext = Result<Next<AcceptedSubmission>, SubmitJobError>;
@@ -63,6 +67,8 @@ impl ForwardSubmissionOperation {
             has_token,
             holders: holders.into(),
             asked: None,
+            tracked: plugin_tag(&request.spec.tags).is_some(),
+            lost: false,
         }
     }
 
@@ -122,6 +128,7 @@ impl Operation for ForwardSubmissionOperation {
             Ok(reply) => reply,
             Err(error) => {
                 debug!(peer = %peer, error = %error, "Submission forwarding failed");
+                self.lost = true;
                 return self.ask();
             }
         };
@@ -133,21 +140,32 @@ impl Operation for ForwardSubmissionOperation {
                     "Unexpected submission forwarding reply"
                 );
             }
+            self.lost = true;
             return self.ask();
         };
-        match result {
-            Ok(ack) => self.accepted(ack),
+        let refused = match result {
+            Ok(ack) => return self.accepted(ack),
             Err(SubmissionRefusal::Conflict { existing_job_id }) => {
-                Err(SubmitJobError::JobPlanConflict { existing_job_id })
+                SubmitJobError::JobPlanConflict { existing_job_id }
             }
-            Err(SubmissionRefusal::Unauthorized) => Err(SubmitJobError::AuthorityDenied),
-            Err(SubmissionRefusal::Invalid { reason }) => {
-                Err(SubmitJobError::InvalidWorkspace(reason))
-            }
+            Err(SubmissionRefusal::Unauthorized) => SubmitJobError::AuthorityDenied,
+            Err(SubmissionRefusal::Invalid { reason }) => SubmitJobError::InvalidWorkspace(reason),
             Err(reason) => {
+                // Only these two prove that the holder committed nothing.
+                self.lost |= !matches!(
+                    reason,
+                    SubmissionRefusal::NotHolder | SubmissionRefusal::IdentityMismatch
+                );
                 debug!(peer = %peer, reason = ?reason, "Family holder refused the submission");
-                self.ask()
+                return self.ask();
             }
+        };
+        // A plugin task's refusal proves nothing once an earlier holder's answer was lost.
+        match self.tracked && self.lost {
+            true => Err(SubmitJobError::PlacementUnavailable(format!(
+                "an earlier holder's answer was lost, then: {refused}"
+            ))),
+            false => Err(refused),
         }
     }
 }
@@ -171,6 +189,7 @@ mod tests {
             captured_inputs: Vec::new(),
             output_policies: Vec::new(),
             input_pages: None,
+            admit_by: None,
         }
     }
 
@@ -256,6 +275,62 @@ mod tests {
         let refused = answer(node(2), Err(SubmissionRefusal::Invalid { reason }));
         assert!(matches!(
             operation.next(refused),
+            Err(SubmitJobError::InvalidWorkspace(_))
+        ));
+    }
+    fn task_forward() -> ForwardSubmissionOperation {
+        let mut request = request();
+        let tag = aruna_core::structs::execution::job::PLUGIN_WORK_TAG.to_string();
+        request.spec.tags.insert(tag, ulid::Ulid::nil().to_string());
+        let identity = request.identity().expect("identity derives");
+        ForwardSubmissionOperation::new(&request, &identity, vec![node(2), node(3)], token())
+    }
+
+    fn invalid(peer: NodeId) -> IoResult {
+        let reason = "compute quota denied".to_string();
+        answer(peer, Err(SubmissionRefusal::Invalid { reason }))
+    }
+
+    // A holder admits a plugin task but its answer is lost; the next holder's refusal then
+    // proves nothing.
+    #[test]
+    fn lost_answer_undecides() {
+        let mut task = task_forward();
+        task.first().expect("first holder");
+        let lost = event(node(2), Err(PeerRequestError::TimedOut));
+        assert_eq!(asked(task.next(lost)), node(3));
+        assert!(matches!(
+            task.next(invalid(node(3))),
+            Err(SubmitJobError::PlacementUnavailable(_))
+        ));
+        // An unavailable holder may have committed too; a holder that is none may not.
+        let mut unavailable = task_forward();
+        unavailable.first().expect("first holder");
+        let refused = answer(node(2), Err(SubmissionRefusal::Unavailable));
+        assert_eq!(asked(unavailable.next(refused)), node(3));
+        assert!(matches!(
+            unavailable.next(invalid(node(3))),
+            Err(SubmitJobError::PlacementUnavailable(_))
+        ));
+        let mut elsewhere = task_forward();
+        elsewhere.first().expect("first holder");
+        let refused = answer(node(2), Err(SubmissionRefusal::NotHolder));
+        assert_eq!(asked(elsewhere.next(refused)), node(3));
+        assert!(matches!(
+            elsewhere.next(invalid(node(3))),
+            Err(SubmitJobError::InvalidWorkspace(_))
+        ));
+    }
+
+    // Other callers keep their answer after a lost reply.
+    #[test]
+    fn untracked_keeps_refusal() {
+        let mut operation = forward(token());
+        operation.first().expect("first holder");
+        let lost = event(node(2), Err(PeerRequestError::TimedOut));
+        operation.next(lost).expect("next holder");
+        assert!(matches!(
+            operation.next(invalid(node(3))),
             Err(SubmitJobError::InvalidWorkspace(_))
         ));
     }

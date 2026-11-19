@@ -627,7 +627,9 @@ fn rejects_unsupported_fields() {
     task.inputs[0].kind = TesFileType::Directory;
     let (spec, _) =
         map_execution_spec(&task, None, ExecutionTarget::Realm).expect("directory maps");
-    let InputSource::S3 { key, .. } = &spec.inputs[0].source;
+    let InputSource::S3 { key, .. } = &spec.inputs[0].source else {
+        panic!("the input names an object");
+    };
     assert!(key.ends_with('/') && spec.inputs[0].dest_key.ends_with('/'));
     task.inputs[0].kind = TesFileType::File;
     task.executors[0].stdout = Some("/logs/out".to_string());
@@ -1416,6 +1418,19 @@ fn rejects_derived_tag() {
     let mut task = sample_task(group);
     task.tags
         .insert(KIND_TAG_KEY.to_string(), "docker".to_string());
+
+    let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code.as_deref(), Some("reserved_tag"));
+}
+
+#[test]
+fn rejects_plugin_tag() {
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    task.tags.insert(
+        "aruna-engine.org/plugin-work".to_string(),
+        Ulid::nil().to_string(),
+    );
 
     let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);

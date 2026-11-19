@@ -59,6 +59,7 @@ use paths::{event_observes_dot, operation_paths, role_definition_value};
 pub use placement::*;
 use placement::{candidate_map_value, transition_plan_value, transition_proof_value};
 pub use revocation::{REVOCATIONS_PER_ORIGIN, revoked_token_entry, revoked_token_path};
+pub use targets::InstallEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminApplyStatus {

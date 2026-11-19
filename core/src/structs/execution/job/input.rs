@@ -71,7 +71,9 @@ pub fn plan_composition(
 }
 
 fn validate_input_version(input: &InputSelection) -> Result<(), CompositionError> {
-    let InputSource::S3 { version_id, .. } = &input.source;
+    let InputSource::S3 { version_id, .. } = &input.source else {
+        return Ok(());
+    };
     match input.mode {
         InputMode::ExactReference if version_id.is_none() => {
             Err(CompositionError::MissingVersion(input.dest_key.clone()))
@@ -86,7 +88,10 @@ fn validate_input_version(input: &InputSelection) -> Result<(), CompositionError
     }
 }
 
-/// Where an input comes from. v1 supports internal S3 objects only.
+/// Inline bytes one plugin task job may carry, all inputs together.
+pub const MAX_INLINE_BYTES: usize = 64 * 1024;
+
+/// Where an input comes from: an internal S3 object, or bytes a plugin wrote into the spec.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputSource {
     S3 {
@@ -94,6 +99,22 @@ pub enum InputSource {
         key: String,
         version_id: Option<String>,
     },
+    /// Only plugin tasks carry it; it is never resolved, captured or transferred.
+    Inline { bytes: Vec<u8> },
+}
+
+impl InputSource {
+    pub fn is_inline(&self) -> bool {
+        matches!(self, Self::Inline { .. })
+    }
+}
+
+/// How many inputs name an object; only those are resolved, captured and planned.
+pub fn object_count(inputs: &[InputSelection]) -> usize {
+    inputs
+        .iter()
+        .filter(|input| !input.source.is_inline())
+        .count()
 }
 
 /// One declared input and where it lands in the workspace bucket.
@@ -147,6 +168,22 @@ pub struct ComputeResources {
     pub disk_bytes: Option<u64>,
     pub max_walltime_ms: Option<u64>,
     pub preemptible: bool,
+}
+
+/// Tags only the plugin host sets, on the jobs of plugin tasks; every job ingress refuses them.
+pub const PLUGIN_TAG_PREFIX: &str = "aruna-engine.org/plugin-";
+/// The plugin install a task job runs for.
+pub const PLUGIN_INSTALL_TAG: &str = "aruna-engine.org/plugin-install";
+/// The work row on the install's receiver that names the task job.
+pub const PLUGIN_WORK_TAG: &str = "aruna-engine.org/plugin-work";
+/// The container file the node reads into the work's report; never exported.
+pub const PLUGIN_REPORT_TAG: &str = "aruna-engine.org/plugin-report";
+
+/// The first tag of `tags` only the plugin host may set.
+pub fn plugin_tag(tags: &BTreeMap<String, String>) -> Option<&str> {
+    tags.keys()
+        .find(|key| key.starts_with(PLUGIN_TAG_PREFIX))
+        .map(String::as_str)
 }
 
 /// The container plan carried by a `JobPayload::Execution`. Bounded per spec 16.2.

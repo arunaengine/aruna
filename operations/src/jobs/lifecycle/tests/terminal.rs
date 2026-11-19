@@ -138,6 +138,7 @@ pub(super) async fn reserve_execution(
             subject_digest: receipt.subject_digest,
             record: Box::new(record.clone()),
             now_ms: 4_000,
+            fence: None,
         }),
         ctx,
     )

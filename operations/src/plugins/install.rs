@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -23,6 +23,7 @@ use aruna_core::{NodeId, UserId};
 use aruna_plugin_types::artifact::ArtifactDigest;
 use aruna_plugin_types::manifest::Manifest;
 use aruna_plugin_types::permission::{Grant, Permission};
+use aruna_plugin_types::recipe::Network;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -46,6 +47,7 @@ use crate::auth::enforcement::{compiled_policies, group_from_path, policy_reads,
 use crate::auth::permission_rules::{PermissionRules, read_rules, rule_reads};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::jobs::lifecycle::advertised::{Advertised, AdvertisementsOperation};
 use crate::users::service_account::check::{
     ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation,
 };
@@ -137,6 +139,8 @@ pub struct Prepared {
     pub warnings: Vec<String>,
     /// Digest of the checked request; a retry with the same id must match it.
     pub request: String,
+    /// The nodes that advertise an executor, read only for a plugin with tasks.
+    pub executors: BTreeSet<NodeId>,
 }
 
 /// Who changes an install, and when the change was asked for.
@@ -177,6 +181,7 @@ impl InstallCaller {
             expected,
             install: Some(install.clone()),
             audit,
+            proven: Default::default(),
         }))
     }
 
@@ -246,6 +251,7 @@ enum PreparePhase {
     Admin,
     Config,
     Holder(Box<CheckedRequest>),
+    Executors(Box<CheckedRequest>),
     Binding(Box<CheckedRequest>),
 }
 
@@ -257,6 +263,7 @@ pub struct PrepareInstall {
     realm_id: RealmId,
     local: Option<NodeId>,
     request: InstallRequest,
+    executors: BTreeSet<NodeId>,
     now_ms: u64,
     ids: IdMint,
     phase: PreparePhase,
@@ -273,6 +280,7 @@ impl PrepareInstall {
             realm_id,
             local,
             request: request.clone(),
+            executors: BTreeSet::new(),
             now_ms: 0,
             ids: IdMint::default(),
             phase: PreparePhase::Admin,
@@ -298,7 +306,8 @@ impl PrepareInstall {
             request.version.as_deref().or(pinned),
         )?;
         let manifest = read_manifest(&plugin)?;
-        check_supported(&manifest)?;
+        let quota = (config.compute.effective_quota(&request.group_id)).unwrap_or_default();
+        check_supported(&manifest, &quota)?;
         let settings = check_settings(&manifest, &request.settings)?;
         let scope = InstallScope {
             realm_id: self.realm_id,
@@ -320,8 +329,9 @@ impl PrepareInstall {
     fn bind(&self, checked: &CheckedRequest) -> IoCall {
         let config = &checked.config;
         let group_id = self.request.group_id;
+        let place = (self.realm_id, group_id);
         let receiver = (self.existing(config).map(|install| install.receiver))
-            .or_else(|| pick_receiver(config, self.realm_id, group_id));
+            .or_else(|| pick_receiver(config, place, &self.executors));
         let place = BindPlace {
             group_id,
             local: self.local,
@@ -330,6 +340,12 @@ impl PrepareInstall {
         let requested = &self.request.secrets;
         let bind = BindSlots::new(config.clone(), place, &checked.manifest, requested);
         IoCall::child(bind)
+    }
+
+    fn bind_next(&mut self, checked: Box<CheckedRequest>) -> Result<Next<Prepared>, InstallError> {
+        let bind = self.bind(&checked);
+        self.phase = PreparePhase::Binding(checked);
+        Ok(Next::Call(bind))
     }
 
     fn prepared(&self, checked: CheckedRequest, bound: BoundSlots) -> Prepared {
@@ -352,6 +368,7 @@ impl PrepareInstall {
             secrets,
             warnings,
             request,
+            executors: self.executors.clone(),
         }
     }
 }
@@ -388,9 +405,20 @@ impl Operation for PrepareInstall {
             }
             PreparePhase::Holder(checked) => {
                 result.child::<(), InstallError>()??;
-                let bind = self.bind(&checked);
-                self.phase = PreparePhase::Binding(checked);
-                Ok(Next::Call(bind))
+                if checked.manifest.recipes.is_empty() {
+                    return self.bind_next(checked);
+                }
+                let read = AdvertisementsOperation::new(&checked.config);
+                self.phase = PreparePhase::Executors(checked);
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            PreparePhase::Executors(checked) => {
+                let (documents, _) = result.child::<Advertised, IoError>()??;
+                self.executors = (documents.into_iter())
+                    .filter(|(_, document)| !document.executors.is_empty())
+                    .map(|(node, _)| node)
+                    .collect();
+                self.bind_next(checked)
             }
             PreparePhase::Binding(checked) => {
                 let bound = result.child::<BoundSlots, BindError>()??;
@@ -452,7 +480,8 @@ impl InstallPrepared {
             }
             Some(existing) => Ok(self.settle(existing.clone())),
             None => {
-                let receiver = pick_receiver(&config, scope.realm_id, scope.group_id);
+                let place = (scope.realm_id, scope.group_id);
+                let receiver = pick_receiver(&config, place, &self.prepared.executors);
                 let receiver = receiver.ok_or_else(|| {
                     let why = "no eligible server or management node holds the group's metadata";
                     InstallError::Unavailable(why.into())
@@ -1003,6 +1032,18 @@ pub struct SecretLine {
     pub value: bool,
 }
 
+/// One container task: the pinned image and its ceilings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLine {
+    pub name: String,
+    pub image: String,
+    pub cpu: u32,
+    pub memory_bytes: u64,
+    pub time_secs: u64,
+    /// With an open network the container can send anything it reads anywhere.
+    pub open_network: bool,
+}
+
 /// What an admin approves: the version, the permissions and connections, and the triggers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
@@ -1017,6 +1058,8 @@ pub struct Summary {
     pub triggers: Vec<String>,
     pub secrets: Vec<SecretLine>,
     pub warnings: Vec<String>,
+    /// The container tasks the plugin may start on the install's receiver.
+    pub tasks: Vec<TaskLine>,
 }
 
 /// The summary of a checked install request, before anything is written.
@@ -1123,6 +1166,16 @@ fn summary_of(
                     .then(|| format!("a realm admin adds the use rule of `{binding}` for `{slot}`"))
             })
             .collect(),
+        tasks: (manifest.recipes.iter())
+            .map(|(name, recipe)| TaskLine {
+                name: name.clone(),
+                image: recipe.image.clone(),
+                cpu: recipe.cpu,
+                memory_bytes: recipe.memory,
+                time_secs: recipe.time,
+                open_network: recipe.network == Network::Open,
+            })
+            .collect(),
     }
 }
 
@@ -1147,6 +1200,7 @@ fn bare_summary(install: &PluginInstall) -> Summary {
         triggers: Vec::new(),
         secrets: Vec::new(),
         warnings: Vec::new(),
+        tasks: Vec::new(),
     }
 }
 

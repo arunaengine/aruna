@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
@@ -12,14 +14,16 @@ use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::target_placement_ref;
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
+use aruna_core::reducer::{
+    AdminDocumentError, AdminDocumentState, InstallEntry, decode_reducer_state,
+};
 use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
@@ -45,6 +49,34 @@ pub struct InstallEntryConfig {
     pub install: Option<PluginInstall>,
     /// The admin audit row written in the same transaction.
     pub audit: Option<AdminAuditRecord>,
+    /// The groups whose admin rights the caller proved; a resolving deletion over a conflict
+    /// needs every group of its candidates here.
+    pub proven: BTreeSet<GroupId>,
+}
+
+/// Whether a write may go to an install's path as the realm config holds it: a removed path
+/// takes no new record, and a conflict with a deletion resolves only to that deletion, by a
+/// caller who proved admin rights for every candidate's group.
+fn entry_admits(
+    entry: &InstallEntry,
+    writes_record: bool,
+    proven: &BTreeSet<GroupId>,
+) -> Result<(), RecordError> {
+    match entry {
+        InstallEntry::Settled(None) if writes_record => Err(RecordError::Retired),
+        InstallEntry::Conflict { deletion: true, .. } if writes_record => Err(RecordError::Retired),
+        InstallEntry::Conflict {
+            deletion: true,
+            installs,
+        } => match installs
+            .iter()
+            .all(|install| proven.contains(&install.group_id))
+        {
+            true => Ok(()),
+            false => Err(RecordError::Unproven),
+        },
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -67,6 +99,10 @@ pub enum RecordError {
     Mismatch,
     #[error("the node that runs an install cannot change")]
     ReceiverChanged,
+    #[error("this install was removed; install again, which mints a new id")]
+    Retired,
+    #[error("the install changed meanwhile: a candidate of another group appeared")]
+    Unproven,
 }
 
 /// A lost transaction stays a storage conflict, so callers can tell it from other failures.
@@ -184,6 +220,8 @@ impl InstallEntryOperation {
         let mut reducer_state = previous
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
+        let entry = reducer_state.install_entry(&self.config.install_id);
+        entry_admits(&entry, self.config.install.is_some(), &self.config.proven)?;
         let current = (reducer_state.materialized_installs().into_iter())
             .find(|install| install.install_id == self.config.install_id);
         if current
@@ -290,6 +328,47 @@ impl Operation for InstallEntryOperation {
                 Ok(self.finish())
             }
         }
+    }
+}
+
+/// Reads the realm config's entry at an install's path, deletions and conflicts included.
+#[derive(Debug, PartialEq)]
+pub struct ReadEntry {
+    realm_id: RealmId,
+    install_id: Ulid,
+}
+
+impl ReadEntry {
+    pub fn new(realm_id: RealmId, install_id: Ulid) -> Self {
+        Self {
+            realm_id,
+            install_id,
+        }
+    }
+}
+
+impl Operation for ReadEntry {
+    type Output = InstallEntry;
+    type Error = RecordError;
+
+    fn first(&mut self) -> Result<Next<InstallEntry>, RecordError> {
+        let target = AdminDocumentTarget::RealmConfig {
+            realm_id: self.realm_id,
+        };
+        let key = reducer_state_key(&target);
+        Ok(Next::Call(IoCall::Read(vec![(
+            DOCUMENT_STATE_KEYSPACE.to_string(),
+            key,
+        )])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<InstallEntry>, RecordError> {
+        let [state] = values::<1>(result)?;
+        let Some(state) = state else {
+            return Ok(Next::Done(InstallEntry::Absent));
+        };
+        let state = decode_reducer_state(state.as_ref()).map_err(ConversionError::from)?;
+        Ok(Next::Done(state.install_entry(&self.install_id)))
     }
 }
 

@@ -15,6 +15,7 @@ use aruna_core::structs::execution::job::UploadForm;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::metadata::api::export_types::RoCrateExportView;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::plugins::check::RunScope;
@@ -40,6 +41,7 @@ use aruna_operations::plugins::outgoing::{
 use aruna_operations::plugins::rows::write_rows;
 use aruna_operations::plugins::state::{MAX_STATE_KEY, read_state};
 use aruna_operations::plugins::submit::{CopyRequest, DownloadRequest, UploadRequest, WorkRequest};
+use aruna_operations::plugins::task_start::TaskRequest;
 use aruna_operations::plugins::unavailable;
 use aruna_operations::plugins::work::RequestContext;
 use aruna_operations::plugins::work_calls::{JobOutputs, JobRow};
@@ -50,7 +52,7 @@ use aruna_plugin_types::calls::{
 };
 use aruna_plugin_types::permission::Permission;
 use aruna_plugins::broker::{
-    Broker, CallContext, FileChange, JobCopy, JobDownload, JobUpload, MetadataCreate,
+    Broker, CallContext, FileChange, JobCopy, JobDownload, JobTask, JobUpload, MetadataCreate,
     MetadataPatch, SendRequest, StatePut, StateRemove,
 };
 use async_trait::async_trait;
@@ -520,6 +522,34 @@ impl Broker for RunBroker {
             ordinal: upload.intent.ordinal,
         };
         (self.native(&upload.intent, WorkRequest::Upload(request))).await
+    }
+
+    async fn jobs_start_task(&self, _cx: &CallContext, task: JobTask) -> Result<String, HostError> {
+        let mut inputs = Vec::with_capacity(task.inputs.len());
+        for (path, source, version) in task.inputs {
+            let version = version.as_deref().map(version_id).transpose()?;
+            inputs.push((path, self.expand(&source)?, version));
+        }
+        let mut outputs = Vec::with_capacity(task.outputs.len());
+        for output in task.outputs {
+            outputs.push((output.name, self.expand(&output.value)?));
+        }
+        let request = TaskRequest {
+            task: task.task,
+            parameters: (task.parameters.into_iter())
+                .map(|field| (field.name, field.value))
+                .collect(),
+            inputs,
+            files: task.files,
+            outputs,
+            ordinal: task.intent.ordinal,
+        };
+        let fresh = self.ctx.fresh_heartbeats();
+        let node = ingress_node(self.ctx.node_and_realm(), fresh, unix_timestamp_millis())
+            .ok_or_else(|| unavailable("this node serves no network"))?;
+        let call = NativeCall::task(&self.scope, call_intent(&task.intent), request, node);
+        let started = drive(call, &self.ctx).await;
+        started.map_err(|failure| self.failed(failure))
     }
 
     async fn jobs_get(&self, _cx: &CallContext, id: &str) -> Result<JobStatus, HostError> {

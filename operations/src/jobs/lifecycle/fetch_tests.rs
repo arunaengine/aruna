@@ -24,7 +24,7 @@ fn fetch(family: &Family) -> FetchFamilyOperation {
     FetchFamilyOperation::new(
         family.placement,
         vec![node(2), node(3)],
-        (family.submission_id, family.request_digest),
+        (family.submission_id, Some(family.request_digest)),
         Duration::from_secs(10),
     )
 }
@@ -121,7 +121,7 @@ fn ends_without_holders() {
     let mut fetch = super::FetchFamilyOperation::new(
         family.placement,
         vec![node(2), node(3)],
-        (family.submission_id, family.request_digest),
+        (family.submission_id, Some(family.request_digest)),
         Duration::from_secs(10),
     );
     fetch.first().expect("first ask");

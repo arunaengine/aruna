@@ -735,12 +735,21 @@ pub enum MetadataTransportMessage {
             MetadataReadError,
         >,
     },
+    /// Asks a node a plugin task's submission was sent to whether it admitted it; past
+    /// `admit_by` it closes the submission when it holds no claim. Appended to keep indices.
+    QuerySubmissionClaim {
+        submission_id: SubmissionId,
+        admit_by: u64,
+    },
+    SubmissionClaimAnswered {
+        answer: aruna_core::jobs::ClosureAnswer,
+    },
     /// A holder asks a launch's target whether it ever accepted the signed launch it carries.
-    ForwardClosureQuery {
+    QueryLaunchClosure {
         launch: Box<LaunchFrame>,
     },
-    ForwardedClosureQuery {
-        answer: aruna_core::events::ClosureAnswer,
+    LaunchClosureAnswered {
+        answer: aruna_core::jobs::LaunchClosureAnswer,
     },
 }
 
