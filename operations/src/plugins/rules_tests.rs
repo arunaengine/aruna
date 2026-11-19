@@ -193,8 +193,6 @@ pub(crate) async fn plain_secret(
 
 #[tokio::test]
 async fn installs_with_secrets() {
-    use crate::plugins::grants::GrantError;
-    use crate::plugins::install::InstallError;
     let fixture = Fixture::keyed().await;
     plain_secret(&fixture, ("api-key", "bearer"), &[]).await;
     plain_secret(
@@ -245,19 +243,13 @@ async fn installs_with_secrets() {
         delivered("hook_key").await,
         [Delivery::Verify, Delivery::Value]
     );
-    // Container work stays refused.
+    // Container work installs within the group's per-job limits.
     let jobs = serde_json::json!({ "permissions": { "required": ["jobs.run"] } });
     let digest = fixture.publish("0.5.0", "bb", jobs).await;
     let mut request = fixture.request(None);
     request.version = Some(digest);
-    let refused = fixture.install(&request).await;
-    assert!(
-        matches!(
-            refused,
-            Err(InstallError::Grant(GrantError::Unsupported(_)))
-        ),
-        "{refused:?}"
-    );
+    let installed = fixture.install(&request).await;
+    assert!(installed.is_ok(), "{installed:?}");
 }
 
 /// The bound install moved to a version whose `catalog` and `mirror` connections inject the
