@@ -17,6 +17,7 @@ mod task;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
 use aruna_core::key_index::{IndexError, IndexEvent};
+use aruna_core::member_read::MemberAnswer;
 use aruna_core::operation::SubOperation;
 use aruna_core::outbound::{
     ConnectionError, OutboundEffect, OutboundError, OutboundEvent, RangeAnswer,
@@ -169,10 +170,11 @@ async fn dispatch_unboxed(
             Event::Net(NetEvent::LocalNode(node))
         }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
-        Effect::Outbound(OutboundEffect::ListRange(listing))
-            if context.outbound_handle.is_some() =>
-        {
+        Effect::Outbound(OutboundEffect::ListRange(listing)) => {
             net::dispatch_listing(*listing, context).await
+        }
+        Effect::Outbound(OutboundEffect::MemberFetch(request)) => {
+            net::dispatch_fetch(*request, context).await
         }
         Effect::Outbound(effect) => match context.outbound_handle.as_ref() {
             Some(outbound) => Event::Outbound(Box::pin(outbound.run(effect)).await),
@@ -290,6 +292,9 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
         OutboundEffect::Request(_) => OutboundEvent::Answered { result: Err(error) },
         OutboundEffect::RefreshMail(_) => OutboundEvent::MailRefreshed,
         OutboundEffect::ListRange(_) => OutboundEvent::RangeListed(Box::new(RangeAnswer::Silent)),
+        OutboundEffect::MemberFetch(_) => {
+            OutboundEvent::MemberAnswered(Box::new(MemberAnswer::Silent))
+        }
         OutboundEffect::Connection(_) => OutboundEvent::ConnectionAnswered {
             result: Err(ConnectionError::NotSent(
                 "this node sends no connection requests".to_string(),

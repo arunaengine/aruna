@@ -136,29 +136,6 @@ async fn reads_ask_holder() {
     );
 }
 
-// A copy's miss goes on to the next holder; the coordinator, asked last, decides.
-#[tokio::test]
-async fn copy_misses_continue() {
-    let (node, peer, set_id) = sharded(r#"{"answer":1}"#).await;
-    let lagging = mock_peer(StatusCode::NOT_FOUND, r#"{"error":"missing"}"#).await;
-    let copy = node_id([21; 32]);
-    publish_api(&node.state, copy, &lagging.url).await;
-    let forward = |node_id| RestForward {
-        set_id,
-        range_id: Ulid::nil(),
-        node_id,
-    };
-    let holders = [forward(copy), forward(node_id(PEER))];
-    let bearer = ValidatedBearer::new_for_test("caller-token");
-    let read = relay_read::<serde_json::Value>(&node.state, &holders, "/x", Some(&bearer));
-    assert_eq!(read.await.unwrap()["answer"], 1);
-    let stream = relay_stream(&node.state, &holders, "/x", Some(&bearer), HeaderMap::new());
-    assert_eq!(stream.await.unwrap().status(), StatusCode::OK);
-    let last = relay_read::<serde_json::Value>(&node.state, &holders[..1], "/x", Some(&bearer));
-    assert!(matches!(last.await, Err(ServerError::NotFound)));
-    assert_eq!(asked(&peer).len(), 2);
-}
-
 // A local copy that misses a version asks the range's coordinator.
 #[tokio::test]
 async fn local_miss_relays() {

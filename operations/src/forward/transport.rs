@@ -163,6 +163,22 @@ pub(crate) fn peer_answer(
     Ok(timed_answer(result)?.0)
 }
 
+/// Whether a peer request failed because this node has no metadata handle to send it with.
+pub(crate) fn no_peer_transport(result: &aruna_core::calls::IoResult) -> bool {
+    use aruna_core::events::{Event, NetEvent, PeerRequestError};
+    use aruna_core::metadata::MetadataError;
+    let aruna_core::calls::IoResult::Event(event) = result else {
+        return false;
+    };
+    let Event::Net(NetEvent::MetadataAnswer(answer)) = &**event else {
+        return false;
+    };
+    matches!(
+        answer.result,
+        Err(PeerRequestError::Failed(MetadataError::HandleMissing))
+    )
+}
+
 /// The peer's decoded answer and how long the request took.
 pub(crate) fn timed_answer(
     result: aruna_core::calls::IoResult,

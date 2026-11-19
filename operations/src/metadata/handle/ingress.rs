@@ -11,7 +11,7 @@ use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults, MetadataSearchHit,
 };
 use aruna_core::structs::SyncRelationship;
-use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;

@@ -28,7 +28,6 @@ use crate::metadata::protocol::{
     response_cap,
 };
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 use aruna_core::telemetry::record_error;
 
 #[tracing::instrument(
@@ -449,33 +448,6 @@ impl MetadataHandle {
             .map_err(|_| MetadataReadError::Unavailable)?
         {
             MetadataTransportMessage::ArtifactStored { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    /// Asks a range coordinator about releases or release files in its ranges.
-    pub async fn request_release_holder(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        bucket: String,
-        ask: HolderAsk,
-    ) -> Result<HolderAnswer, MetadataReadError> {
-        let span = Span::current();
-        match send_remote_request(
-            &self.inner,
-            &span,
-            node_id,
-            MetadataTransportMessage::ReleaseHolder {
-                auth_token,
-                bucket,
-                ask,
-            },
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::ReleaseHolderResults { result } => result,
             _ => Err(MetadataReadError::Unavailable),
         }
     }

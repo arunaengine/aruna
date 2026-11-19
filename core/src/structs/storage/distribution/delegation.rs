@@ -231,6 +231,57 @@ impl BodyTrailer {
     }
 }
 
+/// Headers that describe a forwarded body.
+pub const DIGEST_HEADERS: &[&str] = &[
+    "content-length",
+    "content-md5",
+    "content-type",
+    "x-amz-checksum-crc32",
+    "x-amz-checksum-crc32c",
+    "x-amz-checksum-crc64nvme",
+    "x-amz-checksum-sha1",
+    "x-amz-checksum-sha256",
+];
+
+/// Further headers the coordinator needs to store the same object.
+pub const PASSED_HEADERS: &[&str] = &[
+    "cache-control",
+    "content-disposition",
+    "content-language",
+    "expires",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-unmodified-since",
+    "range",
+    "x-amz-checksum-algorithm",
+    "x-amz-checksum-type",
+    "x-amz-mp-object-size",
+    "x-amz-tagging",
+    "x-amz-copy-source",
+    "x-amz-copy-source-range",
+    "x-amz-copy-source-if-match",
+    "x-amz-copy-source-if-none-match",
+    "x-amz-copy-source-if-modified-since",
+    "x-amz-copy-source-if-unmodified-since",
+    "x-amz-metadata-directive",
+    "x-amz-tagging-directive",
+    "x-amz-acl",
+    "x-amz-checksum-mode",
+];
+
+/// Whether a header carries request semantics a delegation must bind; `accept` selects a
+/// folder index, which a forwarded read never asks for.
+pub fn bound_header(name: &str) -> bool {
+    DIGEST_HEADERS.contains(&name)
+        || PASSED_HEADERS.contains(&name)
+        || name == COPY_CONTEXT_HEADER
+        || name == COPY_READ_HEADER
+        || name == "accept"
+        || name.starts_with("x-amz-meta-")
+        || name.starts_with("x-amz-checksum-")
+}
+
 /// Binds a delegation to one request: method, bucket, key, query and the headers that
 /// describe its body, given as lowercase name and value pairs in any order.
 pub fn request_digest(

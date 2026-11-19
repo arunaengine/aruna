@@ -322,7 +322,9 @@ mod tests {
             operation.first(),
             Ok(Next::Call(IoCall::Child(_)))
         ));
-        let Ok(Next::Done(result)) = operation.next(looked_up(Ok(found(version_id)))) else {
+        let version = found(version_id);
+        let location = version.location.clone();
+        let Ok(Next::Done(result)) = operation.next(looked_up(Ok(version))) else {
             panic!("a plain version needs nothing after its lookup");
         };
         assert_eq!(result.version_id, Some(version_id));
@@ -330,7 +332,7 @@ mod tests {
         assert_eq!(result.checksum_type, MultipartChecksumType::Composite);
         assert_eq!(result.part_count, Some(3));
         assert_eq!(result.composite_hashes.get("md5"), Some(&vec![1]));
-        assert_eq!(result.location, found(version_id).location);
+        assert_eq!(result.location, location);
     }
 
     #[test]

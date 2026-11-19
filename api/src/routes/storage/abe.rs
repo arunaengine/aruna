@@ -7,7 +7,7 @@ mod records;
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::relay::{copy_miss, read_holders, relay_read};
+use crate::routes::storage::relay::{RestRead, holder_json, missed_json};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, ObjectEnvelope};
@@ -172,18 +172,21 @@ pub async fn envelope(
 ) -> ServerResult<Json<EnvelopeView>> {
     let (version, info) = authorize_version(&state, &auth, &query).await?;
     let path = version_path("/data/blobs/envelope", &query);
-    if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {
-        return relay_read(&state, &holders, &path, bearer.as_ref())
-            .await
-            .map(Json);
+    let relayed = RestRead {
+        info: &info,
+        key: &query.key,
+        headers: &headers,
+        path: &path,
+        bearer: bearer.as_ref(),
+    };
+    if let Some(answer) = holder_json(&state, &relayed).await? {
+        return Ok(Json(answer));
     }
     let read = read_envelope(&state, &query, version).await;
     if matches!(read, Err(ServerError::NotFound))
-        && let Some(coordinator) = copy_miss(&state, &info, &query.key, &headers).await?
+        && let Some(answer) = missed_json(&state, &relayed).await?
     {
-        return relay_read(&state, &coordinator, &path, bearer.as_ref())
-            .await
-            .map(Json);
+        return Ok(Json(answer));
     }
     let (envelope, _) = read?;
     let c = &envelope.context;

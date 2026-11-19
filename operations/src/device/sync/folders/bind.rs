@@ -21,7 +21,7 @@ use ulid::Ulid;
 
 use crate::device::sync_status::ArmTimerOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::transport::{peer_answer, peer_call};
+use crate::forward::transport::{no_peer_transport, peer_answer, peer_call};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::transport_message_kind;
 use crate::staging::offered_directory::{OfferedDirectoryError, check_root};
@@ -47,6 +47,9 @@ fn remote_call(node: NodeId, message: &MetadataTransportMessage) -> Result<IoCal
 }
 
 fn remote_answer(result: IoResult) -> Result<MetadataTransportMessage, RemoteError> {
+    if no_peer_transport(&result) {
+        return Err(RemoteError::Unavailable);
+    }
     peer_answer(result)?.map_err(RemoteError::Unreachable)
 }
 

@@ -12,4 +12,6 @@ pub mod removal;
 pub mod restart;
 pub mod rows;
 pub mod startup;
+#[cfg(test)]
+pub(crate) mod test_rows;
 pub mod unlock;

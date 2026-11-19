@@ -802,7 +802,7 @@ impl ReferencedOperation {
 
     fn read_aliases(&mut self) -> Turn<bool> {
         let hash = self.wanted()?.blake3_hash;
-        let aliases = iter_index_effect(&hash, self.start.take(), None)?;
+        let aliases = iter_index_effect(&hash, self.start.take())?;
         self.call(ReferenceStep::Aliases, aliases.into())
     }
 
@@ -814,7 +814,7 @@ impl ReferencedOperation {
                     self.read_aliases()
                 }
                 None => {
-                    let owners = owners_scan_effect(&ArchiveKey::of(&self.location), None);
+                    let owners = owners_scan_effect(&ArchiveKey::of(&self.location));
                     self.call(ReferenceStep::Owners, owners.into())
                 }
             };

@@ -863,7 +863,7 @@ fn departure_kicks_drain() {
     let mut operation = pass(Some(departed()));
     assert!(runs_child(operation.next(no_expansion())));
     assert_eq!(operation.stage, PassStage::Kick);
-    let failed = child(Err::<(), _>(IoError::Conflict));
+    let failed = child(Err::<(), _>(ApplyError::Failed("no timer".to_string())));
     assert_eq!(operation.next(failed), Ok(Next::Done(false)));
 }
 

@@ -3,12 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::IoError;
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PURGE_FENCE_KEYSPACE;
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use thiserror::Error;
 
@@ -45,23 +43,6 @@ pub fn fence_key(bucket: &str) -> Key {
     ByteView::from(bucket.as_bytes().to_vec())
 }
 
-pub fn write_fence_read(bucket: &str, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: PURGE_FENCE_KEYSPACE.to_string(),
-        key: fence_key(bucket),
-        txn_id,
-    })
-}
-
-pub fn check_write_fence(event: Event, bucket: &str, key: &str) -> Result<(), PurgeFenceError> {
-    let value = match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        event => return Err(PurgeFenceError::Unexpected(event.label().to_string())),
-    };
-    check_fence_row(value.as_deref(), bucket, key)
-}
-
 /// Checks the fence row of [`fence_key`] that a write to `key` read.
 pub fn check_fence_row(
     value: Option<&[u8]>,
@@ -76,40 +57,6 @@ pub fn check_fence_row(
 
 /// The purge fence of `bucket` and, for a write to a distributed bucket, the record and fence
 /// rows its authority is checked against, all read in the publication transaction.
-pub fn publication_read(
-    bucket: &str,
-    authority: Option<&WriteAuthority>,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    let Some(authority) = authority else {
-        return write_fence_read(bucket, txn_id);
-    };
-    let mut reads = vec![(PURGE_FENCE_KEYSPACE.to_string(), fence_key(bucket))];
-    reads.extend(authority_reads(authority.binding.set_id));
-    Effect::Storage(StorageEffect::BatchRead { reads, txn_id })
-}
-
-/// Checks the answer to [`publication_read`]: no purge fence covers the key and the write
-/// still holds its distributed authority.
-pub fn check_publication(
-    event: Event,
-    bucket: &str,
-    key: &str,
-    authority: Option<&WriteAuthority>,
-) -> Result<(), PurgeFenceError> {
-    let Some(authority) = authority else {
-        return check_write_fence(event, bucket, key);
-    };
-    let values = match event {
-        Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 3 => values,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        event => return Err(PurgeFenceError::Unexpected(event.label().to_string())),
-    };
-    let values = values.into_iter().map(|(_, value)| value).collect();
-    check_published(values, bucket, key, Some(authority))
-}
-
-/// The rows [`publication_read`] reads, as a call.
 pub fn publication_rows(bucket: &str, authority: Option<&WriteAuthority>) -> Vec<(String, Key)> {
     let mut reads = vec![(PURGE_FENCE_KEYSPACE.to_string(), fence_key(bucket))];
     if let Some(authority) = authority {
@@ -118,7 +65,8 @@ pub fn publication_rows(bucket: &str, authority: Option<&WriteAuthority>) -> Vec
     reads
 }
 
-/// Checks the values of [`publication_rows`], the value form of [`check_publication`].
+/// Checks the values of [`publication_rows`]: no purge fence covers the key and the write still
+/// holds its distributed authority.
 pub fn check_published(
     values: Vec<Option<Value>>,
     bucket: &str,
@@ -169,14 +117,8 @@ mod tests {
     use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
     use ulid::Ulid;
 
-    fn answer(record: Vec<u8>, fence: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (fence_key("bucket"), None),
-                (b"record".to_vec().into(), Some(record.into())),
-                (b"fence".to_vec().into(), fence.map(Into::into)),
-            ],
-        })
+    fn answer(record: Vec<u8>, fence: Option<Vec<u8>>) -> Vec<Option<Value>> {
+        vec![None, Some(record.into()), fence.map(Into::into)]
     }
 
     #[test]
@@ -185,14 +127,10 @@ mod tests {
         let (snapshot, bytes) = record(true);
         let own = binding(&snapshot, 1, 5);
         let authority = write_authority(&own, "a", Some(&bytes), None).unwrap();
-        let Effect::Storage(StorageEffect::BatchRead { reads, txn_id }) =
-            publication_read("bucket", Some(&authority), Some(Ulid::from_bytes([1; 16])))
-        else {
-            panic!("a distributed write reads the purge fence, record and fence row together");
-        };
-        assert_eq!((reads.len(), txn_id.is_some()), (3, true));
+        // A distributed write reads the purge fence, record and fence row together.
+        assert_eq!(publication_rows("bucket", Some(&authority)).len(), 3);
         let accepted =
-            check_publication(answer(bytes.clone(), None), "bucket", "a", Some(&authority));
+            check_published(answer(bytes.clone(), None), "bucket", "a", Some(&authority));
         assert_eq!(accepted, Ok(()));
         let mut fence = LocalFence::default();
         fence.fence_range(RangeFence {
@@ -204,7 +142,7 @@ mod tests {
         });
         let fenced = answer(bytes, Some(fence.to_bytes().unwrap()));
         assert_eq!(
-            check_publication(fenced, "bucket", "a", Some(&authority)),
+            check_published(fenced, "bucket", "a", Some(&authority)),
             Err(PurgeFenceError::Distribution(GuardError::Route(
                 RouteError::Moving(authority.range_id)
             )))
@@ -213,9 +151,6 @@ mod tests {
 
     #[test]
     fn ordinary_reads_purge() {
-        assert!(matches!(
-            publication_read("bucket", None, None),
-            Effect::Storage(StorageEffect::Read { .. })
-        ));
+        assert_eq!(publication_rows("bucket", None).len(), 1);
     }
 }

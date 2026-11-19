@@ -45,6 +45,7 @@ use aruna_operations::realm::mutate_placement::{
 };
 use aruna_operations::realm::node_name::{NodeDisplays, ReadNamesOperation};
 use aruna_operations::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};
+use aruna_operations::relay::targets::management_node_urls;
 use aruna_operations::s3::usage::LoadCountersOperation;
 use aruna_wire::info::{
     AddressStatus, BackendStatus, BlobServiceStatus, ConnectionAddressInfo, DatabaseServiceStatus,
@@ -1252,29 +1253,6 @@ async fn node_names(
         })
 }
 
-/// Every management node of the realm with the api url it published, in
-/// realm-config order. The caller decides where its own node belongs.
-pub(crate) fn management_node_urls(
-    config: &RealmConfigDocument,
-    node_info_docs: &BTreeMap<
-        aruna_core::NodeId,
-        aruna_core::structs::storage::node_info::NodeInfoDocument,
-    >,
-) -> Vec<(aruna_core::NodeId, Option<String>)> {
-    config
-        .nodes
-        .iter()
-        .filter(|node| matches!(node.kind, RealmNodeKind::Management))
-        .filter_map(|node| node.node_id.parse::<aruna_core::NodeId>().ok())
-        .map(|node_id| {
-            let url = node_info_docs
-                .get(&node_id)
-                .and_then(|doc| doc.urls.api.clone());
-            (node_id, url)
-        })
-        .collect()
-}
-
 /// Server and management nodes with a published api url, in realm-config order; this node
 /// names its own interface while its document has not landed yet.
 fn public_nodes(
@@ -1320,7 +1298,9 @@ fn management_urls(
 ) -> Vec<String> {
     let current = state.get_node_id();
     let mut urls: Vec<String> = Vec::new();
-    for (node_id, published) in management_node_urls(config, node_info_docs) {
+    for (node_id, published) in management_node_urls(config, |node| {
+        (node_info_docs.get(node)).and_then(|doc| doc.urls.api.clone())
+    }) {
         let is_current = node_id == current;
         let url = published.or_else(|| is_current.then(|| own_url.map(str::to_string)).flatten());
         let Some(url) = url else {

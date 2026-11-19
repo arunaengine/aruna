@@ -179,7 +179,7 @@ fn broken_gzip_reopens() {
     };
     assert_eq!(chunk.step, ChunkStep::Fill { reused: true });
     let broken = job_event(JobEvent::GzipFilled {
-        work,
+        work: Box::new(work),
         result: Err(GzipBroken::Stream("reset".to_string())),
     });
     assert!(matches!(
@@ -195,7 +195,7 @@ fn broken_gzip_reopens() {
         panic!("expected the new stream to fill");
     };
     let broken = job_event(JobEvent::GzipFilled {
-        work,
+        work: Box::new(work),
         result: Err(GzipBroken::Stream("reset".to_string())),
     });
     assert_eq!(
@@ -210,10 +210,10 @@ fn invalid_gzip_lasts() {
     let mut chunk = reader(TableRead::default());
     chunk.step = ChunkStep::Fill { reused: false };
     let broken = job_event(JobEvent::GzipFilled {
-        work: GzipWork {
+        work: Box::new(GzipWork {
             stream: stream(),
             cursor: GzipCursor::new(0, 16),
-        },
+        }),
         result: Err(GzipBroken::Gzip("bad header".to_string())),
     });
     assert_eq!(

@@ -689,9 +689,9 @@ mod tests {
     fn heads_set_delay() {
         let mut pass = drain();
         pass.step = DrainStep::DueHead;
-        let due = child(Ok::<_, JobMutationError>(Some((150, job_id(1)))));
+        let due = child(Ok::<_, JobMutationError>(Some((150u64, job_id(1)))));
         assert!(is_child(&pass.next(due)));
-        let lease = child(Ok::<_, JobMutationError>(Some((50, job_id(2)))));
+        let lease = child(Ok::<_, JobMutationError>(Some((50u64, job_id(2)))));
         let Next::Done(result) = pass.next(lease).unwrap() else {
             panic!("expected the result");
         };
@@ -714,7 +714,7 @@ mod tests {
         assert!(matches!(timer.next(none()), Ok(Next::Done(()))));
 
         let mut timer = DrainTimerOperation::new(100);
-        let due = child(Ok::<_, JobMutationError>(Some((150, job_id(1)))));
+        let due = child(Ok::<_, JobMutationError>(Some((150u64, job_id(1)))));
         timer.next(due).unwrap();
         assert!(matches!(timer.next(none()), Ok(Next::Then { .. })));
     }

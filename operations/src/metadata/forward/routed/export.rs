@@ -16,6 +16,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use super::super::holder_reads::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT, device_raw_revision};
 use crate::device::replica::{ReplicaRecord, read_answer, replica_read};
+use crate::device::selection::keep_read;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer};
 use crate::metadata::api::MetadataApiError;
@@ -238,6 +239,7 @@ enum RoutedStage {
     Replica,
     Holder,
     Peers,
+    Kept,
     Device,
 }
 
@@ -259,6 +261,8 @@ pub struct RoutedExportOperation {
     answers: Vec<(NodeId, Result<ExportMetadataResult, MetadataReadError>)>,
     /// The other holders' requests, sent once this node's own copy answered.
     pending_fanout: Option<Vec<(NodeId, MetadataTransportMessage)>>,
+    /// The export that answers once this device kept its document.
+    kept: Option<ExportMetadataResult>,
 }
 
 impl RoutedExportOperation {
@@ -283,6 +287,7 @@ impl RoutedExportOperation {
             holder_count: 0,
             answers: Vec::new(),
             pending_fanout: None,
+            kept: None,
         }
     }
 
@@ -402,7 +407,7 @@ impl RoutedExportOperation {
             unavailable,
             AuthFailure::Fatal,
         ) {
-            ReadDecision::Success(export) => return Ok(Next::Done(export)),
+            ReadDecision::Success(export) => return self.found(export),
             ReadDecision::NotFound => MetadataApiError::NotFound,
             ReadDecision::Auth(MetadataReadError::Unauthorized) => MetadataApiError::Unauthorized,
             ReadDecision::Auth(MetadataReadError::Forbidden) => MetadataApiError::Forbidden,
@@ -413,6 +418,23 @@ impl RoutedExportOperation {
             }
         };
         self.fall_back(routed)
+    }
+
+    /// The owner's own online export is kept on this device before it answers, like a read.
+    fn found(&mut self, export: ExportMetadataResult) -> ExportTurn {
+        let config = (self.config.as_ref()).ok_or(MetadataApiError::ServiceUnavailable)?;
+        if !owner_reads(config, self.local_node, self.request.auth.as_ref()) {
+            return Ok(Next::Done(export));
+        }
+        let (ExportMetadataResult::Full { record, .. }
+        | ExportMetadataResult::Summary { record, .. }
+        | ExportMetadataResult::Page { record, .. }
+        | ExportMetadataResult::Raw { record, .. }) = &export;
+        let ids = self.local_node.map(|node| (node, self.realm_id));
+        let keep = keep_read(ids, record);
+        self.kept = Some(export);
+        self.stage = RoutedStage::Kept;
+        Ok(Next::Call(IoCall::child(keep)))
     }
 
     /// An unavailable realm leaves this device's replica to answer.
@@ -474,6 +496,10 @@ impl Operation for RoutedExportOperation {
                 }
                 self.collect()
             }
+            // Keeping is best effort: a full cache or a failed write never fails the export.
+            RoutedStage::Kept => (self.kept.take())
+                .map(Next::Done)
+                .ok_or(MetadataApiError::ServiceUnavailable),
             RoutedStage::Device => {
                 let export = result.child::<ExportMetadataResult, MetadataApiError>()??;
                 ensure_export_limit(&export, self.metadata_bytes)?;
@@ -482,3 +508,7 @@ impl Operation for RoutedExportOperation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "routed_export_tests.rs"]
+mod call_tests;

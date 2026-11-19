@@ -8,6 +8,8 @@ use std::future::Future;
 use std::io;
 use std::ops::Range;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use aruna_core::effects::BlobEffect;
@@ -899,6 +901,25 @@ pub async fn zip_stream(
     }
     .await;
     (Some(ZipWork::new(sink)), result)
+}
+
+/// Writes one entry from `stream` to its end and answers how many bytes it holds.
+pub async fn zip_counted(
+    zip: ZipWork,
+    path: &str,
+    modified_ms: u64,
+    stream: ByteStream,
+) -> (Option<ZipWork>, Result<u64, ZipFailure>) {
+    let size = Arc::new(AtomicU64::new(0));
+    let seen = size.clone();
+    let counted = stream.0.inspect(move |item| {
+        if let Ok(bytes) = item {
+            seen.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+    });
+    let counted = BackendStream(Box::pin(counted));
+    let (zip, result) = zip_stream(zip, path, modified_ms, counted, std::future::pending()).await;
+    (zip, result.map(|_| size.load(Ordering::Relaxed)))
 }
 
 /// Ends the archive and its stream.

@@ -134,7 +134,7 @@ pub(super) struct ObjectPartitionState {
     pub(super) observed_at: Option<SystemTime>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct ObjectCursorPartition {
     pub(super) node_id: [u8; 32],
     pub(super) start_after: Option<Vec<u8>>,
@@ -142,7 +142,7 @@ pub(super) struct ObjectCursorPartition {
     pub(super) observed_at: Option<SystemTime>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct ObjectCursorPayload {
     pub(super) as_of: SystemTime,
     pub(super) partitions: Vec<ObjectCursorPartition>,

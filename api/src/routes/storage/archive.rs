@@ -7,15 +7,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use aruna_core::UserId;
-use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::TokenGrant;
-use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::auth::error::token_grant;
 use aruna_operations::s3::object::archive::{
-    ArchiveScope, EntryStatus, MemberCall, MemberRead, MemberReader, SelectionEntry,
-    validate_selection, write_selection,
+    OpenArchiveOperation, SelectionEntry, WriteSelectionOperation, validate_selection,
 };
 use axum::extract::{Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
@@ -36,17 +33,13 @@ use crate::auth::ValidatedBearer;
 use crate::download::{self, AdmissionError, DownloadPermit};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
-use crate::routes::federation::import::shared_stream;
 use crate::routes::shares::rfc3339;
 use crate::routes::storage::objects::{bearer_access, page_node};
-use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::bearer_token::GrantValidOperation;
 use aruna_operations::driver::drive;
 
-/// Bytes buffered between the archive writer and the response body.
-const PIPE_BYTES: usize = 128 * 1024;
 /// Seconds an archive link works at most.
 const LINK_SECS: u64 = 60;
 const DOWNLOAD_PATH: &str = "/api/v1/data/archives/download";
@@ -131,27 +124,25 @@ fn admitted(state: &ServerState, user_id: UserId) -> ServerResult<DownloadPermit
 }
 
 /// The archive response; dropping its body cancels the writer.
-fn archive_response(
+async fn archive_response(
     state: Arc<ServerState>,
     (auth, bearer): (AuthContext, Option<ValidatedBearer>),
     entries: Vec<SelectionEntry>,
     permit: DownloadPermit,
-) -> Response {
-    let (writer, reader) = tokio::io::duplex(PIPE_BYTES);
+) -> ServerResult<Response> {
+    let (zip, stream) = drive(OpenArchiveOperation, &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let task = AbortOnDropHandle::new(tokio::spawn(async move {
-        let reader = BearerReader {
-            state: &state,
-            bearer: bearer.as_ref(),
-        };
-        let context = state.get_ctx();
-        let scope = ArchiveScope {
-            context: context.as_ref(),
-            node: page_node(&state),
-            access: bearer_access(bearer.as_ref()),
-            reader: &reader,
-        };
         let expiry = bearer.as_ref().map_or(0, ValidatedBearer::expires_at_secs);
-        write_selection(&scope, (&auth, expiry), entries, writer).await
+        let write = WriteSelectionOperation::new(
+            zip,
+            page_node(&state),
+            bearer_access(bearer.as_ref()),
+            (&auth, expiry),
+            entries,
+        );
+        drive(write, &state.get_ctx()).await
     }));
     // Every failure, also of the writer itself, ends the body with an error, never cleanly.
     let tail = futures_util::stream::once(async move {
@@ -162,7 +153,9 @@ fn archive_response(
         }
     })
     .filter_map(std::future::ready);
-    let source = tokio_util::io::ReaderStream::new(reader).chain(tail);
+    let source = (stream.0)
+        .map(|item| item.map_err(std::io::Error::other))
+        .chain(tail);
     let mut response = download::archive_body(BackendStream::new(source), permit).into_response();
     *response.status_mut() = StatusCode::OK;
     let headers = response.headers_mut();
@@ -172,7 +165,7 @@ fn archive_response(
         CONTENT_DISPOSITION,
         HeaderValue::from_static("attachment; filename=\"selection.zip\""),
     );
-    response
+    Ok(response)
 }
 
 #[utoipa::path(
@@ -244,7 +237,7 @@ pub async fn download_selection(
 ) -> ServerResult<Response> {
     let entries = selection(request)?;
     let permit = admitted(&state, auth.user_id)?;
-    Ok(archive_response(state, (auth, bearer), entries, permit))
+    archive_response(state, (auth, bearer), entries, permit).await
 }
 
 #[utoipa::path(
@@ -352,61 +345,7 @@ pub async fn download_link(
         }
     }
     let caller = (link.auth, Some(link.bearer));
-    Ok(archive_response(state, caller, link.entries, permit))
-}
-
-/// Reads the keys other members serve for the holder of a verified bearer token.
-struct BearerReader<'a> {
-    state: &'a ServerState,
-    bearer: Option<&'a ValidatedBearer>,
-}
-
-// Distributed keys are read through the S3 forwarding, with the delegation the S3 GET route sends.
-impl MemberReader for BearerReader<'_> {
-    async fn member_read(&self, call: MemberCall<'_>) -> Result<MemberRead, EntryStatus> {
-        let state = self.state;
-        let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
-        let service = ArunaS3Service::new(state.get_ctx(), realm_id, node_id).await;
-        let expiry = self.bearer.map_or(0, ValidatedBearer::expires_at_secs);
-        // An expiry past what `SystemTime` holds becomes the latest one it always holds.
-        let expiry = std::time::UNIX_EPOCH
-            .checked_add(std::time::Duration::from_secs(expiry))
-            .unwrap_or(std::time::UNIX_EPOCH + std::time::Duration::from_secs(u32::MAX.into()));
-        // The bearer was verified here; the delegation carries its expiry and restrictions.
-        let user = UserAccess {
-            access_key: String::new(),
-            user_identity: call.auth.user_id,
-            group_id: call.info.group_id,
-            secret: EncryptedS3Secret::empty(),
-            expiry,
-            path_restrictions: call.auth.path_restrictions.clone(),
-            issued_by: *node_id.as_bytes(),
-            revoked_at: None,
-        };
-        let read = service.member_get(&user, (call.bucket, call.info), call.key, call.version);
-        match read.await {
-            Ok(ReadAnswer::Local(range_id)) => Ok(MemberRead::Local(range_id)),
-            Ok(ReadAnswer::Forwarded(response, stale)) => {
-                let version = (response.headers().get("x-amz-version-id"))
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| ulid::Ulid::from_string(value).ok())
-                    .ok_or(EntryStatus::Unavailable)?;
-                let blob = shared_stream(response.bytes_stream());
-                Ok(MemberRead::Remote {
-                    version,
-                    blob,
-                    stale,
-                })
-            }
-            Err(error) => Err(match error.code() {
-                s3s::S3ErrorCode::NoSuchKey
-                | s3s::S3ErrorCode::NoSuchVersion
-                | s3s::S3ErrorCode::MethodNotAllowed => EntryStatus::Missing,
-                s3s::S3ErrorCode::AccessDenied => EntryStatus::Denied,
-                _ => EntryStatus::Unavailable,
-            }),
-        }
-    }
+    archive_response(state, caller, link.entries, permit).await
 }
 
 /// What an unredeemed link runs as. The bearer stays in memory for relayed listings and is

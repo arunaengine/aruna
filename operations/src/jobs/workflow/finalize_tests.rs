@@ -136,7 +136,7 @@ fn clean_exit_completes() {
     assert_eq!(finalize.next(outputs_found()), Ok(fetch_logs()));
     assert_eq!(finalize.next(logs_read()), Ok(read_job()));
     assert!(is_child(&finalize.next(job_read(record()))));
-    let digest = child(Ok::<_, JobError>([5; 32]));
+    let digest = child(Ok::<_, JobError>([5u8; 32]));
     assert_eq!(finalize.next(digest), Ok(read_job()));
     assert_eq!(finalize.step, Step::Progress(Box::new(digested(Some(0)))));
     let success = RunSuccess {
@@ -320,7 +320,7 @@ fn late_exit_completes() {
     assert_eq!(finalize.next(control_read()), Ok(collect()));
     assert_eq!(finalize.next(outputs_found()), Ok(read_job()));
     assert!(is_child(&finalize.next(job_read(record()))));
-    let digest = child(Ok::<_, JobError>([5; 32]));
+    let digest = child(Ok::<_, JobError>([5u8; 32]));
     assert_eq!(
         finalize.next(digest),
         Ok(ended(RunEnding::Complete {
@@ -409,7 +409,7 @@ fn ended_session_completes() {
     assert_eq!(finalize.next(settled()), Ok(read_control()));
     assert_eq!(finalize.next(control_read()), Ok(read_job()));
     assert!(is_child(&finalize.next(job_read(record()))));
-    let digest = child(Ok::<_, JobError>([5; 32]));
+    let digest = child(Ok::<_, JobError>([5u8; 32]));
     assert_eq!(
         finalize.next(digest),
         Ok(ended(RunEnding::Complete {

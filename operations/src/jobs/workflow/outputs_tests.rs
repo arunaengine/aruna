@@ -144,6 +144,12 @@ fn put_call(until_stop: bool) -> IoCall {
     IoCall::child(put)
 }
 
+/// Every put holds its own failure slot and never equals another, so their printed forms compare.
+fn assert_put(next: CaptureNext, until_stop: bool) {
+    let expected: CaptureNext = Ok(Next::Call(put_call(until_stop)));
+    assert_eq!(format!("{next:?}"), format!("{expected:?}"));
+}
+
 /// A capture of one literal output whose commit reservation came back as `control`.
 fn reserved_capture(control: AttemptControl, until_stop: bool) -> CaptureOutputsOperation {
     let mut capture = capture_of(output(PATH, node()), until_stop);
@@ -234,7 +240,7 @@ fn stop_checked_first() {
     assert_eq!(stopped.step, CaptureStep::Stops);
     assert_eq!(stopped.next(stops(true)), Err(capture_cancelled()));
     let mut running = reserved_capture(committed(), true);
-    assert_eq!(running.next(stops(false)), Ok(Next::Call(put_call(true))));
+    assert_put(running.next(stops(false)), true);
     let put = child(Ok::<_, JobError>(object(node())));
     assert_eq!(running.next(put), Ok(Next::Done(vec![object(node())])));
 }
@@ -257,10 +263,7 @@ fn cancel_capture_continues() {
     let mut capture = capture_of(output(PATH, node()), false);
     capture.first().unwrap();
     capture.next(no_bucket()).unwrap();
-    assert_eq!(
-        capture.next(reserved(committed())),
-        Ok(Next::Call(put_call(false)))
-    );
+    assert_put(capture.next(reserved(committed())), false);
 }
 
 // An output without its reserved version is never written under another one.

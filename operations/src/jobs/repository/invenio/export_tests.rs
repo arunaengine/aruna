@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::OnceLock;
+
 use super::*;
 use crate::jobs::repository::push::creator_auth;
 use crate::jobs::repository::test_support::{
@@ -19,18 +21,24 @@ const CRATE: &str = r##"{"@graph": [
     {"@id": "#ada", "@type": "Person", "name": "Ada"}
 ]}"##;
 
+/// One sealed token per test run: sealing picks a new nonce, so two seals differ.
 fn token() -> RepositoryCredential {
-    let link = link();
-    RepositoryCredential::seal_link(
-        &credential_key(),
-        link.created_by,
-        link.group_id,
-        link.connector_id,
-        None,
-        link.endpoint,
-        "token",
-    )
-    .unwrap()
+    static SEALED: OnceLock<RepositoryCredential> = OnceLock::new();
+    SEALED
+        .get_or_init(|| {
+            let link = link();
+            RepositoryCredential::seal_link(
+                &credential_key(),
+                link.created_by,
+                link.group_id,
+                link.connector_id,
+                None,
+                link.endpoint,
+                "token",
+            )
+            .unwrap()
+        })
+        .clone()
 }
 
 fn target() -> LinkTarget {

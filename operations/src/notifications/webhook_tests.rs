@@ -119,7 +119,7 @@ fn read_decodes_setting() {
     let mut broken = ReadWebhookOperation::new(user());
     broken.first().unwrap();
     assert!(matches!(
-        broken.next(answer(Ok(Some(vec![0xff])))),
+        broken.next(answer::<Option<Vec<u8>>>(Ok(Some(vec![0xff])))),
         Err(WebhookError::Conversion(_))
     ));
 }

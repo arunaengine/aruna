@@ -506,6 +506,13 @@ pub enum JobEffect {
         modified_ms: u64,
         stream: ByteStream,
     },
+    /// Writes one entry from a stream to its end; answered by `JobEvent::ZipCounted`.
+    ZipCounted {
+        zip: ZipWork,
+        path: String,
+        modified_ms: u64,
+        stream: ByteStream,
+    },
     /// Ends the archive; answered by `JobEvent::ZipClosed`.
     ZipClose(ZipWork),
 }
@@ -637,7 +644,7 @@ pub enum JobEvent {
     /// The bytes read, `None` when the stream held more than the limit.
     CollectedUpTo(Result<Option<Vec<u8>>, String>),
     GzipFilled {
-        work: GzipWork,
+        work: Box<GzipWork>,
         result: Result<(), GzipBroken>,
     },
     Stream(ByteStream),
@@ -654,6 +661,11 @@ pub enum JobEvent {
     ZipStreamed {
         zip: Option<ZipWork>,
         result: Result<[u8; 32], ZipFailure>,
+    },
+    /// The bytes the entry holds, or why writing it ended early.
+    ZipCounted {
+        zip: Option<ZipWork>,
+        result: Result<u64, ZipFailure>,
     },
     ZipClosed(Result<(), String>),
 }

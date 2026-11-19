@@ -4,27 +4,21 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use crate::tests::access::seed_access;
 use crate::tests::staging::{create_test_bucket, setup_driver_context};
+use aruna_blob::archive::{open_zip, zip_close, zip_counted};
 use aruna_core::NodeId;
+use aruna_core::calls::ChildOutcome;
+use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
+use futures_util::StreamExt;
 use std::io::Read;
-use tokio::io::AsyncReadExt;
 
 const BUCKET: &str = "selection";
-
-/// Ordinary buckets only: no other member is ever asked.
-struct NoRelay;
-
-impl MemberReader for NoRelay {
-    async fn member_read(&self, _: MemberCall<'_>) -> Result<MemberRead, EntryStatus> {
-        Ok(MemberRead::Local(None))
-    }
-}
 
 fn file(key: &str, version_id: Option<Ulid>) -> SelectionEntry {
     SelectionEntry::File {
@@ -101,34 +95,44 @@ impl Fixture {
             .version_id
     }
 
-    async fn archive<W: tokio::io::AsyncWrite + Unpin>(
+    async fn archive(
         &self,
         entries: Vec<SelectionEntry>,
-        writer: W,
+        zip: ZipWork,
     ) -> Result<Report, SelectionError> {
-        let scope = ArchiveScope {
-            context: self.context(),
-            node: PageNode {
-                realm_id: self.realm_id,
-                node_id: self.node_id,
-                ids: self.context().node_and_realm(),
-            },
-            access: MemberAccess::Bearer(None),
-            reader: &NoRelay,
+        let node = PageNode {
+            realm_id: self.realm_id,
+            node_id: self.node_id,
+            ids: self.context().node_and_realm(),
         };
-        write_selection(&scope, (&self.auth, u64::MAX), entries, writer).await
+        let access = MemberAccess::Bearer(None);
+        let caller = (&self.auth, u64::MAX);
+        let mut write = WriteSelectionOperation::new(zip, node, access, caller, entries);
+        // Small pages, so a folder spans several.
+        write.folder_page = 2;
+        drive(write, self.context()).await
     }
 
     /// The archive's files by name, in archive order, and its report.
     async fn unzip(&self, entries: Vec<SelectionEntry>) -> (Vec<(String, Vec<u8>)>, Report) {
-        let mut bytes = Vec::new();
-        let report = self.archive(entries, &mut bytes).await.expect("archive");
+        let (zip, stream) = open_zip();
+        let (report, bytes) = tokio::join!(self.archive(entries, zip), collect(stream));
+        let report = report.expect("archive");
         let files = unzip(&bytes);
         let (name, written) = files.last().expect("report entry");
         assert_eq!(name, REPORT_PATH);
         assert_eq!(serde_json::from_slice::<Report>(written).unwrap(), report);
         (files[..files.len() - 1].to_vec(), report)
     }
+}
+
+/// The bytes of an archive stream to its end.
+async fn collect(mut stream: ByteStream) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk.expect("archive reads"));
+    }
+    bytes
 }
 
 fn unzip(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
@@ -220,7 +224,7 @@ async fn folders_page_through() {
         fixture.put(&format!("data/{index}"), b"x").await;
     }
     fixture.put("other.txt", b"o").await;
-    // FOLDER_PAGE lists two keys a page, so the folder spans three pages.
+    // The test lists two keys a page, so the folder spans three pages.
     let entries = vec![
         file("other.txt", None),
         folder("data/"),
@@ -328,19 +332,17 @@ async fn conflicting_keys_renamed() {
 #[tokio::test]
 async fn versions_pinned_late() {
     let fixture = Fixture::new().await;
-    fixture.put("a.bin", &[7; 4096]).await;
+    // Larger than the archive pipe, so the writer blocks inside this entry.
+    fixture.put("a.bin", &vec![7; 1024 * 1024]).await;
     fixture.put("b.txt", b"old").await;
-    let (writer, mut reader) = tokio::io::duplex(64);
+    let (zip, stream) = open_zip();
     let entries = vec![file("a.bin", None), file("b.txt", None)];
-    // The writer blocks inside the first entry until the reader drains it, so the second key is
-    // resolved only after its newer version exists.
+    // The second key is resolved only after the reader drains the first, so after its new version.
     let read = async {
         fixture.put("b.txt", b"new").await;
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).await.expect("archive reads");
-        bytes
+        collect(stream).await
     };
-    let (written, bytes) = tokio::join!(fixture.archive(entries, writer), read);
+    let (written, bytes) = tokio::join!(fixture.archive(entries, zip), read);
     written.expect("archive");
     let files = unzip(&bytes);
     assert_eq!(files[1], ("selection/b.txt".to_string(), b"new".to_vec()));
@@ -348,16 +350,20 @@ async fn versions_pinned_late() {
 
 #[tokio::test]
 async fn zip64_entry_count() {
-    let mut bytes = Vec::new();
-    let mut zip = ZipFileWriter::with_tokio(&mut bytes);
+    let (zip, stream) = open_zip();
     let count = usize::from(u16::MAX) + 2;
-    for index in 0..count {
-        let empty = futures_util::stream::empty::<Result<Bytes, std::io::Error>>();
-        let path = format!("b/{index}");
-        let size = write_entry(&mut zip, &path, 0, BackendStream::new(empty)).await;
-        assert_eq!(size.expect("entry"), 0);
-    }
-    zip.close().await.expect("archive closes");
+    let write = async {
+        let mut zip = zip;
+        for index in 0..count {
+            let empty = futures_util::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
+            let path = format!("b/{index}");
+            let (next, size) = zip_counted(zip, &path, 0, BackendStream::new(empty)).await;
+            assert_eq!(size, Ok(0));
+            zip = next.expect("the writer stays");
+        }
+        zip_close(zip).await.expect("archive closes");
+    };
+    let (_, bytes) = tokio::join!(write, collect(stream));
     let archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("valid archive");
     assert_eq!(archive.len(), count);
 }
@@ -366,8 +372,104 @@ async fn zip64_entry_count() {
 async fn closed_reader_stops() {
     let fixture = Fixture::new().await;
     fixture.put("a.csv", b"content").await;
-    let (writer, reader) = tokio::io::duplex(16);
-    drop(reader);
-    let result = fixture.archive(vec![file("a.csv", None)], writer).await;
-    assert!(matches!(result, Err(SelectionError::Write)));
+    let (zip, stream) = open_zip();
+    drop(stream);
+    let result = fixture.archive(vec![file("a.csv", None)], zip).await;
+    assert_eq!(result, Err(SelectionError::Write));
+}
+
+fn no_zip() -> ZipWork {
+    ZipWork::new(Box::new(()))
+}
+
+fn step_node() -> PageNode {
+    PageNode {
+        realm_id: RealmId::from_bytes([2; 32]),
+        node_id: iroh::SecretKey::from_bytes(&[6; 32]).public(),
+        ids: None,
+    }
+}
+
+fn step_write(entries: Vec<SelectionEntry>) -> WriteSelectionOperation {
+    let node = step_node();
+    let auth = AuthContext::anonymous(node.realm_id);
+    let access = MemberAccess::Bearer(None);
+    WriteSelectionOperation::new(no_zip(), node, access, (&auth, 0), entries)
+}
+
+fn job_answer(event: JobEvent) -> IoResult {
+    IoResult::Event(Box::new(Event::Job(event)))
+}
+
+#[test]
+fn open_answers_writer() {
+    let mut open = OpenArchiveOperation;
+    let expected = IoCall::from(Effect::Job(JobEffect::OpenZip));
+    assert_eq!(open.first(), Ok(Next::Call(expected)));
+    let empty = futures_util::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
+    let opened = JobEvent::ZipOpened {
+        zip: no_zip(),
+        stream: BackendStream::new(empty),
+    };
+    assert!(matches!(open.next(job_answer(opened)), Ok(Next::Done(_))));
+}
+
+#[test]
+fn empty_selection_refused() {
+    assert_eq!(step_write(Vec::new()).first(), Err(SelectionError::Empty));
+}
+
+#[test]
+fn missing_bucket_reported() {
+    let mut write = step_write(vec![file("a", None)]);
+    assert!(matches!(write.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let missing = Err::<BucketInfo, _>(GetBucketError::NotFound);
+    let report = write.next(IoResult::Child(ChildOutcome::new(missing)));
+    assert!(matches!(report, Ok(Next::Call(IoCall::Effect(_)))));
+    let written = JobEvent::ZipWritten {
+        zip: Some(no_zip()),
+        result: Ok(()),
+    };
+    assert!(matches!(
+        write.next(job_answer(written)),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
+    let Ok(Next::Done(report)) = write.next(job_answer(JobEvent::ZipClosed(Ok(())))) else {
+        panic!("the archive ends");
+    };
+    assert_eq!(report.entries, [row("a", None, EntryStatus::Missing)]);
+}
+
+#[test]
+fn failed_close_refused() {
+    let mut write = step_write(vec![file("a", None)]);
+    write.step = ArchiveStep::Close;
+    let closed = JobEvent::ZipClosed(Err("gone".to_string()));
+    assert_eq!(write.next(job_answer(closed)), Err(SelectionError::Write));
+}
+
+fn step_resolve() -> ResolveKeyOperation {
+    let node = step_node();
+    let auth = AuthContext::anonymous(node.realm_id);
+    let info = BucketInfo {
+        group_id: Ulid::from_parts(2, 2),
+        created_at: std::time::UNIX_EPOCH,
+        created_by: Default::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: aruna_core::structs::storage::format::Compression::Off,
+        distribution: None,
+    };
+    ResolveKeyOperation::new(node, (&auth, 0), (BUCKET, &info), "a", None)
+}
+
+#[test]
+fn denied_key_unread() {
+    let mut resolve = step_resolve();
+    resolve.first().unwrap();
+    let denied = Err::<(), _>(AuthorizeError::PermissionDenied);
+    let answer = resolve.next(IoResult::Child(ChildOutcome::new(denied)));
+    assert_eq!(answer, Err(EntryStatus::Denied));
 }

@@ -226,6 +226,8 @@ mod tests {
     fn settings(mode: EncryptionMode) -> Value {
         let settings = BucketEncryption {
             mode,
+            bucket_id: Some(Ulid::from_bytes([4; 16])),
+            key_generation: 1,
             ..Default::default()
         };
         settings.to_bytes().unwrap().into()

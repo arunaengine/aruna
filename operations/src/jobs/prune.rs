@@ -552,6 +552,9 @@ pub(crate) mod tests {
         let job_id = JobId::from_bytes([5u8; 16]);
         let mut prune = PruneJobsOperation::new(10, 4, BTreeSet::new());
         let key = prune_key(5, job_id);
+        // A further due row keeps the batch open, so its deletes are still collected here.
+        let next = prune_key(6, JobId::from_bytes([6u8; 16]));
+        prune.rows.push((next, Value::from(Vec::new())));
         assert!(is_child(&prune.record_read(key, None)));
         assert_eq!(prune.deletes.len(), 2);
         assert_eq!(prune.outcome.pruned, 1);
@@ -657,7 +660,7 @@ pub(crate) mod tests {
     fn timer_follows_entry() {
         let mut timer = PruneTimerOperation::new(10);
         assert!(matches!(timer.first(), Ok(Next::Call(IoCall::Child(_)))));
-        let entry = Some((25, JobId::from_bytes([1u8; 16])));
+        let entry = Some((25u64, JobId::from_bytes([1u8; 16])));
         let found = IoResult::Child(ChildOutcome::new(Ok::<_, JobMutationError>(entry)));
         let Next::Then { calls, .. } = timer.next(found).unwrap() else {
             panic!("expected the timer call");

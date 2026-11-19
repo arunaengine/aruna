@@ -27,7 +27,7 @@ use super::ArunaS3Service;
 use super::object::object_range_request;
 use crate::s3::error::IntoS3Error;
 
-pub(super) fn link_error(error: LinkError) -> s3s::S3Error {
+pub(in crate::s3::service) fn link_error(error: LinkError) -> s3s::S3Error {
     match error {
         LinkError::Denied => s3_error!(AccessDenied, "The link target may not be read"),
         LinkError::NotFound => s3_error!(NoSuchKey, "The link target does not exist."),
@@ -59,7 +59,7 @@ impl ArunaS3Service {
     }
 
     /// This node as a link read needs it.
-    pub(super) fn link_node(&self) -> LinkNode {
+    pub(in crate::s3::service) fn link_node(&self) -> LinkNode {
         LinkNode {
             local: self.node_id,
             ids: self.state.node_and_realm(),
@@ -216,7 +216,7 @@ impl ArunaS3Service {
 impl ArunaS3Service {
     /// Whom a listing follows links for. A request without a credential reads as the Everyone
     /// principal, and as no credential expires, only the delegation's lifetime bounds a HEAD.
-    pub(super) async fn listing_caller(
+    pub(in crate::s3::service) async fn listing_caller(
         &self,
         reader: Option<&UserAccess>,
         bucket: &str,

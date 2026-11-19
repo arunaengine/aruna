@@ -433,7 +433,7 @@ impl WriteReferenceOperation {
             &write.key,
         );
         let mut rows: VecDeque<Effect> =
-            build_transition_effects(&alias, Some(next_pointer), None, None)?
+            build_transition_effects(&alias, Some(next_pointer), None)?
                 .into_iter()
                 .collect();
         let version_key = VersionKey::new(&write.bucket, &write.key, version_id);
@@ -461,7 +461,7 @@ impl WriteReferenceOperation {
             version_id,
             now_ms,
         );
-        let effect = write_version_effect(&version_key, &version, None)?;
+        let effect = write_version_effect(&version_key, &version)?;
         rows.push_back(journaled(effect, &uploaded)?);
         for (key_space, key, value) in connector_reference_write(&version, &version_key)? {
             rows.push_back(Effect::Storage(StorageEffect::Write {

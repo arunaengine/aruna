@@ -355,7 +355,7 @@ impl Operation for ExtendBucketOperation {
 mod tests {
     use super::*;
     use crate::s3::bucket::key::lock::LockBucketOperation;
-    use crate::s3::bucket::key::rows::authority_rows;
+    use crate::s3::bucket::key::test_rows::authority_rows;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;

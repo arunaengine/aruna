@@ -239,7 +239,6 @@ mod tests {
             ),
             hash,
             alias.version_id,
-            None,
         )
         .unwrap();
         let event = context.storage_handle.send_effect(effect).await;

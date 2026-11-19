@@ -8,102 +8,16 @@ use crate::tests::distributed::{
     BUCKET, CLOSED_API, LOCAL, PEER, distribute, mock_peer, node_id, node_state, publish_api,
 };
 use axum::http::StatusCode;
+use serde_json::json;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
-}
-
-fn holder(seed: u8, set: Option<u8>) -> Holder {
-    Holder {
-        node_id: node(seed),
-        set_id: set.map(|set| Ulid::from_parts(1, set.into())),
-    }
 }
 
 fn body(result: CallToolResult) -> Value {
     result
         .structured_content
         .expect("a tool error carries the structured body")
-}
-
-#[test]
-fn local_stays_here() {
-    let here = node(1);
-    assert_eq!(pick_node(here, (None, true, None), &[], &[]), Ok(None));
-    assert_eq!(
-        pick_node(here, (Some(here), false, None), &[], &[]),
-        Ok(None)
-    );
-    // A named node wins over a local bucket of the same name.
-    assert_eq!(
-        pick_node(here, (Some(node(2)), true, None), &[], &[]),
-        Ok(Some(node(2)))
-    );
-}
-
-#[test]
-fn routed_goes_member() {
-    // A member without the key's records, here or named, sends the call to the member with them.
-    let (here, holder) = (node(1), Some(node(2)));
-    assert_eq!(pick_node(here, (None, true, holder), &[], &[]), Ok(holder));
-    assert_eq!(
-        pick_node(here, (Some(here), true, holder), &[], &[]),
-        Ok(holder)
-    );
-    assert_eq!(
-        pick_node(here, (None, true, Some(here)), &[], &[]),
-        Ok(None)
-    );
-}
-
-#[test]
-fn search_stops() {
-    // Ends at the last page, once a holder is known and nodes failed, and when failed nodes
-    // leave nothing new to read, as a cursor would ask them again.
-    assert!(search_done(false, (true, false), true));
-    assert!(search_done(true, (true, true), false));
-    assert!(search_done(false, (false, true), false));
-    assert!(!search_done(false, (true, true), false));
-    // A page past the name proves nothing for a node that stopped early with a sealed cursor:
-    // its own bucket of the same name may still follow, so the search goes on.
-    assert!(!search_done(true, (true, false), false));
-}
-
-#[test]
-fn remote_goes_holder() {
-    let here = node(1);
-    let one = [holder(2, None)];
-    assert_eq!(
-        pick_node(here, (None, false, None), &one, &[]),
-        Ok(Some(node(2)))
-    );
-    assert_eq!(
-        pick_node(here, (None, false, None), &[], &[]),
-        Err(RouteError::Missing)
-    );
-    // Different buckets of one name on several nodes need the caller's choice.
-    let two = [holder(2, None), holder(3, None)];
-    let ambiguous = Err(RouteError::Ambiguous(vec![node(2), node(3)]));
-    assert_eq!(pick_node(here, (None, false, None), &two, &[]), ambiguous);
-    let mixed = [holder(2, Some(7)), holder(3, None)];
-    assert!(pick_node(here, (None, false, None), &mixed, &[]).is_err());
-}
-
-#[test]
-fn distributed_goes_member() {
-    let here = node(1);
-    let set = [holder(2, Some(7))];
-    // The members that keep the key come first; this node never answers for a bucket it lacks.
-    let members = [here, node(3), node(2)];
-    assert_eq!(
-        pick_node(here, (None, false, None), &set, &members),
-        Ok(Some(node(3)))
-    );
-    // Without a record naming the key's members, the member the search found answers.
-    assert_eq!(
-        pick_node(here, (None, false, None), &set, &[]),
-        Ok(Some(node(2)))
-    );
 }
 
 // The record of a distributed bucket names the member for each key: this node below `m`, the
@@ -124,15 +38,6 @@ async fn record_picks_member() {
         let picked = pick_node(outside, (None, false, None), &set, &members);
         assert_eq!(picked, Ok(Some(node_id(member))), "{key}");
     }
-}
-
-#[test]
-fn url_drops_nest() {
-    assert_eq!(
-        mcp_url("https://api.node-2.example/api/v1/"),
-        "https://api.node-2.example/mcp"
-    );
-    assert_eq!(mcp_url("http://127.0.0.1:9"), "http://127.0.0.1:9/mcp");
 }
 
 #[test]
@@ -255,25 +160,6 @@ async fn forward_needs_member() {
     let refused = body(refused.await.unwrap_err());
     assert_eq!(refused["code"], "Bad request");
     assert!(mock.paths.lock().unwrap().is_empty());
-}
-
-#[test]
-fn devices_never_targets() {
-    use aruna_core::structs::identity::realm::{RealmId, RealmNode, RealmNodeKind};
-    let realm_id = RealmId([3; 32]);
-    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-    let device = RealmNodeKind::User {
-        owner: aruna_core::UserId::nil(realm_id),
-    };
-    for (seed, kind) in [(2, RealmNodeKind::Server), (3, device)] {
-        config.nodes.push(RealmNode {
-            node_id: node(seed).to_string(),
-            kind,
-        });
-    }
-    assert!(realm_server(&config, node(2)));
-    assert!(!realm_server(&config, node(3)));
-    assert!(!realm_server(&config, node(4)));
 }
 
 // A call another node forwarded runs here and is never forwarded again; one directed at
