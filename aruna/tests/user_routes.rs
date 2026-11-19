@@ -59,6 +59,9 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
+#[path = "user_merge.rs"]
+mod merge;
+
 #[derive(Clone)]
 struct OidcProviderState {
     issuer: String,
