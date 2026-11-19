@@ -6,7 +6,6 @@ use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentChange, DocumentOutboxEvent};
-use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
@@ -16,12 +15,11 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::repository::{
     LinkBusy, LinkFailure, LinkPatch, LinkQueueEntry, LinkReview, LinkStatus, PullCheck,
     PushOutcome, REVIEW_POLL_MS, RemoteState, RepositoryCredential, RepositoryLink,
-    RepositoryRecord, connector_link_key, link_key,
+    RepositoryRecord, connector_link_key, link_key, schedule_drain,
 };
 use aruna_core::rows::values;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::execution::job::JobId;
-use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use ulid::Ulid;
@@ -452,13 +450,6 @@ impl Operation for ChangeLinkOperation {
             (_, other) => Err(LinkError::Unexpected(other.label().to_string())),
         }
     }
-}
-
-pub fn schedule_drain(after: Duration) -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainLinkQueue,
-        after,
-    })
 }
 
 fn millis(time: SystemTime) -> u64 {

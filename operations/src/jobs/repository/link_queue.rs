@@ -2,19 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
-use aruna_core::keyspaces::LINK_QUEUE_KEYSPACE;
+use aruna_core::keyspaces::{LINK_CHANGE_KEYSPACE, LINK_QUEUE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
 use aruna_core::repository::remote::NodeScope;
 use aruna_core::repository::{
     LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS, RemoteState,
-    RepositoryLink,
+    RepositoryLink, link_change_document, schedule_drain,
 };
 use aruna_core::rows::PrefixPages;
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
@@ -34,7 +34,7 @@ use super::link_store::{
 };
 use super::links::{
     ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, SettleCheckOperation, id_key,
-    queue_row, schedule_drain,
+    queue_row,
 };
 use super::pull::CheckDueOperation;
 use super::push::{creator_auth, parse_checkpoint, read_checkpoint};
@@ -183,15 +183,102 @@ fn queue_pages() -> PrefixPages {
     PrefixPages::new(LINK_QUEUE_KEYSPACE, ByteView::from(Vec::new()), QUEUE_PAGE)
 }
 
+fn change_pages() -> PrefixPages {
+    PrefixPages::new(LINK_CHANGE_KEYSPACE, ByteView::from(Vec::new()), QUEUE_PAGE)
+}
+
+#[derive(Debug, PartialEq)]
+enum ChangeStep {
+    Page,
+    Queued(Vec<Key>),
+    Written(Vec<Key>),
+    Cleared,
+}
+
+/// Queues the push checks of the documents metadata marked as changed, then deletes the marks.
+/// Changes whose checks cannot be queued stay for the next run.
+#[derive(Debug, PartialEq)]
+pub struct QueueChangesOperation {
+    pages: PrefixPages,
+    step: ChangeStep,
+}
+
+impl QueueChangesOperation {
+    pub fn new() -> Self {
+        Self {
+            pages: change_pages(),
+            step: ChangeStep::Page,
+        }
+    }
+
+    fn clear(&mut self, keys: Vec<Key>) -> Turn<()> {
+        self.step = ChangeStep::Cleared;
+        let rows = keys.into_iter().map(|key| (LINK_CHANGE_KEYSPACE.to_string(), key));
+        Ok(Next::Call(IoCall::Delete(rows.collect())))
+    }
+}
+
+impl Default for QueueChangesOperation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Operation for QueueChangesOperation {
+    type Output = ();
+    type Error = LinkError;
+
+    fn first(&mut self) -> Turn<()> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        match std::mem::replace(&mut self.step, ChangeStep::Page) {
+            ChangeStep::Page => {
+                let rows = self.pages.take(result)?;
+                let keys: Vec<Key> = rows.into_iter().map(|(key, _)| key).collect();
+                if keys.is_empty() {
+                    return Ok(Next::Done(()));
+                }
+                let documents: BTreeSet<Ulid> =
+                    keys.iter().filter_map(|key| link_change_document(key)).collect();
+                self.step = ChangeStep::Queued(keys);
+                child(IoCall::child(QueueRowsOperation::new(documents)))
+            }
+            ChangeStep::Queued(keys) => {
+                let rows = result.child::<Vec<(String, Key, Value)>, LinkError>()??;
+                if rows.is_empty() {
+                    return self.clear(keys);
+                }
+                self.step = ChangeStep::Written(keys);
+                Ok(Next::Call(IoCall::Write(rows)))
+            }
+            ChangeStep::Written(keys) => {
+                result.done()?;
+                self.clear(keys)
+            }
+            ChangeStep::Cleared => {
+                result.done()?;
+                if self.pages.done() {
+                    return Ok(Next::Done(()));
+                }
+                Ok(Next::Call(self.pages.call()))
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum DrainStep {
+    Changes,
     Page,
     Removed,
     Check(Ulid, Value),
     Settle(u64),
 }
 
-/// Runs every due check and returns the wait until the next one.
+/// Queues the checks of changed documents, runs every due check and returns the wait until the
+/// next one.
 #[derive(Debug, PartialEq)]
 pub struct DrainLinksOperation {
     scope: NodeScope,
@@ -212,8 +299,13 @@ impl DrainLinksOperation {
             next_due: None,
             started_ms: None,
             now_ms: 0,
-            step: DrainStep::Page,
+            step: DrainStep::Changes,
         }
+    }
+
+    fn queue_page(&mut self) -> Turn<Option<Duration>> {
+        self.step = DrainStep::Page;
+        Ok(Next::Call(self.pages.call()))
     }
 
     fn started(&self) -> u64 {
@@ -245,8 +337,7 @@ impl DrainLinksOperation {
             let wait = self.next_due.map(|due| due_after(self.now_ms, due));
             return Ok(Next::Done(wait));
         }
-        self.step = DrainStep::Page;
-        Ok(Next::Call(self.pages.call()))
+        self.queue_page()
     }
 }
 
@@ -260,11 +351,17 @@ impl Operation for DrainLinksOperation {
     }
 
     fn first(&mut self) -> Turn<Option<Duration>> {
-        Ok(Next::Call(self.pages.call()))
+        child(IoCall::child(QueueChangesOperation::new()))
     }
 
     fn next(&mut self, result: IoResult) -> Turn<Option<Duration>> {
         match std::mem::replace(&mut self.step, DrainStep::Page) {
+            DrainStep::Changes => {
+                if let Err(error) = result.child::<(), LinkError>()? {
+                    warn!(%error, "Failed to queue the link checks of changed documents");
+                }
+                self.queue_page()
+            }
             DrainStep::Page => {
                 self.rows = self.pages.take(result)?.into();
                 self.advance()
@@ -951,77 +1048,6 @@ impl Operation for PushRevisionOperation {
                 Ok(Next::Done(
                     record.map(|record| (record.last_event_id, None)),
                 ))
-            }
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum DeletedStep {
-    Rows,
-    Write,
-    Timer,
-}
-
-/// Queues checks for the links of the deleted document behind `graph_iri`; each check then
-/// removes its link and token.
-#[derive(Debug, PartialEq)]
-pub(crate) struct QueueDeletedOperation {
-    scope: NodeScope,
-    graph_iri: String,
-    step: DeletedStep,
-}
-
-impl QueueDeletedOperation {
-    pub(crate) fn new(scope: NodeScope, graph_iri: String) -> Self {
-        Self {
-            scope,
-            graph_iri,
-            step: DeletedStep::Rows,
-        }
-    }
-}
-
-impl Operation for QueueDeletedOperation {
-    type Output = ();
-    type Error = LinkError;
-
-    fn first(&mut self) -> Turn<()> {
-        let document_id = self
-            .graph_iri
-            .rsplit('/')
-            .next()
-            .and_then(|id| Ulid::from_string(id).ok())
-            .filter(|id| MetadataRegistryRecord::graph_iri_for(*id) == self.graph_iri);
-        match document_id {
-            Some(document_id) => child(IoCall::child(QueueRowsOperation::new([document_id]))),
-            None => Ok(Next::Done(())),
-        }
-    }
-
-    fn next(&mut self, result: IoResult) -> Turn<()> {
-        match self.step {
-            DeletedStep::Rows => {
-                let rows = result.child::<Vec<(String, Key, Value)>, LinkError>()??;
-                if rows.is_empty() {
-                    return Ok(Next::Done(()));
-                }
-                self.step = DeletedStep::Write;
-                Ok(Next::Call(IoCall::Write(rows)))
-            }
-            DeletedStep::Write => {
-                result.done()?;
-                if !self.scope.has_tasks {
-                    return Ok(Next::Done(()));
-                }
-                self.step = DeletedStep::Timer;
-                child(IoCall::child(LinkTimerOperation::new()))
-            }
-            DeletedStep::Timer => {
-                if let Err(error) = result.child::<(), LinkError>()? {
-                    warn!(%error, "Failed to arm the repository link queue");
-                }
-                Ok(Next::Done(()))
             }
         }
     }

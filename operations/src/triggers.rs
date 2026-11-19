@@ -12,10 +12,12 @@ use aruna_core::alpn::Alpn;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
+use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
 use thiserror::Error;
 
+use crate::node::applied_drain::AppliedDrainOperation;
 use crate::notifications::deliver::{DeliverBatchOperation, DeliverInput};
 use crate::notifications::holder::HolderRead;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, DrainOutboxOperation};
@@ -23,7 +25,6 @@ use crate::notifications::prune::{
     NOTIFICATION_RETRY_AFTER, PRUNE_PAGE_SIZE, PruneNotificationsOperation,
 };
 use crate::notifications::serve::{InboxRequest, ServeInboxOperation, WatchEventsOperation};
-use crate::notifications::watch::digest::WATCH_PUBLISH_DEBOUNCE;
 use crate::notifications::watch::drain::WatchDrainOperation;
 use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;
@@ -70,6 +71,7 @@ pub enum TimerOperation {
     PruneNotifications(PruneNotificationsOperation),
     PublishWatchInterest(PublishInterestOperation),
     DrainWatchEvents(WatchDrainOperation),
+    DrainAppliedSync(AppliedDrainOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -87,6 +89,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::DrainWatchEvents => {
             Some(TimerOperation::DrainWatchEvents(WatchDrainOperation::new()))
         }
+        TaskKey::DrainAppliedSync => Some(TimerOperation::DrainAppliedSync(
+            AppliedDrainOperation::new(),
+        )),
         _ => None,
     }
 }
@@ -99,6 +104,7 @@ macro_rules! each_timer {
             TimerOperation::PruneNotifications($operation) => $body,
             TimerOperation::PublishWatchInterest($operation) => $body,
             TimerOperation::DrainWatchEvents($operation) => $body,
+            TimerOperation::DrainAppliedSync($operation) => $body,
         }
     };
 }
@@ -202,6 +208,13 @@ impl TimerRun for PublishInterestOperation {
 
 impl TimerRun for WatchDrainOperation {
     /// A finished run waits for the next queued event; a failed one runs again later.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
+        result.map(|()| None).map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for AppliedDrainOperation {
+    /// A finished run waits for the next applied reconcile; a failed one runs again later.
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
         result.map(|()| None).map_err(TimerFailure::from)
     }

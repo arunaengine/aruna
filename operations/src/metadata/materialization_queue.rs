@@ -23,6 +23,7 @@ use aruna_core::metadata::{
     MetadataRequestDurability, ProfileValidationStatus, deterministic_materialization_actor,
 };
 use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
+use aruna_core::repository::{link_change_entry, schedule_drain};
 use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     dead_letter_entry, dead_letter_key, document_job_entry, document_job_key, document_job_prefix,
@@ -39,8 +40,6 @@ use ulid::Ulid;
 
 use crate::git::snapshot::capture;
 use crate::git::{GitError, GitNode};
-use crate::jobs::repository::link_queue::{LinkTimerOperation, QueueRowsOperation};
-use crate::jobs::repository::links::LinkError;
 use crate::metadata::checkpoint::{CheckpointError, CheckpointOperation};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
@@ -444,7 +443,7 @@ impl MaterializationBatchOperation {
         }
         if self.timings.processed > 0 && self.link_timer {
             self.stage = BatchStage::Timer;
-            return Ok(Next::Call(IoCall::child(LinkTimerOperation::new())));
+            return Ok(Next::Call(IoCall::from(schedule_drain(Duration::ZERO))));
         }
         self.summary()
     }
@@ -548,9 +547,11 @@ impl Operation for MaterializationBatchOperation {
                 self.sync()
             }
             BatchStage::Timer => {
-                match result.child::<(), LinkError>() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => warn!(%error, "Failed to arm the repository link queue"),
+                match result.event() {
+                    Ok(Event::Task(TaskEvent::Error { message, .. })) => {
+                        warn!(%message, "Failed to arm the repository link queue")
+                    }
+                    Ok(_) => {}
                     Err(error) => warn!(%error, "Failed to arm the repository link queue"),
                 }
                 self.summary()
@@ -586,12 +587,6 @@ struct FinishPlan {
     deletes: Vec<(String, ByteView)>,
 }
 
-#[derive(Debug, PartialEq)]
-enum PlanStage {
-    Read,
-    Queue(FinishPlan),
-}
-
 // Guard reads precede the transaction so concurrent changes enter its read set.
 #[derive(Debug, PartialEq)]
 struct PlanFinishOperation {
@@ -599,7 +594,6 @@ struct PlanFinishOperation {
     documents: BTreeSet<Ulid>,
     parked: BTreeSet<(Ulid, Ulid)>,
     now_ms: u64,
-    stage: PlanStage,
 }
 
 impl PlanFinishOperation {
@@ -618,7 +612,6 @@ impl PlanFinishOperation {
             documents,
             parked,
             now_ms: 0,
-            stage: PlanStage::Read,
         }
     }
 
@@ -637,11 +630,11 @@ impl PlanFinishOperation {
             }
         }
         let finished = std::mem::take(&mut self.finished);
-        let (plan, superseding) = plan_rows(finished, &snapshot, &parked, self.now_ms)?;
-        self.stage = PlanStage::Queue(plan);
+        let (mut plan, superseding) = plan_rows(finished, &snapshot, &parked, self.now_ms)?;
         // Linked repositories learn of the change in the same commit as the new status.
-        let queue_rows = QueueRowsOperation::new(superseding);
-        Ok(Next::Call(IoCall::child(queue_rows)))
+        let changes = superseding.into_iter().map(|id| link_change_entry(id, self.now_ms));
+        plan.writes.extend(changes);
+        Ok(Next::Done(plan))
     }
 }
 
@@ -670,21 +663,7 @@ impl Operation for PlanFinishOperation {
     }
 
     fn next(&mut self, result: IoResult) -> MaterializationTurn<FinishPlan> {
-        match std::mem::replace(&mut self.stage, PlanStage::Read) {
-            PlanStage::Read => self.plan(result.values()?),
-            PlanStage::Queue(mut plan) => {
-                match result.child::<Vec<(String, Key, Value)>, LinkError>() {
-                    Ok(Ok(rows)) => plan.writes.extend(rows),
-                    Ok(Err(error)) => {
-                        warn!(%error, "Failed to queue repository link pushes after materialization")
-                    }
-                    Err(error) => {
-                        warn!(%error, "Failed to queue repository link pushes after materialization")
-                    }
-                }
-                Ok(Next::Done(plan))
-            }
-        }
+        self.plan(result.values()?)
     }
 }
 

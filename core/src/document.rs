@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::cmp::Ordering;
+use std::time::Duration;
 
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -10,11 +11,13 @@ use ulid::Ulid;
 
 use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
+use crate::effects::Effect;
+use crate::errors::ConversionError;
 use crate::keyspaces::{
-    AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EMAIL_SETTINGS_KEYSPACE, EVENT_LOG_KEYSPACE,
-    GIT_PACK_KEYSPACE, GIT_RECORD_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE,
-    ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATS_KEYSPACE,
-    OWNER_SECRETS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    APPLIED_SYNC_KEYSPACE, AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EMAIL_SETTINGS_KEYSPACE,
+    EVENT_LOG_KEYSPACE, GIT_PACK_KEYSPACE, GIT_RECORD_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
+    GROUP_KEYSPACE, ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE,
+    NODE_STATS_KEYSPACE, OWNER_SECRETS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
     REPOSITORY_LINK_KEYSPACE, USER_KEY_KEYSPACE, USER_KEYSPACE, VAULT_REVISION_KEYSPACE,
     WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE, WEBHOOK_SETTINGS_KEYSPACE,
 };
@@ -30,7 +33,8 @@ use crate::structs::placement::policy::document::placement_policy_key;
 use crate::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
 use crate::structs::storage::node_info::node_info_key;
 use crate::structs::storage::usage::{usage_global_key, usage_snapshot_key};
-use crate::types::{GroupId, Key};
+use crate::task::{TaskEffect, TaskKey};
+use crate::types::{GroupId, Key, KeySpace, Value};
 use crate::{NodeId, TopicId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -394,7 +398,7 @@ pub struct BatchEvent {
     pub publisher_allowed: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentReconcileResult {
     pub targets: Vec<DocumentTarget>,
     pub metadata_create_events: Vec<MetadataEventRecord>,
@@ -405,6 +409,44 @@ impl DocumentReconcileResult {
     pub fn applied(&self) -> usize {
         self.targets.len()
     }
+}
+
+/// A reconcile a shard pull applied, kept until the node drain ran its usage, watch, mail and
+/// metadata follow-ups. The id orders the rows and is the generation of the usage refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedSync {
+    pub id: Ulid,
+    pub node_id: NodeId,
+    /// The realm this node serves, when it runs a net transport.
+    pub realm_id: Option<RealmId>,
+    pub result: DocumentReconcileResult,
+}
+
+impl AppliedSync {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// The row that queues `applied` for the node drain.
+pub fn applied_sync_entry(
+    applied: &AppliedSync,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    let key = Key::from(applied.id.to_bytes().to_vec());
+    let value = Value::from(applied.to_bytes()?);
+    Ok((APPLIED_SYNC_KEYSPACE.to_string(), key, value))
+}
+
+/// Arms the node drain of applied reconciles to run now.
+pub fn schedule_applied_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainAppliedSync,
+        after: Duration::ZERO,
+    })
 }
 
 impl DocumentSyncPublish {

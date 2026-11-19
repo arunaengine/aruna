@@ -63,6 +63,7 @@ pub(super) async fn import_dataset(
     }
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     Ok(())
 }
 
@@ -294,6 +295,7 @@ pub(super) async fn replace_crate(
     .await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     Ok(())
 }
 
@@ -754,6 +756,7 @@ async fn scaffold_link_checked() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     let raw = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
         .await
         .map(|(_, revision)| revision)?;
@@ -1047,6 +1050,7 @@ async fn deleted_dataset_unlinks() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_prune_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     assert!(has_row(&fixture, LINK_QUEUE_KEYSPACE, &link).await);
 
     due_now(&fixture, &link).await?;
@@ -1104,6 +1108,7 @@ async fn paged_links_unlinked() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_prune_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     for link in &links {
         assert!(has_row(&fixture, LINK_QUEUE_KEYSPACE, link).await);
         due_now(&fixture, link).await?;

@@ -22,8 +22,8 @@ use aruna_operations::jobs::repository::invenio::query::{
 };
 use aruna_operations::jobs::repository::invenio::remote::RemoteStateOperation;
 use aruna_operations::jobs::repository::link_queue::{
-    DrainLinksOperation, OwnerHoldsOperation, PushRevisionOperation, StartPushOperation,
-    revision_event,
+    DrainLinksOperation, OwnerHoldsOperation, PushRevisionOperation, QueueChangesOperation,
+    StartPushOperation, revision_event,
 };
 use aruna_operations::jobs::repository::link_store::{ApplyChangeOperation, ListLinksOperation};
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
@@ -92,6 +92,11 @@ pub(super) async fn start_pull(
 
 pub(super) async fn drain_links(context: &DriverContext) -> Result<Option<Duration>, LinkError> {
     drive(DrainLinksOperation::new(context.node_scope()), context).await
+}
+
+/// Queues the link checks of changed documents, as the link drain does right after a change.
+pub(super) async fn queue_changes(context: &DriverContext) -> Result<(), LinkError> {
+    drive(QueueChangesOperation::new(), context).await
 }
 
 pub(super) async fn owner_holds(context: &DriverContext, link: &RepositoryLink) -> bool {

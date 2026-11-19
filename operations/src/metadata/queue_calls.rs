@@ -5,6 +5,7 @@
 use super::tests::{create_event, node};
 use super::*;
 use aruna_core::storage_entries::create_event_entry;
+use aruna_core::task::TaskKey;
 
 type Error = MetadataMaterializationError;
 
@@ -352,9 +353,7 @@ fn plan_parks_job() {
     );
     let reads = vec![status_read(document_id), dead_letter];
     assert_eq!(plan.first(), Ok(Next::Call(IoCall::Read(reads))));
-    assert!(is_child(&plan.next(IoResult::Values(vec![None, None]))));
-    let queued = child(Ok::<Vec<(String, Key, Value)>, LinkError>(Vec::new()));
-    let Ok(Next::Done(rows)) = plan.next(queued) else {
+    let Ok(Next::Done(rows)) = plan.next(IoResult::Values(vec![None, None])) else {
         panic!("expected the finish plan");
     };
     let parks = (rows.writes.iter()).any(|(space, _, _)| space == DEAD_LETTER_KEYSPACE);
@@ -447,11 +446,20 @@ fn started(started: bool) -> IoResult {
     })))
 }
 
+/// The link queue drain is armed to run now, after the finished jobs queued their changes.
+fn armed(turn: MaterializationTurn<MetadataDrainResult>) -> IoResult {
+    let drain = IoCall::from(schedule_drain(Duration::ZERO));
+    same_call(turn, Ok(Next::Call(drain)));
+    let key = TaskKey::DrainLinkQueue;
+    let after = Duration::ZERO;
+    IoResult::Event(Box::new(Event::Task(TaskEvent::TimerScheduled { key, after })))
+}
+
 #[test]
 fn batch_syncs_graphs() {
     let mut batch = syncing(&event().record.graph_iri);
-    assert!(is_child(&batch.next(started(true))));
-    let result = drain_result(batch.next(child(Ok::<(), LinkError>(()))));
+    let armed = armed(batch.next(started(true)));
+    let result = drain_result(batch.next(armed));
     assert_eq!(result.processed, 1);
     assert_eq!(result.next_due_after, None);
 }
@@ -463,8 +471,8 @@ fn busy_slot_waits() {
     let mut batch = syncing(&graph_iri);
     let inline = IoCall::child(GraphSyncOperation::new(graph_iri, vec![node(2)]));
     same_call(batch.next(started(false)), Ok(Next::Call(inline)));
-    assert!(is_child(&batch.next(child(Ok::<(), MetadataError>(())))));
-    let result = drain_result(batch.next(child(Ok::<(), LinkError>(()))));
+    let armed = armed(batch.next(child(Ok::<(), MetadataError>(()))));
+    let result = drain_result(batch.next(armed));
     assert_eq!(result.processed, 1);
 }
 

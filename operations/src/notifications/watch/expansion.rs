@@ -16,8 +16,8 @@ use aruna_core::metrics::WatchMetricReason;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::structs::execution::notification::{InboxWriteOutcome, NotificationRecord};
 use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription, watch_retry_key,
-    watch_retry_prefix, watch_subscription_key,
+    WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription, dirty_marker_write,
+    watch_retry_key, watch_retry_prefix, watch_subscription_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -31,7 +31,7 @@ use crate::notifications::protocol::{
     RETRY_BYTES_CAP, add_limit, expansion_budget, page_limit, valid_retry,
 };
 use crate::notifications::watch::check::{WatchCheckError, WatchCheckOperation};
-use crate::notifications::watch::digest::{InterestError, InterestOperation, dirty_marker_write};
+use crate::notifications::watch::digest::{InterestError, InterestOperation};
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchPage, WatchScope};
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::WatchSubscriptionError;

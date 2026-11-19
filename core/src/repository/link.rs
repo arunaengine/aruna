@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -10,11 +10,15 @@ use ulid::Ulid;
 
 use super::{ImportOptions, RepositoryDestination, RepositoryRecord};
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
+use crate::effects::Effect;
 use crate::errors::ConversionError;
+use crate::keyspaces::LINK_CHANGE_KEYSPACE;
 use crate::metadata::ProfileValidationFinding;
 use crate::structs::execution::harvest::RepositoryConnectorKind;
 use crate::structs::execution::job::{ImportRoCrateTarget, JobId, RoCrateLimits};
 use crate::structs::placement::record::PlacementRef;
+use crate::task::{TaskEffect, TaskKey};
+use crate::types::{Key, KeySpace, Value};
 use crate::{NodeId, UserId};
 
 /// Quiet time after a change before a link pushes, so a burst of edits becomes one push.
@@ -710,6 +714,29 @@ pub fn connector_link_key(connector_id: Ulid, link_id: Ulid) -> Vec<u8> {
     let mut key = connector_id.to_bytes().to_vec();
     key.extend_from_slice(&link_id.to_bytes());
     key
+}
+
+/// The row that asks the link queue drain to queue push checks for the links of a document that
+/// changed at `now_ms`. The time leads the key, so a later change never replaces one in a drain.
+pub fn link_change_entry(document_id: Ulid, now_ms: u64) -> (KeySpace, Key, Value) {
+    let mut key = now_ms.to_be_bytes().to_vec();
+    key.extend_from_slice(&document_id.to_bytes());
+    let space = LINK_CHANGE_KEYSPACE.to_string();
+    (space, Key::from(key), Value::from(Vec::new()))
+}
+
+/// The document of a [`link_change_entry`] key.
+pub fn link_change_document(key: &[u8]) -> Option<Ulid> {
+    let bytes = <[u8; 16]>::try_from(key.get(8..)?).ok()?;
+    Some(Ulid::from_bytes(bytes))
+}
+
+/// Arms the repository link queue drain to run after `after`.
+pub fn schedule_drain(after: Duration) -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainLinkQueue,
+        after,
+    })
 }
 
 #[cfg(test)]

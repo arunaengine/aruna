@@ -10,7 +10,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::execution::notification_watch::{
     WATCH_USER_CAP, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
-    watch_subscription_prefix,
+    dirty_marker_write, watch_subscription_prefix,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::{Key, KeySpace, Value};
@@ -18,7 +18,6 @@ use ulid::Ulid;
 
 use crate::notifications::unexpected;
 use crate::notifications::watch::check::{WatchCheckError, WatchCheckOperation};
-use crate::notifications::watch::digest::dirty_marker_write;
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
     WatchReplication, WatchSubscriptionError, validated_subscription, watch_subscription_target,

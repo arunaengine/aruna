@@ -571,6 +571,8 @@ async fn restore_prunes_password() {
     let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
     let apply = crate::shard::pull::ApplyPulledOperation::new(node(), realm_id, applied);
     assert!(aruna_drivers::driver::drive(apply, &context).await.unwrap());
+    let followups = crate::node::applied_drain::AppliedDrainOperation::new();
+    aruna_drivers::driver::drive(followups, &context).await.unwrap();
     let row = VaultEntry::new(VaultPurpose::RealmSecret, Ulid::from_parts(3, 3));
     let event = context
         .storage_handle
