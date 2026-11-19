@@ -111,10 +111,13 @@ impl Operation for FamilyAuditOperation {
     type Error = RecordStoreError;
 
     fn first(&mut self) -> Result<Next<AuditPage>, RecordStoreError> {
-        let after = match self.config.cursor.as_ref().map(cursor_key).transpose()? {
-            Some(key) => Some(record_key(&key)),
-            None => None,
-        };
+        let after = self
+            .config
+            .cursor
+            .as_ref()
+            .map(cursor_key)
+            .transpose()?
+            .map(|key| record_key(&key));
         Ok(Next::Call(IoCall::Page {
             space: FAMILY_RECORD_KEYSPACE.to_string(),
             prefix: self.config.scope.prefix(),

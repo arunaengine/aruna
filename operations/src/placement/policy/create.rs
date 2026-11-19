@@ -278,7 +278,7 @@ impl PolicyWrite {
     }
 
     fn sign(&mut self, pending: Box<PendingPublication>) -> Next<PlacementPolicyDocument> {
-        let claim = Box::new(pending.claim.clone());
+        let claim = Box::new(pending.claim);
         self.stage = Stage::Sign;
         self.pending = Some(pending);
         let sign = Effect::Net(NetEffect::PolicySign(claim));

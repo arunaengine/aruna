@@ -1202,11 +1202,12 @@ impl StoreTransitionOperation {
             record.retry_at_ms = Some(self.now_ms.saturating_add(wait));
         }
         let unfinished = self.record.finished_at_ms.is_none();
-        if unfinished && self.record.state == TransitionState::Finished {
-            if let Some(source) = retiring(&self.record) {
-                self.step = StoreStep::SourceKey;
-                return Ok(Next::Call(read_row(BUCKET_KEY_KEYSPACE, source.key())));
-            }
+        if unfinished
+            && self.record.state == TransitionState::Finished
+            && let Some(source) = retiring(&self.record)
+        {
+            self.step = StoreStep::SourceKey;
+            return Ok(Next::Call(read_row(BUCKET_KEY_KEYSPACE, source.key())));
         }
         self.write(Vec::new(), None)
     }

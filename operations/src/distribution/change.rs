@@ -468,9 +468,7 @@ impl<T: ChangeAnswer> ChangeOperation<T> {
     fn sent(&mut self, revision: DistributionRevision) -> Changing<T> {
         let admission = match &self.change {
             Change::Join(input) => Some(((self.set_id, None), input.sizes.clone())),
-            Change::AddCopy(_, _, sizes) => {
-                Some(((self.set_id, Some(revision.clone())), sizes.clone()))
-            }
+            Change::AddCopy(_, _, sizes) => Some(((self.set_id, Some(revision)), sizes.clone())),
             _ => None,
         };
         let Some((accepted, sizes)) = admission else {

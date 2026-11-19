@@ -113,6 +113,9 @@ pub type Caller<'a> = (&'a AuthContext, u64);
 /// A caller an operation keeps.
 type OwnedCaller = (AuthContext, u64);
 
+/// The sealed hidden position a page resumes at and the key bounds it stays inside.
+type PageStart = (Option<Vec<u8>>, Option<(String, Option<String>)>);
+
 #[derive(Debug, Error, PartialEq)]
 pub enum PageError {
     #[error("the cursor is not a next_cursor of this listing")]
@@ -336,7 +339,7 @@ impl<O: PageObject> LocalPartOperation<O> {
         node: PageNode,
         (group_id, caller): (Ulid, Option<OwnedCaller>),
         input: ListBucketInput,
-        (hidden, bounds): (Option<Vec<u8>>, Option<(String, Option<String>)>),
+        (hidden, bounds): PageStart,
     ) -> Self {
         Self {
             node,

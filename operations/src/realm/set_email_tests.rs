@@ -8,6 +8,7 @@ use crate::testing::path_context;
 use aruna_core::UserId;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
+use aruna_core::types::Key;
 use aruna_drivers::driver::{DriverContext, drive};
 use ed25519_dalek::SigningKey;
 use tempfile::tempdir;

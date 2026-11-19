@@ -246,10 +246,7 @@ impl EnableEncryptionOperation {
     /// Every copy must fit a Pithos archive, or the encryption transition could never move it.
     /// The scan reads in the enable transaction, so a concurrent larger write conflicts.
     fn scan_versions(&mut self) -> EnableTurn {
-        let prefix = match VersionKey::bucket_prefix(&self.input.bucket) {
-            Ok(prefix) => prefix,
-            Err(error) => return Err(error.into()),
-        };
+        let prefix = VersionKey::bucket_prefix(&self.input.bucket)?;
         let page = IoCall::Page {
             space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: prefix.into(),
@@ -264,9 +261,9 @@ impl EnableEncryptionOperation {
         self.size_cursor = values.last().map(|(key, _)| key.clone());
         let mut locations = BTreeSet::new();
         for (_, value) in &values {
-            match BlobVersion::from_bytes(value.as_ref()) {
-                Ok(version) => locations.extend(version.location_key().map(|key| key.to_bytes())),
-                Err(error) => return Err(error.into()),
+            {
+                let version = BlobVersion::from_bytes(value.as_ref())?;
+                locations.extend(version.location_key().map(|key| key.to_bytes()))
             }
         }
         if locations.is_empty() {
@@ -417,15 +414,12 @@ impl EnableEncryptionOperation {
             &copies,
             &report,
         );
-        let mut writes = match rows {
-            Ok(writes) => writes,
-            Err(error) => return Err(error.into()),
-        };
+        let mut writes = rows?;
         // Plain copies already stored start their encrypt transition in the same transaction.
         let (bucket, now_ms) = (&self.input.bucket, self.input.now_ms);
-        match encrypt_rows(bucket, &self.settings, &record, self.compression, now_ms) {
-            Ok(rows) => writes.extend(rows),
-            Err(error) => return Err(error.into()),
+        {
+            let rows = encrypt_rows(bucket, &self.settings, &record, self.compression, now_ms)?;
+            writes.extend(rows)
         }
         // The mode change and its audit record commit together.
         let audit = BucketAuditRecord {
@@ -443,9 +437,9 @@ impl EnableEncryptionOperation {
             reason: Some(format!("enabled {:?}", self.input.mode)),
             outcome: AuditOutcome::Applied,
         };
-        match audit_row(&audit) {
-            Ok(row) => writes.push(row),
-            Err(error) => return Err(error.into()),
+        {
+            let row = audit_row(&audit)?;
+            writes.push(row)
         }
         let group = group_bucket_key(self.input.group_id, &self.input.bucket);
         writes.push((

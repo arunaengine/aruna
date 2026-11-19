@@ -117,7 +117,7 @@ impl RealmAsk {
 impl Waiting {
     fn answer(self, result: IoResult) -> Result<ServedReply, IoError> {
         let reply = match self {
-            Self::Export => return Ok(result.child::<ServedReply, IoError>()??),
+            Self::Export => return result.child::<ServedReply, IoError>()?,
             Self::Reply => result.child::<MetadataTransportMessage, IoError>()??,
             Self::Spec => MetadataTransportMessage::StagingSpecResult {
                 result: (result.child::<HandedImport, MetadataReadError>()?).map(Box::new),

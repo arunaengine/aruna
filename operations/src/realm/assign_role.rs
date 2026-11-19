@@ -13,19 +13,18 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
-use aruna_core::types::{Key, KeySpace, RoleId};
+use aruna_core::types::RoleId;
 use byteview::ByteView;
 use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::epoch_due::DueMarks;
+use crate::realm::write_stage::{WriteStage, WriteStep};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -197,40 +196,21 @@ impl Operation for AssignRolesOperation {
     }
 }
 
-/// What the assignment transaction waits for.
-#[derive(Debug, PartialEq)]
-enum Stage {
-    Read,
-    Write,
-    Delete,
-    Marks,
-}
-
 /// Reads the realm authorization and its admin state, writes the assignment, and marks key epochs
 /// due when it narrowed access, in one write transaction.
 #[derive(Debug, PartialEq)]
 struct RoleWrite {
     input: AssignRolesInput,
-    stage: Stage,
-    narrowed: bool,
+    write: WriteStage,
     written: Option<AssignedRoles>,
-    deletes: Vec<(KeySpace, Key)>,
-    marks: DueMarks,
-    ids: IdMint,
-    now_ms: u64,
 }
 
 impl RoleWrite {
     fn new(input: AssignRolesInput) -> Self {
         Self {
             input,
-            stage: Stage::Read,
-            narrowed: false,
+            write: WriteStage::default(),
             written: None,
-            deletes: Vec::new(),
-            marks: DueMarks::new(None, 0),
-            ids: IdMint::default(),
-            now_ms: 0,
         }
     }
 
@@ -273,8 +253,8 @@ impl RoleWrite {
             &mut reducer_state,
             &self.input,
             &role_ids,
-            &mut self.ids,
-            self.now_ms,
+            &mut self.write.ids,
+            self.write.now_ms,
         )?;
 
         let roles_before = auth_doc.roles.clone();
@@ -293,7 +273,7 @@ impl RoleWrite {
                 role.assigned_users.remove(&self.input.user_id);
             }
         }
-        self.narrowed = aruna_core::admin_documents::roles_narrowed(&roles_before, &auth_doc.roles);
+        let narrowed = aruna_core::admin_documents::roles_narrowed(&roles_before, &auth_doc.roles);
 
         let key = (*auth_doc.realm_id.as_bytes()).into();
         let value = auth_doc.to_bytes(&self.input.actor)?.into();
@@ -323,17 +303,8 @@ impl RoleWrite {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.written = Some((auth_doc, !admin_events.is_empty()));
-        self.deletes = stale_conflict_deletes;
-        self.stage = Stage::Write;
+        self.write.written(stale_conflict_deletes, narrowed);
         Ok(Next::Call(IoCall::Write(writes)))
-    }
-
-    fn after_writes(&mut self) -> Result<Next<AssignedRoles>, AssignRolesError> {
-        if self.narrowed {
-            self.stage = Stage::Marks;
-            return Ok(Next::Call(self.marks.first()));
-        }
-        self.finish()
     }
 
     fn finish(&mut self) -> Result<Next<AssignedRoles>, AssignRolesError> {
@@ -349,12 +320,11 @@ impl Operation for RoleWrite {
     type Error = AssignRolesError;
 
     fn seed(&mut self, entropy: u128) {
-        self.ids = IdMint::new(entropy);
+        self.write.ids = IdMint::new(entropy);
     }
 
     fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-        self.marks.stamp(now_ms);
+        self.write.stamp(now_ms);
     }
 
     fn transaction(&self) -> TransactionMode {
@@ -368,27 +338,10 @@ impl Operation for RoleWrite {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<AssignedRoles>, AssignRolesError> {
-        match self.stage {
-            Stage::Read => {
-                let [auth_doc, reducer] = aruna_core::rows::values::<2>(result)?;
-                self.emit_auth_write(auth_doc, reducer)
-            }
-            Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
-                self.stage = Stage::Delete;
-                Ok(Next::Call(IoCall::Delete(std::mem::take(
-                    &mut self.deletes,
-                ))))
-            }
-            Stage::Write | Stage::Delete => {
-                done(result)?;
-                self.after_writes()
-            }
-            Stage::Marks => match self.marks.next(result, true) {
-                Ok(Some(call)) => Ok(Next::Call(call)),
-                Ok(None) => self.finish(),
-                Err(error) => Err(StorageError::WriteError(error.to_string()).into()),
-            },
+        match self.write.step(result)? {
+            WriteStep::Read([auth_doc, reducer]) => self.emit_auth_write(auth_doc, reducer),
+            WriteStep::Call(call) => Ok(Next::Call(call)),
+            WriteStep::Done => self.finish(),
         }
     }
 }

@@ -310,6 +310,9 @@ pub async fn recover_until_stopped(
     Ok(recovered)
 }
 
+/// A supervised job's outcome, or none when its run lost the job; the outcome stays inline like
+/// `JobRunOutcome` itself.
+#[allow(clippy::large_enum_variant)]
 enum SuperviseResult {
     Outcome(JobRunOutcome),
     Zombie,

@@ -379,8 +379,7 @@ impl CreateMultipartOperation {
         if (values.first()).is_some_and(|(_, parameters)| parameters.is_none()) {
             return self.check_purge_fence();
         }
-        let (parameters, epoch) =
-            parse_abe(&values, plan.key).map_err(|error| BlobError::from(error))?;
+        let (parameters, epoch) = parse_abe(&values, plan.key).map_err(BlobError::from)?;
         let envelope = AbeEffect::Envelope(EnvelopePlan {
             parameters,
             epoch,

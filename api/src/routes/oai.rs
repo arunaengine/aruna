@@ -684,7 +684,7 @@ async fn read_jsonld(
             None,
             state.rocrate_limits().metadata_bytes,
         ),
-        &ctx,
+        ctx,
     )
     .await
     {

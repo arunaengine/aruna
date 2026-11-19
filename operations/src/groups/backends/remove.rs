@@ -17,7 +17,7 @@ use aruna_core::structs::storage::group_backend::{
     BUCKET_DELETING, GroupStorage, GroupStorageSecret,
 };
 use aruna_core::structs::storage::multipart::MultipartUpload;
-use aruna_core::types::{Key, Value};
+use aruna_core::types::{Key, PageRows, Value};
 use std::collections::BTreeSet;
 use thiserror::Error;
 use tracing::warn;
@@ -136,7 +136,7 @@ fn scan_page<T>(key_space: &str, after: Option<Key>) -> Next<T> {
 }
 
 /// The rows of a page, or the runner's refusal of any other answer.
-fn scan_rows(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
+fn scan_rows(result: IoResult) -> Result<PageRows, IoError> {
     match result {
         IoResult::Page { rows, next } => Ok((rows, next)),
         _ => Err(IoError::Unexpected {

@@ -206,6 +206,12 @@ impl SweepMarks {
     }
 }
 
+impl Default for SweepMarks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Operation for SweepMarks {
     type Output = usize;
     type Error = StoreError;

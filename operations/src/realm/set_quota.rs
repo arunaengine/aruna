@@ -16,7 +16,6 @@ use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH,
 };
-use aruna_core::rows::{done, values};
 #[cfg(test)]
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::storage_entries::{
@@ -25,13 +24,14 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, ReplicaQuota};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::types::Value;
 use thiserror::Error;
 use tracing::warn;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::mutate_placement::is_management;
+use crate::realm::write_stage::{WriteStage, WriteStep};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -157,35 +157,21 @@ impl Operation for SetQuotaOperation {
     }
 }
 
-/// What the config write transaction waits for.
-#[derive(Debug, PartialEq)]
-enum Stage {
-    Read,
-    Write,
-    Delete,
-}
-
 /// Reads the realm config and its admin state, then stores the change and its queued admin
 /// events in one write transaction.
 #[derive(Debug, PartialEq)]
 struct QuotaWrite {
     config: Arc<SetQuotaConfig>,
-    stage: Stage,
+    write: WriteStage,
     document: Option<RealmConfigDocument>,
-    deletes: Vec<(KeySpace, Key)>,
-    ids: IdMint,
-    now_ms: u64,
 }
 
 impl QuotaWrite {
     fn new(config: Arc<SetQuotaConfig>) -> Self {
         Self {
             config,
-            stage: Stage::Read,
+            write: WriteStage::default(),
             document: None,
-            deletes: Vec::new(),
-            ids: IdMint::default(),
-            now_ms: 0,
         }
     }
 
@@ -239,14 +225,14 @@ impl QuotaWrite {
             AdminDocumentOperation::ConfigQuotaSet {
                 quota: self.config.quota.clone(),
             },
-            self.ids.mint(self.now_ms),
+            self.write.ids.mint(self.write.now_ms),
         )?;
         let replicas_event = reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::ConfigReplicasSet {
                 replicas: self.config.replicas.clone(),
             },
-            self.ids.mint(self.now_ms),
+            self.write.ids.mint(self.write.now_ms),
         )?;
         // Materialized reducer state keeps local and replicated quota conflict outcomes equal.
         apply_reducer_quota(&mut document, &reducer_state);
@@ -278,8 +264,7 @@ impl QuotaWrite {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.document = Some(document.clone());
-        self.deletes = stale_conflict_deletes;
-        self.stage = Stage::Write;
+        self.write.written(stale_conflict_deletes, false);
         Ok(Next::Call(IoCall::Write(writes)))
     }
 
@@ -296,11 +281,11 @@ impl Operation for QuotaWrite {
     type Error = SetQuotaError;
 
     fn seed(&mut self, entropy: u128) {
-        self.ids = IdMint::new(entropy);
+        self.write.ids = IdMint::new(entropy);
     }
 
     fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
+        self.write.now_ms = now_ms;
     }
 
     fn transaction(&self) -> TransactionMode {
@@ -317,22 +302,10 @@ impl Operation for QuotaWrite {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetQuotaError> {
-        match self.stage {
-            Stage::Read => {
-                let [document, reducer] = values::<2>(result)?;
-                self.emit_document_write(document, reducer)
-            }
-            Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
-                self.stage = Stage::Delete;
-                Ok(Next::Call(IoCall::Delete(std::mem::take(
-                    &mut self.deletes,
-                ))))
-            }
-            Stage::Write | Stage::Delete => {
-                done(result)?;
-                self.finish()
-            }
+        match self.write.step(result)? {
+            WriteStep::Read([document, reducer]) => self.emit_document_write(document, reducer),
+            WriteStep::Call(call) => Ok(Next::Call(call)),
+            WriteStep::Done => self.finish(),
         }
     }
 }
@@ -433,6 +406,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         GroupQuotaOverride, RealmConfigDocument, RealmId, RealmNodeKind, UserCapOverride,
     };
+    use aruna_core::types::Key;
     use aruna_drivers::driver::{DriverContext, drive};
     use tempfile::tempdir;
     use ulid::Ulid;

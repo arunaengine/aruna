@@ -396,18 +396,18 @@ impl DecodeTokenOperation {
         // The issuing realm from the verified claims, so a foreign token is judged
         // by its origin realm's revocation set and not by the serving node's.
         let issuer_realm = issuer_realm(&claims)?;
-        let turn = match &self.checks.revocation {
+
+        match &self.checks.revocation {
             RevocationCheck::Realm => {
                 self.claims = Some(claims);
                 self.stage = DecodeStage::Config;
-                return Ok(Next::Call(config_call(issuer_realm)));
+                Ok(Next::Call(config_call(issuer_realm)))
             }
             RevocationCheck::Listed(hashes) if hashes.contains(&bearer_token_hash(&self.token)) => {
                 Err(ArunaBearerError::TokenRevoked)
             }
             _ => self.check_link(claims),
-        };
-        turn
+        }
     }
 
     /// Applies the issuing realm's revocations and the cutoffs of both ids.

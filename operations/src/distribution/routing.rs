@@ -116,7 +116,7 @@ pub fn upload_route(
     key: &str,
     tag: &UploadTag,
 ) -> BoundQuestion<(String, UploadTag), ()> {
-    of_record(binding, (key.to_string(), tag.clone()), upload_held)
+    of_record(binding, (key.to_string(), *tag), upload_held)
 }
 
 /// The tags of listed uploads, from the range and epoch that hold each key now.

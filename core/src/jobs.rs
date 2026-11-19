@@ -512,7 +512,7 @@ pub enum JobEffect {
     /// Reads a stream of at most `limit` bytes; answered by `JobEvent::CollectedUpTo`.
     CollectUpTo { stream: ByteStream, limit: u64 },
     /// Feeds `work` until its cursor holds the next chunk; answered by `JobEvent::GzipFilled`.
-    FillGzip(GzipWork),
+    FillGzip(Box<GzipWork>),
     /// Makes a stream fail once the job stops; answered by `JobEvent::Stream`.
     StoppableStream(ByteStream),
     /// Inspects a stored archive; answered by `JobEvent::ArchiveInspected`.
@@ -802,6 +802,8 @@ impl ProgressReporter {
     }
 }
 
+/// Most outcomes are small; boxing the result payload would touch every job, so it stays inline.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq)]
 pub enum JobRunOutcome {
     Succeeded(JobResultPayload),

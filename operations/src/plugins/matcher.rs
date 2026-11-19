@@ -125,9 +125,7 @@ impl MatchPage {
             for target in self.targets.iter().filter(|target| target.matches(&event)) {
                 let install = (target.install_id, target.revision);
                 let stale = event.journaled_ms < stale;
-                if let Err(error) = outbox.offer(install, key, &event, stale, self.bound) {
-                    return Err(error);
-                }
+                outbox.offer(install, key, &event, stale, self.bound)?;
             }
         }
         let ask = outbox.gap_ask();

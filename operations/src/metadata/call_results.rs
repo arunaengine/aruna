@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoError, IoResult};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::types::{Key, Value};
+use aruna_core::types::{PageRows, Value};
 
 /// The values of a read call, one per requested key. A batch read effect, used inside a
 /// caller's transaction, answers the same way.
@@ -33,7 +33,7 @@ pub(crate) fn read_value(result: IoResult) -> Result<Option<Value>, IoError> {
 
 /// The rows of a page call and the key to continue after. An iteration effect, used to start
 /// at a key or inside a caller's transaction, answers the same way.
-pub(crate) fn page_rows(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
+pub(crate) fn page_rows(result: IoResult) -> Result<PageRows, IoError> {
     match result {
         IoResult::Page { rows, next } => Ok((rows, next)),
         IoResult::Event(event) => match *event {

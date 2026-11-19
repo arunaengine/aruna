@@ -243,7 +243,7 @@ impl IoResult {
     }
 
     /// The rows of a page and the key to continue after.
-    pub fn page(self) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
+    pub fn page(self) -> Result<crate::types::PageRows, IoError> {
         match self {
             Self::Page { rows, next } => Ok((rows, next)),
             other => Err(other.other("IoResult::Page")),

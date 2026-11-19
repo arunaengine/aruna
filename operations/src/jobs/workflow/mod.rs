@@ -248,7 +248,7 @@ enum RunStep {
     ParkedOnError(Box<JobError>),
     Ready(Box<PreparedTask>),
     Image(Box<PreparedTask>),
-    Granted(Box<String>),
+    Granted(String),
     LaunchSite(Box<(TaskSpec, String, GrantedResources)>),
     Intent(Box<(TaskSpec, String)>),
     IntentIntent,
@@ -444,7 +444,7 @@ impl ExecutionRunOperation {
             backend,
             spec: Box::new(task),
         });
-        self.call(RunStep::Granted(Box::new(image)), call)
+        self.call(RunStep::Granted(image), call)
     }
 
     /// Where and with what this attempt is launched; planned until the backend accepts it.
@@ -659,7 +659,7 @@ impl Operation for ExecutionRunOperation {
             },
             RunStep::Granted(image) => match compute_answer(result)? {
                 ComputeAnswer::Granted { spec, resources } => match resources {
-                    Ok(granted) => self.launch_site(*spec, *image, granted),
+                    Ok(granted) => self.launch_site(*spec, image, granted),
                     Err(error) => {
                         let message = format!("submit failed: {error}");
                         let job_error = match error.retryable() {

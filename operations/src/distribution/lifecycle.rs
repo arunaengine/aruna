@@ -1120,6 +1120,9 @@ enum TakeStep {
     State,
 }
 
+/// The watermark, the imports and the optional completion a former coordinator's fence names.
+type FenceParts = ([u8; 32], Vec<u8>, Option<Vec<u8>>);
+
 /// The new coordinator's side: complete once its copy reached the fenced watermark and every
 /// source root it holds references of is checked.
 #[derive(Debug, PartialEq)]
@@ -1129,7 +1132,7 @@ struct TakeOverOperation {
     budget: usize,
     sweep: Option<Sweep>,
     step: TakeStep,
-    fenced: Option<([u8; 32], Vec<u8>, Option<Vec<u8>>)>,
+    fenced: Option<FenceParts>,
     changed: Vec<(Ulid, Option<Sweep>)>,
 }
 
@@ -1155,7 +1158,7 @@ impl TakeOverOperation {
     }
 
     /// The watermark and the imports the former coordinator's fence statement names.
-    fn fenced_parts(&self) -> Option<([u8; 32], Vec<u8>, Option<Vec<u8>>)> {
+    fn fenced_parts(&self) -> Option<FenceParts> {
         let (Some(fenced), None) = (self.open.fenced, self.open.completed) else {
             return None;
         };

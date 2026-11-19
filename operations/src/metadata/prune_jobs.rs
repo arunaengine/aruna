@@ -47,6 +47,8 @@ pub struct DuePruneOperation {
 }
 
 type DueTurn = Result<Next<DuePrune>, IoError>;
+/// The repair writes and the due jobs of one prune step.
+type PrunePlan = (Vec<(KeySpace, Key, Value)>, DuePrune);
 
 impl DuePruneOperation {
     pub(crate) fn new(now_ms: u64, limit: usize) -> Self {
@@ -79,7 +81,7 @@ impl DuePruneOperation {
     }
 
     /// The repair writes and the due jobs; the deletes wait for the writes.
-    fn plan(&mut self) -> Result<(Vec<(KeySpace, Key, Value)>, DuePrune), IoError> {
+    fn plan(&mut self) -> Result<PrunePlan, IoError> {
         let rows = std::mem::take(&mut self.rows);
         let mut preferred: BTreeMap<&str, usize> = BTreeMap::new();
         for (index, (_, job)) in rows.iter().enumerate() {

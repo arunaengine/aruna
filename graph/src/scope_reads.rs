@@ -60,7 +60,8 @@ impl GraphHandle {
         }))
     }
 
-    /// Answers a scoped read, or hands any other effect back.
+    /// Answers a scoped read, or hands any other effect back unchanged, which is no failure.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn run_scoped(
         &self,
         effect: MetadataEffect,

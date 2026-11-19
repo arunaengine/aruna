@@ -100,13 +100,16 @@ pub(crate) fn parse_abe(
     Ok((parameters, epoch))
 }
 
+/// The rows of a write and the usage charge they add.
+pub(crate) type ChargedRows = (Vec<(KeySpace, Key, Value)>, u64);
+
 /// The rows publishing `envelope` for `version` stored at `location`, with its usage charge.
 pub(crate) fn located_rows(
     envelope: &ObjectEnvelope,
     version: &VersionKey,
     location: &BackendLocation,
     rows: (&HashMap<String, String>, u64),
-) -> Result<(Vec<(KeySpace, Key, Value)>, u64), AbeError> {
+) -> Result<ChargedRows, AbeError> {
     // A pending multipart archive has no location key until it is hashed.
     let location_key = location.location_key().map(|key| key.to_bytes());
     let archive = EnvelopeArchive {
@@ -122,7 +125,7 @@ pub(crate) fn envelope_rows(
     version: &VersionKey,
     archive: &EnvelopeArchive,
     (metadata, limit): (&HashMap<String, String>, u64),
-) -> Result<(Vec<(KeySpace, Key, Value)>, u64), AbeError> {
+) -> Result<ChargedRows, AbeError> {
     let version = version.to_bytes().map_err(|_| AbeError::Context)?;
     let id = envelope.context.write_id.to_bytes().to_vec();
     let bytes = envelope.to_bytes()?;

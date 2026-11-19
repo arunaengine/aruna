@@ -139,8 +139,7 @@ impl NodeSecretOperation {
                 Managers::Realm(auth),
                 Some(input.node_id),
                 input.actor,
-                input.now_ms,
-                &mut self.ids,
+                (input.now_ms, &mut self.ids),
             )?;
             self.notices = !notices.is_empty();
             audit.extend(notices);

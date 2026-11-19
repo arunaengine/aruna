@@ -72,7 +72,7 @@ pub fn all_values(result: IoResult) -> Result<Vec<Option<Value>>, IoError> {
 }
 
 /// The rows of one page and the key to continue after.
-pub fn page(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
+pub fn page(result: IoResult) -> Result<crate::types::PageRows, IoError> {
     match result {
         IoResult::Page { rows, next } => Ok((rows, next)),
         other => Err(unexpected("IoResult::Page", &other)),

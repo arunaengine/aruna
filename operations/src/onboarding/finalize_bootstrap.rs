@@ -178,7 +178,8 @@ impl FinalizeBootstrapOperation {
     }
 
     fn mode(&self) -> Result<OnboardingMode, BootstrapFinalizeError> {
-        (self.mode.clone()).ok_or_else(|| BootstrapFinalizeError::Step("no reservation".into()))
+        self.mode
+            .ok_or_else(|| BootstrapFinalizeError::Step("no reservation".into()))
     }
 
     fn ensure_node(&mut self, attempts: usize) -> FinalizeTurn {

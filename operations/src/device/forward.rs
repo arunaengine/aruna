@@ -345,7 +345,7 @@ impl Operation for ReadDocumentsOperation {
             DocumentsStep::Rows => {
                 let [config, authorization, owner] = values::<3>(result)?;
                 let bytes = |row: aruna_core::types::Value| row.as_ref().to_vec();
-                self.realm_config = bytes(config.ok_or(SyncRefusal::NotFound)?);
+                self.realm_config = config.map(bytes).ok_or(SyncRefusal::NotFound)?;
                 self.realm_authorization = authorization.map(bytes);
                 self.owner = owner.map(bytes);
                 let nodes =

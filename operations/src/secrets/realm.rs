@@ -255,8 +255,7 @@ impl RealmSecretOperation {
                 Managers::Realm(auth),
                 None,
                 actor.user_id,
-                self.input.now_ms,
-                &mut self.ids,
+                (self.input.now_ms, &mut self.ids),
             )?;
             self.notices = !notices.is_empty();
             writes.extend(notices);

@@ -1047,7 +1047,7 @@ impl DepositOperation {
                     .destination
                     .link
                     .as_ref()
-                    .is_some_and(|target| target.files.iter().any(|pushed| *pushed == key));
+                    .is_some_and(|target| target.files.contains(&key));
                 if !pushed {
                     return Err(TransferError::Refused(LinkFailure::RemoteChanged));
                 }

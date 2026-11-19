@@ -515,7 +515,7 @@ pub fn begin_external_running(
         renew(record, now_ms);
         Ok(JobMutation::Persist)
     };
-    let build = move || MarkStartOperation::new(job_id, mutate.clone(), attempt_started);
+    let build = move || MarkStartOperation::new(job_id, mutate, attempt_started);
     StoreCall::of(build, Ok, JOB_EXHAUSTED)
 }
 
@@ -847,7 +847,7 @@ pub fn authorize_cleanup(
         control.bound_token = Some(token);
         Ok(JobMutation::Persist)
     };
-    let build = move || MutateControlOperation::new(job_id, Vec::new(), mutate.clone());
+    let build = move || MutateControlOperation::new(job_id, Vec::new(), mutate);
     let map = move |changed: ControlChange| {
         Ok(FenceContext {
             attempt: AttemptRef::new(job_id.to_string().to_lowercase(), attempt_no),
@@ -969,7 +969,7 @@ pub fn persist_output_record(
         stored.output_record = Some(digest);
         Ok(JobMutation::Persist)
     };
-    let build = move || MutateControlOperation::new(job_id, write.clone(), mutate.clone());
+    let build = move || MutateControlOperation::new(job_id, write.clone(), mutate);
     StoreCall::of(build, |_: ControlChange| Ok(()), ATTEMPT_EXHAUSTED)
 }
 

@@ -231,6 +231,12 @@ impl RegistryReadOperation {
     }
 }
 
+impl Default for RegistryReadOperation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Operation for RegistryReadOperation {
     type Output = Registry;
     type Error = MetadataError;

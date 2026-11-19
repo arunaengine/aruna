@@ -26,6 +26,7 @@ pub mod set_policies;
 pub mod set_portal;
 pub mod set_provider;
 pub mod set_quota;
+mod write_stage;
 
 use aruna_core::calls::{IoCall, IoResult};
 use aruna_core::document::DocumentTarget;

@@ -111,10 +111,10 @@ impl Operation for ConsentStoreOperation {
 
 #[derive(Debug, PartialEq)]
 enum HolderState {
-    ReadConsent,
-    ReadBucket,
-    ReadAuthority,
-    ReadGrant,
+    Consent,
+    Bucket,
+    Authority,
+    Grant,
 }
 
 /// Whether `user` holds the key of `bucket` in realm `realm_id` now: its creator, a current group
@@ -138,7 +138,7 @@ impl HolderCheckOperation {
             user,
             consent: None,
             group_id: None,
-            state: HolderState::ReadBucket,
+            state: HolderState::Bucket,
         }
     }
 
@@ -155,7 +155,7 @@ impl HolderCheckOperation {
 
     fn read_bucket(&mut self) -> Turn<bool> {
         let read = read_row(S3_BUCKET_KEYSPACE, self.bucket.as_bytes().to_vec());
-        self.call(HolderState::ReadBucket, read)
+        self.call(HolderState::Bucket, read)
     }
 
     fn consent_read(&mut self, value: Option<Value>) -> Turn<bool> {
@@ -170,7 +170,7 @@ impl HolderCheckOperation {
         let group_id = BucketInfo::from_bytes(&value)?.group_id;
         self.group_id = Some(group_id);
         let reads = authority_keys(&self.bucket, self.realm_id, group_id);
-        self.call(HolderState::ReadAuthority, IoCall::Read(reads))
+        self.call(HolderState::Authority, IoCall::Read(reads))
     }
 
     fn authority_read(&mut self, values: Vec<Option<Value>>) -> Turn<bool> {
@@ -184,7 +184,7 @@ impl HolderCheckOperation {
         };
         let row = [&bucket_id.to_bytes()[..], &self.user.to_storage_key()].concat();
         let read = read_row(BUCKET_HOLDER_KEYSPACE, row);
-        self.call(HolderState::ReadGrant, read)
+        self.call(HolderState::Grant, read)
     }
 
     fn grant_read(&mut self, value: Option<Value>) -> Turn<bool> {
@@ -204,7 +204,7 @@ impl Operation for HolderCheckOperation {
         match self.consent.clone() {
             Some(row) => {
                 let read = read_row(PLAINTEXT_COPY_KEYSPACE, row);
-                self.call(HolderState::ReadConsent, read)
+                self.call(HolderState::Consent, read)
             }
             None => self.read_bucket(),
         }
@@ -212,10 +212,10 @@ impl Operation for HolderCheckOperation {
 
     fn next(&mut self, result: IoResult) -> Turn<bool> {
         match self.state {
-            HolderState::ReadConsent => self.consent_read(result.value()?),
-            HolderState::ReadBucket => self.bucket_read(result.value()?),
-            HolderState::ReadAuthority => self.authority_read(result.values()?),
-            HolderState::ReadGrant => self.grant_read(result.value()?),
+            HolderState::Consent => self.consent_read(result.value()?),
+            HolderState::Bucket => self.bucket_read(result.value()?),
+            HolderState::Authority => self.authority_read(result.values()?),
+            HolderState::Grant => self.grant_read(result.value()?),
         }
     }
 }
