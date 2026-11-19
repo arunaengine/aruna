@@ -82,6 +82,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
 use aruna_core::structs::storage::encryption::TokenCredential;
+use aruna_core::structs::storage::mirror_repair::SyncMirrorIntent;
 use aruna_core::structs::storage::multipart::COMPLETION_DEADLINE_MS;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication::ArunaArn;
@@ -98,9 +99,7 @@ use aruna_operations::auth::request_authorization::BucketAccessOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::placement::policy::GateOperation;
-use aruna_operations::replication::mirror_repair::{
-    KickRepairOperation, MirrorRecordOperation, SyncMirrorIntent,
-};
+use aruna_operations::replication::mirror_repair::{KickRepairOperation, MirrorRecordOperation};
 use aruna_operations::replication::sync_relationship::{
     CreateRelationshipOperation, SyncRelationshipDirection,
 };

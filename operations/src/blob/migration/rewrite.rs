@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::distribution::inventory::outside_answer;
 use crate::s3::object::put::abe::keyed;
 use crate::s3::usage::{QuotaGate, StoredDelta, UsageCounterUpdate, UsageUpdateError};
@@ -27,7 +26,9 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BlobVersionState, CopyOwner, ManagedCopyKey,
     ManagedCopyRecord, ResolvedBackend, VersionKey,
 };
-use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::cleanup::{
+    ReclaimCandidate, ReclaimCandidateKey, schedule_cleanup_effect,
+};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };

@@ -9,11 +9,9 @@ use aruna_core::structs::SyncRelationship;
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 
-use super::{
-    SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, decode_record, one_value, repair_key,
-    repair_read, same_relationship,
-};
+use super::{SyncMirrorError, decode_record, one_value, repair_read, same_relationship};
 use crate::queue_backoff::retry_delay_ms;
+use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord, repair_key};
 
 /// What the operation does with the record it reads.
 #[derive(Debug, PartialEq)]

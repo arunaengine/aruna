@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::distribution::guard::{GuardError, WriteAuthority, authority_reads, record_authority};
 use crate::distribution::inventory::{AddedVersion, stamp_head, stamp_version, version_written};
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
@@ -54,6 +53,7 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ManagedCopyKey, VersionKey,
     WriteOwner,
 };
+use aruna_core::structs::storage::cleanup::schedule_cleanup_effect;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::distribution::inventory::VersionEntry;
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};

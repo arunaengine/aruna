@@ -12,6 +12,7 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permission_path};
+use aruna_core::structs::storage::mirror_repair::SyncMirrorIntent;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncRelationship};
 use aruna_drivers::driver::drive;
@@ -20,7 +21,7 @@ use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::replication::mirror_repair::request::MirrorRequestOperation;
 use aruna_operations::replication::mirror_repair::{
-    KickRepairOperation, MirrorRecordOperation, RemoveMirrorOperation, SyncMirrorIntent,
+    KickRepairOperation, MirrorRecordOperation, RemoveMirrorOperation,
 };
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use aruna_operations::replication::sync_relationship::{

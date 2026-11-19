@@ -15,6 +15,7 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, ensure_confined_path};
+use aruna_core::structs::storage::mirror_repair::SyncMirrorIntent;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::storage::replication_queue::ReplicationMode;
 use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
@@ -25,7 +26,6 @@ use aruna_drivers::driver::{drive, drive_retry};
 use aruna_operations::replication::mirror_repair::request::MirrorRequestOperation;
 use aruna_operations::replication::mirror_repair::{
     KickRepairOperation, MirrorRecordOperation, RemoveMirrorOperation, StoreStatusOperation,
-    SyncMirrorIntent,
 };
 use aruna_operations::replication::parking::AwaitingJobsOperation;
 use aruna_operations::replication::plaintext::{

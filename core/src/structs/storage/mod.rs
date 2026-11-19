@@ -27,6 +27,7 @@ pub mod link;
 pub mod linked_job;
 pub mod listing;
 pub mod metadata_registry;
+pub mod mirror_repair;
 pub mod multipart;
 pub mod node_info;
 pub mod object_read;

@@ -13,12 +13,12 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::types::GroupId;
 
-use crate::replication::mirror_repair::RECONCILE_GRACE;
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, decode_message, encode_message, metadata_request,
     transport_message_kind,
 };
 use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::storage::mirror_repair::RECONCILE_GRACE;
 
 /// A mirror request ends before repair could treat its create as abandoned.
 const MIRROR_REQUEST_TIMEOUT: Duration = RECONCILE_GRACE.saturating_sub(Duration::from_secs(10));

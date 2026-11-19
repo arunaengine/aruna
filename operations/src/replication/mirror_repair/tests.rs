@@ -28,6 +28,9 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::mirror_repair::{
+    SyncMirrorIntent, SyncMirrorRecord, repair_entry, repair_key,
+};
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::sync_relationship_key;
 use aruna_core::structs::{ReferenceHandling, SyncMode, SyncState, SyncStatusSnapshot};
