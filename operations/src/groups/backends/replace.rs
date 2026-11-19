@@ -15,7 +15,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
 use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use ulid::Ulid;
 
 /// Where a replacement stands before its write transaction.
@@ -43,6 +43,7 @@ pub struct ReplaceBackendOperation {
     /// A change without keys never writes the vault, so a rotation meanwhile stays.
     keep_secret: bool,
     state: ReplaceState,
+    now_ms: u64,
 }
 
 impl ReplaceBackendOperation {
@@ -55,6 +56,7 @@ impl ReplaceBackendOperation {
             existing: None,
             keep_secret: false,
             state: ReplaceState::ReadRecord,
+            now_ms: 0,
         }
     }
 
@@ -99,7 +101,7 @@ impl ReplaceBackendOperation {
         let (kind, roots) = (self.input.kind, &self.input.import_roots);
         check_import_root(kind, &normalized.public, existing.group_id, roots)?;
 
-        let now = SystemTime::now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         let record = GroupStorage {
             backend_id: self.backend_id,
             group_id: existing.group_id,
@@ -186,6 +188,10 @@ fn event(result: IoResult) -> Result<Event, CreateBackendError> {
 impl Operation for ReplaceBackendOperation {
     type Output = GroupStorage;
     type Error = CreateBackendError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> ReplaceTurn {
         Ok(Next::Call(IoCall::Read(vec![record_row(self.backend_id)])))
@@ -459,6 +465,7 @@ mod pure_tests {
         let group_id = Ulid::from_bytes([1u8; 16]);
         let backend_id = Ulid::from_bytes([9u8; 16]);
         let mut operation = ReplaceBackendOperation::new(backend_id, input(group_id));
+        operation.stamp(5_000);
         operation.first().unwrap();
 
         let Ok(Next::Call(IoCall::Effect(probe))) =
@@ -471,7 +478,10 @@ mod pure_tests {
         };
         assert_eq!(record.backend_id, backend_id);
         assert_eq!(record.created_at, SystemTime::UNIX_EPOCH);
-        assert!(record.updated_at > SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        assert_eq!(
+            record.updated_at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(5)
+        );
 
         let (writes, record) = commit_update(&mut operation, existing(group_id, backend_id));
         assert!(!writes.is_empty());
