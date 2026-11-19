@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -64,8 +63,6 @@ pub const PROJECTION_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// would win forever. Events beyond the configured skew are deferred until retry; operators must
 /// run NTP.
 const MAX_SKEW_SECS: u64 = 300;
-
-static CLOCK_SKEW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// The largest clock skew a projection accepts, from `MAX_CLOCK_SKEW_SECS`; read by the shells
 /// that start a projection.
@@ -389,7 +386,6 @@ impl ProjectEventsOperation {
     fn begin(&mut self, event: MetadataEventRecord) -> Option<Current> {
         let document_id = event.record.document_id;
         if exceeds_clock_skew(&event, self.now_ms, self.max_skew_ms) {
-            let rejected_total = CLOCK_SKEW_REJECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             warn!(
                 event = "metadata.event.rejected",
                 reason = "clock_skew",
@@ -399,7 +395,6 @@ impl ProjectEventsOperation {
                 updated_at_ms = event.record.updated_at_ms,
                 occurred_at_ms = event.occurred_at_ms,
                 now_ms = self.now_ms,
-                rejected_total,
                 "Deferring metadata event stamped too far in the future; check NTP on the emitting node"
             );
             self.pending_retries.insert((document_id, event.event_id));
