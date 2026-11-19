@@ -21,14 +21,14 @@ use crate::device::replica::{ReplicaRecord, read_answer as replica_answer, repli
 use crate::device::selection::keep_read;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::read_answer;
-use crate::forward::replay::routed_record_matches;
-use crate::forward::transport::read_error;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::resolve_metadata_id;
+use crate::metadata::forward::replay::routed_record_matches;
+use crate::metadata::forward::write::read_error;
 use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, encode_message, metadata_request,

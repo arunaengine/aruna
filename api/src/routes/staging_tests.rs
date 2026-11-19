@@ -294,7 +294,7 @@ async fn queue_failure_repairable() {
 #[test]
 fn staging_submit_classifies() {
     // Job admission refusals must keep their status instead of collapsing into 500.
-    use aruna_operations::jobs::submit::SubmitJobError;
+    use aruna_core::job_request::SubmitJobError;
 
     assert_eq!(
         map_submit_error(SubmitJobError::PlacementUnavailable(

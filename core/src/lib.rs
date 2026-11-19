@@ -54,6 +54,7 @@ pub mod native_reference;
 pub mod node_facts;
 pub mod node_state;
 pub mod node_vault;
+pub mod notification_routing;
 pub mod onboarding;
 pub mod operation;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -108,11 +109,8 @@ pub use document::{
 };
 pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;
-pub use metadata::*;
-pub use onboarding::*;
 pub use structured_id::{
     BucketId, ClockHealthError, IdEnvironment, JobId, MetaResourceId, PlacementHandle, StructuredId,
 };
-pub use task::{TaskEffect, TaskEvent, TaskKey};
 pub use trace_context::DistributedTraceContext;
 pub use user::id::UserId;

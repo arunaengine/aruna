@@ -9,12 +9,12 @@ use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::outbox_write_entry;
-use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
+use aruna_core::structs::execution::notification::{
+    NotificationOutboxRecord, NotificationRecord, schedule_drain_effect,
+};
 use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
-
-use crate::notifications::outbox_record::schedule_drain_effect;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EmitNotificationsError {

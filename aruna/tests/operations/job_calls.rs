@@ -23,6 +23,7 @@ use ulid::Ulid;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, JobId, JobRecord};
 use aruna_core::structs::identity::auth::AuthContext;
@@ -43,7 +44,6 @@ use aruna_operations::jobs::route::{JobRouteError, RoutedJobStatus};
 pub use aruna_operations::jobs::store::test_calls::{
     list_job_entries, record_attempt_intent, submit_execution_job,
 };
-use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::jobs::submit_local::SubmitLocalOperation;
 
 pub async fn read_owned_job(

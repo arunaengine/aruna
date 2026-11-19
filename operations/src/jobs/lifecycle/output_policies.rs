@@ -13,8 +13,8 @@ use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::types::GroupId;
 
-use crate::jobs::submit::SubmitJobError;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::job_request::SubmitJobError;
 
 /// The placement refs of every bucket the run writes into; all live on the ingress node and in
 /// the execution's group.

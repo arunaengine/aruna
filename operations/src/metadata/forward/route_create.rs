@@ -19,15 +19,16 @@ use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::replay::create_record_matches;
-use crate::forward::routing::{create_forward_holders, distinct_holders};
-use crate::forward::transport::{MetadataWriteError, unexpected_response};
+use crate::forward::routing::distinct_holders;
 use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
     mint_forward_document,
 };
 use crate::metadata::create_entry::CreateEntryOperation;
+use crate::metadata::forward::holders::create_forward_holders;
+use crate::metadata::forward::replay::create_record_matches;
+use crate::metadata::forward::write::{MetadataWriteError, unexpected_response};
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, WriteAuthError, decode_message, encode_message, metadata_request,
 };

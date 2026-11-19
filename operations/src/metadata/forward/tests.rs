@@ -3,15 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::device::replica::ReplicaRecord;
-use crate::forward::replay::create_record_matches;
-use crate::forward::replay::routed_record_matches;
 use crate::forward::routing::MetadataWriteRoute;
 use crate::forward::routing::distinct_holders;
 use crate::forward::routing::holder_intersection;
-use crate::forward::routing::holds_metadata_id;
 use crate::forward::routing::write_route;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
+use crate::metadata::forward::holders::holds_metadata_id;
+use crate::metadata::forward::replay::{create_record_matches, routed_record_matches};
 use crate::realm::peer_trust::peer_acts_for;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;

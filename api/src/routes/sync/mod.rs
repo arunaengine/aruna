@@ -22,7 +22,11 @@ use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
 };
 use aruna_drivers::driver::{drive, drive_retry};
-use aruna_operations::metadata::mirror_request::MirrorRequestOperation;
+use aruna_operations::replication::mirror_repair::request::MirrorRequestOperation;
+use aruna_operations::replication::mirror_repair::{
+    KickRepairOperation, MirrorRecordOperation, RemoveMirrorOperation, StoreStatusOperation,
+    SyncMirrorIntent,
+};
 use aruna_operations::replication::parking::AwaitingJobsOperation;
 use aruna_operations::replication::plaintext::{
     ConsentReadOperation, ConsentStoreOperation, EncryptionCheckOperation, consent_delete,
@@ -30,11 +34,7 @@ use aruna_operations::replication::plaintext::{
 };
 use aruna_operations::replication::queue::JobStatsOperation;
 use aruna_operations::replication::queue::QueueBlobOperation;
-use aruna_operations::sync::mirror_repair::{
-    KickRepairOperation, MirrorRecordOperation, RemoveMirrorOperation, StoreStatusOperation,
-    SyncMirrorIntent,
-};
-use aruna_operations::sync::sync_relationship::{
+use aruna_operations::replication::sync_relationship::{
     CreateRelationshipOperation, DeleteRelationshipOperation, GetRelationshipOperation,
     ListRelationshipsOperation, RemoveOutgoingOperation, StoreRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError,

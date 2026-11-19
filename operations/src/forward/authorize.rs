@@ -5,7 +5,7 @@
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::write_peer::WritePeerOperation;
+use crate::forward::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::peer_acts_for;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};

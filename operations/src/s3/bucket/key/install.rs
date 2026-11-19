@@ -797,7 +797,7 @@ mod tests {
         .unwrap();
         assert!(
             !aruna_drivers::driver::drive(
-                crate::jobs::key_locks::KeyUnlockedOperation::new(key.key),
+                crate::blob::unlocked::KeyUnlockedOperation::new(key.key),
                 &context
             )
             .await

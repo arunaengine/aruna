@@ -46,6 +46,25 @@ pub fn outside_answer(result: IoResult) -> Result<IoResult, IoError> {
     }
 }
 
+/// A call of an embedded update: one for the host's transaction, or a read that runs outside
+/// it so that rows other writers change meanwhile never conflict the host's commit.
+#[derive(Debug, PartialEq)]
+pub enum StagedCall {
+    InTransaction(IoCall),
+    Outside(IoCall),
+}
+
+impl StagedCall {
+    /// The call a host operation makes; an outside read runs as its own child run, which never
+    /// joins the host's transaction.
+    pub fn into_call(self) -> IoCall {
+        match self {
+            Self::InTransaction(call) => call,
+            Self::Outside(call) => outside_call(call),
+        }
+    }
+}
+
 /// The `N` values of a read of `N` rows, in the order they were asked for.
 pub fn values<const N: usize>(result: IoResult) -> Result<[Option<Value>; N], IoError> {
     match result {

@@ -586,7 +586,7 @@ mod tests {
     // is read-only for clients, and the cleanup still deletes it.
     #[tokio::test]
     async fn guards_unoffered_bucket() {
-        use crate::staging::bucket_guard::BucketGuardOperation;
+        use crate::s3::bucket::write_guard::BucketGuardOperation;
         use crate::staging::offered_directory::OfferedDirectoryError;
 
         let fixture = crate::tests::staging::setup_driver_context().await;
@@ -628,7 +628,7 @@ mod tests {
     // for clients, so no upload can be opened before the next pass deletes it.
     #[tokio::test]
     async fn guards_interrupted_cleanup() {
-        use crate::staging::bucket_guard::BucketGuardOperation;
+        use crate::s3::bucket::write_guard::BucketGuardOperation;
         use crate::staging::offered_directory::OfferedDirectoryError;
 
         let fixture = crate::tests::staging::setup_driver_context().await;

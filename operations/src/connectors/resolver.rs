@@ -25,12 +25,12 @@ use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBind
 use aruna_core::types::{GroupId, TxnId};
 use ulid::Ulid;
 
+use crate::connectors::harvest_rows::INVENIO_TOKEN;
 use crate::connectors::repository::{
     iter_connectors_effect, parse_connector_iter, parse_secret_read, read_secret_effect,
     source_connector_key,
 };
 use crate::connectors::root_record::{parse_root, read_root};
-use crate::harvest::create_connector::INVENIO_TOKEN;
 use crate::storage_read::decode_row;
 use aruna_core::native_reference::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
@@ -224,7 +224,7 @@ impl ResolveBindingOperation {
     /// The token is used only while the connector still points at the bound endpoint,
     /// so a connector moved to another host never sends its new token to the old one.
     fn repository_read(&mut self, event: Event) -> Resolved {
-        let connector = crate::harvest::repository::parse_connector_read(event)?;
+        let connector = crate::connectors::harvest_rows::parse_connector_read(event)?;
         let bound = self.input.source.descriptor.public_config.get("endpoint");
         match (connector, self.input.source.connector_id) {
             (Some(connector), Some(connector_id))
@@ -232,7 +232,7 @@ impl ResolveBindingOperation {
                     && bound.is_some_and(|bound| same_endpoint(bound, &connector.endpoint)) =>
             {
                 self.state = ResolveBindingState::ReadRepositorySecret;
-                call(crate::harvest::repository::read_secret_effect(
+                call(crate::connectors::harvest_rows::read_secret_effect(
                     connector_id,
                     None,
                 ))
@@ -273,7 +273,7 @@ impl Operation for ResolveBindingOperation {
             )?)),
             ResolveBindingState::ReadRepository => self.repository_read(event),
             ResolveBindingState::ReadRepositorySecret => {
-                let secret = crate::harvest::repository::parse_secret_read(event)?;
+                let secret = crate::connectors::harvest_rows::parse_secret_read(event)?;
                 self.finish_repository(secret.map(|secret| secret.secret_config))
             }
         }
@@ -511,7 +511,7 @@ fn repository_read_effect(source: &VersionSourceBinding) -> Result<Effect, Sourc
     if source.strategy != StagingStrategy::Reference {
         return Err(SourceResolutionError::ResolveFailed);
     }
-    Ok(crate::harvest::repository::read_connector_effect(
+    Ok(crate::connectors::harvest_rows::read_connector_effect(
         group_id,
         connector_id,
         None,

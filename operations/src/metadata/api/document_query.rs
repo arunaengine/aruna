@@ -19,12 +19,13 @@ use super::read_types::{ApiQueryMode, DocumentQueryRequest, MetadataQueryExecuti
 use super::readable::RecordReadableOperation;
 use super::{MetadataApiError, MetadataReadError, map_query_error, replica_query_nodes};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::fetch::{peer_call, peer_reply};
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::record_reads::RecordMaterializedOperation;
 use crate::metadata::repository::StorageReadError;
-use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, encode_message, peer_call, peer_reply,
+};
 
 /// One replica may open its stream and then answer, each within the transport's own bound.
 const HOLDER_QUERY_TIMEOUT: Duration = Duration::from_secs(30);

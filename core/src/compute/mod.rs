@@ -19,6 +19,9 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 use crate::NodeId;
+use crate::calls::{IoCall, IoError, IoResult};
+use crate::effects::{Effect, NetEffect};
+use crate::events::{Event, NetEvent};
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::execution::job::EffectiveResources;
 use crate::structs::placement::policy::{MAX_KIND_LEN, PlacementPolicyError, PlacementSubject};
@@ -557,6 +560,22 @@ impl fmt::Debug for Secret {
 impl Drop for Secret {
     fn drop(&mut self) {
         self.0.zeroize();
+    }
+}
+
+/// The call that draws a secret of `length` letters and digits from the OS random source.
+pub fn draw_secret(length: usize) -> IoCall {
+    Effect::Net(NetEffect::DrawSecret(length)).into()
+}
+
+/// The secret a draw answered.
+pub fn drawn_secret(result: IoResult) -> Result<Secret, IoError> {
+    match result.event()? {
+        Event::Net(NetEvent::SecretDrawn(secret)) => Ok(secret),
+        other => Err(IoError::Unexpected {
+            expected: "NetEvent::SecretDrawn",
+            got: other.label(),
+        }),
     }
 }
 

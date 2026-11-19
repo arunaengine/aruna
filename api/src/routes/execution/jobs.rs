@@ -22,13 +22,13 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_drivers::driver::drive;
-use aruna_operations::federation::grant::AdmitGrantOperation;
 use aruna_operations::jobs::REPORT_MAX_ROWS;
 use aruna_operations::jobs::command::{
     CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
+use aruna_operations::jobs::export::grant::AdmitGrantOperation;
 use aruna_operations::jobs::local_run::LocalExecutionError;
 use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::s3::object::get::ObjectRangeRequest;
@@ -471,9 +471,9 @@ fn encode_report_cursor(
 }
 
 pub(crate) fn map_submit_error(
-    error: aruna_operations::jobs::submit::SubmitJobError,
+    error: aruna_core::job_request::SubmitJobError,
 ) -> ServerError {
-    use aruna_operations::jobs::submit::SubmitJobError;
+    use aruna_core::job_request::SubmitJobError;
     match error {
         SubmitJobError::JobPlanConflict { existing_job_id } => ServerError::JobPlanConflict(
             format!("idempotency key already bound to job {existing_job_id}"),
@@ -502,7 +502,7 @@ pub(crate) fn map_submit_error(
             ServerError::ServiceUnavailableReason(moving.to_string())
         }
         SubmitJobError::Upload(error) => {
-            use aruna_operations::jobs::import::upload::UploadClaimError;
+            use aruna_core::job_request::UploadClaimError;
             match error {
                 UploadClaimError::NotFound => ServerError::NotFound,
                 UploadClaimError::WrongOwner => ServerError::Forbidden,

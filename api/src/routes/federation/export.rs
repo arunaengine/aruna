@@ -21,11 +21,11 @@ use aruna_core::transfer::{
     ExportGrant, GrantError, ImportIntent, TransferError, check_remote, intent_digest,
 };
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_operations::federation::grant::{
+use aruna_operations::federation::import::header_value;
+use aruna_operations::jobs::export::grant::{
     AdmitGrantOperation, IssueExportOperation, IssueGrantConfig, ReadGrantOperation,
     RevokeGrantOperation, export_access,
 };
-use aruna_operations::federation::import::header_value;
 use aruna_operations::jobs::export::{CrateJsonOperation, UnheldBucketOperation};
 use axum::Json;
 use axum::extract::{Path, State};

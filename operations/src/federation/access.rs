@@ -78,7 +78,7 @@ impl Operation for AccessCheckOperation {
 }
 
 /// Whether a finished [`AccessCheckOperation`] allowed the step.
-pub(super) fn access_granted(result: IoResult) -> bool {
+pub(crate) fn access_granted(result: IoResult) -> bool {
     matches!(result.child::<bool, IoError>(), Ok(Ok(true)))
 }
 

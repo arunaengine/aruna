@@ -7,6 +7,7 @@ mod object;
 mod prepare;
 mod reads;
 mod recover;
+pub mod schedule;
 mod twin;
 
 pub use job::BackendImportOperation;

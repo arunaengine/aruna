@@ -19,7 +19,7 @@ use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnaps
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
-use aruna_operations::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
+use aruna_operations::replication::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use fjall::KeyspaceCreateOptions;
 use serde::Deserialize;
 use std::path::Path;

@@ -19,12 +19,12 @@ use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::store::list_jobs::{ListJobsError, ListJobsOperation};
-use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 
 /// Unfinished runs one status scan counts before it stops. A device queues its
 /// owner's work, not a realm's, so the count is bounded instead of paged.
@@ -410,7 +410,6 @@ fn missing_input(bucket: &str, key: &str) -> LocalExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::submit::SubmitJobError;
     use crate::tests::records::payload;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::compute::ExecutorKind;
@@ -420,6 +419,7 @@ mod tests {
     use aruna_core::events::LaunchDecline;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
+    use aruna_core::job_request::SubmitJobError;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
         FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,

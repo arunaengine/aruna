@@ -35,8 +35,9 @@ use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::project::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
 };
-use crate::jobs::submit::SubmitJobError;
-use aruna_core::job_request::{RequestIdentity, SubmissionRequest, effective_resources};
+use aruna_core::job_request::{
+    RequestIdentity, SubmissionRequest, SubmitJobError, effective_resources,
+};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// stored in the immutable spec, so a later config change cannot widen it.

@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
 use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::job::{JobPayload, JobRecord, JobState};
-use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::execution::notification::{NotificationRecord, new_outbox_record};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationOutboxRecord,
 };
@@ -32,8 +32,6 @@ use byteview::ByteView;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 use ulid::Ulid;
-
-use aruna_operations::notifications::outbox_record::new_outbox_record;
 
 #[path = "tests_harness.rs"]
 mod harness;

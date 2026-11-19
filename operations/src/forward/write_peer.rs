@@ -19,7 +19,6 @@ use crate::auth::bearer_token::{
     UserCutoffOperation, claims_auth,
 };
 use crate::auth::error::ArunaBearerError;
-use crate::metadata::call_results::read_value;
 use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
 
 type Turn = Result<Next<AuthContext>, PeerAuthRefusal>;
@@ -232,7 +231,7 @@ impl Operation for WritePeerOperation {
                 }
             }
             PeerStage::Config { auth, trust } => {
-                let config = read_value(result)?;
+                let config = result.value()?;
                 peer_configured(config.as_deref(), (self.peer, auth.realm_id), trust)
                     .map_err(unavailable)?;
                 self.accepted(auth)

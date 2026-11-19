@@ -11,7 +11,7 @@ use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::MOUNT_PREFIX_TAG;
 use aruna_core::compute::session::{SessionAnswer, SessionError, SessionRequest};
 use aruna_core::id::NodeId;
-use aruna_core::job_request::SubmissionScope;
+use aruna_core::job_request::{SubmissionScope, SubmitJobError};
 use aruna_core::metadata::AuthToken;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::job::{
@@ -35,7 +35,6 @@ use aruna_operations::jobs::local_run::{LocalExecutionConfig, LocalExecutionErro
 use aruna_operations::jobs::node_inputs::{ingress_node, local_run};
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::session::SessionOperation;
-use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use ulid::Ulid;
 

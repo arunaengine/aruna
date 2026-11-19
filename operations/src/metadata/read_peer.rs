@@ -13,7 +13,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::write_peer::WritePeerOperation;
+use crate::forward::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::{PeerTrust, ensure_peer_trust};
 use aruna_core::metadata::protocol::MetadataReadError;
 

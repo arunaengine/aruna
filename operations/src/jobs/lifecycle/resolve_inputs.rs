@@ -23,7 +23,7 @@ use super::input_walk::{
 use super::output_policies::OutputPoliciesOperation;
 use super::remote_inputs::{RemoteInputsOperation, ResolveCaller};
 use super::submission_rules::{exact_version, is_directory};
-use crate::jobs::submit::SubmitJobError;
+use aruna_core::job_request::SubmitJobError;
 
 /// The caller of a resolve, and until when its grants hold.
 #[derive(Clone, Debug, PartialEq)]

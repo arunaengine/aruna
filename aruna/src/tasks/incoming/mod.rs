@@ -165,14 +165,14 @@ use aruna_operations::realm::announce_presence::{
 use aruna_operations::replication::drain::{
     ProcessBatchOperation, REPLICATION_RETRY_AFTER, RestoreDrainOperation,
 };
+use aruna_operations::replication::mirror_repair::{
+    DrainRepairsOperation, REPAIR_RETRY_AFTER, RestoreTimerOperation,
+};
 use aruna_operations::replication::page::deliver::MetadataPages;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
 use aruna_operations::s3::object::metadata::REFRESH_RETRY_AFTER;
 use aruna_operations::sync::document_outbox::{
     DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
-};
-use aruna_operations::sync::mirror_repair::{
-    DrainRepairsOperation, REPAIR_RETRY_AFTER, RestoreTimerOperation,
 };
 use aruna_operations::sync::outbox_record::OUTBOX_DRAIN_SIZE;
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
@@ -1122,7 +1122,7 @@ impl OperationsTaskHandler {
                 };
                 let retention_ms = self.rocrate_limits.artifact_retention_ms;
                 let now = unix_timestamp_millis();
-                let run = aruna_operations::s3::imports::schedule::RunDueOperation::new(
+                let run = aruna_operations::jobs::backend_import::schedule::RunDueOperation::new(
                     net_handle.node_id(),
                     retention_ms,
                     now,

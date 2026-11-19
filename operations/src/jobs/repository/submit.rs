@@ -16,10 +16,9 @@ use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use tracing::warn;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::jobs::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
-};
+use crate::jobs::submit::{SubmitJobOperation, SubmitJobSpec};
 use crate::jobs::submit_execution::mint_unplaced;
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult, mint_configured_job};
 
 /// A job a repository link starts.
 #[derive(Clone, Debug, PartialEq)]

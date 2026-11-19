@@ -22,9 +22,8 @@ use crate::jobs::lifecycle::admit::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation,
 };
 use crate::jobs::lifecycle::alias::AliasFamilyOperation;
-use crate::jobs::submit::SubmitJobError;
 use crate::tests::records::{Family, REALM, context, node, payload, secret, user};
-use aruna_core::job_request::{SubmissionRequest, SubmissionScope, store_workspace};
+use aruna_core::job_request::{SubmissionRequest, SubmissionScope, SubmitJobError, store_workspace};
 use aruna_core::metadata::AuthToken;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
@@ -210,7 +209,7 @@ async fn refuses_undeliverable_submit() {
 
     assert!(matches!(
         error,
-        crate::jobs::submit::SubmitJobError::PlacementUnavailable(_)
+        aruna_core::job_request::SubmitJobError::PlacementUnavailable(_)
     ));
     let (queued, _) = iter_prefix_page(
         &ctx.storage_handle,

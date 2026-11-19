@@ -7,6 +7,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::job_request::UploadClaimError;
 use aruna_core::keyspaces::{ROCRATE_UPLOAD_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
@@ -210,28 +211,6 @@ impl Operation for CreateRoCrateOperation {
             },
         ))));
         calls
-    }
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub enum UploadClaimError {
-    #[error("upload not found")]
-    NotFound,
-    #[error("upload is owned by another user")]
-    WrongOwner,
-    #[error("upload expired")]
-    Expired,
-    #[error("upload is already claimed")]
-    AlreadyClaimed,
-    #[error("upload record is invalid: {0}")]
-    Invalid(String),
-    #[error("upload storage failed: {0}")]
-    Storage(String),
-}
-
-impl From<IoError> for UploadClaimError {
-    fn from(error: IoError) -> Self {
-        Self::Storage(error.to_string())
     }
 }
 

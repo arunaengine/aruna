@@ -27,7 +27,6 @@ pub mod list_documents;
 pub(crate) mod live_records;
 pub mod local_query;
 pub mod materialization_queue;
-pub mod mirror_request;
 pub(crate) mod object_version;
 pub mod persistent_id;
 pub mod pid_read;
@@ -60,7 +59,6 @@ pub mod update_entry;
 pub(crate) mod updated_page;
 pub mod visibility_index;
 pub(crate) mod visible_scope;
-pub mod write_peer;
 
 pub use builtin::builtin_shapes;
 

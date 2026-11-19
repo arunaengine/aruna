@@ -5,7 +5,7 @@
 use crate::distribution::guard::write_authority;
 use crate::distribution::guard::{GuardError, WriteAuthority, authority_reads, check_authority};
 use crate::distribution::inventory::{
-    InventoryChange, InventoryError, InventoryUpdate, StagedCall, outside_answer,
+    InventoryChange, InventoryError, InventoryUpdate, outside_answer,
 };
 use crate::groups::backends::{BackendFenceError, backend_key};
 use crate::placement::policy::read::ReadPolicyError;
@@ -27,7 +27,7 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::read_row;
+use aruna_core::rows::{StagedCall, read_row};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::abe::{AbeEffect, AbeEvent, EnvelopePlan, ObjectEnvelope};

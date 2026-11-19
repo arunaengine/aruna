@@ -35,7 +35,7 @@ use super::{
     ApiQueryMode, AuthContext, Event, MetadataApiError, MetadataFanoutOperation,
     MetadataFanoutScope, MetadataReadError, NodeId, RealmId, Span, Ulid, fanout_bearer,
 };
-use crate::forward::transport::read_error;
+use crate::metadata::forward::write::read_error;
 use crate::metadata::object_version::{ObjectVersion, ObjectVersionError, ObjectVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_core::metadata::protocol::MetadataTransportMessage;

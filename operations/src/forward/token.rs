@@ -11,10 +11,10 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{
     ForwardAuthError, ForwardedCallerOperation, forward_auth_error, write_check,
 };
-use crate::forward::fetch::{PeerFrame, peer_call, peer_reply};
+use crate::forward::fetch::PeerFrame;
 use crate::forward::routing::distinct_holders;
 use crate::forward::transport::{ForwardError, reject};
-use crate::metadata::write_peer::forwarded_checks;
+use crate::forward::write_peer::forwarded_checks;
 use aruna_core::NodeId;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -22,7 +22,7 @@ use aruna_core::compute::Secret;
 use aruna_core::events::PeerRequestError;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::protocol::{
-    MetadataTransportMessage, WriteAuthError, transport_message_kind,
+    MetadataTransportMessage, WriteAuthError, peer_call, peer_reply, transport_message_kind,
 };
 use aruna_core::operation::Operation;
 use aruna_core::placement::selector::select_top_peers;

@@ -26,13 +26,13 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::forward::profile_export::ProfileLocalOperation;
 use aruna_operations::metadata::forward::read::admits_profile_peer;
 use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
+use aruna_operations::metadata::forward::write::MetadataWriteError;
 use aruna_operations::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, RevalidateOperation, StoredStatusOperation,
     ValidationStatusOperation, profile_public_iri, profile_verdict,

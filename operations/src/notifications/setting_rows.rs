@@ -27,10 +27,10 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::notifications::unexpected;
-use crate::s3::session::{draw_secret, drawn_secret};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::compute::{draw_secret, drawn_secret};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SettingError {

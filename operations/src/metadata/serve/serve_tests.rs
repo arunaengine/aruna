@@ -342,7 +342,7 @@ fn mirror_needs_token() {
 fn read_only_refused() {
     // A read-only bucket refuses a mirror like a denied write, before any bucket is made.
     use super::mirror::{MirrorRequest, MirrorServeOperation};
-    use crate::staging::bucket_guard::BucketGuardError;
+    use crate::s3::bucket::write_guard::BucketGuardError;
     let realm_id = RealmId([1u8; 32]);
     let caller = caller_of(realm_id);
     let mut stored = relationship("source");

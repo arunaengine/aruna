@@ -17,16 +17,16 @@ use aruna_drivers::driver::drive;
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::metadata::mirror_request::MirrorRequestOperation;
-use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
-use aruna_operations::s3::bucket::get::GetBucketOperation;
-use aruna_operations::sync::mirror_repair::{
+use aruna_operations::replication::mirror_repair::request::MirrorRequestOperation;
+use aruna_operations::replication::mirror_repair::{
     KickRepairOperation, MirrorRecordOperation, RemoveMirrorOperation, SyncMirrorIntent,
 };
-use aruna_operations::sync::sync_relationship::{
+use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use aruna_operations::replication::sync_relationship::{
     DeleteRelationshipOperation, ListRelationshipsOperation, StoreRelationshipOperation,
     SyncRelationshipDirection,
 };
+use aruna_operations::s3::bucket::get::GetBucketOperation;
 use s3s::dto::{
     DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
     ReplicationRule, ReplicationRuleStatus,

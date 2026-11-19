@@ -20,9 +20,10 @@ use ulid::Ulid;
 use super::ServeNode;
 use crate::metadata::device_pull::{
     Admission, AdmitPullOperation, CommitPullOperation, ListHeadsOperation, PullCallerOperation,
-    PullError, ReceiptOperation, SetListing, receipt_of, refusal_kind, refused,
+    PullError, ReceiptOperation, SetListing, receipt_of, refused,
 };
 use aruna_core::metadata::protocol::MetadataTransportMessage as Message;
+use aruna_core::structs::refusal_kind;
 
 /// A forwarded synced-folder request with the owner's token.
 #[derive(Debug, PartialEq)]

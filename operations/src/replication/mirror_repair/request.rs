@@ -14,7 +14,7 @@ use aruna_core::rows::event;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::types::GroupId;
 
-use crate::sync::mirror_repair::RECONCILE_GRACE;
+use crate::replication::mirror_repair::RECONCILE_GRACE;
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, decode_message, encode_message, metadata_request,
     transport_message_kind,

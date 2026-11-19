@@ -2297,7 +2297,7 @@ impl TesError {
 
     /// Task creation shares the REST submit mapping, so a refusal a TES client
     /// must not retry never reaches it as a retryable 500.
-    fn from_submit(error: aruna_operations::jobs::submit::SubmitJobError) -> Self {
+    fn from_submit(error: aruna_core::job_request::SubmitJobError) -> Self {
         Self::from_server(super::jobs::map_submit_error(error))
     }
 

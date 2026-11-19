@@ -31,7 +31,6 @@ use super::node_fanout::{
 use super::path_types::{deduplicate_fanout_nodes, select_fanout_nodes};
 use super::search_types::{MetadataSearchExecution, MetadataSearchRequest};
 use super::{ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
-use crate::forward::fetch::{peer_call, peer_reply};
 use crate::metadata::profile::validation::equivalent_profile_iris;
 use crate::metadata::search_cursor::{
     MAX_PAGINATION_DEPTH, NodeSearchResult, SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE, SearchCursor,
@@ -40,7 +39,7 @@ use crate::metadata::search_cursor::{
 };
 use crate::metadata::text_search::LocalSearchOperation;
 use aruna_core::metadata::protocol::{
-    MetadataTransportMessage, encode_message, metadata_read_error,
+    MetadataTransportMessage, encode_message, metadata_read_error, peer_call, peer_reply,
 };
 
 /// Where one node's search runs.

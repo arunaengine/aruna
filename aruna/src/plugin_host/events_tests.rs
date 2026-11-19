@@ -45,8 +45,8 @@ use aruna_operations::plugins::test_support::install_artifact;
 use aruna_operations::plugins::test_support::installed;
 use aruna_operations::plugins::test_support::scoped;
 use aruna_operations::replication::queue::QueueBlobOperation;
-use aruna_operations::sync::sync_relationship::StoreRelationshipOperation;
-use aruna_operations::sync::sync_relationship::SyncRelationshipDirection::Outgoing;
+use aruna_operations::replication::sync_relationship::StoreRelationshipOperation;
+use aruna_operations::replication::sync_relationship::SyncRelationshipDirection::Outgoing;
 use std::time::SystemTime;
 use ulid::Ulid;
 

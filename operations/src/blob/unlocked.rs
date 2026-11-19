@@ -1,10 +1,13 @@
-//! Promotes pending archives after a key unlock and drops received archives whose hash was rejected.
+//! Tells whether this node holds a key unlock, promotes pending archives after one and drops
+//! received archives whose hash was rejected.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
     BLOB_QUARANTINE_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PENDING_CLAIM_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -355,6 +358,43 @@ impl Operation for DropReceivedOperation {
     }
 }
 
+/// Whether this node holds an active unlock of `key`. A node that cannot tell holds none.
+#[derive(Debug, PartialEq)]
+pub struct KeyUnlockedOperation {
+    key: BucketKeyRef,
+}
+
+impl KeyUnlockedOperation {
+    pub fn new(key: BucketKeyRef) -> Self {
+        Self { key }
+    }
+}
+
+impl Operation for KeyUnlockedOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        let effect = Effect::Blob(BlobEffect::ReadKeyStatus {
+            bucket_id: self.key.bucket_id,
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        let unlocked = match result {
+            IoResult::Event(event) => match *event {
+                Event::Blob(BlobEvent::KeyStatus { generations }) => generations
+                    .iter()
+                    .any(|status| status.key == self.key && status.active),
+                _ => false,
+            },
+            _ => false,
+        };
+        Ok(Next::Done(unlocked))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +468,17 @@ mod tests {
             next: None,
         };
         assert_eq!(operation.next(page), Ok(Next::Done(0)));
+    }
+
+    // Only an active unlock of exactly this key counts; a missing blob handle holds none.
+    #[test]
+    fn unlock_needs_status() {
+        let key = BucketKeyRef {
+            bucket_id: ulid::Ulid::from_parts(1, 1),
+            generation: 1,
+        };
+        let mut check = KeyUnlockedOperation::new(key);
+        assert!(matches!(check.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        assert_eq!(check.next(IoResult::Done), Ok(Next::Done(false)));
     }
 }

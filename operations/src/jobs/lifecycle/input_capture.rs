@@ -40,7 +40,6 @@ use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError, check_error};
 use crate::jobs::read_access::{SourceObject, SourceReadError, SourceReadOperation};
-use crate::jobs::submit::SubmitJobError;
 use crate::s3::bucket::dataset::{
     BucketMetadataError, BucketMetadataOperation, DatasetSummaryOperation,
 };
@@ -50,6 +49,7 @@ use crate::s3::bucket::release::{BucketScope, MembersOutput, MembershipCaller, R
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use aruna_core::job_request::SubmitJobError;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Who captures inputs here, and what their grants and release checks need.

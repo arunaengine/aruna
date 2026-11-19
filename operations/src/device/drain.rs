@@ -30,13 +30,13 @@ use super::replica_store::{read_replica, store_replica};
 use super::retry::{exhausted, retry_due_at};
 use super::selection::track_created;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
     mint_forward_document,
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::routed::write::ApplyBatchOperation;
+use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::realm::load_config::config_unavailable;
 use aruna_core::metadata::api::CreateDocumentPayload;

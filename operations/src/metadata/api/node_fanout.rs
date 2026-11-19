@@ -25,11 +25,12 @@ use super::{
     QUERY_FANOUT_LIMIT, QUERY_MAX_NODES, map_read_error,
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::fetch::peer_reply;
 use crate::realm::get_nodes::{
     GetNodesError, GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
-use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_request};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, encode_message, metadata_request, peer_reply,
+};
 
 fn child_member<O>(operation: O) -> Effect
 where

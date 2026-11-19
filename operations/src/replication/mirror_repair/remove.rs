@@ -10,8 +10,8 @@ use aruna_core::structs::SyncRelationship;
 
 use super::ensure::{creator_token, peer_failure};
 use super::{MirrorPeer, SyncMirrorError, delete_peer};
-use crate::metadata::mirror_request::MirrorRequestOperation;
-use crate::sync::sync_relationship::{
+use crate::replication::mirror_repair::request::MirrorRequestOperation;
+use crate::replication::sync_relationship::{
     DeleteRelationshipOperation, RemoveOutgoingOperation, SyncRelationshipDirection,
     SyncRelationshipError,
 };

@@ -23,8 +23,8 @@ use super::links::{ChangeLinkOperation, LinkChange, LinkError, id_key};
 use super::push::creator_auth;
 use super::submit::{LinkJob, LinkJobOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::metadata::id_mapping::{MappingRoute, PersistentIdError, mapping_route_for};
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 
 const LINK_PAGE: usize = 256;
 

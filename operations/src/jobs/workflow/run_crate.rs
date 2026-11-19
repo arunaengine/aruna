@@ -43,12 +43,12 @@ use super::super::store::row_calls::{
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
 };
 use crate::metadata::create_entry::DocumentMintOperation;
 use crate::metadata::forward::route_create::RouteCreateOperation;
+use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::mutate_placement::node_kind;

@@ -38,7 +38,7 @@ use super::{
     PreflightCursorPlan, PreflightPlan, ResolvedPreflightTargets, assemble_preflight_execution,
     plan_preflight_request,
 };
-use crate::forward::transport::read_error;
+use crate::metadata::forward::write::read_error;
 use crate::metadata::search_cursor::{SearchCursor, resume_fetch_limit};
 use aruna_core::metadata::api::{
     MetadataResolvedTarget, ReferenceNodeExecution, ReferenceNodeRequest,

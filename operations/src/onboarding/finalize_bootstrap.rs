@@ -31,10 +31,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::notifications::emit::{
-    EmitNotificationsError, EmitNotificationsInput, EmitNotificationsOperation,
-};
-use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::notifications::watch::digest::{InterestError, InterestOperation};
 use crate::onboarding::consume_secret::{
     ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation, ConsumeSecretOutput,
@@ -54,6 +50,10 @@ use crate::placement::process_placements::{
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
 use crate::realm::mutate_placement::{MutatePlacementError, RealmPlacementMutation};
 use crate::realm::read_authorization::{ReadAuthorizationError, ReadAuthorizationOperation};
+use crate::sync::notification_outbox::{
+    EmitNotificationsError, EmitNotificationsInput, EmitNotificationsOperation,
+};
+use aruna_core::notification_routing::{RoutingContext, route_resource_event};
 
 const RESERVATION_TTL_SECS: u64 = 300;
 const NODE_UPDATE_RETRIES: usize = 5;

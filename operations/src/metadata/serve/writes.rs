@@ -19,9 +19,6 @@ use crate::auth::error::AuthorizeError;
 use crate::forward::authorize::{
     ForwardAuthError, ForwardedCallerOperation, forward_auth_error, write_check,
 };
-use crate::forward::replay::{
-    CreateRows, CreateRowsOperation, HeldRecordError, HeldRecordOperation, replay_answer,
-};
 use crate::forward::transport::{forwarded_unavailable, reject};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
@@ -29,6 +26,9 @@ use crate::metadata::create_document::{
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use crate::metadata::deletion_guard::metadata_call;
+use crate::metadata::forward::replay::{
+    CreateRows, CreateRowsOperation, HeldRecordError, HeldRecordOperation, replay_answer,
+};
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,

@@ -59,5 +59,6 @@ pub use synced_folder::{
     LocalOrigin, MAX_SYNC_PAGE, ORIGIN_DEVICE_TAG, Observed, PendingMark, RemoteBinding,
     RemoteHead, ReplaceReason, SYNC_TRASH_DIR, SYNC_VERSION_TAG, SyncAction, SyncActionRecord,
     SyncBase, SyncListCursor, SyncPageLimit, SyncPolicy, SyncPull, SyncPullAck, SyncPullStatus,
-    SyncRefusal, SyncVersionPage, SyncedBytes, SyncedFolder, WriteGuard, decide, tagged_receipt,
+    SyncRefusal, SyncVersionPage, SyncedBytes, SyncedFolder, WriteGuard, decide, refusal_kind,
+    tagged_receipt,
 };

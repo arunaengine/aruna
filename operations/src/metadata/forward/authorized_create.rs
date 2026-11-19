@@ -24,17 +24,16 @@ use super::route_create::RouteCreateOperation;
 use crate::auth::error::AuthorizeError;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{AuthorizeCreateOperation, CreateScope};
-use crate::forward::replay::create_record_matches;
-use crate::forward::routing::{
-    ForwardHoldersOperation, HolderWriteError, create_forward_holders, is_user_origin,
-};
-use crate::forward::transport::{MetadataWriteError, unexpected_response};
+use crate::forward::routing::{ForwardHoldersOperation, HolderWriteError, is_user_origin};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
     mint_forward_document, mint_local_document,
 };
 use crate::metadata::create_entry::CreateEntryOperation;
+use crate::metadata::forward::holders::create_forward_holders;
+use crate::metadata::forward::replay::create_record_matches;
+use crate::metadata::forward::write::{MetadataWriteError, unexpected_response};
 use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::load_config::config_unavailable;
 use aruna_core::metadata::api::CreateDocumentPayload;

@@ -34,7 +34,7 @@ use super::records::verify::FamilyView;
 use super::remote_key::{AcceptWakeOperation, RegisterWaitsOperation};
 use super::route::{JobRouteError, RoutedJobStatus};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::write_peer::WritePeerOperation;
+use crate::forward::write_peer::WritePeerOperation;
 use crate::realm::load_config::config_unavailable;
 
 /// What a job-control request is answered with. `running` names the local attempts the

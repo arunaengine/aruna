@@ -1,4 +1,5 @@
-//! Groups the replication modules: wire protocol, job queue, inbound and outbound transfer.
+//! Groups the replication modules: job queue, inbound and outbound transfer, and the sync
+//! relationships with their mirror repair.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -12,6 +13,7 @@ pub mod live_queue;
 pub mod locations;
 pub(crate) mod managed_read;
 pub mod members;
+pub mod mirror_repair;
 mod obligations;
 pub mod page;
 pub mod parking;
@@ -19,4 +21,5 @@ pub mod plaintext;
 pub mod queue;
 mod retire;
 pub(crate) mod source_rules;
+pub mod sync_relationship;
 pub(crate) mod version_replication;

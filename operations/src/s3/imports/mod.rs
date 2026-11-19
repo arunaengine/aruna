@@ -8,7 +8,6 @@ pub mod cron;
 pub mod discovery;
 pub mod folders;
 pub mod remove;
-pub mod schedule;
 pub mod shared;
 
 use crate::groups::backends::RecordReadError;
@@ -55,7 +54,7 @@ pub enum ImportRuleError {
     #[error("storage read failed: {0}")]
     Read(String),
     #[error(transparent)]
-    Submit(#[from] crate::jobs::submit::SubmitJobError),
+    Submit(#[from] aruna_core::job_request::SubmitJobError),
     #[error("unexpected event in state {0}")]
     Unexpected(&'static str),
     #[error("import rule storage failed: {0}")]

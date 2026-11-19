@@ -38,13 +38,14 @@ use crate::document_repository::{
     GetConfigError, GetConfigOperation, GetGroupConfig, GetGroupError, GetGroupOperation,
 };
 use crate::forward::authorize::{ForwardAuthError, ForwardedCallerOperation, write_check};
-use crate::forward::replay::{HeldRecordError, HeldRecordOperation};
-use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::reject;
+use crate::forward::write_peer::WritePeerOperation;
 use crate::groups::list_groups::{ListGroupError, ListGroupOperation};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::deletion_guard::metadata_call;
+use crate::metadata::forward::holders::holds_metadata_id;
+use crate::metadata::forward::replay::{HeldRecordError, HeldRecordOperation};
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::raw_events::RawReadError;
 use crate::metadata::record_reads::RecordMaterializedOperation;
@@ -53,7 +54,6 @@ use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use crate::metadata::update_entry::UpdateEntryOperation;
-use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::load_config::config_unavailable;
 use crate::realm::node_name::{NodeDisplays, NodeNameError, ReadNamesOperation};
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};

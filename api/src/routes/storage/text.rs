@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_drivers::driver::drive;
-use aruna_operations::staging::bucket_guard::BucketGuardOperation;
+use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;

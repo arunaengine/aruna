@@ -15,7 +15,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{CapturedInput, InputSelection, SubmissionId};
 
 use super::submission_rules::{batch_len, resolve_answer};
-use crate::jobs::submit::SubmitJobError;
+use aruna_core::job_request::SubmitJobError;
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, decode_message, encode_message, metadata_request,
 };
