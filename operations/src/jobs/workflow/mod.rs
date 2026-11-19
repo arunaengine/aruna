@@ -12,6 +12,7 @@ pub mod inputs;
 pub mod inventory;
 pub mod outputs;
 pub mod prepare;
+pub mod publish_run;
 pub mod purge;
 pub mod reconcile;
 pub mod recovery;
