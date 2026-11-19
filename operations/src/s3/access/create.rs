@@ -34,7 +34,7 @@ use super::index::{
 };
 use crate::groups::fence::group_fence_key;
 use crate::s3::bucket::key::rows::{Row, audit_row};
-use crate::s3::session::{draw_secret, drawn_secret};
+use aruna_core::compute::{draw_secret, drawn_secret};
 
 pub const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 /// The letters and digits of a new access secret.

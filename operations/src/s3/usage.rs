@@ -28,9 +28,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::distribution::inventory::{
-    InventoryChange, InventoryError, InventoryUpdate, StagedCall,
-};
+use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
+use aruna_core::rows::StagedCall;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {

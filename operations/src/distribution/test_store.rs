@@ -19,10 +19,10 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use super::inventory::{
-    AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, StagedCall,
-    open_ranges,
+    AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, open_ranges,
 };
 use crate::s3::usage::{UsageCounterUpdate, UsageUpdateError};
+use aruna_core::rows::StagedCall;
 
 pub fn open() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("tempdir must be created");

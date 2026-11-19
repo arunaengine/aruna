@@ -36,8 +36,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::{ChangeError, Managers, SecretChange, drains, widening_notices};
-use crate::s3::session::{draw_secret, drawn_secret};
 use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
+use aruna_core::compute::{draw_secret, drawn_secret};
 
 /// Register documents read per page.
 const PAGE: usize = 256;

@@ -20,14 +20,12 @@ pub use revoke::{RevokeS3Config, RevokeS3Operation};
 pub use touch::{TouchS3Config, TouchS3Operation};
 
 use aruna_core::UserId;
-use aruna_core::calls::{IoCall, IoError, IoResult};
+use aruna_core::calls::IoError;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError,
 };
-use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, NetEvent};
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
@@ -202,22 +200,6 @@ fn session_age(session: &S3Session) -> (u128, SystemTime) {
         .and_then(|key_id| key_id.parse::<Ulid>().ok())
         .map_or(0, u128::from);
     (issued, session.expiry)
-}
-
-/// The call that draws a secret of `length` letters and digits from the OS random source.
-pub(crate) fn draw_secret(length: usize) -> IoCall {
-    Effect::Net(NetEffect::DrawSecret(length)).into()
-}
-
-/// The secret a draw answered.
-pub(crate) fn drawn_secret(result: IoResult) -> Result<Secret, IoError> {
-    match result.event()? {
-        Event::Net(NetEvent::SecretDrawn(secret)) => Ok(secret),
-        other => Err(IoError::Unexpected {
-            expected: "NetEvent::SecretDrawn",
-            got: other.label(),
-        }),
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
