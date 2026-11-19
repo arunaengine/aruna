@@ -185,8 +185,8 @@ async fn refused_copy_absent() {
     };
     use aruna_core::structs::storage::format::PithosLayout;
     use aruna_core::structs::storage::replication_queue::ReplicationMode;
-    let (_source_dir, source_storage) = crate::tests::s3::test_storage();
-    let (target_dir, target_storage) = crate::tests::s3::test_storage();
+    let (_source_dir, source_storage) = aruna_test_support::s3::test_storage();
+    let (target_dir, target_storage) = aruna_test_support::s3::test_storage();
     let target_node = iroh::SecretKey::from_bytes(&[42; 32]).public();
     let stream_id = Ulid::from_parts(42, 42);
     let data = [7u8; 42];

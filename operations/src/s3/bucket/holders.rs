@@ -101,7 +101,7 @@ impl Operation for LookupKeysOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::s3::test_storage;
+    use aruna_test_support::s3::test_storage;
     use aruna_core::calls::ChildOutcome;
     use aruna_drivers::testing::test_context;
     use ulid::Ulid;

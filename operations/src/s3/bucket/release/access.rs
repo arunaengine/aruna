@@ -183,7 +183,7 @@ mod tests {
     const GROUP: Ulid = Ulid::from_parts(2, 2);
 
     fn info() -> BucketInfo {
-        crate::tests::s3::bucket_info(GROUP, user())
+        aruna_test_support::s3::bucket_info(GROUP, user())
     }
 
     fn auth() -> AuthContext {

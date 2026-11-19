@@ -566,7 +566,7 @@ mod tests {
 
     use super::*;
     use aruna_drivers::testing::seed_access;
-    use crate::tests::s3::test_storage;
+    use aruna_test_support::s3::test_storage;
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
 

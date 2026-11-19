@@ -176,7 +176,7 @@ fn starts_child(turn: &Turn) -> bool {
 
 /// The cleanup rows among `calls`, in order.
 fn cleanup_works(calls: &[IoCall]) -> Vec<BlobCleanupWork> {
-    crate::tests::s3::cleanup_works(calls)
+    aruna_test_support::s3::cleanup_works(calls)
 }
 
 fn released(calls: &[IoCall]) -> Option<Ulid> {

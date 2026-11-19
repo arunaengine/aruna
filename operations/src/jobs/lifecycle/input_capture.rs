@@ -703,7 +703,7 @@ mod tests {
     }
 
     fn info() -> BucketInfo {
-        crate::tests::s3::bucket_info(GROUP, user())
+        aruna_test_support::s3::bucket_info(GROUP, user())
     }
 
     fn child<T, E>(result: Result<T, E>) -> IoResult

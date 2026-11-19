@@ -691,7 +691,7 @@ pub(crate) mod received {
     use crate::blob::unlocked::{DropReceivedOperation, PromoteUnlockedOperation};
     use crate::s3::object::copy::sealed::{SealedCopyInput, SealedCopyOperation};
     use crate::s3::object::copy::test::{seed_authority, seed_bucket};
-    use crate::tests::s3::full_context;
+    use aruna_test_support::s3::full_context;
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};

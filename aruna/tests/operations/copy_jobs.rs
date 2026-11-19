@@ -24,7 +24,7 @@ use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_drivers::testing::seed_bucket;
-use aruna_operations::tests::s3::{full_context, spawn_reference_server, write_version};
+use aruna_test_support::s3::{full_context, spawn_reference_server, write_version};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;

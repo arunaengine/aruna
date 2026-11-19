@@ -12,14 +12,19 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+aruna-blob = { workspace = true }
 aruna-core = { workspace = true }
 aruna-drivers = { workspace = true, features = ["test-hooks"] }
+aruna-net = { workspace = true }
 aruna-operations = { workspace = true }
 aruna-storage = { workspace = true }
 aruna-tasks = { workspace = true }
+axum = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
 ulid = { workspace = true }

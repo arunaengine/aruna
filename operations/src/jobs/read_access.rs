@@ -258,7 +258,7 @@ mod storage_tests {
 
     use super::*;
     use aruna_drivers::testing::seed_open_access;
-    use crate::tests::s3::test_storage;
+    use aruna_test_support::s3::test_storage;
     use aruna_core::NodeId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::read_grant::READ_OPERATION;

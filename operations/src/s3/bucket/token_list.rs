@@ -135,7 +135,7 @@ impl Operation for ListTokensOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::s3::test_storage;
+    use aruna_test_support::s3::test_storage;
     use aruna_core::UserId;
     use aruna_core::credential_encryption::EncryptedS3Secret;
     use aruna_core::effects::StorageEffect;

@@ -1038,16 +1038,21 @@ dependencies = [
 name = "aruna-test-support"
 version = "3.0.0-alpha.207"
 dependencies = [
+ "aruna-blob",
  "aruna-core",
  "aruna-drivers",
+ "aruna-net",
  "aruna-operations",
  "aruna-storage",
  "aruna-tasks",
+ "axum",
  "chrono",
  "ed25519-dalek 3.0.0",
  "irokle",
  "jsonwebtoken",
  "serde",
+ "tempfile",
+ "tokio",
  "ulid 3.0.0",
 ]
 
