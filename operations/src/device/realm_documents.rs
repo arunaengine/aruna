@@ -31,6 +31,8 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, KeySpace, Value};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -301,6 +303,8 @@ pub struct FetchDocumentsOperation {
     asked: Option<NodeId>,
     selection: Selection,
     installed: bool,
+    /// The run's entropy, which orders the realm's nodes.
+    entropy: u64,
 }
 
 type Fetching = Result<Next<bool>, IoError>;
@@ -338,6 +342,7 @@ impl FetchDocumentsOperation {
             asked: None,
             selection: Selection::default(),
             installed: false,
+            entropy: 0,
         }
     }
 
@@ -354,7 +359,7 @@ impl FetchDocumentsOperation {
         Ok(Next::Call(read))
     }
 
-    /// A different node answers first every time, so one lagging peer never owns this device's
+    /// A different node answers first in every run, so one lagging peer never owns this device's
     /// view of the realm.
     fn configured(&mut self, config: Option<RealmConfigDocument>) -> Fetching {
         let (Some(config), Some((node_id, _))) = (config, self.ids) else {
@@ -364,7 +369,7 @@ impl FetchDocumentsOperation {
             return Ok(Next::Done(false));
         };
         let mut peers = realm_peers(&config, node_id);
-        peers.shuffle(&mut rand::rng());
+        peers.shuffle(&mut StdRng::seed_from_u64(self.entropy));
         self.start(owner, peers)
     }
 
@@ -509,6 +514,10 @@ fn marker_of(row: Option<Value>) -> RealmMarker {
 impl Operation for FetchDocumentsOperation {
     type Output = bool;
     type Error = IoError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.entropy = entropy as u64;
+    }
 
     fn first(&mut self) -> Fetching {
         let Some((_, realm_id)) = self.ids else {

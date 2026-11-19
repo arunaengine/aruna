@@ -15,6 +15,8 @@ use aruna_core::placement::read_holder_sets;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use tracing::debug;
 use ulid::Ulid;
@@ -80,15 +82,13 @@ pub fn refusal_reason(refusal: &SyncRefusal) -> String {
     }
 }
 
-/// The document's holders, in a different order every time so one lagging
-/// holder never owns this device's view.
+/// The document's holders; each run asks them in the order its entropy shuffles them to, so one
+/// lagging holder never owns this device's view.
 fn holders_for(plan: &RefreshPlan, document_id: Ulid) -> Vec<NodeId> {
     let Ok(placement) = resolve_metadata_id(&plan.config, plan.realm_id, None, document_id) else {
         return Vec::new();
     };
-    let mut holders = read_holder_sets(&plan.config, &placement).unwrap_or_default();
-    holders.shuffle(&mut rand::rng());
-    holders
+    read_holder_sets(&plan.config, &placement).unwrap_or_default()
 }
 
 /// What the pending call of a planned refresh answers.
@@ -205,6 +205,11 @@ impl Operation for PlannedRefreshOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        let mut order = StdRng::seed_from_u64(entropy as u64);
+        self.holders.make_contiguous().shuffle(&mut order);
     }
 
     fn first(&mut self) -> Refreshing {
