@@ -13,6 +13,7 @@ use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::after_sync::AfterSyncOperation;
+use crate::metadata::deletion_guard::PruneGraphsOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
@@ -993,7 +994,7 @@ async fn run_maintenance(context: &DriverContext, source: &'static str, attempt:
             "Metadata document sync reconciliation failed"
         );
     }
-    match metadata_handle.prune_deleted_graphs(context).await {
+    match drive(PruneGraphsOperation::new(), context).await {
         Ok(pruned) if pruned > 0 => {
             debug!(source, attempt, pruned, "Metadata graph prune completed")
         }

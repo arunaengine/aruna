@@ -1,9 +1,11 @@
-//! Tests graph lifecycle: tombstones block applies and deletes wait for the graph fence.
+//! Tests that a tombstoned graph refuses changes through the deletion guard.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::auth::{auth_storage, node_id_seed};
 use super::*;
+use crate::driver::drive;
+use crate::metadata::deletion_guard::DeletionGuardOperation;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
@@ -33,6 +35,7 @@ pub(super) fn registry_record(document_path: &str) -> MetadataRegistryRecord {
 
 #[tokio::test]
 async fn tombstone_blocks_apply() {
+    // A graph-addressed change on a graph whose lifecycle row is a tombstone is refused.
     let (_storage_dir, storage) = auth_storage();
     let metadata_dir = tempdir().expect("metadata dir");
     let graph_handle = aruna_graph::GraphHandle::open(
@@ -50,37 +53,8 @@ async fn tombstone_blocks_apply() {
         None,
         Default::default(),
     );
-    let metadata_handle = graph_context(storage.clone(), metadata_handle, graph_handle);
+    let context = graph_context(storage.clone(), metadata_handle, graph_handle);
     let record = registry_record("datasets/fenced");
-    let held = metadata_graph_fence(&record.graph_iri)
-        .acquire()
-        .await
-        .expect("graph fence remains open");
-    let graph_iri = record.graph_iri.clone();
-    let task_handle = metadata_handle.clone();
-    let task = tokio::spawn(async move {
-        send_metadata_effect(
-            &task_handle,
-            MetadataEffect::CreateCrate {
-                request: MetadataCrateRequest {
-                    graph_iri,
-                    name: "fenced".to_string(),
-                    description: "fenced".to_string(),
-                    date_published: "2026-01-01".to_string(),
-                    license: None,
-                    policy: MetadataGraphPolicy {
-                        public: true,
-                        permission_paths: Vec::new(),
-                    },
-                    durability: MetadataRequestDurability::WalAlreadyDurable,
-                    deterministic_actor: None,
-                },
-            },
-        )
-        .await
-    });
-    tokio::task::yield_now().await;
-
     let tombstone = GraphLifecycleRecord::deleted(
         record.graph_iri.clone(),
         record.realm_id,
@@ -101,18 +75,33 @@ async fn tombstone_blocks_apply() {
         Event::Storage(StorageEvent::WriteResult { .. }) => {}
         other => panic!("unexpected lifecycle write result: {other:?}"),
     }
-    drop(held);
 
-    let event = task.await.expect("materialization task joins");
+    let create = MetadataEffect::CreateCrate {
+        request: MetadataCrateRequest {
+            graph_iri: record.graph_iri.clone(),
+            name: "fenced".to_string(),
+            description: "fenced".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: None,
+            policy: MetadataGraphPolicy {
+                public: true,
+                permission_paths: Vec::new(),
+            },
+            durability: MetadataRequestDurability::WalAlreadyDurable,
+            deterministic_actor: None,
+        },
+    };
+    let guard = DeletionGuardOperation::new(record.graph_iri.clone(), create);
+    let event = drive(guard, &context).await.expect("guard answers");
     assert!(matches!(
         event,
-        Event::Metadata(MetadataEvent::Error {
+        MetadataEvent::Error {
             error: MetadataError::InvalidInput(message),
             ..
-        }) if message.contains("deleted")
+        } if message.contains("deleted")
     ));
     assert!(
-        !metadata_handle
+        !context
             .graph_handle
             .as_ref()
             .expect("graph store")
@@ -120,32 +109,4 @@ async fn tombstone_blocks_apply() {
             .await
             .expect("graph probe succeeds")
     );
-}
-
-#[tokio::test]
-async fn delete_waits_fence() {
-    let graph_iri = "urn:test:graph-fence";
-    let held = metadata_graph_fence(graph_iri)
-        .acquire()
-        .await
-        .expect("graph fence remains open");
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        let _ = ready_tx.send(());
-        let _permit = metadata_graph_fence(graph_iri)
-            .acquire()
-            .await
-            .expect("graph fence remains open");
-        let _ = done_tx.send(());
-    });
-
-    ready_rx.await.expect("delete task started");
-    assert!(matches!(
-        done_rx.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    ));
-    drop(held);
-    done_rx.await.expect("delete task completed");
-    task.await.expect("delete task joined");
 }
