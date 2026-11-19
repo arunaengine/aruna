@@ -520,7 +520,7 @@ pub(crate) mod tests {
         aruna_core::structs::execution::job::local::job_prune_key(expiry_ms, job_id)
     }
 
-    fn is_child(next: &PruneNext) -> bool {
+    fn is_child<T>(next: &Result<Next<T>, PruneError>) -> bool {
         matches!(next, Ok(Next::Call(IoCall::Child(_))))
     }
 
