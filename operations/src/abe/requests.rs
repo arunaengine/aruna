@@ -3,11 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::notifications::outbox_record::new_outbox_record;
 use aruna_core::request_policy::CompiledPolicySet;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
-    NotificationClass, NotificationKind, NotificationRecord,
+    NotificationClass, NotificationKind, NotificationRecord, new_outbox_record,
 };
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin};

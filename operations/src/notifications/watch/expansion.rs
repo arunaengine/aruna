@@ -30,12 +30,12 @@ use crate::notifications::protocol::{
     EVENT_BATCH_SIZE, EXPANSION_CANDIDATE_CAP, EXPANSION_RECORD_CAP, RETRY_BATCH_CAP,
     RETRY_BYTES_CAP, add_limit, expansion_budget, page_limit, valid_retry,
 };
-use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::check::{WatchCheckError, WatchCheckOperation};
 use crate::notifications::watch::digest::{InterestError, InterestOperation, dirty_marker_write};
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchPage, WatchScope};
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::WatchSubscriptionError;
+use aruna_core::notification_routing::route_watch_event;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ExpandError {

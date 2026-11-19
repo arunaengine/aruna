@@ -53,6 +53,7 @@ pub mod native_reference;
 pub mod node_facts;
 pub mod node_state;
 pub mod node_vault;
+pub mod notification_routing;
 pub mod onboarding;
 pub mod operation;
 #[cfg(any(test, feature = "test-hooks"))]

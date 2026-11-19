@@ -2,18 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
-use aruna_core::id_mint::IdMint;
-use aruna_core::structs::execution::notification::{
+use crate::UserId;
+use crate::id_mint::IdMint;
+use crate::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord, ResourceEvent,
 };
-use aruna_core::structs::execution::notification_watch::{
+use crate::structs::execution::notification_watch::{
     WatchEvent, WatchSubscription, watch_notification_id, watch_path_matches,
 };
-use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+use crate::structs::identity::group::GroupAuthorizationDocument;
+use crate::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
 
-pub(crate) fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
+pub fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
     let mut ids: Vec<UserId> = auth_doc
         .roles
         .values()
@@ -26,7 +26,7 @@ pub(crate) fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<User
     ids
 }
 
-pub(crate) fn realm_admin_ids(auth_doc: &RealmAuthorizationDocument) -> Vec<UserId> {
+pub fn realm_admin_ids(auth_doc: &RealmAuthorizationDocument) -> Vec<UserId> {
     let mut ids: Vec<UserId> = auth_doc
         .roles
         .values()
@@ -46,7 +46,7 @@ pub struct RoutingContext<'a> {
     pub realm_id: RealmId,
 }
 
-pub(crate) fn route_resource_event(
+pub fn route_resource_event(
     event: &ResourceEvent,
     ctx: RoutingContext<'_>,
     now_ms: u64,
@@ -218,11 +218,11 @@ pub fn route_watch_event(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::execution::notification_watch::{
+    use crate::structs::execution::notification_watch::{
         WatchEventDetail, WatchEventKind, WatchEventMask,
     };
-    use aruna_core::structs::identity::auth::Role;
-    use aruna_core::structs::identity::realm::RealmId;
+    use crate::structs::identity::auth::Role;
+    use crate::structs::identity::realm::RealmId;
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
 
@@ -529,7 +529,7 @@ mod pure_tests {
     }
 
     fn upload_event(actor: UserId, path: &str) -> WatchEvent {
-        let resource = aruna_core::structs::execution::notification_watch::parse_watch_path(path)
+        let resource = crate::structs::execution::notification_watch::parse_watch_path(path)
             .expect("canonical data watch path");
         WatchEvent {
             event_id: Ulid::from_bytes([7u8; 16]),
@@ -549,7 +549,7 @@ mod pure_tests {
     }
 
     fn sync_event(actor: UserId, path: &str) -> WatchEvent {
-        let resource = aruna_core::structs::execution::notification_watch::parse_watch_path(path)
+        let resource = crate::structs::execution::notification_watch::parse_watch_path(path)
             .expect("canonical data watch path");
         WatchEvent {
             event_id: Ulid::from_bytes([9u8; 16]),
@@ -568,8 +568,8 @@ mod pure_tests {
         }
     }
 
-    fn data_path(node_id: aruna_core::NodeId, bucket: &str, key: &str) -> String {
-        aruna_core::structs::execution::notification_watch::watch_resource_path(
+    fn data_path(node_id: crate::NodeId, bucket: &str, key: &str) -> String {
+        crate::structs::execution::notification_watch::watch_resource_path(
             Ulid::from_bytes([6u8; 16]),
             node_id,
             bucket,

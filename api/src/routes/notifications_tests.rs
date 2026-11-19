@@ -12,6 +12,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
+use aruna_core::notification_routing::route_watch_event;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, watch_resource_path,
 };
@@ -26,7 +27,6 @@ use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::notifications::inbox::UpsertInboxOperation;
-use aruna_operations::notifications::routing::route_watch_event;
 use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use aruna_storage::storage::FjallStorage;
 use axum::http::StatusCode;

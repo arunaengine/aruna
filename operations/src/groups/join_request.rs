@@ -4,7 +4,6 @@
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::epoch_due::DueMarks;
-use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -20,6 +19,7 @@ use aruna_core::join_request::{
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
+use aruna_core::notification_routing::{RoutingContext, route_resource_event};
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::target_placement_ref;
@@ -28,6 +28,7 @@ use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
+use aruna_core::structs::execution::notification;
 use aruna_core::structs::execution::notification::{NotificationOutboxRecord, ResourceEvent};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -461,7 +462,7 @@ impl JoinWrite {
         let output = self.result.take().ok_or(GroupJoinError::NotFinished)?;
         let mut calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
         if self.notifications {
-            let notices = crate::notifications::outbox_record::schedule_drain_effect();
+            let notices = notification::schedule_drain_effect();
             calls.push(IoCall::Effect(Box::new(notices)));
         }
         Ok(Next::Then { output, calls })

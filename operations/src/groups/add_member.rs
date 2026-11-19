@@ -32,10 +32,10 @@ use thiserror::Error;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::epoch_due::DueMarks;
 use crate::notifications::emit::emit_notifications_effect;
-use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::notification_routing::{RoutingContext, route_resource_event};
 use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::target_placement_ref;
 
