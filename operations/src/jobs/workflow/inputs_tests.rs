@@ -4,9 +4,9 @@
 
 use aruna_core::NodeId;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{InputContent, InputMode, JobClaim};
+use aruna_core::structs::execution::job::{InputContent, InputMode};
 
-use super::super::fixtures::{child, is_child, job, node, realm, record, spec, token};
+use super::super::fixtures::{child, claimed, is_child, job, node, realm, record, spec, token};
 use super::*;
 
 fn version() -> Ulid {
@@ -239,16 +239,6 @@ fn local_failure_reported() {
         find.next(failed),
         Err(source_input_error(GetObjectError::NoSuchKey))
     );
-}
-
-fn claimed() -> JobRecord {
-    let mut job = record();
-    job.claim = Some(JobClaim {
-        holder_node_id: node(),
-        claim_token: token(),
-        lease_expires_ms: 1,
-    });
-    job
 }
 
 fn spec_with_input() -> ExecutionSpec {

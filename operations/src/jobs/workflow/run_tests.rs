@@ -2,14 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
-
-use aruna_core::compute::{AttemptPhase, NOBODY, StagingMode};
+use aruna_core::compute::{AttemptPhase, NOBODY};
 use aruna_core::structs::execution::job::EffectiveResources;
 
 use super::fixtures::{
-    child, claimed, compute, control, facts, is_child, job, node, realm, record, scope_of, spec,
-    status, token,
+    child, claimed, compute, control, facts, is_child, job, node, prepared, realm, record,
+    scope_of, spec, status, token,
 };
 use super::*;
 
@@ -166,16 +164,6 @@ fn run_of(job: JobRecord) -> ExecutionRunOperation {
     let mut run = ExecutionRunOperation::new(job, wiring());
     run.stamp(NOW);
     run
-}
-
-fn prepared() -> PreparedTask {
-    PreparedTask {
-        inputs: Vec::new(),
-        mounts: Vec::new(),
-        secrets: BTreeMap::new(),
-        staging: StagingMode::Files,
-        workspace: None,
-    }
 }
 
 fn attempt() -> AttemptRef {

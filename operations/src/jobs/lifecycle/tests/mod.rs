@@ -19,7 +19,9 @@ use aruna_core::UserId;
 use aruna_core::effects::{LaunchFrame, ReceiptFrame};
 use aruna_core::events::LaunchDecline;
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::execution::job::{ExecutionSpec, JobId, JobRecord, WorkspaceMode};
+use aruna_core::structs::execution::job::{
+    EffectiveResources, ExecutionSpec, JobId, JobRecord, WorkspaceMode,
+};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
@@ -40,6 +42,16 @@ use crate::jobs::records::audit::AuditPage;
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
 use crate::jobs::submit::SubmitJobError;
 use crate::tasks::job_node::{ingress_node, launch_node};
+
+pub(super) fn resources() -> EffectiveResources {
+    EffectiveResources {
+        cpu_cores: 1,
+        ram_bytes: 1024,
+        disk_bytes: 2048,
+        max_walltime_ms: 60_000,
+        preemptible: false,
+    }
+}
 
 pub(super) async fn family_report(
     context: &DriverContext,
