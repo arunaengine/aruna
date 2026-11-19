@@ -506,8 +506,8 @@ fn key_document(key: &[u8]) -> Option<Ulid> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UserId;
     use crate::structs::storage::metadata_registry::MetadataAuditOperation;
+    use crate::user::id::UserId;
 
     fn key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Vec<u8> {
         let mut key = Vec::with_capacity(AUDIT_KEY_BYTES);

@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::user::id::UserId;
 
 use super::mutate_placement::node_kind;
 use thiserror::Error;
@@ -94,8 +94,8 @@ pub(crate) fn peer_acts_for(config: &RealmConfigDocument, peer: NodeId, user_id:
 mod pure_tests {
     use super::{PeerTrust, RealmPeerError, ensure_peer_trust};
     use aruna_core::NodeId;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

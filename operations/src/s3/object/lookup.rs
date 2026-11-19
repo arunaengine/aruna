@@ -465,13 +465,13 @@ impl Operation for VersionLookup {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
     use aruna_core::structs::storage::blob::{BackendRef, ManagedCopyRecord, ManagedCopyState};
     use aruna_core::structs::storage::encryption::BucketKeyRef;
     use aruna_core::structs::storage::format::{EncodingClass, PithosLayout, StoredFormat};
     use aruna_core::structs::storage::multipart::MultipartChecksumType;
+    use aruna_core::user::id::UserId;
 
     fn row(value: Option<Vec<u8>>) -> IoResult {
         IoResult::Values(vec![value.map(Into::into)])

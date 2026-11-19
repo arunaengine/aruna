@@ -3,13 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::compute::{SecretBytes, SharedSecret};
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::key_seal::seal_to;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::ArchiveKey;
+use crate::user::id::UserId;
 use crate::vault_format::key_fingerprint;
 use hpke::rand_core::CryptoRng;
 use serde::{Deserialize, Serialize};

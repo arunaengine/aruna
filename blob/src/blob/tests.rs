@@ -12,6 +12,7 @@ use super::{
 };
 use crate::messages::{MessageType, ReplicationMessage};
 use crate::s3::{NativeMultipart, create_s3_client, make_bucket};
+use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
@@ -37,7 +38,7 @@ use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_net::streams::BiStream;
 use aruna_net::{InboundEventHandler, NetHandle};

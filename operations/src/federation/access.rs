@@ -84,8 +84,8 @@ pub(crate) fn access_granted(result: IoResult) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use super::*;

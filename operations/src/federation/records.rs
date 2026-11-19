@@ -320,11 +320,11 @@ pub struct ImportRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::federation::Signed;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::transfer::ExportGrant;
+    use aruna_core::user::id::UserId;
     use ed25519_dalek::SigningKey;
     use url::Url;
 

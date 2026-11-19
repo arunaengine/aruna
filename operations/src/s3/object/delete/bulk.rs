@@ -5,13 +5,13 @@
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::VecDeque;
 use ulid::Ulid;
 

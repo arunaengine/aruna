@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::events::Event;
 use crate::metadata::AuthToken;
 use crate::operation::SubOperation;
@@ -33,6 +32,7 @@ use crate::structs::storage::blob::BackendLocation;
 use crate::structs::storage::encryption::BucketKeyRef;
 use crate::structs::storage::storage_purge::StoragePurgeScope;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {

@@ -854,7 +854,6 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, UNIX_EPOCH};
 
-    use aruna_core::UserId;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
@@ -863,6 +862,7 @@ mod tests {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
     use aruna_core::structs::storage::blob::{BackendRef, BlobLocationKey};
+    use aruna_core::user::id::UserId;
     use aruna_storage::storage;
     use byteview::ByteView;
     use tempfile::TempDir;

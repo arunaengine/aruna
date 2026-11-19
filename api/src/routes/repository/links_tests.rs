@@ -124,7 +124,7 @@ async fn create(
 
 fn stranger(linked: &Linked) -> AuthContext {
     AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), linked.test.auth.realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), linked.test.auth.realm_id),
         ..linked.test.auth.clone()
     }
 }

@@ -6,6 +6,7 @@
 use crate::s3::bucket::key::rows::{
     SettingsError, authority_keys, keyless, parse_authority, scan_call,
 };
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
@@ -22,7 +23,7 @@ use aruna_core::structs::storage::holders::{
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 

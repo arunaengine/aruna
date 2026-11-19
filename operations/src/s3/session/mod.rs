@@ -19,7 +19,6 @@ pub use refresh::{RefreshS3Config, RefreshS3Operation};
 pub use revoke::{RevokeS3Config, RevokeS3Operation};
 pub use touch::{TouchS3Config, TouchS3Operation};
 
-use aruna_core::UserId;
 use aruna_core::calls::IoError;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{
@@ -30,6 +29,7 @@ use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_li
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -1291,7 +1291,7 @@ mod tests {
         BucketInfo {
             group_id: Ulid::from_bytes([2; 16]),
             created_at: std::time::UNIX_EPOCH,
-            created_by: aruna_core::UserId::nil(realm_id),
+            created_by: aruna_core::user::id::UserId::nil(realm_id),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),

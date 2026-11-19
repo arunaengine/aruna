@@ -4,7 +4,6 @@
 
 use super::index::{MAX_USER_SESSIONS, decode_index, encode_index, owner_key};
 use crate::auth::create_token::{CreateTokenConfig, CreateTokenError, mint_login_token};
-use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::Secret;
@@ -21,6 +20,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::types::{GroupId, Value};
+use aruna_core::user::id::UserId;
 use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;

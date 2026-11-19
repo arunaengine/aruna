@@ -1371,7 +1371,7 @@ async fn load_job_stats(state: &ServerState, id: Ulid) -> ServerResult<(usize, O
 
 fn filter_relationships(
     relationships: Vec<SyncRelationship>,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
     direction: SyncRelationshipDirection,
     prefix: Option<&str>,
 ) -> Vec<SyncRelationshipResponse> {

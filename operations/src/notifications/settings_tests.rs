@@ -8,7 +8,6 @@ use crate::notifications::setting_rows::{
     ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
 };
 use crate::tests::notifications::{context, managers, store_setting, temp_storage};
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{PeerRequestError, StorageEvent};
@@ -19,6 +18,7 @@ use aruna_core::structs::execution::notification::{NotificationClass, Notificati
 use aruna_core::structs::execution::setting::SettingHead;
 use aruna_core::structs::execution::webhook::WebhookSubscription;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use ulid::Ulid;
 

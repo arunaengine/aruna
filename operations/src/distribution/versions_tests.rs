@@ -4,12 +4,12 @@
 
 use std::time::{Duration, UNIX_EPOCH};
 
-use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_core::structs::storage::distribution::inventory::VersionEntry;
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::user::id::UserId;
 use aruna_storage::storage::handle::StorageHandle;
 
 use super::*;

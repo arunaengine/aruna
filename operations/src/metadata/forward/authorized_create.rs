@@ -89,7 +89,7 @@ fn read_config(result: IoResult) -> Result<RealmConfigDocument, CreateAuthorized
 /// failed queue write only warns and never affects the create.
 fn emitted(
     realm_id: RealmId,
-    user: aruna_core::UserId,
+    user: aruna_core::user::id::UserId,
     created: CreateDocumentResult,
 ) -> CreateTurn {
     let record = created.record;

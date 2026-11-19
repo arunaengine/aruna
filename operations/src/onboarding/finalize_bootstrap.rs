@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, NetEffect};
@@ -29,6 +28,7 @@ use aruna_core::structs::placement::record::{
     NodePlacementEntry, PlacementRef, normalize_placement_input,
 };
 use aruna_core::structs::storage::node_info::reserved_label;
+use aruna_core::user::id::UserId;
 use ed25519_dalek::SigningKey;
 use thiserror::Error;
 use tracing::warn;
@@ -613,7 +613,6 @@ mod tests {
     use crate::onboarding::secret_state::secret_state_key;
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::NodeId;
-    use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -631,6 +630,7 @@ mod tests {
     };
     use aruna_core::structs::placement::record::{BindingScope, DocumentClass};
     use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::NetHandle;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

@@ -6,7 +6,6 @@
 use std::collections::VecDeque;
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::errors::ConversionError;
@@ -20,6 +19,7 @@ use aruna_core::structs::execution::notification_watch::{
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use tracing::warn;
 

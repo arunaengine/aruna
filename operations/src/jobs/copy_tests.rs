@@ -4,7 +4,6 @@
 
 use std::time::{Duration, SystemTime};
 
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::errors::StorageError;
 use aruna_core::jobs::JobStops;
@@ -12,6 +11,7 @@ use aruna_core::structs::execution::job::JobErrorKind;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::*;

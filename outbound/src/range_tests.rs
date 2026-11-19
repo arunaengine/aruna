@@ -5,10 +5,10 @@
 use std::sync::{Arc, Mutex};
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::KeyRange;
+use aruna_core::user::id::UserId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use ulid::Ulid;

@@ -286,12 +286,12 @@ impl Operation for ApplyRelayOperation {
 mod tests {
     use super::*;
     use crate::tests::peers::{failed_answer, peer_answer};
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::PeerRequestError;
     use aruna_core::placement::resolve_shard_holders;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

@@ -117,11 +117,11 @@ impl Operation for WriteAuditOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::purge_audit_record;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::delete_audit::{BlobAuditKind, BlobPurgeKind};
     use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn spec(scope: StoragePurgeScope) -> StoragePurgeSpec {

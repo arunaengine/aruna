@@ -156,7 +156,7 @@ async fn resolves_session_alias() {
     aruna_test_support::jobs::insert_job(&ctx, &physical)
         .await
         .unwrap();
-    let auth = |user_id: aruna_core::UserId| aruna_core::structs::identity::auth::AuthContext {
+    let auth = |user_id: aruna_core::user::id::UserId| aruna_core::structs::identity::auth::AuthContext {
         user_id,
         realm_id: REALM,
         path_restrictions: None,
@@ -172,7 +172,7 @@ async fn resolves_session_alias() {
         .unwrap();
     assert!(matches!(report, JobReportLookup::Ready { job, .. }
         if job.job_id == receipt.physical_job_id && job.report_digest == [4; 32]));
-    let stranger = aruna_core::UserId::new(ulid::Ulid(42), REALM);
+    let stranger = aruna_core::user::id::UserId::new(ulid::Ulid(42), REALM);
     assert!(matches!(
         read_report_routed(&ctx, &auth(stranger), spec.job_id, query()).await,
         Ok(JobReportLookup::NotFound)

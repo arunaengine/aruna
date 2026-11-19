@@ -240,12 +240,12 @@ impl Operation for LocalUserOperation {
 mod tests {
     use super::*;
     use crate::placement::policy::cache::PolicyCacheStats;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::replication_protocol::BaoReadTarget;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::placement::policy::{PlacementDecision, PlacementSubject};
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_core::user::id::UserId;
     use std::collections::{BTreeMap, HashMap};
     use ulid::Ulid;
 

@@ -796,7 +796,7 @@ async fn content_skips_unreadable() {
     let [unreadable, readable] = groups;
     assert!(set_of(unreadable) < set_of(readable));
     let (context, realm) = (state.get_ctx(), test.auth.realm_id);
-    let stranger = aruna_core::UserId::local(Ulid::from_bytes([98; 16]), realm);
+    let stranger = aruna_core::user::id::UserId::local(Ulid::from_bytes([98; 16]), realm);
     // The link's creator owns the readable group only; a stranger owns the other one.
     for (group, name, owner) in [
         (unreadable, "closed", stranger),

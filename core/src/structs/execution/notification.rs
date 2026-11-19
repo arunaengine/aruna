@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::UserId;
 use crate::effects::Effect;
 use crate::errors::ConversionError;
 use crate::structs::execution::notification_watch::{
@@ -19,6 +18,7 @@ use crate::structs::execution::notification_watch::{
 use crate::structs::identity::realm::RealmId;
 use crate::task::{TaskEffect, TaskKey};
 use crate::types::{GroupId, Key};
+use crate::user::id::UserId;
 
 pub const DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 pub const TRANSIENT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;

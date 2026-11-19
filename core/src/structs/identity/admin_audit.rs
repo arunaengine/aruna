@@ -6,12 +6,12 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::keyspaces::ADMIN_AUDIT_KEYSPACE;
 use crate::plugin_installs::PluginInstall;
 use crate::secrets::{Delivery, SecretName, SecretScope};
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 const REALM_SCOPE: u8 = b'r';
 const GROUP_SCOPE: u8 = b'g';

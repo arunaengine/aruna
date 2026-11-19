@@ -16,7 +16,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError};
 use aruna_core::errors::BlobError;
 use aruna_core::keyspaces::{
@@ -39,6 +38,7 @@ use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use ulid::Ulid;
 

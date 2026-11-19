@@ -198,7 +198,6 @@ impl Operation for RevokeUserOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -207,6 +206,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::abe_access::token_prefix;
     use aruna_core::structs::storage::blob::UserAccess;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::collections::BTreeSet;

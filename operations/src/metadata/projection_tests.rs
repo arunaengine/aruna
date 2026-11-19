@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
@@ -14,6 +13,7 @@ use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
 use aruna_core::task::TaskKey;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::write_entries;
 use aruna_storage::storage::handle::StorageHandle;
@@ -108,7 +108,7 @@ fn create_event() -> MetadataEventRecord {
     MetadataEventRecord {
         event_id,
         record,
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         node_id: node(1),
         payload: MetadataEventPayload::Scaffold {
             name: "Lifecycle Outbox".to_string(),

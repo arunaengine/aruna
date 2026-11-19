@@ -7,11 +7,12 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::NodeId;
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentTarget};
 use crate::plugins::{valid_digest, valid_name, valid_version};
 use crate::secrets::{SecretName, SecretScope};
 use crate::types::{GroupId, RoleId};
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 
 /// Bytes of the setting values, as JSON.
 pub const MAX_SETTINGS: usize = 64 * 1024;

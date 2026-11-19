@@ -5,6 +5,7 @@
 
 use crate::auth::ValidatedBearer;
 use crate::server::state::ServerState;
+use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -13,7 +14,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_storage::storage::handle::StorageHandle;

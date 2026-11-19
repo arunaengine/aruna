@@ -5,7 +5,6 @@
 use super::stage::Change;
 use super::{Account, Documents, MergeError, MergeOutcome, MergeState, MergeUsersOperation, plan};
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, Next};
 use aruna_core::document::{DocumentChange, DocumentTarget};
@@ -16,6 +15,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{GroupId, RoleId, Value};
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::{
     DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, counted_attributes,
     validate_attribute_count,

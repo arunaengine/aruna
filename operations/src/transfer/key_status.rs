@@ -6,7 +6,6 @@
 use crate::s3::bucket::key::restart::Replay;
 use crate::s3::bucket::key::rows::{SettingsError, authority_keys, keyless, parse_authority};
 use crate::transfer::abe_rekey::RekeyProgress;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -24,6 +23,7 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::key_audit::{AuditAction, BucketAuditRecord};
 use aruna_core::structs::storage::transition::EncryptionTransition;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use ulid::Ulid;

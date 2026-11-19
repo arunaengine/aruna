@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::federation::{FederationError, Signable, Signed};
 use crate::structs::identity::auth::{AuthContext, SessionKind};
 use crate::structs::identity::realm::RealmId;
+use crate::user::id::UserId;
 
 pub const LINK_DOMAIN: &str = "aruna-link-confirmation-v1";
 /// Longest lifetime of a confirmation, and the oldest login of either side it accepts.

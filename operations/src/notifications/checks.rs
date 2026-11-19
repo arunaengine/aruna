@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, parse_watch_path, watch_resource_path,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::user::id::UserId;
 
 use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;

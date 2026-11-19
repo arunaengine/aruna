@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::SessionKind;
 use aruna_core::structs::identity::user::session::UserSession;
+use aruna_core::user::id::UserId;
 use serde::Deserialize;
 
 #[derive(Deserialize)]

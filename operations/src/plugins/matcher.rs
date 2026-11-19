@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -14,6 +13,7 @@ use aruna_core::plugin_runs::{
     SourceKind, gap_key, outbox_key, source_key,
 };
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_plugin_types::trigger::TriggerKind;
 use ulid::Ulid;
 

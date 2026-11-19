@@ -205,9 +205,9 @@ impl Operation for QueueLiveOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::errors::StorageError;
+    use aruna_core::user::id::UserId;
 
     fn realm() -> RealmId {
         RealmId::from_bytes([1; 32])

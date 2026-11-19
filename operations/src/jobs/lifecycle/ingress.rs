@@ -11,7 +11,6 @@ mod tests {
         sources_match,
     };
     use crate::tests::records::captured_input;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::job_request::{SubmitJobError, store_workspace};
     use aruna_core::jobs::SubmissionRefusal;
@@ -26,6 +25,7 @@ mod tests {
     use aruna_core::structs::storage::dataset_description::DatasetDescription;
     use aruna_core::structs::storage::dataset_description::DescriptionError;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
     use ulid::Ulid;
 

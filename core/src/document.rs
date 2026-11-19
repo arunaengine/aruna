@@ -9,7 +9,6 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
 use crate::effects::Effect;
 use crate::errors::ConversionError;
@@ -35,6 +34,7 @@ use crate::structs::storage::node_info::node_info_key;
 use crate::structs::storage::usage::{usage_global_key, usage_snapshot_key};
 use crate::task::{TaskEffect, TaskKey};
 use crate::types::{GroupId, Key, KeySpace, Value};
+use crate::user::id::UserId;
 use crate::{NodeId, TopicId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

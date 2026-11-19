@@ -9,6 +9,7 @@ use super::util::{anonymous_read_allowed, operation_permission, public_read_allo
 use crate::object_key::ObjectKey;
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
 use crate::s3::service::view::InputView;
+use aruna_core::NodeId;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
@@ -25,7 +26,7 @@ use aruna_core::structs::storage::distribution::delegation::{
 };
 use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::structs::storage::share::SHARE_CREDENTIAL_PREFIX;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_operations::auth::bearer_token::AccountDeactivatedOperation;
 use aruna_operations::auth::bearer_token::UserCutoffOperation;

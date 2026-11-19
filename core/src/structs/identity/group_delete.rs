@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::NodeId;
 use crate::errors::{ConversionError, StorageError};
 use crate::structs::identity::realm::{RealmConfigDocument, RealmId};
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipFence {

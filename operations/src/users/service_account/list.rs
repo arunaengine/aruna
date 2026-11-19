@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::USER_KEYSPACE;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, SubOperationEvent};
@@ -12,6 +11,7 @@ use aruna_core::rows::PrefixPages;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 use super::check::{ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation};

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::NodeId;
-use crate::UserId;
 use crate::admin_documents::{AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget};
 use crate::auth::valid_revocation_expiry;
 use crate::document::DocumentTarget;
@@ -14,6 +13,7 @@ use crate::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use crate::structs::identity::user::User;
 use crate::structs::storage::node_info::reserved_label;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use crate::user::validation::{DEACTIVATED_ATTRIBUTE, INSTALL_ATTRIBUTE, SERVICE_GROUP_ATTRIBUTE};
 
 /// The document family an admin operation changes; each family has its own sync target.

@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE};
@@ -14,6 +13,7 @@ use aruna_core::structs::storage::metadata_registry::{
 };
 use aruna_core::structs::{PersistentIdFailure, PersistentIdMapping, secondary_index_deletes};
 use aruna_core::types::{Key, KeySpace};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use crate::metadata::id_mapping::{

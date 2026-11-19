@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::storage::replication::{ArunaArn, ArunaArnType};
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use ulid::Ulid;
@@ -158,8 +158,9 @@ fn validate_endpoint(arn: &ArunaArn, endpoint: &str) -> Result<(), ConversionErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NodeId;
     use crate::structs::identity::realm::RealmId;
-    use crate::{NodeId, UserId};
+    use crate::user::id::UserId;
 
     fn test_node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

@@ -274,7 +274,6 @@ mod tests {
     };
     use crate::sync::outbox_record::{new_identified_record, write_outbox_effect};
     use aruna_core::NodeId;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
@@ -285,6 +284,7 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::Value;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
     use aruna_storage::storage::handle::StorageHandle;

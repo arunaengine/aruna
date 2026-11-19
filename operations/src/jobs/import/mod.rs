@@ -685,12 +685,12 @@ pub(crate) mod tests {
     use crate::jobs::repository::test_support::{
         artifact, job_id, job_scope, local_scope, owner_node, realm,
     };
-    use aruna_core::UserId;
     use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateTarget, RoCrateLimits,
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::storage::blob::HIDDEN_BLOB_PREFIX;
+    use aruna_core::user::id::UserId;
     use std::time::SystemTime;
 
     pub(super) fn spec() -> ImportRoCrateSpec {

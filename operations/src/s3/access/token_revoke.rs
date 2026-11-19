@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::keyspaces::{
@@ -17,6 +16,7 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 
 use super::list::{admin_check, authorized};
 use super::{Cutoffs, GroupToken, GroupTokensError, TokenKind, TokenStatus};

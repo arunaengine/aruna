@@ -1072,7 +1072,6 @@ async fn run_maintenance(context: &DriverContext, source: &'static str, attempt:
 mod tests {
     use super::*;
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::replication_protocol::{
@@ -1083,6 +1082,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
+    use aruna_core::user::id::UserId;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage::worker::FjallStorage;
     use std::collections::HashMap;

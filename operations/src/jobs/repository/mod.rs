@@ -235,7 +235,7 @@ pub fn ensure_supported(
 /// `nonce` must never repeat under the node's credential key.
 pub fn seal_token(
     scope: &NodeScope,
-    user: aruna_core::UserId,
+    user: aruna_core::user::id::UserId,
     view: &ConnectorView,
     link_id: Option<Ulid>,
     token: &str,

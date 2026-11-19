@@ -692,12 +692,12 @@ pub(crate) mod received {
     use crate::blob::unlocked::{DropReceivedOperation, PromoteUnlockedOperation};
     use crate::transfer::copy::sealed::{SealedCopyInput, SealedCopyOperation};
     use crate::transfer::copy::test::{seed_authority, seed_bucket};
-    use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, ResolvedBackend};
     use aruna_core::structs::storage::encryption::{SealPlan, public_key_of};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_test_support::s3::full_context;
     use futures_util::StreamExt;

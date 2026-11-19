@@ -4,11 +4,12 @@
 
 use super::epoch::{parse_progress, progress};
 use super::*;
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Step {

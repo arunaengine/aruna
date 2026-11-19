@@ -106,7 +106,7 @@ async fn native_clients() -> TestResult<()> {
             .send().await?.error_for_status()?.json().await?;
         assert!(repository["error"].is_null(), "ARC conversion failed");
         let bucket = repository["bucket"].as_str().ok_or_else(|| std::io::Error::other("automatic LFS bucket missing"))?;
-        let other = aruna_core::UserId::local(ulid::Ulid::generate(), seed.realm_id);
+        let other = aruna_core::user::id::UserId::local(ulid::Ulid::generate(), seed.realm_id);
         let other_token = create_bearer_token(seed.context.as_ref(), other, seed.realm_id, seed.capabilities.clone()).await?;
         client.post(format!("{base}/api/v1/access/groups/{}/members", group.group_id)).bearer_auth(&token)
             .json(&serde_json::json!({"user_id": other.to_string()})).send().await?.error_for_status()?;

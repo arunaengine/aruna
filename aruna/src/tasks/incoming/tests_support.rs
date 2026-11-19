@@ -5,7 +5,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::UserId;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
     DocumentSyncRevision, DocumentTarget,
@@ -21,6 +20,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::user::id::UserId;
 use aruna_net::NetHandle;
 use aruna_net::config::NetConfig;
 use aruna_storage::storage::worker::FjallStorage;

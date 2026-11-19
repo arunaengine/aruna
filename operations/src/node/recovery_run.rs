@@ -422,9 +422,9 @@ impl Operation for RecoveryOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::user::id::UserId;
     use irokle::TopicId;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};

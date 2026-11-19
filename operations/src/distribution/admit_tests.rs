@@ -6,7 +6,6 @@
 use std::collections::VecDeque;
 use std::time::SystemTime;
 
-use aruna_core::UserId;
 use aruna_core::calls::CallRun;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::StorageEffect;
@@ -17,6 +16,7 @@ use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::accounting::slot_key;
 use aruna_core::structs::storage::distribution::capacity::OBJECT_METADATA_BYTES;
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::user::id::UserId;
 use aruna_storage::storage::handle::StorageHandle;
 
 use super::*;

@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::id_mint::IdMint;
@@ -18,7 +19,7 @@ use aruna_core::structs::{
 };
 use aruna_core::task::TaskKey;
 use aruna_core::types::Key;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

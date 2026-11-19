@@ -279,7 +279,6 @@ mod tests {
 
     use aruna_compute::executor::ExecutorBackend;
     use aruna_compute::registry::ExecutorRegistry;
-    use aruna_core::UserId;
     use aruna_core::compute::{
         AttemptRef, AttemptStatus, CancelEvidence, FenceContext, LogLimits, LogTails, NOBODY,
         ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, UserSpec,
@@ -294,6 +293,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, UserAccess, VersionKey,
     };
+    use aruna_core::user::id::UserId;
     use aruna_storage::storage::handle::StorageHandle;
     use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;

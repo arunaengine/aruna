@@ -46,7 +46,8 @@ use aruna_core::structs::placement::transition::TransitionLimits;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, group_permission_path};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, StructuredId, UserId};
+use aruna_core::user::id::UserId;
+use aruna_core::{NodeId, StructuredId};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_net::NetHandle;
@@ -1250,7 +1251,7 @@ async fn seed_config_topic(
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: seeder.node_id(),
-        user_id: aruna_core::UserId::nil(realm_id),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
         realm_id,
     };
     let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });

@@ -10,6 +10,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::NodeId;
 use crate::calls::IoError;
 use crate::compute::SharedSecret;
 use crate::injection::OutgoingRequest;
@@ -17,7 +18,7 @@ use crate::structs::execution::email::SmtpTls;
 use crate::structs::execution::setting::SettingChannel;
 use crate::structs::storage::distribution::KeyRange;
 use crate::structs::storage::distribution::delegation::Delegation;
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 
 /// Bytes of a connection answer a call reads at most, headers and body together.
 pub const MAX_CONNECTION_ANSWER: usize = 1024 * 1024;

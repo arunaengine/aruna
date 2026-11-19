@@ -141,7 +141,7 @@ mod pure_tests {
             public_config: HashMap::new(),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             disabled,
             cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }

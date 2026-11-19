@@ -283,7 +283,7 @@ mod tests {
             entry,
             revision: Ulid::from_bytes([6; 16]),
             sealed: vec![0; 40],
-            changed_by: aruna_core::UserId::local(Ulid::from_bytes([7; 16]), realm_id),
+            changed_by: aruna_core::user::id::UserId::local(Ulid::from_bytes([7; 16]), realm_id),
             changed_at_ms: 1,
         };
         let effect = StorageEffect::RealmOpen(Box::new(RealmSealed::Record { realm_id, record }));

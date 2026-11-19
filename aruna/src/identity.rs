@@ -324,8 +324,8 @@ pub async fn mark_onboarding_phase(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::user::id::UserId;
 
     /// The persisted record keeps its byte layout across the ownership move:
     /// the stored encoding is part of the deployed compatibility surface.

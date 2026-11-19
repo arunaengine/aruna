@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::structs::execution::job::{
@@ -14,6 +13,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::store::attempt_intent::AttemptCommit;
 use aruna_operations::jobs::store::job_calls::{
@@ -589,7 +589,7 @@ pub async fn wake_key_waits(
 pub async fn submit_execution_job(
     context: &DriverContext,
     spec: aruna_core::structs::execution::job::ExecutionSpec,
-    created_by: aruna_core::UserId,
+    created_by: aruna_core::user::id::UserId,
     owner_node_id: aruna_core::id::NodeId,
     idempotency_key: Option<String>,
     workspace_mode: aruna_core::structs::execution::job::WorkspaceMode,

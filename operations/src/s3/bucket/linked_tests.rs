@@ -217,7 +217,7 @@ async fn needs_group_admin() {
     let admin = StillAdminOperation::new(&auth, group());
     assert!(drive(admin, &context).await.unwrap());
     let stranger = aruna_core::structs::identity::auth::AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::from_parts(77, 7), realm()),
+        user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(77, 7), realm()),
         ..auth.clone()
     };
     let admin = StillAdminOperation::new(&stranger, group());

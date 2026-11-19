@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aruna_blob::blob::BlobHandler;
-use aruna_core::UserId;
 use aruna_core::blob_records::HeadAliasContext;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -33,6 +32,7 @@ use aruna_core::structs::storage::usage::{
     BucketCounters, NodeUsageSnapshot, USAGE_BUCKET_PREFIX, USAGE_COMPLETE_KEY, UsageCounters,
     dirty_group_key, global_shard_keys, usage_bucket_key, usage_group_key, usage_snapshot_key,
 };
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;

@@ -973,7 +973,7 @@ mod tests {
     fn actor(realm_id: RealmId, key_byte: u8) -> Actor {
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[key_byte; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             realm_id,
         }
     }

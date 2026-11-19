@@ -34,7 +34,6 @@ use aruna_drivers::driver::drive;
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::metadata::MetadataEventPayload;
 use aruna_core::storage_entries::{
@@ -44,6 +43,7 @@ use aruna_core::structs::identity::auth::{Actor, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmNodeKind};
 use aruna_core::types::{Key, RoleId};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 
 mod export;

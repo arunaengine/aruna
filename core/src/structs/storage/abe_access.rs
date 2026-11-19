@@ -4,12 +4,13 @@
 
 use super::abe::{AbeError, AbeParameters, GRANT_PURPOSE, ObjectEnvelope, check_object};
 use super::encryption::{BucketEncryption, EncryptionMode};
+use crate::NodeId;
 use crate::compute::{SecretBytes, SharedSecret};
 use crate::key_seal::{SealedSecret, open_sealed};
 use crate::keyspaces::ABE_DUE_KEYSPACE;
 use crate::structs::identity::auth::PathRestriction;
 use crate::types::{Key, Value};
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 use aruna_kpabe::envelope::Envelope;
 use aruna_kpabe::frame_context;
 use aruna_kpabe::policy::{Attribute, Policy};

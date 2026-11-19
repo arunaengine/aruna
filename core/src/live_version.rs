@@ -177,10 +177,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::UserId;
     use crate::calls::ChildOutcome;
     use crate::structs::identity::realm::RealmId;
     use crate::task::TaskKey;
+    use crate::user::id::UserId;
 
     fn live_operation() -> LiveVersionOperation {
         let realm = RealmId::from_bytes([9u8; 32]);

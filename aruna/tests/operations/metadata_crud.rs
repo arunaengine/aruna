@@ -1009,7 +1009,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
     storage_handle.install_metadata_indexes(metadata_dir.path());
     let actor = Actor {
         node_id,
-        user_id: aruna_core::UserId::local(Ulid::generate(), RealmId([5u8; 32])),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), RealmId([5u8; 32])),
         realm_id: RealmId([5u8; 32]),
     };
     let config = seed_realm_config(&storage_handle, &actor).await?;
@@ -1048,7 +1048,7 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
     storage_handle.install_metadata_indexes(metadata_dir.path());
     let actor = Actor {
         node_id,
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
     };
     let config = seed_realm_config(&storage_handle, &actor).await?;

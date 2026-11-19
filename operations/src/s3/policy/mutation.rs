@@ -238,7 +238,6 @@ impl Operation for PolicyMutationOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::errors::StorageError;
     use aruna_core::events::Event;
@@ -249,6 +248,7 @@ mod pure_tests {
         PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::CurrentVersionPointer;
+    use aruna_core::user::id::UserId;
     use std::time::UNIX_EPOCH;
 
     /// The successor id a test mutation is pinned to.

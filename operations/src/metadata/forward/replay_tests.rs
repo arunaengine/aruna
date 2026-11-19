@@ -160,7 +160,7 @@ fn replay_needs_acceptance() {
     let create = CreateDocumentConfig {
         actor: aruna_core::structs::identity::auth::Actor {
             node_id: holder,
-            user_id: aruna_core::UserId::nil(config.realm_id),
+            user_id: aruna_core::user::id::UserId::nil(config.realm_id),
             realm_id: config.realm_id,
         },
         group_id: Ulid::from_bytes([3; 16]),

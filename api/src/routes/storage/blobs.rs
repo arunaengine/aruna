@@ -232,7 +232,7 @@ pub async fn replicate_blob(
 pub(crate) async fn plaintext_holder(
     state: &ServerState,
     bucket: &str,
-    user: aruna_core::UserId,
+    user: aruna_core::user::id::UserId,
 ) -> ServerResult<bool> {
     let context = state.get_ctx();
     let encrypted = drive(EncryptionCheckOperation::new(bucket, true), &context)

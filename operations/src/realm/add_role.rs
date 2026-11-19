@@ -427,7 +427,6 @@ pub mod test {
     };
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
@@ -441,6 +440,7 @@ pub mod test {
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::NetHandle;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

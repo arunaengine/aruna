@@ -392,11 +392,11 @@ fn unexpected(got: &'static str) -> AnnounceTopicError {
 mod pure_tests {
     use super::*;
 
-    use aruna_core::UserId;
     use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::GroupId;
+    use aruna_core::user::id::UserId;
     use std::time::Duration;
 
     fn local_node_id() -> NodeId {

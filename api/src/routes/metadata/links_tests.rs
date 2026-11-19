@@ -7,8 +7,8 @@ use super::*;
 use crate::auth::RealmAuth;
 use crate::routes::metadata::tests::{TestState, setup_state};
 use crate::tests::datasets::{describe, store_bucket};
-use aruna_core::UserId;
 use aruna_core::structs::storage::data::link::LinkScope;
+use aruna_core::user::id::UserId;
 
 const BUCKET: &str = "reads";
 

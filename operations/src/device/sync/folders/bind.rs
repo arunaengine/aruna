@@ -32,7 +32,7 @@ use aruna_core::structs::synced_folder::folder_bucket;
 
 type RemoteError = ReconcileFolderError;
 
-fn owner_auth(user_id: aruna_core::UserId, realm_id: RealmId) -> AuthContext {
+fn owner_auth(user_id: aruna_core::user::id::UserId, realm_id: RealmId) -> AuthContext {
     AuthContext::new(user_id, realm_id)
 }
 

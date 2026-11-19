@@ -126,11 +126,11 @@ impl Operation for MirrorRequestOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
+    use aruna_core::user::id::UserId;
     use std::time::SystemTime;
     use ulid::Ulid;
 

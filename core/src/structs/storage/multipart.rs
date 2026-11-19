@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::checksum::{ChecksumAlgorithm, HASH_MD5};
 use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -11,6 +10,7 @@ use crate::structs::storage::blob::{BackendLocation, BackendRef};
 use crate::structs::storage::encryption::SealPlan;
 use crate::structs::storage::format::Compression;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;

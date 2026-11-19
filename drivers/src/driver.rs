@@ -2150,7 +2150,7 @@ mod test {
         Effect::Blob(BlobEffect::SpoolHidden {
             namespace: ulid::Ulid::from_bytes([8u8; 16]),
             name: "after-commit".to_string(),
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             max_bytes: None,
             deadline: None,
             blob: aruna_core::stream::BackendStream::new(blob),
@@ -2205,7 +2205,7 @@ mod test {
         Effect::Blob(BlobEffect::SpoolHidden {
             namespace: ulid::Ulid::from_bytes([9u8; 16]),
             name: "nested-deadline".to_string(),
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             max_bytes: None,
             deadline: None,
             blob: aruna_core::stream::BackendStream::new(futures_util::stream::pending::<
@@ -2986,7 +2986,7 @@ mod test {
                 backend_path: "blob/held".to_string(),
                 ulid: self.backend_id,
                 format: Default::default(),
-                created_by: aruna_core::UserId::default(),
+                created_by: aruna_core::user::id::UserId::default(),
                 created_at: std::time::SystemTime::UNIX_EPOCH,
                 staging: false,
                 partial: false,
@@ -3219,7 +3219,7 @@ mod test {
                 BlobEffect::SpoolHidden {
                     namespace: ulid::Ulid::from_bytes([5u8; 16]),
                     name: self.name.to_string(),
-                    created_by: aruna_core::UserId::default(),
+                    created_by: aruna_core::user::id::UserId::default(),
                     max_bytes: None,
                     deadline: None,
                     blob: aruna_core::stream::BackendStream::new(blob),

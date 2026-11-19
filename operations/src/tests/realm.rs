@@ -59,7 +59,7 @@ pub(crate) fn promotion_realm(
     let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     document.ensure_node(nodes[0], RealmNodeKind::Management);
     document.ensure_node(nodes[1], RealmNodeKind::Server);
-    let owner = aruna_core::UserId::nil(realm_id);
+    let owner = aruna_core::user::id::UserId::nil(realm_id);
     document.ensure_node(nodes[2], RealmNodeKind::User { owner });
     (key, realm_id, document)
 }
@@ -71,7 +71,7 @@ pub(crate) fn named_user(
     name: &str,
 ) -> aruna_core::structs::identity::user::User {
     aruna_core::structs::identity::user::User {
-        user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([seed; 16]), realm_id),
+        user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([seed; 16]), realm_id),
         name: name.to_string(),
         subject_ids: Vec::new(),
         alias_user_ids: Default::default(),

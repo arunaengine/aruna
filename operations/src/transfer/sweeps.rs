@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE};
@@ -13,7 +14,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use tracing::warn;
 
 use crate::s3::bucket::holders::{LookupError, LookupKeysOperation, Lookups};

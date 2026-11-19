@@ -371,7 +371,7 @@ mod tests {
         let config = PromoteNodeConfig {
             actor: Actor {
                 node_id: node(1),
-                user_id: aruna_core::UserId::nil(realm_id),
+                user_id: aruna_core::user::id::UserId::nil(realm_id),
                 realm_id,
             },
             node_id: node(2),

@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
@@ -20,6 +19,7 @@ use aruna_core::structs::placement::policy::{
     PlacementPolicyRef, PlacementSubject, PolicyResolution, VerifiedPolicy,
 };
 use aruna_core::types::{Effects, Value};
+use aruna_core::user::id::UserId;
 use std::collections::BTreeMap;
 use ulid::Ulid;
 

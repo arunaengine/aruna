@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::execution::notification_watch::WatchSubscription;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::{DEFAULT_SHARD_COUNT, PlacementStrategy};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use aruna_core::placement::{build_view, resolve_holders};

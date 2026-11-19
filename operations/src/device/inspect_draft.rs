@@ -57,8 +57,8 @@ mod tests {
     use crate::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
     use crate::device::publish_queue::PublishEntry;
     use crate::tests::device::context;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
     use ulid::Ulid;
 

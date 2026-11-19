@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -16,7 +17,7 @@ use aruna_core::plugins::{PluginEffect, PluginEvent};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -251,7 +252,7 @@ mod tests {
     use crate::plugins::fixtures;
     use crate::plugins::rows::tests::{child_result, page_result};
     use crate::plugins::test_support::{install_as, install_request};
-    use aruna_core::UserId;
+    use aruna_core::user::id::UserId;
     use aruna_test_support::plugins::Fixture;
 
     #[tokio::test]

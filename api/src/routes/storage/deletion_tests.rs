@@ -56,7 +56,7 @@ async fn preflight_discloses_cleanup() {
         reference_handling: Default::default(),
         reference_serving: false,
         replicate_deletes: true,
-        created_by: aruna_core::UserId::nil(realm_id),
+        created_by: aruna_core::user::id::UserId::nil(realm_id),
         created_at: SystemTime::UNIX_EPOCH,
         state: SyncState::Enabled,
         status: SyncStatusSnapshot::default(),

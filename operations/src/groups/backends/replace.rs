@@ -303,7 +303,7 @@ mod pure_tests {
     fn input(group_id: Ulid) -> CreateBackendInput {
         CreateBackendInput {
             group_id,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             name: "updated".to_string(),
             kind: GroupBackendKind::S3,
             public_config: HashMap::from([
@@ -331,7 +331,7 @@ mod pure_tests {
             ]),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             disabled: false,
             cleanup: CleanupStrategy::Retain,
         }

@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -21,6 +20,7 @@ use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::EMAIL_HASH_ATTRIBUTE;
 use aruna_core::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
@@ -404,7 +404,8 @@ mod tests {
     use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
     use aruna_core::structs::identity::user::User;
     use aruna_core::types::{Key, KeySpace, Value};
-    use aruna_core::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, UserId};
+    use aruna_core::user::id::UserId;
+    use aruna_core::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
     use std::collections::BTreeSet;
     use ulid::Ulid;
 

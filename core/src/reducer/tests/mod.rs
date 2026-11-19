@@ -15,6 +15,7 @@ use super::{
     realm_role_path, realm_user_path, revoked_token_path, role_definition_value,
     strategy_binding_path, user_attribute_path, user_subject_path,
 };
+use crate::NodeId;
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation};
 use crate::auth::REVOCATION_GRACE_SECS;
 use crate::structs::identity::realm::{
@@ -33,8 +34,8 @@ use crate::structs::placement::transition::{
 };
 use crate::structs::storage::node_info::{CLASS_LABEL_PREFIX, KIND_LABEL_KEY};
 use crate::structured_id::PlacementHandle;
+use crate::user::id::UserId;
 use crate::user::validation::UserAttributeError;
-use crate::{NodeId, UserId};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 

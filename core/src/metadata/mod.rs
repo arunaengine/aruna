@@ -11,12 +11,12 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::UserId;
 use crate::errors::StorageError;
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::metadata_registry::{MetadataAuditOperation, MetadataRegistryRecord};
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 pub mod api;
 pub mod protocol;
@@ -1982,10 +1982,11 @@ mod tests {
         ProfileValidationState, ProfileValidationStatus, RAW_BYTES_LIMIT, apply_raw_remove,
         apply_raw_upsert, compare_metadata_clocks, raw_quotas, resolve_raw_revision,
     };
+    use crate::NodeId;
     use crate::structs::identity::realm::RealmId;
     use crate::structs::placement::record::PlacementRef;
     use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use crate::{NodeId, UserId};
+    use crate::user::id::UserId;
     use craqle::{ActorId, VectorClock};
     use std::collections::BTreeMap;
     use ulid::Ulid;

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::MergeError;
+use aruna_core::NodeId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -16,7 +17,7 @@ use aruna_core::structs::identity::auth::{Actor, Role};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, KeySpace, RoleId, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashMap;
 

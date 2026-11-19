@@ -576,7 +576,6 @@ mod call_tests;
 mod tests {
     use super::*;
     use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
@@ -591,6 +590,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::NetHandle;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

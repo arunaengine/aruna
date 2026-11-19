@@ -7,7 +7,6 @@
 // Only committed revisions are published.
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -35,6 +34,7 @@ use aruna_core::structs::storage::distribution::{
     DistributionView, SetPhase, SignedSnapshot, next_snapshot, publisher_key,
 };
 use aruna_core::structs::storage::usage::dirty_share_key;
+use aruna_core::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;

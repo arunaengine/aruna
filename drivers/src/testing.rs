@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 
 use aruna_blob::blob::BlobHandler;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::events::{Event, StorageEvent};
@@ -26,6 +25,7 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::task::TaskKey;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_graph::GraphHandle;
 use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
@@ -213,7 +213,7 @@ pub async fn send_metadata_effect(context: &DriverContext, effect: MetadataEffec
 /// The stored user `user_id`; panics when the read answers anything else.
 pub async fn read_user(
     context: &DriverContext,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
 ) -> aruna_core::structs::identity::user::User {
     let key = user_id.to_bytes().to_vec();
     let value = read_value(

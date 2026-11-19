@@ -9,7 +9,6 @@ use crate::jobs::{
     output_buckets, validate_output_prefixes, workspace_request,
 };
 use crate::tests::execution::{auth_for, build_state, management_state, node_id, realm};
-use aruna_core::UserId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{
     ArtifactRef, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
@@ -23,6 +22,7 @@ use aruna_core::structs::execution::job::{JobRecord, JobState};
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredFormat;
+use aruna_core::user::id::UserId;
 use aruna_operations::jobs::command::{
     ExecutionInput, ExecutionOutput, InputMode, WorkspaceMode as CommandWorkspaceMode,
     WorkspaceSpec,

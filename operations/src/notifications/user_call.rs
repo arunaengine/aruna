@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::id_mint::IdMint;
@@ -15,6 +14,7 @@ use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEventMask, WatchInterestEntry, WatchSubscription,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

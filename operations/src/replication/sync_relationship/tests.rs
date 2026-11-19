@@ -4,13 +4,14 @@
 
 use super::*;
 use crate::replication::mirror_repair::MirrorRecordOperation;
+use aruna_core::NodeId;
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::mirror_repair::SyncMirrorIntent;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_storage::storage::worker::FjallStorage;
 use byteview::ByteView;

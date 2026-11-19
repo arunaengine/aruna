@@ -591,12 +591,12 @@ mod call_tests {
 
     use super::*;
     use crate::metadata::api::access::tests::{access_for, realm};
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::{GroupEvent, GroupResult};
     use aruna_core::metadata::{MetadataError, MetadataEventPayload};
     use aruna_core::storage_entries::pending_projection_key;
     use aruna_core::types::Value;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn group() -> GroupId {

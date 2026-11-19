@@ -16,6 +16,7 @@ use crate::transfer::copy::{
     CopySourceConditions, evaluate_source_conditions, source_etag, source_modified,
 };
 use crate::transfer::read::{ReadSourceOperation, TokenRead};
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
@@ -27,7 +28,7 @@ use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;

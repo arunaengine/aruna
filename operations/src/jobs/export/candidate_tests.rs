@@ -17,7 +17,6 @@ use crate::replication::plaintext::HolderCheckOperation;
 use crate::tests::export::{
     crate_document, job_context, open_candidate, probe_sources, recognized_entities, scope_of,
 };
-use aruna_core::UserId;
 use aruna_core::effects::BlobEffect;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::BlobEvent;
@@ -43,6 +42,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_test_support::export::{

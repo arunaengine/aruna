@@ -111,7 +111,7 @@ async fn location_routes() {
     assert!(matches!(missing, Err(ServerError::NotFound)));
     let realm_id = test.state.get_realm_id();
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,

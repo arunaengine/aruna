@@ -299,7 +299,7 @@ fn sweeps_stale_copies() {
         digest: kept.into(),
         size: 4,
         manifest: String::new(),
-        published_by: aruna_core::UserId::nil(config.realm_id),
+        published_by: aruna_core::user::id::UserId::nil(config.realm_id),
         published_at_ms: 1,
     });
     let now = GRACE.as_millis() as u64 + 10;

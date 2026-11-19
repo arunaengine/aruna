@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::identity::auth::Actor;
@@ -15,6 +14,7 @@ use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConf
 use aruna_core::structs::storage::bucket_metadata::release_key;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::release::RangeMembers;
+use aruna_core::user::id::UserId;
 use serde_json::json;
 
 use super::access::LoadAccessOperation;

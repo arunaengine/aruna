@@ -6,7 +6,6 @@
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::AuthorizationError;
@@ -24,6 +23,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
+use aruna_core::user::id::UserId;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -664,13 +664,13 @@ impl Operation for DeliverWakesOperation {
 mod tests {
     use super::*;
     use crate::jobs::store::job_calls::ClaimOutcome;
-    use aruna_core::UserId;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::execution::job::JobPayload;
     use aruna_core::structs::execution::job::JobRecord;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::HashIndex;
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::scan::iter_prefix_page;
     use aruna_test_support::jobs::insert_job;

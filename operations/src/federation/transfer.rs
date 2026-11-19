@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::StorageError;
@@ -17,6 +16,7 @@ use aruna_core::transfer::{
     ExportGrant, ImportDestination, ImportIntent, MAX_TRANSFER_SECS, TransferError, check_grant,
     check_intent, import_key,
 };
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

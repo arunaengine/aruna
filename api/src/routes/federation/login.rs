@@ -336,7 +336,6 @@ mod tests {
     use crate::auth::handle_token;
     use crate::routes::access::sessions::{CreateSessionRequest, create_session};
     use crate::tests::routes::{test_state, test_storage};
-    use aruna_core::UserId;
     use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
@@ -346,6 +345,7 @@ mod tests {
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::testing::test_context;
     use aruna_operations::auth::bearer_token::validate_bearer_claims;
     use aruna_operations::auth::error::ArunaBearerError;

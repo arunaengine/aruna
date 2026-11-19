@@ -4,7 +4,6 @@
 
 use std::array::TryFromSliceError;
 
-use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::calls::IoError;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
@@ -12,6 +11,7 @@ use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::backend_import::TokenGrant;
+use aruna_core::user::id::UserId;
 use jsonwebtoken::dangerous::insecure_decode;
 use thiserror::Error;
 

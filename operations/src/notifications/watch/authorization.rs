@@ -28,10 +28,10 @@ mod tests {
     use ulid::Ulid;
 
     use aruna_core::NodeId;
-    use aruna_core::UserId;
     use aruna_core::structs::execution::notification_watch::{
         WatchAuthorizationBinding, WatchSubscription,
     };
+    use aruna_core::user::id::UserId;
 
     use crate::notifications::watch::check::{AuthorizedWatchSubscriptions, WatchFilterOperation};
     use crate::notifications::watch::paths::{

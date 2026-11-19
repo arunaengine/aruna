@@ -3,13 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{KeyAction, KeyError, KeyOperation, KeyResult};
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::GROUP_ENCRYPTED_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 /// Runs one member key operation per encrypted bucket and member, best effort.

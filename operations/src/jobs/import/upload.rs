@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, StorageError};
@@ -17,6 +16,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::storage::blob::HiddenBlobKey;
 use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use byteview::ByteView;
 use std::time::{Duration, Instant};

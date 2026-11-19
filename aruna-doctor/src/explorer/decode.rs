@@ -1025,7 +1025,7 @@ mod tests {
         let info = BucketInfo {
             group_id: Ulid::from_bytes([7_u8; 16]),
             created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::local(Ulid::from_bytes([8_u8; 16]), realm_id),
+            created_by: aruna_core::user::id::UserId::local(Ulid::from_bytes([8_u8; 16]), realm_id),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -1327,7 +1327,7 @@ mod tests {
             },
             publication: PolicyPublication {
                 publisher: secret.public(),
-                created_by: aruna_core::UserId::local(Ulid::from_bytes([15_u8; 16]), realm_id),
+                created_by: aruna_core::user::id::UserId::local(Ulid::from_bytes([15_u8; 16]), realm_id),
                 created_at_ms: 42,
                 event_id: Ulid::from_bytes([12_u8; 16]),
                 config_digest: [13_u8; 32],
@@ -1406,7 +1406,7 @@ mod tests {
                 bucket_identity: (
                     Ulid::from_bytes([20_u8; 16]),
                     std::time::SystemTime::UNIX_EPOCH,
-                    aruna_core::UserId::local(Ulid::from_bytes([22_u8; 16]), realm_id),
+                    aruna_core::user::id::UserId::local(Ulid::from_bytes([22_u8; 16]), realm_id),
                 ),
                 target_refs: Vec::new(),
                 mode: PolicyRefMode::Union,
@@ -1444,7 +1444,7 @@ mod tests {
             bucket_identity: (
                 Ulid::from_bytes([24_u8; 16]),
                 std::time::SystemTime::UNIX_EPOCH,
-                aruna_core::UserId::local(Ulid::from_bytes([25_u8; 16]), realm_id),
+                aruna_core::user::id::UserId::local(Ulid::from_bytes([25_u8; 16]), realm_id),
             ),
             generation: 3,
             target_refs: Vec::new(),
@@ -1519,7 +1519,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[3_u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([4_u8; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([4_u8; 16]), realm_id),
             realm_id,
         };
         let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -1583,7 +1583,7 @@ mod tests {
             onboarding_phase: None,
             onboarding_sync_ticket: Some("ticket".to_string()),
             identity: PersistedNodeIdentity::User {
-                owner: aruna_core::UserId::nil(realm_id),
+                owner: aruna_core::user::id::UserId::nil(realm_id),
             },
         };
         let value = postcard::to_allocvec(&state).unwrap();
@@ -1685,7 +1685,7 @@ mod tests {
     #[test]
     fn decodes_upload_entry() {
         let realm_id = RealmId::from_bytes([3_u8; 32]);
-        let created_by = aruna_core::UserId::local(Ulid::from_bytes([10_u8; 16]), realm_id);
+        let created_by = aruna_core::user::id::UserId::local(Ulid::from_bytes([10_u8; 16]), realm_id);
         let upload = MultipartUpload {
             backend: BackendRef::node_default(),
             storage_class: None,
@@ -1725,7 +1725,7 @@ mod tests {
     #[test]
     fn decodes_upload_part() {
         let realm_id = RealmId::from_bytes([9_u8; 32]);
-        let created_by = aruna_core::UserId::local(Ulid::from_bytes([11_u8; 16]), realm_id);
+        let created_by = aruna_core::user::id::UserId::local(Ulid::from_bytes([11_u8; 16]), realm_id);
         let key = MultipartPartKey::new(Ulid::from_bytes([2_u8; 16]), 5);
         let part = MultipartPart {
             part_number: 5,
@@ -2020,7 +2020,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let group_id = Ulid::from_bytes([2_u8; 16]);
         let node_id = iroh::SecretKey::from_bytes(&[3_u8; 32]).public();
-        let created_by = aruna_core::UserId::local(Ulid::from_bytes([6_u8; 16]), realm_id);
+        let created_by = aruna_core::user::id::UserId::local(Ulid::from_bytes([6_u8; 16]), realm_id);
         let head_key = BlobHeadKey::new("bucket", "path/file.txt");
         let head_value =
             aruna_core::structs::storage::blob::CurrentVersionPointer::new_with_generation(

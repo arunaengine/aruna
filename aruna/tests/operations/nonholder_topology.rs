@@ -208,7 +208,7 @@ async fn record_routes_owner() -> TestResult<()> {
 async fn submit_external_job(
     context: &aruna_drivers::driver::DriverContext,
     spec: aruna_core::structs::execution::job::ExecutionSpec,
-    created_by: aruna_core::UserId,
+    created_by: aruna_core::user::id::UserId,
     idempotency_key: Option<String>,
     workspace_mode: WorkspaceMode,
     workspace_bucket: Option<String>,
@@ -389,7 +389,7 @@ async fn origin_scoped_dedup() -> TestResult<()> {
 }
 
 /// Stores upload `[seed; 16]` of `owner` on `node`, which an import submission claims.
-async fn seed_upload(node: &TestNode, owner: aruna_core::UserId, seed: u8) -> TestResult<()> {
+async fn seed_upload(node: &TestNode, owner: aruna_core::user::id::UserId, seed: u8) -> TestResult<()> {
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     let location = BackendLocation {
         backend: BackendRef::node_default(),

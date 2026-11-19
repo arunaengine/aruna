@@ -228,7 +228,7 @@ async fn releases_pin_versions() -> TestResult<()> {
     };
     let answers = ask(context, scope, restricted, &queries).await?;
     assert!(answers[0].releases.is_empty());
-    let stranger = realm.auth_for(aruna_core::UserId::local(
+    let stranger = realm.auth_for(aruna_core::user::id::UserId::local(
         Ulid::from(77u128),
         realm.realm_id,
     ));
@@ -306,7 +306,7 @@ async fn releases_pin_versions() -> TestResult<()> {
     assert!(captured.releases_complete);
 
     // READ on the one input key admits it but shows nothing of the bucket's metadata.
-    let one_key = aruna_core::UserId::local(Ulid::from(78u128), realm.realm_id);
+    let one_key = aruna_core::user::id::UserId::local(Ulid::from(78u128), realm.realm_id);
     let bytes = topology::read_group_auth(holder, group_id)
         .await?
         .ok_or("the group's authorization document")?;
@@ -362,7 +362,7 @@ async fn releases_pin_versions() -> TestResult<()> {
         assert_eq!(answer, HolderAnswer::Crate(expected));
     }
     // A caller without READ gets the generic refusal, not a holder failure.
-    let stranger_token = realm.bearer_for(aruna_core::UserId::local(
+    let stranger_token = realm.bearer_for(aruna_core::user::id::UserId::local(
         Ulid::from(77u128),
         realm.realm_id,
     ));

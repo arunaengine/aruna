@@ -4,12 +4,12 @@
 
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::node_facts;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;

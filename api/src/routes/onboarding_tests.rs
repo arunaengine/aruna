@@ -7,7 +7,6 @@ use super::{
     list_onboarding_secrets, map_finalize_error, revoke_onboarding_secret,
 };
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -26,6 +25,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StaticRealmEndpoint,
 };
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::id::NodeId;
@@ -13,6 +12,7 @@ use aruna_core::structs::execution::job::{
     ExecutionSpec, InputMode, InputSource, JobPayload, JobRecord, JobState, WorkspaceMode,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;

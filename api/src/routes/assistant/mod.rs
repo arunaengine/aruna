@@ -315,7 +315,7 @@ pub(super) fn provider_summary(provider: &AssistantProvider) -> ProviderSummary 
 
 pub(super) async fn load_provider(
     state: &ServerState,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
     provider_id: String,
 ) -> ServerResult<AssistantProvider> {
     drive(
@@ -329,7 +329,7 @@ pub(super) async fn load_provider(
 
 pub(super) async fn save_provider(
     state: &ServerState,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
     expected: AssistantProvider,
     provider: AssistantProvider,
 ) -> ServerResult<AssistantProvider> {

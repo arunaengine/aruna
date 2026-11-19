@@ -63,7 +63,7 @@ pub struct EnsureBucketOperation {
     name: String,
     group_id: GroupId,
     created_at_ms: u64,
-    creator: aruna_core::UserId,
+    creator: aruna_core::user::id::UserId,
     step: BucketStep,
 }
 
@@ -495,7 +495,7 @@ pub fn describe_pack(pack: &Bytes) -> Result<GitPack, GitError> {
 /// Notes a published pack that was made from this node's cache as imported there, so the next
 /// projection does not index objects the cache already holds. A failure only costs that import.
 pub fn mark_imported(
-    (document_id, actor): (Ulid, aruna_core::UserId),
+    (document_id, actor): (Ulid, aruna_core::user::id::UserId),
     pack: &GitPack,
 ) -> MarkImportedOperation {
     MarkImportedOperation {
@@ -508,7 +508,7 @@ pub fn mark_imported(
 #[derive(Debug, PartialEq)]
 pub struct MarkImportedOperation {
     document_id: Ulid,
-    actor: aruna_core::UserId,
+    actor: aruna_core::user::id::UserId,
     digest: String,
 }
 

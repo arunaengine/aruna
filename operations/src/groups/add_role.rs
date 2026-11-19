@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
 };
@@ -26,6 +25,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{GroupId, Key, KeySpace};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashSet;
 use thiserror::Error;
@@ -697,7 +697,6 @@ pub mod test {
 
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
     use crate::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation, RoleAddition};
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
@@ -712,6 +711,7 @@ pub mod test {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::RoleId;
+    use aruna_core::user::id::UserId;
     use aruna_core::{DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
@@ -1135,7 +1135,7 @@ pub mod test {
             mutated_group.clone(),
             mutated_auth_doc.clone(),
             true,
-            Vec::<aruna_core::UserId>::new(),
+            Vec::<aruna_core::user::id::UserId>::new(),
         )));
         let Ok(Next::Then { output, calls }) = checked.next(IoResult::Child(written)) else {
             panic!("expected the change with the drain wake");

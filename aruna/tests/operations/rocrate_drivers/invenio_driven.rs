@@ -136,7 +136,7 @@ pub(super) async fn seal_credential(
 
 pub(super) async fn seal_link_token(
     context: &DriverContext,
-    user: aruna_core::UserId,
+    user: aruna_core::user::id::UserId,
     group_id: Ulid,
     connector_id: Ulid,
     link_id: Ulid,

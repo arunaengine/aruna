@@ -1178,7 +1178,6 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
 
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::{ConversionError, StorageError};
     use aruna_core::events::{Event, StorageEvent};
@@ -1191,6 +1190,7 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::worker::FjallStorage;
     use std::sync::Arc;

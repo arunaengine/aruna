@@ -6,7 +6,6 @@
 use std::collections::VecDeque;
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 use aruna_core::operation::Operation;
@@ -15,6 +14,7 @@ use aruna_core::structs::execution::job::{
     JobId, JobPayload, JobRecord, PluginWorkSpec, RETENTION_MS, WorkspaceMode,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::user::id::UserId;
 use aruna_plugin_types::calls::{ErrorKind, Field, HostError, JobStatus};
 use base64::Engine;
 use serde_json::Value;

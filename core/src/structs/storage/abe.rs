@@ -433,7 +433,7 @@ pub enum AbeEffect {
         resolved: super::blob::ResolvedBackend,
         bucket: String,
         key: String,
-        created_by: crate::UserId,
+        created_by: crate::user::id::UserId,
         blob: crate::stream::BackendStream<Result<bytes::Bytes, crate::stream::StreamError>>,
         size: Option<u64>,
     },

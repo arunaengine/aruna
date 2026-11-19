@@ -343,7 +343,6 @@ impl Operation for CreateBucketOperation {
 #[cfg(test)]
 mod mapped_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::BlobEffect;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::BlobError;
@@ -355,6 +354,7 @@ mod mapped_tests {
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{Effects, TxnId};
+    use aruna_core::user::id::UserId;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;

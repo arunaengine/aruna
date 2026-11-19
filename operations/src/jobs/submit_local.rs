@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
@@ -16,7 +17,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::structs::storage::backend_import::BackendImportSpec;
 use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 
 use super::JOB_RETENTION_MS;
 use super::records::pages::ServingNode;

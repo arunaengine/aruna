@@ -7,11 +7,11 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::realm_vault::{RealmSecretRef, RealmVaultPurpose};
 use crate::register::RegisterStamp;
 use crate::structs::execution::notification::NotificationRecord;
+use crate::user::id::UserId;
 
 /// The notification categories a user may receive by email.
 pub const EMAIL_CATEGORIES: &[&str] = &["group.membership", "share.upload", "bucket.encryption"];

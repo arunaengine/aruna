@@ -129,12 +129,12 @@ impl Operation for GrantedReadOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::execution::job::SubmissionId;
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::storage::read_grant::ReadGrant;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

@@ -4,7 +4,6 @@
 
 use std::fmt::Debug;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -17,6 +16,7 @@ use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode}
 use aruna_core::structs::storage::holders::KeyLookup;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use aruna_core::vault_format::key_fingerprint;
 use ulid::Ulid;
 

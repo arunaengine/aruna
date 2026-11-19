@@ -9,7 +9,6 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentClock;
 use aruna_core::alpn::{ADMISSION_CLOSE, MEMBERSHIP_CLOSE};
 use aruna_core::auth::revocation_live;
@@ -32,6 +31,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};

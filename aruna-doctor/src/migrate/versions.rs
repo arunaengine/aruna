@@ -6,13 +6,14 @@
 use super::session_refs::{self, Layout};
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
+use aruna_core::NodeId;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, BlobVersionState, VersionKey};
 use aruna_core::structs::storage::broken::BrokenVersion;
 use aruna_core::structs::storage::format::EncodingClass;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_operations::connectors::repository::connector_reference_write;
 use aruna_operations::connectors::root_record::{compact_version, root_write};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};

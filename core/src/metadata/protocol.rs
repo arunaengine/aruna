@@ -4,6 +4,7 @@
 
 use std::time::{Duration, SystemTime};
 
+use crate::NodeId;
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
 use crate::audit::{AuditPageRequest, AuditPageResponse, MAX_PAGE_BYTES};
 use crate::calls::{IoCall, IoError, IoResult};
@@ -35,7 +36,7 @@ use crate::structs::{
     SyncPull, SyncPullStatus, SyncRefusal, SyncRelationship, SyncVersionPage,
 };
 use crate::types::GroupId;
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -524,7 +525,7 @@ pub enum MetadataTransportMessage {
     },
     /// One user's vault heads or key records asked of a holder.
     FetchVaultRecords {
-        user_id: crate::UserId,
+        user_id: crate::user::id::UserId,
         query: crate::effects::VaultQuery,
     },
     /// An empty answer means this holder has no records, never that the vault is absent.
@@ -1301,12 +1302,12 @@ pub fn peer_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UserId;
     use crate::audit::{AuditPageEntry, AuditPageRequest};
     use crate::metadata::MAX_TOKEN_LEN;
     use crate::structs::identity::auth::{AuthContext, PathRestriction, Permission};
     use crate::structs::identity::realm::RealmId;
     use crate::structs::storage::metadata_registry::{MetadataAuditOperation, MetadataAuditRecord};
+    use crate::user::id::UserId;
 
     #[test]
     fn transport_auth_fields() {

@@ -289,7 +289,7 @@ pub(super) fn graph(auth: &AuthContext, id: Ulid, commit: &str) -> GraphOperatio
 
 #[derive(Debug, PartialEq)]
 pub(super) struct GraphOperation {
-    actor: aruna_core::UserId,
+    actor: aruna_core::user::id::UserId,
     id: Ulid,
     commit: String,
     exporting: bool,
@@ -1329,7 +1329,7 @@ mod tests {
             let before = commit(&path, file, &metadata(&["depth"])).await;
             let after = commit(&path, file, &metadata(&["depth", "stuff"])).await;
             let store = GitStore::new(root.path().to_path_buf(), "helper".into());
-            let auth = super::super::project::author(aruna_core::UserId::nil(
+            let auth = super::super::project::author(aruna_core::user::id::UserId::nil(
                 aruna_core::structs::identity::realm::RealmId([1; 32]),
             ));
             let before = run_graph(&store, graph(&auth, id, &before)).await;

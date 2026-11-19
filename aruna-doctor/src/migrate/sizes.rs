@@ -70,7 +70,7 @@ mod tests {
                 establishing_event_id: document_id,
                 last_event_id: document_id,
             },
-            user_id: aruna_core::UserId::nil(realm_id),
+            user_id: aruna_core::user::id::UserId::nil(realm_id),
             node_id: node,
             payload: MetadataEventPayload::Scaffold {
                 name: "Sizes".into(),

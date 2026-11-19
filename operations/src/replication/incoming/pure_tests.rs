@@ -17,6 +17,7 @@ use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::s3::usage::{QuotaGate, QuotaGateError};
+use aruna_core::NodeId;
 use aruna_core::calls::CallRun;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -57,7 +58,7 @@ use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurg
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::types::{Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;

@@ -317,7 +317,6 @@ mod tests {
     use crate::csp::PortalCspConfig;
     use crate::server::state::ServerState;
     use crate::server::{MAX_BODY_SIZE, Server, ServerConfig};
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{
         AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode, Signed,
@@ -326,6 +325,7 @@ mod tests {
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_operations::document_repository::GetConfigOperation;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};

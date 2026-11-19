@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::id_mint::IdMint;
 use crate::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord, ResourceEvent,
@@ -12,6 +11,7 @@ use crate::structs::execution::notification_watch::{
 };
 use crate::structs::identity::group::GroupAuthorizationDocument;
 use crate::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+use crate::user::id::UserId;
 
 pub fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
     let mut ids: Vec<UserId> = auth_doc

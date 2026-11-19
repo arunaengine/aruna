@@ -2426,8 +2426,8 @@ fn rpc_phase_order(phase: RpcPhase) -> u8 {
 mod tests {
     use super::*;
     use crate::test_support::{make_node, make_secret};
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::user::id::UserId;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 

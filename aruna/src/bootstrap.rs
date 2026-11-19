@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::auth::ONBOARDING_SECRET_KEY;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -13,7 +14,7 @@ use aruna_core::onboarding::{
 };
 use aruna_core::placement::target_placement_ref;
 use aruna_core::structs::identity::node_state::PersistedNodeState;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::device_node::realm_documents::fetch_from_peers;
 use aruna_operations::document_repository::GetConfigOperation;

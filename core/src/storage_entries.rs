@@ -6,7 +6,6 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::UserId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{
     DocumentChange, DocumentChangeKind, DocumentSyncConflict, DocumentSyncRevision, DocumentTarget,
@@ -40,6 +39,7 @@ use crate::structs::identity::user::User;
 use crate::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::types::{GroupId, Key, KeySpace, Value};
+use crate::user::id::UserId;
 
 pub fn subject_index_key(subject_id: &str) -> Key {
     ByteView::from(subject_id.as_bytes().to_vec())
@@ -929,6 +929,7 @@ mod tests {
         shard_manifest_prefix, stale_conflict_deletes, sync_conflict_entry, sync_conflict_key,
         sync_revision_entry, sync_revision_key, updated_index_key,
     };
+    use crate::NodeId;
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
     use crate::document::ShardManifestEntry;
     use crate::document::{
@@ -946,7 +947,7 @@ mod tests {
     use crate::structs::identity::realm::RealmId;
     use crate::structs::placement::record::PlacementRef;
     use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use crate::{NodeId, UserId};
+    use crate::user::id::UserId;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

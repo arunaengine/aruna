@@ -6,7 +6,6 @@
 use aruna_core::id_mint::IdMint;
 use std::collections::HashSet;
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget, roles_narrowed};
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
@@ -21,6 +20,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use tracing::warn;
 

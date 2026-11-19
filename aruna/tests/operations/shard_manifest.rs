@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::StructuredId;
-use aruna_core::UserId;
 use aruna_core::document::{DocumentTarget, ShardManifest};
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,

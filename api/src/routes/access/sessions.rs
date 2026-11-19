@@ -352,8 +352,8 @@ mod tests {
     use crate::auth::handle_token;
     use crate::error::TokenError;
     use crate::tests::realms::member_state;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::auth::SessionRef;
+    use aruna_core::user::id::UserId;
     use axum::response::IntoResponse;
     use tempfile::TempDir;
 

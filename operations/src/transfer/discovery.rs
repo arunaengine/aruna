@@ -780,7 +780,7 @@ mod tests {
         let refused = load(&restricted).await;
         assert!(matches!(refused, Err(ImportRuleError::Forbidden)));
         let mut stranger = auth;
-        stranger.user_id = aruna_core::UserId::local(Ulid::from_parts(9, 9), realm);
+        stranger.user_id = aruna_core::user::id::UserId::local(Ulid::from_parts(9, 9), realm);
         let refused = load(&stranger).await;
         assert!(matches!(refused, Err(ImportRuleError::Forbidden)));
     }
@@ -795,7 +795,7 @@ mod tests {
     fn restricted_token_refused() {
         let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let auth = AuthContext {
-            user_id: aruna_core::UserId::nil(realm),
+            user_id: aruna_core::user::id::UserId::nil(realm),
             realm_id: realm,
             path_restrictions: Some(Vec::new()),
             session: None,

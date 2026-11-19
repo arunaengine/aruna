@@ -6,6 +6,7 @@
 use crate::s3::bucket::key::rows::{
     SettingsError, audit_row, authority_keys, keyless, parse_authority,
 };
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -21,7 +22,7 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::holders::{HolderState, KeyLookup};
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

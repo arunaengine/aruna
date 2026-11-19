@@ -6,7 +6,7 @@
 #[cfg(test)]
 use crate::notifications::inbox::UpsertInboxOperation;
 use aruna_core::NodeId;
-use aruna_core::UserId;
+use aruna_core::user::id::UserId;
 #[cfg(test)]
 use aruna_core::document::DocumentTarget;
 use aruna_core::structs::execution::notification::{

@@ -219,7 +219,7 @@ async fn node_info_propagates() -> Result<(), Box<dyn std::error::Error>> {
 fn test_actor(node: &TestNode, realm_id: RealmId) -> Actor {
     Actor {
         node_id: node.net.node_id(),
-        user_id: aruna_core::UserId::nil(realm_id),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
         realm_id,
     }
 }
@@ -234,7 +234,7 @@ async fn create_metadata_document(
         CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
                 node_id: node.net.node_id(),
-                user_id: aruna_core::UserId::local(Ulid::from_bytes([74; 16]), realm_id),
+                user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([74; 16]), realm_id),
                 realm_id,
             },
             group_id,
@@ -527,7 +527,7 @@ async fn seed_config_topic(
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: nodes[1].net.node_id(),
-        user_id: aruna_core::UserId::nil(realm_id),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
         realm_id,
     };
     let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });

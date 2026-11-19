@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::IoError;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
@@ -13,6 +12,7 @@ use aruna_core::structs::execution::notification_watch::{
     MAX_PREFIX_LEN, WatchAuthorizationBinding, WatchEventMask, WatchSubscription, parse_watch_key,
 };
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

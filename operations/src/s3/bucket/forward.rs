@@ -336,8 +336,8 @@ fn accept_existing(info: &BucketInfo, group_id: GroupId, bucket: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::user::id::UserId;
     use std::time::SystemTime;
     use ulid::Ulid;
 

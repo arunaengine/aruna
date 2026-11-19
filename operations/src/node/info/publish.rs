@@ -226,7 +226,7 @@ mod state_machine_tests {
 
     fn device() -> RealmNodeKind {
         RealmNodeKind::User {
-            owner: aruna_core::UserId::new(Ulid::from_parts(2, 2), REALM),
+            owner: aruna_core::user::id::UserId::new(Ulid::from_parts(2, 2), REALM),
         }
     }
 

@@ -699,7 +699,7 @@ mod tests {
     fn missing_bucket_found() {
         let authority = NativeAuthority::Relationship(Ulid::from_bytes([4; 16]));
         let auth = AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([5; 16]), ids().1),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([5; 16]), ids().1),
             realm_id: ids().1,
             path_restrictions: None,
             session: None,
@@ -763,7 +763,7 @@ mod tests {
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let source = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let target = iroh::SecretKey::from_bytes(&[4; 32]).public();
-        let creator = aruna_core::UserId::local(Ulid::from_parts(5, 5), realm_id);
+        let creator = aruna_core::user::id::UserId::local(Ulid::from_parts(5, 5), realm_id);
         let relationship = SyncRelationship {
             id: Ulid::from_parts(2, 2),
             source: ArunaArn::s3_bucket(realm_id, source, "source").unwrap(),
@@ -825,7 +825,7 @@ mod tests {
             reference_handling: ReferenceHandling::Materialize,
             reference_serving: false,
             replicate_deletes: true,
-            created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            created_by: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             state: SyncState::Enabled,
             status: SyncStatusSnapshot::default(),

@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -26,6 +25,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, KeySpace};
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::{
     UserAttributeError, counted_attributes, is_reserved_attribute, validate_attribute_count,
     validate_attribute_key, validate_attribute_value,
@@ -893,7 +893,6 @@ fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateU
 mod pure_tests {
     use super::UserWritten;
     use super::{Step, UpdateUserError, UpdateUserInput, UpdateUserOperation, UserWrite};
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::document::{
@@ -910,6 +909,7 @@ mod pure_tests {
     use aruna_core::structs::identity::user::User;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::{Key, KeySpace, Value};
+    use aruna_core::user::id::UserId;
     use aruna_core::{
         DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
         SYNC_REVISION_KEYSPACE, USER_KEYSPACE,

@@ -7,13 +7,13 @@
 // permission checks.
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::{NodeRealm, RealmId};
 use aruna_core::structs::storage::distribution::delegation::{
     Delegation, Payload, SignedDelegation,
 };
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::accept_delegation::{AcceptDelegationOperation, DelegateError};

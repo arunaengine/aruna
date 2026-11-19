@@ -1373,11 +1373,11 @@ mod pure_tests {
         assert!(is_transient(&profile_rejection("validator_unavailable")));
     }
 
-    use aruna_core::UserId;
     use aruna_core::structs::execution::job::{
         AttemptIntent, CapturedInput, InputMode, InputSelection, OutputObject,
     };
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use serde_json::Value;
 
     pub(super) fn execution_record() -> (JobRecord, ExecutionSpec) {

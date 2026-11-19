@@ -20,7 +20,6 @@ use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
 use crate::transfer::abe_rekey::RekeyProgress;
-use aruna_core::UserId;
 use aruna_core::blob_records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
 };
@@ -57,6 +56,7 @@ use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;

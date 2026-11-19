@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::session_refs::Layout;
+use aruna_core::NodeId;
 use aruna_core::git::{
     GitChange, GitCheckpoint, GitPack, GitRecord, LfsLock, RefUpdate, StoredObject,
 };
@@ -11,7 +12,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use serde::Deserialize;
 use ulid::Ulid;
 

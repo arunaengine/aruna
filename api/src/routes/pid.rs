@@ -995,7 +995,7 @@ mod tests {
         let mapping = PersistentIdMapping::requested(
             id,
             false,
-            aruna_core::UserId::local(
+            aruna_core::user::id::UserId::local(
                 Ulid::from_bytes([4; 16]),
                 aruna_core::structs::identity::realm::RealmId([5; 32]),
             ),
@@ -1079,7 +1079,7 @@ mod tests {
                 .to_bytes(),
         );
         let node_id = iroh::SecretKey::from_bytes(&[8; 32]).public();
-        let user_id = aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id);
+        let user_id = aruna_core::user::id::UserId::local(Ulid::from_bytes([4; 16]), realm_id);
         let actor = Actor {
             node_id,
             user_id,

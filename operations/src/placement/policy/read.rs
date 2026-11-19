@@ -466,13 +466,13 @@ mod pure_tests {
     use super::*;
     use crate::tests::policy::{admin_user, fetch_requests, realm_view, signed_document};
     use aruna_core::NodeId;
-    use aruna_core::UserId;
     use aruna_core::effects::Effect;
     use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_core::structs::placement::policy::document::PolicyPublicationClaim;
     use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector};
     use aruna_core::structs::placement::record::LabelMatch;
     use aruna_core::types::Effects;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

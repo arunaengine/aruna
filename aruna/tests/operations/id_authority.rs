@@ -419,7 +419,7 @@ async fn owner_cannot_withdraw() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
     let (document_id, placement) =
         seed_document(&realm, group_id, "datasets/guarded", true).await?;
-    let owner = aruna_core::UserId::local(Ulid::generate(), realm.realm_id);
+    let owner = aruna_core::user::id::UserId::local(Ulid::generate(), realm.realm_id);
     realm.grant_group_user(group_id, owner).await?;
     let sender = realm.non_holder(&placement);
 
@@ -591,7 +591,7 @@ fn revision(occurred_at_ms: u64) -> PersistentIdRevision {
     }
 }
 
-fn active_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> PersistentIdMapping {
+fn active_mapping(document_id: Ulid, minted_by: aruna_core::user::id::UserId) -> PersistentIdMapping {
     let mut mapping = PersistentIdMapping::requested(
         document_id,
         false,
@@ -605,7 +605,7 @@ fn active_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> Persisten
     mapping
 }
 
-fn withdrawn_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> PersistentIdMapping {
+fn withdrawn_mapping(document_id: Ulid, minted_by: aruna_core::user::id::UserId) -> PersistentIdMapping {
     let mut mapping = PersistentIdMapping::requested(
         document_id,
         false,

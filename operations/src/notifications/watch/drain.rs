@@ -125,11 +125,11 @@ impl Operation for WatchDrainOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::notification_watch::watch_event_entry;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::Value;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn event() -> WatchEvent {

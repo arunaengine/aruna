@@ -77,9 +77,9 @@ impl Operation for CheckPermissionsOperation {
 mod test {
     use std::collections::{HashMap, HashSet};
 
-    use aruna_core::UserId;
     use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_net::NetHandle;
     use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;

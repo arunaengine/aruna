@@ -5,6 +5,7 @@
 
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
+use aruna_core::NodeId;
 use aruna_core::structs::execution::job::{
     StagingJobCheckpoint, StagingJobError, StagingJobItem, StagingJobPhase, StagingJobPrefix,
     StagingJobSpec,
@@ -13,7 +14,7 @@ use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{BucketIdentity, BucketInfo};
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

@@ -432,7 +432,6 @@ fn binding_strategy<'a>(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::UserId;
     use crate::admin_documents::AdminDocumentTarget;
     use crate::reducer::{AdminDocumentState, overlay_placement};
     use crate::structs::identity::realm::{RealmId, RealmNode, RealmNodeKind};
@@ -440,6 +439,7 @@ mod pure_tests {
         AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, NodePlacementEntry, StrategyBinding,
     };
     use crate::structs::storage::node_info::{KIND_LABEL_KEY, LOCATION_LABEL_KEY};
+    use crate::user::id::UserId;
     use proptest::prelude::*;
     use ulid::Ulid;
 

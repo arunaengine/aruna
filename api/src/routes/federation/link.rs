@@ -10,11 +10,11 @@ use crate::lookup::actor;
 use crate::routes::federation::login::SECRET_LEN;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
-use aruna_core::UserId;
 use aruna_core::federation::Signed;
 use aruna_core::handoff::LoginHandoff;
 use aruna_core::link::LinkConfirmation;
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{drive, drive_retry};
 use aruna_operations::federation::link::{
     ConfirmLinkConfig, ConfirmLinkOperation, LinkLoginConfig, LinkLoginError, LinkLoginOperation,

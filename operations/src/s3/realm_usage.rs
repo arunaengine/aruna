@@ -323,7 +323,7 @@ mod state_machine_tests {
         config.seed_default_placement();
         config.ensure_node(node(1), RealmNodeKind::Server);
         config.ensure_node(node(2), RealmNodeKind::Server);
-        let owner = aruna_core::UserId::new(Ulid::from_bytes([9; 16]), REALM);
+        let owner = aruna_core::user::id::UserId::new(Ulid::from_bytes([9; 16]), REALM);
         config.ensure_node(node(3), RealmNodeKind::User { owner });
         Value::from(postcard::to_allocvec(&config).unwrap())
     }

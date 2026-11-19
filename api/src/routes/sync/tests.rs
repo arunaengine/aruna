@@ -8,7 +8,6 @@ use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_state as build_state, test_storage,
     write_doc,
 };
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -27,6 +26,7 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::mirror_repair::SyncMirrorRecord;
+use aruna_core::user::id::UserId;
 use aruna_drivers::testing::test_context;
 use aruna_operations::replication::mirror_repair::DrainRepairsOperation;
 use tempfile::TempDir;

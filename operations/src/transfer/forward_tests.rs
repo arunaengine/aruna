@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::presets::replica_layout;
 use aruna_core::structs::storage::distribution::{
     DistributionConfig, DistributionError, DistributionRequest, DistributionSettings, SetRoot,
     next_snapshot,
 };
+use aruna_core::user::id::UserId;
 
 use super::*;
 use aruna_drivers::driver::drive;

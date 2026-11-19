@@ -232,8 +232,8 @@ impl Operation for ServePublishOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
 
     // The publisher checks a linked dataset with the caller's own access, like the REST route.

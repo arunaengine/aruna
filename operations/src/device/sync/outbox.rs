@@ -681,8 +681,8 @@ impl Operation for RequeueUploadsOperation {
 mod tests {
     use std::sync::Arc;
 
-    use aruna_core::UserId;
     use aruna_core::structs::{FolderMode, RemoteBinding};
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use super::{

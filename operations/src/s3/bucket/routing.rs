@@ -248,7 +248,7 @@ mod pure_tests {
         BucketInfo {
             group_id: group(),
             created_at: SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -335,7 +335,7 @@ mod pure_tests {
             bucket: "b".to_string(),
             key_prefix: "archive/".to_string(),
             schedule: None,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             last_job: None,

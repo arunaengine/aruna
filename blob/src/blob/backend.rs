@@ -1616,7 +1616,7 @@ mod split_tests {
             backend_path: backend_path.to_string(),
             ulid: Ulid::nil(),
             format: StoredFormat::default(),
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
             partial: false,

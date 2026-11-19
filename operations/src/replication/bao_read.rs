@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
@@ -35,7 +36,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use thiserror::Error;
 use ulid::Ulid;
@@ -1545,7 +1546,6 @@ mod pure_tests {
     use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
 
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -1558,6 +1558,7 @@ mod pure_tests {
         BackendLocation, BackendRef, BlobVersion, BucketInfo,
     };
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use super::{

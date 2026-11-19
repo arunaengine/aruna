@@ -6,6 +6,7 @@
 use super::staging::{self, LegacyStaging};
 use super::{Rewrites, decode_error, session_refs};
 use crate::explorer::ExplorerError;
+use aruna_core::NodeId;
 use aruna_core::repository::{ExportIdentity, LinkFailure, RepositoryRecord};
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
@@ -23,7 +24,7 @@ use aruna_core::structs::storage::backend_import::BackendImportSpec;
 use aruna_core::structs::storage::blob::BucketIdentity;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeResult, StoragePurgeSpec};
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_operations::jobs::export::ExportCheckpoint;
 use aruna_operations::jobs::import::ImportCheckpoint;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
@@ -605,7 +606,6 @@ mod tests {
     use crate::migrate::migrate_output;
     use crate::migrate::tests::{read, write};
     use aruna_core::NodeId;
-    use aruna_core::UserId;
     use aruna_core::keyspaces::{JOB_KEYSPACE, JOB_STATE_KEYSPACE};
     use aruna_core::structs::execution::job::{
         CapturedInput, ExecutionSpec, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
@@ -619,6 +619,7 @@ mod tests {
     use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
     use aruna_core::structs::storage::backend_import::BackendImportSpec;
     use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
+    use aruna_core::user::id::UserId;
     use aruna_operations::jobs::export::ExportCheckpoint;
     use aruna_operations::jobs::import::ImportCheckpoint;
     use serde::Serialize;

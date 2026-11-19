@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::PeerAuthRefusal;
 use aruna_core::jobs::{JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange};
@@ -13,6 +12,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobRecord, KeyWait};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 
 use super::job_artifacts::{

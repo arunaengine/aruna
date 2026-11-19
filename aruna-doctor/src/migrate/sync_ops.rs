@@ -166,7 +166,6 @@ mod tests {
     use super::super::migrate_output;
     use super::super::tests::{strip, write};
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
@@ -175,6 +174,7 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_core::user::id::UserId;
     use irokle::oplog::Oplog;
     use irokle::{Ed25519Signer, EventEnvelope, ReplicationPolicy, Signer, TopicGenesis};
     use ulid::Ulid;

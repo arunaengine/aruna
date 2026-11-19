@@ -8,7 +8,6 @@ use crate::tests::execution::auth_for;
 use aruna_compute::executor::{ExecutorBackend, SessionChannel};
 use aruna_compute::registry::ExecutorRegistry;
 use aruna_compute::session::{Session, SessionConfig};
-use aruna_core::UserId;
 use aruna_core::compute::offer::BackendCaps;
 use aruna_core::compute::session::SessionPhase;
 use aruna_core::compute::{
@@ -38,6 +37,7 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;

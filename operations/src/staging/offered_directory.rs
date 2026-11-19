@@ -7,12 +7,12 @@ use crate::s3::bucket::create::CreateBucketError;
 use crate::s3::bucket::write_guard::BucketGuardError;
 use crate::s3::usage::UsageUpdateError;
 use crate::staging::offer::list::ListOffersError;
-use aruna_core::UserId;
 use aruna_core::calls::IoError;
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

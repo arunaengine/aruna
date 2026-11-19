@@ -9,7 +9,6 @@ use super::{
 use crate::blob::BlobHandler;
 use crate::blob::backend::build_part_path;
 use crate::blob::io::compose_chunk;
-use aruna_core::UserId;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -21,6 +20,7 @@ use aruna_core::structs::storage::multipart::{
     MAX_PART_SIZE, MultipartPart, MultipartPartKey, PartPiece, UploadEncryption, WorkingShare,
 };
 use aruna_core::structs::storage::pithos::{MAX_SIZE, WORKING_SET};
+use aruna_core::user::id::UserId;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use opendal::{Operator, Writer};

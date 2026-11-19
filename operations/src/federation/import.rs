@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -28,7 +29,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::transfer::{
     ExportGrant, ImportDestination, ImportIntent, TransferError, check_grant, check_intent,
 };
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use serde::Serialize;
 use thiserror::Error;
 use tracing::warn;

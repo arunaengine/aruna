@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE};
@@ -16,7 +17,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
 use aruna_core::structs::storage::holders::KeyLookup;
 use aruna_core::types::Value;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 use crate::s3::bucket::seal_missing::{SealMissingError, SealMissingInput, SealMissingOperation};
@@ -166,7 +167,6 @@ mod tests {
     use crate::s3::bucket::encryption::{EnableEncryptionOperation, EnableInput};
     use crate::s3::bucket::key::install::{InstallInput, InstallKeyOperation};
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::UserId;
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -179,6 +179,7 @@ mod tests {
     };
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::types::Key;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use std::collections::HashMap;
     use std::time::SystemTime;

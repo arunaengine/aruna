@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::protocol::{PersistentIdRequest, PersistentIdResolution};
@@ -14,6 +13,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export_types::GetVisibleRequest;

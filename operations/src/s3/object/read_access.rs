@@ -248,12 +248,12 @@ mod tests {
 mod storage_tests {
     use std::time::SystemTime;
 
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use super::*;

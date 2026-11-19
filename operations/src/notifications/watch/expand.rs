@@ -12,7 +12,6 @@ mod tests {
     };
     use crate::notifications::watch::expansion::{RetryDrainOperation, WatchExpandOperation};
     use aruna_core::NodeId;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -31,6 +30,7 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::structs::storage::blob::object_permission_path;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive, drive_retry};
     use aruna_storage::storage::handle::StorageHandle;
     use ulid::Ulid;

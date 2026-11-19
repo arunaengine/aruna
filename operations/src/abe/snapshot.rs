@@ -22,7 +22,7 @@ pub(super) struct Snapshot {
     pub revisions: Vec<[u8; 32]>,
     pub rules: PermissionRules,
     pub holder: bool,
-    pub holders: std::collections::BTreeSet<aruna_core::UserId>,
+    pub holders: std::collections::BTreeSet<aruna_core::user::id::UserId>,
     pub policies: bool,
     pub due: bool,
     /// The realm and group CEL policies each enumerated write is checked against.
@@ -263,7 +263,7 @@ impl KeyOperation {
             &self.bucket,
         ))
     }
-    pub(super) fn recipient(&self) -> aruna_core::UserId {
+    pub(super) fn recipient(&self) -> aruna_core::user::id::UserId {
         match &self.action {
             KeyAction::Publish(grant) => grant.context.request.recipient_user,
             KeyAction::Member(user) => *user,

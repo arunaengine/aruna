@@ -1018,6 +1018,7 @@ impl Operation for RebuildIndexOperation {
 mod tests {
     use super::*;
     use crate::metadata::repository::create_outbox_entries;
+    use aruna_core::NodeId;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
@@ -1027,7 +1028,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::time::unix_timestamp_millis;
-    use aruna_core::{NodeId, UserId};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use std::collections::{HashMap, HashSet};
 

@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use crate::NodeId;
 use crate::effects::Effect;
 use crate::git_state::{Ancestry, Projection, ProjectionInputs};
 use crate::keyspaces::GIT_RECORD_KEYSPACE;
@@ -14,7 +15,7 @@ use crate::structs::storage::dataset_location::DatasetLocation;
 use crate::structs::storage::routing::NodeRouting;
 use crate::task::{TaskEffect, TaskKey};
 use crate::types::{GroupId, Key, KeySpace, Value};
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 use bytes::Bytes;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};

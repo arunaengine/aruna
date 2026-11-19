@@ -198,11 +198,11 @@ pub(crate) mod tests {
     use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
     use crate::auth::permission_rules::CollectedRole;
     use crate::tests::calls::compiled;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::types::Value;
+    use aruna_core::user::id::UserId;
     use std::collections::HashSet;
     use ulid::Ulid;
 

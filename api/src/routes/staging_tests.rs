@@ -8,7 +8,6 @@ use crate::openapi::ApiDoc;
 use crate::tests::routes::{
     seed_realm_auth, seed_realm_config, test_state, test_storage, write_doc,
 };
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -31,6 +30,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::testing::test_context;
 use std::collections::HashMap;

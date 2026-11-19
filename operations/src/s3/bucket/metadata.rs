@@ -175,12 +175,12 @@ impl Operation for PutMetadataOperation {
 mod tests {
     use super::*;
     use crate::s3::bucket::dataset::BucketMetadataOperation;
-    use aruna_core::UserId;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use std::time::SystemTime;
     use ulid::Ulid;

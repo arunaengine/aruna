@@ -5,13 +5,13 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::document::DocumentTarget;
 use crate::errors::ConversionError;
 use crate::keyspaces::{EMAIL_SETTINGS_KEYSPACE, WEBHOOK_SETTINGS_KEYSPACE};
 use crate::register::{RegisterStamp, current_write};
 use crate::structs::execution::email::{EMAIL_CATEGORIES, EmailPreference};
 use crate::structs::execution::webhook::{WebhookSubscription, valid_url};
+use crate::user::id::UserId;
 
 /// Bytes a sealed address or signing secret may take, with the HPKE overhead.
 const SEALED_BYTES: usize = 1024;

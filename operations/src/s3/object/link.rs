@@ -708,7 +708,7 @@ mod tests {
         let visitor = delegation(&caller(AuthContext::anonymous(realm_id)), target, now);
         assert_eq!(visitor.credential_expiry, now + MAX_VALID_SECS);
         let member = AuthContext {
-            user_id: aruna_core::UserId::new(Ulid::from_parts(7, 7), realm_id),
+            user_id: aruna_core::user::id::UserId::new(Ulid::from_parts(7, 7), realm_id),
             ..AuthContext::anonymous(realm_id)
         };
         assert_eq!(

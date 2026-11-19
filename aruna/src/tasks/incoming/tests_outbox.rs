@@ -1465,7 +1465,7 @@ fn admin_outbox(
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
-    let user_id = aruna_core::UserId::nil(realm_id);
+    let user_id = aruna_core::user::id::UserId::nil(realm_id);
     aruna_operations::sync::outbox_record::new_identified_record(
         ulid::Ulid::generate(),
         node(1),

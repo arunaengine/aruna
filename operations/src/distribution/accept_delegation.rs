@@ -112,10 +112,10 @@ impl Operation for AcceptDelegationOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_core::structs::storage::distribution::delegation::Payload;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     const NOW: u64 = 105;

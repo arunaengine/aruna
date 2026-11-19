@@ -13,7 +13,6 @@ use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
-use aruna_core::UserId;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
@@ -36,6 +35,7 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,

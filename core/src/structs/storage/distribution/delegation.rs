@@ -12,12 +12,12 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::UserId;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::storage::origin::VersionOrigin;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 /// The header a forwarded S3 request carries its delegation in.
 pub const DELEGATION_HEADER: &str = "x-aruna-delegation";

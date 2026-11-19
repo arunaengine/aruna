@@ -4,6 +4,7 @@
 
 use std::fmt::Debug;
 
+use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect, ShardNetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, ShardNetEvent, StorageEvent};
@@ -13,7 +14,7 @@ use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementStrategy;
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 pub(crate) fn node(seed: u8) -> NodeId {

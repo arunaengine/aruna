@@ -10,7 +10,6 @@ use std::time::SystemTime;
 
 use aruna::tasks::incoming::folder_pass::{reconcile_folder, reconcile_folders};
 use aruna_clock::testing::poll_until;
-use aruna_core::UserId;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -28,6 +27,7 @@ use aruna_core::structs::{
     RemoteBinding, SyncBase, SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal,
 };
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};

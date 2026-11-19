@@ -760,7 +760,7 @@ mod call_tests {
     #[test]
     fn foreign_origin_forwards() {
         let auth = AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::from_parts(8, 8), realm()),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(8, 8), realm()),
             realm_id: realm(),
             path_restrictions: None,
             session: None,

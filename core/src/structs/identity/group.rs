@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::id_mint::named_id;
 use crate::permission_path::permission_pattern_matches;
@@ -10,6 +9,7 @@ use crate::structs::identity::auth::Actor;
 use crate::structs::identity::auth::{Permission, Role};
 use crate::structs::identity::realm::RealmId;
 use crate::types::{GroupId, RoleId};
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -168,10 +168,10 @@ impl GroupAuthorizationDocument {
 mod test {
     use std::collections::HashSet;
 
-    use crate::UserId;
     use crate::structs::identity::auth::Actor;
     use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
     use crate::structs::identity::realm::RealmId;
+    use crate::user::id::UserId;
     use ulid::Ulid;
 
     #[test]

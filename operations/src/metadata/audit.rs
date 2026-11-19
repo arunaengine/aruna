@@ -581,7 +581,6 @@ mod tests {
     };
     use crate::metadata::audit_entry::{admin_refusal, audit_member};
     use crate::metadata::repository::{audit_entry, metadata_audit_key};
-    use aruna_core::UserId;
     use aruna_core::audit::AUDIT_KEY_BYTES;
     use aruna_core::audit::{AuditPageBatch, AuditPageRequest};
     use aruna_core::effects::StorageEffect;
@@ -599,6 +598,7 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::DriverContext;
     use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;

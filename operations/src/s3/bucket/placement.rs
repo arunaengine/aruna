@@ -297,7 +297,6 @@ impl Operation for WriteDefault {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::Event;
     use aruna_core::id::NodeId;
@@ -306,6 +305,7 @@ mod pure_tests {
         PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::user::id::UserId;
     use std::time::UNIX_EPOCH;
 
     fn group_id() -> Ulid {

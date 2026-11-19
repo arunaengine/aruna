@@ -14,7 +14,6 @@ use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
 use aruna_compute::executor::ExecutorBackend;
 use aruna_compute::registry::ExecutorRegistry;
-use aruna_core::UserId;
 use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
     LogTails, NOBODY, OutputChunks, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec, UserSpec,
@@ -44,6 +43,7 @@ use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskKey;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_net::NetHandle;
 use aruna_net::config::NetConfig;

@@ -7,7 +7,6 @@ use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root
 use std::collections::{BTreeSet, VecDeque};
 use std::time::SystemTime;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::SourceResolutionError;
@@ -35,6 +34,7 @@ use aruna_core::structs::storage::origin::{
     OriginProjection, SyncHop, VersionOrigin, project, public_source_url, publishable,
 };
 use aruna_core::types::{GroupId, Key};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

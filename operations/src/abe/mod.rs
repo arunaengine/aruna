@@ -44,7 +44,7 @@ pub enum KeyAction {
     Grants(Option<Vec<u8>>),
     Publish(KeyGrant),
     /// Opens requests for a member's direct read scopes after a role grant by the caller.
-    Member(aruna_core::UserId),
+    Member(aruna_core::user::id::UserId),
     /// Opens requests of the caller's new credential, sealed to its token key and narrowed by
     /// its path restrictions.
     Token {
@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn foreign_user_starts() {
         // A federated user served by realm 1 requests keys there under the ordinary checks.
-        let foreign = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
+        let foreign = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
         let auth = AuthContext {
             user_id: foreign,
             realm_id: RealmId([1; 32]),
@@ -562,7 +562,7 @@ mod tests {
     #[test]
     fn due_refuses_grant() {
         let realm_id = RealmId([1; 32]);
-        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let info = BucketInfo {
             group_id: Ulid::from_bytes([8; 16]),
@@ -654,7 +654,7 @@ mod tests {
     /// A token run at epoch 3 whose snapshot admits READ on `pattern`, and its foo/ request.
     fn merge_fixture(pattern: &str) -> (KeyOperation, KeyRequest) {
         let realm_id = RealmId([1; 32]);
-        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let group_id = Ulid::from_bytes([8; 16]);
         let key = BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1);
@@ -838,7 +838,7 @@ mod tests {
         };
         use aruna_core::structs::identity::user::User;
         let realm_id = RealmId([1; 32]);
-        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let actor = aruna_core::structs::identity::auth::Actor {
             node_id: node,
@@ -877,7 +877,7 @@ mod tests {
             rows.into_iter().map(|v| v.map(Value::from)).collect()
         };
         let snapshot = |action: KeyAction,
-                        caller: aruna_core::UserId,
+                        caller: aruna_core::user::id::UserId,
                         account: Option<&User>,
                         config: &RealmConfigDocument| {
             let auth = AuthContext {
@@ -942,7 +942,7 @@ mod tests {
             Err(KeyError::Denied)
         );
 
-        let foreign = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
+        let foreign = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         assert_eq!(snapshot(request.clone(), foreign, None, &config), Ok(()));
         let missing = snapshot(request.clone(), user, None, &config);

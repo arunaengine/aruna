@@ -466,7 +466,6 @@ pub mod test {
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::SYNC_OUTBOX_KEYSPACE;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
@@ -475,6 +474,7 @@ pub mod test {
     use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_net::NetHandle;
     use tempfile::TempDir;
     use ulid::Ulid;

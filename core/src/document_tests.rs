@@ -11,13 +11,13 @@ use super::{
 };
 use crate::NodeId;
 use crate::TopicId;
-use crate::UserId;
 use crate::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
     GROUP_KEYSPACE, METADATA_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
 };
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
+use crate::user::id::UserId;
 use ulid::Ulid;
 
 fn test_ulid(seed: u8) -> Ulid {

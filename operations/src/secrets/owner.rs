@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentTarget, NodeInterval};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SecretBytes;
@@ -31,7 +32,7 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRec
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, TxnId};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

@@ -1110,13 +1110,13 @@ mod tests {
     use crate::tests::routes::{
         seed_group_docs, seed_realm_auth, seed_realm_config, test_state, test_storage, write_doc,
     };
-    use aruna_core::UserId;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::plugin_installs::InstallState;
     use aruna_core::plugin_runs::RunState;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
     use aruna_operations::plugins::runs::{admit, save_run};

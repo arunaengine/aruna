@@ -22,7 +22,6 @@ use super::registry::{
     PolicyDocumentPlan, RegistryUpsertPlan, Row,
 };
 use super::{ApplyError, PlacementOutcome};
-use crate::UserId;
 use crate::calls::{IoCall, IoResult, Next};
 use crate::config_authority::AdminEventValidation;
 use crate::deferred_topics::DocumentSyncDependency;
@@ -53,6 +52,7 @@ use crate::structs::{
     SyncQuarantineUsage, SyncRejection, quarantine_usage_entry,
 };
 use crate::types::{Key, KeySpace, Value};
+use crate::user::id::UserId;
 
 type Stored = BTreeMap<(KeySpace, Key), Value>;
 

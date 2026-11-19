@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{HolderList, MAX_FETCH_HOLDERS, VaultFetchEffect, VaultQuery};
@@ -19,7 +20,7 @@ use aruna_core::structs::identity::user::vault::{
     retain_newest_keys, user_record_prefix,
 };
 use aruna_core::types::{Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

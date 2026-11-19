@@ -148,7 +148,6 @@ impl BlobHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::BlobEffect;
     use aruna_core::events::BlobEvent;
@@ -158,6 +157,7 @@ mod tests {
     use aruna_core::structs::storage::encryption::{
         BlockCipher, BlockKeys, BucketKeyRef, public_key_of,
     };
+    use aruna_core::user::id::UserId;
     use bao_tree::ByteRanges;
     use bao_tree::io::fsm::{CreateOutboard, encode_ranges_validated};
     use bao_tree::io::outboard::PreOrderOutboard;

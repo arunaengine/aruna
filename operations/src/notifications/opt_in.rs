@@ -5,7 +5,6 @@
 use std::collections::BTreeSet;
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SecretBytes;
 use aruna_core::document::DocumentTarget;
@@ -19,6 +18,7 @@ use aruna_core::rows::{read_row, values};
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailPreference};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
 use thiserror::Error;
 

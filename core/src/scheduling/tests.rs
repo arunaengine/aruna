@@ -380,7 +380,7 @@ fn excludes_user_nodes() {
     let plan_request = request(Vec::new());
     let mut user = candidate(node(3), "docker");
     user.node_kind = RealmNodeKind::User {
-        owner: crate::UserId::nil(crate::structs::identity::realm::RealmId::from_bytes(
+        owner: crate::user::id::UserId::nil(crate::structs::identity::realm::RealmId::from_bytes(
             [1u8; 32],
         )),
     };

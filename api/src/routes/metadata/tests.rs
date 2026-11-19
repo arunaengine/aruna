@@ -1113,7 +1113,7 @@ async fn hides_document_existence() {
     assert!(owner.is_ok());
 
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,
@@ -1203,7 +1203,7 @@ async fn preview_refuses_stranger() {
     let test = setup_state().await;
     let realm_id = test.state.get_realm_id();
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,
@@ -1321,7 +1321,7 @@ async fn grant_anonymous_read(test: &TestState) {
                 format!("/{realm_id}/g/{}/**", test.group_id),
                 Permission::READ,
             )]),
-            assigned_users: HashSet::from([aruna_core::UserId::nil(realm_id)]),
+            assigned_users: HashSet::from([aruna_core::user::id::UserId::nil(realm_id)]),
         },
     );
     write_doc(
@@ -2533,7 +2533,7 @@ async fn create_linking_doc(
     created.summary.document_id
 }
 
-async fn seed_owned_group(test: &TestState, group_id: Ulid, owner: aruna_core::UserId) {
+async fn seed_owned_group(test: &TestState, group_id: Ulid, owner: aruna_core::user::id::UserId) {
     let realm_id = test.state.get_realm_id();
     let actor = Actor {
         node_id: test.state.get_node_id(),
@@ -2672,7 +2672,7 @@ async fn references_omits_unauthorized() {
     // A private backlink from a group the caller cannot read is dropped.
     let test = setup_state().await;
     let realm_id = test.state.get_realm_id();
-    let foreign_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let foreign_user = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let foreign_group = Ulid::generate();
     seed_owned_group(&test, foreign_group, foreign_user).await;
     let foreign_auth = AuthContext {
@@ -2948,7 +2948,7 @@ async fn preflight_distinguishes_states() {
 async fn hidden_references_concealed() {
     let test = setup_state().await;
     let realm_id = test.state.get_realm_id();
-    let foreign_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let foreign_user = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let foreign_group = Ulid::generate();
     seed_owned_group(&test, foreign_group, foreign_user).await;
     let foreign_auth = AuthContext {
@@ -3219,7 +3219,7 @@ pub(crate) async fn setup_state() -> TestState {
     let metadata_dir = tempfile::tempdir().unwrap();
     let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
     let realm_id = test_realm_id(3);
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let actor = Actor {
         node_id,
         user_id,
@@ -3306,7 +3306,7 @@ pub(crate) async fn setup_network_state() -> TestState {
     .await
     .unwrap();
     let node_id = net.node_id();
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let actor = Actor {
         node_id,
         user_id,
@@ -3339,7 +3339,7 @@ pub(crate) async fn setup_network_state() -> TestState {
         config
             .to_bytes(&Actor {
                 node_id,
-                user_id: aruna_core::UserId::nil(realm_id),
+                user_id: aruna_core::user::id::UserId::nil(realm_id),
                 realm_id,
             })
             .unwrap()
@@ -3450,7 +3450,7 @@ mod authorization {
                 .to_bytes(),
         );
         AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
             session: None,
@@ -3460,7 +3460,7 @@ mod authorization {
     fn stranger_auth(state: &ServerState) -> AuthContext {
         let realm_id = state.get_realm_id();
         AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
             session: None,
@@ -3702,7 +3702,7 @@ async fn lookup_hides_private() {
         serde_json::json!({"matches": [{"document_id": document_id.to_string(), "origin": "imported"}]})
     );
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), test.auth.realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), test.auth.realm_id),
         ..test.auth.clone()
     };
     for auth in [None, Some(stranger)] {

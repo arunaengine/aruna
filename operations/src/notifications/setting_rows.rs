@@ -5,7 +5,6 @@
 use std::collections::BTreeSet;
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SecretBytes;
 use aruna_core::document::{
@@ -22,6 +21,7 @@ use aruna_core::structs::execution::setting::{SettingChannel, SettingHead, curre
 use aruna_core::structs::execution::webhook::WebhookSubscription;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;

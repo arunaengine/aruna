@@ -49,7 +49,7 @@ impl From<IoError> for FetchError {
 pub(super) struct FetchRemoteOperation {
     realm_id: RealmId,
     node_id: NodeId,
-    owner: aruna_core::UserId,
+    owner: aruna_core::user::id::UserId,
     bucket: String,
     key: String,
     version: Ulid,

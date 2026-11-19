@@ -10,6 +10,7 @@ mod stage;
 #[cfg(test)]
 mod tests;
 
+use aruna_core::NodeId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -35,8 +36,8 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::vault::VaultRecords;
 use aruna_core::types::{RoleId, Value};
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::UserAttributeError;
-use aruna_core::{NodeId, UserId};
 use byteview::ByteView;
 use std::collections::HashMap;
 use std::time::Duration;

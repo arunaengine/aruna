@@ -431,7 +431,7 @@ mod tests {
 
     fn caller() -> DelegatedCaller {
         DelegatedCaller {
-            user_id: aruna_core::UserId::nil(RealmId::from_bytes([1; 32])),
+            user_id: aruna_core::user::id::UserId::nil(RealmId::from_bytes([1; 32])),
             group_id: Ulid::from_bytes([2; 16]),
             credential_id: String::new(),
             restrictions: None,

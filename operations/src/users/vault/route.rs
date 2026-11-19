@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::VaultQuery;
@@ -15,6 +14,7 @@ use aruna_core::placement::{holds_placement, target_placement_ref};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::VaultRecords;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;

@@ -211,9 +211,9 @@ pub(super) fn peer_failure(error: MetadataError) -> SyncMirrorError {
 mod tests {
     use super::super::tests::relationship;
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::user::id::UserId;
     use byteview::ByteView;
     use std::time::SystemTime;
     use ulid::Ulid;

@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::errors::{ConversionError, StorageError};
@@ -13,6 +12,7 @@ use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderSecret, AssistantSecretError,
 };
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::BTreeSet;
 use thiserror::Error;

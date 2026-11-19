@@ -23,6 +23,7 @@ use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
 use aruna_core::errors::{
@@ -65,7 +66,7 @@ use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::replication_queue::live_obligation_entry;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, warn};

@@ -426,7 +426,7 @@ mod tests {
         config.ensure_node(
             node(3),
             RealmNodeKind::User {
-                owner: aruna_core::UserId::nil(realm_id),
+                owner: aruna_core::user::id::UserId::nil(realm_id),
             },
         );
         let mut operation = ForwardRevokeOperation::new(

@@ -6,6 +6,7 @@ use crate::server::state::ServerState;
 use crate::tests::assistant::spawn_mock;
 use crate::tests::routes::{seed_group_docs, seed_realm_auth, test_state, write_doc};
 use aruna_blob::blob::BlobHandler;
+use aruna_core::NodeId;
 use aruna_core::download_slots::DownloadSlots;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -29,7 +30,7 @@ use aruna_core::structs::storage::distribution::{
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
 };
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};

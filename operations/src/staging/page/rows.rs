@@ -11,7 +11,6 @@ use crate::distribution::inventory::{
 };
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::s3::usage::UsageUpdateError;
-use aruna_core::UserId;
 use aruna_core::calls::IoError;
 use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::StorageReadError;
@@ -48,6 +47,7 @@ use aruna_core::structs::storage::replication_queue::{
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;

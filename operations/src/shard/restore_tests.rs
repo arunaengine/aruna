@@ -9,7 +9,6 @@ use super::*;
 use crate::shard::restore_plan::{
     RESTORE_CHUNK_TOPICS, RESTORE_TOPIC_COUNT, RESTORE_UNIT_BUDGET, shared_topic_peers,
 };
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
@@ -17,6 +16,7 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::record::PlacementStrategy;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::storage::worker::FjallStorage;
 use tempfile::tempdir;

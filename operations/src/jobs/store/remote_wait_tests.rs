@@ -30,7 +30,7 @@ fn job() -> JobId {
 
 fn auth() -> AuthContext {
     AuthContext {
-        user_id: aruna_core::UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
+        user_id: aruna_core::user::id::UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
         realm_id: RealmId([1; 32]),
         path_restrictions: None,
         session: None,

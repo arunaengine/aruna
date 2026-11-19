@@ -5,7 +5,6 @@
 use crate::shared;
 
 use aruna::config::StartupMode;
-use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -15,6 +14,7 @@ use aruna_core::placement::build_view;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::node_state::PersistedNodeIdentity;
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};

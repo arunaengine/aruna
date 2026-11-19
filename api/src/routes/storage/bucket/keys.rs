@@ -15,7 +15,6 @@ use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -26,6 +25,7 @@ use aruna_core::structs::storage::holders::{
     HolderEntry, HolderState, KeyLookup, holder_revision, revision_with_facts,
 };
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::key_wake::WakeUnlockedOperation;
 use aruna_operations::s3::bucket::holders::LookupKeysOperation;

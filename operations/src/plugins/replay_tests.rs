@@ -375,10 +375,10 @@ fn replays_pages_bounded() {
 }
 
 mod replay_pass {
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::user::id::UserId;
     use serde_json::json;
 
     use super::*;

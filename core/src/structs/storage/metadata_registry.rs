@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::UserId;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetadataRegistryRecord {

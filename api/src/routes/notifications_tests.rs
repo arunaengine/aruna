@@ -7,7 +7,6 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::extract;
 use crate::tests::routes::write_fixture;
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
@@ -23,6 +22,7 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_net::NetHandle;

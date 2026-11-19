@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
@@ -13,6 +12,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::harvest::{RepositoryConnector, RepositoryConnectorKind};
 use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 use crate::connectors::harvest_rows::{INVENIO_TOKEN, connector_writes};

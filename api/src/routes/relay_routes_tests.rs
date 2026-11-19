@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use super::{RELAY_HOP_HEADER, healthy_first, relay_middleware};
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::keyspaces::{MANAGEMENT_URL_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_storage::storage::worker::FjallStorage;

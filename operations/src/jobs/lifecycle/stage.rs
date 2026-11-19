@@ -43,7 +43,7 @@ impl From<IoError> for StageError {
 /// a missing or corrupt source moves to the next one without ever changing the stored input.
 #[derive(Debug, PartialEq)]
 pub struct StageInputOperation {
-    created_by: aruna_core::UserId,
+    created_by: aruna_core::user::id::UserId,
     source_node: Option<NodeId>,
     /// The endpoint owning the bucket, key and version identity of this input.
     ingress: Option<NodeId>,

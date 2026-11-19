@@ -175,10 +175,10 @@ mod tests {
     use super::*;
     use crate::auth::handle_token;
     use crate::error::TokenError;
-    use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
     use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::DriverContext;
     use aruna_drivers::jobs::runtime::JobsRuntime;
     use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};

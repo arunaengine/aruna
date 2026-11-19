@@ -628,7 +628,6 @@ fn remove_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
 
 #[cfg(test)]
 mod pure_tests {
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentTarget,
@@ -652,6 +651,7 @@ mod pure_tests {
         StrategyBinding, band_start, coordinator_spans,
     };
     use aruna_core::types::{Key, KeySpace, Value};
+    use aruna_core::user::id::UserId;
     use std::collections::BTreeMap;
     use ulid::Ulid;
 

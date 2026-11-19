@@ -6,7 +6,6 @@ use super::*;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::extract;
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget,
 };
@@ -18,6 +17,7 @@ use aruna_core::structs::{
     SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage,
     build_quarantine_entries, quarantine_usage_entry,
 };
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};

@@ -6,7 +6,6 @@ pub mod bind;
 pub mod reads;
 pub mod unbind;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE;
@@ -15,6 +14,7 @@ use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

@@ -488,7 +488,7 @@ mod call_tests {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         }
     }

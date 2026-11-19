@@ -663,7 +663,7 @@ impl Operation for PruneReleasedOperation {
         let realm_id = self.realm_id;
         let actor = Actor {
             node_id: self.local,
-            user_id: aruna_core::UserId::nil(realm_id),
+            user_id: aruna_core::user::id::UserId::nil(realm_id),
             realm_id,
         };
         let bytes = (stored.to_bytes(&actor)).map_err(|error| IoError::Codec(error.to_string()))?;

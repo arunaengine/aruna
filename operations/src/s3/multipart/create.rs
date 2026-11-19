@@ -16,7 +16,6 @@ use crate::s3::object::put::abe::{abe_reads, keyed, parse_abe};
 use crate::s3::object::put::{owner_call, path_owned, same_name_path};
 use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::usage::upload_count;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -43,6 +42,7 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -801,7 +801,7 @@ mod pure_tests {
             bucket: "bucket".to_string(),
             key: "archive/one".to_string(),
             group_id: snapshot.group_id,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             checksum_hint: None,
             routing: snapshot,
         }
@@ -977,7 +977,7 @@ mod pure_tests {
         let bucket = aruna_core::structs::storage::blob::BucketInfo {
             group_id: Ulid::from_parts(1, 1),
             created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -1025,7 +1025,7 @@ mod pure_tests {
         let bucket = aruna_core::structs::storage::blob::BucketInfo {
             group_id: Ulid::from_parts(1, 1),
             created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -1288,7 +1288,7 @@ mod pure_tests {
                 backend_path: "bucket/key".to_string(),
                 ulid: Ulid::from_bytes([6u8; 16]),
                 format: aruna_core::structs::storage::format::StoredFormat::default(),
-                created_by: aruna_core::UserId::default(),
+                created_by: aruna_core::user::id::UserId::default(),
                 created_at: std::time::SystemTime::UNIX_EPOCH,
                 staging: false,
                 partial: false,
@@ -1378,7 +1378,7 @@ mod pure_tests {
             bucket: "bucket".to_string(),
             key_prefix: "archive/".to_string(),
             schedule: None,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             updated_at: std::time::SystemTime::UNIX_EPOCH,
             last_job: None,
@@ -1507,7 +1507,7 @@ mod pure_tests {
             public_config: std::collections::HashMap::new(),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             updated_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             disabled: true,
             cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }

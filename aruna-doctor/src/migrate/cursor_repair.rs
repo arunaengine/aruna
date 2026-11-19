@@ -530,7 +530,7 @@ mod tests {
                 establishing_event_id: event_id,
                 last_event_id: event_id,
             },
-            user_id: aruna_core::UserId::nil(realm_id),
+            user_id: aruna_core::user::id::UserId::nil(realm_id),
             node_id,
             payload,
             occurred_at_ms: 1,
@@ -594,7 +594,7 @@ mod tests {
             onboarding_phase: None,
             onboarding_sync_ticket: None,
             identity: PersistedNodeIdentity::User {
-                owner: aruna_core::UserId::nil(realm),
+                owner: aruna_core::user::id::UserId::nil(realm),
             },
         };
         let value = postcard::to_allocvec(&state).unwrap();

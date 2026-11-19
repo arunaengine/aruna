@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::UserId;
 use crate::effects::Effect;
 use crate::errors::ConversionError;
 use crate::keyspaces::{WATCH_INTEREST_KEYSPACE, WATCH_OUTBOX_KEYSPACE};
@@ -20,6 +19,7 @@ use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::task::{TaskEffect, TaskKey};
 use crate::types::{GroupId, Key, KeySpace, Value};
+use crate::user::id::UserId;
 
 pub const WATCH_USER_CAP: usize = 50;
 pub const MAX_PREFIX_LEN: usize = 1024;

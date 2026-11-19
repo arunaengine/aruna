@@ -144,7 +144,7 @@ pub(crate) async fn member_requests(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
-    members: Vec<aruna_core::UserId>,
+    members: Vec<aruna_core::user::id::UserId>,
 ) -> Vec<String> {
     let now = aruna_clock::unix_timestamp_millis();
     let node = state.get_node_id();

@@ -6,6 +6,7 @@
 use super::jobs::LegacyInput;
 use super::{Rewrites, decode_error, rewritten};
 use crate::explorer::ExplorerError;
+use aruna_core::NodeId;
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE,
@@ -24,7 +25,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -506,7 +507,6 @@ mod tests {
     use crate::migrate::{MigrateOutput, migrate_output};
     use aruna::tasks::runner::recover_stale_jobs;
     use aruna_core::NodeId;
-    use aruna_core::UserId;
     use aruna_core::compute::ExecutionTargetId;
     use aruna_core::keyspaces::{
         ACTIVE_USER_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
@@ -526,6 +526,7 @@ mod tests {
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::GroupId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::jobs::runtime::JobsRuntime;
     use aruna_operations::jobs::store::list_jobs::ListJobsOperation;

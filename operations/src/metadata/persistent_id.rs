@@ -223,8 +223,8 @@ impl Operation for PidChangeOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::handle::Handle;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
 
     async fn change(
@@ -306,8 +306,8 @@ mod tests {
         RealmId([3; 32])
     }
 
-    fn user() -> aruna_core::UserId {
-        aruna_core::UserId::local(Ulid::from_bytes([2; 16]), realm())
+    fn user() -> aruna_core::user::id::UserId {
+        aruna_core::user::id::UserId::local(Ulid::from_bytes([2; 16]), realm())
     }
 
     fn record(document_id: Ulid) -> MetadataRegistryRecord {

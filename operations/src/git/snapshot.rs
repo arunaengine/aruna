@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::git::{
@@ -19,6 +18,7 @@ use aruna_core::repo_layout::{Layout, metadata_layout};
 use aruna_core::storage_entries::{document_job_prefix, materialization_status_key};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use tracing::warn;
 use ulid::Ulid;

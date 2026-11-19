@@ -447,7 +447,6 @@ impl Operation for PermissionRulesOperation {
 mod pure_tests {
     use std::collections::{HashMap, HashSet};
 
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::errors::AuthorizationError;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
@@ -456,6 +455,7 @@ mod pure_tests {
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use super::{

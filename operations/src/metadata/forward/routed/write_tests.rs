@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
 use aruna_core::events::{MetadataAnswer, NetEvent};
 use aruna_core::metadata::MetadataError;
+use aruna_core::user::id::UserId;
 
 fn realm() -> RealmId {
     RealmId::from_bytes([1; 32])

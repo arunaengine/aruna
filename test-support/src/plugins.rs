@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::compute::Secret;
 use aruna_core::document::DocumentTarget;
@@ -40,6 +39,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_drivers::testing::{seed_bucket, with_blob};

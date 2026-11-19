@@ -5,12 +5,12 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 

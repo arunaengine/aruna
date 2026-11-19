@@ -75,7 +75,6 @@ impl Operation for GetBucketOperation {
 #[cfg(test)]
 mod tests {
     use super::{GetBucketError, GetBucketOperation};
-    use crate::UserId;
     use crate::calls::{IoCall, IoError, IoResult, Next};
     use crate::errors::StorageError;
     use crate::keyspaces::S3_BUCKET_KEYSPACE;
@@ -83,6 +82,7 @@ mod tests {
     use crate::structs::identity::realm::RealmId;
     use crate::structs::storage::blob::BucketInfo;
     use crate::structs::storage::format::Compression;
+    use crate::user::id::UserId;
     use ulid::Ulid;
 
     fn fixed_bucket_info() -> BucketInfo {

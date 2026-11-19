@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect};
@@ -18,8 +19,8 @@ use aruna_core::structs::identity::user::vault::{
 };
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use aruna_core::vault_format::key_fingerprint;
-use aruna_core::{NodeId, UserId};
 use thiserror::Error;
 use ulid::Ulid;
 

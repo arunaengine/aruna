@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -21,6 +20,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use tempfile::tempdir;
 
 use super::*;

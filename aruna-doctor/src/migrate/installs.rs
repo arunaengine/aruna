@@ -5,12 +5,12 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentOperation;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
 use aruna_core::plugin_installs::{InstallState, PluginInstall, Prerequisite, Widening};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{GroupId, RoleId};
+use aruna_core::user::id::UserId;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;

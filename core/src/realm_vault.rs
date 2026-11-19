@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::compute::SecretBytes;
 use crate::key_seal::{SealedSecret, SeedRng, open_sealed, seal_to};
 use crate::secret_registers::SecretOwner;
 use crate::secrets::SecretName;
 use crate::structs::execution::setting::SettingChannel;
 use crate::structs::identity::realm::{RealmId, RealmNodeKind};
+use crate::user::id::UserId;
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Nonce, Payload};
 use ed25519_dalek::{SigningKey, VerifyingKey};

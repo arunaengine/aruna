@@ -7,7 +7,6 @@ pub mod list;
 #[path = "token_revoke.rs"]
 pub mod revoke;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
@@ -22,6 +21,7 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;

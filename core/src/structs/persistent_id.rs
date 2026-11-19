@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::NodeId;
-use crate::UserId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
 use crate::keyspaces::SECONDARY_ID_KEYSPACE;
@@ -11,6 +10,7 @@ use crate::structs::execution::job::JobId;
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::secondary_id::{SecondaryIdentifier, insert_identifier};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+use crate::user::id::UserId;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

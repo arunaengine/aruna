@@ -561,7 +561,6 @@ mod tests {
         };
         assert_eq!(done, Ok(Next::Done(expected)));
     }
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -576,6 +575,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{BucketInfo, HashIndex};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX;
+    use aruna_core::user::id::UserId;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;

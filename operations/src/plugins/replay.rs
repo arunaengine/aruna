@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -16,7 +17,7 @@ use aruna_core::plugin_runs::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_plugin_types::trigger::TriggerKind;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;

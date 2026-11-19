@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
@@ -11,6 +10,7 @@ use aruna_core::structs::execution::notification::{
     NotificationRecord, notification_inbox_cursor, notification_inbox_prefix, parse_inbox_key,
 };
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 use crate::notifications::unexpected;

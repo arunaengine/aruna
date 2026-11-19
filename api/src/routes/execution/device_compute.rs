@@ -12,10 +12,10 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aruna_core::UserId;
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::id::NodeId;
 use aruna_core::structs::{RemoteBinding, SyncRefusal};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::local_run::{
     BackendState, ComputeStatus, LocalExecutionError, LocalRunsOperation, status_of,

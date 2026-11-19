@@ -12,7 +12,6 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::UserId;
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentTarget, AdminRoleDefinition,
@@ -37,6 +36,7 @@ use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::reserved_label;
 use crate::structured_id::PlacementHandle;
 use crate::types::RoleId;
+use crate::user::id::UserId;
 use crate::user::validation::{
     UserAttributeError, validate_attribute_key, validate_attribute_value,
 };

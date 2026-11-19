@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna::inbound::initialize_incoming_fixture;
-use aruna_core::UserId;
 use aruna_core::effects::BlobEffect;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::BlobEvent;
@@ -14,6 +13,7 @@ use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::export::ExportFailure;

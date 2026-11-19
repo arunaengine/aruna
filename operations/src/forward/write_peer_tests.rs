@@ -158,7 +158,7 @@ fn mirror_checks_foreign() {
     check.first().unwrap();
     assert!(runs_child(check.next(realm_answer(Some(REALM)))));
     let claims = aruna_core::structs::identity::auth::TokenClaims {
-        sub: aruna_core::UserId::local(Ulid::from_bytes([1u8; 16]), foreign).to_string(),
+        sub: aruna_core::user::id::UserId::local(Ulid::from_bytes([1u8; 16]), foreign).to_string(),
         iss: foreign.to_base64(),
         iat: 1,
         exp: 2,

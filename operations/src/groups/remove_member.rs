@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -24,6 +23,7 @@ use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{GroupId, Key, KeySpace, RoleId};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashSet;
 use thiserror::Error;
@@ -541,7 +541,6 @@ pub mod test {
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::SYNC_OUTBOX_KEYSPACE;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
@@ -553,6 +552,7 @@ pub mod test {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::RoleId;
+    use aruna_core::user::id::UserId;
     use aruna_net::NetHandle;
     use tempfile::TempDir;
     use ulid::Ulid;

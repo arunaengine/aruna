@@ -18,7 +18,7 @@ fn route() -> RouteCreateOperation {
     let create = CreateDocumentOperation::new(CreateDocumentConfig {
         actor: Actor {
             node_id: node(1),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         },
         group_id: Ulid::from_parts(2, 2),

@@ -6,7 +6,6 @@
 use std::collections::VecDeque;
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
@@ -15,6 +14,7 @@ use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::{WatchEvent, watch_path_matches};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use tracing::warn;
 use ulid::Ulid;
 

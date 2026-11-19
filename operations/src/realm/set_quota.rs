@@ -400,12 +400,12 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetQuotaError> {
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::structs::identity::realm::{
         GroupQuotaOverride, RealmConfigDocument, RealmId, RealmNodeKind, UserCapOverride,
     };
     use aruna_core::types::Key;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::path_context;
     use tempfile::tempdir;

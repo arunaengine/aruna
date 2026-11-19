@@ -23,7 +23,6 @@ use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
-use aruna_core::UserId;
 use aruna_core::blob_records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
@@ -56,6 +55,7 @@ use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication_queue::build_live_obligation;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -857,7 +857,7 @@ mod tests {
             job_id: None,
             preassigned_version_id: None,
             group_id,
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([3; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([3; 16]), realm_id),
             realm_id,
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
             bucket: "bucket-a".into(),
@@ -879,7 +879,7 @@ mod tests {
         BucketInfo {
             group_id,
             created_at: SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::local(Ulid::from_bytes([3; 16]), realm_id),
+            created_by: aruna_core::user::id::UserId::local(Ulid::from_bytes([3; 16]), realm_id),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -1017,7 +1017,7 @@ mod tests {
         let expected = BucketInfo {
             group_id,
             created_at: SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            created_by: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -1054,7 +1054,7 @@ mod tests {
         let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let node_id = iroh::SecretKey::generate().public();
-        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
         let expected_bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
 
         let initial = drive(
@@ -1187,7 +1187,7 @@ mod tests {
         let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let node_id = iroh::SecretKey::generate().public();
-        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
         let expected_bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
         let (server, endpoint) = spawn_reference_server("ref-data").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
@@ -1260,7 +1260,7 @@ mod tests {
         let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let node_id = iroh::SecretKey::generate().public();
-        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
         let expected_bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
         let (server, endpoint) = spawn_reference_server("ref-data").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
@@ -1312,7 +1312,7 @@ mod tests {
         let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([7; 32]);
         let node_id = iroh::SecretKey::generate().public();
-        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
         let bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
         let (server, endpoint) = spawn_reference_server("ref-data").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
@@ -1361,7 +1361,7 @@ mod tests {
         let group_id = Ulid::generate();
         let realm_id = RealmId::from_bytes([7; 32]);
         let node_id = iroh::SecretKey::generate().public();
-        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
         let bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
         let (server, endpoint) = spawn_reference_server("ref-data").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
@@ -1461,7 +1461,7 @@ mod tests {
             group_id: Ulid::generate(),
             realm_id,
             node_id: iroh::SecretKey::generate().public(),
-            user_id: aruna_core::UserId::new(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::new(Ulid::generate(), realm_id),
         };
         drive(offer_directory(offer.clone()), context)
             .await
@@ -1538,7 +1538,7 @@ mod tests {
             job_id: None,
             preassigned_version_id: None,
             group_id: resolved.group_id,
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([3; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([3; 16]), realm_id),
             realm_id,
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
             bucket: "bucket-a".into(),

@@ -4,10 +4,10 @@
 
 use super::*;
 use crate::tests::calls::caller_of;
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::identity::group_delete::GroupDeletePlan;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use std::collections::BTreeSet;
 use ulid::Ulid;
 

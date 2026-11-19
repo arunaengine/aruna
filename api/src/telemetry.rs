@@ -353,7 +353,7 @@ mod tests {
             realm_id,
             issuer: issuer.public(),
             target: iroh::SecretKey::from_bytes(&[3; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
             grant: TokenGrant {
                 token_hash: marker.to_string(),
                 issuer: realm_id,

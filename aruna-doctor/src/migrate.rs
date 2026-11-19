@@ -1370,7 +1370,7 @@ mod tests {
             onboarding_phase: None,
             onboarding_sync_ticket: None,
             identity: PersistedNodeIdentity::User {
-                owner: aruna_core::UserId::nil(REALM),
+                owner: aruna_core::user::id::UserId::nil(REALM),
             },
         };
         // Only the node_state row holds the identity; another row that decodes must not win.

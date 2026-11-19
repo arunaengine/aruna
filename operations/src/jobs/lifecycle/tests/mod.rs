@@ -15,7 +15,6 @@ mod scheduling;
 mod terminal;
 mod uncertain_commit;
 
-use aruna_core::UserId;
 use aruna_core::effects::{LaunchFrame, ReceiptFrame};
 use aruna_core::events::LaunchDecline;
 use aruna_core::metadata::AuthToken;
@@ -24,6 +23,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use crate::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};

@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
 use aruna_core::structs::identity::auth::oidc_subject_key;
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_core::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
 use thiserror::Error;
@@ -163,12 +163,12 @@ impl Operation for GetOidcOperation {
 #[cfg(test)]
 mod tests {
     use super::{GetOidcInput, GetOidcOperation};
-    use aruna_core::UserId;
     use aruna_core::calls::{IoResult, Next};
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
+    use aruna_core::user::id::UserId;
     use aruna_core::user::validation::{MERGED_INTO_ATTRIBUTE, MERGED_PREFIX};
     use byteview::ByteView;
     use ulid::Ulid;

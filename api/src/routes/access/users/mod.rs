@@ -14,7 +14,6 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::onboarding::{authorize_onboarding_admin, map_consume_error, map_inspect_error};
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs as now_timestamp;
-use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission, Role, SessionKind,
@@ -22,6 +21,7 @@ use aruna_core::structs::identity::auth::{
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::email_hash;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::enforcement::EnforcePolicyOperation;
@@ -1606,7 +1606,7 @@ fn enrollment_status(claimed: bool, expires_at: u64, now: u64) -> &'static str {
 /// an outstanding enrollment secret only shows what has not landed yet.
 async fn owned_devices(
     state: &Arc<ServerState>,
-    owner: aruna_core::UserId,
+    owner: aruna_core::user::id::UserId,
 ) -> ServerResult<Vec<UserDeviceResponse>> {
     let config = drive(
         GetConfigOperation::new(state.get_realm_id()),

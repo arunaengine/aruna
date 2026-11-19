@@ -361,10 +361,10 @@ mod tests {
 
     use super::*;
     use crate::tests::records::{Family, REALM, local_ingress, node, payload, user};
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::job_request::SubmissionScope;
     use aruna_core::structs::execution::job::JobId;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn request() -> SubmissionRequest {

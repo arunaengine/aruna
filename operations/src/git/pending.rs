@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn rows_keep_order() {
         let merge = |new: char| PendingMerge {
-            user_id: aruna_core::UserId::new(Ulid::from(1), RealmId([1; 32])),
+            user_id: aruna_core::user::id::UserId::new(Ulid::from(1), RealmId([1; 32])),
             old: ZERO_OID.into(),
             new: new.to_string().repeat(40),
         };
@@ -418,7 +418,7 @@ mod tests {
             outbound_handle: None,
         };
         let merge = PendingMerge {
-            user_id: aruna_core::UserId::new(Ulid::from(1), RealmId([1; 32])),
+            user_id: aruna_core::user::id::UserId::new(Ulid::from(1), RealmId([1; 32])),
             old: ZERO_OID.into(),
             new: "a".repeat(40),
         };

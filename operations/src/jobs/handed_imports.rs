@@ -139,13 +139,13 @@ impl Operation for StartKeptOperation {
 mod tests {
     use std::time::SystemTime;
 
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::id::NodeId;
     use aruna_core::structs::execution::job::{JobId, StagingJobCheckpoint};
     use aruna_core::structs::execution::staging::StagingStrategy;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use super::*;

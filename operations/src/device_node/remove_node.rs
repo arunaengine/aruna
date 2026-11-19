@@ -317,9 +317,9 @@ impl Operation for RemoveNodeOperation {
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use ulid::Ulid;
 

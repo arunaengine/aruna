@@ -928,7 +928,7 @@ mod pure_tests {
     #[test]
     fn user_origin_empty() {
         let (mut config, _) = config_and_placement();
-        let owner = crate::UserId::nil(config.realm_id);
+        let owner = crate::user::id::UserId::nil(config.realm_id);
         config.ensure_node(node(5), RealmNodeKind::User { owner });
         let strategy = strategy_of(&config);
         assert!(held_buckets(&config, strategy, node(5)).is_empty());
@@ -1588,7 +1588,7 @@ mod pure_tests {
         let mut state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
         let actor = |seed: u8| Actor {
             node_id: node(seed),
-            user_id: crate::UserId::nil(realm_id),
+            user_id: crate::user::id::UserId::nil(realm_id),
             realm_id,
         };
         let map = |epoch: u64, seeds: [u8; 2]| CandidatePlacementMap {
