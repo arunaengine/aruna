@@ -1078,6 +1078,7 @@ mod tests {
     #[derive(Clone)]
     struct RecordingHandler {
         runs: Arc<Mutex<Vec<(TaskKey, Instant)>>>,
+        recorded: Arc<Notify>,
     }
 
     #[async_trait]
@@ -1087,6 +1088,7 @@ mod tests {
                 .lock()
                 .expect("run log lock should stay open")
                 .push((key, Instant::now()));
+            self.recorded.notify_one();
         }
     }
 
@@ -1099,10 +1101,11 @@ mod tests {
             .await;
     }
 
-    async fn wait_for_runs(runs: &Arc<AtomicUsize>, expected: usize) {
+    /// Waits until the handler counted `expected` runs; each run notifies `started` once.
+    async fn wait_for_runs(runs: &Arc<AtomicUsize>, started: &Notify, expected: usize) {
         tokio::time::timeout(Duration::from_secs(2), async {
             while runs.load(Ordering::SeqCst) < expected {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                started.notified().await;
             }
         })
         .await
@@ -1119,10 +1122,11 @@ mod tests {
         count.await.expect("drain waiter query should be answered")
     }
 
-    async fn wait_for_records(runs: &Arc<Mutex<Vec<(TaskKey, Instant)>>>, expected: usize) {
+    /// Waits until the handler recorded `expected` runs; each run notifies `recorded` once.
+    async fn wait_for_records(handler: &RecordingHandler, expected: usize) {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while runs.lock().expect("run log lock should stay open").len() < expected {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            while handler.runs.lock().expect("run log lock should stay open").len() < expected {
+                handler.recorded.notified().await;
             }
         })
         .await
@@ -1269,7 +1273,7 @@ mod tests {
             .expect("handler future should be dropped after abort");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn overlap_coalesces_refire() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
@@ -1297,12 +1301,12 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
 
         gate.add_permits(16);
-        wait_for_runs(&runs, 2).await;
+        wait_for_runs(&runs, &started, 2).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn running_fire_refires() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
@@ -1328,12 +1332,12 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
 
         gate.add_permits(16);
-        wait_for_runs(&runs, 2).await;
+        wait_for_runs(&runs, &started, 2).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn fires_run_once() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
@@ -1350,11 +1354,11 @@ mod tests {
             .await;
 
         fire_timer(&handle, key.clone()).await;
-        wait_for_runs(&runs, 1).await;
+        wait_for_runs(&runs, &started, 1).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         fire_timer(&handle, key).await;
-        wait_for_runs(&runs, 2).await;
+        wait_for_runs(&runs, &started, 2).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
@@ -1418,8 +1422,12 @@ mod tests {
         let handle = TaskHandle::new();
         let runs = Arc::new(Mutex::new(Vec::new()));
         let key = test_key();
+        let handler = RecordingHandler {
+            runs: runs.clone(),
+            recorded: Arc::new(Notify::new()),
+        };
         handle
-            .set_inbound_handler(Arc::new(RecordingHandler { runs: runs.clone() }))
+            .set_inbound_handler(Arc::new(handler.clone()))
             .await;
 
         tokio::time::advance(Duration::from_secs(3600)).await;
@@ -1454,7 +1462,7 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_secs(1)).await;
-        wait_for_records(&runs, 1).await;
+        wait_for_records(&handler, 1).await;
         let recorded = runs.lock().expect("run log lock should stay open").clone();
         assert_eq!(recorded[0].0, key);
         assert_eq!(recorded[0].1, submitted_at + Duration::from_secs(10));
@@ -1467,8 +1475,12 @@ mod tests {
         let runs = Arc::new(Mutex::new(Vec::new()));
         let waiting = test_key();
         let added = other_key();
+        let handler = RecordingHandler {
+            runs: runs.clone(),
+            recorded: Arc::new(Notify::new()),
+        };
         handle
-            .set_inbound_handler(Arc::new(RecordingHandler { runs: runs.clone() }))
+            .set_inbound_handler(Arc::new(handler.clone()))
             .await;
 
         let _ = handle
@@ -1510,7 +1522,7 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_secs(1)).await;
-        wait_for_records(&runs, 1).await;
+        wait_for_records(&handler, 1).await;
         {
             let recorded = runs.lock().expect("run log lock should stay open");
             assert_eq!(recorded.len(), 1, "the pending timer must stay pending");
@@ -1519,7 +1531,7 @@ mod tests {
         }
 
         tokio::time::advance(Duration::from_secs(4990)).await;
-        wait_for_records(&runs, 2).await;
+        wait_for_records(&handler, 2).await;
         let recorded = runs.lock().expect("run log lock should stay open").clone();
         assert_eq!(recorded[1].0, waiting);
     }
@@ -1607,12 +1619,14 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
         let finished = Arc::new(Notify::new());
+        let (release, released) = std::sync::mpsc::channel();
         let key = test_key();
         handle
             .set_inbound_handler(Arc::new(SlowSyncHandler {
                 runs: runs.clone(),
                 started: started.clone(),
                 finished: finished.clone(),
+                release: Arc::new(Mutex::new(released)),
             }))
             .await;
         fire_timer(&handle, key.clone()).await;
@@ -1645,6 +1659,7 @@ mod tests {
         };
         assert_eq!(count, 1, "the force-stopped run must stay owned");
 
+        release.send(()).expect("the handler waits for its release");
         tokio::time::timeout(Duration::from_secs(1), finished.notified())
             .await
             .expect("handler should reach its completion");
@@ -1865,6 +1880,7 @@ mod tests {
         runs: Arc<AtomicUsize>,
         started: Arc<Notify>,
         finished: Arc<Notify>,
+        release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
     }
 
     #[async_trait]
@@ -1872,7 +1888,9 @@ mod tests {
         async fn handle_timer(&self, _key: TaskKey) {
             self.runs.fetch_add(1, Ordering::SeqCst);
             self.started.notify_one();
-            std::thread::sleep(Duration::from_millis(150));
+            let release = self.release.lock().expect("release lock should stay open");
+            release.recv().expect("the test releases the section");
+            drop(release);
             self.finished.notify_one();
         }
     }
@@ -1886,12 +1904,14 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
         let finished = Arc::new(Notify::new());
+        let (release, released) = std::sync::mpsc::channel();
         let key = test_key();
         handle
             .set_inbound_handler(Arc::new(SlowSyncHandler {
                 runs: runs.clone(),
                 started: started.clone(),
                 finished: finished.clone(),
+                release: Arc::new(Mutex::new(released)),
             }))
             .await;
         fire_timer(&handle, key.clone()).await;
@@ -1921,6 +1941,7 @@ mod tests {
         };
         assert_eq!(count, 1, "the aborted run must stay owned until completion");
 
+        release.send(()).expect("the handler waits for its release");
         tokio::time::timeout(Duration::from_secs(1), finished.notified())
             .await
             .expect("handler should reach its completion");
@@ -1952,14 +1973,19 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
         let finished = Arc::new(Notify::new());
+        let (release, released) = std::sync::mpsc::channel();
         let key = test_key();
         handle
             .set_inbound_handler(Arc::new(SlowSyncHandler {
                 runs: runs.clone(),
                 started: started.clone(),
                 finished: finished.clone(),
+                release: Arc::new(Mutex::new(released)),
             }))
             .await;
+        // One thread runs the test and the handler, so both runs are released up front.
+        release.send(()).expect("the handler waits for its release");
+        release.send(()).expect("the handler waits for its release");
         fire_timer(&handle, key.clone()).await;
         tokio::time::timeout(Duration::from_secs(1), started.notified())
             .await
@@ -1972,7 +1998,7 @@ mod tests {
             .await;
         fire_timer(&handle, key.clone()).await;
 
-        wait_for_runs(&runs, 2).await;
+        wait_for_runs(&runs, &started, 2).await;
     }
 
     // Repeating shutdown after handlers were already drained is a clean no-op
@@ -2009,7 +2035,7 @@ mod tests {
         };
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_ignores_running() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));

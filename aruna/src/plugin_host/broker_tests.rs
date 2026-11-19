@@ -5,6 +5,7 @@
 
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::api::ExportMetadataResult;
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_drivers::driver::drive;
 use aruna_operations::metadata::api::MetadataApiError;
@@ -28,13 +29,14 @@ use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::read_types::DocumentQueryRequest;
 use aruna_operations::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
 use aruna_operations::metadata::create_entry::CreateEntryOperation;
-use aruna_operations::plugins::dataset::merge_into;
 use aruna_operations::plugins::host_calls::VisibleObjects;
+use aruna_operations::plugins::host_steps::GrantedCall;
 use aruna_operations::plugins::store::Txn;
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::queued;
-use aruna_operations::testing::drain_projection_queue;
-use aruna_operations::testing::process_materialization_batch;
+use aruna_test_support::projection::drain_projection_queue;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_plugin_types::calls::merge_into;
 
 /// Runs the projection and graph work a write queued.
 async fn project(ctx: &DriverContext) {
@@ -171,18 +173,10 @@ async fn object_calls() {
     let refused = broker.objects_info(&cx(), &path, pinned).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::NotGranted);
     let meta = format!("/{}/g/{}/meta/x", fixture.actor.realm_id, fixture.group_id);
-    assert!(
-        broker
-            .checked(Permission::MetadataRead, &meta)
-            .await
-            .is_ok()
-    );
-    assert!(
-        broker
-            .checked(Permission::ObjectsRead, &path)
-            .await
-            .is_err()
-    );
+    let meta_read = GrantedCall::target(&broker.scope, Permission::MetadataRead, &meta);
+    assert!(drive(meta_read, &broker.ctx).await.is_ok());
+    let object_read = GrantedCall::target(&broker.scope, Permission::ObjectsRead, &path);
+    assert!(drive(object_read, &broker.ctx).await.is_err());
 
     // With `read` on the whole group, objects of other nodes and buckets outside it are refused.
     let reads = serde_json::json!({ "permissions": { "required": ["objects.read"] } });
@@ -1067,7 +1061,7 @@ async fn superseded_merge_journaled() {
     };
     use aruna_core::plugin_runs::source_key;
     use aruna_operations::metadata::record_reads::DocumentRecordOperation;
-    use aruna_operations::testing::project_create_events;
+    use aruna_test_support::projection::project_create_events;
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;
     let revision = revision_of(&broker, document).await;
@@ -1084,7 +1078,7 @@ async fn superseded_merge_journaled() {
     let source = MetadataBatchSource::UpsertDataEntity {
         jsonld: r#"{"@id":"./d.txt","@type":"File","name":"d"}"#.to_string(),
     };
-    let planned = aruna_operations::testing::send_metadata_effect(
+    let planned = aruna_drivers::testing::send_metadata_effect(
         &broker.ctx,
         MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
@@ -1620,7 +1614,7 @@ async fn unprojected_event_refused() {
         source: source.clone(),
     };
     let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) =
-        aruna_operations::testing::send_metadata_effect(&broker.ctx, plan).await
+        aruna_drivers::testing::send_metadata_effect(&broker.ctx, plan).await
     else {
         panic!("expected a planned batch");
     };

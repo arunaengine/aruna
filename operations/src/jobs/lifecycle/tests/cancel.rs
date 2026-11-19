@@ -20,7 +20,7 @@ use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::store::test_calls::read_job_record;
+use aruna_test_support::jobs::read_job_record;
 use crate::tests::records::{Family, REALM, serve_job_record, user};
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_drivers::driver::{DriverContext, drive};
@@ -373,7 +373,7 @@ async fn unrecorded_deletion_kept() {
     // delete records it again; a holder records it before the run goes.
     use crate::jobs::job_reads::tests::delete_owned_run;
     use crate::jobs::store::RunDelete;
-    use crate::jobs::store::test_calls::insert_job;
+    use aruna_test_support::jobs::insert_job;
     use crate::tests::records::secret;
     use aruna_core::structs::execution::job::{
         ComputeResources, ExecutionSpec, JobPayload, JobRecord,

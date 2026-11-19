@@ -322,9 +322,9 @@ fn map_email_error(error: SetEmailError) -> ServerError {
         SetEmailError::InvalidProfile { .. } | SetEmailError::PasswordRequired => {
             ServerError::BadRequestReason(error.to_string())
         }
-        SetEmailError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
-            "concurrent realm configuration update conflict; retry".to_string(),
-        ),
+        SetEmailError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::config_conflict()
+        }
         SetEmailError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }

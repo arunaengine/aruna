@@ -45,6 +45,7 @@ pub struct ReplicateDocumentsOperation {
     retry_needed: bool,
     /// Fail when a document was not handed to the outbox instead of deferring it.
     strict: bool,
+    now_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -119,6 +120,7 @@ impl ReplicateDocumentsOperation {
             placement_action: None,
             retry_needed: false,
             strict: false,
+            now_ms: 0,
         }
     }
 
@@ -184,6 +186,7 @@ impl ReplicateDocumentsOperation {
                     placement,
                     self.config.local_node_id,
                     Vec::new(),
+                    self.now_ms / 1_000,
                 )));
                 return self.emit_placement_update().map(Some);
             }
@@ -210,6 +213,7 @@ impl ReplicateDocumentsOperation {
                 placement,
                 local_node_id,
                 selected_peers.clone(),
+                self.now_ms / 1_000,
             )))
         };
 
@@ -273,6 +277,7 @@ impl ReplicateDocumentsOperation {
             placement,
             self.config.local_node_id,
             Vec::new(),
+            self.now_ms / 1_000,
         )));
         self.emit_placement_update()
     }
@@ -306,6 +311,10 @@ impl ReplicateDocumentsOperation {
 impl Operation for ReplicateDocumentsOperation {
     type Output = ();
     type Error = ReplicateDocumentsError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<()>, ReplicateDocumentsError> {
         let config = DocumentTarget::RealmConfig {

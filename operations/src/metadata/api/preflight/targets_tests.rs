@@ -22,7 +22,7 @@ fn auth() -> AuthContext {
 }
 
 fn info() -> BucketInfo {
-    crate::tests::s3::bucket_info(Ulid::from_parts(3, 3), UserId::nil(realm()))
+    aruna_test_support::s3::bucket_info(Ulid::from_parts(3, 3), UserId::nil(realm()))
 }
 
 fn bucket_target(operation: MetadataStorageOperation) -> ReferenceTarget {

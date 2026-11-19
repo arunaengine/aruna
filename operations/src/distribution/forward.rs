@@ -24,7 +24,6 @@ use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionMember, DistributionSnapshot, SignedSnapshot, SignedStatement,
 };
 use aruna_core::structs::storage::format::Compression;
-use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 

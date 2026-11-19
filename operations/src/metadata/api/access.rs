@@ -8,7 +8,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, GroupEvent, GroupResult};
-use aruna_core::operation::{Operation, Runnable, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -30,10 +30,9 @@ pub(super) fn internal(error: impl ToString) -> MetadataApiError {
     MetadataApiError::Internal(error.to_string())
 }
 
-fn member<O, K>(operation: O) -> Effect
+fn member<O>(operation: O) -> Effect
 where
-    O: Runnable<K> + 'static,
-    K: 'static,
+    O: Operation + 'static,
     O::Output: std::fmt::Debug + Send + PartialEq + 'static,
     O::Error: std::fmt::Debug + Send + PartialEq + 'static,
 {
@@ -51,10 +50,9 @@ fn group(members: Vec<Effect>) -> IoCall {
 }
 
 /// Runs `operations` as one group of children, at most [`FANOUT_LIMIT`] at a time.
-pub(crate) fn children<O, K>(operations: Vec<O>) -> IoCall
+pub(crate) fn children<O>(operations: Vec<O>) -> IoCall
 where
-    O: Runnable<K> + 'static,
-    K: 'static,
+    O: Operation + 'static,
     O::Output: std::fmt::Debug + Send + PartialEq + 'static,
     O::Error: std::fmt::Debug + Send + PartialEq + 'static,
 {

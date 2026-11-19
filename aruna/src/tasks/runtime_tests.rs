@@ -25,16 +25,16 @@ use aruna_drivers::jobs::executor::RangeTurns;
 use aruna_drivers::jobs::runtime::*;
 use aruna_drivers::jobs::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
 use aruna_drivers::testing::import_record;
+use aruna_drivers::testing::task_context;
 use aruna_operations::jobs::JOB_MAX_ATTEMPTS;
 use aruna_operations::jobs::runtime_steps::requeue_call;
 use aruna_operations::jobs::store::JobMutation;
 use aruna_operations::jobs::store::job_calls::{AdoptOutcome, ClaimOutcome, RequeueOutcome};
 use aruna_operations::jobs::store::mutation_error::JobMutationError;
-use aruna_operations::jobs::store::test_calls::{
+use aruna_test_support::jobs::{
     adopt_external_attempt, cancel_running_job, claim_job, complete_job, insert_job, mutate_job,
     read_job_record, record_attempt_intent, requeue_job, set_cancel_requested,
 };
-use aruna_operations::testing::task_context;
 use aruna_storage::{FjallStorage, StorageHandle};
 use byteview::ByteView;
 use futures_util::future::FutureExt;

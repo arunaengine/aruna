@@ -9,7 +9,7 @@ use aruna_core::git::{GitChange, GitRecord};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::reducer::decode_reducer_state;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
@@ -456,7 +456,8 @@ impl Operation for GroupDefaultOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<DatasetLocation>, GitError> {
-        let state = value(result)?
+        let state = result
+            .value()?
             .map(|bytes| decode_reducer_state(&bytes))
             .transpose()
             .map_err(|_| GitError::Unavailable)?;

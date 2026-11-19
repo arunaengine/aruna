@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     UPLOAD_INVENTORY_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, read_row, value};
+use aruna_core::rows::{PrefixPages, done, read_row};
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, Cursor, RangeAccount, RangeCounters, Rebuild, account_key,
     generation_key,
@@ -484,7 +484,7 @@ impl Operation for RebuildOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<RebuildOutcome>, RebuildError> {
         match self.state {
             State::Account => {
-                let stored = value(result)?;
+                let stored = result.value()?;
                 let account = decode_account(stored.as_ref(), self.config.range_id)?;
                 self.advance(account)
             }

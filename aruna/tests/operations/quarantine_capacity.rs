@@ -19,13 +19,14 @@ use aruna_core::structs::{
 };
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
+use aruna_drivers::testing::write_entries;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::sync::sync_quarantine::{
     AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
     QuarantinePage, QuarantinePageRequest, ReadQuarantineOperation,
 };
-use aruna_operations::testing::{reconcile_topics, write_entries};
 use aruna_storage::StorageHandle;
+use aruna_test_support::documents::reconcile_topics;
 use byteview::ByteView;
 use ulid::Ulid;
 

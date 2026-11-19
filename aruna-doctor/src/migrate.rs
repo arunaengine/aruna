@@ -37,7 +37,7 @@ use aruna_core::realm_vault::RealmVaultRecord;
 use aruna_core::secrets::SecretRecord;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
 use aruna_core::structs::execution::email::RealmEmailProfile;
-use aruna_core::structs::execution::harvest::{HarvestSource, RepositoryConnectorSecret};
+use aruna_core::structs::execution::harvest::HarvestSource;
 use aruna_core::structs::execution::job::record_rows::{
     ConflictRecord, PendingNeed, PendingRecord,
 };
@@ -46,7 +46,7 @@ use aruna_core::structs::execution::job::{
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
-use aruna_core::structs::execution::source_connector::SourceConnector;
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, ReplicaQuota};
@@ -723,7 +723,7 @@ fn seal_rows(
     skipped: &mut Vec<String>,
 ) -> Result<Rewrites, ExplorerError> {
     let plain = |value: &[u8]| match name {
-        CONNECTOR_SECRET_KEYSPACE => RepositoryConnectorSecret::from_bytes(value).is_ok(),
+        CONNECTOR_SECRET_KEYSPACE => SourceConnectorSecret::from_bytes(value).is_ok(),
         _ => false,
     };
     let mut scanned = 0;
@@ -1394,13 +1394,13 @@ mod tests {
     #[test]
     fn seals_plain_secrets() {
         use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes};
-        use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
+        use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
         use std::collections::HashMap;
 
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         node_state(&path);
-        let plain = RepositoryConnectorSecret::new(
+        let plain = SourceConnectorSecret::new(
             Ulid::from_bytes([1u8; 16]),
             HashMap::from([("token".to_string(), "canary-61d0".to_string())]),
             std::time::SystemTime::UNIX_EPOCH,

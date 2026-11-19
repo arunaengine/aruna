@@ -26,7 +26,7 @@ fn table_run() -> StagingRun {
 }
 
 fn observation(length: u64) -> SourceMetadata {
-    crate::tests::staging::sized_source(length, None)
+    aruna_test_support::staging::sized_source(length, None)
 }
 
 fn reader(read: TableRead) -> ChunkReadOperation {
@@ -54,7 +54,7 @@ where
 }
 
 fn stream() -> ByteStream {
-    BackendStream::new(futures_util::stream::empty::<Result<Bytes, StreamError>>())
+    BackendStream::empty()
 }
 
 fn read_answer(metadata: SourceMetadata) -> IoResult {

@@ -31,7 +31,7 @@ fn count_files(path: &Path) -> usize {
 }
 
 async fn read_value(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {
-    crate::testing::read_value(&context.storage_handle, key_space, key).await
+    aruna_drivers::testing::read_value(&context.storage_handle, key_space, key).await
 }
 
 fn test_location(created_by: UserId) -> BackendLocation {
@@ -126,7 +126,7 @@ pub(super) fn asked(turn: &Turn) -> &Effect {
 
 /// The cleanup rows among `calls`, in order.
 pub(super) fn cleanup_works(calls: &[IoCall]) -> Vec<BlobCleanupWork> {
-    crate::tests::s3::cleanup_works(calls)
+    aruna_test_support::s3::cleanup_works(calls)
 }
 
 /// `calls` delete the written blob through a rollback child, and nothing else.

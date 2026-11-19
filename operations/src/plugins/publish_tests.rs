@@ -269,7 +269,11 @@ fn copies_in_window() {
     use crate::plugins::copy_rows::CHUNK;
     let artifact = vec![7u8; CHUNK + 1];
     let (first, second) = (node(1), node(2));
-    let mut copy = copy_artifact(vec![first, second], "sha256:d".into(), artifact.clone());
+    let mut copy = copy_artifact(
+        vec![first, second],
+        "sha256:d".into(),
+        artifact.clone().into(),
+    );
     let group = EffectGroup {
         members: vec![sent(first, &artifact, 0), sent(second, &artifact, 0)],
         limit: 2,
@@ -290,7 +294,7 @@ fn copies_in_window() {
 
 #[test]
 fn copy_refuses_answers() {
-    let mut copy = copy_artifact(vec![node(1)], "sha256:d".into(), vec![1]);
+    let mut copy = copy_artifact(vec![node(1)], "sha256:d".into(), vec![1u8].into());
     copy.first().unwrap();
     let got = "GroupEvent::Member";
     let unknown = copy.next(answered(5, Ok(true)));
@@ -301,7 +305,7 @@ fn copy_refuses_answers() {
         Err(CopyError::Unexpected { got })
     );
     // Without peers nothing is sent and no node confirms.
-    let mut alone = copy_artifact(Vec::new(), "sha256:d".into(), vec![1]);
+    let mut alone = copy_artifact(Vec::new(), "sha256:d".into(), vec![1u8].into());
     assert_eq!(alone.first(), Ok(Next::Done(BTreeSet::new())));
 }
 
@@ -384,7 +388,7 @@ mod operations {
             config: managers_of(managers),
             entry: entry("sha256:aa"),
         };
-        FinishPublish::new(actor, auth, plan, FIXTURE.to_vec())
+        FinishPublish::new(actor, auth, plan, Bytes::from_static(FIXTURE))
     }
 
     #[test]
@@ -410,5 +414,59 @@ mod operations {
         let written = entry("sha256:aa");
         let answer = publish.next(child_result(Ok::<_, EntryError>(written.clone())));
         assert_eq!(answer, Ok(Next::Done(written)));
+    }
+
+    fn publish() -> PublishPlugin {
+        let actor = actor();
+        let mut publish = PublishPlugin::new(actor.clone(), auth(&actor), Bytes::from(FIXTURE));
+        publish.stamp(7);
+        publish
+    }
+
+    /// A publish whose check planned to store a new version.
+    fn checked() -> PublishPlugin {
+        let mut publish = publish();
+        assert!(is_child(&publish.first()), "the check runs first");
+        let plan = Box::new(PublishPlan {
+            config: managers_of(0),
+            entry: entry("sha256:aa"),
+        });
+        let planned = Ok::<_, PublishError>(PublishStep::Store(plan));
+        assert!(is_child(&publish.next(child_result(planned))), "store here");
+        publish
+    }
+
+    #[test]
+    fn publish_runs_steps() {
+        let mut publish = checked();
+        assert!(matches!(publish.phase, PublishPhase::Storing(_)));
+        let stored = child_result(Ok::<(), ArtifactError>(()));
+        assert!(is_child(&publish.next(stored)), "copy and write");
+        assert!(publish.artifact.is_empty(), "the finish holds the artifact");
+        let written = entry("sha256:aa");
+        let finished = child_result(Ok::<_, PublishError>(written.clone()));
+        assert_eq!(publish.next(finished), Ok(Next::Done(written)));
+    }
+
+    #[test]
+    fn publish_stops_early() {
+        let mut known = publish();
+        assert_eq!(known.now_ms, 7);
+        known.first().unwrap();
+        let same = entry("sha256:aa");
+        let planned = Ok::<_, PublishError>(PublishStep::Known(same.clone()));
+        assert_eq!(known.next(child_result(planned)), Ok(Next::Done(same)));
+        let mut refused = publish();
+        refused.first().unwrap();
+        let denied = child_result(Err::<PublishStep, _>(PublishError::Unauthorized));
+        assert_eq!(refused.next(denied), Err(PublishError::Unauthorized));
+        let mut lost = checked();
+        let failed = child_result(Err::<(), _>(ArtifactError::Busy));
+        let busy = Err(PublishError::Artifact(ArtifactError::Busy));
+        assert_eq!(lost.next(failed), busy, "no copies without one here");
+        let actor = actor();
+        let large = vec![0u8; MAX_ARTIFACT + 1].into();
+        let mut large = PublishPlugin::new(actor.clone(), auth(&actor), large);
+        assert_eq!(large.first(), Err(PublishError::TooLarge));
     }
 }

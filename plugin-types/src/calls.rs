@@ -5,6 +5,7 @@
 
 use std::fmt;
 
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// One header or query pair.
@@ -165,6 +166,27 @@ impl Intent {
         Self {
             ordinal,
             digest: hasher.finalize().into(),
+        }
+    }
+}
+
+/// Applies a JSON merge patch to `target`, as a dataset patch call does. The SDK's fake host
+/// keeps its own copy; `merge_cases.json` holds both to the same cases.
+pub fn merge_into(target: &mut Value, patch: Value) {
+    let Value::Object(changes) = patch else {
+        *target = patch;
+        return;
+    };
+    if !target.is_object() {
+        *target = Value::Object(Map::new());
+    }
+    let Value::Object(fields) = target else {
+        return;
+    };
+    for (key, value) in changes {
+        match value {
+            Value::Null => drop(fields.remove(&key)),
+            value => merge_into(fields.entry(key).or_insert(Value::Null), value),
         }
     }
 }

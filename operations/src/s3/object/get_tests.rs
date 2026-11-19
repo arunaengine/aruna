@@ -10,7 +10,7 @@ use crate::s3::object::get::{
     Turn,
 };
 use crate::s3::object::read::{
-    GetRoutedOperation, HolderFailures, PromoteLeasedOperation, RoutedRead, routed_info, slice_blob,
+    GetRoutedOperation, HolderFailures, PromoteLeasedOperation, RoutedRead, routed_info,
 };
 use crate::s3::usage::{RowChange, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
@@ -1438,7 +1438,7 @@ async fn drift_creates_successor() {
 }
 
 fn observation(content_length: u64) -> SourceMetadata {
-    crate::tests::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
+    aruna_test_support::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
 }
 
 fn reference_source() -> VersionSourceBinding {
@@ -2198,7 +2198,7 @@ async fn read_reference_version(ctx: &DriverContext, version_id: Ulid) -> Source
 async fn offered_drift_replaces() {
     use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
 
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let context = &fixture.driver_context;
     let root = tempdir().unwrap();
     let file = root.path().join("data.bin");
@@ -2734,10 +2734,7 @@ async fn slices_routed_range() {
             .into_iter()
             .map(|chunk| Ok(bytes::Bytes::from_static(chunk.as_bytes())))
             .collect();
-        let mut blob = slice_blob(
-            BackendStream::new(futures_util::stream::iter(chunks)),
-            range,
-        );
+        let mut blob = BackendStream::new(futures_util::stream::iter(chunks)).slice(range);
         let mut bytes = Vec::new();
         while let Some(chunk) = blob.0.next().await {
             bytes.extend_from_slice(&chunk.unwrap());

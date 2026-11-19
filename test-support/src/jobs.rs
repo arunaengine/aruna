@@ -2,27 +2,31 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::attempt_intent::AttemptCommit;
-use super::job_calls::AdoptOutcome;
-use super::job_calls::CancelRequestOutcome;
-use super::job_calls::ClaimOutcome;
-use super::job_calls::ExecutionCompleteOutcome;
-use super::job_calls::ParkOutcome;
-use super::job_calls::ReleaseOutcome;
-use super::job_calls::RenewOutcome;
-use super::job_calls::RequeueOutcome;
-use super::job_calls::RunSuccess;
-use super::mutation::{MutateJobOperation, NoGuard};
-use super::park_wake::AwaitOutcome;
-use super::*;
-use super::{job_calls, row_calls};
-use aruna_core::structs::execution::job::KeyWait;
+use std::collections::BTreeMap;
+
+use aruna_core::UserId;
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::{
+    AttemptControl, AttemptIntent, JobError, JobId, JobProgress, JobRecord, JobRecordEnvelope,
+    JobResultPayload, KeyWait, LaunchRecord,
+};
 use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
-use aruna_core::types::TxnId;
-use aruna_drivers::driver::DriverContext;
-use aruna_drivers::driver::drive;
-use std::collections::BTreeMap;
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
+use aruna_core::types::{Key, TxnId, Value};
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_operations::jobs::store::attempt_intent::AttemptCommit;
+use aruna_operations::jobs::store::job_calls::{
+    self, AdoptOutcome, CancelRequestOutcome, ClaimOutcome, ExecutionCompleteOutcome, ParkOutcome,
+    ReleaseOutcome, RenewOutcome, RequeueOutcome, RunSuccess,
+};
+use aruna_operations::jobs::store::mutation_error::JobMutationError;
+use aruna_operations::jobs::store::park_wake::AwaitOutcome;
+use aruna_operations::jobs::store::{JobMutation, RunDelete, row_calls};
+use aruna_operations::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use ulid::Ulid;
 
 pub async fn adopt_external_attempt(
     context: &DriverContext,
@@ -256,21 +260,9 @@ pub async fn mutate_job<F>(
     mutate: F,
 ) -> Result<JobRecord, JobMutationError>
 where
-    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Clone + Send + 'static,
 {
-    let mut mutate = mutate;
-    let mut attempt = 0;
-    loop {
-        let result = drive(
-            MutateJobOperation::new(job_id, &mut mutate, None::<NoGuard>),
-            context,
-        )
-        .await;
-        match settle_attempt(result, attempt, "job mutation exhausted conflict retries").await {
-            Some(result) => return result,
-            None => attempt += 1,
-        }
-    }
+    drive(job_calls::change_job(job_id, mutate), context).await
 }
 
 pub async fn park_job(
@@ -592,24 +584,6 @@ pub async fn wake_key_waits(
     drive(row_calls::wake_key_waits(key, now_ms), context).await
 }
 
-pub async fn settle_attempt<T>(
-    result: Result<T, JobMutationError>,
-    attempt: u32,
-    exhausted: &str,
-) -> Option<Result<T, JobMutationError>> {
-    match result {
-        Err(JobMutationError::Conflict) if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
-            // Lets the competing writer finish before the retry, without real time.
-            tokio::task::yield_now().await;
-            None
-        }
-        Err(JobMutationError::Conflict) => {
-            Some(Err(JobMutationError::Storage(exhausted.to_string())))
-        }
-        other => Some(other),
-    }
-}
-
 /// Submits an execution job served by this context's node, at the current time.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_execution_job(
@@ -622,8 +596,7 @@ pub async fn submit_execution_job(
     workspace_bucket: Option<String>,
     retention_ms: u64,
     active_cap: Option<u32>,
-) -> Result<aruna_core::job_request::SubmitJobResult, aruna_core::job_request::SubmitJobError> {
-    use crate::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
+) -> Result<SubmitJobResult, SubmitJobError> {
     let submission = ExecutionSubmission {
         spec,
         created_by,

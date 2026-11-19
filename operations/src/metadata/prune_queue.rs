@@ -728,7 +728,7 @@ pub fn jobs_queued() -> DuePruneOperation {
 mod tests {
     use super::*;
     use crate::metadata::registry_cache::{Registry, RegistryReadOperation};
-    use crate::testing::{process_graph_tombstones, process_prune_batch, prune_jobs_exist};
+    use aruna_test_support::metadata::{process_graph_tombstones, process_prune_batch, prune_jobs_exist};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::storage_entries::{graph_lifecycle_entry, registry_write_entries};
@@ -741,8 +741,8 @@ mod tests {
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
 
-    use crate::testing::write_entries;
     use crate::tests::metadata::storage_key_exists;
+    use aruna_drivers::testing::write_entries;
 
     fn lifecycle(graph_iri: &str) -> GraphLifecycleRecord {
         GraphLifecycleRecord::deleted(

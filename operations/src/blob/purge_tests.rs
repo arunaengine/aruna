@@ -245,7 +245,7 @@ async fn plans_until_ended() {
         1,
         None,
     );
-    crate::jobs::store::test_calls::insert_job(&context, &record)
+    aruna_test_support::jobs::insert_job(&context, &record)
         .await
         .unwrap();
     aruna_drivers::driver::drive(

@@ -653,7 +653,7 @@ mod tests {
     use ulid::Ulid;
 
     fn observation(content_length: u64) -> SourceMetadata {
-        crate::tests::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
+        aruna_test_support::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
     }
 
     fn refresh(metadata: Option<SourceMetadata>, seconds: u64) -> ReferenceRefresh {

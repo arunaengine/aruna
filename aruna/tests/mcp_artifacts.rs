@@ -1,5 +1,5 @@
 //! Tests the MCP artifact contract: a captured PNG keeps its content type and is served by S3.
-//! Skips when Docker is unavailable.
+//! Ignored by default, since it needs a Docker daemon.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,8 +10,8 @@ use crate::shared;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::docker::DockerBackend;
-use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::structs::execution::job::JobId;
 use aws_sdk_s3::primitives::ByteStream;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig, ProtocolVersion};
@@ -34,31 +34,6 @@ import matplotlib.pyplot as plt
 plt.bar(["a", "b", "c"], [3, 1, 2])
 plt.savefig("/work/chart.png")
 "#;
-
-/// A reachable, healthy Docker daemon, or `None` (test skips).
-async fn docker_or_skip() -> Option<DockerBackend> {
-    let config = DockerConfig {
-        keep_failed: std::env::var("ARUNA_KEEP_FAILED").is_ok(),
-        // Its own state root, so tests that run at once never contend for one owner lock.
-        state_root: std::env::temp_dir()
-            .join("aruna-compute-tests")
-            .join(ulid::Ulid::generate().to_string()),
-        ..DockerConfig::default()
-    };
-    match DockerBackend::with_config(config) {
-        Ok(backend) => match backend.health().await {
-            Ok(()) => Some(backend),
-            Err(error) => {
-                eprintln!("skipping artifact test: docker daemon unhealthy: {error}");
-                None
-            }
-        },
-        Err(error) => {
-            eprintln!("skipping artifact test: no reachable docker daemon: {error}");
-            None
-        }
-    }
-}
 
 struct Fixture {
     seed: shared::SeedNode,
@@ -202,10 +177,9 @@ async fn wait_view(
 // A chart written by a script run is discoverable and displayable: the tools
 // name its type, size, filename, and exact version, and S3 serves those bytes.
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn artifact_round_trip() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     let fixture = setup(backend).await?;
     let client = connect(&fixture.seed.base_url, &fixture.bearer).await;
 

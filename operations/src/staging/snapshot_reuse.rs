@@ -131,7 +131,7 @@ impl Operation for SnapshotReuseOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::staging::{sample_connector, sample_metadata};
+    use aruna_test_support::staging::{sample_connector, sample_metadata};
     use aruna_core::structs::execution::staging::StagingStrategy;
 
     fn operation() -> SnapshotReuseOperation {

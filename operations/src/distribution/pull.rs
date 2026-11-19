@@ -21,7 +21,7 @@ use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE, FILL_CLAIM_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::{outside_answer, outside_call, read_row, value};
+use aruna_core::rows::{outside_answer, outside_call, read_row};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo};
@@ -239,7 +239,7 @@ impl Operation for PullMemberOperation {
     fn next(&mut self, result: IoResult) -> MemberTurn {
         match self.step {
             MemberStep::Bucket => {
-                let bucket = value(result)?.ok_or(GetObjectError::NoSuchKey)?;
+                let bucket = result.value()?.ok_or(GetObjectError::NoSuchKey)?;
                 let binding = BucketInfo::from_bytes(&bucket)?
                     .distribution
                     .filter(|binding| binding.set_id == self.request.held.set_id)
@@ -250,7 +250,7 @@ impl Operation for PullMemberOperation {
                 Ok(Next::Call(read_row(DISTRIBUTION_KEYSPACE, key)))
             }
             MemberStep::Record => {
-                let record = value(result)?.ok_or(GetObjectError::HoldersUnavailable)?;
+                let record = result.value()?.ok_or(GetObjectError::HoldersUnavailable)?;
                 let member_id = self.member_id.ok_or(IoError::Unfinished)?;
                 self.recorded(&record, member_id)
             }
@@ -273,7 +273,7 @@ impl Operation for PullMemberOperation {
                 Ok(Next::Call(read_row(BUCKET_ENCRYPTION_KEYSPACE, key)))
             }
             MemberStep::Encryption => {
-                let settings = value(result)?;
+                let settings = result.value()?;
                 // Governed versions are served only from registered copies, never kept ones.
                 let keeping = BucketEncryption::from_row(settings.as_deref())?
                     .active_key()

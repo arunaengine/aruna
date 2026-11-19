@@ -651,7 +651,6 @@ impl PutCrateOperation {
         let group_id = scope.info.group_id;
         let bytes = std::mem::take(&mut self.bytes);
         let size = bytes.len() as u64;
-        let body = futures_util::stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
         let tags = HashMap::from([
             (RELEASE_TAG.to_string(), input.spec.label.clone()),
             (RELEASE_PREFIX_TAG.to_string(), input.spec.prefix.clone()),
@@ -669,7 +668,7 @@ impl PutCrateOperation {
                 bucket: scope.bucket.clone(),
                 key: input.key.clone(),
                 content_length: Some(size),
-                body: Some(BackendStream::new(body)),
+                body: Some(BackendStream::once(Bytes::from(bytes))),
             },
             expected_checksums: Vec::new(),
             checksum_type: None,

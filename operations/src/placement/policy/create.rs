@@ -28,7 +28,9 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox_record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
 use aruna_core::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -329,7 +331,8 @@ impl PolicyWrite {
         if let Some(entry) = shard_manifest_entry(&target, &change)? {
             writes.push(entry);
         }
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            self.ids.mint(self.config.created_at_ms),
             self.config.actor.node_id,
             target,
             holders,

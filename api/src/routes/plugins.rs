@@ -4,18 +4,15 @@
 
 use std::sync::Arc;
 
-use aruna_clock::unix_timestamp_millis;
 use aruna_core::errors::StorageError;
 use aruna_core::plugins::{MAX_ARTIFACT, MemoryPermit, PublishedPlugin};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::plugins::artifacts::ArtifactError;
 use aruna_operations::plugins::copies::ReserveMemory;
-use aruna_operations::plugins::publish::{
-    CheckPublish, EntryError, FinishPublish, PublishError, PublishStep,
-};
+use aruna_operations::plugins::publish::{EntryError, PublishError, PublishPlugin};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{StatusCode, header};
@@ -141,27 +138,11 @@ pub async fn publish(
 ) -> ServerResult<(StatusCode, Json<PluginView>)> {
     let (auth, body, _memory) = read_upload(&state, auth, request).await?;
     let actor = actor(&state, &auth);
-    let published = publish_artifact(&state.get_ctx(), actor, auth, Vec::from(body))
+    let publish = PublishPlugin::new(actor, auth, body);
+    let published = drive(publish, &state.get_ctx())
         .await
         .map_err(map_publish_error)?;
     Ok((StatusCode::CREATED, Json(published.into())))
-}
-
-/// Checks the artifact, stores it here, copies it to the other management nodes and writes the
-/// entry. Answers only after a majority stored it durably; otherwise nothing is published.
-async fn publish_artifact(
-    ctx: &DriverContext,
-    actor: Actor,
-    auth: AuthContext,
-    artifact: Vec<u8>,
-) -> Result<PublishedPlugin, PublishError> {
-    let check = CheckPublish::new(&actor, &auth, &artifact, unix_timestamp_millis())?;
-    let plan = match drive(check, ctx).await? {
-        PublishStep::Known(published) => return Ok(published),
-        PublishStep::Store(plan) => plan,
-    };
-    drive(plan.store_copy(&artifact), ctx).await?;
-    drive(FinishPublish::new(actor, auth, *plan, artifact), ctx).await
 }
 
 /// Reads an artifact upload only after the caller may publish and this node reserved memory for
@@ -270,7 +251,7 @@ fn map_publish_error(error: PublishError) -> ServerError {
             ServerError::Conflict(error.to_string())
         }
         PublishError::Entry(EntryError::StorageError(StorageError::TransactionConflict)) => {
-            ServerError::Conflict("concurrent realm configuration update conflict; retry".into())
+            ServerError::config_conflict()
         }
         PublishError::Entry(EntryError::Unauthorized | EntryError::NotManagementNode) => {
             ServerError::Forbidden

@@ -15,7 +15,6 @@ use aruna_core::events::{Event, NetEvent};
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, FEDERATION_KEYSPACE, USER_KEYSPACE};
 use aruna_core::link::{alias_claims_key, alias_owner};
 use aruna_core::operation::Operation;
-use aruna_core::rows::value;
 use aruna_core::structs::identity::auth::{AuthContext, TokenClaims};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
@@ -88,7 +87,7 @@ impl Operation for TokenRevokedOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, ArunaBearerError> {
-        let revoked = read_config(value(result)?)?
+        let revoked = read_config(result.value()?)?
             .is_none_or(|config| config.token_revoked(&self.token_hash, now_secs(self.now_ms)));
         Ok(Next::Done(revoked))
     }
@@ -125,7 +124,7 @@ impl Operation for UserCutoffOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<u64>>, ArunaBearerError> {
-        let cutoff = read_config(value(result)?)?
+        let cutoff = read_config(result.value()?)?
             .and_then(|config| config.user_cutoff(&self.user_id, now_secs(self.now_ms)));
         Ok(Next::Done(cutoff))
     }
@@ -156,7 +155,8 @@ impl Operation for AccountDeactivatedOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, ArunaBearerError> {
-        let user = value(result)?
+        let user = result
+            .value()?
             .map(|bytes| User::from_bytes(&bytes))
             .transpose()
             .map_err(|_| ArunaBearerError::RevocationUnavailable)?;
@@ -190,7 +190,7 @@ impl Operation for LinkedOwnerOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<UserId>>, ArunaBearerError> {
-        let row = value(result)?;
+        let row = result.value()?;
         let unreadable = |_| ArunaBearerError::RevocationUnavailable;
         let Some(owner) = self.owner else {
             let claims = row
@@ -263,7 +263,7 @@ impl Operation for GrantValidOperation {
             let owner = linked_owner(result)?;
             return Ok(Next::Done(owner == Some(self.user_id)));
         }
-        let Some(config) = read_config(value(result)?)? else {
+        let Some(config) = read_config(result.value()?)? else {
             return Ok(Next::Done(false));
         };
         let now = now_secs(self.now_ms);
@@ -468,7 +468,7 @@ impl Operation for DecodeTokenOperation {
     fn next(&mut self, result: IoResult) -> DecodeTurn {
         match self.stage {
             DecodeStage::Trust => {
-                let trusted = stored_realms(value(result));
+                let trusted = stored_realms(result.value());
                 self.verify(trusted)
             }
             DecodeStage::Key(bytes) => {
@@ -480,7 +480,7 @@ impl Operation for DecodeTokenOperation {
                 let trusted = std::mem::take(&mut self.trusted);
                 self.check_signed(&trusted, &key)
             }
-            DecodeStage::Config => self.config_read(read_config(value(result)?)?),
+            DecodeStage::Config => self.config_read(read_config(result.value()?)?),
             DecodeStage::Link => {
                 let owner = linked_owner(result)?;
                 let claims = self.claims.take().ok_or(ArunaBearerError::TokenRevoked)?;

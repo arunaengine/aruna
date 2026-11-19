@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::tasks::runner::recover_stale_jobs;
-use aruna_operations::jobs::store::test_calls::{claim_job, insert_job, read_job_record};
+use aruna_test_support::jobs::{claim_job, insert_job, read_job_record};
 
 pub(super) use super::support::*;
 

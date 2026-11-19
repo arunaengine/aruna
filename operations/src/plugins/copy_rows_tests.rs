@@ -189,8 +189,8 @@ fn admission_bound() {
 #[test]
 fn stores_whole_copy() {
     let config = config();
-    let bytes = vec![3u8; CHUNK + 1];
-    let mut store = StoreCopy::new(&config, DIGEST, &bytes, NOW);
+    let bytes = Bytes::from(vec![3u8; CHUNK + 1]);
+    let mut store = StoreCopy::new(&config, DIGEST, bytes, NOW);
     assert_eq!(store.first(), Ok(Next::Call(read_state(DIGEST))));
     let scan_progress = store.next(no_state()).unwrap();
     assert!(matches!(scan_progress, Next::Call(IoCall::Page { .. })));
@@ -207,12 +207,12 @@ fn stores_whole_copy() {
 fn replaces_known_copy() {
     // A copy this node already knows skips the bound.
     let config = config();
-    let mut store = StoreCopy::new(&config, DIGEST, FIXTURE, NOW);
+    let mut store = StoreCopy::new(&config, DIGEST, Bytes::from_static(FIXTURE), NOW);
     store.first().unwrap();
     let known = values_result(vec![Some(Done::encode(1, 1)), Some(vec![1])]);
     assert!(is_child(store.next(known).unwrap()));
     assert_eq!(store.phase, StorePhase::Writing);
-    let mut bad = StoreCopy::new(&config, DIGEST, FIXTURE, NOW);
+    let mut bad = StoreCopy::new(&config, DIGEST, Bytes::from_static(FIXTURE), NOW);
     let refused = bad.next(values_result(vec![None, Some(vec![1])]));
     assert_eq!(refused, Err(storage("a bad progress row")));
 }

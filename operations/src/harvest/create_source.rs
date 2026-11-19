@@ -214,7 +214,7 @@ impl Operation for CreateSourceOperation {
                 }
                 Err(error) => Err(error.into()),
             },
-            Stage::Reread => self.decide(rows::value(result)?, true),
+            Stage::Reread => self.decide(result.value()?, true),
         }
     }
 }

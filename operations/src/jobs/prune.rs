@@ -427,10 +427,8 @@ pub(crate) mod tests {
     use crate::jobs::JOB_PRUNE_PAGE;
     use crate::jobs::JOB_RETENTION_MS;
     use crate::jobs::store::job_calls::ClaimOutcome;
-    use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::test_calls::put_job_entry;
-    use crate::jobs::store::test_calls::read_job_record;
-    use crate::jobs::store::test_calls::{claim_job, complete_job, transition_to_running};
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::handle::Handle;
@@ -449,34 +447,16 @@ pub(crate) mod tests {
     use aruna_core::task::TaskEvent;
     use aruna_core::time::unix_timestamp_millis;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_drivers::jobs::context::PayloadHandler;
     use aruna_drivers::testing::test_context;
     use aruna_storage::FjallStorage;
     use aruna_storage::scan::iter_prefix_page;
     use byteview::ByteView;
-    use std::sync::Arc;
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    /// One prune pass with the keep decisions of `handlers`, as the prune task runs it.
-    pub(crate) async fn prune_job_batch(
-        context: &DriverContext,
-        handlers: &[Arc<dyn PayloadHandler>],
-    ) -> Result<JobPruneOutcome, String> {
-        let now_ms = unix_timestamp_millis();
-        let mut kept = BTreeSet::new();
-        if !handlers.is_empty() {
-            let due = drive(PruneDueOperation::new(now_ms, JOB_PRUNE_PAGE), context)
-                .await
-                .map_err(|error| error.0)?;
-            for (job_id, payload) in due {
-                for handler in handlers {
-                    if handler.keeps_job(context, &payload).await? {
-                        kept.insert(job_id);
-                    }
-                }
-            }
-        }
+    /// One prune pass with nothing kept back.
+    async fn prune_job_batch(context: &DriverContext) -> Result<JobPruneOutcome, String> {
+        let (now_ms, kept) = (unix_timestamp_millis(), BTreeSet::new());
         let prune = PruneJobsOperation::new(now_ms, JOB_PRUNE_PAGE, kept);
         drive(prune, context).await.map_err(|error| error.0)
     }
@@ -704,7 +684,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
         assert_eq!(outcome.pruned, 1);
@@ -742,7 +722,7 @@ pub(crate) mod tests {
             })
             .await;
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
 
@@ -764,7 +744,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
         assert_eq!(outcome.pruned, 0);
@@ -786,7 +766,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
 
@@ -840,42 +820,35 @@ pub(crate) mod tests {
         record.retention_ms = retention_ms;
         insert_job(&context, &record).await.unwrap();
         let ClaimOutcome::Claimed(claimed) =
-            claim_job(&context, job_id, node_id(7), 2).await.unwrap()
+            aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, node_id(7), 2), &context).await.unwrap()
         else {
             panic!("job must be claimed")
         };
         let token = claimed.claim.unwrap().claim_token;
-        put_job_entry(&context, job_id, token, b"entry", &"row")
+        aruna_drivers::driver::drive(crate::jobs::store::job_calls::put_job_entry(job_id, token, b"entry", &"row"), &context)
             .await
             .unwrap();
-        transition_to_running(&context, job_id, token, 3)
+        aruna_drivers::driver::drive(crate::jobs::store::job_calls::transition_to_running(job_id, token, 3), &context)
             .await
             .unwrap();
-        complete_job(
-            &context,
-            job_id,
-            token,
-            JobResultPayload::ImportRoCrate(ImportRoCrateResult {
+        aruna_drivers::driver::drive(crate::jobs::store::job_calls::complete_job(job_id, token, JobResultPayload::ImportRoCrate(ImportRoCrateResult {
                 document_id: None,
                 entries_total: 1,
                 imported: 1,
                 unlisted: 0,
                 failed: 0,
                 report_digest: [0u8; 32],
-            }),
-            JobProgress {
+            }), JobProgress {
                 current: 1,
                 total: Some(1),
                 unit: "entries".to_string(),
                 paused_until: None,
-            },
-            unix_timestamp_millis().saturating_sub(2),
-        )
+            }, unix_timestamp_millis().saturating_sub(2)), &context)
         .await
         .unwrap();
         assert_eq!(count(&context, JOB_ENTRY_KEYSPACE).await, 1);
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
         assert_eq!(outcome.pruned, 1);
@@ -897,7 +870,7 @@ pub(crate) mod tests {
             .unwrap();
         insert_job(&context, &cleanup_record(job_id)).await.unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
 
@@ -927,7 +900,7 @@ pub(crate) mod tests {
         cleanup.finished_at_ms = Some(finished);
         insert_job(&context, &cleanup).await.unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
 

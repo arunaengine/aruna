@@ -30,8 +30,8 @@ pub struct JobContext {
     pub handlers: Vec<Arc<dyn PayloadHandler>>,
 }
 
-/// Runs and keeps the jobs of a payload kind that `jobs` does not own. The node wiring
-/// registers one per owning domain.
+/// Runs the jobs of a payload kind that `jobs` does not own. The node wiring registers one per
+/// owning domain.
 pub trait PayloadHandler: Send + Sync {
     /// Runs one job, or `None` when this handler does not own the payload.
     fn run<'a>(
@@ -39,13 +39,6 @@ pub trait PayloadHandler: Send + Sync {
         ctx: &'a JobContext,
         payload: &'a JobPayload,
     ) -> Option<BoxFuture<'a, JobRunOutcome>>;
-
-    /// Whether the job prune keeps this job for now.
-    fn keeps_job<'a>(
-        &'a self,
-        context: &'a DriverContext,
-        payload: &'a JobPayload,
-    ) -> BoxFuture<'a, Result<bool, String>>;
 }
 
 /// Reconciliation seam for lost external attempts. A lost lease or node restart must never

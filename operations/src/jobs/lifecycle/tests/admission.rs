@@ -128,7 +128,7 @@ async fn admits_local_claim() {
         drive(AliasFamilyOperation::new(job_id), &ctx).await,
         Ok(Some(family.family()))
     );
-    let record = crate::jobs::store::test_calls::read_job_record(&ctx, job_id, None)
+    let record = aruna_test_support::jobs::read_job_record(&ctx, job_id, None)
         .await
         .expect("logical row read")
         .expect("logical row exists");

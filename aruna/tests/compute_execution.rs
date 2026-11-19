@@ -1,5 +1,5 @@
 //! End-to-end compute tests that run jobs on a real Docker daemon and a real S3 endpoint.
-//! Each test skips with a written message when no daemon is reachable.
+//! They are ignored by default; a run on purpose without a daemon fails.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use aruna::tasks::runner::{ComputeReconciler, run_execution_job};
 use aruna_clock::unix_timestamp_millis;
+use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::docker::DockerBackend;
-use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{
@@ -44,31 +44,6 @@ fn job_id() -> JobId {
         BucketId::new(0).unwrap(),
     )
     .unwrap()
-}
-
-/// A reachable, healthy Docker daemon, or `None` (test skips).
-async fn docker_or_skip() -> Option<DockerBackend> {
-    let config = DockerConfig {
-        keep_failed: std::env::var("ARUNA_KEEP_FAILED").is_ok(),
-        // Its own state root, so tests that run at once never contend for one owner lock.
-        state_root: std::env::temp_dir()
-            .join("aruna-compute-tests")
-            .join(ulid::Ulid::generate().to_string()),
-        ..DockerConfig::default()
-    };
-    match DockerBackend::with_config(config) {
-        Ok(backend) => match backend.health().await {
-            Ok(()) => Some(backend),
-            Err(error) => {
-                eprintln!("skipping compute test: docker daemon unhealthy: {error}");
-                None
-            }
-        },
-        Err(error) => {
-            eprintln!("skipping compute test: no reachable docker daemon: {error}");
-            None
-        }
-    }
 }
 
 struct Fixture {
@@ -396,10 +371,9 @@ async fn run_upper(fixture: &Fixture) -> JobId {
 // Covers staged input, container output, terminal success, durable output, and run crate.
 // The run must not create a bucket of its own.
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn executes_job() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     let fixture = setup(backend).await?;
     let job_id = run_upper(&fixture).await;
 
@@ -473,10 +447,9 @@ fn exact_version(run_crate: &Value, location: &str) -> String {
 
 // Follows a run's output back to its input through the provenance routes, and exports it.
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn follows_provenance() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     let fixture = setup(backend).await?;
     let job_id = run_upper(&fixture).await;
     let crate_status = wait_run_crate(&fixture.compute_ctx, job_id, Duration::from_secs(30)).await;
@@ -553,10 +526,9 @@ async fn follows_provenance() -> TestResult<()> {
 
 // A cancel mid-run terminalizes as Cancelled (evidence-correlated).
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn execution_cancel_terminalizes() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     let fixture = setup(backend).await?;
     let spec = execution_spec(
         &fixture,
@@ -608,10 +580,9 @@ async fn execution_cancel_terminalizes() -> TestResult<()> {
 // A node restart mid-run: the reconciler adopts the running container and does
 // NOT start a second one.
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn execution_restart_adopts() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     let fixture = setup(backend).await?;
     let spec = execution_spec(
         &fixture,
@@ -776,10 +747,9 @@ async fn read_object(s3: &aws_sdk_s3::Client, bucket: &str, key: String) -> Opti
 // A Nextflow task through the TES route: a glob keeps the staged input it matches out of the
 // results, and a glob that matches a directory captures every file below it.
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn runs_nextflow_task() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     // One absolute cap over setup, every request and the polling keeps a hang under five minutes.
     tokio::time::timeout(Duration::from_secs(240), check_nextflow_task(backend))
         .await

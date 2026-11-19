@@ -11,7 +11,7 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::metadata::{AuthToken, MetadataActor, MetadataError};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, outside_answer, outside_call, read_row, value};
+use aruna_core::rows::{done, outside_answer, outside_call, read_row};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{NodeRealm, RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -480,7 +480,7 @@ impl Operation for ForwardEntryOperation {
                     key,
                 ))))
             }
-            ForwardStep::Fence => self.fenced(outside_answer(result).and_then(value)),
+            ForwardStep::Fence => self.fenced(outside_answer(result).and_then(IoResult::value)),
             ForwardStep::Refused => {
                 let actor = result.child::<Option<MetadataActor>, DeviceEditError>()?;
                 self.apply(actor)
@@ -625,7 +625,7 @@ mod tests {
 
     async fn store(context: &Arc<DriverContext>, entry: &PublishEntry) {
         let (key_space, key, value) = publish_entry(entry).unwrap();
-        crate::testing::write_value(&context.storage_handle, &key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, &key_space, key, value).await;
     }
 
     async fn claim_state(

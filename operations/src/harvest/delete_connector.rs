@@ -56,7 +56,7 @@ impl Operation for DeleteRepositoryOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, UpdateConnectorError> {
         match self.stage {
             Stage::Record => {
-                let record = rows::value(result)?.ok_or(UpdateConnectorError::NotFound)?;
+                let record = result.value()?.ok_or(UpdateConnectorError::NotFound)?;
                 RepositoryConnector::from_bytes(&record)
                     .map_err(|_| UpdateConnectorError::Unexpected)?;
                 self.stage = Stage::Links;

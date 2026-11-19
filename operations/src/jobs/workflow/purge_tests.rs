@@ -60,7 +60,7 @@ fn file_scope() -> StoragePurgeScope {
 }
 
 fn info(group_id: Ulid) -> BucketInfo {
-    crate::tests::s3::bucket_info(group_id, Default::default())
+    aruna_test_support::s3::bucket_info(group_id, Default::default())
 }
 
 fn run_at(scope: StoragePurgeScope, phase: PurgePhase) -> PurgeRun {

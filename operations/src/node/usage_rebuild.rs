@@ -20,7 +20,8 @@ use aruna_core::keyspaces::{
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
     prefix_upper_bound,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
@@ -29,13 +30,14 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::usage::{
     RebuildProgress, USAGE_PROGRESS_KEY, UsageCounterError, UsageCounters,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::node::rebuild_counts::{Joined, RebuildCounts, is_pithos, named_size, usable};
+use crate::node::rebuild_counts::{
+    CounterDeltas, Joined, RebuildCounts, is_pithos, named_size, usable,
+};
 
 /// Rows read per walk page; every page commits before the next one is read.
 const PAGE_LIMIT: usize = 256;
@@ -45,21 +47,15 @@ const COPY_LIMIT: usize = 16;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RebuildStatsState {
     Init,
-    Begin,
     ReadProgress,
     ReadConfig,
     Page,
     Joins,
     Fallback,
-    StartPage,
-    PageMarker,
-    AddPage,
-    SaveProgress,
-    CommitPage,
-    CloseSnapshot,
+    /// A page books its counts as a child in its own transaction.
+    Book,
+    /// The parent swaps the rebuild rows in once the walk ended.
     Finish,
-    Done,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -80,6 +76,25 @@ pub enum RebuildStatsError {
     RebuildFailed,
     #[error("another usage rebuild replaced this one")]
     Superseded,
+    #[error(transparent)]
+    Io(IoError),
+}
+
+/// A refused storage call keeps its storage error, as the rebuild reported it before.
+impl From<IoError> for RebuildStatsError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::StorageError(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
+type Walking = Result<Next<UsageCounters>, RebuildStatsError>;
+
+/// The call that hands `effect` to storage.
+fn storage(effect: StorageEffect) -> Walking {
+    Ok(Next::Call(IoCall::from(Effect::Storage(effect))))
 }
 
 /// A walk position: walk index, quota bucket and the start of the next page.
@@ -165,12 +180,68 @@ impl Walk {
 /// Recomputes all usage counters without stopping writers: storage begins the rebuild and
 /// answers a snapshot, every page adds its counts from that snapshot to the rebuild rows, and
 /// storage swaps them in at the end. Memory grows with buckets and one page, never objects.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct RebuildStatsOperation {
+    realm_id: Option<RealmId>,
+    /// The walk's totals while storage swaps the rebuild rows in.
+    walked: Option<UsageCounters>,
+}
+
+impl RebuildStatsOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Walks the buckets of groups with a quota in this realm first.
+    pub fn with_realm(mut self, realm_id: RealmId) -> Self {
+        self.realm_id = Some(realm_id);
+        self
+    }
+}
+
+impl Operation for RebuildStatsOperation {
+    type Output = UsageCounters;
+    type Error = RebuildStatsError;
+
+    fn first(&mut self) -> Walking {
+        let walk = UsageWalkOperation::new(self.realm_id);
+        Ok(Next::Call(IoCall::child(walk)))
+    }
+
+    /// The walk's snapshot is closed when its child run ends, before the rows are swapped in.
+    fn next(&mut self, result: IoResult) -> Walking {
+        let Some(counters) = self.walked.take() else {
+            self.walked = Some(result.child::<UsageCounters, RebuildStatsError>()??);
+            return storage(StorageEffect::FinishUsageRebuild {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+            });
+        };
+        match result.event()? {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(Next::Done(counters)),
+            other => Err(unexpected(RebuildStatsState::Finish, "BatchWriteResult", &other)),
+        }
+    }
+}
+
+/// A refusal of `received` where `state` expects `expected`.
+fn unexpected(
+    state: RebuildStatsState,
+    expected: &'static str,
+    received: &Event,
+) -> RebuildStatsError {
+    RebuildStatsError::InvalidStateEvent {
+        state,
+        expected,
+        received: received.label(),
+    }
+}
+
+/// The paged walk over the rebuild's snapshot. Each page books its counts as a child, so the
+/// snapshot stays open across the page commits.
+#[derive(Debug, PartialEq)]
+struct UsageWalkOperation {
     state: RebuildStatsState,
     realm_id: Option<RealmId>,
-    snapshot: Option<TxnId>,
-    page_txn: Option<TxnId>,
     walk: Walk,
     /// Start of the current page; `None` starts the walk.
     cursor: Option<IterStart>,
@@ -190,22 +261,13 @@ pub struct RebuildStatsOperation {
     generation: Option<Ulid>,
     /// The saved position to resume at after the bucket walk recounted the bucket map.
     resume: Option<Position>,
-    output: Option<Result<UsageCounters, RebuildStatsError>>,
 }
 
-impl Default for RebuildStatsOperation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RebuildStatsOperation {
-    pub fn new() -> Self {
+impl UsageWalkOperation {
+    fn new(realm_id: Option<RealmId>) -> Self {
         Self {
             state: RebuildStatsState::Init,
-            realm_id: None,
-            snapshot: None,
-            page_txn: None,
+            realm_id,
             walk: Walk::Buckets,
             cursor: None,
             next: None,
@@ -219,61 +281,23 @@ impl RebuildStatsOperation {
             counts: RebuildCounts::default(),
             generation: None,
             resume: None,
-            output: None,
         }
     }
 
-    /// Walks the buckets of groups with a quota in this realm first.
-    pub fn with_realm(mut self, realm_id: RealmId) -> Self {
-        self.realm_id = Some(realm_id);
-        self
-    }
-
-    /// Open transactions are left to `abort` and the runner's transaction cleanup.
-    fn fail(&mut self, error: RebuildStatsError) -> Effects {
-        self.state = RebuildStatsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, received: Event) -> Effects {
-        self.fail(RebuildStatsError::InvalidStateEvent {
-            state: self.state.clone(),
-            expected,
-            received: received.label(),
-        })
-    }
-
-    fn snapshot_id(&self) -> Result<TxnId, RebuildStatsError> {
-        self.snapshot.ok_or(RebuildStatsError::RebuildFailed)
+    fn unexpected(&self, expected: &'static str, received: Event) -> Walking {
+        Err(unexpected(self.state.clone(), expected, &received))
     }
 
     fn scope_bucket(&self) -> Option<&String> {
         self.counts.quota_buckets.iter().nth(self.scope)
     }
 
-    fn handle_begin(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected("TransactionStarted", event);
-        };
-        self.snapshot = Some(txn_id);
-        self.state = RebuildStatsState::ReadProgress;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            key: Key::from(USAGE_PROGRESS_KEY.to_vec()),
-            txn_id: Some(txn_id),
-        })]
-    }
-
     /// Takes the saved position and totals; the walk restarts at the buckets either way.
-    fn handle_progress(&mut self, event: Event) -> Effects {
+    fn handle_progress(&mut self, event: Event) -> Walking {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected("ReadResult", event);
         };
-        let progress = match marker_progress(value) {
-            Ok(progress) => progress,
-            Err(error) => return self.fail(error),
-        };
+        let progress = marker_progress(value)?;
         self.generation = Some(progress.generation);
         self.counts.total = progress.total;
         self.counts.orphan_versions = progress.orphan_versions;
@@ -287,32 +311,25 @@ impl RebuildStatsOperation {
         let Some(realm_id) = self.realm_id else {
             return self.start_walk(Walk::Buckets);
         };
-        let snapshot = match self.snapshot_id() {
-            Ok(snapshot) => snapshot,
-            Err(error) => return self.fail(error),
-        };
         self.state = RebuildStatsState::ReadConfig;
-        smallvec![Effect::Storage(StorageEffect::Read {
+        storage(StorageEffect::Read {
             key_space: REALM_CONFIG_KEYSPACE.to_string(),
             key: DocumentTarget::RealmConfig { realm_id }.storage_key(),
-            txn_id: Some(snapshot),
-        })]
+            txn_id: None,
+        })
     }
 
-    fn handle_config(&mut self, event: Event) -> Effects {
+    fn handle_config(&mut self, event: Event) -> Walking {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected("ReadResult", event);
         };
         if let Some(bytes) = value {
-            match RealmConfigDocument::from_bytes(bytes.as_ref()) {
-                Ok(document) => self.counts.quota = Some(document.quota),
-                Err(error) => return self.fail(error.into()),
-            }
+            self.counts.quota = Some(RealmConfigDocument::from_bytes(bytes.as_ref())?.quota);
         }
         self.start_walk(Walk::Buckets)
     }
 
-    fn start_walk(&mut self, walk: Walk) -> Effects {
+    fn start_walk(&mut self, walk: Walk) -> Walking {
         self.walk = walk;
         self.cursor = None;
         self.scope = 0;
@@ -322,29 +339,22 @@ impl RebuildStatsOperation {
         self.page_effect()
     }
 
-    fn page_effect(&mut self) -> Effects {
-        let snapshot = match self.snapshot_id() {
-            Ok(snapshot) => snapshot,
-            Err(error) => return self.fail(error),
-        };
+    fn page_effect(&mut self) -> Walking {
         let prefix = match (self.walk.scoped(), self.scope_bucket()) {
-            (true, Some(bucket)) => match VersionKey::bucket_prefix(bucket) {
-                Ok(prefix) => Some(Key::from(prefix)),
-                Err(error) => return self.fail(error.into()),
-            },
+            (true, Some(bucket)) => Some(Key::from(VersionKey::bucket_prefix(bucket)?)),
             _ => None,
         };
         self.state = RebuildStatsState::Page;
-        smallvec![Effect::Storage(StorageEffect::Iter {
+        storage(StorageEffect::Iter {
             key_space: self.walk.key_space().to_string(),
             prefix,
             start: self.cursor.clone(),
             limit: PAGE_LIMIT,
-            txn_id: Some(snapshot),
-        })]
+            txn_id: None,
+        })
     }
 
-    fn handle_page(&mut self, event: Event) -> Effects {
+    fn handle_page(&mut self, event: Event) -> Walking {
         let Event::Storage(StorageEvent::IterResult {
             values,
             next_start_after,
@@ -354,32 +364,22 @@ impl RebuildStatsOperation {
         };
         self.rows = values;
         self.next = next_start_after.map(IterStart::After);
-        if self.walk.skips_quota()
-            && !self.counts.quota_buckets.is_empty()
-            && let Err(error) = self.skip_quota()
-        {
-            return self.fail(error);
+        if self.walk.skips_quota() && !self.counts.quota_buckets.is_empty() {
+            self.skip_quota()?;
         }
-        match self.page_reads() {
-            Ok(reads) if reads.is_empty() => self.book_page(),
-            Ok(reads) => {
-                let snapshot = match self.snapshot_id() {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => return self.fail(error),
-                };
-                let effect = StorageEffect::BatchRead {
-                    reads: reads
-                        .iter()
-                        .map(|(key_space, key)| (key_space.to_string(), Key::from(key.clone())))
-                        .collect(),
-                    txn_id: Some(snapshot),
-                };
-                self.reads = reads;
-                self.state = RebuildStatsState::Joins;
-                smallvec![Effect::Storage(effect)]
-            }
-            Err(error) => self.fail(error),
+        let reads = self.page_reads()?;
+        if reads.is_empty() {
+            return self.book_page();
         }
+        let effect = StorageEffect::BatchRead {
+            reads: (reads.iter())
+                .map(|(key_space, key)| (key_space.to_string(), Key::from(key.clone())))
+                .collect(),
+            txn_id: None,
+        };
+        self.reads = reads;
+        self.state = RebuildStatsState::Joins;
+        storage(effect)
     }
 
     /// Ends the page at the first row of a quota bucket and seeks past that bucket.
@@ -452,21 +452,19 @@ impl RebuildStatsOperation {
         Ok(wanted.into_iter().collect())
     }
 
-    fn handle_joins(&mut self, event: Event) -> Effects {
+    fn handle_joins(&mut self, event: Event) -> Walking {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected("BatchReadResult", event);
         };
         let reads = std::mem::take(&mut self.reads);
         if reads.len() != values.len() {
-            return self.fail(RebuildStatsError::RebuildFailed);
+            return Err(RebuildStatsError::RebuildFailed);
         }
         for (read, (_, value)) in reads.into_iter().zip(values) {
             self.joined.insert(read, value);
         }
-        if self.walk.versions()
-            && let Err(error) = self.queue_copies()
-        {
-            return self.fail(error);
+        if self.walk.versions() {
+            self.queue_copies()?;
         }
         self.next_copy()
     }
@@ -494,25 +492,21 @@ impl RebuildStatsOperation {
         Ok(())
     }
 
-    fn next_copy(&mut self) -> Effects {
+    fn next_copy(&mut self) -> Walking {
         let Some(hash) = self.copies.front().copied() else {
             return self.book_page();
         };
-        let snapshot = match self.snapshot_id() {
-            Ok(snapshot) => snapshot,
-            Err(error) => return self.fail(error),
-        };
         self.state = RebuildStatsState::Fallback;
-        smallvec![Effect::Storage(StorageEffect::Iter {
+        storage(StorageEffect::Iter {
             key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
             prefix: Some(Key::from(hash.to_vec())),
             start: self.copy_cursor.clone(),
             limit: COPY_LIMIT,
-            txn_id: Some(snapshot),
-        })]
+            txn_id: None,
+        })
     }
 
-    fn handle_copy(&mut self, event: Event) -> Effects {
+    fn handle_copy(&mut self, event: Event) -> Walking {
         let Event::Storage(StorageEvent::IterResult {
             values,
             next_start_after,
@@ -521,17 +515,14 @@ impl RebuildStatsOperation {
             return self.unexpected("IterResult", event);
         };
         let Some(hash) = self.copies.front().copied() else {
-            return self.fail(RebuildStatsError::RebuildFailed);
+            return Err(RebuildStatsError::RebuildFailed);
         };
         let mut size = None;
         for (_, value) in &values {
-            match BackendLocation::from_bytes(value.as_ref()) {
-                Ok(location) if usable(&location) => {
-                    size = Some(location.blob_size);
-                    break;
-                }
-                Ok(_) => {}
-                Err(error) => return self.fail(error.into()),
+            let location = BackendLocation::from_bytes(value.as_ref())?;
+            if usable(&location) {
+                size = Some(location.blob_size);
+                break;
             }
         }
         match (size, next_start_after) {
@@ -545,19 +536,18 @@ impl RebuildStatsOperation {
         self.next_copy()
     }
 
-    fn book_page(&mut self) -> Effects {
-        if let Err(error) = self.book_rows() {
-            return self.fail(error);
-        }
+    fn book_page(&mut self) -> Walking {
+        self.book_rows()?;
         self.joined.clear();
         self.sizes.clear();
         if self.counts.is_empty() {
             return self.advance();
         }
-        self.state = RebuildStatsState::StartPage;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        let generation = self.generation.ok_or(RebuildStatsError::RebuildFailed)?;
+        let progress = self.progress()?;
+        let page = BookPageOperation::new(generation, self.counts.take_deltas(), progress);
+        self.state = RebuildStatsState::Book;
+        Ok(Next::Call(IoCall::child(page)))
     }
 
     fn book_rows(&mut self) -> Result<(), RebuildStatsError> {
@@ -583,79 +573,13 @@ impl RebuildStatsOperation {
         Ok(())
     }
 
-    fn handle_page_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected("TransactionStarted", event);
-        };
-        self.page_txn = Some(txn_id);
-        self.state = RebuildStatsState::PageMarker;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            key: Key::from(USAGE_PROGRESS_KEY.to_vec()),
-            txn_id: Some(txn_id),
-        })]
-    }
 
-    /// The page commits only into the rebuild that the saved progress still names.
-    fn handle_page_marker(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected("ReadResult", event);
-        };
-        match marker_progress(value) {
-            Ok(progress) if Some(progress.generation) == self.generation => {}
-            Ok(_) => return self.fail(RebuildStatsError::Superseded),
-            Err(error) => return self.fail(error),
-        }
-        let Some(txn_id) = self.page_txn else {
-            return self.fail(RebuildStatsError::RebuildFailed);
-        };
-        let (deltas, buckets) = self.counts.take_deltas();
-        self.state = RebuildStatsState::AddPage;
-        smallvec![Effect::Storage(StorageEffect::AddUsage {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            deltas,
-            buckets,
-            txn_id,
-        })]
-    }
 
-    fn handle_page_added(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.unexpected("BatchWriteResult", event);
-        };
-        let (Some(txn_id), Ok(progress)) = (self.page_txn, self.progress()) else {
-            return self.fail(RebuildStatsError::RebuildFailed);
-        };
-        self.state = RebuildStatsState::SaveProgress;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            key: Key::from(USAGE_PROGRESS_KEY.to_vec()),
-            value: Value::from(progress),
-            txn_id: Some(txn_id),
-        })]
-    }
 
-    fn handle_progress_saved(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.unexpected("WriteResult", event);
-        };
-        let Some(txn_id) = self.page_txn else {
-            return self.fail(RebuildStatsError::RebuildFailed);
-        };
-        self.state = RebuildStatsState::CommitPage;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
 
-    fn handle_page_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected("TransactionCommitted", event);
-        };
-        self.page_txn = None;
-        self.advance()
-    }
 
     /// Reads the next page of the walk, or moves to the next quota bucket or walk.
-    fn advance(&mut self) -> Effects {
+    fn advance(&mut self) -> Walking {
         if let Some(next) = self.next.take() {
             self.cursor = Some(next);
             return self.page_effect();
@@ -669,7 +593,7 @@ impl RebuildStatsOperation {
         self.walk_done()
     }
 
-    fn walk_done(&mut self) -> Effects {
+    fn walk_done(&mut self) -> Walking {
         self.counts.last_head = None;
         if self.walk == Walk::Buckets
             && let Some((walk, scope, start)) = self.resume.take()
@@ -684,7 +608,7 @@ impl RebuildStatsOperation {
     }
 
     /// Continues at a saved position; past the last walk the rebuild only finishes.
-    fn resume_at(&mut self, walk: usize, scope: usize, start: Option<IterStart>) -> Effects {
+    fn resume_at(&mut self, walk: usize, scope: usize, start: Option<IterStart>) -> Walking {
         let Some(walk) = WALKS.get(walk).copied() else {
             return self.close_walks();
         };
@@ -737,41 +661,14 @@ impl RebuildStatsOperation {
         Ok(progress.to_bytes()?)
     }
 
-    fn close_walks(&mut self) -> Effects {
+    fn close_walks(&mut self) -> Walking {
         if self.counts.orphan_versions > 0 {
             warn!(
                 versions = self.counts.orphan_versions,
                 "rebuilt usage omits versions without a blob location row"
             );
         }
-        let snapshot = match self.snapshot_id() {
-            Ok(snapshot) => snapshot,
-            Err(error) => return self.fail(error),
-        };
-        self.state = RebuildStatsState::CloseSnapshot;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-            txn_id: snapshot
-        })]
-    }
-
-    fn handle_closed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected("TransactionCommitted", event);
-        };
-        self.snapshot = None;
-        self.state = RebuildStatsState::Finish;
-        smallvec![Effect::Storage(StorageEffect::FinishUsageRebuild {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-        })]
-    }
-
-    fn handle_finished(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.unexpected("BatchWriteResult", event);
-        };
-        self.state = RebuildStatsState::Done;
-        self.output = Some(Ok(self.counts.total));
-        smallvec![]
+        Ok(Next::Done(self.counts.total))
     }
 }
 
@@ -781,68 +678,110 @@ fn marker_progress(value: Option<Value>) -> Result<RebuildProgress, RebuildStats
     Ok(RebuildProgress::from_bytes(value.as_ref())?)
 }
 
-impl EffectOperation for RebuildStatsOperation {
+impl Operation for UsageWalkOperation {
     type Output = UsageCounters;
     type Error = RebuildStatsError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RebuildStatsState::Begin;
-        smallvec![Effect::Storage(StorageEffect::BeginUsageRebuild {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::UsageRebuild
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(RebuildStatsError::StorageError(error));
+    fn first(&mut self) -> Walking {
+        self.state = RebuildStatsState::ReadProgress;
+        storage(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: Key::from(USAGE_PROGRESS_KEY.to_vec()),
+            txn_id: None,
+        })
+    }
+
+    fn next(&mut self, result: IoResult) -> Walking {
+        if self.state == RebuildStatsState::Book {
+            result.child::<(), RebuildStatsError>()??;
+            return self.advance();
         }
+        let event = result.event()?;
         match self.state {
-            RebuildStatsState::Init => self.start(),
-            RebuildStatsState::Begin => self.handle_begin(event),
             RebuildStatsState::ReadProgress => self.handle_progress(event),
             RebuildStatsState::ReadConfig => self.handle_config(event),
             RebuildStatsState::Page => self.handle_page(event),
             RebuildStatsState::Joins => self.handle_joins(event),
             RebuildStatsState::Fallback => self.handle_copy(event),
-            RebuildStatsState::StartPage => self.handle_page_started(event),
-            RebuildStatsState::PageMarker => self.handle_page_marker(event),
-            RebuildStatsState::AddPage => self.handle_page_added(event),
-            RebuildStatsState::SaveProgress => self.handle_progress_saved(event),
-            RebuildStatsState::CommitPage => self.handle_page_committed(event),
-            RebuildStatsState::CloseSnapshot => self.handle_closed(event),
-            RebuildStatsState::Finish => self.handle_finished(event),
-            RebuildStatsState::Done | RebuildStatsState::Error => {
-                self.unexpected("no event", event)
+            _ => self.unexpected("no event", event),
+        }
+    }
+}
+
+/// What a page booking waits for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BookStep {
+    Marker,
+    Added,
+    Saved,
+}
+
+/// Books one page in its own write transaction: only into the rebuild that the saved progress
+/// still names, then its counts and the position after it, committed together.
+#[derive(Debug, PartialEq)]
+struct BookPageOperation {
+    generation: Ulid,
+    deltas: Option<CounterDeltas>,
+    progress: Vec<u8>,
+    step: BookStep,
+}
+
+impl BookPageOperation {
+    fn new(generation: Ulid, deltas: CounterDeltas, progress: Vec<u8>) -> Self {
+        Self {
+            generation,
+            deltas: Some(deltas),
+            progress,
+            step: BookStep::Marker,
+        }
+    }
+}
+
+impl Operation for BookPageOperation {
+    type Output = ();
+    type Error = RebuildStatsError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<()>, RebuildStatsError> {
+        let marker = (USAGE_STATS_KEYSPACE.to_string(), Key::from(USAGE_PROGRESS_KEY.to_vec()));
+        Ok(Next::Call(IoCall::Read(vec![marker])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, RebuildStatsError> {
+        match self.step {
+            BookStep::Marker => {
+                let marker = result.value()?;
+                if marker_progress(marker)?.generation != self.generation {
+                    return Err(RebuildStatsError::Superseded);
+                }
+                let (deltas, buckets) = self.deltas.take().ok_or(RebuildStatsError::RebuildFailed)?;
+                self.step = BookStep::Added;
+                Ok(Next::Call(IoCall::AddUsage {
+                    space: USAGE_STATS_KEYSPACE.to_string(),
+                    deltas,
+                    buckets,
+                }))
+            }
+            BookStep::Added => {
+                result.done()?;
+                self.step = BookStep::Saved;
+                let progress = std::mem::take(&mut self.progress);
+                let key = Key::from(USAGE_PROGRESS_KEY.to_vec());
+                let row = (USAGE_STATS_KEYSPACE.to_string(), key, Value::from(progress));
+                Ok(Next::Call(IoCall::Write(vec![row])))
+            }
+            BookStep::Saved => {
+                result.done()?;
+                Ok(Next::Done(()))
             }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RebuildStatsState::Done | RebuildStatsState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(counters)) => Ok(counters),
-            Some(Err(error)) => Err(error),
-            None => Err(RebuildStatsError::RebuildFailed),
-        }
-    }
-
-    /// Closes the open page transaction and the snapshot. The marker stays, so the counters
-    /// stay incomplete until a later rebuild finishes.
-    fn abort(&mut self) -> Effects {
-        let mut effects = Effects::new();
-        for txn_id in [self.page_txn.take(), self.snapshot.take()]
-            .into_iter()
-            .flatten()
-        {
-            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-        }
-        effects
     }
 }
 

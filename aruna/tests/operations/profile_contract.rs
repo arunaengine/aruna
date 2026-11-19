@@ -41,7 +41,8 @@ use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use aruna_operations::metadata::update_entry::UpdateEntryOperation;
-use aruna_operations::testing::{drain_projection_queue, process_materialization_batch};
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::drain_projection_queue;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -1417,7 +1418,7 @@ async fn graph_exists(
         aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(
             document_id,
         );
-    match aruna_operations::testing::send_metadata_effect(
+    match aruna_drivers::testing::send_metadata_effect(
         &test.context,
         MetadataEffect::ContainsGraph { graph_iri },
     )

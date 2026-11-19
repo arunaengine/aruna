@@ -21,7 +21,7 @@ use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::job_context;
 use aruna_operations::plugins::work::{Identity, RequestContext, WorkKind, reserve};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
-use aruna_operations::testing_objects::{seed_bucket, with_blob};
+use aruna_drivers::testing::{seed_bucket, with_blob};
 
 const BODY: &[u8] = b"ACGTACGT";
 

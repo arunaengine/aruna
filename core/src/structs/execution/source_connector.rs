@@ -169,6 +169,8 @@ impl SourceConnector {
     }
 }
 
+/// Credentials of a source or repository connector, split from the public record so the public
+/// projection never carries a secret.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceConnectorSecret {
     pub connector_id: Ulid,
@@ -268,6 +270,18 @@ mod tests {
 
         assert!(!rendered.contains("canary-7f3a"));
         assert!(rendered.contains("token"));
+    }
+
+    #[test]
+    fn empty_secret_none() {
+        assert!(
+            SourceConnectorSecret::new(
+                Ulid::from_bytes([4u8; 16]),
+                HashMap::new(),
+                SystemTime::UNIX_EPOCH,
+            )
+            .is_none()
+        );
     }
 
     // Table rows name URLs; they resolve below the endpoint and root, S3 has no base URL.

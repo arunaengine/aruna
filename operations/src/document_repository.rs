@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{value, values};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key, KeySpace, TxnId};
@@ -106,7 +106,7 @@ impl Operation for GetConfigOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<RealmConfigDocument>, GetConfigError> {
-        let bytes = value(result)?.ok_or(GetConfigError::DocumentNotFound)?;
+        let bytes = result.value()?.ok_or(GetConfigError::DocumentNotFound)?;
         Ok(Next::Done(RealmConfigDocument::from_bytes(&bytes)?))
     }
 }

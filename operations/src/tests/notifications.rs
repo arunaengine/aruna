@@ -3,9 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+#[cfg(test)]
 use crate::notifications::inbox::UpsertInboxOperation;
 use aruna_core::NodeId;
 use aruna_core::UserId;
+#[cfg(test)]
 use aruna_core::document::DocumentTarget;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -14,22 +16,27 @@ use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_drivers::driver::DriverContext;
-use aruna_drivers::driver::drive;
+#[cfg(test)]
+use aruna_drivers::driver::{DriverContext, drive};
+#[cfg(test)]
 use aruna_storage::storage::{FjallStorage, StorageHandle};
+#[cfg(test)]
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
 
+#[cfg(test)]
 pub fn temp_storage() -> (TempDir, StorageHandle) {
     let directory = tempdir().unwrap();
     let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
     (directory, storage)
 }
 
+#[cfg(test)]
 pub fn context(storage: &StorageHandle) -> DriverContext {
     aruna_drivers::testing::test_context(storage.clone())
 }
 
+#[cfg(test)]
 pub fn context_with_storage() -> (TempDir, DriverContext) {
     let (directory, storage) = temp_storage();
     (directory, context(&storage))
@@ -56,12 +63,14 @@ pub fn record(
     )
 }
 
+#[cfg(test)]
 pub async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
     let upsert = UpsertInboxOperation::new(records.to_vec());
     let outcome = drive(upsert, &context(storage)).await;
     assert_eq!(outcome.map(|outcome| outcome.written), Ok(records.len()));
 }
 
+#[cfg(test)]
 /// Stores one register write of a setting on this node, as a local write or sync would.
 pub async fn store_setting(storage: &StorageHandle, target: &DocumentTarget, bytes: Vec<u8>) {
     let write = aruna_core::effects::StorageEffect::Write {
@@ -78,6 +87,7 @@ pub fn managers() -> [aruna_core::NodeId; 3] {
     [61u8, 62, 63].map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
 }
 
+#[cfg(test)]
 /// Creates a watch on this node as its holder, with the owner's READ check and replication.
 pub async fn create_holder_watch(
     context: &DriverContext,
@@ -93,7 +103,7 @@ pub async fn create_holder_watch(
 > {
     let watch = (path_prefix, event_mask);
     let create = crate::notifications::watch::store::CreateWatchOperation::new(
-        Ulid::generate(),
+        (Ulid::generate(), Ulid::generate()),
         local_node_id,
         owner,
         watch,
@@ -103,6 +113,7 @@ pub async fn create_holder_watch(
     drive(create, context).await
 }
 
+#[cfg(test)]
 /// Stores a watch of `owner` on this node without authorization or replication.
 pub async fn create_local_watch(
     storage: &StorageHandle,
@@ -112,6 +123,25 @@ pub async fn create_local_watch(
     now_ms: u64,
 ) -> Result<
     aruna_core::structs::execution::notification_watch::WatchSubscription,
+    crate::notifications::watch::records::WatchSubscriptionError,
+> {
+    let (subscription, store) = local_watch(owner, path_prefix, event_mask, now_ms)?;
+    drive(store, &context(storage)).await?;
+    Ok(subscription)
+}
+
+/// A validated watch of `owner` and the operation that stores it on this node without
+/// authorization or replication.
+pub fn local_watch(
+    owner: UserId,
+    path_prefix: String,
+    event_mask: aruna_core::structs::execution::notification_watch::WatchEventMask,
+    now_ms: u64,
+) -> Result<
+    (
+        aruna_core::structs::execution::notification_watch::WatchSubscription,
+        crate::notifications::watch::store::StoreWatchOperation,
+    ),
     crate::notifications::watch::records::WatchSubscriptionError,
 > {
     let subscription = crate::notifications::watch::records::validated_subscription(
@@ -124,10 +154,10 @@ pub async fn create_local_watch(
     )?;
     let store =
         crate::notifications::watch::store::StoreWatchOperation::create(subscription.clone(), None);
-    drive(store, &context(storage)).await?;
-    Ok(subscription)
+    Ok((subscription, store))
 }
 
+#[cfg(test)]
 /// Deletes a watch of `owner` on this node without replication.
 pub async fn delete_local_watch(
     storage: &StorageHandle,

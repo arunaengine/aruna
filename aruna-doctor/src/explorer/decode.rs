@@ -1615,6 +1615,7 @@ mod tests {
             placement_ref,
             authoritative_node_id,
             vec![selected_peer],
+            1,
         );
         let value = postcard::to_allocvec(&placement).unwrap();
         let key = aruna_operations::sync::shard_placement::placement_key(realm_id, &placement_ref);

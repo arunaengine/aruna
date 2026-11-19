@@ -143,7 +143,7 @@ mod tests {
     use crate::s3::bucket::write_guard::BucketGuardOperation;
     use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
     use crate::staging::offer::list::ListOffersOperation;
-    use crate::tests::staging::setup_driver_context;
+    use aruna_test_support::staging::setup_driver_context;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USAGE_STATS_KEYSPACE};
@@ -236,7 +236,7 @@ mod tests {
         let context = &fixture.driver_context;
         let root = tempfile::tempdir().expect("root must be created");
         let offer = input("taken", root.path().to_str().expect("utf-8 root"));
-        crate::tests::staging::create_test_bucket(context, offer.group_id, offer.user_id, "taken")
+        aruna_test_support::staging::create_test_bucket(context, offer.group_id, offer.user_id, "taken")
             .await;
 
         assert_eq!(

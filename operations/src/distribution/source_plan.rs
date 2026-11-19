@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ExpectedChecksum, unmatched_checksum};
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
@@ -225,7 +225,7 @@ impl Operation for KeepPlanOperation {
     }
 
     fn next(&mut self, result: IoResult) -> PlanNext {
-        self.decide(value(result)?)
+        self.decide(result.value()?)
     }
 }
 
@@ -442,7 +442,7 @@ mod tests {
     }
 
     fn metadata(length: u64) -> SourceMetadata {
-        crate::tests::staging::sized_source(length, None)
+        aruna_test_support::staging::sized_source(length, None)
     }
 
     fn spool_plan(reference: bool) -> SpoolSourceOperation {
@@ -455,8 +455,8 @@ mod tests {
             true => {
                 let source = crate::connectors::descriptor::build_source_binding(
                     StagingStrategy::Snapshot,
-                    &crate::tests::staging::sample_connector(),
-                    &crate::tests::staging::sample_metadata(),
+                    &aruna_test_support::staging::sample_connector(),
+                    &aruna_test_support::staging::sample_metadata(),
                     "folder/file.txt".to_string(),
                     None,
                     None,

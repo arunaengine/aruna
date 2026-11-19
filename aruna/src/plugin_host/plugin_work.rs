@@ -16,10 +16,9 @@ use futures_util::future::BoxFuture;
 use ulid::Ulid;
 
 use aruna_core::jobs::JobRunOutcome;
-use aruna_drivers::driver::{DriverContext, drive, node_routing};
+use aruna_drivers::driver::{drive, node_routing};
 use aruna_drivers::jobs::context::{JobContext, PayloadHandler};
 use aruna_operations::plugins::copy_steps::{CopyWork, LockedSource, PrepareCopy, copy_locked};
-use aruna_operations::plugins::work::holds_job;
 use aruna_operations::plugins::work_calls::{AdmitWork, AdmittedWork, WorkRefusal};
 
 use super::transfers::{Download, Upload, download_work, upload_work};
@@ -30,7 +29,7 @@ pub(super) const PROGRESS_TICK: Duration = Duration::from_secs(1);
 /// How long a paused install's work waits before its next attempt.
 const PAUSED_RETRY: Duration = Duration::from_secs(60);
 
-/// Runs plugin work jobs and keeps each job until its work row holds the summary.
+/// Runs plugin work jobs.
 #[derive(Debug, Default)]
 pub struct PluginWorkHandler;
 
@@ -44,21 +43,6 @@ impl PayloadHandler for PluginWorkHandler {
             return None;
         };
         Some(Box::pin(run_plugin_work(ctx, spec)))
-    }
-
-    fn keeps_job<'a>(
-        &'a self,
-        context: &'a DriverContext,
-        payload: &'a JobPayload,
-    ) -> BoxFuture<'a, Result<bool, String>> {
-        Box::pin(async move {
-            let JobPayload::PluginWork(spec) = payload else {
-                return Ok(false);
-            };
-            drive(holds_job(spec), context)
-                .await
-                .map_err(|error| error.0)
-        })
     }
 }
 

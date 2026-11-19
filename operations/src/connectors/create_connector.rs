@@ -288,7 +288,7 @@ impl Operation for SourceConnectorOperation {
         let chosen = self.chosen_id.unwrap_or_default();
         match self.stage {
             Stage::Existing => {
-                let existing = decode_row(rows::value(result)?, SourceConnector::from_bytes)?;
+                let existing = decode_row(result.value()?, SourceConnector::from_bytes)?;
                 if existing
                     .as_ref()
                     .is_some_and(|existing| !self.same_record(existing))

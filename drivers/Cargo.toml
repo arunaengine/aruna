@@ -12,7 +12,7 @@ rust-version.workspace = true
 
 [features]
 # Shared test helpers; only dev-dependencies enable it.
-test-hooks = []
+test-hooks = ["dep:async-trait", "dep:tempfile"]
 
 [dependencies]
 aruna-blob = { workspace = true }
@@ -25,6 +25,7 @@ aruna-outbound = { workspace = true }
 aruna-plugins = { workspace = true }
 aruna-storage = { workspace = true }
 aruna-tasks = { workspace = true }
+async-trait = { workspace = true, optional = true }
 bytes = { workspace = true }
 byteview = { workspace = true }
 chacha20poly1305 = { workspace = true }
@@ -36,12 +37,14 @@ postcard = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 sysinfo = { workspace = true }
+tempfile = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 aruna-core = { workspace = true, features = ["test-hooks"] }
 aruna-storage = { workspace = true, features = ["test-hooks"] }
 iroh = { workspace = true }

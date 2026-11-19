@@ -25,7 +25,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::plugin_runs::{DEDUP_RETENTION_MS, SourceEvent, journal_entries, source_key};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::{done, read_row};
 use aruna_core::storage_entries::{
     delete_projection_entry, document_job_entry, document_lifecycle_entry, document_lifecycle_key,
     event_log_key, graph_lifecycle_key, materialization_job_entry, materialization_status_key,
@@ -564,7 +564,8 @@ impl ProjectEventsOperation {
                         return Ok(Flow::Call(read_row(MATERIALIZATION_STATUS_KEYSPACE, key)));
                     }
                     (None, Some(result)) => {
-                        let status = value(result)?
+                        let status = result
+                            .value()?
                             .map(|bytes| decode::<MaterializationStatusRecord>(&bytes))
                             .transpose()?;
                         self.status_cache.insert(document_id, status.clone());
@@ -630,7 +631,7 @@ impl ProjectEventsOperation {
         answer: Option<IoResult>,
     ) -> Result<Flow, MetadataProjectionError> {
         let journaled = match answer {
-            Some(result) => value(result)?.is_some(),
+            Some(result) => result.value()?.is_some(),
             None => true,
         };
         if !journaled && let Some(source) = current.source.as_ref() {
@@ -702,7 +703,7 @@ impl ProjectEventsOperation {
                 );
                 return Ok(Flow::Call(read_row(PENDING_PROJECTION_KEYSPACE, key)));
             };
-            current.mint_pending = value(result)?.is_some();
+            current.mint_pending = result.value()?.is_some();
         }
         if !current.needs_projection && !current.mint_pending {
             return Ok(Flow::EventDone);
@@ -771,7 +772,8 @@ impl ProjectEventsOperation {
         answer: Option<IoResult>,
     ) -> Result<Flow, MetadataProjectionError> {
         let lifecycle = match answer {
-            Some(result) => value(result)?
+            Some(result) => result
+                .value()?
                 .and_then(|bytes| postcard::from_bytes::<MetadataLifecycleRecord>(&bytes).ok()),
             None => None,
         };
@@ -1019,7 +1021,8 @@ fn author_message_read(event: &MetadataEventRecord) -> IoCall {
 }
 
 fn message_value(result: IoResult) -> Result<Option<String>, MetadataProjectionError> {
-    value(result)?
+    result
+        .value()?
         .map(|bytes| decode::<String>(&bytes))
         .transpose()
 }
@@ -1048,7 +1051,9 @@ impl Operation for ProjectEventsOperation {
     fn next(&mut self, result: IoResult) -> ProjectTurn {
         if self.max_skew_ms.is_none() {
             // A node that never stored the setting keeps the default.
-            let stored = value(result)?.and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
+            let stored = result
+                .value()?
+                .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
             self.max_skew_ms = Some(stored.map_or(DEFAULT_SKEW_MS, u64::from_be_bytes));
             return Ok(Next::Call(metadata_call(MetadataEffect::CacheGeneration)));
         }

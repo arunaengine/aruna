@@ -11,7 +11,6 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::keyspaces::{OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{Key, TxnId, Value};
 use byteview::ByteView;
 use ulid::Ulid;
@@ -72,25 +71,6 @@ pub(crate) fn revocation_index_key(record: &DocumentOutboxRecord) -> Option<Key>
         .then(|| outbox_key(record))
 }
 
-pub fn new_outbox_record(
-    node_id: NodeId,
-    target: DocumentTarget,
-    peers: Vec<NodeId>,
-    event: DocumentOutboxEvent,
-    admin_placement: PlacementRef,
-    allow_genesis: bool,
-) -> DocumentOutboxRecord {
-    new_identified_record(
-        Ulid::generate(),
-        node_id,
-        target,
-        peers,
-        event,
-        admin_placement,
-        allow_genesis,
-    )
-}
-
 /// `admin_placement` is only consulted for `AdminOperation` records (which carry
 /// no envelope change); `Upsert`/`Delete` always take their ref from the event's
 /// change so the record and its envelope can never diverge.
@@ -119,7 +99,7 @@ pub fn new_identified_record(
         placement,
         // Unfenced by default; a fence-admitted writer stamps its generation.
         generation: 0,
-        updated_at: unix_timestamp_secs(),
+        updated_at: outbox_id.timestamp_ms() / 1_000,
         allow_genesis,
     }
 }

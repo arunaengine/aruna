@@ -14,7 +14,7 @@ autotests = false
 
 [features]
 # Exposes the shared metadata test fixtures to the node crate's route tests.
-test-hooks = ["aruna-operations/test-hooks", "aruna-drivers/test-hooks"]
+test-hooks = ["aruna-operations/test-hooks", "aruna-drivers/test-hooks", "dep:aruna-test-support"]
 
 [dependencies]
 zeroize = { workspace = true }
@@ -24,6 +24,7 @@ aruna-core = { workspace = true }
 aruna-operations = { workspace = true }
 aruna-drivers = { workspace = true }
 aruna-wire = { workspace = true }
+aruna-test-support = { workspace = true, optional = true }
 
 # General
 ahash = { workspace = true }
@@ -86,6 +87,7 @@ s3s = { workspace = true }
 
 [dev-dependencies]
 aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-test-support = { workspace = true }
 aruna-graph = { workspace = true }
 aruna-operations = { workspace = true, features = ["test-hooks"] }
 aruna-drivers = { workspace = true, features = ["test-hooks"] }

@@ -940,6 +940,94 @@ impl Operation for ApplyChange {
     }
 }
 
+/// What a mutating call runs once its checks let it proceed.
+pub trait ProceedPlan: Send + std::fmt::Debug + PartialEq + 'static {
+    type Ready: Send + std::fmt::Debug + PartialEq + 'static;
+    type Call: Operation<Output = String, Error = CallFailure> + 'static;
+
+    fn call(self, ready: Self::Ready) -> Self::Call;
+}
+
+/// A mutating call: its checks `C`, then the call the plan makes from the checked write, as one
+/// operation. A call that settled before answers its stored reply. A failure after the checks
+/// never marks the run as changed.
+#[derive(Debug, PartialEq)]
+pub struct Checked<C, P> {
+    checks: Option<C>,
+    plan: Option<P>,
+}
+
+impl<C, P> Checked<C, P> {
+    pub fn new(checks: C, plan: P) -> Self {
+        Self {
+            checks: Some(checks),
+            plan: Some(plan),
+        }
+    }
+}
+
+impl<C, P> Operation for Checked<C, P>
+where
+    P: ProceedPlan,
+    C: Operation<Output = CallStep<P::Ready>, Error = CallFailure> + 'static,
+{
+    type Output = String;
+    type Error = CallFailure;
+
+    fn first(&mut self) -> Result<Next<String>, CallFailure> {
+        let checks = self.checks.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(checks)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<String>, CallFailure> {
+        let Some(plan) = self.plan.take() else {
+            let reply = result.child::<String, CallFailure>()?;
+            let unmarked = |failure| CallFailure {
+                changed: false,
+                ..failure
+            };
+            return reply.map(Next::Done).map_err(unmarked);
+        };
+        match result.child::<CallStep<P::Ready>, CallFailure>()?? {
+            CallStep::Replied(reply) => Ok(Next::Done(reply)),
+            CallStep::Proceed(ready) => Ok(Next::Call(IoCall::child(plan.call(ready)))),
+        }
+    }
+}
+
+/// How a checked metadata write becomes a document mutation.
+#[derive(Debug, PartialEq)]
+pub enum ChangeMutation {
+    /// Upserts the dataset entity the patch produced.
+    Dataset,
+    Given(UpdateDocumentMutation),
+}
+
+/// Routes a checked metadata write from this node and records its outcome in the call's intent.
+#[derive(Debug, PartialEq)]
+pub struct ChangePlan {
+    pub scope: RunScope,
+    pub network_node: Option<NodeId>,
+    pub mutation: ChangeMutation,
+    pub intent: CallIntent,
+}
+
+impl ProceedPlan for ChangePlan {
+    type Ready = ReadyChange;
+    type Call = ApplyChange;
+
+    fn call(self, ready: ReadyChange) -> ApplyChange {
+        let mutation = match self.mutation {
+            ChangeMutation::Dataset => UpdateDocumentMutation::UpsertContextualEntity {
+                jsonld: ready.entity.clone().unwrap_or_default(),
+            },
+            ChangeMutation::Given(mutation) => mutation,
+        };
+        let place = (&self.scope, self.network_node);
+        ApplyChange::new(place, ready, mutation, self.intent)
+    }
+}
+
 /// A new document's call, checked and with its id and node pinned; `minted` says why not.
 #[derive(Debug, PartialEq)]
 pub struct ReadyCreate {

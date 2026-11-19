@@ -336,6 +336,7 @@ dependencies = [
  "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-test-support",
  "aruna-wire",
  "astral_async_zip",
  "async-trait",
@@ -407,6 +408,7 @@ dependencies = [
  "aruna-operations",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-test-support",
  "aruna-wire",
  "astral_async_zip",
  "async-trait",
@@ -672,6 +674,7 @@ dependencies = [
  "aruna-operations",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-test-support",
  "aruna-wire",
  "async-trait",
  "axum",
@@ -717,6 +720,7 @@ dependencies = [
  "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
+ "async-trait",
  "bytes",
  "byteview",
  "chacha20poly1305",
@@ -836,6 +840,7 @@ dependencies = [
  "aruna-plugin-types",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-test-support",
  "astral_async_zip",
  "async-trait",
  "axum",
@@ -851,6 +856,7 @@ dependencies = [
  "futures-util",
  "globset",
  "hex",
+ "http",
  "iroh",
  "irokle",
  "jsonwebtoken",
@@ -959,6 +965,7 @@ dependencies = [
  "wasmtime-wasi-io",
  "wit-component",
  "wit-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -1026,6 +1033,35 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "aruna-test-support"
+version = "3.0.0-alpha.207"
+dependencies = [
+ "aruna-blob",
+ "aruna-core",
+ "aruna-drivers",
+ "aruna-graph",
+ "aruna-net",
+ "aruna-operations",
+ "aruna-outbound",
+ "aruna-storage",
+ "aruna-tasks",
+ "axum",
+ "bytes",
+ "chrono",
+ "ed25519-dalek 3.0.0",
+ "futures-util",
+ "iroh",
+ "irokle",
+ "jsonwebtoken",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "ulid 3.0.0",
 ]
 
 [[package]]

@@ -23,7 +23,6 @@ use aruna_core::structs::storage::origin::SourcePin;
 use aruna_core::structs::storage::read_grant::READ_OPERATION;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::GroupId;
-use futures_util::StreamExt;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -568,15 +567,8 @@ impl LoadInputsOperation {
         if let Some(pin) = pin {
             self.served.insert(file.dest_key, pin);
         }
-        let stream = file
-            .source
-            .blob
-            .map(|chunk| chunk.map_err(std::io::Error::other));
-        self.files.push(TaskInput::from_stream(
-            file.path,
-            file.size,
-            Box::pin(stream),
-        ));
+        let input = TaskInput::from_blob(file.path, file.size, file.source.blob);
+        self.files.push(input);
         self.next_input()
     }
 

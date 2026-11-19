@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
     RANGE_INDEX_KEYSPACE, SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::{done, read_row};
 use aruna_core::structs::execution::table::search_terms;
 use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
 use aruna_core::structs::storage::distribution::DistributionView;
@@ -259,7 +259,8 @@ impl Describe {
     /// The next call, or the described changes once done.
     fn step(&mut self, result: IoResult) -> Result<Result<IoCall, Vec<KeyChange>>, FeedError> {
         if !self.reading_versions {
-            let view = (value(result)?
+            let view = (result
+                .value()?
                 .map(|value| DistributionView::from_bytes(&value))
                 .transpose())
             .map_err(|error| FeedError::Storage(error.to_string()))?;
@@ -737,7 +738,7 @@ impl Operation for OpenWalk {
             }
             OpenState::Record => {
                 let (_, set_id, _) = *self.current.as_ref().ok_or(FeedError::NotFinished)?;
-                let search = search_on(value(result)?)?;
+                let search = search_on(result.value()?)?;
                 self.searched.insert(set_id, search);
                 match search {
                     true => self.prune(),
@@ -1074,7 +1075,7 @@ impl Operation for StateWalk {
         match self.state {
             StateStep::Accounts => self.accounts(result.values()?),
             StateStep::Record => {
-                let search = search_on(value(result)?)?;
+                let search = search_on(result.value()?)?;
                 let current = self.current.as_mut().ok_or(FeedError::NotFinished)?;
                 self.searched.insert(current.set_id, search);
                 if !search {

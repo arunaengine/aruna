@@ -52,7 +52,6 @@ impl Drop for OutboxBarrier {
 }
 
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
-use aruna_drivers::jobs::context::PayloadHandler;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::blob::cleanup::{
     BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, CleanupNode, ProcessCleanupOperation,
@@ -83,9 +82,7 @@ use aruna_operations::jobs::lifecycle::updates::SETTLE_RETRY_AFTER;
 use aruna_operations::jobs::lifecycle::updates::SettleTerminalsOperation;
 use aruna_operations::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation};
 use aruna_operations::jobs::node_inputs::witness_node;
-use aruna_operations::jobs::prune::{
-    JobPruneOutcome, PruneDueOperation, PruneJobsOperation, PruneTimerOperation,
-};
+use aruna_operations::jobs::prune::PruneTimerOperation;
 use aruna_operations::jobs::store::job_calls;
 use aruna_operations::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use aruna_operations::metadata::data_links::RetryUnverifiedOperation;
@@ -99,6 +96,7 @@ use aruna_operations::metadata::projection::{
     DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
     ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation,
 };
+use aruna_operations::plugins::work::PruneKeepingWork;
 use aruna_operations::replication::catch_up::CatchUpCursors;
 
 /// Replays the whole event log into the registry projection, one page at a time.
@@ -989,7 +987,7 @@ impl OperationsTaskHandler {
                     warn!("Cannot record a timed bucket lock without net handle");
                     return;
                 };
-                let now_ms = aruna_core::time::unix_timestamp_millis();
+                let now_ms = unix_timestamp_millis();
                 let operation = LockBucketOperation::timed(ticket, net_handle.node_id(), now_ms);
                 if let Err(error) = drive(operation, &self.context).await {
                     warn!(error = %error, "Timed bucket lock failed");

@@ -35,7 +35,7 @@ use crate::realm::create_realm::CreateRealmOperation;
 use crate::secrets::SecretChange;
 use crate::secrets::owner::OwnerChange;
 use crate::secrets::owner::OwnerSecretOperation;
-use crate::testing_objects::seed_bucket;
+use aruna_drivers::testing::seed_bucket;
 use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::compute::Secret;
@@ -832,7 +832,8 @@ pub async fn ready_copy(
     PluginWorkSpec,
 ) {
     use crate::s3::object::put::PutObjectOperation;
-    use crate::testing_objects::{put_config, seed_bucket, with_blob};
+    use crate::testing_objects::put_config;
+    use aruna_drivers::testing::{seed_bucket, with_blob};
     use aruna_drivers::driver::drive;
     let install = copier(fixture).await;
     let root = tempfile::tempdir().unwrap();

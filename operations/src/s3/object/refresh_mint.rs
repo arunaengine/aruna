@@ -32,10 +32,10 @@ use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
-use aruna_core::structs::storage::replication_queue::{MAX_AUTO_ADVANCES, ReferenceAdvance};
 use aruna_core::structs::storage::replication_queue::{
     LiveObligationRecord, live_obligation_entry,
 };
+use aruna_core::structs::storage::replication_queue::{MAX_AUTO_ADVANCES, ReferenceAdvance};
 
 /// One storage row a successor writes.
 type Row = (KeySpace, Key, Value);
@@ -335,7 +335,7 @@ mod tests {
     use ulid::Ulid;
 
     fn observation(content_length: u64) -> SourceMetadata {
-        crate::tests::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
+        aruna_test_support::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
     }
 
     fn mint(version_id: Ulid) -> MintSuccessorOperation {

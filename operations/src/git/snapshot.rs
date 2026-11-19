@@ -14,7 +14,7 @@ use aruna_core::metadata::{
     MaterializationState, MaterializationStatusRecord, MetadataEffect, MetadataEvent,
     MetadataRawRevision,
 };
-use aruna_core::operation::{HoldScope, Operation, Runnable, boxed_suboperation};
+use aruna_core::operation::{HoldScope, Operation, boxed_suboperation};
 use aruna_core::repo_layout::{Layout, metadata_layout};
 use aruna_core::storage_entries::{document_job_prefix, materialization_status_key};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -504,10 +504,9 @@ impl Operation for HeldRefreshOperation {
 }
 
 /// Runs background snapshot work under its own stage timers and logs them when it is slow.
-fn timed_work<O, K>(document_id: Ulid, work: O) -> TimedWorkOperation
+fn timed_work<O>(document_id: Ulid, work: O) -> TimedWorkOperation
 where
-    O: Runnable<K, Output = (), Error = GitError> + 'static,
-    K: 'static,
+    O: Operation<Output = (), Error = GitError> + 'static,
 {
     TimedWorkOperation {
         document_id,

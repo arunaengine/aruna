@@ -130,7 +130,7 @@ impl Operation for DeleteSourceOperation {
         let connector_id = self.input.connector_id;
         match &mut self.stage {
             Stage::Connector => {
-                decode_row(rows::value(result)?, SourceConnector::from_bytes)?
+                decode_row(result.value()?, SourceConnector::from_bytes)?
                     .ok_or(DeleteSourceError::NotFound)?;
                 self.stage = Stage::Secret;
                 let read = read_secret_effect(connector_id, None);
@@ -186,7 +186,7 @@ mod tests {
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::handle::Handle;
-    use aruna_core::operation::{EffectOperation, Runnable};
+    use aruna_core::calls::CallRun;
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::{
         SourceConnector, SourceConnectorKind, SourceConnectorSecret,
@@ -447,7 +447,7 @@ mod tests {
             connector_id: connector.connector_id,
         };
         // Runs the delete by hand: its transaction start, connector read and secret read.
-        let mut operation = DeleteSourceOperation::new(input.clone()).into_machine();
+        let mut operation = CallRun::new(DeleteSourceOperation::new(input.clone()));
         let mut effects = operation.start();
         for _ in 0..3 {
             assert_eq!(effects.len(), 1);

@@ -15,7 +15,7 @@ use aruna_core::jobs::{JobRequest, JobResponse, WaitTarget};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_retry};
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::{JobId, JobRecord, JobState, KeyWait};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
@@ -146,7 +146,7 @@ impl TargetLocksOperation {
     }
 
     fn bucket_read(&mut self, result: IoResult) -> TargetNext {
-        let Some(info) = value(result)? else {
+        let Some(info) = result.value()? else {
             return Ok(Next::Done(Vec::new()));
         };
         let group_id = BucketInfo::from_bytes(&info)
@@ -664,9 +664,8 @@ impl Operation for DeliverWakesOperation {
 mod tests {
     use super::*;
     use crate::jobs::store::job_calls::ClaimOutcome;
-    use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::test_calls::park_job;
-    use crate::jobs::store::test_calls::{claim_job, read_job_record};
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use aruna_core::UserId;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::execution::job::JobPayload;
@@ -766,7 +765,7 @@ mod tests {
         let record = JobRecord::new(job_id, payload, owner, local, 1_000, 1_000, None);
         insert_job(&context, &record).await.unwrap();
         let ClaimOutcome::Claimed(claimed) =
-            claim_job(&context, job_id, local, 2_000).await.unwrap()
+            aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, local, 2_000), &context).await.unwrap()
         else {
             panic!("job must be claimed")
         };
@@ -786,7 +785,7 @@ mod tests {
             key,
         };
         let token = claimed.claim.unwrap().claim_token;
-        park_job(&context, job_id, token, 3_000, vec![wait])
+        aruna_drivers::driver::drive(crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait]), &context)
             .await
             .unwrap();
         // Only the node holding the key wakes the job; another node's wake is acknowledged only.
@@ -1059,7 +1058,7 @@ mod tests {
         let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
         let record = JobRecord::new(job_id, payload, owner, waiter, 1_000, 1_000, None);
         insert_job(&waiter_node, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) = claim_job(&waiter_node, job_id, waiter, 2_000)
+        let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, waiter, 2_000), &waiter_node)
             .await
             .unwrap()
         else {
@@ -1074,7 +1073,7 @@ mod tests {
             key,
         };
         let token = claimed.claim.unwrap().claim_token;
-        park_job(&waiter_node, job_id, token, 3_000, vec![wait])
+        aruna_drivers::driver::drive(crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait]), &waiter_node)
             .await
             .unwrap();
         let register = WaitRowOperation::register(key, waiter, job_id, &auth);

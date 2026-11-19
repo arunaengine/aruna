@@ -1019,7 +1019,7 @@ mod tests {
         use aruna_core::structs::storage::blob::BucketInfo;
         use aruna_core::structs::storage::format::Compression;
 
-        let (_directory, storage) = crate::tests::s3::test_storage();
+        let (_directory, storage) = aruna_test_support::s3::test_storage();
         let context = aruna_drivers::testing::test_context(storage);
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let group_id = Ulid::from_parts(2, 2);
@@ -1034,7 +1034,7 @@ mod tests {
         };
         let scope = (realm_id, group_id, local);
         let owner =
-            crate::testing_access::seed_open_access(&context, scope, "none/**", None, vec![policy])
+            aruna_drivers::testing::seed_open_access(&context, scope, "none/**", None, vec![policy])
                 .await;
         let info = BucketInfo {
             group_id,

@@ -372,7 +372,7 @@ pub fn claim_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::s3::test_storage;
+    use aruna_test_support::s3::test_storage;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
     use aruna_core::structs::storage::backend_import::{DEFAULT_PATTERN, ImportedObject};

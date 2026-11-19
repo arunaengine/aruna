@@ -4,7 +4,8 @@
 
 use super::*;
 use aruna_core::events::StorageEvent;
-use aruna_core::operation::{EffectOperation, Runnable};
+use aruna_core::operation::Operation;
+use aruna_core::calls::CallRun;
 use aruna_core::structs::storage::abe::envelope_charge;
 use aruna_core::structs::storage::blob::{BackendRef, VersionKey};
 use aruna_core::structs::storage::encryption::ReadLease;
@@ -691,7 +692,7 @@ pub(crate) mod received {
     use crate::blob::unlocked::{DropReceivedOperation, PromoteUnlockedOperation};
     use crate::s3::object::copy::sealed::{SealedCopyInput, SealedCopyOperation};
     use crate::s3::object::copy::test::{seed_authority, seed_bucket};
-    use crate::tests::s3::full_context;
+    use aruna_test_support::s3::full_context;
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
@@ -703,7 +704,7 @@ pub(crate) mod received {
     use tokio::io::AsyncWriteExt;
 
     async fn put(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&context.storage_handle, space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, space, key, value).await;
     }
 
     pub(crate) async fn fixture() -> (tempfile::TempDir, DriverContext, SealPlan, UserId) {
@@ -933,7 +934,7 @@ pub(crate) mod received {
 
     async fn storage_step(
         context: &DriverContext,
-        operation: &mut impl EffectOperation,
+        operation: &mut CallRun<impl Operation>,
         effects: Effects,
     ) -> Effects {
         assert_eq!(effects.len(), 1);
@@ -960,7 +961,7 @@ pub(crate) mod received {
         let record =
             BlobQuarantineRecord::new([0; 32], archive.backend.clone(), "mismatch".into(), 0);
         let fence = RejectOwnersOperation::new(archive.clone(), &record).unwrap();
-        let mut first = fence.clone().into_machine();
+        let mut first = CallRun::new(fence.clone());
         let effects = first.start();
         let effects = storage_step(&context, &mut first, effects).await;
         let effects = storage_step(&context, &mut first, effects).await;

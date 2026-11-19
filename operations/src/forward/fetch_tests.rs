@@ -4,7 +4,7 @@
 
 use super::*;
 use aruna_core::metadata::MetadataError;
-use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
+use aruna_core::operation_check::sample_events;
 
 #[test]
 fn frame_debug_hidden() {
@@ -41,49 +41,51 @@ fn fetch(budget: Budget) -> HolderFetchOperation<String> {
     HolderFetchOperation::new(&holders, &request(), Duration::from_secs(9), budget)
 }
 
-fn asked(peer: NodeId, timeout: Duration) -> Effect {
-    Effect::Net(NetEffect::MetadataRequest(Box::new(metadata_request(
-        peer,
-        encode_message(&request()).unwrap(),
-        timeout,
-    ))))
+fn asked(peer: NodeId, timeout: Duration) -> FetchTurn<String> {
+    let frame = encode_message(&request()).unwrap();
+    Ok(Next::Call(peer_call(peer, frame, timeout)))
 }
 
-fn answer(peer: NodeId, seconds: u64, text: &str) -> Event {
+fn done(outcome: Fetched<String>) -> FetchTurn<String> {
+    Ok(Next::Done(outcome))
+}
+
+fn answer(peer: NodeId, seconds: u64, text: &str) -> IoResult {
     let frame = encode_message(&MetadataTransportMessage::Reject(text.to_string())).unwrap();
     reply(peer, seconds, Ok(frame))
 }
 
-fn reply(peer: NodeId, seconds: u64, result: Result<Vec<u8>, PeerRequestError>) -> Event {
-    Event::Net(NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
+fn reply(peer: NodeId, seconds: u64, result: Result<Vec<u8>, PeerRequestError>) -> IoResult {
+    let event = Event::Net(NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
         peer,
         elapsed: Duration::from_secs(seconds),
         result,
-    })))
+    })));
+    IoResult::Event(Box::new(event))
+}
+
+fn down() -> Result<Vec<u8>, PeerRequestError> {
+    Err(PeerRequestError::Failed(MetadataError::Backend(
+        "down".into(),
+    )))
+}
+
+fn seconds(count: u64) -> Duration {
+    Duration::from_secs(count)
 }
 
 #[test]
 fn asks_in_order() {
     // A miss and a useless answer move on with the time left; the first record wins.
     let mut operation = fetch(Budget::Shared);
-    check_trace(
-        &mut operation,
-        &[asked(node(1), Duration::from_secs(9))],
-        vec![
-            (
-                answer(node(1), 2, "missing"),
-                vec![asked(node(2), Duration::from_secs(7))],
-            ),
-            (
-                answer(node(2), 3, "other"),
-                vec![asked(node(3), Duration::from_secs(4))],
-            ),
-            (answer(node(3), 1, "found it"), vec![]),
-        ],
-    );
+    assert_eq!(operation.first(), asked(node(1), seconds(9)));
+    let missing = operation.next(answer(node(1), 2, "missing"));
+    assert_eq!(missing, asked(node(2), seconds(7)));
+    let other = operation.next(answer(node(2), 3, "other"));
+    assert_eq!(other, asked(node(3), seconds(4)));
     assert_eq!(
-        operation.finalize(),
-        Ok(Fetched::Found {
+        operation.next(answer(node(3), 1, "found it")),
+        done(Fetched::Found {
             holder: node(3),
             value: "found it".to_string(),
         })
@@ -94,32 +96,19 @@ fn asks_in_order() {
 fn misses_not_found() {
     // Only a fetch where nobody answered is unavailable; answered misses are a miss.
     let mut operation = fetch(Budget::Shared);
-    operation.start();
-    operation.step(answer(node(1), 1, "missing"));
-    operation.step(reply(
-        node(2),
-        1,
-        Err(PeerRequestError::Failed(MetadataError::Backend(
-            "down".into(),
-        ))),
-    ));
-    operation.step(answer(node(3), 1, "missing"));
-    assert_eq!(operation.finalize(), Ok(Fetched::NotFound));
+    operation.first().unwrap();
+    operation.next(answer(node(1), 1, "missing")).unwrap();
+    operation.next(reply(node(2), 1, down())).unwrap();
+    let last = operation.next(answer(node(3), 1, "missing"));
+    assert_eq!(last, done(Fetched::NotFound));
 
     let mut operation = fetch(Budget::Shared);
-    operation.start();
-    for peer in [node(1), node(2), node(3)] {
-        operation.step(reply(
-            peer,
-            1,
-            Err(PeerRequestError::Failed(MetadataError::Backend(
-                "down".into(),
-            ))),
-        ));
-    }
+    operation.first().unwrap();
+    operation.next(reply(node(1), 1, down())).unwrap();
+    operation.next(reply(node(2), 1, down())).unwrap();
     assert_eq!(
-        operation.finalize(),
-        Ok(Fetched::Unavailable("no test holder answered".to_string()))
+        operation.next(reply(node(3), 1, down())),
+        done(Fetched::Unavailable("no test holder answered".to_string()))
     );
 }
 
@@ -127,84 +116,75 @@ fn misses_not_found() {
 fn denial_stops_fetch() {
     // A refusal ends the fetch at once; no later holder is asked.
     let mut operation = fetch(Budget::Split);
-    operation.start();
-    assert!(operation.step(answer(node(1), 1, "denied")).is_empty());
-    assert_eq!(operation.finalize(), Ok(Fetched::Denied));
+    operation.first().unwrap();
+    let denied = operation.next(answer(node(1), 1, "denied"));
+    assert_eq!(denied, done(Fetched::Denied));
 }
 
 #[test]
 fn budgets_spend_deadline() {
     // A shared budget ends on a timeout; a split budget gives each holder its share and moves on.
     let mut shared = fetch(Budget::Shared);
-    shared.start();
-    assert!(
-        shared
-            .step(reply(node(1), 9, Err(PeerRequestError::TimedOut)))
-            .is_empty()
-    );
+    shared.first().unwrap();
     assert_eq!(
-        shared.finalize(),
-        Ok(Fetched::Unavailable("no test holder answered".to_string()))
+        shared.next(reply(node(1), 9, Err(PeerRequestError::TimedOut))),
+        done(Fetched::Unavailable("no test holder answered".to_string()))
     );
 
     let mut split = fetch(Budget::Split);
-    check_trace(
-        &mut split,
-        &[asked(node(1), Duration::from_secs(3))],
-        vec![
-            (
-                reply(node(1), 3, Err(PeerRequestError::TimedOut)),
-                vec![asked(node(2), Duration::from_secs(3))],
-            ),
-            (
-                answer(node(2), 1, "other"),
-                vec![asked(node(3), Duration::from_secs(5))],
-            ),
-            (answer(node(3), 5, "missing"), vec![]),
-        ],
-    );
-    assert_eq!(split.finalize(), Ok(Fetched::NotFound));
+    assert_eq!(split.first(), asked(node(1), seconds(3)));
+    let timed_out = split.next(reply(node(1), 3, Err(PeerRequestError::TimedOut)));
+    assert_eq!(timed_out, asked(node(2), seconds(3)));
+    let other = split.next(answer(node(2), 1, "other"));
+    assert_eq!(other, asked(node(3), seconds(5)));
+    let missing = split.next(answer(node(3), 5, "missing"));
+    assert_eq!(missing, done(Fetched::NotFound));
 
     // A spent deadline asks nobody else.
     let mut spent = fetch(Budget::Shared);
-    spent.start();
-    assert!(spent.step(answer(node(1), 9, "missing")).is_empty());
-    assert_eq!(spent.finalize(), Ok(Fetched::NotFound));
+    spent.first().unwrap();
+    let missing = spent.next(answer(node(1), 9, "missing"));
+    assert_eq!(missing, done(Fetched::NotFound));
 }
 
 #[test]
 fn no_holders_unavailable() {
-    // Without holders the fetch ends at start without a request.
+    // Without holders the fetch ends at once without a request.
     let mut operation = HolderFetchOperation::<String>::new(
         &[],
         &request(),
         Duration::from_secs(1),
         Budget::Shared,
     );
-    assert!(operation.start().is_empty());
-    assert!(operation.is_complete());
-    assert!(matches!(operation.finalize(), Ok(Fetched::Unavailable(_))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Done(Fetched::Unavailable(_)))
+    ));
 }
 
 #[test]
 fn rejects_unexpected_events() {
-    // Before start, and for an answer from a holder that was not asked, the fetch fails.
-    let make = || fetch(Budget::Shared);
-    for (label, effects, error) in rejects_events(make, sample_events, |_| false) {
-        assert!(effects.is_empty(), "{label} emitted effects");
-        assert_eq!(error, FetchError::Unexpected, "{label}");
+    // Before the first call, for another result kind and for an answer from a holder that was
+    // not asked, the fetch fails.
+    for event in sample_events() {
+        let label = event.label();
+        let mut operation = fetch(Budget::Shared);
+        let refused = operation.next(IoResult::Event(Box::new(event)));
+        assert_eq!(refused, Err(FetchError::Unexpected), "{label}");
     }
     let mut operation = fetch(Budget::Shared);
-    operation.start();
-    assert!(operation.step(answer(node(2), 1, "found")).is_empty());
-    assert_eq!(operation.finalize(), Err(FetchError::Unexpected));
+    operation.first().unwrap();
+    assert_eq!(operation.next(IoResult::Woke), Err(FetchError::Unexpected));
+    let mut operation = fetch(Budget::Shared);
+    operation.first().unwrap();
+    let stranger = operation.next(answer(node(2), 1, "found"));
+    assert_eq!(stranger, Err(FetchError::Unexpected));
 }
 
 #[test]
-fn abort_and_finalize() {
-    // A fetch only reads: abort has nothing to clean up, and an early finalize fails.
+fn abort_cleans_nothing() {
+    // A fetch only reads, so a stopped fetch has nothing to clean up.
     let mut operation = fetch(Budget::Shared);
-    operation.start();
+    operation.first().unwrap();
     assert!(operation.abort().is_empty());
-    rejects_finalize(operation);
 }

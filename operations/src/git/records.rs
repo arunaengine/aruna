@@ -10,7 +10,7 @@ use aruna_core::git::{GitRecord, MAX_RECORDS, git_record_prefix};
 use aruna_core::keyspaces::GIT_RECORD_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::fence::WriteFence;
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::{done, read_row};
 use aruna_core::types::{Key, Value};
 use serde::{Serialize, de::DeserializeOwned};
 use ulid::Ulid;
@@ -94,7 +94,7 @@ impl<T: Row> Operation for LoadRowOperation<T> {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<T>>, GitError> {
-        let row = value(result)?.map(|bytes| decode(&bytes)).transpose()?;
+        let row = result.value()?.map(|bytes| decode(&bytes)).transpose()?;
         Ok(Next::Done(row))
     }
 }
@@ -179,7 +179,7 @@ impl<T: Row> Operation for InsertRowOperation<T> {
             done(result)?;
             return Ok(Next::Done(decode(&kept)?));
         }
-        if let Some(old) = value(result)? {
+        if let Some(old) = result.value()? {
             return Ok(Next::Done(decode(&old)?));
         }
         let bytes = std::mem::replace(&mut self.bytes, Err(GitError::Unavailable))?;

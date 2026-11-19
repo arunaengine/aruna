@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::{done, read_row};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
@@ -377,7 +377,7 @@ impl Operation for DeleteLocalOperation {
     fn next(&mut self, result: IoResult) -> BucketTurn {
         match self.step {
             BucketStep::Row => {
-                let Some(row) = value(result)? else {
+                let Some(row) = result.value()? else {
                     return Ok(Next::Done(()));
                 };
                 BucketInfo::from_bytes(&row).map_err(OfferedDirectoryError::Conversion)?;

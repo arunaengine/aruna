@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::body::to_bytes;
 
-use crate::job_test_calls::insert_job;
+use aruna_test_support::jobs::insert_job;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{

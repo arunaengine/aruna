@@ -20,7 +20,7 @@ use aruna_core::keyspaces::{
     SEARCH_INDEX_KEYSPACE, SOURCE_ROOT_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, value, values};
+use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo, HiddenBlobKey};
 use aruna_core::structs::storage::distribution::DistributionBinding;
@@ -225,7 +225,7 @@ impl Operation for ReadRowOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<Value>>, PurgeError> {
-        Ok(Next::Done(value(result)?))
+        Ok(Next::Done(result.value()?))
     }
 }
 
@@ -370,7 +370,7 @@ impl Operation for DropAttachmentOperation {
             self.deleted = true;
             return Ok(Next::Call(IoCall::child(DropCopyOperation::new(location))));
         }
-        let Some(stored) = value(result)? else {
+        let Some(stored) = result.value()? else {
             return Ok(Next::Done(()));
         };
         let attachment = Attachment::from_bytes(&stored).map_err(fault)?;
@@ -856,7 +856,7 @@ impl Operation for ClearRangeOperation {
             }
             return Ok(self.advance());
         }
-        let stored = value(result)?;
+        let stored = result.value()?;
         if let Some(parent) = self.parent.take() {
             // The sibling's account decides whether this is the last child held here.
             return Ok(self.plan(stored.is_none().then_some(parent)));
@@ -995,7 +995,7 @@ impl Operation for PurgeRangeOperation {
     fn next(&mut self, result: IoResult) -> RangeNext {
         match self.state {
             RangeState::Cursor => {
-                let stored = value(result)?;
+                let stored = result.value()?;
                 self.cursor = PurgeCursor::decode(stored.as_deref()).map_err(fault)?;
                 self.turn()
             }
@@ -1203,7 +1203,7 @@ impl Operation for DropResumeOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, PurgeError> {
         match self.state {
             ResumeState::Read => {
-                if value(result)?.is_none() {
+                if result.value()?.is_none() {
                     return Ok(Next::Done(()));
                 }
                 self.state = ResumeState::Cleared;
@@ -1418,7 +1418,7 @@ impl Operation for ClearSetOperation {
     fn next(&mut self, result: IoResult) -> ClearNext {
         match self.state {
             ClearState::Cursor => {
-                let stored = value(result)?;
+                let stored = result.value()?;
                 self.cursor = ClearCursor::decode(stored.as_deref()).map_err(fault)?;
                 self.turn()
             }
@@ -1451,7 +1451,7 @@ impl Operation for ClearSetOperation {
                 self.turn()
             }
             ClearState::Fence => {
-                let stored = value(result)?;
+                let stored = result.value()?;
                 let fence = LocalFence::decode(stored.as_deref()).map_err(fault)?;
                 self.transfers = fence.ranges.iter().map(|f| f.transfer_id).collect();
                 self.next_transfer()

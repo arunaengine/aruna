@@ -104,7 +104,7 @@ pub mod submit {
     use crate::plugins::test_support::edit_config;
     use crate::plugins::test_support::path;
     use crate::plugins::work::RequestContext;
-    use crate::testing_objects::seed_bucket;
+    use aruna_drivers::testing::seed_bucket;
     use aruna_core::plugin_installs::PluginInstall;
     use aruna_drivers::driver::DriverContext;
     use ulid::Ulid;
@@ -159,7 +159,8 @@ pub mod submit {
         install: &PluginInstall,
     ) -> (tempfile::TempDir, DriverContext) {
         use crate::s3::object::put::PutObjectOperation;
-        use crate::testing_objects::{put_config, with_blob};
+        use crate::testing_objects::put_config;
+        use aruna_drivers::testing::with_blob;
         use aruna_drivers::driver::drive;
         let root = tempfile::tempdir().unwrap();
         let blob = with_blob(&fixture.ctx, root.path()).await;

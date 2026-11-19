@@ -22,7 +22,7 @@ use ulid::Ulid;
 
 use crate::jobs::JOB_MAX_ATTEMPTS;
 use crate::jobs::store::job_calls::RequeueOutcome;
-use crate::jobs::store::test_calls::{insert_job, list_job_entries, requeue_job};
+use aruna_test_support::jobs::{insert_job, list_job_entries};
 
 fn node_id(seed: u8) -> NodeId {
     let mut seed_bytes = [0u8; 32];
@@ -70,7 +70,7 @@ async fn panicked_import_kept() {
     use aruna_core::events::BlobEvent;
     use aruna_core::stream::BackendStream;
 
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let driver = Arc::new(fixture.driver_context);
     let storage = driver.storage_handle.clone();
     let job_id = JobId::from_bytes([0x4B; 16]);
@@ -143,14 +143,7 @@ async fn panicked_import_kept() {
     // The error the job runner fails a panicking payload with.
     let error = JobError::retryable("job payload panicked");
     assert_eq!(error.kind, JobErrorKind::Retryable);
-    let outcome = requeue_job(
-        &driver,
-        job_id,
-        Some(token),
-        unix_timestamp_millis(),
-        None,
-        Some(error),
-    )
+    let outcome = aruna_drivers::driver::drive(crate::jobs::store::job_calls::requeue_job(job_id, Some(token), unix_timestamp_millis(), None, Some(error)), &driver)
     .await
     .unwrap();
     let RequeueOutcome::Exhausted(exhausted) = outcome else {

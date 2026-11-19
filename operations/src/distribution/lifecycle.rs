@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
     RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -324,7 +324,7 @@ impl Operation for SettleMarkerOperation {
             result.done()?;
             return Ok(Next::Done(()));
         }
-        if value(result)?.as_deref() != Some(self.seen.as_slice()) {
+        if result.value()?.as_deref() != Some(self.seen.as_slice()) {
             return Ok(Next::Done(()));
         }
         self.deleting = true;
@@ -1476,7 +1476,7 @@ impl Operation for RangeCountersOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<RangeCounters>>, PurgeError> {
-        let stored = value(result)?;
+        let stored = result.value()?;
         if self.reading_counters {
             let counters = stored.map(|value| RangeCounters::from_bytes(&value));
             let counters = counters.transpose().map_err(failed)?;
@@ -1572,7 +1572,7 @@ impl Operation for UnbindOperation {
         };
         match self.writes {
             0 => {
-                let stored = value(result)?;
+                let stored = result.value()?;
                 let info = stored.and_then(|value| BucketInfo::from_bytes(&value).ok());
                 match info.filter(|info| self.same(info)) {
                     Some(info) => self.release(info),
@@ -1719,7 +1719,7 @@ mod tests {
     #[tokio::test]
     async fn replaced_member_departs() {
         // A join replaced this node's member 3 before its bucket was released.
-        use crate::distribution::test_record::{realm, replicated, secret, store_record};
+        use crate::distribution::test_record::{realm, replicated, secret};
         use crate::distribution::test_store::{context, get, open};
         use aruna_core::structs::storage::distribution::snapshot::Tombstone;
         use aruna_core::structs::storage::distribution::{DistributionView, SignedSnapshot};
@@ -1734,7 +1734,7 @@ mod tests {
             conflict: None,
         };
         let (_dir, handle) = open();
-        store_record(&handle, set_id, view.to_bytes().unwrap()).await;
+        aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), view.to_bytes().unwrap()).await;
         let left = DistributionBinding {
             member_id: Ulid::from_bytes([3; 16]),
             ..crate::distribution::test_record::binding(&snapshot, 2, 5)
@@ -1790,7 +1790,6 @@ mod tests {
     async fn drops_settled_imports() {
         // A former coordinator drops the imports it kept for a transfer no longer open only.
         use crate::distribution::imports::KeepResumeOperation;
-        use crate::distribution::test_record::store_record;
         use crate::distribution::test_record::{binding, member, realm, replicated, secret};
         use crate::distribution::test_store::{context, get, open};
         use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
@@ -1817,7 +1816,7 @@ mod tests {
             conflict: None,
         };
         let (_dir, handle) = open();
-        store_record(&handle, set_id, view.to_bytes().unwrap()).await;
+        aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), view.to_bytes().unwrap()).await;
         let info = BucketInfo {
             group_id: snapshot.config.owner_group,
             created_at: std::time::SystemTime::UNIX_EPOCH,

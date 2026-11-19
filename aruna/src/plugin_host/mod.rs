@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 
@@ -11,7 +10,6 @@ use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::plugins::artifacts::{ArtifactError, FetchArtifact, ServingNode};
 use aruna_operations::plugins::copies::Assembled;
-use aruna_operations::plugins::copy_rows::StoreCopy;
 use aruna_operations::plugins::install::InstallError;
 
 pub mod broker;
@@ -58,9 +56,5 @@ pub(crate) async fn ready_artifact(
     local: Option<NodeId>,
 ) -> Result<Assembled, ArtifactError> {
     let fetched = drive(FetchArtifact::new(config, digest, local)?, ctx).await?;
-    if fetched.fresh {
-        let store = StoreCopy::new(config, digest, &fetched.copy.bytes, unix_timestamp_millis());
-        drive(store, ctx).await?;
-    }
     Ok(fetched.copy)
 }

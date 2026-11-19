@@ -11,7 +11,7 @@ use aruna_core::git::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::repo_layout::{Layout, StoredFile, name_stored, unstored_paths};
-use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -495,8 +495,7 @@ impl Operation for WriteContentOperation {
         match self.content.take().ok_or(IoError::Unfinished)? {
             Content::Blob(bytes) => {
                 let size = bytes.len() as u64;
-                let chunks = futures_util::stream::iter([Ok::<_, StreamError>(bytes)]);
-                self.put(size, BackendStream::new(chunks))
+                self.put(size, BackendStream::once(bytes))
             }
             Content::Lfs(source) => {
                 let copy = objects::copy(&self.document, &source.sha256);

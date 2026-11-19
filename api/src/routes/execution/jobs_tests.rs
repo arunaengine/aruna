@@ -4,9 +4,9 @@
 
 use super::*;
 use crate::auth::UnrestrictedAuth;
-use crate::job_test_calls::insert_job;
-use crate::job_test_calls::put_job_entry;
-use crate::job_test_calls::{claim_job, complete_job, transition_to_running};
+use aruna_test_support::jobs::insert_job;
+use aruna_test_support::jobs::put_job_entry;
+use aruna_test_support::jobs::{claim_job, complete_job, transition_to_running};
 use crate::jobs::{
     JobRequestError, MAX_OUTPUT_PREFIXES, mount_permission_path, native_input, native_outputs,
     output_buckets, validate_output_prefixes, workspace_request,

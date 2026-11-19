@@ -9,13 +9,13 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::entropy::shuffle;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::placement::read_holder_sets;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use rand::seq::SliceRandom;
 use tracing::debug;
 use ulid::Ulid;
 
@@ -26,7 +26,9 @@ use crate::document_repository::{config_of, realm_config};
 use crate::forward::transport::{peer_call_within, timed_answer};
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::realm::mutate_placement::node_kind;
-use aruna_core::metadata::protocol::{GraphState, MetadataTransportMessage, transport_message_kind};
+use aruna_core::metadata::protocol::{
+    GraphState, MetadataTransportMessage, transport_message_kind,
+};
 use aruna_core::structs::identity::realm::NodeRealm;
 
 /// Replicas one pass refreshes. The rest follow on the next beat, so a large
@@ -79,15 +81,13 @@ pub fn refusal_reason(refusal: &SyncRefusal) -> String {
     }
 }
 
-/// The document's holders, in a different order every time so one lagging
-/// holder never owns this device's view.
+/// The document's holders; each run shuffles them so one lagging holder never owns this
+/// device's view.
 fn holders_for(plan: &RefreshPlan, document_id: Ulid) -> Vec<NodeId> {
     let Ok(placement) = resolve_metadata_id(&plan.config, plan.realm_id, None, document_id) else {
         return Vec::new();
     };
-    let mut holders = read_holder_sets(&plan.config, &placement).unwrap_or_default();
-    holders.shuffle(&mut rand::rng());
-    holders
+    read_holder_sets(&plan.config, &placement).unwrap_or_default()
 }
 
 /// What the pending call of a planned refresh answers.
@@ -204,6 +204,10 @@ impl Operation for PlannedRefreshOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        shuffle(self.holders.make_contiguous(), entropy);
     }
 
     fn first(&mut self) -> Refreshing {

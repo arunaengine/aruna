@@ -10,7 +10,7 @@ use byteview::ByteView;
 use super::*;
 use crate::jobs::staging::pure_tests::{child_answer, test_connector, test_run};
 use crate::jobs::store::mutation_error::JobMutationError;
-use crate::tests::staging::test_spec;
+use aruna_test_support::staging::test_spec;
 
 fn job_event(event: JobEvent) -> IoResult {
     IoResult::Event(Box::new(Event::Job(event)))

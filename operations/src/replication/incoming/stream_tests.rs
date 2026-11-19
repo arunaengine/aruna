@@ -417,7 +417,7 @@ async fn denies_offered_bucket() {
     use aruna_core::structs::synced_folder::folder_bucket;
     use aruna_drivers::driver::drive;
 
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let context = &fixture.driver_context;
     let root = tempdir().unwrap();
     std::fs::write(root.path().join("note.txt"), b"note").unwrap();

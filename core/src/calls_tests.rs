@@ -160,6 +160,23 @@ fn snapshot_joins_reads() {
 }
 
 #[test]
+fn rebuild_opens_snapshot() {
+    // A usage rebuild's snapshot is the one beginning the rebuild answers; reads then join it.
+    let mut procedure = script(vec![read_a()]);
+    procedure.mode = TransactionMode::UsageRebuild;
+    let mut operation = CallRun::new(procedure);
+    let begin = StorageEffect::BeginUsageRebuild {
+        key_space: crate::keyspaces::USAGE_STATS_KEYSPACE.to_string(),
+    };
+    assert_eq!(operation.start().as_slice(), &[storage(begin)]);
+    let read = StorageEffect::BatchRead {
+        reads: vec![("rows".to_string(), key("a"))],
+        txn_id: Some(txn()),
+    };
+    assert_eq!(operation.step(started()).as_slice(), &[storage(read)]);
+}
+
+#[test]
 fn storage_refusal_fails() {
     // A storage effect answered with a storage error fails the operation like a storage call.
     let read = StorageEffect::Read {

@@ -76,12 +76,6 @@ pub fn values<const N: usize>(result: IoResult) -> Result<[Option<Value>; N], Io
     }
 }
 
-/// The value of a one-row read; a missing row is `None`.
-pub fn value(result: IoResult) -> Result<Option<Value>, IoError> {
-    let [value] = values::<1>(result)?;
-    Ok(value)
-}
-
 /// The values of a read of any number of rows, in the order they were asked for.
 pub fn all_values(result: IoResult) -> Result<Vec<Option<Value>>, IoError> {
     match result {

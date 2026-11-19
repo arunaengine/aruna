@@ -111,6 +111,7 @@ class SpansTest(unittest.TestCase):
         self.assertTrue(check_layers.is_test("operations/tests/main.rs"))
         self.assertTrue(check_layers.is_test("operations/src/realm_vault_tests.rs"))
         self.assertTrue(check_layers.is_test("operations/src/jobs/tests_outbox.rs"))
+        self.assertTrue(check_layers.is_test("operations/src/metadata/store_tests/mod.rs"))
         self.assertFalse(check_layers.is_test("operations/src/jobs/testing.rs"))
 
 
@@ -210,12 +211,34 @@ class TriggerTest(unittest.TestCase):
         )
 
     def test_broker_impl(self):
-        rel = "operations/src/plugins/broker.rs"
-        text = "impl Broker for RunBroker {\n    async fn get(&self) {}\n    fn sync(&self) {}\n}\nasync fn free() {}\n"
+        rel = "aruna/src/plugin_host/broker.rs"
+        text = (
+            "impl Broker for RunBroker {\n    async fn get(&self) { self.a().await; drive(b).await }\n"
+            "    async fn one(&self) { Ok(drive(op, c).await?) }\n    fn sync(&self) {}\n}\n"
+            "async fn free() { x.await; y.await }\n"
+        )
         with tempfile.TemporaryDirectory() as root:
             write_tree(root, {rel: text})
             source = check_layers.load_source(root, rel)
         self.assertEqual(check_layers.trigger_arms({rel: source}), [f"{rel}: Broker::get"])
+
+
+class ClocksTest(unittest.TestCase):
+    def test_core_hooks(self):
+        hook = '#[cfg(any(test, feature = "test-hooks"))]\n'
+        files = {
+            "core/src/lib.rs": f"{hook}pub mod time;\npub mod rows;\n",
+            "core/src/time.rs": "pub fn now() -> u64 { unix_timestamp_millis() }\n",
+            "core/src/rows.rs": (
+                f"{hook}pub fn key() -> u8 {{ getrandom::fill(&mut b); 1 }}\n"
+                "pub fn now_ms(&self) -> u64 { self.now_ms }\nfn at(rows: &R) -> u64 { rows.now_ms() }\n"
+                "fn read() -> u64 { SystemTime::now(); now_ms() }\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, files)
+            sources = [check_layers.load_source(root, rel) for rel in check_layers.rust_files(root)]
+        self.assertEqual(check_layers.core_clocks(sources), ["core/src/rows.rs:5", "core/src/rows.rs:5"])
 
 
 class HabitsTest(unittest.TestCase):

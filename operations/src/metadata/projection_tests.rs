@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::testing::write_entries;
 use aruna_core::UserId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::StorageEffect;
@@ -16,6 +15,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
 use aruna_core::task::TaskKey;
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::write_entries;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;

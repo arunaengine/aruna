@@ -135,9 +135,7 @@ pub(crate) fn request_auth(
         .ok_or_else(|| server_error(crate::error::ServerError::Unauthorized))
 }
 
-pub(crate) fn empty_extras(
-    tool: &str,
-) -> aruna_core::request_policy::PolicyRequestExtras {
+pub(crate) fn empty_extras(tool: &str) -> aruna_core::request_policy::PolicyRequestExtras {
     aruna_core::request_policy::PolicyRequestExtras {
         operation: format!("mcp:{tool}"),
         params: BTreeMap::new(),
@@ -165,14 +163,12 @@ pub(crate) fn tool_extras<T: serde::Serialize>(
             (key.clone(), value)
         })
         .collect();
-    Ok(
-        aruna_core::request_policy::PolicyRequestExtras {
-            operation: format!("mcp:{tool}"),
-            params,
-            headers: BTreeMap::new(),
-            body: None,
-        },
-    )
+    Ok(aruna_core::request_policy::PolicyRequestExtras {
+        operation: format!("mcp:{tool}"),
+        params,
+        headers: BTreeMap::new(),
+        body: None,
+    })
 }
 
 pub(crate) fn server_error(error: crate::error::ServerError) -> CallToolResult {

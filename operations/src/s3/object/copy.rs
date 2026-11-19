@@ -34,7 +34,6 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
-use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
@@ -49,10 +48,9 @@ use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot, resolve_backend};
 use aruna_core::types::GroupId;
-use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
@@ -606,13 +604,7 @@ impl CopyBytesOperation {
         });
         let body = match (adopt.is_some(), self.progress.take()) {
             (true, _) => None,
-            (false, Some(PulledBytes(pulled))) => {
-                Some(BackendStream(Box::pin(source.blob.inspect(move |chunk| {
-                    if let Ok(bytes) = chunk {
-                        pulled.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    }
-                }))))
-            }
+            (false, Some(PulledBytes(pulled))) => Some(source.blob.counted(pulled)),
             (false, None) => Some(source.blob),
         };
         // Materialized source bytes are kept only when they match every recorded digest.
@@ -950,11 +942,11 @@ impl Operation for KeepReferenceOperation {
 pub(crate) mod test {
     use super::*;
     use crate::s3::object::get::GetObjectOperation;
-    use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
     #[allow(unused_imports)]
-    pub(crate) use crate::testing_objects::{put_config, seed_bucket, with_blob};
+    pub(crate) use crate::testing_objects::put_config;
+    pub(crate) use aruna_drivers::testing::{seed_bucket, with_blob};
     use crate::tests::policy::{seed_gate, subject};
-    use crate::tests::s3::{full_context, spawn_reference_server, write_version};
+    use aruna_test_support::s3::{full_context, spawn_reference_server, write_version};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
@@ -963,9 +955,11 @@ pub(crate) mod test {
     use aruna_core::structs::execution::staging::PortableSourceDescriptor;
     use aruna_core::structs::storage::blob::{BlobHeadKey, BlobVersion, VersionKey};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
     use aruna_drivers::driver::{DriverContext, drive, node_routing};
     use futures_util::StreamExt;
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     fn test_node_id() -> aruna_core::NodeId {

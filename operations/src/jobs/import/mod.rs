@@ -4,7 +4,7 @@
 
 mod acquire;
 #[cfg(test)]
-mod consortium;
+mod consortium_tests;
 mod finish;
 mod job;
 mod plan;

@@ -18,7 +18,7 @@ const BUCKET: &str = "bakrep";
 const KEY: &str = "genes/SAMN15803895.faa.gz";
 
 async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-    crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
+    aruna_drivers::testing::write_value(&context.storage_handle, key_space, key, value).await;
 }
 
 /// A bucket with one version and database metadata whose rules find BioSample ids.

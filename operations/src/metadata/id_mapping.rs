@@ -23,7 +23,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry};
+use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
 use aruna_core::placement::fence::{admits, fence_read};
 use aruna_core::placement::resolve_shard_holders;
 
@@ -168,12 +168,14 @@ pub(crate) fn transition_actor(route: &Option<MappingRoute>) -> aruna_core::Node
         .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[0u8; 32]).public())
 }
 
+/// A revision of the mapping with `event_id`, minted by the caller's run.
 pub(crate) fn mapping_revision(
     route: &Option<MappingRoute>,
+    event_id: Ulid,
     occurred_at_ms: u64,
 ) -> PersistentIdRevision {
     PersistentIdRevision {
-        event_id: Ulid::generate(),
+        event_id,
         actor: transition_actor(route),
         occurred_at_ms,
     }
@@ -186,26 +188,28 @@ pub(crate) fn tombstone_transition(
     route: &Option<MappingRoute>,
     document_id: Ulid,
     deleted_at_ms: u64,
+    (event_id, outbox_id): (Ulid, Ulid),
 ) -> Result<Option<(PersistentIdMapping, Vec<TransitionEntry>)>, PersistentIdError> {
     let Some(mapping) = existing else {
         return Ok(None);
     };
     debug_assert_eq!(mapping.target, document_id);
     let mut mapping = mapping.clone();
-    if !mapping.mark_tombstoned(mapping_revision(route, deleted_at_ms)) {
+    if !mapping.mark_tombstoned(mapping_revision(route, event_id, deleted_at_ms)) {
         return Ok(None);
     }
-    let writes = transition_entries(route, &mapping)?;
+    let writes = transition_entries(route, &mapping, outbox_id)?;
     Ok(Some((mapping, writes)))
 }
 
 pub type TransitionEntry = (String, ByteView, ByteView);
 
-/// Row, identifier index, sync sidecar, shard-manifest entry and outbox publish, so an accepted
-/// transition is either fully durable and replicated or not taken.
+/// Row, identifier index, sync sidecar, shard-manifest entry and outbox publish under
+/// `outbox_id`, so an accepted transition is either fully durable and replicated or not taken.
 pub(crate) fn transition_entries(
     route: &Option<MappingRoute>,
     mapping: &PersistentIdMapping,
+    outbox_id: Ulid,
 ) -> Result<Vec<TransitionEntry>, PersistentIdError> {
     let target = persistent_id_target(mapping.target);
     let mut writes = vec![(
@@ -223,7 +227,8 @@ pub(crate) fn transition_entries(
             writes.push(entry);
         }
         if !route.peers.is_empty() {
-            let record = new_outbox_record(
+            let record = new_identified_record(
+                outbox_id,
                 route.actor,
                 target,
                 route.peers.clone(),

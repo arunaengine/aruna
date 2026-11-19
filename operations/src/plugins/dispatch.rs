@@ -21,7 +21,7 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 use super::bound::{CheckNodeBinding, NodeCheckFailure, delivery_clash, vault_kind};
-use super::held::{AskRelease, HeldSecrets};
+use super::held::{AskRelease, fresh_fields};
 use super::hooks::{DROPPED, HookError};
 use super::install::{InstallError, admin_answer, admin_call, pick_version, read_manifest};
 use super::rate::{take_hook, taken};
@@ -343,8 +343,8 @@ impl VerifyHook {
             manifest,
             slot,
         } = check;
-        let (released, fields) = (HeldSecrets::default().absorb(&slot, released))
-            .map_err(|error| unavailable(error.to_string()))?;
+        let (released, fields) =
+            fresh_fields(released).map_err(|error| unavailable(error.to_string()))?;
         // A secret edit can make the checked header the delivery id; nothing starts then.
         if delivery_clash(&manifest, &slot, &released.settings) {
             let clash = "the delivery id header is the checked header".to_string();

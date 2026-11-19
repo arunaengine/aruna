@@ -456,7 +456,7 @@ pub(crate) mod pure_tests {
     use super::walk::{directory_list_path, record_failure};
     use super::*;
     use crate::staging::page::rows::MAX_ERROR_SAMPLE;
-    use crate::tests::staging::test_spec;
+    use aruna_test_support::staging::test_spec;
     use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 
     /// A run of the test spec.

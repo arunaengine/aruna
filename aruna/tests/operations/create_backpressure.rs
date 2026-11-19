@@ -17,9 +17,9 @@ use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
-use aruna_operations::testing::project_logged_events;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::projection::project_logged_events;
 use tempfile::TempDir;
 use ulid::Ulid;
 

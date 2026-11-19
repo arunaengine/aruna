@@ -370,7 +370,7 @@ impl Operation for ReadPolicyOperation {
     }
 
     fn next(&mut self, result: IoResult) -> ReadTurn {
-        match self.state.clone() {
+        match std::mem::replace(&mut self.state, ReadPolicyState::ReadLocal) {
             ReadPolicyState::ReadLocal => {
                 let [policy_value, config_value, auth_value] = values::<3>(result)?;
                 self.store_realm(config_value, auth_value)?;

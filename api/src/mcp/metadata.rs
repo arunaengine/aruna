@@ -1198,15 +1198,15 @@ mod authorization_tests {
 
     async fn drain_metadata_background(state: &ServerState) {
         let ctx = state.get_ctx();
-        let drained = aruna_operations::testing::drain_projection_queue(ctx.as_ref())
+        let drained = aruna_test_support::projection::drain_projection_queue(ctx.as_ref())
             .await
             .unwrap();
         if drained.markers_examined == 0 {
-            aruna_operations::testing::replay_event_log(ctx.as_ref())
+            aruna_test_support::projection::replay_event_log(ctx.as_ref())
                 .await
                 .unwrap();
         }
-        aruna_operations::testing::process_materialization_batch(ctx.as_ref())
+        aruna_test_support::metadata::process_materialization_batch(ctx.as_ref())
             .await
             .unwrap();
         // A text search sees only committed index updates.

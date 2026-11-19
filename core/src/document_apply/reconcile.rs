@@ -27,7 +27,7 @@ use crate::events::{Event, NetEvent};
 use crate::keyspaces::APPLIED_OPS_KEYSPACE;
 use crate::operation::{HoldScope, Operation, TransactionMode};
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
-use crate::rows::{done, event, read_row, value};
+use crate::rows::{done, event, read_row};
 use crate::structs::SyncRejection;
 use crate::structs::identity::realm::RealmId;
 use crate::types::{Key, Value};
@@ -378,7 +378,7 @@ impl Operation for ReconcileTopicsOperation {
                 self.next_topic()
             }
             Stage::ReadingCursor(topic) => {
-                let stored_cursor = value(result)?;
+                let stored_cursor = result.value()?;
                 self.net_call(
                     Stage::LoadingBatch(topic),
                     DocumentEffect::ReconcileBatch {
@@ -407,7 +407,7 @@ impl Operation for ReconcileTopicsOperation {
             }
             Stage::CheckingOverflow(cursor, outcome) => {
                 // An earlier checkpoint is kept.
-                if value(result)?.is_some() {
+                if result.value()?.is_some() {
                     return self.settle(cursor, *outcome);
                 }
                 let row = (

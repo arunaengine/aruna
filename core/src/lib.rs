@@ -25,6 +25,7 @@ pub mod download_slots;
 pub mod effects;
 pub mod egress;
 pub mod entity_patch;
+pub mod entropy;
 pub mod errors;
 pub mod events;
 pub mod federation;
@@ -91,6 +92,7 @@ pub mod task;
 pub mod telemetry;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod testing;
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod time;
 pub mod trace_context;
 pub mod transfer;

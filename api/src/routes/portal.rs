@@ -132,9 +132,9 @@ fn map_portal_error(error: SetPortalError) -> ServerError {
         SetPortalError::ConfigMissing => ServerError::NotFound,
         SetPortalError::Unauthorized | SetPortalError::NotManagementNode => ServerError::Forbidden,
         SetPortalError::InvalidFeatures { reason } => ServerError::BadRequestReason(reason),
-        SetPortalError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
-            "concurrent realm configuration update conflict; retry".to_string(),
-        ),
+        SetPortalError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::config_conflict()
+        }
         SetPortalError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }

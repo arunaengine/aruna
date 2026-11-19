@@ -1484,7 +1484,7 @@ mod tests {
             (second_doc, Ulid::from_bytes([8u8; 16])),
         ] {
             let row = audit_entry(&record(group_id, document_id, realm_id), audit_id).unwrap();
-            crate::testing::write_entries(&context.storage_handle, vec![row]).await;
+            aruna_drivers::testing::write_entries(&context.storage_handle, vec![row]).await;
         }
 
         let first = aruna_drivers::driver::drive(

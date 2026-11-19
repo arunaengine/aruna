@@ -742,7 +742,7 @@ mod tests {
     }
 
     async fn read_user(context: &DriverContext, user_id: UserId) -> User {
-        aruna_operations::testing::read_user(context, user_id).await
+        aruna_drivers::testing::read_user(context, user_id).await
     }
 
     async fn read_realm_config(
@@ -941,7 +941,7 @@ mod tests {
     }
 
     fn aruna_token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
-        aruna_operations::testing::token_claims(realm_id, user_id)
+        aruna_test_support::tokens::token_claims(realm_id, user_id)
     }
 
     fn sign_aruna_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {

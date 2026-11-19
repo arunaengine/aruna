@@ -15,7 +15,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::offered_directory::modified_ms;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -554,7 +554,7 @@ impl Operation for LocalOriginOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<LocalOrigin>>, FolderError> {
-        let origin = value(result)?.map(|bytes| LocalOrigin::from_bytes(&bytes));
+        let origin = result.value()?.map(|bytes| LocalOrigin::from_bytes(&bytes));
         let origin = origin.transpose().map_err(|_| FolderError::Unavailable)?;
         Ok(Next::Done(origin))
     }

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod account;
+pub mod admitted;
 pub mod artifacts;
 pub mod attempt;
 pub mod bound;
@@ -46,6 +47,7 @@ pub mod rows;
 pub mod rules;
 pub mod runs;
 pub(crate) mod secret_use;
+pub mod send_calls;
 pub mod settings;
 pub mod state;
 pub mod submit;

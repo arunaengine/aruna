@@ -491,3 +491,66 @@ fn apply_records_failure() {
     let kept = child_result(Err::<String, _>(failed.clone()));
     assert_eq!(change.next(kept), Err(failed));
 }
+
+fn plan(mutation: ChangeMutation) -> ChangePlan {
+    ChangePlan {
+        scope: scope(),
+        network_node: None,
+        mutation,
+        intent: intent(),
+    }
+}
+
+fn checked(mutation: ChangeMutation) -> Checked<PrepareChange, ChangePlan> {
+    let mut write = Checked::new(change(ChangeInput::File(None)), plan(mutation));
+    assert!(is_child(&write.first()), "the checks run first");
+    write
+}
+
+/// A failure that marks the run as changed.
+fn marked_failure() -> CallFailure {
+    CallFailure {
+        changed: true,
+        ..CallFailure::from(refusal())
+    }
+}
+
+#[test]
+fn checked_proceeds_once() {
+    let mut write = checked(ChangeMutation::Dataset);
+    let ready = Ok::<_, CallFailure>(CallStep::Proceed(ready_change()));
+    assert!(is_child(&write.next(child_result(ready))), "then the write");
+    let failed = write.next(child_result(Err::<String, _>(marked_failure())));
+    let unmarked = Err(CallFailure::from(refusal()));
+    assert_eq!(failed, unmarked, "a late failure is no change");
+}
+
+#[test]
+fn checked_answers_earlier() {
+    let given = ChangeMutation::Given(UpdateDocumentMutation::RemoveDataEntity {
+        id: "file".to_string(),
+    });
+    let mut write = checked(given);
+    let replied = CallStep::<ReadyChange>::Replied("reply".into());
+    let answer = write.next(child_result(Ok::<_, CallFailure>(replied)));
+    assert_eq!(answer, Ok(Next::Done("reply".into())));
+    let mut refused = checked(ChangeMutation::Dataset);
+    let checks = child_result(Err::<CallStep<ReadyChange>, _>(marked_failure()));
+    let kept = Err(marked_failure());
+    assert_eq!(refused.next(checks), kept, "checks keep their mark");
+}
+
+#[test]
+fn dataset_upserts_entity() {
+    let entity = "{\"@id\":\"./\"}";
+    let ready = || ReadyChange {
+        entity: Some(entity.into()),
+        ..ready_change()
+    };
+    let upsert = UpdateDocumentMutation::UpsertContextualEntity {
+        jsonld: entity.into(),
+    };
+    let scope = scope();
+    let direct = ApplyChange::new((&scope, None), ready(), upsert, intent());
+    assert_eq!(plan(ChangeMutation::Dataset).call(ready()), direct);
+}

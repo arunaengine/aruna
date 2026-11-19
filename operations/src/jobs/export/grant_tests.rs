@@ -97,7 +97,7 @@ async fn write_record(
 }
 
 fn context() -> (TempDir, DriverContext) {
-    crate::testing::temp_context()
+    aruna_drivers::testing::temp_context()
 }
 
 fn capabilities() -> NodeCapabilities {
@@ -160,7 +160,7 @@ async fn denial_stops_reads() {
 }
 
 async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-    crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
+    aruna_drivers::testing::write_value(&context.storage_handle, key_space, key, value).await;
 }
 
 #[tokio::test]

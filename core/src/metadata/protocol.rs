@@ -735,10 +735,7 @@ pub enum MetadataTransportMessage {
     /// An export answer with its body already read; the transport hands it to the operation
     /// that asked, and it never crosses the wire.
     ExportAnswer {
-        result: Result<
-            Box<crate::metadata::api::ExportMetadataResult>,
-            MetadataReadError,
-        >,
+        result: Result<Box<crate::metadata::api::ExportMetadataResult>, MetadataReadError>,
     },
 }
 
@@ -808,10 +805,8 @@ pub struct RealmDocuments {
     /// Display names of realm nodes from the serving node's realm config state.
     pub node_names: std::collections::BTreeMap<crate::NodeId, String>,
     /// Map places of realm nodes from the serving node's realm config state.
-    pub node_places: std::collections::BTreeMap<
-        crate::NodeId,
-        crate::structs::identity::realm::NodePlace,
-    >,
+    pub node_places:
+        std::collections::BTreeMap<crate::NodeId, crate::structs::identity::realm::NodePlace>,
 }
 
 /// One page of immutable records plus the cursor of the next one.
@@ -984,11 +979,7 @@ pub fn request_shape(message: &MetadataTransportMessage) -> FrameShape {
 
 /// The effect that sends one encoded request to `peer`, with the bounds its answer is read
 /// within; a frame that does not decode carries no shape and is never sent.
-pub fn metadata_request(
-    peer: NodeId,
-    frame: Vec<u8>,
-    timeout: Duration,
-) -> MetadataRequestEffect {
+pub fn metadata_request(peer: NodeId, frame: Vec<u8>, timeout: Duration) -> MetadataRequestEffect {
     let shape = decode_message(&frame)
         .ok()
         .map(|message| request_shape(&message));
@@ -1054,7 +1045,7 @@ pub fn audit_frame_cap() -> usize {
     MAX_PAGE_BYTES.saturating_add(AUDIT_FRAME_OVERHEAD)
 }
 
-pub fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
+fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
     let Some(&last) = prefix.last() else {
         return Ok(None);
     };
@@ -1328,9 +1319,7 @@ mod tests {
     use crate::metadata::MAX_TOKEN_LEN;
     use crate::structs::identity::auth::{AuthContext, PathRestriction, Permission};
     use crate::structs::identity::realm::RealmId;
-    use crate::structs::storage::metadata_registry::{
-        MetadataAuditOperation, MetadataAuditRecord,
-    };
+    use crate::structs::storage::metadata_registry::{MetadataAuditOperation, MetadataAuditRecord};
 
     #[test]
     fn transport_auth_fields() {

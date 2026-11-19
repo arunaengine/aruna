@@ -112,7 +112,7 @@ mod tests {
 
     async fn store(context: &DriverContext, entry: &PublishEntry) {
         let (key_space, key, value) = publish_entry(entry).unwrap();
-        crate::testing::write_value(&context.storage_handle, &key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, &key_space, key, value).await;
     }
 
     // The entry and its fence row are deleted in the transaction; a draft in flight stays.

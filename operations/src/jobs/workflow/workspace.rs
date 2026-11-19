@@ -1114,7 +1114,7 @@ mod tests {
     #[tokio::test]
     async fn served_sources_kept() {
         use aruna_core::structs::execution::job::{CapturedInput, InputContent};
-        let test_context = crate::tests::staging::setup_driver_context().await;
+        let test_context = aruna_test_support::staging::setup_driver_context().await;
         let context = &test_context.driver_context;
         let realm_id = RealmId([1; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2; 16]), realm_id);
@@ -1153,7 +1153,7 @@ mod tests {
             claim_token: Ulid::from_bytes([8; 16]),
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::test_calls::insert_job(context, &record)
+        aruna_test_support::jobs::insert_job(context, &record)
             .await
             .unwrap();
         let pin = SourcePin {
@@ -1163,7 +1163,7 @@ mod tests {
         };
         let stored = || async {
             let read =
-                crate::jobs::store::test_calls::read_job_record(context, record.job_id, None).await;
+                aruna_test_support::jobs::read_job_record(context, record.job_id, None).await;
             read.unwrap().unwrap().captured_inputs[0].served_by.clone()
         };
         let token = Ulid::from_bytes([8; 16]);

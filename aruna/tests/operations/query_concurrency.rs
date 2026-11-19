@@ -192,7 +192,7 @@ async fn create_crate_graph(harness: &TestHarness, index: usize) -> Result<Strin
 }
 
 async fn create_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Result<(), BoxError> {
-    let event = aruna_operations::testing::send_metadata_effect(
+    let event = aruna_drivers::testing::send_metadata_effect(
         &harness.context,
         MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {
@@ -560,7 +560,7 @@ async fn graph_filter_first() -> Result<(), BoxError> {
 }
 
 async fn replay_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Result<(), BoxError> {
-    let event = aruna_operations::testing::send_metadata_effect(
+    let event = aruna_drivers::testing::send_metadata_effect(
         &harness.context,
         MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {
@@ -917,7 +917,7 @@ async fn concurrent_mutation_profile() -> Result<(), BoxError> {
                 let jsonld = format!(
                     "{{\"@id\": \"./load-{writer}-{round}.dat\", \"@type\": \"MediaObject\", \"name\": \"load-{writer}-{round}\", \"keywords\": [{keywords}]}}"
                 );
-                let event = aruna_operations::testing::send_metadata_effect(&harness.context, MetadataEffect::UpsertDataEntity {
+                let event = aruna_drivers::testing::send_metadata_effect(&harness.context, MetadataEffect::UpsertDataEntity {
                         request: UpsertEntityRequest {
                             graph_iri,
                             jsonld,

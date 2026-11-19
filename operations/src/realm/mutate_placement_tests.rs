@@ -25,12 +25,12 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::document_repository::GetConfigOperation;
-use crate::testing::path_context;
 use aruna_core::placement::transition::{TransitionRequest, plan_transition};
 use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits,
 };
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::path_context;
 
 fn node(seed: u8) -> aruna_core::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -152,7 +152,7 @@ fn create_event(actor: &Actor, strategy_id: Ulid, document_seed: u8) -> Metadata
 }
 
 async fn write_entries(context: &DriverContext, writes: Vec<(String, Key, Value)>) {
-    crate::testing::write_entries(&context.storage_handle, writes).await;
+    aruna_drivers::testing::write_entries(&context.storage_handle, writes).await;
 }
 
 #[tokio::test]
@@ -1348,7 +1348,7 @@ async fn unauthorized_writes_nothing() {
         .expect("the realm config survives a rejected mutation");
     assert!(stored.candidate_maps.is_empty());
     assert!(
-        crate::testing::read_outbox_tails(&context.storage_handle)
+        aruna_test_support::documents::read_outbox_tails(&context.storage_handle)
             .await
             .expect("outbox scan")
             .is_empty()

@@ -18,7 +18,7 @@ use aruna_core::metadata::{
 use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::reducer::AdminDocumentState;
-use aruna_core::rows::{outside_answer, outside_call, read_row, value, values};
+use aruna_core::rows::{outside_answer, outside_call, read_row, values};
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -395,7 +395,10 @@ impl Operation for ReadDocumentsOperation {
             // What this node applied to the realm configuration, as the reducer keeps it. A
             // device compares it with its own copy's and never accepts less.
             DocumentsStep::Clock => {
-                let state = outside_answer(result).and_then(value).ok().flatten();
+                let state = outside_answer(result)
+                    .and_then(IoResult::value)
+                    .ok()
+                    .flatten();
                 let state =
                     state.and_then(|bytes| postcard::from_bytes::<AdminDocumentState>(&bytes).ok());
                 self.finish(state.map(|state| state.clock).unwrap_or_default())

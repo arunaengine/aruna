@@ -129,7 +129,7 @@ async fn manifest_read_authorized() {
         claim_token,
         lease_expires_ms: u64::MAX,
     });
-    crate::jobs::store::test_calls::insert_job(&context, &record)
+    aruna_test_support::jobs::insert_job(&context, &record)
         .await
         .unwrap();
     let driver = DriverContext {
@@ -145,7 +145,7 @@ async fn manifest_read_authorized() {
     let mut spec = spec();
     let denied = source_permission_path(&spec, "data/MD5SUMS");
     let scope = (spec.auth_context.realm_id, spec.group_id, spec.node_id);
-    spec.auth_context = crate::testing_access::seed_access(&driver, scope, &denied).await;
+    spec.auth_context = aruna_drivers::testing::seed_access(&driver, scope, &denied).await;
     let checkpoint = checkpoint();
     // Digests an earlier chunk stored, and one of another folder's manifest.
     let digest = postcard::to_allocvec(&(ChecksumAlgorithm::Md5, vec![1u8; 16])).unwrap();

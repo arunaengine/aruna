@@ -402,6 +402,11 @@ impl IntoResponse for ServerError {
 }
 
 impl ServerError {
+    /// A realm configuration write that lost to a concurrent one; the caller may retry.
+    pub(crate) fn config_conflict() -> Self {
+        Self::Conflict("concurrent realm configuration update conflict; retry".to_string())
+    }
+
     pub(crate) fn response_body(&self) -> ErrorResponse {
         let mut body = ErrorResponse::new(self.public_message()).with_code(self.error_code());
         if let ServerError::MetadataValidation(violations) = self {

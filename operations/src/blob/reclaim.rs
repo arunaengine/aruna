@@ -412,12 +412,11 @@ mod tests {
         BackendStatusOperation, RECLAIM_TICK_LIMIT, ReclaimOutcome, ReclaimSweepError,
         ReclaimSweepOperation,
     };
-    use crate::testing::path_context;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-    use aruna_core::operation::{EffectOperation, Runnable};
+    use aruna_core::calls::CallRun;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::CopyOwner;
     use aruna_core::structs::storage::format::EncodingClass;
@@ -425,6 +424,7 @@ mod tests {
     use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
     use aruna_core::types::Value;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::path_context;
     use aruna_storage::scan::iter_prefix_page;
     use std::collections::HashMap;
     use tempfile::tempdir;
@@ -487,7 +487,7 @@ mod tests {
     }
 
     async fn write(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     async fn read(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {
@@ -945,7 +945,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let context = path_context(dir.path().to_str().unwrap());
         seed(&context, 10).await;
-        let mut operation = reclaim_op(candidate_key()).into_machine();
+        let mut operation = CallRun::new(reclaim_op(candidate_key()));
         let mut effects = std::collections::VecDeque::from_iter(operation.start());
         let mut refreshed = false;
         while !operation.is_complete() {

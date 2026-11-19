@@ -27,6 +27,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
+use bytes::Bytes;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -80,11 +81,75 @@ pub struct PublishPlan {
     entry: PublishedPlugin,
 }
 
-impl PublishPlan {
-    /// Stores the artifact on this node, as the copy the publish counts first.
-    pub fn store_copy<'a>(&self, artifact: &'a [u8]) -> StoreCopy<'a> {
-        let (digest, now_ms) = (&self.entry.digest, self.entry.published_at_ms);
-        StoreCopy::new(&self.config, digest, artifact, now_ms)
+/// Publishes `artifact` for a realm admin: checks it, stores it here, copies it to the other
+/// management nodes and writes the entry. Answers only after a majority stored it durably;
+/// otherwise nothing is published. The entry takes the time of the run's start.
+#[derive(Debug, PartialEq)]
+pub struct PublishPlugin {
+    actor: Actor,
+    auth: AuthContext,
+    artifact: Bytes,
+    now_ms: u64,
+    phase: PublishPhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum PublishPhase {
+    Checking,
+    Storing(Box<PublishPlan>),
+    Finishing,
+}
+
+impl PublishPlugin {
+    pub fn new(actor: Actor, auth: AuthContext, artifact: Bytes) -> Self {
+        Self {
+            actor,
+            auth,
+            artifact,
+            now_ms: 0,
+            phase: PublishPhase::Checking,
+        }
+    }
+}
+
+impl Operation for PublishPlugin {
+    type Output = PublishedPlugin;
+    type Error = PublishError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<PublishedPlugin>, PublishError> {
+        let (actor, auth) = (&self.actor, &self.auth);
+        let check = CheckPublish::new(actor, auth, &self.artifact, self.now_ms)?;
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PublishedPlugin>, PublishError> {
+        match std::mem::replace(&mut self.phase, PublishPhase::Finishing) {
+            PublishPhase::Checking => match result.child::<PublishStep, PublishError>()?? {
+                PublishStep::Known(published) => Ok(Next::Done(published)),
+                PublishStep::Store(plan) => {
+                    let (digest, now_ms) = (&plan.entry.digest, plan.entry.published_at_ms);
+                    let bytes = self.artifact.clone();
+                    let store = StoreCopy::new(&plan.config, digest, bytes, now_ms);
+                    self.phase = PublishPhase::Storing(plan);
+                    Ok(Next::Call(IoCall::child(store)))
+                }
+            },
+            PublishPhase::Storing(plan) => {
+                result.child::<(), ArtifactError>()??;
+                let (actor, auth) = (self.actor.clone(), self.auth.clone());
+                let artifact = std::mem::take(&mut self.artifact);
+                let finish = FinishPublish::new(actor, auth, *plan, artifact);
+                Ok(Next::Call(IoCall::child(finish)))
+            }
+            PublishPhase::Finishing => {
+                let published = result.child::<PublishedPlugin, PublishError>()??;
+                Ok(Next::Done(published))
+            }
+        }
     }
 }
 
@@ -181,12 +246,12 @@ pub struct FinishPublish {
     actor: Actor,
     auth: AuthContext,
     plan: PublishPlan,
-    artifact: Vec<u8>,
+    artifact: Bytes,
     stored: Option<usize>,
 }
 
 impl FinishPublish {
-    pub fn new(actor: Actor, auth: AuthContext, plan: PublishPlan, artifact: Vec<u8>) -> Self {
+    pub fn new(actor: Actor, auth: AuthContext, plan: PublishPlan, artifact: Bytes) -> Self {
         Self {
             actor,
             auth,
@@ -259,7 +324,7 @@ fn same_version(
 /// Sends the artifact to every other management node at once, the chunks of one node one after
 /// another; answers the nodes that confirmed a complete, synced copy. A node that refuses or
 /// fails a chunk gets no more.
-pub(crate) fn copy_artifact(peers: Vec<NodeId>, digest: String, artifact: Vec<u8>) -> CopyArtifact {
+pub(crate) fn copy_artifact(peers: Vec<NodeId>, digest: String, artifact: Bytes) -> CopyArtifact {
     CopyArtifact {
         peers,
         digest,
@@ -273,7 +338,7 @@ pub(crate) fn copy_artifact(peers: Vec<NodeId>, digest: String, artifact: Vec<u8
 pub struct CopyArtifact {
     peers: Vec<NodeId>,
     digest: String,
-    artifact: Vec<u8>,
+    artifact: Bytes,
     /// The node and chunk of each window member, by member index.
     members: Vec<(NodeId, u32)>,
     confirmed: BTreeSet<NodeId>,

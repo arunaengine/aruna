@@ -10,9 +10,8 @@ use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows;
-use aruna_core::structs::execution::harvest::{
-    RepositoryConnector, RepositoryConnectorKind, RepositoryConnectorSecret,
-};
+use aruna_core::structs::execution::harvest::{RepositoryConnector, RepositoryConnectorKind};
+use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::structs::identity::group_delete::{GroupWriteError, check_group_write};
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
@@ -135,10 +134,11 @@ impl UpdateRepositoryOperation {
             updated_at: now,
             ..existing
         };
-        let secret =
-            self.input.secret_config.clone().and_then(|config| {
-                RepositoryConnectorSecret::new(connector.connector_id, config, now)
-            });
+        let secret = self
+            .input
+            .secret_config
+            .clone()
+            .and_then(|config| SourceConnectorSecret::new(connector.connector_id, config, now));
         let has_secret_config = match &self.input.secret_config {
             None => stored,
             Some(_) => secret.is_some(),

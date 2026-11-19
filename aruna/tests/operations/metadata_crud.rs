@@ -40,13 +40,14 @@ use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOper
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
 use aruna_operations::metadata::registry_cache::RegistryReadOperation;
 use aruna_operations::metadata::update_document::{UpdateDocumentConfig, UpdateDocumentOperation};
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::{
-    drain_projection_queue, project_create_events, project_logged_event, replay_event_log,
-    schedule_projection_drain,
-};
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::{drain_projection_queue, project_create_events};
+use aruna_test_support::projection::{project_logged_event, replay_event_log, schedule_projection_drain};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::projection::{
+    project_logged_event, replay_event_log, schedule_projection_drain,
+};
 use byteview::ByteView;
 use tempfile::TempDir;
 use ulid::Ulid;

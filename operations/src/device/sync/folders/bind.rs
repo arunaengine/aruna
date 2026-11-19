@@ -7,7 +7,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{HoldScope, Operation, TransactionMode};
-use aruna_core::rows::{done, outside_answer, outside_call, read_row, value};
+use aruna_core::rows::{done, outside_answer, outside_call, read_row};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::{
@@ -688,7 +688,9 @@ impl Operation for DropBindingOperation {
             done(result)?;
             return Ok(Next::Done(()));
         }
-        let folder = value(result)?.and_then(|row| SyncedFolder::from_bytes(&row).ok());
+        let folder = result
+            .value()?
+            .and_then(|row| SyncedFolder::from_bytes(&row).ok());
         if !folder.is_some_and(|folder| matches!(folder.state, FolderState::Binding { .. })) {
             return Ok(Next::Done(()));
         }

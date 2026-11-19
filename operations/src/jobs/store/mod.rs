@@ -120,7 +120,5 @@ fn hash_report_value(hasher: &mut blake3::Hasher, value: &[u8]) {
 
 #[cfg(test)]
 mod key_wait_tests;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod test_calls;
 #[cfg(test)]
 mod tests;

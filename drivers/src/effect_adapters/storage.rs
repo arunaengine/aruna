@@ -77,7 +77,8 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::types::TxnId;
@@ -87,73 +88,38 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::tempdir;
 
+    /// Commits a transaction that the test opened and fails unless storage acknowledges it.
     #[derive(Debug, PartialEq)]
     struct CommitOutcome {
-        state: u8,
-        failed: bool,
-        txn_id: Option<TxnId>,
+        txn_id: TxnId,
     }
 
-    impl EffectOperation for CommitOutcome {
+    impl Operation for CommitOutcome {
         type Output = ();
-        type Error = ();
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            if let Some(txn_id) = self.txn_id {
-                self.state = 3;
-                return smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                    txn_id
-                },)];
+        fn first(&mut self) -> Result<Next<()>, IoError> {
+            let commit = StorageEffect::CommitTransaction {
+                txn_id: self.txn_id,
+            };
+            Ok(Next::Call(IoCall::from(Effect::Storage(commit))))
+        }
+
+        fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+            match result {
+                IoResult::Event(event)
+                    if matches!(
+                        *event,
+                        Event::Storage(StorageEvent::TransactionCommitted { .. })
+                    ) =>
+                {
+                    Ok(Next::Done(()))
+                }
+                _ => Err(IoError::Unexpected {
+                    expected: "a committed transaction",
+                    got: "another storage answer",
+                }),
             }
-            self.state = 1;
-            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        }
-
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            match (event, self.state) {
-                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
-                    self.txn_id = Some(txn_id);
-                    self.state = 2;
-                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
-                        key_space: "default".to_string(),
-                        key: ByteView::from(*b"commit-outcome"),
-                        value: ByteView::from(*b"committed"),
-                        txn_id: Some(txn_id),
-                    })]
-                }
-                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
-                    self.state = 3;
-                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                        txn_id: self.txn_id.expect("transaction id recorded"),
-                    })]
-                }
-                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 3) => {
-                    self.state = 4;
-                    smallvec::smallvec![]
-                }
-                (Event::Storage(StorageEvent::Error { .. }), 3) => {
-                    self.failed = true;
-                    self.state = 4;
-                    smallvec::smallvec![]
-                }
-                _ => smallvec::smallvec![],
-            }
-        }
-
-        fn is_complete(&self) -> bool {
-            self.state == 4
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            if self.failed { Err(()) } else { Ok(()) }
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            self.failed = true;
-            self.state = 4;
-            smallvec::smallvec![]
         }
     }
 
@@ -262,11 +228,7 @@ mod tests {
         let task_context = context.clone();
         let mut task = tokio::spawn(async move {
             crate::driver::drive_until(
-                CommitOutcome {
-                    state: 0,
-                    failed: false,
-                    txn_id: Some(txn_id),
-                },
+                CommitOutcome { txn_id },
                 &task_context,
                 tokio::time::Instant::now() + std::time::Duration::from_millis(100),
             )

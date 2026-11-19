@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{page, read_row, value};
+use aruna_core::rows::{page, read_row};
 use aruna_core::structs::execution::job::{CapturedInput, JobError, JobId, JobRecord, KeyWait};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{
@@ -233,10 +233,10 @@ impl Operation for VersionWaitOperation {
 
     fn next(&mut self, result: IoResult) -> WaitNext {
         match self.step {
-            WaitStep::Version => self.versioned(value(result)?),
-            WaitStep::Location => self.located(value(result)?),
+            WaitStep::Version => self.versioned(result.value()?),
+            WaitStep::Location => self.located(result.value()?),
             WaitStep::Bucket => {
-                let settings = value(result)?;
+                let settings = result.value()?;
                 let key = BucketEncryption::from_row(settings.as_deref())
                     .map_err(check_error)?
                     .active_key();
