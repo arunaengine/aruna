@@ -808,6 +808,13 @@ impl MemberReadOperation {
     }
 }
 
+/// The message of a REST refusal.
+fn rest_message(body: &str) -> String {
+    (serde_json::from_str::<serde_json::Value>(body).ok())
+        .and_then(|value| value.get("error")?.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
 impl Operation for MemberReadOperation {
     type Output = MemberRead;
     type Error = MemberFailure;
@@ -815,11 +822,12 @@ impl Operation for MemberReadOperation {
     fn first(&mut self) -> ReadTurn {
         let (binding, key) = (&self.binding, &self.object.key);
         let pinned = self.object.version.is_some();
+        let by_route = pinned || self.is_rest();
         match self.origin {
             ReadOrigin::Delegated { copy_read } if pinned || copy_read => {
                 Ok(Next::Done(MemberRead::Local(None)))
             }
-            ReadOrigin::Caller if pinned => {
+            ReadOrigin::Caller if by_route => {
                 self.step = ReadStep::Route;
                 Ok(Next::Call(IoCall::child(route_read(binding, key, false))))
             }
@@ -841,12 +849,32 @@ impl Operation for MemberReadOperation {
                     self.range_id = Some(range_id);
                     self.coordinator = Some(node_id);
                     let holders = key_holders(self.binding.set_id, &self.object.key);
-                    self.step = ReadStep::Holders;
+                    self.step = match self.is_rest() {
+                        true => ReadStep::RestHolders,
+                        false => ReadStep::Holders,
+                    };
                     Ok(Next::Call(IoCall::child(holders)))
                 }
                 Ok(ReadRoute::Local { .. }) => Ok(Next::Done(MemberRead::Local(None))),
                 Err(error) => self.failed(MemberRefusal::Route(error)),
             },
+            ReadStep::RestHolders => {
+                let holders = result.child::<Vec<NodeId>, IoError>()?.unwrap_or_default();
+                let coordinator = self.coordinator.ok_or(IoError::Unfinished)?;
+                let ReadAccess::Rest(ask) = &self.access else {
+                    return Err(IoError::Unfinished.into());
+                };
+                let local = ask.local;
+                self.copies = (holders.into_iter())
+                    .filter(|holder| *holder != local && *holder != coordinator)
+                    .chain([coordinator])
+                    .collect();
+                self.next_rest()
+            }
+            ReadStep::RestAnswer => {
+                let answer = result.child::<RestAnswer, IoError>()??;
+                self.rest_answered(answer)
+            }
             ReadStep::Holders => {
                 let holders = result.child::<Vec<NodeId>, IoError>()?.unwrap_or_default();
                 let choice = HolderChoiceOperation::new(&holders, self.now_ms);
