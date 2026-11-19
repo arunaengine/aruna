@@ -31,12 +31,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use ulid::Ulid;
 
-/// Structs that gained a trailing backend name, with the field count alpha.206 stored.
+/// Structs that gained trailing fields since alpha.206, such as the backend name or a job's local
+/// admission, with the field count alpha.206 stored.
 const UNNAMED: Layout = &[
     ("ExecutionSpec", 16),
     ("AttemptIntent", 5),
     ("LaunchRecord", 7),
     ("JobReservationRecord", 7),
+    ("JobRecord", 28),
 ];
 
 /// Submission, request digest and job of an alpha.206 spec, launch or receipt, read with the

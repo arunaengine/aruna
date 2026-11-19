@@ -275,7 +275,9 @@ mod tests {
         let payload = JobPayload::Staging(spec);
         let mut record = JobRecord::new(done, payload, UserId::nil(realm_id), node_id, 5, 5, None);
         record.plan_digest = Some([3; 32]);
+        // That release stored no local admission, the job record's last field.
         let bytes = record.to_bytes().unwrap();
+        let bytes = &bytes[..bytes.len() - 1];
         let at = bytes
             .windows(new_spec.len())
             .position(|part| part == new_spec)

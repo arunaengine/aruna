@@ -232,8 +232,9 @@ fn deletes_unnamed_jobs() {
     old.attempt_intent = Some(intent.clone());
     let mut old_keys = Vec::new();
     for (keyspace, key, value) in job_insert_entries(&old).unwrap() {
+        // Alpha.206 stored no local admission, the job record's last field.
         let value = match keyspace == JOB_KEYSPACE {
-            true => unnamed_intent(&without_name(&value)),
+            true => unnamed_intent(&without_name(&value[..value.len() - 1])),
             false => value.to_vec(),
         };
         write(&path, &keyspace, vec![(key.as_ref(), value)]);
@@ -275,11 +276,15 @@ fn deletes_unnamed_jobs() {
         config_digest: [0u8; 32],
     };
     let current = postcard::to_allocvec(&reservation).unwrap();
+    // Alpha.206 stored no cited config clock either.
+    let clock = postcard::to_allocvec(&reservation.config_clock)
+        .unwrap()
+        .len();
     let rows = vec![
         (b"current".as_slice(), current.clone()),
         (
             b"old".as_slice(),
-            current[..current.len() - trailing].to_vec(),
+            current[..current.len() - trailing - clock].to_vec(),
         ),
     ];
     write(&path, JOB_RESERVATION_KEYSPACE, rows);

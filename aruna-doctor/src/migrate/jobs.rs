@@ -800,6 +800,12 @@ mod tests {
     }
 
     /// `bytes` with the one occurrence of `from` replaced by `to`.
+    /// `record` as releases before the local admission stored it: without that last field.
+    fn unadmitted(record: &JobRecord) -> Vec<u8> {
+        let bytes = record.to_bytes().unwrap();
+        bytes[..bytes.len() - 1].to_vec()
+    }
+
     fn splice(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
         let at = bytes
             .windows(from.len())
@@ -944,7 +950,7 @@ mod tests {
         // Alpha.134 lacked the trailing pause byte and wrote each input in its older shape.
         let progress = postcard::to_allocvec(&record.progress).unwrap();
         let unpaused = &progress[..progress.len() - 1];
-        let stored = splice(&record.to_bytes().unwrap(), &progress, unpaused);
+        let stored = splice(&unadmitted(&record), &progress, unpaused);
         let new_input = postcard::to_allocvec(&input).unwrap();
         let stored = splice(
             &stored,
@@ -1010,7 +1016,7 @@ mod tests {
             record.result = result;
             let progress = postcard::to_allocvec(&record.progress).unwrap();
             let unpaused = &progress[..progress.len() - 1];
-            let stored = splice(&record.to_bytes().unwrap(), &progress, unpaused);
+            let stored = splice(&unadmitted(&record), &progress, unpaused);
             rows.push((job_record_key(job_id), stored));
             records.push(record);
         }
