@@ -20,19 +20,19 @@ pub use revoke::{RevokeS3Config, RevokeS3Operation};
 pub use touch::{TouchS3Config, TouchS3Operation};
 
 use aruna_core::UserId;
-use aruna_core::calls::IoError;
+use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError,
 };
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
-use rand::distr::Alphanumeric;
-use rand::{RngExt, rng};
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -42,6 +42,8 @@ pub const MAX_GROUP_SESSIONS: usize = 4;
 pub const PURGE_BATCH: usize = 256;
 const SIGNING_SECRET_LEN: usize = 30;
 const SESSION_TOKEN_LEN: usize = 64;
+/// The letters and digits one session draws: its signing secret, then its token.
+const SESSION_SECRETS_LEN: usize = SIGNING_SECRET_LEN + SESSION_TOKEN_LEN;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum S3SessionError {
@@ -202,14 +204,20 @@ fn session_age(session: &S3Session) -> (u128, SystemTime) {
     (issued, session.expiry)
 }
 
-fn generate_secret(length: usize) -> Secret {
-    Secret::new(
-        rng()
-            .sample_iter(&Alphanumeric)
-            .take(length)
-            .map(char::from)
-            .collect::<String>(),
-    )
+/// The call that draws a secret of `length` letters and digits from the OS random source.
+pub(crate) fn draw_secret(length: usize) -> IoCall {
+    Effect::Net(NetEffect::DrawSecret(length)).into()
+}
+
+/// The secret a draw answered.
+pub(crate) fn drawn_secret(result: IoResult) -> Result<Secret, IoError> {
+    match result.event()? {
+        Event::Net(NetEvent::SecretDrawn(secret)) => Ok(secret),
+        other => Err(IoError::Unexpected {
+            expected: "NetEvent::SecretDrawn",
+            got: other.label(),
+        }),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -221,6 +229,7 @@ fn build_session(
     path_restrictions: Option<Vec<PathRestriction>>,
     issued_by: [u8; 32],
     encryption_key: &CredentialEncryptionKey,
+    drawn: Secret,
     nonce: [u8; 24],
 ) -> Result<S3SessionCredentials, S3SessionError> {
     if let Some(restrictions) = path_restrictions.as_deref() {
@@ -229,8 +238,9 @@ fn build_session(
     if !S3Session::valid_access_key(&access_key) {
         return Err(S3SessionError::InvalidAccessKey);
     }
-    let secret_access_key = generate_secret(SIGNING_SECRET_LEN);
-    let session_token = generate_secret(SESSION_TOKEN_LEN);
+    let split = drawn.expose().split_at_checked(SIGNING_SECRET_LEN);
+    let (signing, token) = split.ok_or(S3SessionError::Failed)?;
+    let (secret_access_key, session_token) = (Secret::new(signing), Secret::new(token));
     let mut session = S3Session {
         access_key: access_key.clone(),
         user_identity,

@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    S3SessionCredentials, S3SessionError, build_session, decode_index, expiry_key, owner_key,
+    S3SessionCredentials, S3SessionError, SESSION_SECRETS_LEN, build_session, decode_index,
+    draw_secret, drawn_secret, expiry_key, owner_key,
 };
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
@@ -29,6 +31,7 @@ pub struct RefreshS3Config {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RefreshPhase {
+    Secret,
     Read,
     Delete,
     Write,
@@ -38,6 +41,8 @@ enum RefreshPhase {
 pub struct RefreshS3Operation {
     config: RefreshS3Config,
     encryption_key: CredentialEncryptionKey,
+    /// The secrets drawn for the successor, until it is built.
+    drawn: Option<Secret>,
     pending: Option<S3SessionCredentials>,
     phase: RefreshPhase,
     ids: IdMint,
@@ -49,8 +54,9 @@ impl RefreshS3Operation {
         Self {
             config,
             encryption_key,
+            drawn: None,
             pending: None,
-            phase: RefreshPhase::Read,
+            phase: RefreshPhase::Secret,
             ids: IdMint::default(),
             now_ms: 0,
         }
@@ -106,6 +112,7 @@ impl RefreshS3Operation {
             self.config.path_restrictions.clone(),
             self.config.issued_by,
             &self.encryption_key,
+            self.drawn.take().ok_or(S3SessionError::Failed)?,
             aruna_core::id_mint::id_nonce(self.ids.mint(self.now_ms)),
         )?;
         // Requests signed before this refresh stay valid until the old expiry.
@@ -162,20 +169,26 @@ impl Operation for RefreshS3Operation {
         if ttl.is_zero() || ttl > SESSION_MAX_TTL {
             return Err(S3SessionError::InvalidExpiry);
         }
-        Ok(Next::Call(IoCall::Read(vec![
-            (
-                S3_SESSION_KEYSPACE.to_string(),
-                self.config.access_key.as_bytes().into(),
-            ),
-            (
-                SESSION_OWNER_KEYSPACE.to_string(),
-                owner_key(self.config.user_identity, self.config.group_id),
-            ),
-        ])))
+        self.phase = RefreshPhase::Secret;
+        Ok(Next::Call(draw_secret(SESSION_SECRETS_LEN)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<S3SessionCredentials>, S3SessionError> {
         match self.phase {
+            RefreshPhase::Secret => {
+                self.drawn = Some(drawn_secret(result)?);
+                self.phase = RefreshPhase::Read;
+                Ok(Next::Call(IoCall::Read(vec![
+                    (
+                        S3_SESSION_KEYSPACE.to_string(),
+                        self.config.access_key.as_bytes().into(),
+                    ),
+                    (
+                        SESSION_OWNER_KEYSPACE.to_string(),
+                        owner_key(self.config.user_identity, self.config.group_id),
+                    ),
+                ])))
+            }
             RefreshPhase::Read => self.records_read(result.values()?),
             RefreshPhase::Delete => {
                 result.done()?;
@@ -201,6 +214,8 @@ impl Operation for RefreshS3Operation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::effects::{Effect, NetEffect};
+    use aruna_core::events::{Event, NetEvent};
     use aruna_core::structs::identity::realm::RealmId;
     use std::time::Duration;
     use ulid::Ulid;
@@ -226,7 +241,16 @@ mod tests {
     #[test]
     fn reads_session_index() {
         let mut refresh = operation(Duration::from_secs(60));
-        let Ok(Next::Call(IoCall::Read(reads))) = refresh.first() else {
+        let Ok(Next::Call(IoCall::Effect(draw))) = refresh.first() else {
+            panic!("expected the secret draw");
+        };
+        assert_eq!(
+            *draw,
+            Effect::Net(NetEffect::DrawSecret(SESSION_SECRETS_LEN))
+        );
+        let secret = Secret::new("d".repeat(SESSION_SECRETS_LEN));
+        let drawn = IoResult::Event(Box::new(Event::Net(NetEvent::SecretDrawn(secret))));
+        let Ok(Next::Call(IoCall::Read(reads))) = refresh.next(drawn) else {
             panic!("expected the session and index read");
         };
         assert_eq!(reads.len(), 2);

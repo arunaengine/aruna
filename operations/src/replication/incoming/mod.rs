@@ -2466,7 +2466,7 @@ impl IncomingVersionOperation {
     fn start_usage_update(&mut self) -> Turn {
         match self.usage_update.as_mut() {
             Some(update) => {
-                let call = update.start_calls().into_call();
+                let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
                 self.call(IncomingVersionState::UpdateUsage, call)
             }
             None => self.fail(ReplicationError::ReplicationFailed.into()),

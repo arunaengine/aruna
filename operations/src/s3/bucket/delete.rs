@@ -461,7 +461,7 @@ impl DeleteBucketOperation {
             ..Default::default()
         };
         let mut update = UsageCounterUpdate::for_group(group_id, delta);
-        let call = update.start_calls().into_call();
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.usage_update = Some(update);
         self.call(DeleteBucketState::UpdateUsage, call)
     }

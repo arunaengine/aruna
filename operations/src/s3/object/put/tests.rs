@@ -285,7 +285,8 @@ fn quota_error_cleans() {
         group_id,
         UsageDelta::default(),
     ));
-    child.usage_update.as_mut().unwrap().start_calls();
+    let generation = Ulid::from_parts(1, 1);
+    child.usage_update.as_mut().unwrap().start_calls(generation);
     let turn = child.handle_usage_update(values(vec![None]));
     assert!(matches!(turn, Err(PutObjectError::UsageUpdateError(_))));
 

@@ -18,6 +18,7 @@ use crate::s3::usage::{
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE,
     PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -221,6 +222,9 @@ type Step = Result<Option<IoCall>, SuccessorError>;
 /// one implementation and one commit boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SuccessorMint {
+    /// The run clock and ids its operation forwards.
+    now_ms: u64,
+    ids: IdMint,
     plan: SuccessorPlan,
     state: MintState,
     predecessor: Option<BlobVersion>,
@@ -243,6 +247,8 @@ impl SuccessorMint {
     pub fn new(plan: SuccessorPlan) -> Self {
         Self {
             plan,
+            now_ms: 0,
+            ids: IdMint::default(),
             state: MintState::ReadMutation,
             predecessor: None,
             effective_refs: Vec::new(),
@@ -730,7 +736,7 @@ impl SuccessorMint {
             return Ok(None);
         };
         self.state = MintState::UpdateUsage;
-        let call = update.start_calls().into_call();
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
         self.usage = Some(update);
         Ok(Some(call))
     }
@@ -889,6 +895,14 @@ impl Operation for MintSuccessorOperation {
                 | SuccessorError::VersionMissing
                 | SuccessorError::Purge(PurgeFenceError::Suspended)
         )
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.mint.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint.ids = IdMint::new(entropy);
     }
 }
 
