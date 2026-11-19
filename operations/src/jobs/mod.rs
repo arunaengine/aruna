@@ -11,6 +11,7 @@ pub mod command;
 pub mod copy;
 pub mod demand;
 pub mod device_admission;
+pub mod discard;
 pub mod drain;
 pub mod export;
 pub mod fence;

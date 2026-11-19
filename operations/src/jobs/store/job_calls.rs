@@ -706,6 +706,24 @@ pub fn release_job(job_id: JobId, token: Ulid, now_ms: u64) -> StoreCall<Release
     change_mapped(job_id, mutate, released)
 }
 
+/// Ends one execution of a discard as an infrastructure error with retention zero, so its rows go
+/// right after its cleanup and release. A terminal job is left as it is; both answer the row.
+pub fn discard_execution(job_id: JobId, now_ms: u64, error: JobError) -> StoreCall<JobRecord> {
+    let mutate = move |record: &mut JobRecord| {
+        if record.state.is_terminal() {
+            return Ok(JobMutation::Skip);
+        }
+        record.state = JobState::Failed;
+        record.last_error = Some(error.clone());
+        record.claim = None;
+        record.finished_at_ms = Some(now_ms);
+        record.updated_at_ms = now_ms;
+        record.retention_ms = 0;
+        Ok(JobMutation::Persist)
+    };
+    change_mapped(job_id, mutate, |record, _| record)
+}
+
 /// Requeue a dependency-blocked job without spending an attempt. Unlike a shutdown release,
 /// this records the reason and delays the next claim so a lagging projection is not polled hot.
 pub fn defer_job(
