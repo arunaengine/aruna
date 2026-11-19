@@ -1136,9 +1136,6 @@ pub fn encode_frame(message: &MetadataTransportMessage) -> Result<Vec<u8>, Strin
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
     use super::*;
     use aruna_core::UserId;
     use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
@@ -1148,8 +1145,6 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
     };
-    use tokio::io::AsyncWriteExt;
-    use tokio::sync::Semaphore;
 
     #[test]
     fn transport_auth_fields() {
