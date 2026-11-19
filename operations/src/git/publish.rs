@@ -17,13 +17,16 @@ use aruna_core::placement::resolve_shard_holders;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use ulid::Ulid;
 
 use super::calls::{noted, written_call};
 use super::records::Writes;
 use super::{GitError, records};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::load_config::config_unavailable;
-use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox_record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
 
 type Document = MetadataRegistryRecord;
 type Row = (String, byteview::ByteView, byteview::ByteView);
@@ -125,6 +128,8 @@ pub fn publish_pack(
         document: document.clone(),
         pack,
         step: PackStep::Stored,
+        ids: IdMint::default(),
+        now_ms: 0,
     }
 }
 
@@ -134,11 +139,21 @@ pub struct PublishPackOperation {
     document: Document,
     pack: GitPackRecord,
     step: PackStep,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl Operation for PublishPackOperation {
     type Output = ();
     type Error = GitError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<()>, GitError> {
         Ok(Next::Call(stored_call(&self.pack)))
@@ -160,7 +175,8 @@ impl Operation for PublishPackOperation {
                 let peers = holders_in(&config, node, document)?;
                 let mut fence = WriteFence::default();
                 fence.add(document.realm_id, &config, [self.pack.placement]);
-                let writes = pack_writes(&self.pack, document.realm_id, peers, &fence)?;
+                let place = (peers, &fence, self.ids.mint(self.now_ms));
+                let writes = pack_writes(&self.pack, document.realm_id, place)?;
                 self.step = PackStep::Commit;
                 Ok(Next::Call(commit_call(writes, &fence)))
             }
@@ -194,8 +210,7 @@ pub fn pack_record(record: &GitRecord, bytes: bytes::Bytes) -> GitPackRecord {
 fn pack_writes(
     pack: &GitPackRecord,
     realm_id: RealmId,
-    peers: Vec<NodeId>,
-    fence: &WriteFence,
+    (peers, fence, outbox_id): (Vec<NodeId>, &WriteFence, Ulid),
 ) -> Result<Vec<Row>, GitError> {
     let target = pack.target();
     let change = pack.change();
@@ -209,7 +224,8 @@ fn pack_writes(
         sync_revision_entry(&target, &change).map_err(|_| GitError::Invalid)?,
     ];
     writes.extend(shard_manifest_entry(&target, &change).map_err(|_| GitError::Invalid)?);
-    let outbox = new_outbox_record(
+    let outbox = new_identified_record(
+        outbox_id,
         pack.node_id,
         target,
         peers,
@@ -350,7 +366,8 @@ impl PublishRecordOperation {
         }
         // Every record goes onto the document topic, even with no co-holder yet, so holders
         // that join later receive it through topic sync.
-        let outbox = new_outbox_record(
+        let outbox = new_identified_record(
+            self.mint.mint(self.now_ms),
             node_id,
             target,
             self.peers.clone(),
@@ -422,7 +439,8 @@ impl Operation for PublishRecordOperation {
                 if !stored_answer(result)? {
                     let realm_id = self.document.realm_id;
                     let peers = std::mem::take(&mut self.peers);
-                    let writes = pack_writes(&pack, realm_id, peers, &self.fence)?;
+                    let place = (peers, &self.fence, self.mint.mint(self.now_ms));
+                    let writes = pack_writes(&pack, realm_id, place)?;
                     self.writes.extend(writes);
                 }
                 self.commit()

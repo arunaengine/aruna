@@ -266,21 +266,24 @@ fn prune_keeps_held() {
     let due = vec![due_work(1), due_work(2)];
     let read = IoResult::Child(ChildOutcome::new(Ok::<_, PruneError>(due)));
     assert!(is_child(&prune.next(read)));
-    assert_eq!(prune.phase, PrunePhase::Holds(job(1)));
+    assert_eq!(prune.phase, KeepPhase::Holds(job(1)));
     let held = IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>(true)));
     assert!(is_child(&prune.next(held)));
-    assert_eq!(prune.phase, PrunePhase::Holds(job(2)));
+    assert_eq!(prune.phase, KeepPhase::Holds(job(2)));
     assert_eq!(prune.kept, BTreeSet::from([job(1)]));
     let settled = IoResult::Child(ChildOutcome::new(Ok::<_, StoreError>(false)));
     assert!(is_child(&prune.next(settled)));
-    assert_eq!(prune.phase, PrunePhase::Prune);
+    assert_eq!(prune.phase, KeepPhase::Prune);
     let outcome = JobPruneOutcome {
         pruned: 1,
         ..JobPruneOutcome::default()
     };
     let done = IoResult::Child(ChildOutcome::new(Ok::<_, PruneError>(outcome)));
     let pruned = prune.next(done).unwrap();
-    assert!(matches!(pruned, Next::Done(JobPruneOutcome { pruned: 1, .. })));
+    assert!(matches!(
+        pruned,
+        Next::Done(JobPruneOutcome { pruned: 1, .. })
+    ));
 }
 
 #[test]
@@ -402,7 +405,9 @@ async fn prunes_settled_rows() {
         rows.push((run.run_id, row));
     }
     assert_eq!(settle_work(ctx, 1).await, Ok(2));
-    let pruned = drive(PruneKeepingWork::new(JOB_PRUNE_PAGE), ctx).await.unwrap();
+    let pruned = drive(PruneKeepingWork::new(JOB_PRUNE_PAGE), ctx)
+        .await
+        .unwrap();
     assert_eq!(pruned.pruned, 2);
     // Delivered as `job_finished`; an undelivered row is never pruned.
     for (_, row) in &rows {

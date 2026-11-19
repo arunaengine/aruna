@@ -21,7 +21,9 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::ExportOperation;
-use crate::metadata::api::export_types::{ENTRY_ROOM, ExportMetadataRequest, PAGE_DEFAULT, PAGE_MAX};
+use crate::metadata::api::export_types::{
+    ENTRY_ROOM, ExportMetadataRequest, PAGE_DEFAULT, PAGE_MAX,
+};
 use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::resolve_metadata_id;

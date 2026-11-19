@@ -273,9 +273,7 @@ mod tests {
     use crate::sync::outbox_record::{
         OUTBOX_DRAIN_SIZE, admin_outbox_prefix, outbox_key, outbox_prefix, revocation_index_entry,
     };
-    use crate::sync::outbox_record::{
-        new_identified_record, new_outbox_record, write_outbox_effect,
-    };
+    use crate::sync::outbox_record::{new_identified_record, write_outbox_effect};
     use aruna_test_support::documents::{read_outbox_record, read_outbox_records};
     use aruna_core::NodeId;
     use aruna_core::UserId;
@@ -442,7 +440,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let corrupt_key = b"000-corrupt-outbox".to_vec();
-        let valid = new_outbox_record(
+        let valid = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -499,7 +498,8 @@ mod tests {
     #[test]
     fn record_roundtrip_deduplicates() {
         let peer = node(3);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![peer, peer],
@@ -519,7 +519,8 @@ mod tests {
 
     #[test]
     fn upsert_roundtrip_revision() {
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(3)],
@@ -545,7 +546,8 @@ mod tests {
 
     #[test]
     fn delete_roundtrip_revision() {
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(3)],
@@ -568,7 +570,8 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let left = new_outbox_record(
+        let left = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -576,7 +579,8 @@ mod tests {
             aruna_core::structs::placement::record::PlacementRef::NIL,
             false,
         );
-        let right = new_outbox_record(
+        let right = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -597,7 +601,8 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let mut older = new_outbox_record(
+        let mut older = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -606,7 +611,8 @@ mod tests {
             false,
         );
         older.outbox_id = Ulid::from_parts(1, 0);
-        let mut newer = new_outbox_record(
+        let mut newer = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig {
                 realm_id: RealmId::from_bytes([9u8; 32]),
@@ -625,7 +631,8 @@ mod tests {
     fn admin_keys_ordered() {
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
         let target = DocumentTarget::User { user_id };
-        let mut earlier = new_outbox_record(
+        let mut earlier = new_identified_record(
+            Ulid::generate(),
             node(1),
             target.clone(),
             Vec::new(),
@@ -634,7 +641,8 @@ mod tests {
             false,
         );
         earlier.outbox_id = Ulid::from_parts(2, 2);
-        let mut later = new_outbox_record(
+        let mut later = new_identified_record(
+            Ulid::generate(),
             node(1),
             target,
             Vec::new(),
@@ -652,7 +660,8 @@ mod tests {
     #[test]
     fn admin_prefix_scopes() {
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::User { user_id },
             Vec::new(),
@@ -669,7 +678,8 @@ mod tests {
     #[test]
     fn index_uses_key() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig { realm_id },
             Vec::new(),
@@ -690,7 +700,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig { realm_id },
             Vec::new(),
@@ -736,7 +747,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
-        let metadata = new_outbox_record(
+        let metadata = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -747,7 +759,8 @@ mod tests {
             aruna_core::structs::placement::record::PlacementRef::NIL,
             false,
         );
-        let admin = new_outbox_record(
+        let admin = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::User { user_id },
             Vec::new(),
@@ -797,7 +810,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig { realm_id },
             Vec::new(),

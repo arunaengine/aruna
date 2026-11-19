@@ -186,12 +186,22 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
 /// The bytes of `blob`, read to its end.
 async fn collect_stream(
     mut blob: BackendStream<Result<Bytes, StreamError>>,
-) -> Result<Vec<u8>, String> {
+    limit: Option<u64>,
+) -> BlobEvent {
     let mut bytes = Vec::new();
     while let Some(chunk) = futures::StreamExt::next(&mut blob).await {
-        bytes.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
+        match chunk {
+            Ok(chunk) => bytes.extend_from_slice(&chunk),
+            Err(error) => {
+                let bytes = Err(error.to_string());
+                return BlobEvent::StreamCollected { bytes };
+            }
+        }
+        if let Some(limit) = limit.filter(|limit| bytes.len() as u64 > *limit) {
+            return BlobEvent::StreamTooLarge { limit };
+        }
     }
-    Ok(bytes)
+    BlobEvent::StreamCollected { bytes: Ok(bytes) }
 }
 
 /// Tracks one in-flight blob mutation so `drain_writes` can wait for it.
@@ -856,9 +866,7 @@ impl BlobHandler {
             BlobEffect::ReadHeld { backend_path } => BlobEvent::ReadHeld {
                 held: self.read_pins.held(&backend_path),
             },
-            BlobEffect::CollectStream { blob } => BlobEvent::StreamCollected {
-                bytes: collect_stream(blob).await,
-            },
+            BlobEffect::CollectStream { blob, limit } => collect_stream(blob, limit).await,
             BlobEffect::ReconcileReservation { location } => {
                 match Box::pin(self.reconcile_reservation(location)).await {
                     Ok(done) => BlobEvent::ReservationReconciled { done },
@@ -1386,4 +1394,28 @@ impl BlobHandler {
 
 fn source_error(error: StagingSourceError) -> StagingSourceEvent {
     StagingSourceEvent::Error { error }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunks(sizes: &[usize]) -> BackendStream<Result<Bytes, StreamError>> {
+        let parts: Vec<Result<Bytes, std::io::Error>> = (sizes.iter())
+            .map(|size| Ok(Bytes::from(vec![7u8; *size])))
+            .collect();
+        BackendStream::new(futures::stream::iter(parts))
+    }
+
+    #[tokio::test]
+    async fn collect_stops_early() {
+        let whole = collect_stream(chunks(&[3, 3]), Some(6)).await;
+        let bytes = Ok(vec![7u8; 6]);
+        assert_eq!(whole, BlobEvent::StreamCollected { bytes });
+        let cut = collect_stream(chunks(&[3, 3, 3]), Some(5)).await;
+        assert_eq!(cut, BlobEvent::StreamTooLarge { limit: 5 });
+        let open = collect_stream(chunks(&[4, 4]), None).await;
+        let bytes = Ok(vec![7u8; 8]);
+        assert_eq!(open, BlobEvent::StreamCollected { bytes });
+    }
 }

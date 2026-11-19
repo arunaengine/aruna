@@ -90,7 +90,7 @@ impl VersionReplicationManifest {
         self.reference_intent && self.kind == ReplicationItemKind::Materialized
     }
 
-    pub(crate) fn validate(&self) -> Result<(), ConversionError> {
+    pub fn validate(&self) -> Result<(), ConversionError> {
         let mut budget = ManifestBudget::default();
         if PlacementPolicyRef::canonical_set(&self.placement_policies)
             .is_ok_and(|canonical| canonical == self.placement_policies)
@@ -904,16 +904,15 @@ mod pure_tests {
             )
             .unwrap(),
         );
-        manifest.reference_metadata = Some(
-            crate::structs::execution::source_access::SourceMetadata {
+        manifest.reference_metadata =
+            Some(crate::structs::execution::source_access::SourceMetadata {
                 content_length: 42,
                 content_type: Some("text/plain".to_string()),
                 etag: Some("etag-1".to_string()),
                 last_modified: Some(SystemTime::UNIX_EPOCH),
                 source_version: None,
                 digests: Default::default(),
-            },
-        );
+            });
         manifest
             .metadata
             .insert("mtime".to_string(), "1753272000.123456789".to_string());

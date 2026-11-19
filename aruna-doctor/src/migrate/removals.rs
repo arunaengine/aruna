@@ -79,7 +79,7 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_operations::sync::outbox_record::new_outbox_record;
+    use aruna_operations::sync::outbox_record::new_identified_record;
     use ulid::Ulid;
 
     /// A queued node removal and its bytes before the publisher cutoffs.
@@ -108,7 +108,15 @@ mod tests {
             origin_signature,
         };
         let target = DocumentTarget::RealmConfig { realm_id };
-        let record = new_outbox_record(origin, target, Vec::new(), event, PlacementRef::NIL, false);
+        let record = new_identified_record(
+            Ulid::generate(),
+            origin,
+            target,
+            Vec::new(),
+            event,
+            PlacementRef::NIL,
+            false,
+        );
         let current = postcard::to_allocvec(&record).expect("record encodes");
         let removed = [
             postcard::to_allocvec(&removed).expect("id encodes"),

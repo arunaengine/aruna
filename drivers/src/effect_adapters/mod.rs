@@ -298,6 +298,26 @@ fn plugin_state(effect: PluginEffect) -> PluginEvent {
             };
             PluginEvent::Seen(host_state::first_seen(&keys(named), &keys(unnamed), now_ms))
         }
+        PluginEffect::HeldValue {
+            run_id,
+            holder,
+            slot,
+        } => {
+            let held = host_state::held_value((run_id.into(), holder.into()), &slot);
+            PluginEvent::Held(held.map(ulid::Ulid::from))
+        }
+        PluginEffect::HoldValue {
+            run_id,
+            holder,
+            slot,
+            value_id,
+            fields,
+        } => {
+            let fields = fields.map(|fields| fields.expose().to_vec());
+            let holder = (run_id.into(), holder.into());
+            let held = host_state::hold_value(holder, &slot, value_id.into(), fields);
+            PluginEvent::Fields(held.map(aruna_core::compute::SecretBytes::new))
+        }
     }
 }
 

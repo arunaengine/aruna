@@ -1203,7 +1203,6 @@ mod tests {
 
     use super::*;
     use aruna_core::UserId;
-    use std::sync::Arc;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::{ConversionError, StorageError};
     use aruna_core::events::{Event, StorageEvent};
@@ -1218,6 +1217,7 @@ mod tests {
     use aruna_core::structs::storage::replication::VersionedObjectArn;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::FjallStorage;
+    use std::sync::Arc;
     use std::time::SystemTime;
 
     async fn guard_target(context: &DriverContext, bucket: &str) -> Result<(), SyncRefusal> {

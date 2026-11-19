@@ -412,7 +412,6 @@ mod tests {
         BackendStatusOperation, RECLAIM_TICK_LIMIT, ReclaimOutcome, ReclaimSweepError,
         ReclaimSweepOperation,
     };
-    use aruna_drivers::testing::path_context;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
@@ -425,6 +424,7 @@ mod tests {
     use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
     use aruna_core::types::Value;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::path_context;
     use aruna_storage::scan::iter_prefix_page;
     use std::collections::HashMap;
     use tempfile::tempdir;

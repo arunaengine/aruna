@@ -604,9 +604,7 @@ impl CopyBytesOperation {
         });
         let body = match (adopt.is_some(), self.progress.take()) {
             (true, _) => None,
-            (false, Some(PulledBytes(pulled))) => {
-                Some(source.blob.counted(pulled))
-            }
+            (false, Some(PulledBytes(pulled))) => Some(source.blob.counted(pulled)),
             (false, None) => Some(source.blob),
         };
         // Materialized source bytes are kept only when they match every recorded digest.
@@ -944,8 +942,6 @@ impl Operation for KeepReferenceOperation {
 pub(crate) mod test {
     use super::*;
     use crate::s3::object::get::GetObjectOperation;
-    use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
-    use std::sync::atomic::Ordering;
     #[allow(unused_imports)]
     pub(crate) use crate::testing_objects::put_config;
     pub(crate) use aruna_drivers::testing::{seed_bucket, with_blob};
@@ -959,9 +955,11 @@ pub(crate) mod test {
     use aruna_core::structs::execution::staging::PortableSourceDescriptor;
     use aruna_core::structs::storage::blob::{BlobHeadKey, BlobVersion, VersionKey};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
     use aruna_drivers::driver::{DriverContext, drive, node_routing};
     use futures_util::StreamExt;
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     fn test_node_id() -> aruna_core::NodeId {

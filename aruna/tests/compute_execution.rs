@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use aruna::tasks::runner::{ComputeReconciler, run_execution_job};
 use aruna_clock::unix_timestamp_millis;
-use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::ExecutorRegistry;
+use aruna_compute::executor::docker::DockerBackend;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{

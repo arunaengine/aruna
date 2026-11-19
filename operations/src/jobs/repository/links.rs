@@ -8,6 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentChange, DocumentOutboxEvent};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     LINK_CONNECTOR_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE,
 };
@@ -26,7 +27,9 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use crate::metadata::id_mapping::MappingRoute;
-use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox_record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
 use aruna_core::placement::fence;
 
 /// How often a check waits for a running push before it looks again.
@@ -138,6 +141,7 @@ pub struct ChangeLinkOperation {
     queued: Option<LinkQueueEntry>,
     /// The link as the change leaves it, `None` once deleted.
     changed: Option<Option<RepositoryLink>>,
+    ids: IdMint,
 }
 
 impl ChangeLinkOperation {
@@ -154,6 +158,7 @@ impl ChangeLinkOperation {
             stored: None,
             queued: None,
             changed: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -341,7 +346,8 @@ impl ChangeLinkOperation {
                 ]);
                 if let Some(route) = &self.route {
                     let change = link.delete_change(route.placement);
-                    writes.extend(sync_rows(route, &link, change, None)?);
+                    let outbox_id = self.ids.mint(now_ms);
+                    writes.extend(sync_rows((route, outbox_id), &link, change, None)?);
                 }
                 None
             }
@@ -376,7 +382,8 @@ impl ChangeLinkOperation {
             let bytes = link.to_bytes()?;
             if let Some(route) = &self.route {
                 let change = link.sync_change(route.placement);
-                writes.extend(sync_rows(route, link, change, Some(bytes.clone()))?);
+                let place = (route, self.ids.mint(now_ms));
+                writes.extend(sync_rows(place, link, change, Some(bytes.clone()))?);
             }
             writes.push((link_row.0, link_row.1, ByteView::from(bytes)));
         }
@@ -407,6 +414,10 @@ impl Operation for ChangeLinkOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn first(&mut self) -> Step {
@@ -455,10 +466,10 @@ fn millis(time: SystemTime) -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-/// Sidecar, manifest entry and outbox publish that replicate one stored link change.
-/// Without `bytes` the change removes the row.
+/// Sidecar, manifest entry and outbox publish under `outbox_id` that replicate one stored link
+/// change. Without `bytes` the change removes the row.
 fn sync_rows(
-    route: &MappingRoute,
+    (route, outbox_id): (&MappingRoute, Ulid),
     link: &RepositoryLink,
     change: DocumentChange,
     bytes: Option<Vec<u8>>,
@@ -471,7 +482,8 @@ fn sync_rows(
     let mut rows = vec![sync_revision_entry(&target, &change)?];
     rows.extend(shard_manifest_entry(&target, &change)?);
     if !route.peers.is_empty() {
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            outbox_id,
             route.actor,
             target,
             route.peers.clone(),

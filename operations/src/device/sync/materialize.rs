@@ -268,10 +268,7 @@ impl Operation for MaterializeEntryOperation {
     fn first(&mut self) -> Result<Next<MaterializeOutcome>, MaterializeError> {
         let root = self.input.folder.root.clone();
         let relative = self.input.relative.clone();
-        let blob = std::mem::replace(
-            &mut self.input.blob,
-            BackendStream::empty(),
-        );
+        let blob = std::mem::replace(&mut self.input.blob, BackendStream::empty());
         let effect = match self.input.conflicted {
             true => LocalFileEffect::WriteConflicted {
                 root,

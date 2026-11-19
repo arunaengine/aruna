@@ -85,7 +85,7 @@ impl Operation for GetShareOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ShareStoreError> {
-        let link = rows::value(result)?.map(|bytes| ShareLink::from_bytes(&bytes));
+        let link = result.value()?.map(|bytes| ShareLink::from_bytes(&bytes));
         let link = link.transpose()?;
         if link.as_ref().is_some_and(|link| link.id != self.id) {
             return Err(ShareStoreError::UnexpectedEvent);
@@ -232,7 +232,7 @@ impl Operation for LogShareOperation {
             rows::done(result)?;
             return Ok(Next::Done(()));
         }
-        let uses = rows::value(result)?;
+        let uses = result.value()?;
         self.written = true;
         Ok(Next::Call(IoCall::Write(self.writes(uses.as_deref())?)))
     }

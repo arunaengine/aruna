@@ -29,6 +29,7 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
+use aruna_drivers::testing::read_value;
 use aruna_net::NetHandle;
 use aruna_net::dht::storage::decode_entries;
 use aruna_operations::blob::cleanup::{
@@ -43,7 +44,6 @@ use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultip
 use aruna_operations::s3::multipart::part_upload::{UploadPartInput, UploadPartOperation};
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_drivers::testing::read_value;
 use aruna_storage::storage;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{create_dir_all, exists, read_dir};

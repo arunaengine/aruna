@@ -11,7 +11,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_retry};
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::persistent_id_key;
@@ -50,7 +50,8 @@ impl Operation for MappingReadOperation {
         &mut self,
         result: IoResult,
     ) -> Result<Next<Option<PersistentIdMapping>>, PersistentIdError> {
-        let mapping = value(result)?
+        let mapping = result
+            .value()?
             .map(|bytes| PersistentIdMapping::from_bytes(bytes.as_ref()))
             .transpose()
             .map_err(PersistentIdError::Conversion)?;
@@ -356,12 +357,12 @@ mod tests {
             JobId::from_bytes([7; 16]),
             true,
             record(document_id).permission_path,
-            mapping_revision(&None, 1),
+            mapping_revision(&None, Ulid::generate(), 1),
         );
         match ctx
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::BatchWrite {
-                writes: transition_entries(&None, &mapping).unwrap(),
+                writes: transition_entries(&None, &mapping, Ulid::generate()).unwrap(),
                 txn_id: None,
             }))
             .await
@@ -599,9 +600,11 @@ mod tests {
             JobId::from_bytes([7; 16]),
             true,
             record(document_id).permission_path,
-            mapping_revision(&Some(route.clone()), 1),
+            mapping_revision(&Some(route.clone()), Ulid::generate(), 1),
         );
-        let writes = transition_entries(&Some(route.clone()), &mapping).expect("entries build");
+        let outbox_id = Ulid::generate();
+        let writes = transition_entries(&Some(route.clone()), &mapping, outbox_id);
+        let writes = writes.expect("entries build");
         assert_eq!(outbox_row(&writes).generation, 1);
 
         assert!(fence_open(&ctx, &route).await);
@@ -644,7 +647,7 @@ mod tests {
             JobId::from_bytes([7; 16]),
             true,
             record(document_id).permission_path,
-            mapping_revision(&None, 1),
+            mapping_revision(&None, Ulid::generate(), 1),
         )
     }
 

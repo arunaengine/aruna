@@ -279,6 +279,7 @@ impl DeleteDocumentOperation {
         }
         self.deletes = registry_delete_entries(&record);
         // Commit the PID tombstone with the registry row so a crash never leaves it active.
+        let ids = (self.ids.mint(self.now_ms), self.ids.mint(self.now_ms));
         let transition = match self.mapping.as_ref() {
             None => Ok(None),
             Some(mapping) => tombstone_transition(
@@ -286,6 +287,7 @@ impl DeleteDocumentOperation {
                 &self.mapping_route,
                 self.document_id,
                 self.now_ms,
+                ids,
             ),
         };
         match transition {

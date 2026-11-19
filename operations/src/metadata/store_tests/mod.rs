@@ -13,6 +13,7 @@ use aruna_core::storage_entries::graph_lifecycle_key;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::DriverContext;
+use aruna_drivers::testing::send_metadata_effect;
 use aruna_graph::GraphHandle;
 use aruna_storage::FjallStorage;
 use aruna_storage::StorageHandle;

@@ -134,10 +134,11 @@ impl UpdateRepositoryOperation {
             updated_at: now,
             ..existing
         };
-        let secret =
-            self.input.secret_config.clone().and_then(|config| {
-                SourceConnectorSecret::new(connector.connector_id, config, now)
-            });
+        let secret = self
+            .input
+            .secret_config
+            .clone()
+            .and_then(|config| SourceConnectorSecret::new(connector.connector_id, config, now));
         let has_secret_config = match &self.input.secret_config {
             None => stored,
             Some(_) => secret.is_some(),

@@ -78,4 +78,3 @@ mod tests {
         assert_ne!(value, feed_value(None).unwrap());
     }
 }
-

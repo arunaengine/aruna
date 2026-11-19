@@ -45,6 +45,9 @@ use aruna_test_support::projection::{drain_projection_queue, project_create_even
 use aruna_test_support::projection::{project_logged_event, replay_event_log, schedule_projection_drain};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::projection::{
+    project_logged_event, replay_event_log, schedule_projection_drain,
+};
 use byteview::ByteView;
 use tempfile::TempDir;
 use ulid::Ulid;

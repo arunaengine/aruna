@@ -12,7 +12,7 @@ use aruna_core::events::{Event, NetEvent};
 use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{
     CapturedInput, InputContent, InputSelection, SubmissionId,
@@ -89,7 +89,8 @@ impl Operation for VersionHashOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
-        let version = value(result)?.and_then(|row| postcard::from_bytes::<BlobVersion>(&row).ok());
+        let version =
+            (result.value()?).and_then(|row| postcard::from_bytes::<BlobVersion>(&row).ok());
         Ok(Next::Done(version.and_then(
             |version| match version.state {
                 BlobVersionState::Materialized { blob_hash, .. } => Some(blob_hash),

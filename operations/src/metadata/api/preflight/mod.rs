@@ -15,8 +15,8 @@ use super::{
     SearchCursor, SearchWatermark, Ulid, Value, VersionKey, paginate,
 };
 use aruna_core::metadata::api::{
-    MetadataIndexState, MetadataPreflightLocation, MetadataResolvedTarget, MetadataVisibleReference,
-    ReferenceNodeExecution,
+    MetadataIndexState, MetadataPreflightLocation, MetadataResolvedTarget,
+    MetadataVisibleReference, ReferenceNodeExecution,
 };
 
 use super::head_versions::HeadVersionsError;

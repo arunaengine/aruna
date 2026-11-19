@@ -269,7 +269,11 @@ fn copies_in_window() {
     use crate::plugins::copy_rows::CHUNK;
     let artifact = vec![7u8; CHUNK + 1];
     let (first, second) = (node(1), node(2));
-    let mut copy = copy_artifact(vec![first, second], "sha256:d".into(), artifact.clone().into());
+    let mut copy = copy_artifact(
+        vec![first, second],
+        "sha256:d".into(),
+        artifact.clone().into(),
+    );
     let group = EffectGroup {
         members: vec![sent(first, &artifact, 0), sent(second, &artifact, 0)],
         limit: 2,

@@ -47,6 +47,7 @@ use aruna_core::structs::storage::storage_purge::{
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
+use aruna_drivers::testing::read_value;
 use aruna_net::NetHandle;
 use aruna_operations::blob::pause::{PausePurgeOperation, PausedOperation};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
@@ -75,7 +76,6 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::purge_fence::{PurgeFenceError, fence_key};
-use aruna_drivers::testing::read_value;
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;

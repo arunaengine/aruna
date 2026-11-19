@@ -742,8 +742,8 @@ mod tests {
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
 
-    use aruna_drivers::testing::write_entries;
     use crate::tests::metadata::storage_key_exists;
+    use aruna_drivers::testing::write_entries;
 
     fn lifecycle(graph_iri: &str) -> GraphLifecycleRecord {
         GraphLifecycleRecord::deleted(

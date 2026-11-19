@@ -105,7 +105,7 @@ mod tests {
         IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier,
     };
     use aruna_core::structs::{PersistentIdMapping, PersistentIdRevision, persistent_id_change};
-    use aruna_operations::sync::outbox_record::new_outbox_record;
+    use aruna_operations::sync::outbox_record::new_identified_record;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -149,7 +149,8 @@ mod tests {
     }
 
     fn outbox(mapping: &PersistentIdMapping, bytes: Vec<u8>) -> Vec<u8> {
-        let record: DocumentOutboxRecord = new_outbox_record(
+        let record: DocumentOutboxRecord = new_identified_record(
+            Ulid::generate(),
             iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
             DocumentTarget::PersistentIdMapping {
                 document_id: mapping.target,

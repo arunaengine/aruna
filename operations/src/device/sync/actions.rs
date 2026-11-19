@@ -10,7 +10,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, outside_answer, outside_call, read_row, value};
+use aruna_core::rows::{done, outside_answer, outside_call, read_row};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, FolderState, SyncActionRecord,
@@ -480,7 +480,10 @@ impl Operation for EntryActionOperation {
     fn next(&mut self, result: IoResult) -> EntryTurn {
         match self.step {
             EntryStep::Base => {
-                let row = outside_answer(result).and_then(value).ok().flatten();
+                let row = outside_answer(result)
+                    .and_then(IoResult::value)
+                    .ok()
+                    .flatten();
                 let base = row.and_then(|bytes| SyncBase::from_bytes(&bytes).ok());
                 self.decide(base.ok_or(ActionError::NotFound)?)
             }

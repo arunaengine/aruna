@@ -11,7 +11,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::RUN_PUBLISH_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::{done, read_row};
 use aruna_core::structs::execution::job::{
     JobError, JobId, JobPayload, JobRecord, JobResultPayload, LocalCrate, OutputObject,
     RunCrateStatus, run_crate_key,
@@ -381,7 +381,8 @@ impl Operation for PublishRunOperation {
                 self.configured(config.map_err(unavailable)?)
             }
             PublishStep::Frozen => {
-                let frozen = value(result)?
+                let frozen = result
+                    .value()?
                     .map(|bytes| postcard::from_bytes(&bytes))
                     .transpose()
                     .map_err(unavailable)?;

@@ -9,7 +9,7 @@ use aruna_core::repository::{
     LinkDirection, LinkFailure, LinkPull, LinkRemote, LinkStatus, PULL_CHECK_MS, PullCheck,
     PushOutcome, RepositoryLink, RepositoryPull, RepositoryRecord,
 };
-use aruna_core::rows::{event, value};
+use aruna_core::rows::event;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobRecord, JobState,
@@ -391,7 +391,7 @@ impl Operation for PullRunningOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, TransferError> {
-        let link = parse_link(value(result)?)
+        let link = parse_link(result.value()?)
             .map_err(|error| TransferError::Retryable(error.to_string()))?
             .filter(|link| link.status != LinkStatus::Paused && link.pull().is_some())
             .ok_or(TransferError::Cancelled)?;

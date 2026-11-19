@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
     RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -324,7 +324,7 @@ impl Operation for SettleMarkerOperation {
             result.done()?;
             return Ok(Next::Done(()));
         }
-        if value(result)?.as_deref() != Some(self.seen.as_slice()) {
+        if result.value()?.as_deref() != Some(self.seen.as_slice()) {
             return Ok(Next::Done(()));
         }
         self.deleting = true;
@@ -1476,7 +1476,7 @@ impl Operation for RangeCountersOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<RangeCounters>>, PurgeError> {
-        let stored = value(result)?;
+        let stored = result.value()?;
         if self.reading_counters {
             let counters = stored.map(|value| RangeCounters::from_bytes(&value));
             let counters = counters.transpose().map_err(failed)?;
@@ -1572,7 +1572,7 @@ impl Operation for UnbindOperation {
         };
         match self.writes {
             0 => {
-                let stored = value(result)?;
+                let stored = result.value()?;
                 let info = stored.and_then(|value| BucketInfo::from_bytes(&value).ok());
                 match info.filter(|info| self.same(info)) {
                     Some(info) => self.release(info),

@@ -149,7 +149,7 @@ impl Operation for WriteChatOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ChatStoreError> {
         match std::mem::replace(&mut self.stage, WriteHeadStage::Head) {
-            WriteHeadStage::Head => match decode_head(rows::value(result)?)? {
+            WriteHeadStage::Head => match decode_head(result.value()?)? {
                 Some(head) => self.rename(head),
                 None => {
                     self.stage = WriteHeadStage::Count;
@@ -231,7 +231,7 @@ impl Operation for DeleteChatOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ChatStoreError> {
         match std::mem::replace(&mut self.stage, DeleteChatStage::Written) {
-            DeleteChatStage::Head => match decode_head(rows::value(result)?)? {
+            DeleteChatStage::Head => match decode_head(result.value()?)? {
                 Some(head) if head.is_live() => {
                     let turns = turns_page(self.user_id, &self.chat_id, head.first_seq, usize::MAX);
                     self.stage = DeleteChatStage::Turns(head);

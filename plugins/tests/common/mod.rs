@@ -16,7 +16,10 @@ pub fn require(language: &str, program: &str) {
         .is_ok_and(|out| out.status.success());
     assert!(runs, "{language}: `{program}` is not installed");
     if language == "rust" {
-        assert!(wasm_target(), "rust: the wasm32-unknown-unknown target is not installed");
+        assert!(
+            wasm_target(),
+            "rust: the wasm32-unknown-unknown target is not installed"
+        );
     }
 }
 

@@ -9,7 +9,7 @@ use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, JOB_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, read_row, value};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::execution::job::{
     JobId, JobPayload, JobRecord, RECORD_KEY_PREFIX, StagingJobCheckpoint, StagingJobSpec,
 };
@@ -305,7 +305,7 @@ impl Operation for FencedImportsOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<JobId>>, ImportError> {
         match self.step {
             FencedStep::Kept => {
-                let kept = value(result)?;
+                let kept = result.value()?;
                 let kept = kept.as_deref().map(postcard::from_bytes).transpose();
                 self.jobs = kept.map_err(failed)?.unwrap_or_default();
                 self.step = FencedStep::Open;
@@ -391,7 +391,7 @@ impl Operation for StagingSpecOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<HandedImport>, MetadataReadError> {
         match self.step {
             SpecStep::Resume => {
-                let stored = value(result)?.ok_or(MetadataReadError::NotFound)?;
+                let stored = result.value()?.ok_or(MetadataReadError::NotFound)?;
                 let job: FencedJob =
                     postcard::from_bytes(&stored).map_err(|_| MetadataReadError::Unavailable)?;
                 let bucket = GetBucketOperation::new(job.spec.bucket.clone());
@@ -407,7 +407,7 @@ impl Operation for StagingSpecOperation {
                 Ok(Next::Call(record_read(binding.set_id)))
             }
             SpecStep::Record => {
-                let record = value(result)?.ok_or(MetadataReadError::Forbidden)?;
+                let record = result.value()?.ok_or(MetadataReadError::Forbidden)?;
                 let view = DistributionView::from_bytes(&record)
                     .map_err(|_| MetadataReadError::Unavailable)?;
                 let members = &view.snapshot().config.members;
@@ -608,7 +608,7 @@ impl Operation for FetchImportsOperation {
     fn next(&mut self, result: IoResult) -> Fetching {
         match self.step {
             FetchStep::Kept => {
-                self.kept = Some(match value(result)? {
+                self.kept = Some(match result.value()? {
                     Some(stored) => postcard::from_bytes(&stored).map_err(failed)?,
                     None => Kept {
                         from: self.from,
@@ -762,7 +762,7 @@ impl Operation for ContinueImportsOperation {
                 self.next_row()
             }
             ContinueStep::Record => {
-                let Some(record) = value(result)? else {
+                let Some(record) = result.value()? else {
                     return self.drop_row();
                 };
                 let view = DistributionView::from_bytes(&record).map_err(failed)?;

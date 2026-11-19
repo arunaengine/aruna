@@ -59,7 +59,7 @@ use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
 use aruna_operations::sync::outbox_record::outbox_key;
-use aruna_operations::sync::outbox_record::{new_outbox_record, write_outbox_effect};
+use aruna_operations::sync::outbox_record::{new_identified_record, write_outbox_effect};
 use aruna_test_support::documents::read_outbox_record;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
@@ -816,7 +816,8 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
     wait_holder_records(&nodes, &holders, document_id).await?;
 
     // Plant a delete for the document's bucket into the non-holder's outbox.
-    let forged = new_outbox_record(
+    let forged = new_identified_record(
+        Ulid::generate(),
         outsider.net.node_id(),
         DocumentTarget::MetadataDocumentLifecycle { document_id },
         Vec::new(),

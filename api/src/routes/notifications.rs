@@ -470,9 +470,7 @@ async fn authorize_watch(
         auth,
         permission_path,
         Permission::READ,
-        aruna_core::request_policy::PolicyRequestExtras::operation(
-            "notifications.create_watch",
-        ),
+        aruna_core::request_policy::PolicyRequestExtras::operation("notifications.create_watch"),
     )
     .await
     {

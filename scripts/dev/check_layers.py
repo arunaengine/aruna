@@ -37,7 +37,14 @@ ANY_CRATE = "*"
 # Internal normal dependencies the target table (target-architecture.md section 2) allows.
 CRATE_TARGETS = {
     "aruna": ANY_CRATE,
-    "aruna-api": ("aruna-core", "aruna-clock", "aruna-operations", "aruna-drivers", "aruna-wire"),
+    "aruna-api": (
+        "aruna-core",
+        "aruna-clock",
+        "aruna-operations",
+        "aruna-drivers",
+        "aruna-wire",
+        "aruna-test-support",
+    ),
     "aruna-doctor": (
         "aruna-core",
         "aruna-clock",
@@ -122,6 +129,7 @@ COUNTS = (
     ("group_cycle_modules", "modules in cycle groups inside a domain group"),
     ("runner_refs", "runner references into domain modules"),
     ("core_clocks", "clock and random calls in core production code"),
+    ("operation_clocks", "clock, random and id-mint calls in operations production code"),
     ("trigger_arms", "trigger shell arms that do more than drive one operation"),
     ("state_clones", "match self.state.clone() in operations"),
     ("async_parallel", "files with parallel work only through async code"),
@@ -157,7 +165,7 @@ PARALLEL_RE = re.compile(r"\b(?:join_all|FuturesUnordered|buffer_unordered|JoinS
 SLEEP_RE = re.compile(r"(?<![\w.:])(?:(?:std::)?thread::|(?:tokio::)?time::)?sleep\s*\(")
 CLOCK_RE = re.compile(
     r"\b(?:(?:SystemTime|Instant|Utc)::now|unix_timestamp_(?:secs|millis)|(?<!\.)(?<!fn )now_ms(?=\s*\()"
-    r"|Ulid::(?:new|generate)|thread_rng|OsRng|rand::random|getrandom)\b"
+    r"|Ulid::(?:new|generate)|thread_rng|OsRng|rand::(?:random|rng)|Uuid::new_v4|getrandom)\b"
 )
 EFFECT_OP_RE = re.compile(r"\bimpl(?:\s*<[^{;]*?>)?\s+(?:[\w:]+::)?EffectOperation\s+for\b")
 PAUSE_RE = re.compile(r"\bstart_paused\b|\bpause\s*\(\s*\)")
@@ -706,6 +714,7 @@ def measure(root):
     details["async_parallel"] = [source.rel for source in operations if PARALLEL_RE.search(source.masked)]
     details["test_sleeps"], details["silent_skips"] = test_habits(sources)
     details["core_clocks"] = core_clocks(sources)
+    details["operation_clocks"] = core_clocks(sources, OPERATIONS_SRC + "/")
     duplicates = duplicate_groups(sources)
     details["duplicate_groups"] = [" | ".join(group) for group in duplicates]
     for key in (
@@ -715,22 +724,11 @@ def measure(root):
         "test_sleeps",
         "silent_skips",
         "core_clocks",
+        "operation_clocks",
         "duplicate_groups",
     ):
         counts[key] = len(details[key])
     return counts, details, async_lines(ops), ops, sources
-
-
-def clock_calls(ops):
-    """Clock and random calls in production files that define an operation, reported only."""
-    found = []
-    for rel, info in sorted(ops.files.items()):
-        if info["kind"] not in ("op", "mixed"):
-            continue
-        masked = info["source"].masked
-        for hit in CLOCK_RE.finditer(masked):
-            found.append(f"{rel}:{masked.count(chr(10), 0, hit.start()) + 1}")
-    return found
 
 
 def hook_spans(source):
@@ -753,9 +751,9 @@ def hook_modules(sources):
     return prefixes
 
 
-def core_clocks(sources):
-    """Clock and random calls in core production code; test-hooks items are test helpers."""
-    core = [source for source in sources if source.rel.startswith("core/src/")]
+def core_clocks(sources, root="core/src/"):
+    """Clock, random and id-mint calls in a crate's production code; test hooks are helpers."""
+    core = [source for source in sources if source.rel.startswith(root)]
     hooked = hook_modules(core)
     found = []
     for source in core:
@@ -807,11 +805,6 @@ def report(root, baseline, show_all):
         for _ in EFFECT_OP_RE.finditer(source.masked)
     ]
     print(f"EffectOperation implementations outside tests: {len(effect_ops)}, reported only")
-    clocks = clock_calls(ops)
-    print(f"clock and random calls in operation files: {len(clocks)}, reported only")
-    if show_all:
-        for hit in clocks:
-            print(f"    {hit}")
     for key, label in COUNTS:
         now, limit = counts[key], baseline["structural"][key]
         print(f"{label}: {now} (baseline {limit})")

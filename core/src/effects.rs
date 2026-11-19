@@ -169,9 +169,11 @@ pub enum BlobEffect {
     ReleaseReservation {
         id: Ulid,
     },
-    /// Reads a stream to its end; answered by `StreamCollected`.
+    /// Reads a stream to its end; answered by `StreamCollected`. With a `limit` the read stops
+    /// once more bytes came and answers `StreamTooLarge`, so a longer stream never fills memory.
     CollectStream {
         blob: BackendStream<Result<Bytes, StreamError>>,
+        limit: Option<u64>,
     },
     /// Settles the reservation a write left behind; answered by `ReservationReconciled`.
     ReconcileReservation {

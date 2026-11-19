@@ -11,7 +11,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::{done, read_row};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
 use aruna_core::types::GroupId;
@@ -222,7 +222,7 @@ impl Operation for UpdateFolderOperation {
             done(result)?;
             return Ok(Next::Done(changed));
         }
-        let row = value(result)?;
+        let row = result.value()?;
         let current = row.and_then(|row| SyncedFolder::from_bytes(&row).ok());
         let current = current.ok_or(FolderError::NotFound)?;
         let change = self.change.take().ok_or(IoError::Unfinished)?;
