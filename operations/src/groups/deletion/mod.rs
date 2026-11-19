@@ -5,14 +5,13 @@
 mod access;
 mod check;
 mod commit;
-mod coordinator;
+pub mod coordinator;
 mod onboarding;
 mod peer;
 mod prepare;
 mod resources;
 
 pub use check::{CheckGroupOperation, GroupBlockers};
-pub use coordinator::SyncDecisionOperation;
 pub use coordinator::{DeleteGroupOperation, InstallOnboardingOperation};
 pub(crate) use peer::ApplyRequestOperation;
 

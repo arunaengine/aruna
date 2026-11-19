@@ -45,7 +45,7 @@ use aruna_operations::notifications::watch::records::WATCH_SUBSCRIPTION_UNAUTHOR
 use aruna_operations::realm::load_config::config_unavailable;
 use aruna_operations::tests::notifications::create_local_watch;
 use aruna_operations::tests::notifications::{data_group_id, data_node_id, data_path};
-use aruna_operations::tests::notifications::{record, upload_event};
+use aruna_operations::tests::notifications::{seeded_record, upload_event};
 use aruna_storage::FjallStorage;
 use byteview::ByteView;
 use std::sync::Arc;
@@ -536,7 +536,7 @@ async fn remote_upserts_deliver() {
     .await;
 
     let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
-    let mut records = vec![record(recipient, 1), record(recipient, 2)];
+    let mut records = vec![seeded_record(recipient, 1), seeded_record(recipient, 2)];
     let written = deliver_remote(&a.context, b.net.node_id(), records.clone())
         .await
         .expect("delivery succeeds");
@@ -565,7 +565,7 @@ async fn remote_delivery_idempotent() {
     .await;
 
     let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
-    let records = vec![record(recipient, 1), record(recipient, 2)];
+    let records = vec![seeded_record(recipient, 1), seeded_record(recipient, 2)];
 
     let first = deliver_remote(&a.context, b.net.node_id(), records.clone())
         .await
@@ -597,9 +597,13 @@ async fn unknown_peer_rejected() {
     .await;
 
     let recipient = UserId::new(Ulid::generate(), realm_id);
-    let error = deliver_remote(&c.context, b.net.node_id(), vec![record(recipient, 1)])
-        .await
-        .expect_err("unknown peer must be rejected");
+    let error = deliver_remote(
+        &c.context,
+        b.net.node_id(),
+        vec![seeded_record(recipient, 1)],
+    )
+    .await
+    .expect_err("unknown peer must be rejected");
     assert!(
         error.contains("not a sync-eligible node"),
         "unexpected reject reason: {error}"
@@ -625,8 +629,8 @@ async fn mixed_realm_rejected() {
     .await;
 
     let records = vec![
-        record(UserId::new(Ulid::generate(), realm_id), 1),
-        record(UserId::new(Ulid::generate(), other_realm), 2),
+        seeded_record(UserId::new(Ulid::generate(), realm_id), 1),
+        seeded_record(UserId::new(Ulid::generate(), other_realm), 2),
     ];
     let error = deliver_remote(&a.context, b.net.node_id(), records)
         .await
@@ -659,7 +663,10 @@ async fn nonholder_batch_rejected() {
     let error = deliver_remote(
         &a.context,
         b.net.node_id(),
-        vec![record(local_recipient, 1), record(remote_recipient, 2)],
+        vec![
+            seeded_record(local_recipient, 1),
+            seeded_record(remote_recipient, 2),
+        ],
     )
     .await
     .expect_err("batch containing non-local recipient must be rejected");
@@ -673,8 +680,8 @@ async fn nonholder_batch_rejected() {
 #[tokio::test]
 async fn read_batch_rejected() {
     let (a, b, recipient) = delivery_pair(70).await;
-    let valid = record(recipient, 1);
-    let mut read = record(recipient, 2);
+    let valid = seeded_record(recipient, 1);
+    let mut read = seeded_record(recipient, 2);
     read.read_at_ms = Some(1_700_000_000_999);
 
     let error = deliver_remote(&a.context, b.net.node_id(), vec![valid, read])
@@ -690,8 +697,8 @@ async fn read_batch_rejected() {
 #[tokio::test]
 async fn future_batch_rejected() {
     let (a, b, recipient) = delivery_pair(72).await;
-    let valid = record(recipient, 1);
-    let mut future = record(recipient, 2);
+    let valid = seeded_record(recipient, 1);
+    let mut future = seeded_record(recipient, 2);
     future.created_at_ms = unix_timestamp_millis()
         .saturating_add(MAX_FUTURE_SKEW)
         .saturating_add(60_000);
@@ -709,8 +716,8 @@ async fn future_batch_rejected() {
 #[tokio::test]
 async fn invalid_user_rejected() {
     let (a, b, recipient) = delivery_pair(73).await;
-    let valid = record(recipient, 1);
-    let mut invalid = record(recipient, 2);
+    let valid = seeded_record(recipient, 1);
+    let mut invalid = seeded_record(recipient, 2);
     invalid.kind = NotificationKind::AddedToGroup {
         group_id: Ulid::from_bytes([2u8; 16]),
         actor_user_id: UserId::nil(recipient.realm_id),
@@ -729,8 +736,8 @@ async fn invalid_user_rejected() {
 #[tokio::test]
 async fn watch_batch_rejected() {
     let (a, b, recipient) = delivery_pair(83).await;
-    let valid = record(recipient, 1);
-    let mut invalid = record(recipient, 2);
+    let valid = seeded_record(recipient, 1);
+    let mut invalid = seeded_record(recipient, 2);
     let group_id = Ulid::from_bytes([3u8; 16]);
     let node_id = data_node_id();
     invalid.kind = NotificationKind::DataUploaded {
@@ -757,7 +764,7 @@ async fn watch_batch_rejected() {
 async fn direct_cap_rejected() {
     let (a, b, recipient) = delivery_pair(74).await;
     let records: Vec<_> = (0..=OUTBOX_BATCH_SIZE)
-        .map(|index| record(recipient, (index % 255 + 1) as u8))
+        .map(|index| seeded_record(recipient, (index % 255 + 1) as u8))
         .collect();
 
     let error = deliver_remote(&a.context, b.net.node_id(), records)
@@ -822,9 +829,13 @@ async fn user_peer_rejected() {
     .await;
 
     let recipient = UserId::new(Ulid::generate(), realm_id);
-    let deliver_error = deliver_remote(&c.context, b.net.node_id(), vec![record(recipient, 1)])
-        .await
-        .expect_err("user-kind peer must be rejected");
+    let deliver_error = deliver_remote(
+        &c.context,
+        b.net.node_id(),
+        vec![seeded_record(recipient, 1)],
+    )
+    .await
+    .expect_err("user-kind peer must be rejected");
     assert!(
         deliver_error.contains("not a sync-eligible node"),
         "unexpected reject reason: {deliver_error}"
@@ -868,9 +879,9 @@ async fn rpc_list_roundtrip() {
 
     let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
     let records = vec![
-        record(recipient, 1),
-        record(recipient, 2),
-        record(recipient, 3),
+        seeded_record(recipient, 1),
+        seeded_record(recipient, 2),
+        seeded_record(recipient, 3),
     ];
     seed_inbox(&b, &records).await;
 
@@ -916,7 +927,7 @@ async fn list_skips_revoked() {
     let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
     install_watch_authorization(&b, realm_id, recipient, &[]).await;
     admit_peers(&b, &config).await;
-    let direct = record(recipient, 1);
+    let direct = seeded_record(recipient, 1);
     let watch_two = watch_record(recipient, 2);
     let watch_three = watch_record(recipient, 3);
     seed_inbox(
@@ -1013,7 +1024,7 @@ async fn revoked_token_ignored() {
     let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
     install_watch_authorization(&b, realm_id, recipient, &[]).await;
     admit_peers(&b, &config).await;
-    let direct = record(recipient, 1);
+    let direct = seeded_record(recipient, 1);
     let watch = watch_record(recipient, 2);
     seed_inbox(&b, &[direct.clone(), watch.clone()]).await;
 
@@ -1101,9 +1112,9 @@ async fn unread_mark_roundtrip() {
 
     let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
     let records = vec![
-        record(recipient, 1),
-        record(recipient, 2),
-        record(recipient, 3),
+        seeded_record(recipient, 1),
+        seeded_record(recipient, 2),
+        seeded_record(recipient, 3),
     ];
     seed_inbox(&b, &records).await;
 
@@ -1196,7 +1207,7 @@ async fn inbox_nonholder_rejected() {
     .await;
 
     let recipient = recipient_for_holder(&config, a.net.node_id(), realm_id);
-    let seeded = record(recipient, 1);
+    let seeded = seeded_record(recipient, 1);
     seed_inbox(&b, std::slice::from_ref(&seeded)).await;
 
     for error in [
@@ -1244,7 +1255,7 @@ async fn oversized_message_refused() {
     .await;
 
     let recipient = UserId::new(Ulid::generate(), realm_id);
-    let sample = record(recipient, 1);
+    let sample = seeded_record(recipient, 1);
     let per_record = postcard::to_allocvec(&NotificationTransportMessage::DeliverBatch {
         records: vec![sample.clone(), sample.clone()],
     })
@@ -1954,7 +1965,7 @@ async fn fresh_delivery_wakes() {
     .await;
 
     let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
-    let batch = vec![record(recipient, 1)];
+    let batch = vec![seeded_record(recipient, 1)];
     let mut wakes = b.net.subscribe_notification_wakes();
 
     deliver_remote(&a.context, b.net.node_id(), batch.clone())
@@ -1991,7 +2002,7 @@ async fn changed_count_wakes() {
     .await;
 
     let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
-    let records = vec![record(recipient, 1), record(recipient, 2)];
+    let records = vec![seeded_record(recipient, 1), seeded_record(recipient, 2)];
     seed_inbox(&b, &records).await;
     let ids: Vec<Ulid> = records
         .iter()

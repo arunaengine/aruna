@@ -156,7 +156,8 @@ pub fn peer_input() -> crate::notifications::deliver::DeliverInput {
     }
 }
 
-pub fn record(recipient: UserId, seed: u8) -> NotificationRecord {
+/// A direct notification whose ids and time follow `seed`.
+pub fn seeded_record(recipient: UserId, seed: u8) -> NotificationRecord {
     NotificationRecord::new(
         recipient,
         NotificationClass::Direct,
