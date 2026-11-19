@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::position::{open_position, seal_position};
 use aruna_blob::native::{body_stream, send_request};
 use std::sync::Arc;
 
@@ -332,6 +333,12 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
     };
     if let NetEffect::GrantedRead(read) = effect {
         return Event::Net(NetEvent::GrantedRead(granted_read(*read, context).await));
+    }
+    if let NetEffect::SealPosition(position) = effect {
+        return Event::Net(NetEvent::PositionSealed(seal_position(&position)));
+    }
+    if let NetEffect::OpenPosition(position) = effect {
+        return Event::Net(NetEvent::PositionOpened(open_position(&position)));
     }
     if let NetEffect::AvoidHolder { node_id, now_ms } = effect {
         context.avoid_holder(node_id, now_ms);

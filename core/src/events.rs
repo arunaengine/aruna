@@ -536,6 +536,10 @@ pub enum NetEvent {
     HolderAvoided,
     /// The cursor signature, or `None` when this node cannot sign the cursor.
     CursorSigned(Option<iroh::Signature>),
+    /// The sealed position, or `None` when it could not be sealed.
+    PositionSealed(Option<Vec<u8>>),
+    /// The opened position, or `None` when this process did not seal it.
+    PositionOpened(Option<Vec<u8>>),
     /// The peer's last-contact time is refreshed.
     PeerContact,
     Shard(Box<ShardNetEvent>),
@@ -1073,6 +1077,8 @@ impl Event {
                     DelegationSign,
                     HolderAvoided,
                     CursorSigned,
+                    PositionSealed,
+                    PositionOpened,
                     Shard,
                     TopicPeers,
                     MissingTopicPeers,
