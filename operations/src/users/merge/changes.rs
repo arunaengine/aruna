@@ -289,6 +289,7 @@ impl MergeUsersOperation {
             &mut realm_auth.roles,
             (&handed, &held),
             (survivor, merged),
+            (&mut self.ids, self.now_ms),
         )?;
         let document = DocumentTarget::RealmAuthorization { realm_id };
         self.batch.writes.push((
@@ -318,7 +319,14 @@ impl MergeUsersOperation {
         for ((group, state), (handed, held)) in groups.iter_mut().zip(states).zip(plans) {
             let group_id: GroupId = group.group_id;
             let mut change = Change::new(state.as_ref(), AdminDocumentTarget::Group { group_id })?;
-            change.move_roles(&actor, &mut group.roles, (handed, held), (survivor, merged))?;
+            let mint = (&mut self.ids, self.now_ms);
+            change.move_roles(
+                &actor,
+                &mut group.roles,
+                (handed, held),
+                (survivor, merged),
+                mint,
+            )?;
             let document = DocumentTarget::GroupAuthorization { group_id };
             let placement = self.placement(config, &document);
             self.batch.writes.push((

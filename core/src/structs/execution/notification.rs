@@ -745,8 +745,13 @@ mod tests {
             added(3),
             t,
         );
-        let direct =
-            NotificationRecord::new(ulid::Ulid::generate(), r, NotificationClass::Direct, added(3), t);
+        let direct = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            r,
+            NotificationClass::Direct,
+            added(3),
+            t,
+        );
         let kt = notification_prune_key(&transient);
         let kd = notification_prune_key(&direct);
         assert!(kt < kd);

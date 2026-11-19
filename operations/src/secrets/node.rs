@@ -140,6 +140,7 @@ impl NodeSecretOperation {
                 Some(input.node_id),
                 input.actor,
                 input.now_ms,
+                &mut self.ids,
             )?;
             self.notices = !notices.is_empty();
             audit.extend(notices);

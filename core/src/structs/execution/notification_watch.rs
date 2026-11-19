@@ -717,8 +717,13 @@ mod tests {
             ]),
             WatchEventMask::from_kinds([WatchEventKind::SyncCompleted, WatchEventKind::SyncFailed]),
         ] {
-            let record =
-                WatchSubscription::new(ulid::Ulid::generate(), owner, "/data".to_string(), mask, 42);
+            let record = WatchSubscription::new(
+                ulid::Ulid::generate(),
+                owner,
+                "/data".to_string(),
+                mask,
+                42,
+            );
             let bytes = record.to_bytes().unwrap();
             assert_eq!(WatchSubscription::from_bytes(&bytes).unwrap(), record);
         }
