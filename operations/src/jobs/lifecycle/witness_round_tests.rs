@@ -45,9 +45,26 @@ fn configured(fixture: &Family) -> WitnessRoundOperation {
     let mut operation = round(fixture, fixture.holder.public());
     assert!(is_child(&operation.first()));
     let config = child(Ok::<_, GetConfigError>(fixture.config.clone()));
-    assert!(is_child(&operation.next(config)));
+    assert_eq!(operation.next(config), Ok(Next::Call(fence_read())));
+    assert!(is_child(&operation.next(IoResult::Values(vec![None]))));
     assert_eq!(operation.step, RoundStep::Family);
     operation
+}
+
+// Behind the start fence the round plans nothing and looks again after its base delay.
+#[test]
+fn fenced_round_waits() {
+    let fixture = Family::new([27u8; 32]);
+    let base = fixture.config.compute.witness_delay_ms;
+    let mut operation = round(&fixture, fixture.holder.public());
+    operation.first().unwrap();
+    let config = child(Ok::<_, GetConfigError>(fixture.config.clone()));
+    operation.next(config).unwrap();
+    let fenced = IoResult::Values(vec![Some(Value::from(&[][..]))]);
+    assert_eq!(
+        outcome(operation.next(fenced)),
+        RoundOutcome::Retry { after_ms: base }
+    );
 }
 
 /// Answers the family read with `records`, then the membership read with `view`.

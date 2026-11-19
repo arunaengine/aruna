@@ -31,6 +31,7 @@ use super::settle::{
 };
 use super::supervise::SuperviseOperation;
 use crate::jobs::device_admission::{RecheckAdmission, backend_refusal};
+use crate::jobs::fence::{fence_read, fence_up};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::store::job_calls::{
@@ -207,6 +208,9 @@ pub enum AdoptedEnd {
 enum SettleStep {
     Fence,
     Reconcile,
+    /// The start fence, read before an attempt is submitted again under its name.
+    StartFence,
+    HandedBack,
     Started(Box<ReconcileEvidence>),
     Running(Box<ReconcileEvidence>),
     StopThenPark,
@@ -288,11 +292,19 @@ impl SettleAdoptedOperation {
         self.resolve(evidence)
     }
 
+    /// Behind the start fence an attempt is not submitted again; it is handed back free.
+    fn resume(&mut self, phase: AttemptPhase) -> SettleNext {
+        match phase {
+            AttemptPhase::Submitted => self.call(SettleStep::StartFence, fence_read()),
+            phase => Ok(Next::Done(AdoptedEnd::Resume(phase))),
+        }
+    }
+
     fn resolve(&mut self, evidence: ReconcileEvidence) -> SettleNext {
         let scope = self.scope.clone();
         match evidence {
             ReconcileEvidence::Adoptable(evidence) if !evidence.status.is_terminal() => {
-                Ok(Next::Done(AdoptedEnd::Resume(evidence.status.phase)))
+                self.resume(evidence.status.phase)
             }
             // Terminal evidence is committed now, which correlates the cancel intent.
             ReconcileEvidence::Adoptable(evidence) => {
@@ -300,9 +312,7 @@ impl SettleAdoptedOperation {
                 self.finalize(FinalizeGoal::Attempt(Ok(status)))
             }
             // Absence after a submit retries the same attempt name.
-            ReconcileEvidence::Absent => {
-                Ok(Next::Done(AdoptedEnd::Resume(AttemptPhase::Submitted)))
-            }
+            ReconcileEvidence::Absent => self.resume(AttemptPhase::Submitted),
             ReconcileEvidence::Unavailable(error) => {
                 self.park(JobError::retryable(format!("backend unavailable: {error}")))
             }
@@ -355,6 +365,19 @@ impl Operation for SettleAdoptedOperation {
     fn next(&mut self, result: IoResult) -> SettleNext {
         let scope = self.scope.clone();
         match std::mem::replace(&mut self.step, SettleStep::Last) {
+            SettleStep::StartFence => match fence_up(result) {
+                false => Ok(Next::Done(AdoptedEnd::Resume(AttemptPhase::Submitted))),
+                true => {
+                    let handoff = handoff_external_attempt(scope.job_id, scope.token, self.now_ms);
+                    self.call(SettleStep::HandedBack, IoCall::child(handoff))
+                }
+            },
+            SettleStep::HandedBack => {
+                if let Err(error) = result.child::<ReleaseOutcome, JobMutationError>()? {
+                    warn!(job_id = %scope.job_id, error = %error, "Fenced attempt was not handed back");
+                }
+                Ok(Next::Done(AdoptedEnd::Settled))
+            }
             SettleStep::Fence => match compute_answer(result)? {
                 ComputeAnswer::Done(Ok(())) => {
                     if self.record.cancel_requested {

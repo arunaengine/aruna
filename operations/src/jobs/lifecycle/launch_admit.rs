@@ -42,6 +42,7 @@ use super::outbox::schedule_outbox_drain;
 use super::plan::network_access;
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::jobs::fence::{fence_read, fence_up};
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{
@@ -501,13 +502,17 @@ impl LaunchNode {
 
 #[derive(Debug, PartialEq)]
 enum AdmitStep {
+    /// Behind the start fence no launch is admitted: an availability answer, never a refusal.
+    Fence,
     Config,
     Records,
     Pull,
     RecordsAfterPull,
     SpecInputs,
     PlannedInputs(Box<LogicalJobSpec>),
-    Append { retried: bool },
+    Append {
+        retried: bool,
+    },
     PullBeforeAppend,
     Decide,
     Interval,
@@ -558,7 +563,7 @@ impl AdmitLaunchOperation {
             planned: None,
             clock: AdminDocumentClock::default(),
             ids: IdMint::default(),
-            step: AdmitStep::Config,
+            step: AdmitStep::Fence,
         }
     }
 
@@ -824,12 +829,19 @@ impl Operation for AdmitLaunchOperation {
     }
 
     fn first(&mut self) -> AdmitNext {
-        let read = GetConfigOperation::new(self.node.realm_id);
-        Ok(Next::Call(IoCall::child(read)))
+        Ok(Next::Call(fence_read()))
     }
 
     fn next(&mut self, result: IoResult) -> AdmitNext {
         match std::mem::replace(&mut self.step, AdmitStep::Commit) {
+            AdmitStep::Fence => {
+                if fence_up(result) {
+                    return Err(LaunchUndecided);
+                }
+                self.step = AdmitStep::Config;
+                let read = GetConfigOperation::new(self.node.realm_id);
+                Ok(Next::Call(IoCall::child(read)))
+            }
             AdmitStep::Config => {
                 let config = result.child::<RealmConfigDocument, GetConfigError>()?;
                 self.configured(config.map_err(|_| LaunchUndecided)?)

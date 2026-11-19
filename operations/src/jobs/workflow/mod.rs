@@ -63,11 +63,12 @@ use super::lifecycle::held::HeldReservations;
 use super::lifecycle::updates::PublishProgressOperation;
 use super::store::attempt_intent::AttemptCommit;
 use super::store::job_calls::{
-    begin_external_running, cancel_running_job, record_attempt_intent, transition_to_preparing,
-    transition_to_ready,
+    ReleaseOutcome, begin_external_running, cancel_running_job, defer_job, record_attempt_intent,
+    transition_to_preparing, transition_to_ready,
 };
 use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::read_job_record;
+use crate::jobs::fence::{FENCE_RECHECK, fence_read, fence_up};
 use crate::placement::policy::{LocalSubjectOperation, SubjectScanError};
 
 /// Fallback walltime when a spec declares none. Enforcement, reconcile
@@ -240,6 +241,8 @@ impl Operation for ResolveBackendOperation {
 enum RunStep {
     FreshCancel,
     Recheck,
+    StartFence,
+    Deferred,
     Resolve,
     Preparing,
     Published,
@@ -384,8 +387,20 @@ impl ExecutionRunOperation {
     }
 
     fn resolve(&mut self) -> RunNext {
-        let resolve = ResolveBackendOperation::new(&*self.execution()?, self.job_id());
-        self.call(RunStep::Resolve, IoCall::child(resolve))
+        self.call(RunStep::StartFence, fence_read())
+    }
+
+    /// Behind the start fence nothing starts for the first time; the job waits, spending no
+    /// attempt.
+    fn fenced(&mut self, result: IoResult) -> RunNext {
+        if !fence_up(result) {
+            let resolve = ResolveBackendOperation::new(&*self.execution()?, self.job_id());
+            return self.call(RunStep::Resolve, IoCall::child(resolve));
+        }
+        let waiting = JobError::retryable("waiting for the realm config catch-up after a start");
+        let retry_ms = FENCE_RECHECK.as_millis() as u64;
+        let defer = defer_job(self.job_id(), self.claim()?, self.now_ms, retry_ms, waiting);
+        self.call(RunStep::Deferred, IoCall::child(defer))
     }
 
     fn backend_ready(&mut self, facts: BackendFacts) -> RunNext {
@@ -590,6 +605,13 @@ impl Operation for ExecutionRunOperation {
         let job_id = self.job_id();
         match std::mem::replace(&mut self.step, RunStep::Last) {
             RunStep::FreshCancel => self.cancelled(result, "Fresh cancellation write failed"),
+            RunStep::StartFence => self.fenced(result),
+            RunStep::Deferred => {
+                if let Err(error) = result.child::<ReleaseOutcome, JobMutationError>()? {
+                    warn!(job_id = %job_id, error = %error, "Fenced first start was not deferred");
+                }
+                Ok(Next::Done(()))
+            }
             RunStep::Recheck => match result.child::<(), JobError>()? {
                 Ok(()) => self.resolve(),
                 Err(error) => self.pre_submit(error, false),

@@ -206,20 +206,27 @@ fn fenced_cancel_finalizes() {
     );
 }
 
-// A live attempt goes back to supervision, and an absent one is submitted under its name.
+// A live attempt goes back to supervision, and an absent one is submitted under its name once
+// no start fence holds; behind the fence it is handed back free.
 #[test]
 fn unfinished_attempt_resumes() {
-    let cases = [
-        (adoptable(running(None)), AttemptPhase::Running),
-        (ReconcileEvidence::Absent, AttemptPhase::Submitted),
-    ];
-    for (found, phase) in cases {
+    let mut live = reconciling(in_state(JobState::Running));
+    let supervised = Ok(Next::Done(AdoptedEnd::Resume(AttemptPhase::Running)));
+    assert_eq!(live.next(evidence(adoptable(running(None)))), supervised);
+    let absent = || {
         let mut settle = reconciling(in_state(JobState::Running));
-        assert_eq!(
-            settle.next(evidence(found)),
-            Ok(Next::Done(AdoptedEnd::Resume(phase)))
-        );
-    }
+        let fence = settle.next(evidence(ReconcileEvidence::Absent));
+        assert_eq!(fence, Ok(Next::Call(fence_read())));
+        settle
+    };
+    let submitted = Ok(Next::Done(AdoptedEnd::Resume(AttemptPhase::Submitted)));
+    assert_eq!(absent().next(IoResult::Values(vec![None])), submitted);
+    let fenced = IoResult::Values(vec![Some(aruna_core::types::Value::from(&[][..]))]);
+    let handoff = handoff_external_attempt(job(), token(), NOW);
+    let mut held = absent();
+    assert_eq!(held.next(fenced), Ok(Next::Call(IoCall::child(handoff))));
+    let released = child(Ok::<_, JobMutationError>(ReleaseOutcome::Skipped));
+    assert_eq!(held.next(released), Ok(Next::Done(AdoptedEnd::Settled)));
 }
 
 // Start evidence is stored first; losing that write parks the attempt.

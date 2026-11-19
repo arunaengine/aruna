@@ -243,7 +243,9 @@ fn run_scope() -> Arc<AttemptScope> {
 fn resolved() -> ExecutionRunOperation {
     let mut run = run_of(claimed());
     let resolve = ResolveBackendOperation::new(&spec(), job());
-    assert_eq!(run.first(), Ok(Next::Call(IoCall::child(resolve))));
+    assert_eq!(run.first(), Ok(Next::Call(fence_read())));
+    let open = run.next(IoResult::Values(vec![None]));
+    assert_eq!(open, Ok(Next::Call(IoCall::child(resolve))));
     let found = ResolvedBackend {
         facts: facts(),
         receipted: None,
@@ -401,7 +403,9 @@ fn device_rechecks_first() {
     let recheck = RecheckAdmission::of_job(&device, token(), Arc::new(spec())).unwrap();
     assert_eq!(run.first(), Ok(Next::Call(IoCall::child(recheck))));
     let passed = run.next(child(Ok::<(), JobError>(())));
-    assert_eq!(passed, Ok(Next::Call(IoCall::child(resolve()))));
+    assert_eq!(passed, Ok(Next::Call(fence_read())));
+    let open = run.next(IoResult::Values(vec![None]));
+    assert_eq!(open, Ok(Next::Call(IoCall::child(resolve()))));
     let mut refused = run_of(device);
     refused.first().unwrap();
     let error = JobError::retryable("compute backend docker is not available here");
@@ -614,4 +618,16 @@ fn recovery_decides_supervision() {
         recovering().next(child(Ok::<_, IoError>(false))),
         Ok(Next::Done(()))
     );
+}
+
+// Behind the start fence a first start waits for the catch-up and spends no attempt.
+#[test]
+fn fenced_start_waits() {
+    let mut run = run_of(claimed());
+    assert_eq!(run.first(), Ok(Next::Call(fence_read())));
+    let fenced = IoResult::Values(vec![Some(aruna_core::types::Value::from(&[][..]))]);
+    let waiting = JobError::retryable("waiting for the realm config catch-up after a start");
+    let retry_ms = FENCE_RECHECK.as_millis() as u64;
+    let defer = defer_job(job(), token(), NOW, retry_ms, waiting);
+    assert_eq!(run.next(fenced), Ok(Next::Call(IoCall::child(defer))));
 }

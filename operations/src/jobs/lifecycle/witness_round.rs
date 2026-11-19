@@ -39,6 +39,7 @@ use super::offer::{OfferLaunchOperation, OfferOutcome};
 use super::plan::{BuildPlanOperation, PlanBuildError, PlanRound};
 use super::witness_arm::WitnessExplain;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::jobs::fence::{fence_read, fence_up};
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{
@@ -110,6 +111,8 @@ fn retry(after_ms: u64) -> RoundNext {
 #[derive(Debug, PartialEq)]
 enum RoundStep {
     Config,
+    /// Behind the start fence this node creates and offers no launch.
+    Fence,
     Family,
     Interval,
     Silence,
@@ -286,8 +289,7 @@ impl WitnessRoundOperation {
             offer: None,
             declining: None,
         }));
-        let read = LoadFamilyOperation::family(self.family);
-        self.call(RoundStep::Family, IoCall::child(read))
+        self.call(RoundStep::Fence, fence_read())
     }
 
     /// An incomplete family read is undecided evidence: a suppression, cancel or earlier
@@ -749,6 +751,13 @@ impl Operation for WitnessRoundOperation {
                 Err(error) => {
                     config_unavailable(&error);
                     retry(1_000)
+                }
+            },
+            RoundStep::Fence => match fence_up(result) {
+                true => retry(self.base_ms()?),
+                false => {
+                    let read = LoadFamilyOperation::family(self.family);
+                    self.call(RoundStep::Family, IoCall::child(read))
                 }
             },
             RoundStep::Family => self.family_read(result),

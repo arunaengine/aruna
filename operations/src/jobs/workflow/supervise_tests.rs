@@ -70,6 +70,21 @@ fn session(request: SessionRequest) -> Next<()> {
 }
 
 /// A plain run that is waiting for its attempt.
+/// The answer of a fence read on a node that is not fenced.
+fn open() -> IoResult {
+    IoResult::Values(vec![None])
+}
+
+// Behind the start fence a session run reopens no session and only waits.
+#[test]
+fn fenced_session_waits() {
+    let mut supervise = supervise(notebook());
+    supervise.first().unwrap();
+    supervise.next(anchor(700)).unwrap();
+    let fenced = IoResult::Values(vec![Some(aruna_core::types::Value::from(&[][..]))]);
+    assert_eq!(supervise.next(fenced), Ok(awaited(notebook(), 300, None)));
+}
+
 fn waiting() -> SuperviseOperation {
     let mut supervise = supervise(limited());
     supervise.first().unwrap();
@@ -84,10 +99,8 @@ fn in_session() -> SuperviseOperation {
     let facts = ComputeEffect::Facts {
         backend: "docker".to_string(),
     };
-    assert_eq!(
-        supervise.next(anchor(700)),
-        Ok(Next::Call(compute_call(facts)))
-    );
+    assert_eq!(supervise.next(anchor(700)), Ok(Next::Call(fence_read())));
+    assert_eq!(supervise.next(open()), Ok(Next::Call(compute_call(facts))));
     assert!(is_child(&supervise.next(compute(ComputeAnswer::NoBackend))));
     let plan = SessionPlan {
         public_job_id: job(),
@@ -216,6 +229,7 @@ fn refused_session_skipped() {
     let mut supervise = supervise(notebook());
     supervise.first().unwrap();
     supervise.next(anchor(700)).unwrap();
+    supervise.next(open()).unwrap();
     supervise.next(compute(ComputeAnswer::NoBackend)).unwrap();
     let plan = SessionPlan {
         public_job_id: job(),
@@ -238,6 +252,7 @@ fn unplanned_session_waits() {
     let mut unplanned = supervise(notebook());
     unplanned.first().unwrap();
     unplanned.next(anchor(700)).unwrap();
+    unplanned.next(open()).unwrap();
     unplanned.next(compute(ComputeAnswer::NoBackend)).unwrap();
     let no_plan = child(Ok::<Option<SessionPlan>, IoError>(None));
     assert_eq!(unplanned.next(no_plan), Ok(awaited(notebook(), 300, None)));
