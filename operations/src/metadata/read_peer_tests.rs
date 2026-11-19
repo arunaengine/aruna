@@ -112,7 +112,7 @@ fn trusted_read_vouches() {
 }
 
 #[test]
-fn object_search_needs_bearer() {
+fn objects_need_bearer() {
     let mut search = SearchPeerOperation::new((node(1), realm()), None, PeerReader::Objects);
     assert_eq!(search.first(), Err(MetadataReadError::Unauthorized));
 }

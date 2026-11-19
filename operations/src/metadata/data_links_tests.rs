@@ -424,7 +424,7 @@ fn retry_settles_local() {
 }
 
 #[test]
-fn retry_skips_lost_settle() {
+fn retry_skips_conflict() {
     let mut retry = RetryUnverifiedOperation::new(None, None);
     retry.first().unwrap();
     let page = IoResult::Page {
