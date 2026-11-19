@@ -281,13 +281,13 @@ mod call_tests;
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive, node_routing};
-    use crate::effect_adapters::job::run_hosted;
     use crate::jobs::context::JobContext;
     use crate::jobs::executor::ProgressReporter;
     use crate::s3::object::copy::test::{
         full_context, seed_bucket, spawn_reference_server, write_version,
     };
     use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
+    use crate::testing::run_hosted;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;

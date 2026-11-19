@@ -4,7 +4,6 @@
 
 use std::any::Any;
 use std::collections::BTreeSet;
-use std::fmt::Display;
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
@@ -18,21 +17,16 @@ use aruna_core::jobs::{
     ArchiveEntryRead, ArchiveRead, ByteStream, GzipBroken, GzipWork, JobEffect, JobEvent,
     JobReport, JobStops,
 };
-use aruna_core::operation::Runnable;
 use aruna_core::rocrate_archive::ArchiveInspection;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::JobError;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use super::dispatch_effect_until;
 use crate::driver::DriverContext;
-use crate::jobs::context::JobContext;
-use crate::jobs::executor::{JobRunOutcome, ProgressReporter, RangeTurns};
 
 const NO_BLOB_HANDLE: &str = "this job needs a blob handle";
 
@@ -62,81 +56,6 @@ pub trait JobHost: Send + Sync {
 /// Runs `future` with `host` answering the job effects of every operation it drives.
 pub async fn with_job_host<F: Future>(host: Arc<dyn JobHost>, future: F) -> F::Output {
     JOB_HOST.scope(host, future).await
-}
-
-/// The running job's signals and shared state, as its operations reach them through effects.
-struct ContextHost {
-    cancel: CancellationToken,
-    shutdown: CancellationToken,
-    progress: ProgressReporter,
-    turns: RangeTurns,
-}
-
-impl JobHost for ContextHost {
-    fn stops(&self) -> JobStops {
-        JobStops {
-            cancelled: self.cancel.is_cancelled(),
-            shutdown: self.shutdown.is_cancelled(),
-        }
-    }
-
-    fn report(&self, report: JobReport) {
-        if let Some(current) = report.current {
-            self.progress.set_current(current);
-        }
-        if let Some(total) = report.total {
-            self.progress.set_total(total);
-        }
-        if report.advance > 0 {
-            self.progress.advance(report.advance);
-        }
-        if report.checkpoint {
-            self.progress.checkpoint();
-        }
-    }
-
-    fn stopped(&self) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            tokio::select! {
-                _ = self.cancel.cancelled() => {}
-                _ = self.shutdown.cancelled() => {}
-            }
-        })
-    }
-
-    fn take_turns<'a>(
-        &'a self,
-        turns: &'a BTreeSet<(Ulid, Ulid)>,
-    ) -> BoxFuture<'a, Box<dyn Any + Send>> {
-        Box::pin(async move {
-            let locks = self.turns.turn_locks(turns);
-            let mut guards = Vec::with_capacity(locks.len());
-            for lock in locks {
-                guards.push(lock.lock_owned().await);
-            }
-            Box::new(guards) as Box<dyn Any + Send>
-        })
-    }
-}
-
-/// Drives a job's operation with the job's host answering its effects. A failure of the run
-/// itself is retryable, since the job's checkpoint stays.
-pub async fn run_hosted<O, K>(ctx: &JobContext, operation: O) -> JobRunOutcome
-where
-    O: Runnable<K, Output = JobRunOutcome>,
-    O::Error: Display,
-{
-    let host = Arc::new(ContextHost {
-        cancel: ctx.cancel.clone(),
-        shutdown: ctx.shutdown.clone(),
-        progress: ctx.progress.clone(),
-        turns: ctx.range_turns.clone(),
-    });
-    let run = with_job_host(host, crate::driver::drive(operation, &ctx.driver));
-    match Box::pin(run).await {
-        Ok(outcome) => outcome,
-        Err(error) => JobRunOutcome::Failed(JobError::retryable(error.to_string())),
-    }
 }
 
 pub(super) fn current_host() -> Option<Arc<dyn JobHost>> {

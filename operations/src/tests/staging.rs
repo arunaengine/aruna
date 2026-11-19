@@ -170,5 +170,5 @@ pub(crate) async fn run_staging_job(
         seed: 7,
     };
     let job = crate::jobs::staging::StagingJobOperation::new(run);
-    crate::effect_adapters::job::run_hosted(ctx, job).await
+    crate::testing::run_hosted(ctx, job).await
 }

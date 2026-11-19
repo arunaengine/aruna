@@ -326,3 +326,83 @@ pub fn freeze_clock() -> ClockGuard {
     });
     ClockGuard { _stop: stop }
 }
+
+/// The host a job context gives its operations in tests; the job runner of the node has its own.
+struct JobContextHost {
+    cancel: tokio_util::sync::CancellationToken,
+    shutdown: tokio_util::sync::CancellationToken,
+    progress: crate::jobs::executor::ProgressReporter,
+    turns: crate::jobs::executor::RangeTurns,
+}
+
+impl crate::effect_adapters::job::JobHost for JobContextHost {
+    fn stops(&self) -> aruna_core::jobs::JobStops {
+        aruna_core::jobs::JobStops {
+            cancelled: self.cancel.is_cancelled(),
+            shutdown: self.shutdown.is_cancelled(),
+        }
+    }
+
+    fn report(&self, report: aruna_core::jobs::JobReport) {
+        if let Some(current) = report.current {
+            self.progress.set_current(current);
+        }
+        if let Some(total) = report.total {
+            self.progress.set_total(total);
+        }
+        if report.advance > 0 {
+            self.progress.advance(report.advance);
+        }
+        if report.checkpoint {
+            self.progress.checkpoint();
+        }
+    }
+
+    fn stopped(&self) -> futures_util::future::BoxFuture<'_, ()> {
+        Box::pin(async move {
+            tokio::select! {
+                _ = self.cancel.cancelled() => {}
+                _ = self.shutdown.cancelled() => {}
+            }
+        })
+    }
+
+    fn take_turns<'a>(
+        &'a self,
+        turns: &'a std::collections::BTreeSet<(ulid::Ulid, ulid::Ulid)>,
+    ) -> futures_util::future::BoxFuture<'a, Box<dyn std::any::Any + Send>> {
+        Box::pin(async move {
+            let locks = self.turns.turn_locks(turns);
+            let mut guards = Vec::with_capacity(locks.len());
+            for lock in locks {
+                guards.push(lock.lock_owned().await);
+            }
+            Box::new(guards) as Box<dyn std::any::Any + Send>
+        })
+    }
+}
+
+/// Drives a job's operation with the job's host answering its effects. A failure of the run
+/// itself is retryable, since the job's checkpoint stays.
+pub async fn run_hosted<O, K>(
+    ctx: &crate::jobs::context::JobContext,
+    operation: O,
+) -> crate::jobs::executor::JobRunOutcome
+where
+    O: aruna_core::operation::Runnable<K, Output = crate::jobs::executor::JobRunOutcome>,
+    O::Error: std::fmt::Display,
+{
+    let host = std::sync::Arc::new(JobContextHost {
+        cancel: ctx.cancel.clone(),
+        shutdown: ctx.shutdown.clone(),
+        progress: ctx.progress.clone(),
+        turns: ctx.range_turns.clone(),
+    });
+    let run = crate::effect_adapters::job::with_job_host(host, drive(operation, &ctx.driver));
+    match Box::pin(run).await {
+        Ok(outcome) => outcome,
+        Err(error) => crate::jobs::executor::JobRunOutcome::Failed(
+            aruna_core::structs::execution::job::JobError::retryable(error.to_string()),
+        ),
+    }
+}
