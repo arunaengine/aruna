@@ -516,8 +516,8 @@ impl BlobHandler {
         let encoder = match (seal, compression) {
             (Some(plan), _) => {
                 // One supported size for every sealed copy, so any of them can be re-encoded later.
-                if size.is_some_and(|size| size > super::pithos::MAX_SIZE) {
-                    let limit = super::pithos::MAX_SIZE;
+                if size.is_some_and(|size| size > aruna_core::structs::storage::pithos::MAX_SIZE) {
+                    let limit = aruna_core::structs::storage::pithos::MAX_SIZE;
                     return BlobEvent::Error(BlobError::SizeLimitExceeded { limit });
                 }
                 let covered = size.unwrap_or(super::pithos::GROWTH);

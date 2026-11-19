@@ -10,7 +10,6 @@ use crate::s3::bucket::key::rows::{
 };
 use crate::s3::imports::LinkScan;
 use crate::s3::object::put::abe::keyed;
-use aruna_blob::blob::pithos::MAX_SIZE;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -34,6 +33,7 @@ use aruna_core::structs::storage::holders::{
     HolderReport, KeyLookup, RecoveryState, resolve_holders,
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+use aruna_core::structs::storage::pithos::MAX_SIZE;
 use aruna_core::structs::storage::transition::EncryptionTransition;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{GroupId, Key, Value};

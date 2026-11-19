@@ -693,7 +693,7 @@ impl CompleteUploadOperation {
             let mut part_record = MultipartPart::from_bytes(value.as_ref())?;
             if requested.contains(&part_key.part_number) {
                 if self.compose_share.is_some() {
-                    let limit = aruna_blob::blob::pithos::MAX_SIZE;
+                    let limit = aruna_core::structs::storage::pithos::MAX_SIZE;
                     self.selected_bytes = self
                         .selected_bytes
                         .checked_add(part_record.location.blob_size)

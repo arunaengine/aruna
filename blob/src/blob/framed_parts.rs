@@ -625,10 +625,10 @@ impl BlobHandler {
 #[cfg(test)]
 mod tests {
     use super::{completion_charge, cut_pieces, run_limit};
-    use crate::blob::pithos::WORKING_SET;
     use crate::codec::compressor_memory;
     use aruna_core::structs::storage::blob::Backend;
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::pithos::WORKING_SET;
     use std::collections::BTreeSet;
 
     #[test]

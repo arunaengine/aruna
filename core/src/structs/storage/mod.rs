@@ -29,6 +29,7 @@ pub mod metadata_registry;
 pub mod multipart;
 pub mod node_info;
 pub mod origin;
+pub mod pithos;
 pub mod read_grant;
 pub mod release;
 pub mod replication;

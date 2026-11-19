@@ -512,7 +512,7 @@ async fn release_crate(
             let deadline = Instant::now() + RESOLVE_BUDGET;
             match resolved(
                 drive_until(
-                    resolve_version(context.node_and_realm(), version_id, deadline),
+                    resolve_version(context.node_and_realm(), version_id, RESOLVE_BUDGET),
                     context.as_ref(),
                     deadline,
                 )

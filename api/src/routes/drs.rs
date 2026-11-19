@@ -1182,6 +1182,11 @@ fn drs_denied_error(anonymous: bool) -> DrsError {
     }
 }
 
+/// The time left until `deadline`, which a resolve run measures on its own clock.
+fn within(deadline: Instant) -> std::time::Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
 fn routed_deadline() -> Instant {
     Instant::now() + DRS_ROUTED_TIMEOUT
 }
@@ -1238,7 +1243,7 @@ async fn resolve_distributed_hash(
 ) -> Result<ResolveOutcome, DrsError> {
     let resolution = content_resolved(
         drive_until(
-            resolve_content(state.get_ctx().node_and_realm(), hash, deadline),
+            resolve_content(state.get_ctx().node_and_realm(), hash, within(deadline)),
             &state.get_ctx(),
             deadline,
         )
@@ -1278,7 +1283,7 @@ async fn resolve_global(
     let context = state.get_ctx();
     let found = match resolved(
         drive_until(
-            resolve_version(context.node_and_realm(), version_id, deadline),
+            resolve_version(context.node_and_realm(), version_id, within(deadline)),
             &context,
             deadline,
         )

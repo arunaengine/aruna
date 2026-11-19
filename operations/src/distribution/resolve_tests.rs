@@ -104,3 +104,25 @@ async fn content_page_bounded() {
         .unwrap();
     assert_eq!(other, (Vec::new(), false));
 }
+
+#[test]
+fn spent_deadline_stops() {
+    // Members are asked only while the runner clock is before the deadline.
+    use super::{AskSetOperation, SetAnswer};
+    use crate::s3::bucket::get::GetBucketError;
+    use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::BucketInfo;
+    let ask = |now_ms| {
+        let ids = Some((secret(3).public(), RealmId::from_bytes([1; 32])));
+        let version_id = ulid::Ulid::from_bytes([5; 16]);
+        let mut ask = AskSetOperation::new(ids, ready_set(), version_id, (0, Some(10)));
+        ask.stamp(now_ms);
+        ask.first().unwrap();
+        let missing = Err::<BucketInfo, _>(GetBucketError::NotFound);
+        ask.next(IoResult::Child(ChildOutcome::new(missing)))
+    };
+    assert!(matches!(ask(9), Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(ask(10), Ok(Next::Done((SetAnswer::Unknown, 0))));
+}
