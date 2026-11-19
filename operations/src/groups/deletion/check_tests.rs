@@ -303,3 +303,36 @@ async fn finished_jobs_pass() {
         );
     }
 }
+
+// A finished job family blocks its group until the prune pass deleted it; then nothing of it is
+// left to block the deletion.
+#[tokio::test]
+async fn pruned_families_pass() {
+    use crate::jobs::records::tests::prune::{index, pass, write as write_rows};
+    use crate::tests::records::{Family, payload};
+    use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
+    use aruna_core::structs::execution::job::record_keys::record_key;
+    use aruna_core::structs::execution::job::record_rows::to_bytes;
+    let fixture = Fixture::new(&[1]).await;
+    let group_id = payload().group_id;
+    let family = Family::new([95u8; 32]);
+    for envelope in &family.stopped_run() {
+        let key = record_key(&envelope.key()).to_vec();
+        let value = to_bytes(envelope).unwrap();
+        write(&fixture.context, FAMILY_RECORD_KEYSPACE, key, value).await;
+    }
+    write_rows(&fixture.context, index(&family, 2_000)).await;
+    let scan = || {
+        drive(
+            ScanOperation::new(&fixture.auth, group_id, node(1)),
+            &fixture.context,
+        )
+    };
+    assert_eq!(scan().await, Err(super::tests::empty("job families")));
+
+    for _ in 0..3 {
+        pass(&fixture.context).await;
+    }
+
+    assert_eq!(scan().await, Ok(()));
+}
