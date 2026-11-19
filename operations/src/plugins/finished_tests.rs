@@ -12,29 +12,31 @@ use serde_json::json;
 
 use super::*;
 use crate::plugins::host_calls::call_intent;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::page_result;
 use crate::plugins::rows::tests::values_result;
 use crate::plugins::runs::{list_runs, save_run};
 use crate::plugins::submit::WorkRequest;
-use crate::plugins::submit::tests::{path, ready, request, scope};
+use crate::plugins::submit::tests::{request, scope};
+use crate::plugins::test_support::{install_as, install_request};
 use crate::plugins::work::tests::edit_work;
 use crate::plugins::work::{FinalState, prune_work, read_work, summary_of};
 use crate::s3::object::copy::test::seed_bucket;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::{path, ready};
 
 /// An install whose version copies and has a `job_finished` trigger, with buckets `in` and `out`.
 async fn finisher(fixture: &Fixture) -> PluginInstall {
     let manifest = json!({ "permissions": { "required": ["objects.copy"] },
         "triggers": { "job_finished": {} } });
-    let mut request = fixture.request(None);
+    let mut request = install_request(&fixture, None);
     request.version = Some(fixture.publish("0.3.0", "ce", manifest).await);
     let data = format!("/{}/g/{}/data/**", fixture.actor.realm_id, fixture.group_id);
     let grants = [("read", data.clone()), ("write", data)];
     request.grants = (grants.into_iter())
         .map(|(grant, pattern)| (grant.to_string(), vec![pattern]))
         .collect();
-    let install = fixture.install(&request).await.unwrap();
+    let install = install_as(&fixture, &request).await.unwrap();
     for bucket in ["in", "out"] {
         seed_bucket(
             &fixture.ctx,

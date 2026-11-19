@@ -5,18 +5,19 @@
 
 use super::*;
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::event_trigger;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::rows::{StoreError, decode, read_call, values};
 use crate::plugins::runs::{TimerRow, list_runs, read_run};
-use crate::plugins::test_support::installed;
+use crate::plugins::test_support::{install_as, install_request};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_RUNS_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::SourceKind;
 use aruna_core::plugin_runs::{RUNS_QUEUED, timer_key};
 use aruna_drivers::driver::drive;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::artifacts::installed;
 
 const HOUR: u64 = 3600 * 1000;
 
@@ -58,7 +59,7 @@ async fn manual_runs() {
     let auth = fixture.auth();
     let elsewhere = start_run(ctx, &auth, realm, other, install.install_id, "{}", 5).await;
     assert!(matches!(elsewhere, Err(StartError::Elsewhere(node)) if node == local));
-    let plain = fixture.install(&fixture.request(None)).await.unwrap();
+    let plain = install_as(&fixture, &install_request(&fixture, None)).await.unwrap();
     let none = start_run(ctx, &auth, realm, local, plain.install_id, "{}", 5).await;
     assert!(matches!(none, Err(StartError::NoTrigger("manual"))));
 }

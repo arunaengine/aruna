@@ -11,23 +11,23 @@ use aruna_core::plugin_runs::RUNS_PARALLEL;
 use aruna_core::plugin_runs::RunState;
 use aruna_core::plugin_runs::RunTrigger;
 use aruna_drivers::driver::drive;
-use aruna_operations::plugins::calls::*;
+use aruna_operations::plugins::dispatch::StartRun;
 use aruna_operations::plugins::grants::short_path;
 use aruna_operations::plugins::host_calls::call_intent;
+use aruna_operations::plugins::install::InstallCaller;
 use aruna_operations::plugins::intents::unknown_row;
+use aruna_operations::plugins::lifecycle::{RemoveInstall, SetGrants, SetPaused};
 use aruna_operations::plugins::rows::StoreError;
 use aruna_operations::plugins::rows::write_rows;
 use aruna_operations::plugins::runs::event_run;
 use aruna_operations::plugins::runs::{admit, conclude, read_run, save_run, unfinished};
-use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::queued;
-#[allow(unused_imports)]
-pub(crate) use aruna_operations::plugins::test_support::{
-    connected, created, echoed_sync, install_artifact, installed, job_guest, publish_artifact,
-    scoped, secured, synced,
-};
 use aruna_plugin_types::calls::Intent;
 use aruna_plugins::{InvokeError, Trigger};
+use aruna_test_support::plugins::Fixture;
+#[allow(unused_imports)]
+use aruna_test_support::plugins::artifacts::installed;
+use aruna_test_support::plugins::queued;
+use aruna_test_support::plugins::{created, scoped, synced};
 use std::time::Duration;
 use ulid::Ulid;
 
@@ -186,16 +186,9 @@ async fn event_rechecked() {
     (run.state, run.attempts) = (RunState::Running, 1);
     drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();
     let narrowed = scoped(vec![format!("{base}/D2/**")]);
-    let auth = fixture.auth();
-    set_grants(
-        &fixture.ctx,
-        &fixture.actor,
-        &auth,
-        install.install_id,
-        &narrowed,
-    )
-    .await
-    .unwrap();
+    let caller = InstallCaller::new(&fixture.actor, &fixture.auth(), unix_timestamp_millis());
+    let grants = SetGrants::new(caller, install.install_id, &narrowed);
+    drive(grants, &fixture.ctx).await.unwrap();
 
     let worker = worker(&fixture);
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
@@ -267,6 +260,7 @@ async fn revoked_runs() {
     use aruna_operations::plugins::dispatch::StartError;
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let caller = || InstallCaller::new(actor, &auth, unix_timestamp_millis());
     let install = installed(&fixture).await;
     let state = async |run: &PluginRun| {
         let run = drive(read_run(install.install_id, run.run_id), ctx)
@@ -277,18 +271,16 @@ async fn revoked_runs() {
     let worker = worker(&fixture);
     let paused = admitted(&fixture, &install, 1, "spin").await;
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
-    pause_install(ctx, actor, &auth, install.install_id)
-        .await
-        .unwrap();
+    let pause = SetPaused::new(caller(), install.install_id, true);
+    drive(pause, ctx).await.unwrap();
     worker.claim(unix_timestamp_millis()).await.unwrap();
     worker.settle().await;
     let cancelled = (RunState::Cancelled, "the install was paused".to_string());
     assert_eq!(state(&paused).await, cancelled);
 
     // A draining receiver cancels its guests and refuses new runs, without a record write.
-    resume_install(ctx, actor, &auth, install.install_id)
-        .await
-        .unwrap();
+    let resume = SetPaused::new(caller(), install.install_id, false);
+    drive(resume, ctx).await.unwrap();
     let lost = admitted(&fixture, &install, 2, "spin").await;
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
     drain(&fixture).await;
@@ -296,7 +288,8 @@ async fn revoked_runs() {
     worker.settle().await;
     assert_eq!(state(&lost).await.1, "the node that runs it is draining");
     let (realm, node) = (actor.realm_id, actor.node_id);
-    let refused = start_run(ctx, &auth, realm, node, install.install_id, "{}", 1).await;
+    let start = StartRun::new(&auth, (realm, node), install.install_id, "{}", 1);
+    let refused = drive(start, ctx).await;
     assert!(matches!(refused, Err(StartError::Lost { receiver, .. }) if receiver == node));
     let before = read_config(ctx, realm).await.unwrap().installs;
     assert!(
@@ -307,7 +300,7 @@ async fn revoked_runs() {
 
     // Queued runs of a removed install end as cancelled.
     let queued = admitted(&fixture, &install, 3, "echo").await;
-    remove_install(ctx, actor, &auth, install.install_id)
+    drive(RemoveInstall::new(caller(), install.install_id), ctx)
         .await
         .unwrap();
     worker.claim(unix_timestamp_millis()).await.unwrap();
@@ -369,7 +362,8 @@ async fn removed_with_intents() {
     let intent = Intent::new(0, &[b"patch"]);
     let unknown = unknown_row(open.run_id, &call_intent(&intent), "timed out").unwrap();
     drive(write_rows(vec![unknown]), ctx).await.unwrap();
-    remove_install(ctx, actor, &auth, install.install_id)
+    let caller = InstallCaller::new(actor, &auth, unix_timestamp_millis());
+    drive(RemoveInstall::new(caller, install.install_id), ctx)
         .await
         .unwrap();
     worker(&fixture)

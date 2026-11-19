@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::plugin_host::plugin_work::run_plugin_work;
+use crate::plugin_host::read_config;
 use crate::plugin_host::worker::Worker;
 use crate::plugin_host::worker::tests::worker_on;
 use aruna_clock::unix_timestamp_millis;
@@ -22,13 +23,12 @@ use aruna_drivers::driver::drive;
 use aruna_drivers::testing::seed_bucket;
 use aruna_drivers::testing::with_blob;
 use aruna_operations::jobs::store::row_calls;
-use aruna_operations::plugins::calls::notify_work;
-use aruna_operations::plugins::calls::read_config;
-use aruna_operations::plugins::calls::settle_work;
+use aruna_operations::plugins::finished::NotifyDue;
 use aruna_operations::plugins::finished::drop_completion;
 use aruna_operations::plugins::finished::retry_run;
 use aruna_operations::plugins::finished::waits_for;
 use aruna_operations::plugins::host_calls::call_intent;
+use aruna_operations::plugins::job_work::SettleWork;
 use aruna_operations::plugins::runs::admit;
 use aruna_operations::plugins::runs::list_runs;
 use aruna_operations::plugins::runs::read_run;
@@ -36,15 +36,15 @@ use aruna_operations::plugins::state::MAX_STATE_BYTES;
 use aruna_operations::plugins::state::MAX_STATE_VALUE;
 use aruna_operations::plugins::state::put_state;
 use aruna_operations::plugins::state::remove_state;
-use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::install_artifact;
-use aruna_operations::plugins::test_support::job_context;
-use aruna_operations::plugins::test_support::job_guest;
-use aruna_operations::plugins::test_support::queued;
 use aruna_operations::plugins::work::list_work;
 use aruna_operations::s3::object::put::PutObjectOperation;
 use aruna_operations::testing_objects::put_config;
 use aruna_plugin_types::calls::Intent;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::artifacts::install_artifact;
+use aruna_test_support::plugins::artifacts::job_guest;
+use aruna_test_support::plugins::job_context;
+use aruna_test_support::plugins::queued;
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -178,9 +178,8 @@ async fn held(fixture: &Fixture) -> Held {
 
 async fn notify(fixture: &Fixture, blob: &DriverContext) -> usize {
     let config = read_config(blob, fixture.actor.realm_id).await.unwrap();
-    notify_work(blob, &config, fixture.actor.node_id, 3)
-        .await
-        .unwrap()
+    let due = NotifyDue::new(Arc::new(config), fixture.actor.node_id, 3);
+    drive(due, blob).await.unwrap()
 }
 
 /// Runs the install's one copy job on this node and records how it ended.
@@ -204,7 +203,7 @@ async fn run_copy(fixture: &Fixture, blob: &DriverContext, install: &PluginInsta
     finished.state = aruna_core::structs::execution::job::JobState::Succeeded;
     (finished.result, finished.finished_at_ms) = (Some(result), Some(1));
     drive(row_calls::insert_job(&finished), blob).await.unwrap();
-    assert_eq!(settle_work(blob, 2).await.unwrap(), 1);
+    assert_eq!(drive(SettleWork::new(2), blob).await.unwrap(), 1);
 }
 
 #[tokio::test]

@@ -10,13 +10,14 @@ use aruna_core::plugin_runs::{HookRequest, PluginRun, RunTrigger};
 use serde_json::json;
 
 use super::*;
-use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, hook_secret};
+use crate::plugins::bound::tests::hook_secret;
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::runs::list_runs;
-use crate::plugins::test_support::leaks;
 use aruna_drivers::driver::drive;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::leaks;
+use aruna_test_support::plugins::{TOKEN, bound, edit_config, hold_keys};
 
 /// An install moved to a version whose webhook the `header` slot `hook_key` verifies, bound to
 /// the group secret `hook-key` that checks `x-signature`.

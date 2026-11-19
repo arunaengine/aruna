@@ -7,7 +7,7 @@ use aruna_plugin_types::calls::{ErrorKind, HostError};
 use super::*;
 use crate::plugins::fixtures::{self, is_child, node};
 use crate::plugins::rows::tests::child_result;
-use crate::plugins::runs::tests::queued;
+use aruna_test_support::plugins::queued;
 
 fn scope() -> RunScope {
     RunScope {

@@ -10,11 +10,11 @@ use aruna_drivers::driver::drive;
 
 use super::*;
 use crate::plugins::cleanup::sweep_events;
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::matcher::tests::config;
-use crate::plugins::store::Txn;
-use crate::plugins::test_support::installed;
 use aruna_core::metadata::api::CreateDocumentPayload;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::artifacts::installed;
+use aruna_test_support::plugins::flows::matcher::config;
+use aruna_test_support::plugins::rows::Txn;
 
 fn pinned(fixture: &Fixture, name: &str) -> PinnedCreate {
     PinnedCreate {

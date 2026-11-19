@@ -13,13 +13,13 @@ use aruna_core::plugin_installs::InstallState;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_drivers::driver::drive;
 use aruna_operations::plugins::cleanup::sweep_events;
-use aruna_operations::plugins::flow_support::cleanup::count;
-use aruna_operations::plugins::flow_support::matcher::config;
-use aruna_operations::plugins::flow_support::matcher::journal;
-use aruna_operations::plugins::store::Txn;
-use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::created;
-use aruna_operations::plugins::test_support::installed;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::artifacts::installed;
+use aruna_test_support::plugins::created;
+use aruna_test_support::plugins::flows::cleanup::count;
+use aruna_test_support::plugins::flows::matcher::config;
+use aruna_test_support::plugins::flows::matcher::journal;
+use aruna_test_support::plugins::rows::Txn;
 
 #[tokio::test]
 async fn removed_install_rows() {

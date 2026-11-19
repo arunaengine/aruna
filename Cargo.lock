@@ -1046,6 +1046,7 @@ dependencies = [
  "aruna-net",
  "aruna-operations",
  "aruna-outbound",
+ "aruna-plugin-types",
  "aruna-storage",
  "aruna-tasks",
  "axum",
