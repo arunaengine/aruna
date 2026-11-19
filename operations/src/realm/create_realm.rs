@@ -8,6 +8,7 @@ use aruna_core::admin_documents::{
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -22,10 +23,8 @@ use aruna_core::structs::placement::record::{
     NodePlacementEntry, PlacementBinding, PlacementScope, band_start, normalize_placement_input,
 };
 use aruna_core::structured_id::{FieldError, PlacementHandle};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
@@ -56,6 +55,8 @@ pub struct CreateRealmOperation {
     config: CreateRealmConfig,
     auth_doc: Option<RealmAuthorizationDocument>,
     config_doc: Option<RealmConfigDocument>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl CreateRealmOperation {
@@ -64,6 +65,8 @@ impl CreateRealmOperation {
             config,
             auth_doc: None,
             config_doc: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -90,7 +93,7 @@ impl CreateRealmOperation {
         config_doc.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
         // The creator owns the root pool and consumes its first band before onboarding peers.
         config_doc.band_pools.push(BandPool {
-            pool_id: Ulid::generate(),
+            pool_id: self.ids.mint(self.now_ms),
             parent: None,
             issuer: self.config.actor.node_id,
             owner: self.config.actor.node_id,
@@ -98,7 +101,7 @@ impl CreateRealmOperation {
             end: band_start(HANDLE_BANDS),
         });
         let creator_range = HandleRange {
-            range_id: Ulid::generate(),
+            range_id: self.ids.mint(self.now_ms),
             owner: self.config.actor.node_id,
             start: FIRST_GRANTABLE_HANDLE,
             end: FIRST_GRANTABLE_HANDLE + HANDLE_RANGE_SIZE,
@@ -117,7 +120,7 @@ impl CreateRealmOperation {
             strategy_id,
             allocator_range_id: Some(creator_range.range_id),
             allocated_by: Some(self.config.actor.node_id),
-            allocated_at_ms: Some(unix_timestamp_millis()),
+            allocated_at_ms: Some(self.now_ms),
         });
         config_doc
             .placement_map
@@ -336,6 +339,14 @@ impl From<IoError> for CreateRealmError {
 impl Operation for CreateRealmOperation {
     type Output = CreatedRealm;
     type Error = CreateRealmError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
