@@ -254,6 +254,7 @@ def is_test(rel):
     name = os.path.basename(rel)
     return (
         "/tests/" in "/" + rel
+        or "_tests/" in rel
         or name == "tests.rs"
         or name.endswith("_tests.rs")
         or name.startswith(("test_", "tests_"))
