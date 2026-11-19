@@ -18,9 +18,8 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 use shared::{
-    AWS_REGION, SeedNode, TestResult, create_bearer_token, create_group_http,
-    create_restricted_credentials, create_s3_credentials, s3_client, sign_token,
-    spawn_complete_seed, spawn_s3_with,
+    AWS_REGION, TestResult, create_bearer_token, create_group_http, create_restricted_credentials,
+    create_s3_credentials, s3_client, s3_setup, sign_token, spawn_complete_seed, spawn_s3_with,
 };
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -35,25 +34,6 @@ where
         .err()
         .and_then(|err| err.as_service_error().and_then(|inner| inner.code()))
         .map(ToOwned::to_owned)
-}
-
-async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client)> {
-    let seed = spawn_complete_seed().await?;
-    let admin_token = create_bearer_token(
-        seed.context.as_ref(),
-        seed.user_id,
-        seed.realm_id,
-        seed.capabilities.clone(),
-    )
-    .await?;
-    let group = create_group_http(&seed.base_url, &admin_token, group_name).await?;
-    let credentials = create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
-    let endpoint = seed
-        .s3
-        .as_ref()
-        .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-    let client = s3_client(endpoint, &credentials);
-    Ok((seed, client))
 }
 
 #[tokio::test]
