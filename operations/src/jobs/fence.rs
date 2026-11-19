@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::VecDeque;
+use std::str::FromStr;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -14,11 +15,12 @@ use aruna_core::keyspaces::{COMPUTE_DEPARTURE_KEYSPACE, JOB_RESERVATION_KEYSPACE
 use aruna_core::node_state::START_FENCE_KEY;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{JobId, left_executions};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
 use tracing::{info, warn};
 
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::membership::MembershipViewOperation;
 use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
 use crate::jobs::store::mutation_error::JobMutationError;
@@ -47,23 +49,64 @@ pub fn fence_up(result: IoResult) -> bool {
     result.value().map_or(true, |value| value.is_some())
 }
 
-/// Raises the fence at start, before any peer can reach this node.
-#[derive(Debug, Default, PartialEq)]
-pub struct RaiseFenceOperation;
+/// The management nodes of `config` other than `local`, which a start catches up with. A device
+/// does not sync the realm config with them and runs only its owner's local jobs, so it waits on
+/// none.
+pub fn catch_up_peers(config: &RealmConfigDocument, local: NodeId) -> Vec<NodeId> {
+    let syncs = (config.nodes.iter())
+        .find(|node| NodeId::from_str(&node.node_id).ok() == Some(local))
+        .is_some_and(|node| node.kind.is_sync_eligible());
+    if !syncs {
+        return Vec::new();
+    }
+    (config.nodes.iter())
+        .filter(|node| node.kind == RealmNodeKind::Management)
+        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+        .filter(|node_id| *node_id != local)
+        .collect()
+}
+
+/// Raises the fence at start, before any peer can reach this node. A node with no management
+/// node to catch up with has nothing to wait for; an unreadable realm config raises it.
+#[derive(Debug, PartialEq)]
+pub struct RaiseFenceOperation {
+    local: NodeId,
+    realm_id: RealmId,
+    writing: bool,
+}
+
+impl RaiseFenceOperation {
+    pub fn new(local: NodeId, realm_id: RealmId) -> Self {
+        Self {
+            local,
+            realm_id,
+            writing: false,
+        }
+    }
+}
 
 impl Operation for RaiseFenceOperation {
     type Output = ();
     type Error = IoError;
 
     fn first(&mut self) -> Result<Next<()>, IoError> {
-        let (space, key) = fence_row();
-        let row = (space, key, Value::from(&[][..]));
-        Ok(Next::Call(IoCall::Write(vec![row])))
+        let read = GetConfigOperation::new(self.realm_id);
+        Ok(Next::Call(IoCall::child(read)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
-        result.done()?;
-        Ok(Next::Done(()))
+        if self.writing {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+        if config.is_ok_and(|config| catch_up_peers(&config, self.local).is_empty()) {
+            return Ok(Next::Done(()));
+        }
+        self.writing = true;
+        let (space, key) = fence_row();
+        let row = (space, key, Value::from(&[][..]));
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 

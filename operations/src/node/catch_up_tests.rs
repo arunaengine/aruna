@@ -4,6 +4,8 @@
 
 use aruna_core::calls::ChildOutcome;
 
+use aruna_core::structs::identity::realm::RealmNodeKind;
+
 use super::*;
 use crate::tests::records::REALM;
 

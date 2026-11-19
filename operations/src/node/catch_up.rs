@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::str::FromStr;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -15,14 +14,14 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::COMPUTE_DEPARTURE_KEYSPACE;
 use aruna_core::node_state::{DISCARD_KEY, LAST_CONTACT_KEY};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
 use tracing::{debug, warn};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::jobs::fence::LiftFenceOperation;
+use crate::jobs::fence::{LiftFenceOperation, catch_up_peers};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::held::HeldReservations;
 
@@ -108,7 +107,7 @@ impl CatchUpOperation {
 
     /// A management node without other management nodes counts through its own config.
     fn configured(&mut self, config: &RealmConfigDocument) -> CatchUpNext {
-        self.management = management_nodes(config, self.local);
+        self.management = catch_up_peers(config, self.local);
         match self.management.is_empty() {
             true => self.contact(),
             false => self.round(0),
@@ -158,7 +157,7 @@ impl CatchUpOperation {
     /// Asks the management nodes the applied config names that had no round yet. Only rounds
     /// with a current management node count; with none of them the node has not caught up.
     fn reloaded(&mut self, config: &RealmConfigDocument) -> CatchUpNext {
-        let current = management_nodes(config, self.local);
+        let current = catch_up_peers(config, self.local);
         self.targets
             .retain(|(node_id, _)| current.contains(node_id));
         let asked = self.management.len();
@@ -288,22 +287,6 @@ impl Operation for CatchUpOperation {
             }
         }
     }
-}
-
-/// The management nodes of `config` other than `local`. A device does not sync the realm config
-/// with them and runs only its owner's local jobs, so it waits on none.
-fn management_nodes(config: &RealmConfigDocument, local: NodeId) -> Vec<NodeId> {
-    let syncs = (config.nodes.iter())
-        .find(|node| NodeId::from_str(&node.node_id).ok() == Some(local))
-        .is_some_and(|node| node.kind.is_sync_eligible());
-    if !syncs {
-        return Vec::new();
-    }
-    (config.nodes.iter())
-        .filter(|node| node.kind == RealmNodeKind::Management)
-        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
-        .filter(|node_id| *node_id != local)
-        .collect()
 }
 
 /// Writes the last contact, and deletes the marker of an unfinished discard in the same

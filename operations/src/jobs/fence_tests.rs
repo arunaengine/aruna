@@ -83,18 +83,39 @@ fn viewed(view: WriterView) -> LiftFenceOperation {
     lift
 }
 
-// The raise writes the fence row; an unreadable fence row counts as up.
+/// The answer of a realm config read with node 4 as a server and `managers` as management nodes.
+fn realm(managers: &[u8]) -> IoResult {
+    use aruna_core::structs::identity::realm::RealmNodeKind;
+    let mut config = RealmConfigDocument::new(REALM, Vec::new(), 5);
+    config.ensure_node(node(4), RealmNodeKind::Server);
+    for seed in managers {
+        config.ensure_node(node(*seed), RealmNodeKind::Management);
+    }
+    child(Ok::<_, GetConfigError>(config))
+}
+
+// A node with a management node to catch up with, or without a readable config, writes the
+// fence row; a node with none has nothing to wait for. An unreadable fence row counts as up.
 #[test]
 fn raises_and_reads() {
-    let mut raise = RaiseFenceOperation;
-    let Ok(Next::Call(IoCall::Write(rows))) = raise.first() else {
-        panic!("the fence row is written");
+    let raised = |answer: IoResult| {
+        let mut raise = RaiseFenceOperation::new(node(4), REALM);
+        let read = IoCall::child(GetConfigOperation::new(REALM));
+        assert_eq!(raise.first(), Ok(Next::Call(read)));
+        let next = raise.next(answer);
+        let Ok(Next::Call(IoCall::Write(rows))) = next else {
+            return false;
+        };
+        let row = (rows[0].0.as_str(), rows[0].1.as_ref());
+        assert_eq!(row, (COMPUTE_DEPARTURE_KEYSPACE, START_FENCE_KEY));
+        assert_eq!(raise.next(IoResult::Done), Ok(Next::Done(())));
+        true
     };
-    assert_eq!(
-        (rows[0].0.as_str(), rows[0].1.as_ref()),
-        (COMPUTE_DEPARTURE_KEYSPACE, START_FENCE_KEY)
-    );
-    assert_eq!(raise.next(IoResult::Done), Ok(Next::Done(())));
+    assert!(raised(realm(&[2])));
+    assert!(raised(child(Err::<RealmConfigDocument, _>(
+        GetConfigError::DocumentNotFound
+    ))));
+    assert!(!raised(realm(&[])));
     assert!(fence_up(IoResult::Values(vec![Some(Value::from(&[][..]))])));
     assert!(!fence_up(IoResult::Values(vec![None])));
     assert!(fence_up(IoResult::Done));
