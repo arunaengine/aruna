@@ -157,6 +157,8 @@ impl ServeAdmissionOperation {
     }
 }
 
+type Served = Result<Next<MetadataTransportMessage>, IoError>;
+
 impl Operation for ServeAdmissionOperation {
     type Output = MetadataTransportMessage;
     type Error = IoError;

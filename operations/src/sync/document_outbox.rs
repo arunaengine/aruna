@@ -274,7 +274,6 @@ mod tests {
         OUTBOX_DRAIN_SIZE, admin_outbox_prefix, outbox_key, outbox_prefix, revocation_index_entry,
     };
     use crate::sync::outbox_record::{new_identified_record, write_outbox_effect};
-    use aruna_test_support::documents::{read_outbox_record, read_outbox_records};
     use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
@@ -290,6 +289,7 @@ mod tests {
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
     use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_test_support::documents::{read_outbox_record, read_outbox_records};
     use tempfile::tempdir;
     use ulid::Ulid;
 

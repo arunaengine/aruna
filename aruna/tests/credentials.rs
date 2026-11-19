@@ -1155,8 +1155,13 @@ async fn token_needs_credential() -> TestResult<()> {
 
         // A holder publishes the live token's request without reading the creator's vault.
         let action = KeyAction::Publish(grant.clone());
-        let mut operation =
-            CallRun::new(KeyOperation::new(BUCKET.into(), auth.clone(), node, action, now));
+        let mut operation = CallRun::new(KeyOperation::new(
+            BUCKET.into(),
+            auth.clone(),
+            node,
+            action,
+            now,
+        ));
         let mut effects: std::collections::VecDeque<_> = operation.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {
             let aruna_core::effects::Effect::Storage(effect) = effect else {

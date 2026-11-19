@@ -5,11 +5,11 @@
 use crate::shared;
 
 use aruna_core::UserId;
+use aruna_core::calls::CallRun;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::key_seal::{SealedSecret, open_sealed, seal_to};
-use aruna_core::calls::CallRun;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::abe::{
     AbeError, GRANT_PURPOSE, SysRng, create_parameters, derive_master, setup_context,
@@ -2194,8 +2194,13 @@ async fn abe_epochs() -> TestResult<()> {
         let node = seed.net.node_id();
         let now = aruna_clock::unix_timestamp_millis();
         let action = KeyAction::Epoch { instant: false };
-        let mut operation =
-            CallRun::new(KeyOperation::new(BUCKET.into(), auth.clone(), node, action.clone(), now));
+        let mut operation = CallRun::new(KeyOperation::new(
+            BUCKET.into(),
+            auth.clone(),
+            node,
+            action.clone(),
+            now,
+        ));
         let mut effects: std::collections::VecDeque<Effect> =
             operation.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {
@@ -2545,8 +2550,13 @@ async fn publish_racing(
     };
     let now = aruna_clock::unix_timestamp_millis();
     let action = KeyAction::Publish(grant);
-    let mut operation =
-        CallRun::new(KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), action, now));
+    let mut operation = CallRun::new(KeyOperation::new(
+        BUCKET.into(),
+        auth,
+        seed.net.node_id(),
+        action,
+        now,
+    ));
     let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
     let mut race = Some(race);
     while let Some(effect) = effects.pop_front() {

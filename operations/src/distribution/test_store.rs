@@ -3,6 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::inventory::{AddedVersion, HeadChange, InventoryChange, InventoryUpdate};
+#[cfg(test)]
+use super::inventory::{InventoryError, open_ranges};
+#[cfg(test)]
+use crate::s3::usage::{UsageCounterUpdate, UsageUpdateError};
 #[cfg(test)]
 use aruna_core::calls::{IoCall, IoError, IoResult};
 #[cfg(test)]
@@ -11,6 +16,8 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 #[cfg(test)]
 use aruna_core::keyspaces::{INVENTORY_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
+#[cfg(test)]
+use aruna_core::rows::StagedCall;
 use aruna_core::structs::storage::distribution::accounting::RangeCounters;
 #[cfg(test)]
 use aruna_core::structs::storage::distribution::accounting::{RangeAccount, account_key};
@@ -25,13 +32,6 @@ use byteview::ByteView;
 #[cfg(test)]
 use tempfile::TempDir;
 use ulid::Ulid;
-use super::inventory::{AddedVersion, HeadChange, InventoryChange, InventoryUpdate};
-#[cfg(test)]
-use super::inventory::{InventoryError, open_ranges};
-#[cfg(test)]
-use crate::s3::usage::{UsageCounterUpdate, UsageUpdateError};
-#[cfg(test)]
-use aruna_core::rows::StagedCall;
 
 #[cfg(test)]
 pub fn open() -> (TempDir, StorageHandle) {
@@ -390,7 +390,10 @@ impl Feeder {
     }
 
     /// Keeps the cursors of a finished pass; true when it changed an index or a row.
-    pub fn passed<E>(&mut self, pass: Result<crate::distribution::feed_walks::FeedPass, E>) -> bool {
+    pub fn passed<E>(
+        &mut self,
+        pass: Result<crate::distribution::feed_walks::FeedPass, E>,
+    ) -> bool {
         match pass {
             Ok(pass) => {
                 self.cursors = pass.cursors;

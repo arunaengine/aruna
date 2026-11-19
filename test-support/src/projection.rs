@@ -4,9 +4,9 @@
 
 use std::time::Duration;
 
-use aruna_drivers::driver::{DriverContext, drive};
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataEventRecord;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::projection::{
     DrainProjectionOperation, MetadataProjectionError, PendingProjectionResult,
     ProjectEventsOperation, ProjectLoggedOperation, ProjectionWakeOperation, ReplayPageOperation,

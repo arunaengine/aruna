@@ -18,11 +18,9 @@ use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::context::ExternalReconciler;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::JOB_MAX_ATTEMPTS;
-use aruna_test_support::jobs::{
-    insert_job, read_job_record, record_attempt_intent,
-};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::jobs::{insert_job, read_job_record, record_attempt_intent};
 use std::sync::Arc;
 use tempfile::tempdir;
 use ulid::Ulid;

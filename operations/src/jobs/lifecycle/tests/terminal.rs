@@ -159,14 +159,32 @@ async fn publishes_terminal_success() {
         pinned_image: "alpine@sha256:0".to_string(),
         attempt_epoch: 0,
     };
-    let commit = aruna_drivers::driver::drive(crate::jobs::store::job_calls::record_attempt_intent( physical(), TOKEN, intent, Some(receipt.execution_id), None, 4_100, ), &ctx)
+    let commit = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            physical(),
+            TOKEN,
+            intent,
+            Some(receipt.execution_id),
+            None,
+            4_100,
+        ),
+        &ctx,
+    )
     .await
     .expect("attempt intent commits");
     let executor = family.target.public();
     let destinations = vec![(executor, "ws".to_string(), "out.txt".to_string())];
-    let control = aruna_drivers::driver::drive(crate::jobs::store::job_calls::reserve_output_commits(physical(), destinations.to_vec(), Default::default(), aruna_core::time::unix_timestamp_millis()), &ctx)
-        .await
-        .expect("output commits reserved");
+    let control = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::reserve_output_commits(
+            physical(),
+            destinations.to_vec(),
+            Default::default(),
+            aruna_core::time::unix_timestamp_millis(),
+        ),
+        &ctx,
+    )
+    .await
+    .expect("output commits reserved");
     let outputs = vec![OutputObject {
         node_id: executor,
         bucket: "ws".to_string(),

@@ -7,6 +7,7 @@ use crate::connectors::descriptor::build_source_binding;
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES};
 use aruna_core::UserId;
+use aruna_core::calls::CallRun;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -15,7 +16,6 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
-use aruna_core::calls::CallRun;
 use aruna_core::structs::execution::job::{
     JobClaim, JobId, JobPayload, JobRecord, StagingJobCheckpoint, StagingJobPhase,
 };
@@ -623,7 +623,9 @@ fn page_bounds_entries() {
 // A progress flush and a lease renewal that commit while the page is open must not conflict.
 #[tokio::test]
 async fn flush_keeps_page() {
-    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -649,12 +651,18 @@ async fn flush_keeps_page() {
         let commit = matches!(effect, StorageEffect::CommitTransaction { .. });
         if commit {
             let progress = job.progress.clone();
-            aruna_drivers::driver::drive(crate::jobs::store::job_calls::flush_progress(job.job_id, token(), progress, 2), context)
-                .await
-                .unwrap();
-            aruna_drivers::driver::drive(crate::jobs::store::job_calls::renew_lease(job.job_id, token(), 3, None), context)
-                .await
-                .unwrap();
+            aruna_drivers::driver::drive(
+                crate::jobs::store::job_calls::flush_progress(job.job_id, token(), progress, 2),
+                context,
+            )
+            .await
+            .unwrap();
+            aruna_drivers::driver::drive(
+                crate::jobs::store::job_calls::renew_lease(job.job_id, token(), 3, None),
+                context,
+            )
+            .await
+            .unwrap();
         }
         let event = storage.send_storage_effect(effect).await;
         if commit {
@@ -677,9 +685,11 @@ async fn flush_keeps_page() {
 #[tokio::test]
 async fn bare_size_unchanged() {
     use crate::connectors::repository::source_connector_key;
-    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
     use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -756,11 +766,13 @@ async fn bare_size_unchanged() {
 // registered head, so usage and connector rows are counted once.
 #[tokio::test]
 async fn replay_charges_once() {
-    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::IterStart;
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
     use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -852,11 +864,13 @@ fn guards_carry_hint() {
 #[tokio::test]
 async fn page_maintains_inventory() {
     use crate::distribution::test_store::{counters, has_row, install, range};
-    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::storage::distribution::accounting::generation_key;
     use aruna_core::structs::storage::distribution::inventory::head_position;
     use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -867,7 +881,13 @@ async fn page_maintains_inventory() {
     // Member 1 of the test set coordinates the keys "a" and "b".
     let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
     let set_id = snapshot.set_id();
-    aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), record_bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
     bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -924,10 +944,12 @@ async fn page_needs_coordinator() {
     use crate::distribution::guard::GuardError;
     use crate::distribution::test_record::{binding, record as set_record};
     use crate::distribution::test_store::{has_row, install, range};
-    use aruna_test_support::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::storage::distribution::inventory::head_position;
     use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -938,7 +960,13 @@ async fn page_needs_coordinator() {
     // Member 1 coordinates "a"; member 2 coordinates "x".
     let (snapshot, record_bytes) = set_record(true);
     let set_id = snapshot.set_id();
-    aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), record_bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
     bound.distribution = Some(binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -1059,9 +1087,9 @@ fn print_sizes(
 #[tokio::test]
 async fn distributed_sizes_measured() {
     use crate::distribution::test_store::{install, range};
-    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
 
     const ENTRIES: usize = 100;
     let test = setup_driver_context().await;
@@ -1072,7 +1100,13 @@ async fn distributed_sizes_measured() {
     let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
     let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
     let set_id = snapshot.set_id();
-    aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), record_bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
     bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -1104,8 +1138,8 @@ async fn distributed_sizes_measured() {
 // for the entry size work, not a size contract. Run with `--nocapture` to read it.
 #[tokio::test]
 async fn entry_sizes_measured() {
-    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
     use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
 
     const ENTRIES: usize = 100;
     let test = setup_driver_context().await;
@@ -1190,8 +1224,8 @@ async fn count_exchanges(
 #[tokio::test]
 async fn page_exchanges_measured() {
     use crate::distribution::test_store::{install, range};
-    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
 
     const ENTRIES: usize = 500;
     let test = setup_driver_context().await;
@@ -1202,7 +1236,13 @@ async fn page_exchanges_measured() {
     let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
     let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
     let set_id = snapshot.set_id();
-    aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), record_bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
     bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),

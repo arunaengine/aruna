@@ -28,9 +28,9 @@ use super::store::row_calls::preserve_artifact_tombstone;
 use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation, validate_execution};
 use super::submit_local::DedupLookupOperation;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_test_support::jobs::insert_job;
 use aruna_test_support::jobs::read_job_record;
-use aruna_drivers::driver::{DriverContext, drive};
 
 fn node_id() -> NodeId {
     iroh::SecretKey::from_bytes(&[7u8; 32]).public()
@@ -143,9 +143,7 @@ async fn caps_declared_outputs() {
         collision_policy: Default::default(),
     };
 
-    let error = submit_shared(&context, spec.clone())
-    .await
-    .unwrap_err();
+    let error = submit_shared(&context, spec.clone()).await.unwrap_err();
     assert!(matches!(
         error,
         SubmitJobError::TooManyOutputs {
@@ -161,8 +159,7 @@ async fn caps_declared_outputs() {
     ));
     spec.output_prefixes.clear();
     assert!(!matches!(
-        submit_shared(&context, spec)
-        .await,
+        submit_shared(&context, spec).await,
         Err(SubmitJobError::TooManyOutputs { .. })
     ));
 }

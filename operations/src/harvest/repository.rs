@@ -9,7 +9,6 @@ use aruna_core::keyspaces::{HARVEST_PROVENANCE_KEYSPACE, HARVEST_SOURCE_KEYSPACE
 use aruna_core::structs::execution::harvest::{
     HarvestProvenance, HarvestSource, harvest_provenance_key, harvest_provenance_prefix,
 };
-use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
 use ulid::Ulid;

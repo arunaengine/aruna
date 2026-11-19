@@ -104,9 +104,9 @@ pub mod submit {
     use crate::plugins::test_support::edit_config;
     use crate::plugins::test_support::path;
     use crate::plugins::work::RequestContext;
-    use aruna_drivers::testing::seed_bucket;
     use aruna_core::plugin_installs::PluginInstall;
     use aruna_drivers::driver::DriverContext;
+    use aruna_drivers::testing::seed_bucket;
     use ulid::Ulid;
 
     /// An install granted the group's data whose `catalog` connection injects the slot `api_key`.
@@ -160,8 +160,8 @@ pub mod submit {
     ) -> (tempfile::TempDir, DriverContext) {
         use crate::s3::object::put::PutObjectOperation;
         use crate::testing_objects::put_config;
-        use aruna_drivers::testing::with_blob;
         use aruna_drivers::driver::drive;
+        use aruna_drivers::testing::with_blob;
         let root = tempfile::tempdir().unwrap();
         let blob = with_blob(&fixture.ctx, root.path()).await;
         let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);

@@ -345,9 +345,9 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use aruna_test_support::jobs::insert_job;
     use aruna_core::structs::execution::job::JobId;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_test_support::jobs::insert_job;
 
     const TOKEN: Ulid = Ulid(0x5EA1);
 
@@ -456,20 +456,37 @@ mod tests {
         // The signed record must be readable back under the digest terminal
         // success will name, and a replay must not mint a second record.
         let (_dir, context, record, net) = fixture().await;
-        aruna_drivers::driver::drive(crate::jobs::store::job_calls::record_attempt_intent( record.job_id, TOKEN, AttemptIntent {
-                attempt_no: 1,
-                external_name: "aruna-test-a1".to_string(),
-                executor_kind: "docker".to_string(),
-                pinned_image: "alpine@sha256:0".to_string(),
-                attempt_epoch: 0,
-            }, None, None, 2_000, ), &context)
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::record_attempt_intent(
+                record.job_id,
+                TOKEN,
+                AttemptIntent {
+                    attempt_no: 1,
+                    external_name: "aruna-test-a1".to_string(),
+                    executor_kind: "docker".to_string(),
+                    pinned_image: "alpine@sha256:0".to_string(),
+                    attempt_epoch: 0,
+                },
+                None,
+                None,
+                2_000,
+            ),
+            &context,
+        )
         .await
         .unwrap();
         let destinations = vec![(net.node_id(), "ws".to_string(), "reports/a.txt".to_string())];
-        let control =
-            aruna_drivers::driver::drive(crate::jobs::store::job_calls::reserve_output_commits(record.job_id, destinations.to_vec(), Default::default(), aruna_core::time::unix_timestamp_millis()), &context)
-                .await
-                .unwrap();
+        let control = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::reserve_output_commits(
+                record.job_id,
+                destinations.to_vec(),
+                Default::default(),
+                aruna_core::time::unix_timestamp_millis(),
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
         let version_id = control.output_commits[0].version_id;
         let outputs = vec![output(control.execution_id, version_id)];
 
@@ -477,16 +494,25 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = aruna_drivers::driver::drive(crate::jobs::store::row_calls::read_attempt_control(record.job_id, control.attempt_epoch), &context)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::read_attempt_control(
+                record.job_id,
+                control.attempt_epoch,
+            ),
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(stored.output_record, Some(digest));
 
-        let envelope = aruna_drivers::driver::drive(crate::jobs::store::row_calls::read_output_record(record.job_id, control.attempt_epoch), &context)
-            .await
-            .unwrap()
-            .unwrap();
+        let envelope = aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::read_output_record(record.job_id, control.attempt_epoch),
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(envelope.digest().unwrap(), digest);
         assert!(envelope.verify_signature().is_ok());
         let JobFamilyRecord::Output(output_record) = &envelope.record else {

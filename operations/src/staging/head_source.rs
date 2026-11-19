@@ -100,12 +100,12 @@ impl Operation for HeadSourceOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::execution::source_access::ResolvedSourceConnector;
+    use aruna_drivers::driver::drive;
     use aruna_test_support::staging::{
         create_http_connector, sample_connector, sample_metadata, sample_resolved_connector,
         setup_driver_context,
     };
-    use aruna_core::structs::execution::source_access::ResolvedSourceConnector;
-    use aruna_drivers::driver::drive;
 
     fn sample_input() -> HeadSourceInput {
         HeadSourceInput {

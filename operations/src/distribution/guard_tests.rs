@@ -184,7 +184,13 @@ async fn uploads_follow_authority() {
     let (_dir, handle) = open();
     let context = context(&handle);
     let (snapshot, bytes) = record(true);
-    aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let own = binding(&snapshot, 1, 5);
     let upload = Ulid::from_bytes([4; 16]);
     let tag = drive(upload_tag(&own, "a", upload), &context)
@@ -219,7 +225,13 @@ async fn replicas_take_reads() {
     let (_dir, handle) = open();
     let context = context(&handle);
     let (snapshot, bytes) = replicated(true, 1);
-    aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let replica = binding(&snapshot, 2, 5);
     let lower = snapshot.config.ranges[0].range_id;
     assert_eq!(
@@ -233,7 +245,13 @@ async fn replicas_take_reads() {
     let (_dir, handle) = open();
     let context = crate::distribution::test_store::context(&handle);
     let (snapshot, bytes) = record(true);
-    aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let stranger = binding(&snapshot, 2, 5);
     let lower = snapshot.config.ranges[0].range_id;
     assert_eq!(
@@ -250,7 +268,13 @@ async fn fenced_coordinator_refuses() {
     let (_dir, handle) = open();
     let context = context(&handle);
     let (snapshot, bytes) = record(true);
-    aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let own = binding(&snapshot, 1, 5);
     assert_eq!(drive(read_coordinator(&own, "a"), &context).await, Ok(None));
     assert_eq!(
@@ -296,7 +320,13 @@ async fn copies_answer_reads() {
     let (_dir, handle) = open();
     let context = context(&handle);
     let (snapshot, bytes) = replicated(true, 1);
-    aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let (coordinator, copy) = (binding(&snapshot, 1, 5), binding(&snapshot, 2, 5));
     let lower = snapshot.config.ranges[0].range_id;
     assert_eq!(

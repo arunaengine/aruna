@@ -2,21 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
-use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::groups::routing::BucketRules;
-use aruna_operations::groups::routing::SnapshotOperation;
-use aruna_operations::placement::policy::GateOperation;
-use aruna_operations::replication::queue::LiveVersionInput;
-use aruna_operations::replication::queue::LiveVersionOperation;
-use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::s3::object::head::HeadObjectInput;
-use aruna_operations::s3::object::head::HeadObjectOperation;
-use aruna_operations::s3::object::put::PutObjectConfig;
-use aruna_operations::s3::object::put::PutObjectInput;
-use aruna_operations::s3::object::put::PutObjectOperation;
-use aruna_operations::s3::object::search::SearchObjectsInput;
-use aruna_operations::s3::object::search_scan::SearchObjectsOperation;
 use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
@@ -39,6 +24,23 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_net::NetHandle;
+use aruna_operations::connectors::create_connector::{
+    SourceConnectorInput, SourceConnectorOperation,
+};
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::groups::routing::BucketRules;
+use aruna_operations::groups::routing::SnapshotOperation;
+use aruna_operations::placement::policy::GateOperation;
+use aruna_operations::replication::queue::LiveVersionInput;
+use aruna_operations::replication::queue::LiveVersionOperation;
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::object::head::HeadObjectInput;
+use aruna_operations::s3::object::head::HeadObjectOperation;
+use aruna_operations::s3::object::put::PutObjectConfig;
+use aruna_operations::s3::object::put::PutObjectInput;
+use aruna_operations::s3::object::put::PutObjectOperation;
+use aruna_operations::s3::object::search::SearchObjectsInput;
+use aruna_operations::s3::object::search_scan::SearchObjectsOperation;
 use aruna_storage::storage;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
@@ -361,8 +363,10 @@ pub struct Fixture {
 
 impl Fixture {
     pub async fn new(endpoint: &str, table: serde_json::Value) -> Self {
-        use aruna_operations::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
         use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_operations::connectors::create_connector::{
+            SourceConnectorInput, SourceConnectorOperation,
+        };
 
         let test = setup_driver_context().await;
         let driver = test.driver_context;
@@ -415,9 +419,12 @@ impl Fixture {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        aruna_drivers::driver::drive(aruna_operations::jobs::store::row_calls::insert_job(&record), &self.driver)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            aruna_operations::jobs::store::row_calls::insert_job(&record),
+            &self.driver,
+        )
+        .await
+        .unwrap();
         JobContext {
             driver: self.driver.clone(),
             job_id,

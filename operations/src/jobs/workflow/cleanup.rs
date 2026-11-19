@@ -300,13 +300,13 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use aruna_test_support::jobs::insert_job;
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;
     use aruna_core::jobs::ProgressReporter;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::jobs::context::JobContext;
+    use aruna_test_support::jobs::insert_job;
 
     async fn run_terminal_cleanup(
         ctx: &JobContext,
@@ -495,12 +495,22 @@ mod tests {
             lease_expires_ms: 10_000,
         });
         insert_job(context, &record).await.unwrap();
-        aruna_drivers::driver::drive(crate::jobs::store::job_calls::record_attempt_intent( job_id, token, intent(job_id, kind), None, None, 2, ), context)
-            .await
-            .unwrap()
-            .record
-            .attempt_intent
-            .unwrap()
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::record_attempt_intent(
+                job_id,
+                token,
+                intent(job_id, kind),
+                None,
+                None,
+                2,
+            ),
+            context,
+        )
+        .await
+        .unwrap()
+        .record
+        .attempt_intent
+        .unwrap()
     }
 
     async fn seed_workspace(

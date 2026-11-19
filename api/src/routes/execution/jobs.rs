@@ -470,9 +470,7 @@ fn encode_report_cursor(
         .transpose()
 }
 
-pub(crate) fn map_submit_error(
-    error: aruna_core::job_request::SubmitJobError,
-) -> ServerError {
+pub(crate) fn map_submit_error(error: aruna_core::job_request::SubmitJobError) -> ServerError {
     use aruna_core::job_request::SubmitJobError;
     match error {
         SubmitJobError::JobPlanConflict { existing_job_id } => ServerError::JobPlanConflict(

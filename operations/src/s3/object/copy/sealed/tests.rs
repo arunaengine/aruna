@@ -419,11 +419,11 @@ async fn governed_copy_registered() {
     use crate::placement::policy::GateOperation;
     use crate::s3::object::copy::test::{admits, seed_bucket};
     use crate::tests::policy::{seed_gate, subject};
-    use aruna_test_support::s3::full_context;
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
     use aruna_core::managed_copy::{CopyRequest, validate_registration};
     use aruna_core::structs::storage::blob::ManagedCopyKey;
     use aruna_drivers::driver::drive;
+    use aruna_test_support::s3::full_context;
 
     let (_temp, context) = full_context().await;
     let realm_id = RealmId::from_bytes([3; 32]);

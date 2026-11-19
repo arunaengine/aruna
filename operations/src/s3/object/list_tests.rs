@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_test_support::s3::test_storage;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -20,6 +19,7 @@ use aruna_core::types::Value;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
 use aruna_storage::storage;
+use aruna_test_support::s3::test_storage;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
 

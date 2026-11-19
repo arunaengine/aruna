@@ -538,7 +538,6 @@ impl Operation for SubmitJobOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_test_support::jobs::read_job_record;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{JOB_INDEX_KEYSPACE, JOB_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
@@ -554,6 +553,7 @@ mod tests {
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
+    use aruna_test_support::jobs::read_job_record;
     use byteview::ByteView;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -1008,19 +1008,28 @@ mod tests {
         );
 
         let crate::jobs::store::job_calls::ClaimOutcome::Claimed(claimed) =
-            aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(first.job_id, node_id(3), 2_000), &ctx)
-                .await
-                .unwrap()
+            aruna_drivers::driver::drive(
+                crate::jobs::store::job_calls::claim_job(first.job_id, node_id(3), 2_000),
+                &ctx,
+            )
+            .await
+            .unwrap()
         else {
             panic!("job must be claimed");
         };
         let token = claimed.claim.unwrap().claim_token;
-        aruna_drivers::driver::drive(crate::jobs::store::job_calls::transition_to_running(first.job_id, token, 2_100), &ctx)
-            .await
-            .unwrap();
-        aruna_drivers::driver::drive(crate::jobs::store::job_calls::cancel_running_job(first.job_id, token, 2_200), &ctx)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::transition_to_running(first.job_id, token, 2_100),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::cancel_running_job(first.job_id, token, 2_200),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         let mut third = rocrate_spec(1, None);
         seed_upload(&ctx, &mut third, 6, u64::MAX).await;
@@ -1086,19 +1095,28 @@ mod tests {
         assert_eq!(second.job_id, first.job_id);
 
         let crate::jobs::store::job_calls::ClaimOutcome::Claimed(claimed) =
-            aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(first.job_id, node_id(3), 2_000), &ctx)
-                .await
-                .unwrap()
+            aruna_drivers::driver::drive(
+                crate::jobs::store::job_calls::claim_job(first.job_id, node_id(3), 2_000),
+                &ctx,
+            )
+            .await
+            .unwrap()
         else {
             panic!("job must be claimed");
         };
         let token = claimed.claim.unwrap().claim_token;
-        aruna_drivers::driver::drive(crate::jobs::store::job_calls::transition_to_running(first.job_id, token, 2_100), &ctx)
-            .await
-            .unwrap();
-        aruna_drivers::driver::drive(crate::jobs::store::job_calls::cancel_running_job(first.job_id, token, 2_200), &ctx)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::transition_to_running(first.job_id, token, 2_100),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::cancel_running_job(first.job_id, token, 2_200),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         let terminal = drive(operation(submission), &ctx).await.unwrap();
         assert!(!terminal.created);
@@ -1288,20 +1306,29 @@ mod tests {
             .await
             .unwrap();
         // Take the job through claim + terminal so the dedup entry is cleared.
-        aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(first.job_id, node_id(3), 2_000), &ctx)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(first.job_id, node_id(3), 2_000),
+            &ctx,
+        )
+        .await
+        .unwrap();
         let claimed = read_job_record(&ctx, first.job_id, None)
             .await
             .unwrap()
             .unwrap();
         let token = claimed.claim.unwrap().claim_token;
-        aruna_drivers::driver::drive(crate::jobs::store::job_calls::transition_to_running(first.job_id, token, 2_100), &ctx)
-            .await
-            .unwrap();
-        aruna_drivers::driver::drive(crate::jobs::store::job_calls::cancel_running_job(first.job_id, token, 2_200), &ctx)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::transition_to_running(first.job_id, token, 2_100),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::cancel_running_job(first.job_id, token, 2_200),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         let second = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
             .await

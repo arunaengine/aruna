@@ -1033,9 +1033,14 @@ mod tests {
             enabled: true,
         };
         let scope = (realm_id, group_id, local);
-        let owner =
-            aruna_drivers::testing::seed_open_access(&context, scope, "none/**", None, vec![policy])
-                .await;
+        let owner = aruna_drivers::testing::seed_open_access(
+            &context,
+            scope,
+            "none/**",
+            None,
+            vec![policy],
+        )
+        .await;
         let info = BucketInfo {
             group_id,
             created_at: std::time::SystemTime::UNIX_EPOCH,

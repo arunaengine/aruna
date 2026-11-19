@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -20,7 +21,6 @@ use aruna_core::keyspaces::{
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
     prefix_upper_bound,
 };
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{
@@ -218,7 +218,11 @@ impl Operation for RebuildStatsOperation {
         };
         match result.event()? {
             Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(Next::Done(counters)),
-            other => Err(unexpected(RebuildStatsState::Finish, "BatchWriteResult", &other)),
+            other => Err(unexpected(
+                RebuildStatsState::Finish,
+                "BatchWriteResult",
+                &other,
+            )),
         }
     }
 }
@@ -573,11 +577,6 @@ impl UsageWalkOperation {
         Ok(())
     }
 
-
-
-
-
-
     /// Reads the next page of the walk, or moves to the next quota bucket or walk.
     fn advance(&mut self) -> Walking {
         if let Some(next) = self.next.take() {
@@ -750,7 +749,10 @@ impl Operation for BookPageOperation {
     }
 
     fn first(&mut self) -> Result<Next<()>, RebuildStatsError> {
-        let marker = (USAGE_STATS_KEYSPACE.to_string(), Key::from(USAGE_PROGRESS_KEY.to_vec()));
+        let marker = (
+            USAGE_STATS_KEYSPACE.to_string(),
+            Key::from(USAGE_PROGRESS_KEY.to_vec()),
+        );
         Ok(Next::Call(IoCall::Read(vec![marker])))
     }
 
@@ -761,7 +763,8 @@ impl Operation for BookPageOperation {
                 if marker_progress(marker)?.generation != self.generation {
                     return Err(RebuildStatsError::Superseded);
                 }
-                let (deltas, buckets) = self.deltas.take().ok_or(RebuildStatsError::RebuildFailed)?;
+                let (deltas, buckets) =
+                    self.deltas.take().ok_or(RebuildStatsError::RebuildFailed)?;
                 self.step = BookStep::Added;
                 Ok(Next::Call(IoCall::AddUsage {
                     space: USAGE_STATS_KEYSPACE.to_string(),

@@ -15,6 +15,7 @@ use serde_json::json;
 use super::*;
 use crate::plugin_host::plugin_work::run_plugin_work;
 use aruna_drivers::driver::DriverContext;
+use aruna_drivers::testing::{seed_bucket, with_blob};
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::edit_work;
 use aruna_operations::plugins::test_support::job_context;
@@ -23,7 +24,6 @@ use aruna_operations::plugins::work::{
 };
 use aruna_operations::s3::object::put::PutObjectOperation;
 use aruna_operations::testing_objects::put_config;
-use aruna_drivers::testing::{seed_bucket, with_blob};
 
 const CONTENT: &[u8] = b"ACGTACGT";
 

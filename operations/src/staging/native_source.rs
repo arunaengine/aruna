@@ -37,7 +37,9 @@ use crate::distribution::delegate::{DelegationInput, unsigned_delegation};
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::peer_trust::is_sync_eligible;
-use crate::replication::mirror_repair::{KickRepairOperation, StoreStatusOperation, SyncMirrorError};
+use crate::replication::mirror_repair::{
+    KickRepairOperation, StoreStatusOperation, SyncMirrorError,
+};
 use crate::replication::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };

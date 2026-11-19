@@ -49,7 +49,13 @@ async fn distributed_with(
 ) -> Distributed {
     let fixture = setup().await;
     let (snapshot, bytes) = record(true);
-    aruna_drivers::testing::write_value(&fixture.context.storage_handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &fixture.context.storage_handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let binding = binding(&snapshot, 1, 5);
     let bucket = BucketInfo {
         group_id: fixture.visible_group,

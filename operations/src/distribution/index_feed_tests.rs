@@ -42,7 +42,13 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let (dir, handle) = open();
-    aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set().to_bytes().to_vec(), searched().1).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set().to_bytes().to_vec(),
+        searched().1,
+    )
+    .await;
     install(&handle, set(), &[range(1, "", None)]).await;
     let index_dir = tempfile::tempdir().unwrap();
     let indexes = handle.install_range_indexes(RangeIndexes::new(index_dir.path()));
@@ -327,7 +333,13 @@ async fn search_off_skips() {
     let (_dir, handle) = open();
     let (snapshot, bytes) = record(true);
     let set_id = snapshot.set_id();
-    aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     install(&handle, set_id, &[range(1, "", None)]).await;
     assert!(apply(&handle, write(set_id, "a/one", 1, 3)).await.unwrap());
     let index_dir = tempfile::tempdir().unwrap();

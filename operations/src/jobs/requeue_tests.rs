@@ -143,7 +143,16 @@ async fn panicked_import_kept() {
     // The error the job runner fails a panicking payload with.
     let error = JobError::retryable("job payload panicked");
     assert_eq!(error.kind, JobErrorKind::Retryable);
-    let outcome = aruna_drivers::driver::drive(crate::jobs::store::job_calls::requeue_job(job_id, Some(token), unix_timestamp_millis(), None, Some(error)), &driver)
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(
+            job_id,
+            Some(token),
+            unix_timestamp_millis(),
+            None,
+            Some(error),
+        ),
+        &driver,
+    )
     .await
     .unwrap();
     let RequeueOutcome::Exhausted(exhausted) = outcome else {

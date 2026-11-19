@@ -58,7 +58,13 @@ fn cached(seed: u8, size: u64, capacity: u64) -> KeptCopy {
 async fn attached(handle: &StorageHandle, seed: u8) -> KeptCopy {
     use crate::distribution::test_record::{member, record};
     let (snapshot, bytes) = record(true);
-    aruna_drivers::testing::write_value(handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     KeptCopy {
         kind: KeptKind::Attachment,
         set_id: snapshot.set_id(),

@@ -75,7 +75,8 @@ impl Operation for GraphDeletedOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, GraphDeletedError> {
-        let deleted = result.value()?
+        let deleted = result
+            .value()?
             .map(|bytes| postcard::from_bytes::<GraphLifecycleRecord>(&bytes))
             .transpose()
             .map_err(ConversionError::from)?

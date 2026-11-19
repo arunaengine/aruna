@@ -252,7 +252,9 @@ pub(crate) mod tests {
         .await
         .unwrap();
         for _ in 0..3 {
-            aruna_test_support::projection::drain_projection_queue(&ctx).await.unwrap();
+            aruna_test_support::projection::drain_projection_queue(&ctx)
+                .await
+                .unwrap();
         }
         let page = journal_page(JOURNAL_ROW, None, 10);
         let (kept, _) = drive(page, &ctx).await.unwrap();

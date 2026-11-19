@@ -751,12 +751,12 @@ mod tests {
     #[tokio::test]
     async fn install_wakes_parked() {
         use crate::jobs::store::job_calls::ClaimOutcome;
-        use aruna_test_support::jobs::{insert_job, read_job_record};
         use aruna_core::keyspaces::KEY_COPY_KEYSPACE;
         use aruna_core::node_vault::{VaultEntry, VaultPurpose};
         use aruna_core::structs::execution::job::{
             JobId, JobPayload, JobRecord, JobState, KeyWait, due_index_key,
         };
+        use aruna_test_support::jobs::{insert_job, read_job_record};
 
         let (_dir, context, enabled) = enabled_context().await;
         let storage = &context.storage_handle;
@@ -774,9 +774,12 @@ mod tests {
         };
         let job = JobRecord::new(job_id, payload, creator, node, 1_000, 1_000, None);
         insert_job(&context, &job).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) =
-            aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, node, 2_000), &context).await.unwrap()
-        else {
+        let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, node, 2_000),
+            &context,
+        )
+        .await
+        .unwrap() else {
             panic!("job must be claimed")
         };
         let wait = KeyWait {
@@ -785,7 +788,15 @@ mod tests {
             group_id: None,
             key: key.key,
         };
-        aruna_drivers::driver::drive(crate::jobs::store::row_calls::park_job(job_id, claimed.claim.unwrap().claim_token, 3_000, vec![wait]), &context)
+        aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::park_job(
+                job_id,
+                claimed.claim.unwrap().claim_token,
+                3_000,
+                vec![wait],
+            ),
+            &context,
+        )
         .await
         .unwrap();
         assert!(

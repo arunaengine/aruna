@@ -741,10 +741,10 @@ mod tests {
 
     #[tokio::test]
     async fn checks_bucket_access() {
-        use aruna_test_support::s3::test_storage;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::storage::blob::object_permission_path;
         use aruna_drivers::testing::test_context;
+        use aruna_test_support::s3::test_storage;
         let (_directory, storage) = test_storage();
         let context = test_context(storage);
         let rule = import_rule();

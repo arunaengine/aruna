@@ -28,8 +28,8 @@ use resolve::ExportCandidate;
 
 pub mod archive;
 mod assemble;
-pub mod grant;
 pub mod consent;
+pub mod grant;
 mod job;
 pub mod open;
 pub mod probe;

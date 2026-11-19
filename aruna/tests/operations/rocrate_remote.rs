@@ -53,10 +53,10 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::testing::fresh_job_id;
-use aruna_test_support::metadata::process_materialization_batch;
-use aruna_test_support::projection::replay_event_log;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::replay_event_log;
 use aruna_test_support::projection::replay_event_log;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};

@@ -60,12 +60,12 @@ use aruna_operations::metadata::repository::write_document_lifecycle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_test_support::metadata::process_materialization_batch;
-use aruna_test_support::projection::drain_projection_queue;
-use aruna_test_support::projection::schedule_projection_drain;
-use aruna_test_support::metadata::{process_graph_tombstones, prune_jobs_exist};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::metadata::{process_graph_tombstones, prune_jobs_exist};
+use aruna_test_support::projection::drain_projection_queue;
+use aruna_test_support::projection::schedule_projection_drain;
 use aruna_test_support::projection::schedule_projection_drain;
 use serde_json::json;
 use std::collections::HashSet;

@@ -334,8 +334,7 @@ impl Operation for EnqueuePruneOperation {
             self.written = true;
             return Ok(Next::Call(IoCall::Effect(Box::new(schedule_prune_drain()))));
         }
-        if let Ok(Event::Task(aruna_core::task::TaskEvent::Error { message, .. })) =
-            result.event()
+        if let Ok(Event::Task(aruna_core::task::TaskEvent::Error { message, .. })) = result.event()
         {
             warn!(%message, graph_iri = %self.graph_iri, "Failed to wake the metadata graph prune drain");
         }
@@ -728,7 +727,6 @@ pub fn jobs_queued() -> DuePruneOperation {
 mod tests {
     use super::*;
     use crate::metadata::registry_cache::{Registry, RegistryReadOperation};
-    use aruna_test_support::metadata::{process_graph_tombstones, process_prune_batch, prune_jobs_exist};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::storage_entries::{graph_lifecycle_entry, registry_write_entries};
@@ -739,6 +737,9 @@ mod tests {
     use aruna_storage::FjallStorage;
     use aruna_storage::StorageHandle;
     use aruna_tasks::TaskHandle;
+    use aruna_test_support::metadata::{
+        process_graph_tombstones, process_prune_batch, prune_jobs_exist,
+    };
     use tempfile::tempdir;
 
     use crate::tests::metadata::storage_key_exists;

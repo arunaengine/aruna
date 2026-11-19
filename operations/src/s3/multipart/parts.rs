@@ -156,7 +156,6 @@ impl Operation for ListPartsOperation {
 #[cfg(test)]
 mod test {
     use super::*;
-    use aruna_test_support::s3::seed_upload;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
@@ -165,6 +164,7 @@ mod test {
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
     use aruna_storage::storage;
+    use aruna_test_support::s3::seed_upload;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::tempdir;

@@ -34,9 +34,9 @@ use aruna_operations::plugins::host_steps::GrantedCall;
 use aruna_operations::plugins::store::Txn;
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::queued;
-use aruna_test_support::projection::drain_projection_queue;
-use aruna_test_support::metadata::process_materialization_batch;
 use aruna_plugin_types::calls::merge_into;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::drain_projection_queue;
 
 /// Runs the projection and graph work a write queued.
 async fn project(ctx: &DriverContext) {

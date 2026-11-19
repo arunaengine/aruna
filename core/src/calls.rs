@@ -13,11 +13,10 @@ use tracing::warn;
 
 use crate::effects::{Effect, EffectGroup, GroupForm, IterStart, StorageEffect, abort_effects};
 use crate::errors::StorageError;
-use crate::keyspaces::USAGE_STATS_KEYSPACE;
 use crate::events::{Event, GroupEvent, StorageEvent};
+use crate::keyspaces::USAGE_STATS_KEYSPACE;
 use crate::operation::{
-    AfterConflict, HoldScope, Operation, SubOperation, TransactionMode,
-    boxed_suboperation,
+    AfterConflict, HoldScope, Operation, SubOperation, TransactionMode, boxed_suboperation,
 };
 use crate::structs::storage::distribution::accounting::RangeCounters;
 use crate::structs::storage::usage::{BucketDelta, UsageDelta};
