@@ -879,6 +879,10 @@ pub enum NetEffect {
     DashboardChanged,
     /// Records one suppressed watch delivery in this node's watch metrics.
     RecordSuppression(crate::metrics::WatchMetricReason),
+    /// Asks when this node last saw each of `peers`; answers `NetEvent::PeerContacts`.
+    PeerContacts {
+        peers: Vec<NodeId>,
+    },
     /// Asks for this node's id; answers `NetEvent::LocalNode`.
     LocalNode,
     /// Asks for the realm this node serves; answers `NetEvent::LocalRealm`.

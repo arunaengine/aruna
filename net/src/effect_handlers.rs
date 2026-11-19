@@ -318,6 +318,7 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         | NetEffect::HeartbeatSilence(_)
         | NetEffect::DashboardChanged
         | NetEffect::RecordSuppression(_)
+        | NetEffect::PeerContacts { .. }
         | NetEffect::LocalNode
         | NetEffect::LocalRealm
         | NetEffect::WatchHolders { .. }
@@ -687,6 +688,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::HeartbeatSilence(_) => "heartbeat_silence",
         NetEffect::DashboardChanged => "dashboard_changed",
         NetEffect::RecordSuppression(_) => "record_suppression",
+        NetEffect::PeerContacts { .. } => "peer_contacts",
         NetEffect::LocalNode => "local_node",
         NetEffect::LocalRealm => "local_realm",
         NetEffect::WatchHolders { .. } => "watch_holders",

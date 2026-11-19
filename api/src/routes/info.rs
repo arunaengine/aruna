@@ -15,6 +15,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::heartbeat::MAX_HEARTBEAT_AGE;
+use aruna_core::heartbeat::seen_recently;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::placement::transition::transition_health;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -26,13 +27,13 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_net::contacts::PeerContacts;
 use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::federation::totals::DataTotalsOperation;
 use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
+use aruna_operations::node::contacts::PeerContactsOperation;
 use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
 use aruna_operations::placement::mutation::PlacementMutationOperation;
@@ -1149,7 +1150,7 @@ pub(crate) async fn run_realm_info(
         let present_nodes = load_realm_presence(state).await;
         let discovery = serde_json::to_value(&config.discovery)
             .map_err(|error| ServerError::InternalError(error.into()))?;
-        let contacts = state.peer_contacts();
+        let contacts = peer_contacts(state, &config).await;
         let names = node_names(state, config.realm_id).await;
         let nodes = map_realm_nodes(
             state,
@@ -1201,12 +1202,25 @@ pub(crate) async fn run_realm_info(
     })
 }
 
+/// When this node last saw each node of the realm config; empty when it cannot tell.
+async fn peer_contacts(
+    state: &ServerState,
+    config: &RealmConfigDocument,
+) -> BTreeMap<aruna_core::NodeId, u64> {
+    let peers = (config.nodes.iter())
+        .filter_map(|node| node.node_id.parse::<aruna_core::NodeId>().ok())
+        .collect();
+    drive(PeerContactsOperation::new(peers), &state.get_ctx())
+        .await
+        .unwrap_or_default()
+}
+
 /// The realm's infrastructure nodes as a visitor sees them: name, place and whether they are
 /// online, without owners, placement, utilization or devices.
 async fn visitor_nodes(state: &ServerState, config: &RealmConfigDocument) -> Vec<NodeInfoResponse> {
     let present_nodes = load_realm_presence(state).await;
     let names = node_names(state, config.realm_id).await;
-    let contacts = state.peer_contacts();
+    let contacts = peer_contacts(state, config).await;
     let documents = BTreeMap::new();
     let nodes = map_realm_nodes(
         state,
@@ -2177,7 +2191,7 @@ fn map_realm_nodes(
         aruna_core::NodeId,
         aruna_core::structs::storage::node_info::NodeInfoDocument,
     >,
-    contacts: &PeerContacts,
+    contacts: &BTreeMap<aruna_core::NodeId, u64>,
     names: &NodeDisplays,
     now_ms: u64,
 ) -> Vec<NodeInfoResponse> {
@@ -2211,12 +2225,14 @@ fn map_realm_nodes(
             // A device answering for itself is in contact by definition.
             let last_seen_ms = match (is_device, is_current) {
                 (true, true) => Some(now_ms),
-                (true, false) => parsed.and_then(|node_id| contacts.last_seen(&node_id)),
+                (true, false) => parsed.and_then(|node_id| contacts.get(&node_id).copied()),
                 (false, _) => None,
             };
             let seen_recently = is_device
                 && (is_current
-                    || parsed.is_some_and(|node_id| contacts.seen_recently(&node_id, now_ms)));
+                    || parsed
+                        .and_then(|node_id| contacts.get(&node_id))
+                        .is_some_and(|seen_ms| seen_recently(*seen_ms, now_ms)));
             let shown = parsed.map(|node_id| names.of(&node_id)).unwrap_or_default();
             let place = shown.place.unwrap_or_default();
             NodeInfoResponse {

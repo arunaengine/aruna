@@ -4,11 +4,11 @@
 
 use super::{
     GroupCapOverride, InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeKindInfo,
-    PeerContacts, PublicNode, RealmBinding, RealmBindingScope, RealmConnectionStatus,
-    RealmPlacementOverride, RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig,
-    RealmQuotaOverride, ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info,
-    get_realm_placement, get_usage, map_handle_error, map_placement_error, map_quota_error,
-    map_realm_nodes, mutate_realm_placement, presence_nodes, run_realm_info, set_realm_quota,
+    PublicNode, RealmBinding, RealmBindingScope, RealmConnectionStatus, RealmPlacementOverride,
+    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, RealmQuotaOverride,
+    ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info, get_realm_placement,
+    get_usage, map_handle_error, map_placement_error, map_quota_error, map_realm_nodes,
+    mutate_realm_placement, presence_nodes, run_realm_info, set_realm_quota,
 };
 use crate::auth::extract;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
@@ -1942,7 +1942,7 @@ async fn device_never_connected() {
         &config,
         present,
         BTreeMap::new(),
-        &PeerContacts::default(),
+        &BTreeMap::new(),
         &aruna_operations::realm::node_name::NodeDisplays::default(),
         10_000,
     );
@@ -1986,10 +1986,8 @@ async fn reports_device_seen() {
             });
     }
     let now_ms = 1_000_000;
-    let window = aruna_net::contacts::PEER_CONTACT_WINDOW.as_millis() as u64;
-    let contacts = PeerContacts::default();
-    contacts.note(recent, now_ms - window);
-    contacts.note(stale, now_ms - window - 1);
+    let window = aruna_core::heartbeat::PEER_CONTACT_WINDOW.as_millis() as u64;
+    let contacts = BTreeMap::from([(recent, now_ms - window), (stale, now_ms - window - 1)]);
 
     let nodes = map_realm_nodes(
         &state,

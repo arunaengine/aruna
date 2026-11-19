@@ -586,15 +586,6 @@ impl ServerState {
             .ok_or(OidcError::ProviderNotFound)
     }
 
-    /// Peer contacts from the net handle; empty without a network.
-    pub fn peer_contacts(&self) -> aruna_net::contacts::PeerContacts {
-        self.get_ctx()
-            .net_handle
-            .as_ref()
-            .map(aruna_net::NetHandle::peer_contacts)
-            .unwrap_or_default()
-    }
-
     pub fn is_management_node(&self) -> bool {
         matches!(
             self.identity.node_capabilities,

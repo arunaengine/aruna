@@ -155,6 +155,12 @@ async fn dispatch_unboxed(
             context.notify_dashboard_change();
             Event::Net(NetEvent::Recorded)
         }
+        Effect::Net(NetEffect::PeerContacts { peers }) => {
+            let seen = (context.net_handle.as_ref())
+                .map(|net| net.peer_contacts().last_seen_of(&peers))
+                .unwrap_or_default();
+            Event::Net(NetEvent::PeerContacts(seen))
+        }
         Effect::Net(NetEffect::LocalNode) => {
             let node = context.net_handle.as_ref().map(|net| net.node_id());
             Event::Net(NetEvent::LocalNode(node))

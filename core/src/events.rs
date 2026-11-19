@@ -502,6 +502,8 @@ pub enum NetEvent {
     ),
     InboxWoken,
     /// This node's id, or `None` on a node without a net handle.
+    /// The last contact of each asked peer this node saw, in unix milliseconds.
+    PeerContacts(std::collections::BTreeMap<NodeId, u64>),
     LocalNode(Option<crate::NodeId>),
     /// The realm this node serves, `None` without a network.
     LocalRealm(Option<crate::structs::identity::realm::RealmId>),
@@ -1072,6 +1074,7 @@ impl Event {
                     DeletePlanSigned,
                     Notification,
                     InboxWoken,
+                    PeerContacts,
                     LocalNode,
                     LocalRealm,
                     WatchHolders,

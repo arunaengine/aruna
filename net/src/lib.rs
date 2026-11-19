@@ -1135,6 +1135,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::HeartbeatSilence(_)) => "heartbeat_silence",
         Effect::Net(NetEffect::DashboardChanged) => "dashboard_changed",
         Effect::Net(NetEffect::RecordSuppression(_)) => "record_suppression",
+        Effect::Net(NetEffect::PeerContacts { .. }) => "peer_contacts",
         Effect::Net(NetEffect::LocalNode) => "local_node",
         Effect::Net(NetEffect::LocalRealm) => "local_realm",
         Effect::Net(NetEffect::WatchHolders { .. }) => "watch_holders",
