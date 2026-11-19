@@ -2,24 +2,33 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::effect::{ComputeAnswer, ComputeRequest};
 use aruna_core::compute::{BackendError, ExecutorKind, FenceContext, TombstoneSpec};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    AttemptControl, AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload,
+    AttemptControl, AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload, JobWrites,
+    StopEvidence,
 };
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::UserAccess;
 use ulid::Ulid;
 
-use super::super::store::job_calls::{authorize_cleanup, record_attempt_tombstone};
+use super::super::lifecycle::outbox::schedule_outbox_drain;
+use super::super::store::job_calls::{authorize_cleanup, record_stop_tombstone};
 use super::super::store::mutation_error::JobMutationError;
 use super::compute::{attempt_call, compute_answer};
+use super::stop_record::StopRecordOperation;
 use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use aruna_core::jobs::JobRunOutcome;
 
 #[derive(Debug, PartialEq)]
 enum CleanupStep {
+    Stop,
+    StopWrite,
     Authorize,
     Fence(FenceContext),
     Cleanup(FenceContext),
@@ -29,13 +38,18 @@ enum CleanupStep {
 }
 
 /// Removes a finished attempt from its backend and revokes the run's credential. The revoke runs
-/// even when the backend work failed, so one failure cannot strand a live workspace key.
+/// even when the backend work failed, so one failure cannot strand a live workspace key. On a
+/// node with a network the stop record of the execution lands with the attempt tombstone.
 #[derive(Debug, PartialEq)]
 pub struct TerminalCleanupOperation {
     for_job: JobId,
     token: Ulid,
     intent: Option<AttemptIntent>,
     access_key: String,
+    serving: Option<(NodeId, RealmId)>,
+    /// The stop record rows; `stopped` once they are stored.
+    stop: JobWrites,
+    stopped: bool,
     backend_error: Option<JobError>,
     step: CleanupStep,
 }
@@ -44,17 +58,38 @@ impl TerminalCleanupOperation {
     pub fn new(
         for_job: JobId,
         token: Ulid,
-        intent: Option<AttemptIntent>,
-        access_key: &str,
+        (intent, access_key): (Option<AttemptIntent>, &str),
+        serving: Option<(NodeId, RealmId)>,
     ) -> Self {
         Self {
             for_job,
             token,
             intent,
             access_key: access_key.to_string(),
+            serving,
+            stop: Vec::new(),
+            stopped: false,
             backend_error: None,
             step: CleanupStep::Authorize,
         }
+    }
+
+    /// Goes on to the backend work with the stop rows, or writes them alone without an attempt.
+    fn stop_built(&mut self, stop: JobWrites) -> Next<()> {
+        self.stop = stop;
+        let Some(intent) = self.intent.clone() else {
+            if self.stop.is_empty() {
+                return self.revoke();
+            }
+            self.step = CleanupStep::StopWrite;
+            return Next::Call(IoCall::Write(self.stop.clone()));
+        };
+        self.step = CleanupStep::Authorize;
+        Next::Call(IoCall::child(authorize_cleanup(
+            self.for_job,
+            intent,
+            self.token,
+        )))
     }
 
     fn revoke(&mut self) -> Next<()> {
@@ -162,12 +197,10 @@ impl TerminalCleanupOperation {
         match answer {
             ComputeAnswer::Tombstone(Ok(tombstone)) => {
                 self.step = CleanupStep::Record;
-                Next::Call(IoCall::child(record_attempt_tombstone(
-                    self.for_job,
-                    self.token,
-                    fence.attempt_epoch,
-                    tombstone.backend_ref,
-                )))
+                let tombstone = (fence.attempt_epoch, tombstone.backend_ref);
+                let stop = self.stop.clone();
+                let record = record_stop_tombstone(self.for_job, self.token, tombstone, stop);
+                Next::Call(IoCall::child(record))
             }
             ComputeAnswer::Tombstone(Err(error)) => self.failed(JobError::retryable(format!(
                 "backend tombstone failed: {error}"
@@ -186,15 +219,34 @@ impl Operation for TerminalCleanupOperation {
     type Error = JobError;
 
     fn first(&mut self) -> Result<Next<()>, JobError> {
-        let Some(intent) = self.intent.clone() else {
-            return Ok(self.revoke());
+        let Some(serving) = self.serving else {
+            return Ok(self.stop_built(Vec::new()));
         };
-        let authorize = authorize_cleanup(self.for_job, intent, self.token);
-        Ok(Next::Call(IoCall::child(authorize)))
+        let evidence = match self.intent {
+            Some(_) => StopEvidence::Tombstoned,
+            None => StopEvidence::NothingSubmitted,
+        };
+        self.step = CleanupStep::Stop;
+        let stop = StopRecordOperation::new(self.for_job, evidence, serving);
+        Ok(Next::Call(IoCall::child(stop)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, JobError> {
         match std::mem::replace(&mut self.step, CleanupStep::Revoke) {
+            CleanupStep::Stop => match result.child::<JobWrites, JobError>()? {
+                Ok(stop) => Ok(self.stop_built(stop)),
+                Err(error) => Ok(self.failed(error)),
+            },
+            CleanupStep::StopWrite => match result.done() {
+                Ok(()) => {
+                    self.stopped = true;
+                    Ok(self.revoke())
+                }
+                Err(error) => {
+                    let message = format!("stop record write failed: {error}");
+                    Ok(self.failed(JobError::retryable(message)))
+                }
+            },
             CleanupStep::Authorize => {
                 let fence = result.child::<FenceContext, JobMutationError>()?;
                 Ok(self.authorized(fence))
@@ -212,7 +264,10 @@ impl Operation for TerminalCleanupOperation {
                 Ok(self.tombstoned(fence, answer))
             }
             CleanupStep::Record => match result.child::<AttemptControl, JobMutationError>()? {
-                Ok(_) => Ok(self.revoke()),
+                Ok(_) => {
+                    self.stopped = !self.stop.is_empty();
+                    Ok(self.revoke())
+                }
                 Err(error) => Ok(self.failed(JobError::retryable(format!(
                     "tombstone record failed: {error}"
                 )))),
@@ -224,6 +279,13 @@ impl Operation for TerminalCleanupOperation {
                 };
                 match cleanup_error([revoke_error, self.backend_error.take()]) {
                     Some(error) => Err(error),
+                    // A stored stop record is offered to the holders at once.
+                    None if self.stopped => Ok(Next::Then {
+                        output: (),
+                        calls: vec![IoCall::Effect(Box::new(schedule_outbox_drain(
+                            Duration::ZERO,
+                        )))],
+                    }),
                     None => Ok(Next::Done(())),
                 }
             }
@@ -314,8 +376,9 @@ mod tests {
         intent: Option<&AttemptIntent>,
         access_key: &str,
     ) -> JobRunOutcome {
-        let cleanup =
-            TerminalCleanupOperation::new(for_job, ctx.claim_token, intent.cloned(), access_key);
+        let serving = ctx.driver.node_and_realm();
+        let attempt = (intent.cloned(), access_key);
+        let cleanup = TerminalCleanupOperation::new(for_job, ctx.claim_token, attempt, serving);
         cleanup_outcome(drive(cleanup, &ctx.driver).await)
     }
 

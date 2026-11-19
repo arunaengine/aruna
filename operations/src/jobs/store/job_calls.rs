@@ -73,7 +73,16 @@ where
 }
 
 fn control_of(job_id: JobId, change: impl ControlEdit) -> StoreCall<AttemptControl> {
-    let build = move || MutateControlOperation::new(job_id, Vec::new(), change.clone());
+    control_with(job_id, Vec::new(), change)
+}
+
+/// [`control_of`], with `extra` rows that must land with the change.
+fn control_with(
+    job_id: JobId,
+    extra: JobWrites,
+    change: impl ControlEdit,
+) -> StoreCall<AttemptControl> {
+    let build = move || MutateControlOperation::new(job_id, extra.clone(), change.clone());
     StoreCall::of(
         build,
         |changed: ControlChange| Ok(changed.control),
@@ -841,8 +850,19 @@ pub fn record_attempt_tombstone(
     attempt_epoch: u64,
     tombstone_ref: String,
 ) -> StoreCall<AttemptControl> {
-    control_of(
+    record_stop_tombstone(job_id, token, (attempt_epoch, tombstone_ref), Vec::new())
+}
+
+/// Records the attempt tombstone and writes `stop`, the stop record rows, in the same transaction.
+pub fn record_stop_tombstone(
+    job_id: JobId,
+    token: Ulid,
+    (attempt_epoch, tombstone_ref): (u64, String),
+    stop: JobWrites,
+) -> StoreCall<AttemptControl> {
+    control_with(
         job_id,
+        stop,
         move |_: &mut JobRecord, control: &mut AttemptControl| {
             if control.attempt_epoch != attempt_epoch {
                 return Err(JobMutationError::EpochMismatch);

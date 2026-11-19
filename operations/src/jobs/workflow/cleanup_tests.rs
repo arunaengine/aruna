@@ -36,7 +36,7 @@ fn fence() -> FenceContext {
 }
 
 fn operation(intent: Option<AttemptIntent>) -> TerminalCleanupOperation {
-    TerminalCleanupOperation::new(job(), Ulid::from_bytes([1; 16]), intent, "key")
+    TerminalCleanupOperation::new(job(), Ulid::from_bytes([1; 16]), (intent, "key"), None)
 }
 
 fn answer(answer: ComputeAnswer) -> IoResult {
@@ -123,6 +123,77 @@ fn cleans_then_revokes() {
     let stored = IoResult::Child(ChildOutcome::new(Ok::<_, JobMutationError>(control)));
     assert!(is_child(&cleanup.next(stored)));
     assert_eq!(cleanup.next(revoked()), Ok(Next::Done(())));
+}
+
+fn serving() -> (NodeId, RealmId) {
+    (
+        iroh::SecretKey::from_bytes(&[4; 32]).public(),
+        RealmId([3; 32]),
+    )
+}
+
+/// A cleanup on a node with a network, answered with the stop rows `stop`.
+fn stop_built(intent: Option<AttemptIntent>, stop: JobWrites) -> TerminalCleanupOperation {
+    let token = Ulid::from_bytes([1; 16]);
+    let mut cleanup =
+        TerminalCleanupOperation::new(job(), token, (intent.clone(), "key"), Some(serving()));
+    let evidence = match intent {
+        Some(_) => StopEvidence::Tombstoned,
+        None => StopEvidence::NothingSubmitted,
+    };
+    let stop_read = StopRecordOperation::new(job(), evidence, serving());
+    assert_eq!(cleanup.first(), Ok(Next::Call(IoCall::child(stop_read))));
+    let built = cleanup.next(IoResult::Child(ChildOutcome::new(Ok::<_, JobError>(stop))));
+    assert!(matches!(built, Ok(Next::Call(_))));
+    cleanup
+}
+
+fn stop_rows() -> JobWrites {
+    let key = aruna_core::types::Key::from(b"stop".to_vec());
+    let row = |space: &str| (space.to_string(), key.clone(), b"row".to_vec().into());
+    vec![row("record"), row("outbox")]
+}
+
+fn drained() -> Result<Next<()>, JobError> {
+    let kick = IoCall::Effect(Box::new(schedule_outbox_drain(Duration::ZERO)));
+    Ok(Next::Then {
+        output: (),
+        calls: vec![kick],
+    })
+}
+
+// The stop rows land in the tombstone's transaction, and a stored stop is offered at once.
+#[test]
+fn stop_with_tombstone() {
+    let mut cleanup = stop_built(Some(intent()), stop_rows());
+    cleanup.next(authorized()).unwrap();
+    cleanup.next(answer(ComputeAnswer::Done(Ok(())))).unwrap();
+    cleanup.next(answer(ComputeAnswer::Done(Ok(())))).unwrap();
+    let tombstone = TombstoneEvidence {
+        backend_ref: "gone".to_string(),
+        attempt_epoch: 3,
+    };
+    let token = Ulid::from_bytes([1; 16]);
+    let record = record_stop_tombstone(job(), token, (3, "gone".to_string()), stop_rows());
+    let recorded = cleanup.next(answer(ComputeAnswer::Tombstone(Ok(tombstone))));
+    assert_eq!(recorded, Ok(Next::Call(IoCall::child(record))));
+    let lost = IoResult::Child(ChildOutcome::new(Err::<AttemptControl, _>(
+        JobMutationError::TokenMismatch,
+    )));
+    assert!(is_child(&cleanup.next(lost)));
+    // A refused tombstone stored no stop, so nothing is offered.
+    assert!(cleanup.next(revoked()).is_err());
+}
+
+// A run that never submitted writes its stop alone before the revoke.
+#[test]
+fn unsubmitted_stop_written() {
+    let mut cleanup = stop_built(None, stop_rows());
+    assert_eq!(cleanup.step, CleanupStep::StopWrite);
+    assert!(is_child(&cleanup.next(IoResult::Done)));
+    assert_eq!(cleanup.next(revoked()), drained());
+    let mut nothing = stop_built(None, Vec::new());
+    assert_eq!(nothing.next(revoked()), Ok(Next::Done(())));
 }
 
 // Without an attempt only the credential is revoked; a key already gone is fine.
