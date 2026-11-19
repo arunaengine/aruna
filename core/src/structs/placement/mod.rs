@@ -4,6 +4,7 @@
 
 pub mod binding_directory;
 pub mod compute_config;
+pub mod coverage;
 pub mod handle_allocation;
 pub mod node_subject;
 pub mod policy;

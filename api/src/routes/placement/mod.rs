@@ -1620,7 +1620,7 @@ async fn coverage_here(
             scope,
             start_after: decode_cursor(cursor)?,
             limit: query.limit.unwrap_or(SCAN_DEFAULT_LIMIT),
-            auth_context: auth,
+            auth_context: Some(auth),
         }),
         &state.get_ctx(),
     )

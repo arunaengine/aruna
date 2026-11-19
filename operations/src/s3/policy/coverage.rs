@@ -117,7 +117,8 @@ pub struct CoverageInput {
     pub scope: CoverageScope,
     pub start_after: Option<Key>,
     pub limit: usize,
-    pub auth_context: AuthContext,
+    /// None when the caller already holds READ on the realm policy path, as a saved count does.
+    pub auth_context: Option<AuthContext>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -197,7 +198,9 @@ impl Operation for PolicyCoverageOperation {
     type Error = CoverageError;
 
     fn first(&mut self) -> CoverageTurn {
-        let auth_context = self.input.auth_context.clone();
+        let Some(auth_context) = self.input.auth_context.clone() else {
+            return self.authorized(Ok(true));
+        };
         let path = policy_admin_path(auth_context.realm_id);
         let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context,
@@ -676,13 +679,23 @@ mod pure_tests {
             scope,
             start_after: None,
             limit: 16,
-            auth_context: AuthContext {
+            auth_context: Some(AuthContext {
                 user_id: user_id(),
                 realm_id: RealmId::from_bytes([1u8; 32]),
                 path_restrictions: None,
                 session: None,
-            },
+            }),
         }
+    }
+
+    // A saved count holds READ already, so its scan starts without a permission check.
+    #[test]
+    fn checked_caller_skips() {
+        let mut checked = input(CoverageScope::CurrentHeads);
+        checked.auth_context = None;
+        let mut coverage = PolicyCoverageOperation::new(checked);
+        assert!(matches!(coverage.first(), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(coverage.scanning);
     }
 
     /// A scan that read `bucket` and asks for what comes next.

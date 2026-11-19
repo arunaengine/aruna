@@ -176,6 +176,10 @@ pub const RENAMED_ROW_KEYSPACE: &str = "backend_import_renamed_rows";
 pub const STORAGE_CHECK_KEYSPACE: &str = "storage_checks";
 /// Buckets whose check is unfinished; the migration worker scans only these.
 pub const CHECK_QUEUE_KEYSPACE: &str = "storage_check_queue";
+/// Node-local count of a bucket's current versions against its placement rules.
+pub const COVERAGE_COUNT_KEYSPACE: &str = "coverage_counts";
+/// Buckets whose coverage count is unfinished; the migration worker scans only these.
+pub const COUNT_QUEUE_KEYSPACE: &str = "coverage_count_queue";
 /// Versions a check found broken, keyed by version key so one bucket is one prefix.
 pub const BROKEN_VERSION_KEYSPACE: &str = "broken_versions";
 pub const HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
@@ -687,6 +691,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     RENAMED_ROW_KEYSPACE,
     STORAGE_CHECK_KEYSPACE,
     CHECK_QUEUE_KEYSPACE,
+    COVERAGE_COUNT_KEYSPACE,
+    COUNT_QUEUE_KEYSPACE,
     BROKEN_VERSION_KEYSPACE,
     ABE_PARAMETERS_KEYSPACE,
     ABE_EPOCH_KEYSPACE,
