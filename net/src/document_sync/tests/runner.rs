@@ -26,9 +26,8 @@ use aruna_core::document_apply::validate::{validate_group_authority, validate_us
 use aruna_core::document_apply::{ApplyError, PlacementOutcome};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::NetEvent;
-use aruna_core::operation::{
-    ByCalls, EffectOperation, Operation, Runnable, SubOperation, TransactionMode,
-};
+use aruna_core::operation::{Operation, SubOperation, TransactionMode};
+use aruna_core::calls::CallRun;
 use aruna_core::row_plan::{PlanOperation, PlanRows, Planned, RowPlan};
 use aruna_core::types::Effects;
 use aruna_core::types::TxnId;
@@ -105,7 +104,7 @@ impl<'a> Backends<'a> {
     where
         O: Operation<Error = ApplyError> + 'static,
     {
-        let mut machine = Runnable::<ByCalls>::into_machine(operation);
+        let mut machine = CallRun::new(operation);
         machine.stamp(unix_timestamp_millis());
         let mut effects: VecDeque<Effect> = machine.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {
@@ -143,7 +142,7 @@ where
     P::Output: PartialEq,
 {
     let mut during = Some(Box::pin(during));
-    let mut machine = Runnable::<ByCalls>::into_machine(PlanOperation::new(plan));
+    let mut machine = CallRun::new(PlanOperation::new(plan));
     machine.stamp(unix_timestamp_millis());
     let mut effects: VecDeque<Effect> = machine.start().into_iter().collect();
     while let Some(effect) = effects.pop_front() {

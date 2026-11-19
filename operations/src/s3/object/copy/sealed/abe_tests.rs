@@ -16,7 +16,8 @@ use aruna_core::compute::SecretBytes;
 use aruna_core::keyspaces::{
     ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Runnable};
+use aruna_core::operation::Operation;
+use aruna_core::calls::CallRun;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::abe::{
     EnvelopeArchive, EnvelopePlan, check_copy, copy_envelope, create_envelope, create_parameters,
@@ -145,7 +146,7 @@ async fn sealed(storage: &StorageHandle) -> (Sealed, Ulid, ObjectEnvelope) {
 /// Runs storage effects on `storage` and answers copy envelopes as an unlocked or locked node.
 /// Runs an operation of either kind as the runner's effect machine against storage and a
 /// stand-in for the ABE crypto.
-async fn run<O: Runnable<K>, K>(
+async fn run<O: Operation>(
     operation: O,
     storage: &StorageHandle,
     unlocked: Option<&Sealed>,
@@ -153,7 +154,7 @@ async fn run<O: Runnable<K>, K>(
 ) -> Result<O::Output, O::Error> {
     // Each run gets its own entropy, as the runner gives it, so two copies mint distinct ids.
     static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(7);
-    let mut operation = operation.into_machine();
+    let mut operation = CallRun::new(operation);
     let entropy = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     operation.seed(u128::from(entropy));
     let mut effects: Vec<Effect> = operation.start().into_iter().collect();
@@ -238,7 +239,7 @@ async fn envelope_of(
     version_id: Ulid,
 ) -> Result<(ObjectEnvelope, EnvelopeArchive), AbeError> {
     let operation = EnvelopeOperation::new("bucket".to_string(), key.to_string(), version_id);
-    run(operation.into_machine(), storage, None, Race::Off).await
+    run(CallRun::new(operation), storage, None, Race::Off).await
 }
 
 /// The pending row of a version, whatever bucket key prefixes it.

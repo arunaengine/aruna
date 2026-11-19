@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::time::SystemTime;
 use aruna_core::UserId;
+use aruna_core::calls::CallRun;
 use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::effects::Effect;
 use aruna_core::effects::StorageEffect;
@@ -202,7 +203,7 @@ async fn occupied_peer_refuses() {
 async fn writer_conflicts_freeze() {
     let fixture = Fixture::new(&[1]).await;
     let mut operation =
-        CreateBucketOperation::new("racing".into(), fixture.bucket()).into_machine();
+        CallRun::new(CreateBucketOperation::new("racing".into(), fixture.bucket()));
     let mut effects = VecDeque::from_iter(operation.start());
     let mut prepared = false;
     while !operation.is_complete() {

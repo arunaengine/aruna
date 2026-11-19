@@ -16,7 +16,7 @@ use aruna_core::compute::AttemptPhase;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::jobs::{JobReport, JobStops};
-use aruna_core::operation::Runnable;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     JobError, JobExecutionClass, JobId, JobPayload, JobRecord, JobState,
 };
@@ -565,14 +565,14 @@ pub fn run_wiring(context: &DriverContext) -> RunWiring {
 
 /// Drives `operation` of one execution while its lease is renewed. `None` means the claim was
 /// lost first: another execution took over, so the work is abandoned.
-pub async fn under_lease<O, K>(
+pub async fn under_lease<O>(
     context: &DriverContext,
     (job_id, token): (JobId, Ulid),
     cancel: CancellationToken,
     operation: O,
 ) -> Option<Result<O::Output, O::Error>>
 where
-    O: Runnable<K>,
+    O: Operation,
 {
     let stop = CancellationToken::new();
     let heartbeat = tokio::spawn(execution_heartbeat(

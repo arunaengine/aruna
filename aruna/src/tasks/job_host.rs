@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aruna_blob::pace::{Pace, paced};
 use aruna_core::jobs::{JobReport, JobStops};
-use aruna_core::operation::Runnable;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{CopyJobSpec, JobError, StagingJobSpec};
 use aruna_core::structs::storage::backend_import::BackendImportSpec;
 use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
@@ -101,9 +101,9 @@ impl JobHost for ContextHost {
 
 /// Drives a job's operation with the job's host answering its effects. A failure of the run
 /// itself is retryable, since the job's checkpoint stays.
-pub async fn run_hosted<O, K>(ctx: &JobContext, operation: O) -> JobRunOutcome
+pub async fn run_hosted<O>(ctx: &JobContext, operation: O) -> JobRunOutcome
 where
-    O: Runnable<K, Output = JobRunOutcome>,
+    O: Operation<Output = JobRunOutcome>,
     O::Error: Display,
 {
     let host = Arc::new(ContextHost {

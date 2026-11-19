@@ -252,7 +252,7 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
-    use aruna_core::operation::{EffectOperation, Runnable};
+    use aruna_core::calls::CallRun;
     use aruna_core::structs::identity::realm::{
         QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
     };
@@ -320,7 +320,7 @@ mod tests {
     /// Runs a mint's effects against storage up to its commit and hands that
     /// commit back, so two mints can be interleaved deliberately.
     async fn run_to_commit(
-        operation: &mut impl EffectOperation,
+        operation: &mut CallRun<impl Operation>,
         context: &DriverContext,
     ) -> StorageEffect {
         let mut queue: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
@@ -454,14 +454,12 @@ mod tests {
         // read conflicts with the winner's insert, so only one commits.
         let owner = UserId::local(Ulid::generate(), realm());
         let (_dir, context) = context_with_cap(Some(1), &[]).await;
-        let mut first = CreateSecretOperation::new(CreateSecretInput {
+        let mut first = CallRun::new(CreateSecretOperation::new(CreateSecretInput {
             record: device_record(owner),
-        })
-        .into_machine();
-        let mut second = CreateSecretOperation::new(CreateSecretInput {
+        }));
+        let mut second = CallRun::new(CreateSecretOperation::new(CreateSecretInput {
             record: device_record(owner),
-        })
-        .into_machine();
+        }));
 
         let first_commit = run_to_commit(&mut first, &context).await;
         let second_commit = run_to_commit(&mut second, &context).await;

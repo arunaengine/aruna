@@ -359,7 +359,6 @@ mod tests {
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
-    use aruna_core::operation::Runnable;
     use aruna_core::structs::execution::job::RoCrateLimits;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::{BucketKeyError, public_key_of};
@@ -384,13 +383,13 @@ mod tests {
     }
 
     /// Activates a key as the routes do, then resumes the work that waited for it.
-    async fn activate_and_wake<O, K>(
+    async fn activate_and_wake<O>(
         context: &DriverContext,
         operation: O,
         origin: (RealmId, NodeId),
     ) -> Result<UnlockStatus, O::Error>
     where
-        O: Runnable<K, Output = UnlockStatus>,
+        O: Operation<Output = UnlockStatus>,
     {
         let status = drive(operation, context).await?;
         let now_ms = aruna_core::time::unix_timestamp_millis();

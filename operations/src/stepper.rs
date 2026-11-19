@@ -5,7 +5,7 @@
 use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::operation::{Runnable, SubOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, SubOperation, boxed_suboperation};
 use aruna_core::types::Effects;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -23,10 +23,9 @@ where
     E: Send + Sync + Debug + PartialEq + 'static,
 {
     /// Starts `operation` and answers its first effects.
-    pub(crate) fn new<O, K>(operation: O) -> (Self, Effects)
+    pub(crate) fn new<O>(operation: O) -> (Self, Effects)
     where
-        O: Runnable<K, Output = T, Error = E> + 'static,
-        K: 'static,
+        O: Operation<Output = T, Error = E> + 'static,
     {
         let mut machine =
             boxed_suboperation(operation, |result| Event::Child(ChildOutcome::new(result)));

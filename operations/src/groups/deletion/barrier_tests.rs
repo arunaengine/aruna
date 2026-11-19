@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{EffectOperation, Runnable};
+use aruna_core::calls::CallRun;
 use aruna_core::structs::identity::group_delete::{
     GroupDeletePhase, GroupDeletionError, GroupWriteError, MembershipFence,
 };
@@ -86,7 +86,7 @@ async fn prepare_blocks_enrollment() {
 #[tokio::test]
 async fn enrollment_conflicts_prepare() {
     let fixture = enroll_fixture().await;
-    let mut operation = enrollment(&fixture).into_machine();
+    let mut operation = CallRun::new(enrollment(&fixture));
     let mut effects = VecDeque::from_iter(operation.start());
     let mut prepared = false;
     while !operation.is_complete() {
@@ -266,7 +266,7 @@ async fn replacement_cannot_reopen() {
         .await
         .unwrap();
         let connector_id = created.connector.connector_id;
-        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
+        let mut operation = CallRun::new(ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id: fixture.plan.group_id,
             connector_id,
             name: "After".into(),
@@ -277,8 +277,7 @@ async fn replacement_cannot_reopen() {
             } else {
                 HashMap::new()
             },
-        })
-        .into_machine();
+        }));
         let mut effects = VecDeque::from_iter(operation.start());
         let mut deleted = false;
         while !operation.is_complete() {

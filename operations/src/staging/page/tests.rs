@@ -15,7 +15,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Runnable};
+use aruna_core::calls::CallRun;
 use aruna_core::structs::execution::job::{
     JobClaim, JobId, JobPayload, JobRecord, StagingJobCheckpoint, StagingJobPhase,
 };
@@ -635,12 +635,11 @@ async fn flush_keeps_page() {
     aruna_test_support::jobs::insert_job(context, &job)
         .await
         .unwrap();
-    let mut operation = PageImportOperation::new(PageImportInput {
+    let mut operation = CallRun::new(PageImportOperation::new(PageImportInput {
         connector,
         expected_bucket,
         ..input(vec![entry("a")])
-    })
-    .into_machine();
+    }));
 
     let mut pending = std::collections::VecDeque::from(operation.start().into_vec());
     while let Some(effect) = pending.pop_front() {
@@ -1157,7 +1156,7 @@ async fn count_exchanges(
     handle: &aruna_storage::StorageHandle,
     process: u32,
 ) -> (usize, Result<PageImportResult, PageImportError>) {
-    let mut operation = operation.into_machine();
+    let mut operation = CallRun::new(operation);
     // Each run gets its own entropy, as the runner gives it.
     let (now_ms, mut slot) = (2_000_000, 0);
     operation.stamp(now_ms);

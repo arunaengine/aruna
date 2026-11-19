@@ -416,7 +416,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-    use aruna_core::operation::{EffectOperation, Runnable};
+    use aruna_core::calls::CallRun;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::CopyOwner;
     use aruna_core::structs::storage::format::EncodingClass;
@@ -945,7 +945,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let context = path_context(dir.path().to_str().unwrap());
         seed(&context, 10).await;
-        let mut operation = reclaim_op(candidate_key()).into_machine();
+        let mut operation = CallRun::new(reclaim_op(candidate_key()));
         let mut effects = std::collections::VecDeque::from_iter(operation.start());
         let mut refreshed = false;
         while !operation.is_complete() {
