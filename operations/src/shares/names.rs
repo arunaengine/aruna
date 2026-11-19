@@ -58,7 +58,7 @@ impl Operation for ClaimNameOperation {
             rows::done(result)?;
             return Ok(Next::Done(true));
         }
-        let held = rows::value(result)?
+        let held = result.value()?
             .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok())
             .is_some_and(|until| u64::from_be_bytes(until) > self.now);
         if held {

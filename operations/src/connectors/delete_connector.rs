@@ -130,7 +130,7 @@ impl Operation for DeleteSourceOperation {
         let connector_id = self.input.connector_id;
         match &mut self.stage {
             Stage::Connector => {
-                decode_row(rows::value(result)?, SourceConnector::from_bytes)?
+                decode_row(result.value()?, SourceConnector::from_bytes)?
                     .ok_or(DeleteSourceError::NotFound)?;
                 self.stage = Stage::Secret;
                 let read = read_secret_effect(connector_id, None);

@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::holds_placement;
-use aruna_core::rows::{decode, page, read_row, value, values};
+use aruna_core::rows::{decode, page, read_row, values};
 use aruna_core::storage_entries::{create_acceptance_key, metadata_document_key};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
@@ -172,7 +172,7 @@ impl Operation for DeletedHereOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
         if self.scanned {
-            let accepted = value(result)?;
+            let accepted = result.value()?;
             let accepted = (accepted.as_deref().map(decode::<MetadataEventRecord>)).transpose()?;
             return Ok(Next::Done(accepted.is_some()));
         }
@@ -287,7 +287,7 @@ impl Operation for HeldRecordOperation {
                 )),
             });
         }
-        match value(result)? {
+        match result.value()? {
             Some(bytes) => Ok(Next::Done(self.checked(decode(&bytes)?)?)),
             None => {
                 self.scanning = true;

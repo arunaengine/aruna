@@ -163,7 +163,7 @@ impl Operation for CreateProviderOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<AssistantProvider>, ProviderStoreError> {
         match std::mem::replace(&mut self.stage, CreateStage::Written) {
             CreateStage::Index => {
-                let mut index = decode_index(rows::value(result)?.as_ref())?;
+                let mut index = decode_index(result.value()?.as_ref())?;
                 if !index.insert(self.provider.provider_id.clone()) {
                     return Err(ProviderStoreError::IdCollision);
                 }
@@ -172,7 +172,7 @@ impl Operation for CreateProviderOperation {
                 Ok(Next::Call(IoCall::Read(vec![read])))
             }
             CreateStage::Provider(index) => {
-                if rows::value(result)?.is_some() {
+                if result.value()?.is_some() {
                     return Err(ProviderStoreError::IdCollision);
                 }
                 Ok(Next::Call(self.write(&index)?))
@@ -217,7 +217,7 @@ impl Operation for GetProviderOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ProviderStoreError> {
-        let provider = (rows::value(result)?)
+        let provider = (result.value()?)
             .map(|value| AssistantProvider::from_bytes(value.as_ref()))
             .transpose()?;
         let owned = provider.filter(|provider| provider.user_id == self.user_id);
@@ -277,7 +277,7 @@ impl Operation for ListProviderOperation {
                 self.collect(&provider_ids, rows::all_values(result)?)?,
             ));
         }
-        let index = decode_index(rows::value(result)?.as_ref())?;
+        let index = decode_index(result.value()?.as_ref())?;
         if index.is_empty() {
             return Ok(Next::Done(Vec::new()));
         }
@@ -344,7 +344,7 @@ impl Operation for UpdateProviderOperation {
             rows::done(result)?;
             return Ok(Next::Done(self.provider.clone()));
         }
-        self.check(rows::value(result)?)?;
+        self.check(result.value()?)?;
         let (space, key) = provider_row(&self.provider.provider_id);
         self.written = true;
         Ok(Next::Call(IoCall::Write(vec![(
@@ -441,7 +441,7 @@ impl Operation for DeleteProviderOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ProviderStoreError> {
         match std::mem::replace(&mut self.stage, DeleteStage::Written) {
             DeleteStage::Provider => {
-                let value = rows::value(result)?.ok_or(ProviderStoreError::NotFound)?;
+                let value = result.value()?.ok_or(ProviderStoreError::NotFound)?;
                 if AssistantProvider::from_bytes(value.as_ref())?.user_id != self.user_id {
                     return Err(ProviderStoreError::NotFound);
                 }
@@ -449,7 +449,7 @@ impl Operation for DeleteProviderOperation {
                 Ok(Next::Call(IoCall::Read(vec![owner_row(self.user_id)])))
             }
             DeleteStage::Index => {
-                let mut index = decode_index(rows::value(result)?.as_ref())?;
+                let mut index = decode_index(result.value()?.as_ref())?;
                 if !index.remove(&self.provider_id) {
                     return Err(ProviderStoreError::IndexInconsistent);
                 }

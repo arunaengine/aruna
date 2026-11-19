@@ -16,7 +16,7 @@ use aruna_core::metadata::{
     MetadataEvent, MetadataEventPayload, MetadataEventRecord,
 };
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{
     document_job_prefix, event_log_prefix, materialization_status_key,
 };
@@ -110,7 +110,7 @@ impl ReadyBaseOperation {
     }
 
     fn status_read(&mut self, result: IoResult) -> BaseTurn {
-        let status = value(result)?
+        let status = result.value()?
             .and_then(|bytes| postcard::from_bytes::<MaterializationStatusRecord>(&bytes).ok());
         let applied = status.is_some_and(|status| {
             status.state == MaterializationState::Materialized && status.event_id >= self.expected
@@ -154,7 +154,7 @@ impl ReadyBaseOperation {
     /// A marker of an applied batch is only a deferred lifecycle mint; any other one is a
     /// received change the graph has not applied.
     fn marker_read(&mut self, result: IoResult, keys: Vec<Key>, next: Option<Key>) -> BaseTurn {
-        let event = value(result)?
+        let event = result.value()?
             .and_then(|bytes| postcard::from_bytes::<MetadataEventRecord>(&bytes).ok());
         let Some(MetadataEventPayload::ApplyBatch { batch, .. }) = event.map(|event| event.payload)
         else {

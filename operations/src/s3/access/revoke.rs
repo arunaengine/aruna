@@ -8,7 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ACCESS_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, read_row, value};
+use aruna_core::rows::{PrefixPages, done, read_row};
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::Key;
 use std::time::{Duration, SystemTime};
@@ -172,8 +172,8 @@ impl Operation for RevokeUserOperation {
 
     fn next(&mut self, result: IoResult) -> RevokeTurn {
         match self.stage {
-            Stage::Access => self.access_read(value(result)?),
-            Stage::Owner => self.index_read(value(result)?),
+            Stage::Access => self.access_read(result.value()?),
+            Stage::Owner => self.index_read(result.value()?),
             Stage::Index => {
                 done(result)?;
                 Ok(self.delete_access())

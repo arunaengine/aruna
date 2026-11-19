@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{
     CONTENT_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::inventory::{
@@ -295,7 +295,7 @@ impl Operation for IndexedKeyOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<String>>, ResolveError> {
-        let Some(stored) = value(result)? else {
+        let Some(stored) = result.value()? else {
             return Ok(Next::Done(None));
         };
         let entry = IndexEntry::from_bytes(&stored).map_err(failed)?;

@@ -15,7 +15,7 @@ use aruna_core::jobs::{JobRequest, JobResponse, WaitTarget};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_retry};
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::{JobId, JobRecord, JobState, KeyWait};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
@@ -145,7 +145,7 @@ impl TargetLocksOperation {
     }
 
     fn bucket_read(&mut self, result: IoResult) -> TargetNext {
-        let Some(info) = value(result)? else {
+        let Some(info) = result.value()? else {
             return Ok(Next::Done(Vec::new()));
         };
         let group_id = BucketInfo::from_bytes(&info)

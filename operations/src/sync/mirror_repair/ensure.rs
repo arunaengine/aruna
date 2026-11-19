@@ -7,7 +7,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -170,7 +170,7 @@ fn bucket_read(bucket: &str) -> IoCall {
 
 /// The owning group of a local endpoint bucket; `side` names the endpoint in the error.
 fn bucket_group(result: IoResult, side: &str) -> Result<GroupId, SyncMirrorError> {
-    let bytes = value(result)?
+    let bytes = result.value()?
         .ok_or_else(|| SyncMirrorError::Mirror(format!("{side} bucket not found")))?;
     Ok(BucketInfo::from_bytes(&bytes)?.group_id)
 }

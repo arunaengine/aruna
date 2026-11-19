@@ -6,7 +6,7 @@ use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::BucketInfo;
 use thiserror::Error;
 
@@ -63,7 +63,7 @@ impl Operation for GetBucketOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<BucketInfo>, GetBucketError> {
-        let bytes = value(result)?.ok_or(GetBucketError::NotFound)?;
+        let bytes = result.value()?.ok_or(GetBucketError::NotFound)?;
         Ok(Next::Done(BucketInfo::from_bytes(&bytes)?))
     }
 

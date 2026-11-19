@@ -520,7 +520,7 @@ impl Operation for OwnerSecretOperation {
                 Some(effect) => Ok(Next::Call(IoCall::Effect(Box::new(effect)))),
                 None => self.read_managers(),
             },
-            Stage::Managers => self.write(rows::value(result)?.as_deref()),
+            Stage::Managers => self.write(result.value()?.as_deref()),
             Stage::Write => {
                 rows::done(result)?;
                 Ok(Next::Then {
@@ -635,7 +635,7 @@ impl Operation for OwnerSecretsOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, OwnerSecretError> {
         if self.view.is_none() {
-            self.view = Some(WriterView::read(rows::value(result)?.as_deref())?);
+            self.view = Some(WriterView::read(result.value()?.as_deref())?);
             return Ok(self.page(self.after.clone()));
         }
         let (values, next) = rows::page(result)?;

@@ -309,10 +309,10 @@ impl Operation for OpenShareOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<OpenedShare>, ShareError> {
         match self.state {
             OpenState::Load => {
-                let link = parse_link(rows::value(result)?, self.config.token.share_id())?;
+                let link = parse_link(result.value()?, self.config.token.share_id())?;
                 self.loaded(link)
             }
-            OpenState::CheckCreator => self.creator_read(rows::value(result)?),
+            OpenState::CheckCreator => self.creator_read(result.value()?),
             OpenState::LogOpen => {
                 logged(rows::event(result)?)?;
                 (self.opened.take().map(Next::Done)).ok_or(ShareError::NotFinished)
@@ -358,7 +358,7 @@ impl Operation for RevokeShareOperation {
             rows::done(result)?;
             return Ok(Next::Done(()));
         }
-        let link = parse_link(rows::value(result)?, self.id)?;
+        let link = parse_link(result.value()?, self.id)?;
         let link = link.filter(|link| link.created_by == self.owner);
         let link = link.ok_or(ShareError::Unavailable)?;
         if link.revoked_at.is_some() {

@@ -11,7 +11,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_retry};
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::persistent_id_key;
@@ -50,7 +50,7 @@ impl Operation for MappingReadOperation {
         &mut self,
         result: IoResult,
     ) -> Result<Next<Option<PersistentIdMapping>>, PersistentIdError> {
-        let mapping = value(result)?
+        let mapping = result.value()?
             .map(|bytes| PersistentIdMapping::from_bytes(bytes.as_ref()))
             .transpose()
             .map_err(PersistentIdError::Conversion)?;

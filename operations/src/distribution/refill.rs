@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
     INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::{done, read_row};
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, Cursor, RangeAccount, RangeCounters, SAMPLE_SIZE, SampleEntry, account_key, refill_key,
     sample_count_key, sample_prefix,
@@ -273,7 +273,7 @@ impl Operation for RefillPageOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<PageEnd>, RefillError> {
         match self.step {
             PageStep::Cursor => {
-                let stored = decode_cursor(value(result)?)?;
+                let stored = decode_cursor(result.value()?)?;
                 // A finished pass starts over, so its end marker still matches a fresh start.
                 let restarted = stored == Cursor::End && self.cursor == Cursor::Start;
                 if stored != self.cursor && !restarted {
@@ -299,7 +299,7 @@ impl Operation for RefillPageOperation {
                 let key = sample_count_key(self.config.set_id, self.config.range_id);
                 self.call(PageStep::Count, read_row(RANGE_COUNTER_KEYSPACE, key))
             }
-            PageStep::Count => self.write(value(result)?),
+            PageStep::Count => self.write(result.value()?),
             PageStep::Write => {
                 done(result)?;
                 let deletes = std::mem::take(&mut self.deletes);
@@ -412,7 +412,7 @@ impl Operation for RefillOperation {
         let range_id = self.config.range_id;
         match self.state {
             State::Account => {
-                let stored = value(result)?.ok_or(RefillError::RangeMissing(range_id))?;
+                let stored = result.value()?.ok_or(RefillError::RangeMissing(range_id))?;
                 let account = RangeAccount::from_bytes(&stored)?;
                 if matches!(account.charge, Charge::Retired { .. }) {
                     return Err(RefillError::RangeRetired(range_id));
@@ -424,7 +424,7 @@ impl Operation for RefillOperation {
                 self.call(State::Cursor, read)
             }
             State::Cursor => {
-                self.cursor = decode_cursor(value(result)?)?;
+                self.cursor = decode_cursor(result.value()?)?;
                 // A finished pass starts over: the sample is refilled because it ran low.
                 if self.cursor == Cursor::End {
                     self.cursor = Cursor::Start;

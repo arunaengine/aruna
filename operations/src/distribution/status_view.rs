@@ -12,7 +12,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::heartbeat::MAX_HEARTBEAT_AGE;
 use aruna_core::keyspaces::{DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::distribution::bootstrap::{BootstrapCursor, bootstrap_key};
 use aruna_core::structs::storage::distribution::fence::LocalFence;
@@ -345,7 +345,7 @@ impl Operation for ReadViewOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<DistributionView>>, StatusError> {
-        Ok(Next::Done(decode_view(value(result)?)?))
+        Ok(Next::Done(decode_view(result.value()?)?))
     }
 }
 
@@ -409,7 +409,7 @@ impl Operation for ReadStatusOperation {
         let unfinished = || StorageError::ReadError("the status was not read".to_string());
         match self.step {
             StatusStep::View => {
-                let Some(view) = decode_view(value(result)?)? else {
+                let Some(view) = decode_view(result.value()?)? else {
                     return Ok(Next::Done(None));
                 };
                 self.view = Some(view);

@@ -9,7 +9,7 @@ use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::{done, read_row};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
@@ -305,7 +305,7 @@ impl Operation for MarkFailedOperation {
             done(result)?;
             return Ok(Next::Done(()));
         }
-        let Some(bytes) = value(result)? else {
+        let Some(bytes) = result.value()? else {
             warn!(relative = %self.relative, "The failed download has no row");
             return Ok(Next::Done(()));
         };

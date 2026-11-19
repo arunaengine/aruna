@@ -12,7 +12,7 @@ use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::keyspaces::INPUT_PAGE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::{done, read_row};
 use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use aruna_core::structs::execution::job::{
@@ -210,7 +210,7 @@ impl Operation for LoadChainOperation {
 
     fn next(&mut self, result: IoResult) -> ChainNext {
         match self.step.take() {
-            Some(ChainStep::Local(digest)) => match value(result)? {
+            Some(ChainStep::Local(digest)) => match result.value()? {
                 Some(row) => {
                     self.pages.push(stored_page(&row, &digest)?);
                     self.read_next()
@@ -545,7 +545,7 @@ impl Operation for ServePageOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<ServedPage>, PageReadError> {
         if self.admitted {
-            let page = value(result)?
+            let page = result.value()?
                 .map(|row| stored_page(&row, &self.digest))
                 .transpose()?;
             return Ok(Next::Done(page.map(Box::new)));

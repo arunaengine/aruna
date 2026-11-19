@@ -17,7 +17,7 @@ use aruna_core::metadata::{
     MetadataActor, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
 };
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::{done, read_row};
 use aruna_core::storage_entries::{metadata_actor_entry, metadata_actor_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -323,7 +323,7 @@ fn actor_call(document_id: Ulid) -> IoCall {
 }
 
 fn actor_answer(result: IoResult) -> Result<Option<MetadataActor>, DeviceEditError> {
-    value(result)?
+    result.value()?
         .map(|bytes| postcard::from_bytes(&bytes).map_err(|_| DeviceEditError::Unavailable))
         .transpose()
 }
