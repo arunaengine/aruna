@@ -68,6 +68,9 @@ pub(super) fn admission_error(error: LifecycleError) -> SubmitJobError {
         }
         LifecycleError::QuotaDenied(reason) => SubmitJobError::QuotaDenied(reason),
         LifecycleError::GroupWrite(error) => SubmitJobError::GroupWrite(error),
+        error @ LifecycleError::AdmissionClosed => {
+            SubmitJobError::InvalidWorkspace(error.to_string())
+        }
         error => SubmitJobError::PlacementUnavailable(error.to_string()),
     }
 }

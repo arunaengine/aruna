@@ -10,7 +10,10 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{InputPage, PageManifest, SubmissionId, spec_entries};
+use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::structs::execution::job::{
+    InputPage, PageManifest, SubmissionId, plugin_tag, spec_entries,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::group_permission_path;
@@ -32,6 +35,7 @@ use crate::jobs::records::pages::{LoadChainOperation, PageReadError, StoreEntrie
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::write_peer::WritePeerOperation;
+use crate::plugins::screen::{ScreenError, ScreenTask, tagged};
 use crate::realm::peer_trust::peer_acts_for;
 
 /// Whether the caller may write in a group: its grants, then the request policies.
@@ -99,6 +103,7 @@ enum ForwardedStep {
     Group(Box<RealmConfigDocument>),
     Pages(Box<RealmConfigDocument>),
     Device(Box<RealmConfigDocument>),
+    Screen(Box<RealmConfigDocument>),
     Store(Box<(RealmConfigDocument, RequestIdentity)>),
     Admit,
 }
@@ -159,10 +164,25 @@ impl AdmitForwardedOperation {
         if !peer_acts_for(&config, self.peer, auth.user_id) || auth.path_restrictions.is_some() {
             return Err(SubmissionRefusal::Unauthorized);
         }
+        // A plugin task passes the replicated task check, sent by its install's receiver only.
+        if tagged(&self.request.spec).is_some() {
+            let request = &self.request;
+            let task = (&request.spec, request.created_by, request.ingress_node_id);
+            let screen = ScreenTask::new(std::sync::Arc::new(config.clone()), task);
+            self.step = ForwardedStep::Screen(Box::new(config));
+            return Ok(Next::Call(IoCall::child(screen)));
+        }
         let group_id = self.request.spec.group_id;
         let check = GroupWriteOperation::new(auth, group_id, self.node()?.local);
         self.step = ForwardedStep::Group(Box::new(config));
         Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn screened(&mut self, config: RealmConfigDocument, install: PluginInstall) -> ForwardedNext {
+        if install.receiver != self.peer || self.request.ingress_node_id != self.peer {
+            return Err(SubmissionRefusal::Unauthorized);
+        }
+        self.load_pages(config)
     }
 
     /// Paged inputs come from the forwarding node, checked page by page against the manifest.
@@ -262,17 +282,36 @@ impl AdmitForwardedOperation {
             self.request.captured_inputs.clear();
         }
         self.request.input_pages = manifest;
+        let plugin_task = plugin_tag(&self.request.spec.tags).is_some();
         let admit = self.node()?.admission(&self.request, identity, config);
-        let admit = admit.map_err(admission_refusal)?;
+        let admit = admit.map_err(|error| admission_refusal(error, plugin_task))?;
         self.step = ForwardedStep::Admit;
         Ok(Next::Call(IoCall::child(admit)))
     }
 }
 
-fn admission_refusal(error: SubmitJobError) -> SubmissionRefusal {
+/// A failed task check commits nothing, so the sender may count it as a refusal.
+fn screen_refusal(error: ScreenError) -> SubmissionRefusal {
+    match error {
+        ScreenError::Unavailable(_) => SubmissionRefusal::Unavailable,
+        refused => SubmissionRefusal::Invalid {
+            reason: refused.to_string(),
+        },
+    }
+}
+
+fn admission_refusal(error: SubmitJobError, plugin_task: bool) -> SubmissionRefusal {
     match placement_failure(error) {
         SubmitJobError::JobPlanConflict { existing_job_id } => {
             SubmissionRefusal::Conflict { existing_job_id }
+        }
+        // A plugin task's sender must tell a refusal that committed nothing from a lost answer.
+        error @ (SubmitJobError::QuotaDenied(_) | SubmitJobError::InvalidWorkspace(_))
+            if plugin_task =>
+        {
+            SubmissionRefusal::Invalid {
+                reason: error.to_string(),
+            }
         }
         error => {
             warn!(error = %error, "Forwarded submission could not be admitted");
@@ -301,6 +340,10 @@ impl Operation for AdmitForwardedOperation {
                 let config = config.map_err(|_| SubmissionRefusal::Unavailable)?;
                 self.configured(&auth, config)
             }
+            ForwardedStep::Screen(config) => {
+                let install = result.child::<PluginInstall, ScreenError>()?;
+                self.screened(*config, install.map_err(screen_refusal)?)
+            }
             ForwardedStep::Group(config) => match result.child::<bool, IoError>()? {
                 Ok(true) => self.load_pages(*config),
                 Ok(false) | Err(_) => Err(SubmissionRefusal::Unauthorized),
@@ -323,7 +366,8 @@ impl Operation for AdmitForwardedOperation {
             }
             ForwardedStep::Admit => {
                 let accepted = result.child::<AcceptedSubmission, SubmitJobError>()?;
-                let accepted = accepted.map_err(admission_refusal)?;
+                let plugin_task = plugin_tag(&self.request.spec.tags).is_some();
+                let accepted = accepted.map_err(|error| admission_refusal(error, plugin_task))?;
                 Ok(Next::Done(SubmissionAck {
                     job_id: accepted.job_id,
                     created: accepted.created,
