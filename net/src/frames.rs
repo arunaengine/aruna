@@ -3,11 +3,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Instant;
+
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::FrameShape;
+use aruna_core::telemetry::{record_elapsed_ms, record_error};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
+use tracing::{Span, field};
 
 use crate::NetHandle;
 use crate::streams::{BiStream, RecvStream};
@@ -69,6 +73,20 @@ fn close(stream: &mut BiStream) {
 impl NetHandle {
     /// Sends `frame` to `peer` in the class `shape` names and answers with the answer frame's
     /// payload, followed by the body when `shape` caps one.
+    #[tracing::instrument(
+        name = "net.frame.request",
+        level = "debug",
+        skip(self, frame, shape),
+        fields(
+            peer = ?peer,
+            class = shape.class,
+            open_stream_ms = field::Empty,
+            write_ms = field::Empty,
+            read_ms = field::Empty,
+            elapsed_ms = field::Empty,
+            error = field::Empty,
+        )
+    )]
     pub async fn frame_request(
         &self,
         peer: NodeId,
@@ -76,12 +94,33 @@ impl NetHandle {
         frame: &[u8],
         shape: &FrameShape,
     ) -> Result<Vec<u8>, FrameError> {
+        let span = Span::current();
+        let started = Instant::now();
+        let result = self.exchange(peer, alpn, frame, shape, &span).await;
+        record_elapsed_ms(&span, "elapsed_ms", started);
+        if let Err(error) = &result {
+            record_error(&span, &error.message);
+        }
+        result
+    }
+
+    async fn exchange(
+        &self,
+        peer: NodeId,
+        alpn: Alpn,
+        frame: &[u8],
+        shape: &FrameShape,
+        span: &Span,
+    ) -> Result<Vec<u8>, FrameError> {
+        let started = Instant::now();
         let length = u32::try_from(frame.len())
             .map_err(|_| FrameError::unsent("request frame exceeds the frame size"))?;
         let mut stream = timeout(shape.io_wait, self.open_stream(peer, alpn))
             .await
             .map_err(|_| FrameError::unsent("timed out opening the stream"))?
             .map_err(|error| FrameError::unsent(error.to_string()))?;
+        record_elapsed_ms(span, "open_stream_ms", started);
+        let write_started = Instant::now();
         let written = timeout(shape.io_wait, async {
             stream.0.write_all(&[shape.class]).await?;
             stream.0.write_all(&length.to_be_bytes()).await?;
@@ -97,6 +136,8 @@ impl NetHandle {
         if let Err(error) = stream.0.finish() {
             return Err(FrameError::sent(&stream, error.to_string()));
         }
+        let read_started = Instant::now();
+        record_elapsed_ms(span, "write_ms", write_started);
         let mut answer = match timeout(
             shape.answer_wait,
             read_frame(&mut stream.1, shape.class, shape.answer_cap),
@@ -121,6 +162,7 @@ impl NetHandle {
                 Err(_) => return Err(FrameError::sent(&stream, "timed out reading the body")),
             }
         }
+        record_elapsed_ms(span, "read_ms", read_started);
         close(&mut stream);
         #[cfg(feature = "test-hooks")]
         if self.take_dropped(&answer) {
