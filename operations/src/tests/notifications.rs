@@ -93,7 +93,7 @@ pub async fn create_holder_watch(
 > {
     let watch = (path_prefix, event_mask);
     let create = crate::notifications::watch::store::CreateWatchOperation::new(
-        Ulid::generate(),
+        (Ulid::generate(), Ulid::generate()),
         local_node_id,
         owner,
         watch,
