@@ -17,14 +17,14 @@ use aruna_operations::blob::migration::misplaced::AccessRule;
 use aruna_operations::blob::purge::ScopeTotalsOperation;
 use aruna_operations::jobs::JOB_RETENTION_MS;
 use aruna_operations::metadata::api::links::set_preview_distributed;
+use aruna_operations::replication::sync_relationship::{
+    ListRelationshipsOperation, SyncRelationshipDirection,
+};
 use aruna_operations::s3::bucket::release::BucketScope;
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use aruna_operations::s3::object::delete::pinned::{PinnedError, RefuseScopeOperation};
 use aruna_operations::s3::object::versions::{
     ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
-};
-use aruna_operations::sync::sync_relationship::{
-    ListRelationshipsOperation, SyncRelationshipDirection,
 };
 use axum::extract::State;
 use axum::http::StatusCode;

@@ -5,7 +5,7 @@
 use super::ensure::EnsureMirrorOperation;
 use super::settle::{RollbackClaim, SettleReconcileOperation};
 use super::*;
-use crate::sync::sync_relationship::{
+use crate::replication::sync_relationship::{
     CreateRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
     SyncRelationshipDirection,
 };

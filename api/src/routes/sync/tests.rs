@@ -27,7 +27,7 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_drivers::testing::test_context;
-use aruna_operations::sync::mirror_repair::{DrainRepairsOperation, SyncMirrorRecord};
+use aruna_operations::replication::mirror_repair::{DrainRepairsOperation, SyncMirrorRecord};
 use tempfile::TempDir;
 
 fn test_node(seed: u8) -> NodeId {

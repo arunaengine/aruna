@@ -60,7 +60,7 @@ use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::plugins::decide::WaitingRow;
-use aruna_operations::sync::mirror_repair::SyncMirrorRecord;
+use aruna_operations::replication::mirror_repair::SyncMirrorRecord;
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use layouts::{CONNECTOR, HEAD, NODE_INFO, OBLIGATION, padded};

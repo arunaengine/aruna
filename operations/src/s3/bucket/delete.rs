@@ -42,7 +42,7 @@ use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
 use thiserror::Error;
 
-use crate::sync::mirror_repair::mirror_delete_entry;
+use crate::replication::mirror_repair::mirror_delete_entry;
 use aruna_core::structs::execution::notification::schedule_drain_effect;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

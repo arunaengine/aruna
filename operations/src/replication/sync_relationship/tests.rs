@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::sync::mirror_repair::{MirrorRecordOperation, SyncMirrorIntent};
+use crate::replication::mirror_repair::{MirrorRecordOperation, SyncMirrorIntent};
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;

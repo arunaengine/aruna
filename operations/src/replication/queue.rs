@@ -667,7 +667,7 @@ mod tests {
         .await
     }
     use super::super::version_replication::SourceAuthorizationError;
-    use crate::sync::mirror_repair::StoreStatusOperation;
+    use crate::replication::mirror_repair::StoreStatusOperation;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,

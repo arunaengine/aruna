@@ -7,6 +7,7 @@ mod ensure;
 mod kick;
 mod record;
 mod remove;
+pub mod request;
 mod scan;
 mod settle;
 mod status;
@@ -19,6 +20,7 @@ pub use record::MirrorRecordOperation;
 pub use remove::RemoveMirrorOperation;
 pub use status::StoreStatusOperation;
 
+use crate::replication::sync_relationship::SyncRelationshipError;
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -31,8 +33,6 @@ use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-use crate::sync::sync_relationship::SyncRelationshipError;
 
 pub(crate) const RECONCILE_GRACE: Duration = Duration::from_secs(30);
 pub const REPAIR_RETRY_AFTER: Duration = Duration::from_secs(1);

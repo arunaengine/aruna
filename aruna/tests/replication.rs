@@ -42,7 +42,7 @@ use aruna_drivers::driver::drive;
 use aruna_kpabe::{Envelope, UserKey};
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
-use aruna_operations::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
+use aruna_operations::replication::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
