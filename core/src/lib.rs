@@ -107,4 +107,3 @@ pub mod vault_format;
 
 #[cfg(test)]
 mod tests;
-
