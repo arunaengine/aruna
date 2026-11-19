@@ -108,9 +108,4 @@ pub mod vault_format;
 #[cfg(test)]
 mod tests;
 
-pub use document::{
-    DocumentApplyDecision, DocumentChange, DocumentChangeKind, DocumentEffect, DocumentEvent,
-    DocumentEvictedDocument, DocumentNetEvent, DocumentSyncRevision, DocumentTarget,
-};
 pub use keyspaces::*;
-pub use trace_context::DistributedTraceContext;

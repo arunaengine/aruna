@@ -5,7 +5,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
-use aruna_core::DistributedTraceContext;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::DhtGetOptions;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -15,6 +14,7 @@ use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keyspaces::DHT_KEYSPACE;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::trace_context::DistributedTraceContext;
 use aruna_core::types::TxnId;
 use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::owner::TransactionOwner;

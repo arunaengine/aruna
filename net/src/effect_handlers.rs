@@ -204,28 +204,28 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
     match effect {
         NetEffect::Dht(dht_effect) => handle_dht_effect(ctx, dht_effect).await,
         NetEffect::DocumentSync(document_sync_effect) => match document_sync_effect {
-            aruna_core::DocumentEffect::PublishDocuments { documents, peers } => {
+            aruna_core::document::DocumentEffect::PublishDocuments { documents, peers } => {
                 NetEvent::DocumentSync(document_sync.publish_documents(documents, peers).await)
             }
-            aruna_core::DocumentEffect::SyncDocument { topic, peers } => {
+            aruna_core::document::DocumentEffect::SyncDocument { topic, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_document_event(topic, peers).await)
             }
-            aruna_core::DocumentEffect::SyncDocuments { topics, peers } => {
+            aruna_core::document::DocumentEffect::SyncDocuments { topics, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_documents_event(topics, peers).await)
             }
-            aruna_core::DocumentEffect::ReconcileBatch {
+            aruna_core::document::DocumentEffect::ReconcileBatch {
                 topic,
                 stored_cursor,
             } => NetEvent::DocumentSync(document_sync.reconcile_batch_event(topic, stored_cursor)),
-            aruna_core::DocumentEffect::OverflowPage {
+            aruna_core::document::DocumentEffect::OverflowPage {
                 topic,
                 start,
                 applied,
             } => NetEvent::DocumentSync(document_sync.overflow_page_event(topic, start, applied)),
-            aruna_core::DocumentEffect::NoteGitRecord { document_id } => {
+            aruna_core::document::DocumentEffect::NoteGitRecord { document_id } => {
                 NetEvent::DocumentSync(document_sync.note_git_record(document_id))
             }
-            aruna_core::DocumentEffect::ReloadRealmPeers => {
+            aruna_core::document::DocumentEffect::ReloadRealmPeers => {
                 NetEvent::DocumentSync(aruna_core::document::DocumentNetEvent::Error {
                     target: None,
                     error: "a peer reload must be dispatched by the operations runner".to_string(),
