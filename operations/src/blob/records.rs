@@ -263,7 +263,6 @@ mod pure_tests {
                 11,
             )),
             Some([6u8; 32]),
-            None,
         )
         .unwrap();
 

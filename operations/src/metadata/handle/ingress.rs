@@ -1344,6 +1344,7 @@ impl MetadataHandle {
                 (MetadataTransportMessage::RealmSecretResult { result }, None)
             }
             MetadataTransportMessage::OpenSetting { target, bytes } => {
+                let bytes = bytes.expose().to_vec();
                 let request = crate::realm_vault::ServeRequest::Setting { target, bytes };
                 let result = match context.net_handle.as_ref() {
                     Some(net) => {

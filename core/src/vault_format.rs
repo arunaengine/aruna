@@ -57,13 +57,13 @@ pub struct VaultKdf {
     pub salt: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrappedMaster {
     pub nonce: String,
     pub wrapped: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryBlock {
     pub salt: String,
     pub nonce: String,
@@ -73,14 +73,14 @@ pub struct RecoveryBlock {
     pub kdf: Option<KdfParams>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedData {
     pub nonce: String,
     pub sealed: String,
 }
 
 /// One keypair in the `keys` slot. The private key is sealed with the master key.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultKey {
     pub id: String,
     pub kind: String,
@@ -93,6 +93,44 @@ pub struct VaultKey {
 }
 
 /// The vault payload JSON as the portal writes it.
+impl fmt::Debug for WrappedMaster {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WrappedMaster")
+            .field("wrapped_len", &self.wrapped.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for RecoveryBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecoveryBlock")
+            .field("wrapped_len", &self.wrapped.len())
+            .field("kdf", &self.kdf)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for SealedData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SealedData")
+            .field("sealed_len", &self.sealed.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for VaultKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VaultKey")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("public", &self.public)
+            .field("wrapped_len", &self.wrapped_private.len())
+            .field("created_at", &self.created_at)
+            .field("retired_at", &self.retired_at)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultPayload {
     pub version: u32,
@@ -391,6 +429,58 @@ mod tests {
 
     fn nonce(text: &str) -> [u8; 12] {
         decode(text).unwrap().try_into().unwrap()
+    }
+
+    #[test]
+    fn master_debug_hidden() {
+        let master = WrappedMaster {
+            nonce: "hidden-nonce".to_string(),
+            wrapped: "hidden-master".to_string(),
+        };
+        let shown = format!("{master:?}");
+        assert!(!shown.contains("hidden-nonce"));
+        assert!(!shown.contains("hidden-master"));
+    }
+
+    #[test]
+    fn recovery_debug_hidden() {
+        let recovery = RecoveryBlock {
+            salt: "hidden-salt".to_string(),
+            nonce: "hidden-nonce".to_string(),
+            wrapped: "hidden-master".to_string(),
+            kdf: None,
+        };
+        let shown = format!("{recovery:?}");
+        for hidden in ["hidden-salt", "hidden-nonce", "hidden-master"] {
+            assert!(!shown.contains(hidden));
+        }
+    }
+
+    #[test]
+    fn sealed_debug_hidden() {
+        let data = SealedData {
+            nonce: "hidden-nonce".to_string(),
+            sealed: "hidden-data".to_string(),
+        };
+        let shown = format!("{data:?}");
+        assert!(!shown.contains("hidden-nonce"));
+        assert!(!shown.contains("hidden-data"));
+    }
+
+    #[test]
+    fn key_debug_hidden() {
+        let key = VaultKey {
+            id: "key".to_string(),
+            kind: "x25519".to_string(),
+            public: "public".to_string(),
+            nonce: "hidden-nonce".to_string(),
+            wrapped_private: "hidden-private".to_string(),
+            created_at: "now".to_string(),
+            retired_at: None,
+        };
+        let shown = format!("{key:?}");
+        assert!(!shown.contains("hidden-nonce"));
+        assert!(!shown.contains("hidden-private"));
     }
 
     #[test]

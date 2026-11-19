@@ -198,7 +198,9 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
         &driver_ctx,
     )
     .await
-    .map_err(|err| std::io::Error::other(err.to_string()))?;
+    .map_err(|err| std::io::Error::other(err.to_string()))?
+    .expose()
+    .to_string();
 
     Ok(token)
 }

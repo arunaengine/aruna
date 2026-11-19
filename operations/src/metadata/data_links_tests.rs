@@ -334,9 +334,10 @@ fn members_skip_malformed() {
 
 #[test]
 fn no_versions_done() {
-    let link = DataLink::Set {
+    let link = DataLink::SetPrefix {
         realm_id: realm(),
         set_id: Ulid::from_parts(5, 5),
+        prefix: String::new(),
     };
     let links = BTreeMap::from([(link, posting())]);
     let mut associate = AssociateVersionsOperation::new(links.clone());

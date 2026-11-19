@@ -292,7 +292,7 @@ impl ArunaS3Service {
     }
 
     /// Sends one request to the coordinator and returns its successful answer.
-    pub(super) async fn forward_write(
+    pub(in crate::s3::service) async fn forward_write(
         &self,
         user: &UserAccess,
         forward: &Forward,

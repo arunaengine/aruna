@@ -210,12 +210,22 @@ impl EnvelopeContext {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectEnvelope {
     pub context: EnvelopeContext,
     pub abe: Vec<u8>,
     pub recovery_enc: [u8; 32],
     pub recovery_ciphertext: Vec<u8>,
+}
+
+impl std::fmt::Debug for ObjectEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectEnvelope")
+            .field("context", &self.context)
+            .field("abe_len", &self.abe.len())
+            .field("recovery_len", &self.recovery_ciphertext.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ObjectEnvelope {

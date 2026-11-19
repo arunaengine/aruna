@@ -4,9 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::fetch::{peer_call, peer_reply};
+use crate::forward::fetch::{PeerFrame, peer_call, peer_reply};
 use crate::forward::transport::{ForwardError, reject};
-use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError, encode_message};
+use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
 use crate::realm::peer_trust::is_sync_eligible;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 use aruna_core::NodeId;
@@ -32,7 +32,7 @@ const RELAY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct RelayAdminOperation {
     /// Reversed, so the next holder pops off the end.
     peers: Vec<NodeId>,
-    frame: Result<Vec<u8>, String>,
+    frame: Result<PeerFrame, String>,
     asked: Option<NodeId>,
 }
 
@@ -50,7 +50,7 @@ impl RelayAdminOperation {
             .take(RELAY_PEER_LIMIT)
             .collect();
         peers.reverse();
-        let frame = encode_message(&MetadataTransportMessage::ForwardAdminEvent {
+        let frame = PeerFrame::encode(&MetadataTransportMessage::ForwardAdminEvent {
             target,
             event,
             placement,
@@ -70,7 +70,7 @@ impl RelayAdminOperation {
         })?;
         let peer = self.peers.pop().ok_or(ForwardError::Unavailable)?;
         self.asked = Some(peer);
-        let call = peer_call(peer, frame.clone(), RELAY_ATTEMPT_TIMEOUT);
+        let call = peer_call(peer, frame.bytes(), RELAY_ATTEMPT_TIMEOUT);
         Ok(Next::Call(call))
     }
 }

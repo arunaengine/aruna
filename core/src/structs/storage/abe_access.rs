@@ -263,11 +263,20 @@ impl GrantContext {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyGrant {
     pub context: GrantContext,
     pub enc: [u8; 32],
     pub ciphertext: Vec<u8>,
+}
+
+impl std::fmt::Debug for KeyGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyGrant")
+            .field("context", &self.context)
+            .field("ciphertext_len", &self.ciphertext.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl KeyGrant {
@@ -320,6 +329,7 @@ impl KeyGrant {
 mod tests {
     use super::*;
     use crate::structs::identity::realm::RealmId;
+    use crate::structs::storage::abe::{EnvelopeContext, ObjectEnvelope};
     use crate::structs::storage::encryption::BucketKeyRef;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use serde_json::{Value, json};
@@ -368,9 +378,8 @@ mod tests {
             "aad":STANDARD.encode(context.bytes().unwrap())})
     }
 
-    fn fixture() -> Value {
-        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
-        let request = KeyRequest {
+    fn key_request(node: NodeId) -> KeyRequest {
+        KeyRequest {
             request_id: ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8T9"),
             requesting_user: user("01K6YQ8ZQ9V3X2N4M5P6R7S8TA", 1),
             recipient_user: user("01K6YQ8ZQ9V3X2N4M5P6R7S8TB", 1),
@@ -391,7 +400,49 @@ mod tests {
             restrictions: None,
             revisions: vec![[8; 32]],
             created_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn grant_debug_hidden() {
+        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let grant = KeyGrant {
+            context: GrantContext {
+                request: key_request(node),
+                issuer: KeyIssuer::Node(node),
+            },
+            enc: [201; 32],
+            ciphertext: vec![202; 32],
         };
+        let shown = format!("{grant:?}");
+        assert!(!shown.contains("201, 201"));
+        assert!(!shown.contains("202, 202"));
+    }
+
+    #[test]
+    fn envelope_debug_hidden() {
+        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let envelope = ObjectEnvelope {
+            context: EnvelopeContext {
+                parameters: key_request(node).parameters,
+                epoch: 1,
+                object_key: "data/a.csv".to_string(),
+                write_id: ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8TD"),
+                public_key: [3; 32],
+            },
+            abe: vec![201; 32],
+            recovery_enc: [202; 32],
+            recovery_ciphertext: vec![203; 32],
+        };
+        let shown = format!("{envelope:?}");
+        for hidden in ["201, 201", "202, 202", "203, 203"] {
+            assert!(!shown.contains(hidden));
+        }
+    }
+
+    fn fixture() -> Value {
+        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let request = key_request(node);
         let mut wide = request.clone();
         wide.request_id = ulid("01K6YQ8ZQ9V3X2N4M5P6R7S8TE");
         wide.recipient_user = user("01K6YQ8ZQ9V3X2N4M5P6R7S8TF", 2);

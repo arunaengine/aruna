@@ -16,10 +16,12 @@ use super::export_types::{
     ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
 };
 use super::fanout::ensure_query_form;
+use super::fanout_types::{forwarded_bearer, query_union_safe};
 use super::list_types::{ListVisibleRequest, ListVisibleResult, MetadataListOrder};
 use super::path::LocalPathOperation;
 use super::path::{reduce_path_response, select_forward_peers, validate_path_resolution};
 use super::path_types::MetadataLookupResult;
+use super::path_types::deduplicate_fanout_nodes;
 use super::path_types::sanitize_path_winner;
 use super::preflight_types::{
     MetadataIndexState, MetadataNodeFreshness, MetadataResolvedTarget, MetadataStorageOperation,
@@ -28,6 +30,8 @@ use super::preflight_types::{
 use super::readable::PathPermissionOperation;
 use super::search_types::SearchQueryRequest;
 use crate::driver::drive;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::StorageEvent;
 
 use std::collections::BTreeMap;
 

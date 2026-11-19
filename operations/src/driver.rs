@@ -1221,9 +1221,10 @@ pub(crate) fn drive_suboperation<'a>(
                 depth,
                 "Starting suboperation"
             );
-            let _hold = take_hold(context, operation.hold_scope()).await;
+            let scope = operation.hold_scope();
+            let _hold = take_hold(context, scope).await;
             let mut run = SubRun(operation.as_mut(), None);
-            let mut state = drive_effects(
+            let effects = drive_effects(
                 &mut run,
                 context,
                 depth,
@@ -1231,8 +1232,8 @@ pub(crate) fn drive_suboperation<'a>(
                 DeadlineAbort::BeforeCommitOnly,
                 ExpiryRecheck::EveryEffect,
                 None,
-            )
-            .await;
+            );
+            let mut state = holding(scope, effects).await;
 
             let record = run.1;
             abort_leaked_transaction(&mut state.tracker, context, depth, state.cleanup_deadline)
@@ -1267,7 +1268,11 @@ async fn take_hold(
     context: &DriverContext,
     scope: Option<HoldScope>,
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-    match scope? {
+    let scope = scope?;
+    if HELD.try_with(|held| held.contains(&scope)).unwrap_or(false) {
+        return None;
+    }
+    match scope {
         HoldScope::DocumentReconcile => Some(context.net_handle.as_ref()?.hold_reconcile().await),
         HoldScope::DocumentWrite(document_id) => Some(
             context
@@ -1280,6 +1285,24 @@ async fn take_hold(
             Some(context.blob_handle.as_ref()?.git()?.lock(document_id).await)
         }
         scope => Some(local_hold(scope).lock_owned().await),
+    }
+}
+
+tokio::task_local! {
+    /// The scopes the runs of this task hold. A child of a holder runs under that hold, as the
+    /// helpers of an async function ran under its lock, instead of waiting for it forever.
+    static HELD: Vec<HoldScope>;
+}
+
+/// Runs `effects` with `scope` marked as held, so the children it drives do not wait for it.
+async fn holding<F: Future>(scope: Option<HoldScope>, effects: F) -> F::Output {
+    let mut held = HELD.try_with(Clone::clone).unwrap_or_default();
+    match scope {
+        Some(scope) if !held.contains(&scope) => {
+            held.push(scope);
+            HELD.scope(held, effects).await
+        }
+        _ => effects.await,
     }
 }
 
@@ -1318,7 +1341,8 @@ async fn machine_until<O: EffectOperation>(
     context: &DriverContext,
     deadline: tokio::time::Instant,
 ) -> Result<O::Output, O::Error> {
-    let hold = take_hold(context, operation.hold_scope());
+    let scope = operation.hold_scope();
+    let hold = take_hold(context, scope);
     let Ok(_hold) = tokio::time::timeout_at(deadline, hold).await else {
         warn!(
             operation = %type_name::<O>(),
@@ -1328,7 +1352,7 @@ async fn machine_until<O: EffectOperation>(
         return operation.finalize();
     };
     let mut run = ParentRun(&mut operation, None);
-    let mut state = drive_effects(
+    let effects = drive_effects(
         &mut run,
         context,
         0,
@@ -1336,8 +1360,8 @@ async fn machine_until<O: EffectOperation>(
         DeadlineAbort::OperationOptIn,
         ExpiryRecheck::Once,
         Some(type_name::<O>()),
-    )
-    .await;
+    );
+    let mut state = holding(scope, effects).await;
     let record = run.1;
     if !operation.is_complete() {
         // Nonterminal operations cannot finalize. Drop late cleanup effects and let the
@@ -1400,18 +1424,22 @@ async fn drive_machine<O: EffectOperation>(
         "Starting operation"
     );
 
-    let _hold = take_hold(context, operation.hold_scope()).await;
+    let scope = operation.hold_scope();
+    let _hold = take_hold(context, scope).await;
     let mut run = ParentRun(&mut operation, None);
     // Heap the effect loop: an adapter may drive another operation inline, and
     // nested effect-loop futures otherwise stack up in one caller's future.
-    let mut state = Box::pin(drive_effects(
-        &mut run,
-        context,
-        0,
-        None,
-        DeadlineAbort::BeforeCommitOnly,
-        ExpiryRecheck::Once,
-        None,
+    let mut state = Box::pin(holding(
+        scope,
+        drive_effects(
+            &mut run,
+            context,
+            0,
+            None,
+            DeadlineAbort::BeforeCommitOnly,
+            ExpiryRecheck::Once,
+            None,
+        ),
     ))
     .await;
     let record = run.1;
@@ -3677,6 +3705,63 @@ mod test {
         assert_eq!(second_task.await.unwrap(), Ok(()));
         tokio::time::resume();
         assert_eq!(*log.lock().unwrap(), ["first", "other", "second"]);
+        assert!(reconcile_free(&context));
+    }
+
+    /// Holds the reconcile scope and runs a child that names the same scope.
+    #[derive(Debug, PartialEq)]
+    struct HoldingParent {
+        child: Option<Holding>,
+        done: bool,
+    }
+
+    impl EffectOperation for HoldingParent {
+        type Output = ();
+        type Error = ();
+
+        fn hold_scope(&self) -> Option<HoldScope> {
+            Some(HoldScope::DocumentReconcile)
+        }
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            let Some(child) = self.child.take() else {
+                return smallvec::smallvec![];
+            };
+            smallvec::smallvec![Effect::SubOperation(boxed_suboperation(child, |_| {
+                Event::Delayed
+            }))]
+        }
+
+        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
+            self.done = true;
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.done
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            if self.done { Ok(()) } else { Err(()) }
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    // A child runs under its parent's hold of the same scope; waiting for it would never end.
+    #[tokio::test]
+    async fn child_shares_hold() {
+        let (_directory, context) = net_context().await;
+        let log = Arc::default();
+        let parent = HoldingParent {
+            child: Some(Holding::new("child", &log)),
+            done: false,
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        assert_eq!(drive_until(parent, &context, deadline).await, Ok(()));
+        assert_eq!(*log.lock().unwrap(), ["child"]);
         assert!(reconcile_free(&context));
     }
 

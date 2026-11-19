@@ -249,7 +249,9 @@ async fn setup_fixture() -> Fixture {
         &context,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expose()
+    .to_string();
     Fixture {
         _root: root,
         state,

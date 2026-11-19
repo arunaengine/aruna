@@ -334,9 +334,9 @@ async fn releases_pin_versions() -> TestResult<()> {
         submission_id: SubmissionId([8; 32]),
         expires_at: u64::MAX,
     };
-    let token = Some(realm.bearer_for(one_key));
+    let one_key_token = Some(realm.bearer_for(one_key));
     let resolved = drive(
-        RemoteInputsOperation::new(holder.node_id(), inputs, caller, token),
+        RemoteInputsOperation::new(holder.node_id(), inputs, caller, one_key_token),
         asker,
     )
     .await?;

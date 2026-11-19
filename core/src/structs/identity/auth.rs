@@ -142,7 +142,7 @@ pub struct PathRestriction {
     pub permission: Permission,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum NodeCapabilities {
     // This may seem redundant, but because we need both representations both
     // and need both on (nearly) every request, this mitigates unneeded conversions
@@ -208,6 +208,17 @@ impl NodeCapabilities {
         let realm_verifying_key = realm_id.pkcs8_pem_bytes()?;
         Ok(NodeCapabilities::User {
             realm_verifying_key,
+        })
+    }
+}
+
+/// Names the variant only: the encoding keys are private key PEM.
+impl fmt::Debug for NodeCapabilities {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Management { .. } => "NodeCapabilities::Management",
+            Self::Server { .. } => "NodeCapabilities::Server",
+            Self::User { .. } => "NodeCapabilities::User",
         })
     }
 }
@@ -329,11 +340,35 @@ impl TryFrom<&Actor> for Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthContext, PathRestriction, Permission, SessionKind, TokenClaims, oidc_subject_key,
+        AuthContext, NodeCapabilities, PathRestriction, Permission, SessionKind, TokenClaims,
+        oidc_subject_key,
     };
     use crate::UserId;
     use crate::structs::identity::realm::RealmId;
     use ulid::Ulid;
+
+    #[test]
+    fn capabilities_hide_keys() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
+        let management = NodeCapabilities::management_node(key.clone()).unwrap();
+        let server = NodeCapabilities::server_node(key, realm_id, "proof".to_string()).unwrap();
+        let NodeCapabilities::Management {
+            realm_encoding_key, ..
+        } = &management
+        else {
+            panic!("expected management capabilities");
+        };
+        let NodeCapabilities::Server {
+            issuer_encoding_key,
+            ..
+        } = &server
+        else {
+            panic!("expected server capabilities");
+        };
+        assert!(!format!("{management:?}").contains(&format!("{realm_encoding_key:?}")));
+        assert!(!format!("{server:?}").contains(&format!("{issuer_encoding_key:?}")));
+    }
 
     #[test]
     fn hashes_oidc_subject() {

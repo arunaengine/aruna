@@ -7,8 +7,12 @@ use crate::mcp::data::{ListObjectsInput, ObjectsOutput};
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, LOCAL, PEER, distribute, mock_peer, node_id, node_state, publish_api,
 };
+use aruna_operations::distribution::resolve::key_holders;
+use aruna_operations::relay::tool::{Holder, pick_node};
+use aruna_operations::relay::tool_route::HolderSearchOperation;
 use axum::http::StatusCode;
 use serde_json::json;
+use std::time::Duration;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -247,11 +251,15 @@ async fn prefix_grant_finds() {
     crate::tests::routes::open_paths(&state.get_ctx(), &actor, fixture.group_id, &[open]).await;
     let server = McpServer::new(state.clone());
     let parts = auth_parts(&fixture.stranger, None);
-    let found = server.find_holders(&parts, &fixture.stranger, BUCKET, "open/a");
+    let call = (&parts, &fixture.stranger);
+    let route = server.tool_route(call, BUCKET, None, "open/a");
+    let context = state.get_ctx();
+    let found = drive(HolderSearchOperation::new(route), &context);
     let found = tokio::time::timeout(Duration::from_secs(120), found).await;
-    let (holders, _) = found.expect("the holder search stops").unwrap();
+    let found = found.expect("the holder search stops").unwrap();
     assert_eq!(
-        holders
+        found
+            .holders
             .iter()
             .map(|holder| holder.node_id)
             .collect::<Vec<_>>(),
