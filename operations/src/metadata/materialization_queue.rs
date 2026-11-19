@@ -2023,7 +2023,7 @@ impl MaterializationJobOperation {
                 status.dataset_digest =
                     (plan.revision.as_ref()).and_then(|revision| revision.dataset_digest);
                 let validation_write = profile_validation_entry(&status)?;
-                self.mark(MaterializedCreateEvent {
+                self.mark(event, MaterializedCreateEvent {
                     raw_revision: plan.revision,
                     raw_state_write: plan.state_write,
                     validation_write: Some(validation_write),
@@ -2041,7 +2041,7 @@ impl MaterializationJobOperation {
                 | MetadataEvent::ApplyRoCrateResult { .. }
                 | MetadataEvent::EntityUpsertResult { .. } => {
                     plan.cache(&mut self.cache);
-                    self.mark(MaterializedCreateEvent {
+                    self.mark(event, MaterializedCreateEvent {
                         raw_revision: plan.revision,
                         raw_state_write: plan.state_write,
                         validation_write: None,
@@ -2085,16 +2085,17 @@ impl MaterializationJobOperation {
         self.finish(ProcessedMaterializationJob::deferred(finished, elapsed))
     }
 
-    // Refreshes keep off the raw view from here until the Git capture drain, after the finish
-    // batch stored this graph, takes its snapshot. The mark holds the graph this job made: its
-    // displayed revision, or without one the graph exported right after the apply.
+    // Refreshes keep off the raw view until the Git capture drain snapshots the graph the finish
+    // stored. The mark holds the displayed revision, or else the graph exported after the apply.
+    // The apply step passes the event, as it holds it outside `self.event` while it runs.
     fn mark(
         &mut self,
+        event: &MetadataEventRecord,
         materialized: MaterializedCreateEvent,
     ) -> MaterializationTurn<ProcessedMaterializationJob> {
         self.craqle_elapsed = elapsed(self.apply_started_ms, self.now_ms);
         let Some(revision) = materialized.raw_revision.as_ref() else {
-            let graph_iri = self.event()?.record.graph_iri.clone();
+            let graph_iri = event.record.graph_iri.clone();
             self.stage = JobStage::Render(Box::new(materialized));
             return Ok(graph_call(MetadataEffect::ExportRoCrate { graph_iri }));
         };

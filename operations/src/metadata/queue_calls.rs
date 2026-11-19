@@ -4,7 +4,9 @@
 
 use super::tests::{create_event, node};
 use super::*;
+use crate::metadata::raw_events::RawRevisionState;
 use aruna_core::keyspaces::RAW_REVISION_KEYSPACE;
+use aruna_core::metadata::MetadataBatch;
 use aruna_core::storage_entries::create_event_entry;
 use aruna_core::task::TaskKey;
 
@@ -439,7 +441,7 @@ fn mark_holds_revision() {
         jsonld: "{}".to_string(),
         ready: false,
     };
-    let written = marking().mark(materialized(Some(revision)));
+    let written = marking().mark(&event(), materialized(Some(revision)));
     assert_eq!(written, mark_write(&mark));
 }
 
@@ -451,7 +453,8 @@ fn scaffold_mark_exported() {
     let export = MetadataEffect::ExportRoCrate {
         graph_iri: graph_iri.clone(),
     };
-    assert_eq!(operation.mark(materialized(None)), Ok(graph_call(export)));
+    let marked = operation.mark(&event(), materialized(None));
+    assert_eq!(marked, Ok(graph_call(export)));
     let jsonld = "{\"name\":\"scaffold\"}".to_string();
     let exported = MetadataEvent::RoCrateExportResult {
         graph_iri,
@@ -465,6 +468,37 @@ fn scaffold_mark_exported() {
         ready: false,
     };
     assert_eq!(operation.next(exported), mark_write(&mark));
+}
+
+// A scaffold applied in the job's own run reaches its mark export, so the job never defers.
+#[test]
+fn applied_scaffold_marked() {
+    let mut prepare = PrepareRawOperation::new(event(), RawStateCache::default());
+    prepare.first().unwrap();
+    let plan = match prepare.next(child(Ok::<_, RawReadError>(None::<RawRevisionState>))) {
+        Ok(Next::Done(plan)) => plan,
+        other => panic!("expected a raw plan, got {other:?}"),
+    };
+    let mut operation = marking();
+    operation.stage = JobStage::Raw;
+    let applied = operation.next(child(Ok::<_, RawReadError>(plan)));
+    let create = graph_materialization_effect(&event(), None, false);
+    assert_eq!(applied, Ok(graph_call(create)));
+    let graph_iri = event().record.graph_iri;
+    let created = MetadataEvent::CreateCrateResult {
+        graph_iri: graph_iri.clone(),
+        batch: MetadataBatch {
+            graph_iri: graph_iri.clone(),
+            actor: [1; 32],
+            counter: 1,
+            base_clock: craqle::VectorClock::default(),
+            ops: Vec::new(),
+            timestamp_millis: 1,
+        },
+    };
+    let created = IoResult::Event(Box::new(Event::Metadata(created)));
+    let export = MetadataEffect::ExportRoCrate { graph_iri };
+    assert_eq!(operation.next(created), Ok(graph_call(export)));
 }
 
 // The finish that stores a job's graph makes its capture mark ready; a job that stored none
