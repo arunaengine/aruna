@@ -14,7 +14,7 @@ use crate::NodeId;
 use crate::UserId;
 use crate::effects::Effect;
 use crate::errors::ConversionError;
-use crate::keyspaces::WATCH_OUTBOX_KEYSPACE;
+use crate::keyspaces::{WATCH_INTEREST_KEYSPACE, WATCH_OUTBOX_KEYSPACE};
 use crate::structs::execution::notification::NotificationKind;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
@@ -727,6 +727,31 @@ pub fn schedule_watch_drain() -> Effect {
         key: TaskKey::DrainWatchEvents,
         after: Duration::ZERO,
     })
+}
+
+/// Debounce window for the coalesced watch-interest publisher: `ShortenTimer`
+/// fires this long after the first dirty write, collapsing a run of watch CRUD
+/// into one publish with bounded latency.
+pub const WATCH_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Schedules (or shortens toward) the debounced watch-interest publish task.
+pub fn schedule_publish_effect() -> Effect {
+    Effect::Task(TaskEffect::ShortenTimer {
+        key: TaskKey::PublishWatchInterest,
+        after: WATCH_PUBLISH_DEBOUNCE,
+    })
+}
+
+/// Dirty marker written in the same transaction as a subscription row change,
+/// so the debounced publisher knows which realm's digest to rebuild. The value
+/// is a generation id; a marker is only cleared if its generation still matches.
+pub fn dirty_marker_write(realm_id: RealmId, generation: Ulid) -> (KeySpace, Key, Value) {
+    let generation = ByteView::from(generation.to_bytes().to_vec());
+    (
+        WATCH_INTEREST_KEYSPACE.to_string(),
+        ByteView::from(interest_dirty_key(realm_id)),
+        generation,
+    )
 }
 
 #[cfg(test)]

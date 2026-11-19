@@ -12,6 +12,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
+use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
 use thiserror::Error;
@@ -23,7 +24,6 @@ use crate::notifications::prune::{
     NOTIFICATION_RETRY_AFTER, PRUNE_PAGE_SIZE, PruneNotificationsOperation,
 };
 use crate::notifications::serve::{InboxRequest, ServeInboxOperation, WatchEventsOperation};
-use crate::notifications::watch::digest::WATCH_PUBLISH_DEBOUNCE;
 use crate::notifications::watch::drain::WatchDrainOperation;
 use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;

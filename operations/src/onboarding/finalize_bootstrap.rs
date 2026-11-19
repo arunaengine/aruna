@@ -9,12 +9,17 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, NetEvent, TopicPeerError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingSecretError, OnboardingSecretRecord, OnboardingTicket,
 };
 use aruna_core::operation::Operation;
 use aruna_core::placement::{holds_placement, target_placement_ref};
+use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::structs::execution::notification::ResourceEvent;
+use aruna_core::structs::execution::notification_watch::{
+    dirty_marker_write, schedule_publish_effect,
+};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{
     METADATA_REPLICATION_FACTOR, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
@@ -30,7 +35,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::notifications::watch::digest::{InterestError, InterestOperation};
 use crate::onboarding::consume_secret::{
     ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation, ConsumeSecretOutput,
 };
@@ -123,6 +127,7 @@ enum FinalizeStage {
     Activate,
     Node { attempts: usize },
     Interest,
+    Publish,
     Joiner,
     Expand,
     Reconcile,
@@ -162,6 +167,8 @@ pub struct FinalizeBootstrapOperation {
     mode: Option<OnboardingMode>,
     ticket: Option<OnboardingTicket>,
     encoded_ticket: Option<String>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 impl FinalizeBootstrapOperation {
@@ -173,6 +180,8 @@ impl FinalizeBootstrapOperation {
             mode: None,
             ticket: None,
             encoded_ticket: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -273,6 +282,14 @@ impl Operation for FinalizeBootstrapOperation {
     type Output = BootstrapFinalizeOutput;
     type Error = BootstrapFinalizeError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> FinalizeTurn {
         self.entry = Some(build_joiner_entry(&self.input)?);
         let input = &self.input;
@@ -307,8 +324,9 @@ impl Operation for FinalizeBootstrapOperation {
                 match result.child::<RealmConfigDocument, EnsureConfigError>()? {
                     Ok(_) => {
                         self.stage = FinalizeStage::Interest;
-                        let mark = InterestOperation::mark(self.input.realm_id);
-                        Ok(Next::Call(IoCall::child(mark)))
+                        let generation = self.ids.mint(self.now_ms);
+                        let marker = dirty_marker_write(self.input.realm_id, generation);
+                        Ok(Next::Call(outside_call(IoCall::Write(vec![marker]))))
                     }
                     Err(EnsureConfigError::StorageError(StorageError::TransactionConflict))
                         if attempts < NODE_UPDATE_RETRIES =>
@@ -319,8 +337,17 @@ impl Operation for FinalizeBootstrapOperation {
                 }
             }
             FinalizeStage::Interest => {
-                if let Err(error) = result.child::<bool, InterestError>()? {
+                if let Err(error) = outside_answer(result).and_then(IoResult::done) {
                     warn!(%error, "Failed to rebuild watch placement after onboarding realm change");
+                    return self.set_joiner();
+                }
+                self.stage = FinalizeStage::Publish;
+                Ok(Next::Call(IoCall::from(schedule_publish_effect())))
+            }
+            // The stored marker is published on the next arming, so a missed one only warns.
+            FinalizeStage::Publish => {
+                if let Err(error) = result.event() {
+                    warn!(%error, "Watch interest publish not armed after onboarding");
                 }
                 self.set_joiner()
             }

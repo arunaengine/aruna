@@ -575,14 +575,13 @@ mod call_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notifications::watch::digest::dirty_marker_write;
     use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::structs::execution::notification_watch::{
-        INTEREST_ENTRY_CAP, interest_dirty_key,
+        INTEREST_ENTRY_CAP, dirty_marker_write, interest_dirty_key,
     };
     use aruna_core::structs::execution::notification_watch::{
         WatchEventKind, WatchEventMask, WatchInterestEntry,

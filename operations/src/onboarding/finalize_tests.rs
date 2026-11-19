@@ -5,7 +5,9 @@
 use super::*;
 use crate::tests::calls::{called, child, node, runs_child};
 use aruna_core::onboarding::OnboardingPurpose;
+use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
 use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
+use aruna_core::task::{TaskEvent, TaskKey};
 
 fn signing_key() -> SigningKey {
     SigningKey::from_bytes(&[3; 32])
@@ -74,6 +76,12 @@ fn consumed(consumed_now: bool) -> IoResult {
     }))
 }
 
+fn armed() -> IoResult {
+    let key = TaskKey::PublishWatchInterest;
+    let after = WATCH_PUBLISH_DEBOUNCE;
+    IoResult::Event(Box::new(Event::Task(TaskEvent::TimerScheduled { key, after })))
+}
+
 /// Runs up to the listing of the joiner in the realm config.
 fn reserved(mode: OnboardingMode) -> FinalizeBootstrapOperation {
     let mut operation = FinalizeBootstrapOperation::new(input());
@@ -90,9 +98,9 @@ fn reserved(mode: OnboardingMode) -> FinalizeBootstrapOperation {
 fn before_ticket(mode: OnboardingMode) -> FinalizeBootstrapOperation {
     let mut operation = reserved(mode);
     assert!(runs_child(operation.next(listed())));
-    assert!(runs_child(
-        operation.next(child(Ok::<_, InterestError>(true)))
-    ));
+    let marked = operation.next(child(Ok::<_, IoError>(IoResult::Done)));
+    assert!(matches!(marked, Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(runs_child(operation.next(armed())));
     assert!(runs_child(operation.next(mutated())));
     let started = child(Ok::<_, MutatePlacementError>(Vec::<Ulid>::new()));
     assert!(runs_child(operation.next(started)));
@@ -230,7 +238,7 @@ fn listing_error_stops() {
 fn watch_failure_continues() {
     let mut operation = reserved(OnboardingMode::Server);
     operation.next(listed()).unwrap();
-    let failed = child(Err::<bool, _>(InterestError::Encode("bad".to_string())));
+    let failed = child(Err::<IoResult, _>(IoError::Conflict));
     assert!(runs_child(operation.next(failed)));
     assert_eq!(operation.stage, FinalizeStage::Joiner);
 }
