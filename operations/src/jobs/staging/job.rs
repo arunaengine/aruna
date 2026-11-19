@@ -21,14 +21,12 @@ use super::walk::{
     Ahead, WalkPageOperation, WalkPlace, WalkedPage, parse_queued, queue_read, start_prefix_walk,
     start_queued_walk,
 };
-use super::{
-    ClearQueueOperation, PageFailure, StagingRun, StagingStoreError, committed, decode_main,
-    initial_checkpoint, main_read,
-};
+use super::{ClearQueueOperation, PageFailure, StagingRun, StagingStoreError, committed};
 use crate::connectors::get_connector::{
     GetSourceError, GetSourceInput, GetSourceOperation, GetSourceResult,
 };
 use aruna_core::jobs::JobRunOutcome;
+use aruna_core::staging_checkpoint::{decode_main, initial_checkpoint, main_read};
 
 #[derive(Debug, PartialEq)]
 enum Step {
@@ -313,7 +311,7 @@ impl Operation for StagingJobOperation {
             Step::Read => {
                 let stored = match decode_main(result) {
                     Ok(stored) => stored,
-                    Err(error) => return self.end(retryable(error.0)),
+                    Err(error) => return self.end(retryable(error.to_string())),
                 };
                 let checkpoint = stored.unwrap_or_else(|| initial_checkpoint(&self.run.spec));
                 let flat_known = checkpoint.flat.is_some();

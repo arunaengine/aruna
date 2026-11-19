@@ -83,6 +83,7 @@ pub mod search;
 pub mod search_enrichment;
 pub mod secret_registers;
 pub mod secrets;
+pub mod staging_checkpoint;
 pub mod storage_entries;
 pub mod stream;
 pub mod structs;

@@ -47,7 +47,7 @@ use crate::distribution::guard::{GuardError, authority_reads, write_target, writ
 use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
 };
-use crate::staging::page::rows::MAX_ERROR_SAMPLE;
+use aruna_core::staging_checkpoint::MAX_ERROR_SAMPLE;
 
 /// Entries one listing request reads.
 const STAGING_PAGE_SIZE: usize = 1000;

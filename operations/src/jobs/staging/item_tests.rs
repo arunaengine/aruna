@@ -24,7 +24,7 @@ fn item() -> StagingJobItem {
 
 fn item_run() -> RunItemOperation {
     let run = test_run();
-    let checkpoint = crate::jobs::staging::initial_checkpoint(&run.spec);
+    let checkpoint = aruna_core::staging_checkpoint::initial_checkpoint(&run.spec);
     RunItemOperation::new(run, item(), checkpoint)
 }
 

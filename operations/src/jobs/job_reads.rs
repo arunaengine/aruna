@@ -23,7 +23,6 @@ use ulid::Ulid;
 
 use super::records::pages::ServingNode;
 use super::route::{JobRouteError, RoutedJobStatus};
-use super::staging::{ReadCheckpointOperation, StagingStoreError};
 use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::{read_crate_status, read_job_record, read_key_waits};
 use crate::auth::error::AuthorizeError;
@@ -31,6 +30,7 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::load_config::config_unavailable;
 use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::staging_checkpoint::ReadCheckpointOperation;
 
 /// A local job read failed; the text is what the caller reports.
 #[derive(Debug, Error, PartialEq)]
@@ -346,8 +346,8 @@ impl Operation for RecordDataOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, JobReadError> {
         if let Some(record) = self.record.take() {
             let checkpoint = result
-                .child::<Option<StagingJobCheckpoint>, StagingStoreError>()?
-                .map_err(|error| JobReadError(error.0))?;
+                .child::<Option<StagingJobCheckpoint>, IoError>()?
+                .map_err(|error| JobReadError(error.to_string()))?;
             return Ok(Next::Done(Some((*record, checkpoint))));
         }
         let Some(record) = result.child::<Option<JobRecord>, JobReadError>()?? else {

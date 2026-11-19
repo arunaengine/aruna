@@ -33,9 +33,9 @@ use crate::connectors::list_connectors::{
     ListSourceError, ListSourceInput, ListSourceOperation, ListSourceResult,
 };
 use crate::forward::transport::{peer_answer, peer_call};
-use crate::jobs::staging::{ReadCheckpointOperation, StagingStoreError, handed_checkpoint};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
+use aruna_core::staging_checkpoint::{ReadCheckpointOperation, handed_checkpoint};
 
 /// Job rows one scan page reads.
 const JOB_PAGE: usize = 256;
@@ -229,7 +229,7 @@ impl Operation for KeepResumeOperation {
                 self.next_job()
             }
             KeepStep::Checkpoint => {
-                let read = result.child::<Option<StagingJobCheckpoint>, StagingStoreError>()?;
+                let read = result.child::<Option<StagingJobCheckpoint>, IoError>()?;
                 let at = read.map_err(failed)?;
                 let (job_id, spec) = self.current.take().ok_or(IoError::Unfinished)?;
                 self.jobs.push(job_id);
