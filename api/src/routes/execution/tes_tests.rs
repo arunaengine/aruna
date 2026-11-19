@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::tests::execution::{auth_for, build_state, management_state, node_id, realm};
 use std::time::Duration;
 
 use axum::body::to_bytes;
@@ -10,41 +11,19 @@ use axum::body::to_bytes;
 use crate::job_test_calls::insert_job;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
-use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{JobError, OutputObject};
-use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_storage::FjallStorage;
-use tempfile::TempDir;
-
-fn realm() -> RealmId {
-    RealmId([1u8; 32])
-}
-
-fn node_id() -> NodeId {
-    iroh::SecretKey::from_bytes(&[7u8; 32]).public()
-}
 
 fn user(byte: u8) -> UserId {
     UserId::new(Ulid::from_bytes([byte; 16]), realm())
-}
-
-fn auth_for(user_id: UserId) -> Option<AuthContext> {
-    Some(AuthContext {
-        user_id,
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    })
 }
 
 const TES_SECRET: &str = "tes-secret";
@@ -145,32 +124,6 @@ async fn write_auth(state: &ServerState, group_id: Ulid, owner: UserId) {
             })
             .await;
     }
-}
-
-async fn build_state() -> (TempDir, Arc<ServerState>) {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let ctx = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    });
-    let state = ServerState::new(
-        ctx,
-        realm(),
-        node_id(),
-        NodeCapabilities::user_node(realm()).unwrap(),
-        false,
-        None,
-        JobsRuntime::new(),
-    )
-    .await;
-    (dir, Arc::new(state))
 }
 
 fn sample_task(group: Ulid) -> TesTask {
@@ -1330,34 +1283,6 @@ fn derives_family_tags() {
     assert!(minimal.tags.is_empty());
 }
 
-async fn management_state() -> (TempDir, Arc<ServerState>) {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let ctx = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    });
-    let capabilities =
-        NodeCapabilities::management_node(aruna_core::keys::generate_signing_key()).unwrap();
-    let state = ServerState::new(
-        ctx,
-        realm(),
-        node_id(),
-        capabilities,
-        false,
-        None,
-        JobsRuntime::new(),
-    )
-    .await;
-    (dir, Arc::new(state))
-}
-
 /// Writes a live user cutoff for `user` into this realm's config.
 async fn deactivate(state: &ServerState, user: UserId) {
     use aruna_core::structs::identity::realm::TokenRevocation;
@@ -1416,15 +1341,6 @@ fn local_task(group: Ulid) -> TesTask {
     task
 }
 
-fn bearer_auth(user_id: UserId) -> Option<AuthContext> {
-    Some(AuthContext {
-        user_id,
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    })
-}
-
 #[tokio::test]
 async fn local_needs_device() {
     // A node that serves no device plane refuses the target, not the caller.
@@ -1433,7 +1349,7 @@ async fn local_needs_device() {
 
     let response = create_task(
         State(state),
-        Extension(bearer_auth(user(2))),
+        Extension(auth_for(user(2))),
         Extension(None),
         HeaderMap::new(),
         Json(local_task(group)),
@@ -1451,7 +1367,7 @@ async fn local_refuses_stranger() {
 
     let response = create_task(
         State(state),
-        Extension(bearer_auth(user(3))),
+        Extension(auth_for(user(3))),
         Extension(None),
         HeaderMap::new(),
         Json(local_task(group)),
