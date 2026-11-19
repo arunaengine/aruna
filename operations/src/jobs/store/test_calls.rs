@@ -616,7 +616,8 @@ pub(crate) async fn settle_attempt<T>(
 ) -> Option<Result<T, JobMutationError>> {
     match result {
         Err(JobMutationError::Conflict) if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
-            tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
+            // Lets the competing writer finish before the retry, without real time.
+            tokio::task::yield_now().await;
             None
         }
         Err(JobMutationError::Conflict) => {
