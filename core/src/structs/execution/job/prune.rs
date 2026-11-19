@@ -10,7 +10,7 @@ use ulid::Ulid;
 use super::family::{CLOCK_MARGIN_MS, JobFamilyRecord, JobRecordEnvelope, LogicalJobState};
 use super::identity::RETENTION_MS;
 use super::membership::NotRun;
-use crate::NodeId;
+use crate::{NodeId, UserId};
 
 /// How long tombstones and pending rows are kept; it is also the bound of spec freshness.
 pub const TOMBSTONE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -24,6 +24,8 @@ pub struct FamilyTombstone {
     pub last_record_ms: u64,
     /// Every body page is deleted; until then every record of the family is refused for now.
     pub finished: bool,
+    /// The submitter of the pruned spec: only they learn that the job was pruned.
+    pub created_by: Option<UserId>,
 }
 
 /// What one node knows about one family when it decides.

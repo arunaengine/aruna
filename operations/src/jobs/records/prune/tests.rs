@@ -94,6 +94,7 @@ fn tombstone_pages_bodies() {
         pruned_at_ms: 1,
         last_record_ms: 1,
         finished: false,
+        created_by: None,
     };
     let stored = Some(Value::from(to_bytes(&tombstone).unwrap().as_slice()));
     let mut prune = PruneFamilyOperation::new(family(), 7, None);

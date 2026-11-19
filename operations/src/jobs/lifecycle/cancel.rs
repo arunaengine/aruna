@@ -460,6 +460,7 @@ impl Operation for PublishDeletionOperation {
 
     fn first(&mut self) -> PublishNext {
         let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        let read = read.for_reader(self.auth.user_id);
         Ok(Next::Call(IoCall::child(read)))
     }
 
@@ -633,6 +634,7 @@ impl Operation for CancelFamilyOperation {
                 };
                 self.step = CancelStep::Projection(family);
                 let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+                let read = read.for_reader(self.auth.user_id);
                 Ok(Next::Call(IoCall::child(read)))
             }
             CancelStep::Projection(family) => {

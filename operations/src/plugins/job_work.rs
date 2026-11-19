@@ -162,6 +162,8 @@ impl Operation for JobState {
             (None, Some(alias)) if row.kind == WorkKind::Recipe => {
                 self.row = Some(Box::new(row));
                 let read = FamilyProjectionOperation::new(alias, self.now_ms);
+                // Plugin tasks are submitted as the install account.
+                let read = read.for_reader(self.install.account);
                 Ok(Next::Call(IoCall::child(read)))
             }
             (None, Some(job)) => {

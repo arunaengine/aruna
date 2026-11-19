@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -25,7 +26,7 @@ use crate::jobs::lifecycle::family_reads::FamilyProjectionOperation;
 use crate::jobs::records::pages::{page_key, page_rows};
 use crate::jobs::records::prune::{FamilyPruneOutcome, PruneFamiliesOperation};
 use crate::jobs::route::JobRouteError;
-use crate::tests::records::{Family, context, read_row};
+use crate::tests::records::{Family, REALM, context, read_row, user};
 
 pub(crate) async fn write(ctx: &DriverContext, writes: Vec<(String, Key, Value)>) {
     let effect = StorageEffect::BatchWrite {
@@ -118,8 +119,12 @@ pub(crate) async fn pass(ctx: &DriverContext) -> FamilyPruneOutcome {
         .expect("prune pass")
 }
 
-async fn projected(ctx: &DriverContext, family: &Family) -> Result<(), JobRouteError> {
-    let read = FamilyProjectionOperation::new(family.job_id, 1);
+async fn projected(
+    ctx: &DriverContext,
+    family: &Family,
+    reader: UserId,
+) -> Result<(), JobRouteError> {
+    let read = FamilyProjectionOperation::new(family.job_id, 1).for_reader(reader);
     drive(read, ctx).await.map(|_| ())
 }
 
@@ -144,7 +149,10 @@ async fn prunes_in_steps() {
             .is_some_and(|due| due > RETENTION_MS)
     );
     assert_eq!(rows(&ctx, FAMILY_PROJECTION_KEYSPACE, &family).await, 0);
-    assert_eq!(projected(&ctx, &family).await, Err(JobRouteError::Pruned));
+    assert_eq!(
+        projected(&ctx, &family, user()).await,
+        Err(JobRouteError::Pruned)
+    );
 
     pass(&ctx).await;
     assert_eq!(rows(&ctx, FAMILY_RECORD_KEYSPACE, &family).await, 0);
@@ -161,7 +169,10 @@ async fn prunes_in_steps() {
             .await
             .is_some_and(|tombstone| tombstone.finished)
     );
-    assert_eq!(projected(&ctx, &family).await, Err(JobRouteError::Pruned));
+    assert_eq!(
+        projected(&ctx, &family, user()).await,
+        Err(JobRouteError::Pruned)
+    );
 }
 
 #[tokio::test]

@@ -274,10 +274,15 @@ impl PruneFamilyOperation {
     /// Step 2: the tombstone, the projection, the witness deadline and the index row due now, in
     /// one transaction. From then on readers answer "pruned" and no witness round plans it.
     fn enter(&mut self, deadline: Option<Value>) -> FamilyNext {
+        let created_by = (self.records.iter()).find_map(|envelope| match &envelope.record {
+            JobFamilyRecord::Spec(spec) => Some(spec.created_by),
+            _ => None,
+        });
         let tombstone = FamilyTombstone {
             pruned_at_ms: self.now_ms,
             last_record_ms: last_record_ms(&self.records),
             finished: false,
+            created_by,
         };
         let prefix = family_prefix(&self.family);
         let mut deletes = std::mem::take(&mut self.expired);

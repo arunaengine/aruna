@@ -79,6 +79,7 @@ fn target_answers_rows() {
         pruned_at_ms: start + 5,
         last_record_ms: start + 1,
         finished: true,
+        created_by: None,
     };
     let answer = answered(&family, frame, start + 1, (Vec::new(), Some(pruned)));
     assert_eq!(answer, Ok(Next::Done(LaunchClosureAnswer::Pruned)));
