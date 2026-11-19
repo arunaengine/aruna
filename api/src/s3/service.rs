@@ -36,14 +36,16 @@ use self::response::{
 use aruna_core::structs::storage::format::Compression;
 
 use self::copy::{copy_object_response, copy_part_response, copy_source_conditions};
-use self::forward::copy::{CopyPath, CopySource};
-use self::forward::list::{Resume, decode_bound, encode_bound};
+use self::forward::copy::CopySource;
+use self::forward::list::{decode_bound, encode_bound};
 use self::listing::{
     ObjectListingPage, list_parts_output, list_uploads_output, marker_continuation_token,
     next_marker_for,
 };
 use self::multipart::parse_upload_marker;
 use self::object::object_range_request;
+use aruna_operations::s3::object::member_merge::MergeResume as Resume;
+use aruna_operations::s3::object::member_write::CopyPath;
 
 use crate::object_key::ObjectKey;
 use crate::s3::auth::map_authorize_error;

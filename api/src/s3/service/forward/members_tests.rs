@@ -1534,14 +1534,14 @@ async fn copy_read_marked() {
         range_id: snapshot.config.ranges[1].range_id,
         node_id: members.nodes[2].node_id(),
     };
-    let read = || super::ForwardRequest {
+    let read = || aruna_operations::s3::object::member_read::MemberRequest {
         method: aruna_core::member_read::MemberMethod::Get,
         operation: "GetObject",
         bucket: BUCKET.to_string(),
         key: "k/1".to_string(),
         query: None,
         headers: Vec::new(),
-        body: super::ForwardBody::Empty,
+        body: aruna_operations::s3::object::member_read::MemberPayload::Empty,
     };
     let service = &members.nodes[0].service;
     let error = service
