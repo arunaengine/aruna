@@ -389,3 +389,58 @@ pub fn reference_refresh(
         ),
     }
 }
+
+/// The stored user `user_id`; panics when the read answers anything else.
+pub async fn read_user(
+    context: &DriverContext,
+    user_id: aruna_core::UserId,
+) -> aruna_core::structs::identity::user::User {
+    let key = user_id.to_bytes().to_vec();
+    let value = read_value(
+        &context.storage_handle,
+        aruna_core::keyspaces::USER_KEYSPACE,
+        key,
+    )
+    .await
+    .expect("the user is stored");
+    aruna_core::structs::identity::user::User::from_bytes(&value).unwrap()
+}
+
+/// Claims of `user_id` issued by `realm_id`, valid for ten minutes from now.
+pub fn token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenClaims {
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    TokenClaims {
+        sub: user_id.to_string(),
+        iss: realm_id.to_string(),
+        iat: now,
+        exp: now + 600,
+        jti: ulid::Ulid::generate().to_string(),
+        sid: None,
+        session_kind: None,
+        restrictions: None,
+        issuer_pubkey: None,
+        delegation_signature: None,
+        name: None,
+        via: None,
+        auth_time: None,
+    }
+}
+
+/// An enabled or `disabled` S3 backend of group 1 that keeps its data on removal.
+pub fn group_storage(
+    backend_id: ulid::Ulid,
+    disabled: bool,
+) -> aruna_core::structs::storage::group_backend::GroupStorage {
+    aruna_core::structs::storage::group_backend::GroupStorage {
+        backend_id,
+        group_id: ulid::Ulid::from_bytes([1u8; 16]),
+        name: "tenant".to_string(),
+        kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
+        public_config: std::collections::HashMap::new(),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        updated_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        disabled,
+        cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
+    }
+}

@@ -13,7 +13,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::keyspaces::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
+use aruna_core::keyspaces::SUBJECT_INDEX_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, oidc_subject_key};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::identity::user::User;
@@ -85,20 +85,7 @@ fn sign_oidc_token(
 }
 
 async fn read_user(context: &DriverContext, user_id: UserId) -> User {
-    match context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: USER_KEYSPACE.to_string(),
-            key: ByteView::from(user_id.to_bytes()),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => User::from_bytes(&bytes).unwrap(),
-        other => panic!("unexpected user read result: {other:?}"),
-    }
+    aruna_operations::testing::read_user(context, user_id).await
 }
 
 async fn read_subject_index(context: &DriverContext, subject_key: &str) -> UserId {
