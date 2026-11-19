@@ -12,8 +12,6 @@ use aruna_core::structs::storage::blob::{
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::read_value;
-
 /// The version an object resolved to, and its record when one is stored.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectVersion {
@@ -94,7 +92,7 @@ impl Operation for ObjectVersionOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<ObjectVersion>, ObjectVersionError> {
-        let value = read_value(result)?;
+        let value = result.value()?;
         if self.reading_version {
             let version = value
                 .map(|value| BlobVersion::from_bytes(&value))

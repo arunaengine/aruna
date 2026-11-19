@@ -25,9 +25,10 @@ use aruna_core::structs::storage::distribution::{
 };
 use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
+use aruna_core::structs::synced_folder::refusal_kind;
 use aruna_core::structs::{
     ORIGIN_DEVICE_TAG, RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull,
-    SyncPullAck, SyncRefusal, SyncVersionPage, refusal_kind,
+    SyncPullAck, SyncRefusal, SyncVersionPage,
 };
 use aruna_core::types::{GroupId, Key, Value};
 use tracing::{debug, warn};
@@ -1442,11 +1443,11 @@ mod tests {
     #[tokio::test]
     async fn guards_folder_pull() {
         use crate::device::sync::folders::finish_unbind;
-        use crate::device::sync::repository::folder_bucket;
         use crate::staging::offered_directory::{
             OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
         };
         use crate::tests::device::store_folder;
+        use aruna_core::structs::synced_folder::folder_bucket;
         use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
 
         let fixture = aruna_test_support::staging::setup_driver_context().await;

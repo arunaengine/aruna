@@ -25,9 +25,10 @@ use crate::staging::offered_directory::{OfferedDirectoryError, check_root};
 use aruna_core::metadata::protocol::{MetadataTransportMessage, transport_message_kind};
 
 use super::super::ReconcileFolderError;
-use super::super::repository::{MAX_SYNCED_FOLDERS, folder_bucket, folder_entry, folder_key};
+use super::super::repository::{MAX_SYNCED_FOLDERS, folder_entry, folder_key};
 use super::reads::read_bound;
 use super::{BindFolderInput, FolderChange, FolderError, RealmBucketInput, UpdateFolderOperation};
+use aruna_core::structs::synced_folder::folder_bucket;
 
 type RemoteError = ReconcileFolderError;
 

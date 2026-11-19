@@ -18,7 +18,7 @@ use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::device::realm_documents::installed_management_urls;
+use crate::device_node::realm_documents::installed_management_urls;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::users::merge::{Coordinator, coordinator};
 

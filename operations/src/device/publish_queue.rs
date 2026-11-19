@@ -335,6 +335,17 @@ impl Operation for ClaimStateOperation {
     }
 }
 
+/// What one drain pass achieved, so the caller knows how soon to look again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The pass could not complete; earlier pages may already be forwarded.
+    Deferred,
+    /// At least one entry asked for another pass; it does not prove entries remain.
+    Recheck,
+    /// No entry asked for another pass.
+    Idle,
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::{

@@ -18,7 +18,7 @@ mod persistent_id;
 pub mod secondary_id;
 mod sync_quarantine;
 mod sync_relationship;
-mod synced_folder;
+pub mod synced_folder;
 
 pub use assistant_chat::{
     AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS,
@@ -59,6 +59,5 @@ pub use synced_folder::{
     LocalOrigin, MAX_SYNC_PAGE, ORIGIN_DEVICE_TAG, Observed, PendingMark, RemoteBinding,
     RemoteHead, ReplaceReason, SYNC_TRASH_DIR, SYNC_VERSION_TAG, SyncAction, SyncActionRecord,
     SyncBase, SyncListCursor, SyncPageLimit, SyncPolicy, SyncPull, SyncPullAck, SyncPullStatus,
-    SyncRefusal, SyncVersionPage, SyncedBytes, SyncedFolder, WriteGuard, decide, refusal_kind,
-    tagged_receipt,
+    SyncRefusal, SyncVersionPage, SyncedBytes, SyncedFolder, WriteGuard, decide, tagged_receipt,
 };

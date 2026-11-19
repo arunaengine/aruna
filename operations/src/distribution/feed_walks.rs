@@ -36,7 +36,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::charged_ranges::{HeldRange, HeldRanges, HeldRangesOperation, UsageError, sum_held};
-use crate::metadata::call_results::page_rows;
 
 /// The open end of a range in its range index key.
 const OPEN_END: [u8; 1] = [0xFF];
@@ -1102,7 +1101,7 @@ impl Operation for StateWalk {
                 other => Err(wrong_index(other)),
             },
             StateStep::BuildPage => {
-                let (rows, truncated) = page_rows(result)?;
+                let (rows, truncated) = result.page()?;
                 self.build_read(rows, truncated)
             }
             StateStep::BuildDescribe => {

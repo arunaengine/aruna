@@ -39,16 +39,15 @@ use super::submission_rules::{admitted_description, reference_content, source_er
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError, check_error};
-use crate::jobs::read_access::{SourceObject, SourceReadError, SourceReadOperation};
-use crate::s3::bucket::dataset::{
-    BucketMetadataError, BucketMetadataOperation, DatasetSummaryOperation,
-};
+use crate::metadata::forward::read::DatasetSummaryOperation;
+use crate::s3::bucket::dataset::{BucketMetadataError, BucketMetadataOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::access::MembersCheckOperation;
 use crate::s3::bucket::release::{BucketScope, MembersOutput, MembershipCaller, ReleaseError};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use crate::s3::object::read_access::{SourceObject, SourceReadError, SourceReadOperation};
 use aruna_core::job_request::SubmitJobError;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 

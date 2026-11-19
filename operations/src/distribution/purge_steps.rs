@@ -42,7 +42,6 @@ use ulid::Ulid;
 use super::feed_walks::split_key;
 use super::imports::{jobs_key, resume_prefix};
 use super::inventory::{Walk, route};
-use crate::metadata::call_results::page_rows;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::object::delete::{
@@ -1013,7 +1012,7 @@ impl Operation for PurgeRangeOperation {
                 self.call(RangeState::Page, page)
             }
             RangeState::Page => {
-                let (rows, _) = page_rows(result)?;
+                let (rows, _) = result.page()?;
                 self.page_read(rows)
             }
             RangeState::Aborted | RangeState::KeysPurged => {
@@ -1074,7 +1073,7 @@ impl Operation for RangeUploadsOperation {
             step_done(result)?;
             return Ok(Next::Done(found));
         }
-        let (rows, _) = page_rows(result)?;
+        let (rows, _) = result.page()?;
         let found = !rows.is_empty();
         if !self.abort {
             return Ok(Next::Done(found));

@@ -26,7 +26,7 @@ use aruna_core::user::validation::email_hash;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 use aruna_operations::auth::token_subject::{SubjectCheckError, SubjectCheckOperation};
-use aruna_operations::device::remove_node::{
+use aruna_operations::device_node::remove_node::{
     DeviceEvictionScope, RemoveNodeConfig, RemoveNodeError, RemoveNodeOperation,
 };
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};

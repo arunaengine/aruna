@@ -25,7 +25,6 @@ use serde::{Deserialize, Serialize};
 use tracing::trace;
 use ulid::Ulid;
 
-use super::call_results::page_rows;
 use crate::forward::fetch::read_answer;
 use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_request};
 use aruna_core::placement::selector::select_top_peers;
@@ -240,7 +239,7 @@ impl Operation for LocalPageOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<AuditPageResponse>, ListAuditError> {
-        let (values, next) = page_rows(result)?;
+        let (values, next) = result.page()?;
         Ok(Next::Done(parse_audit_page(values, next, &self.request())?))
     }
 }

@@ -25,7 +25,7 @@ use aruna_core::structs::{RemoteBinding, SyncRefusal};
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
-use aruna_operations::device::realm_documents::fetch_realm_documents;
+use aruna_operations::device_node::realm_documents::fetch_realm_documents;
 use aruna_operations::jobs::workflow::publish_run::{
     PublishRunError, PublishRunInput, local_run_crate, publish_run,
 };

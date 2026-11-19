@@ -29,7 +29,6 @@ use ulid::Ulid;
 use super::prune_jobs::{DuePrune, DuePruneOperation, RescheduleOperation};
 use crate::jobs::repository::link_queue::QueueDeletedOperation;
 use crate::jobs::repository::links::LinkError;
-use crate::metadata::call_results::effect_event;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::repository::schedule_prune_drain;
@@ -94,7 +93,7 @@ fn graph_effect(effect: MetadataEffect) -> IoCall {
 
 /// A graph answer, or the error it carries.
 fn graph_answer(result: IoResult) -> Result<MetadataEvent, MetadataError> {
-    match effect_event(result)? {
+    match result.event()? {
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error),
         Event::Metadata(event) => Ok(event),
         other => Err(MetadataError::Backend(format!(
@@ -336,7 +335,7 @@ impl Operation for EnqueuePruneOperation {
             return Ok(Next::Call(IoCall::Effect(Box::new(schedule_prune_drain()))));
         }
         if let Ok(Event::Task(aruna_core::task::TaskEvent::Error { message, .. })) =
-            effect_event(result)
+            result.event()
         {
             warn!(%message, graph_iri = %self.graph_iri, "Failed to wake the metadata graph prune drain");
         }
@@ -422,7 +421,7 @@ impl Operation for TombstonesOperation {
         match self.stage {
             TombstoneStage::Uncache => {
                 // A node without the cache has nothing to drop.
-                let _ = effect_event(result);
+                let _ = result.event();
                 self.stage = TombstoneStage::Enqueue;
                 Ok(Next::Call(IoCall::child(EnqueuePruneOperation::new(
                     &graph_iri,

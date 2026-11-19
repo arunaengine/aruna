@@ -22,7 +22,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, TxnId, Value};
 use ulid::Ulid;
 
-use crate::metadata::call_results::read_value;
 use crate::metadata::raw_events::{
     RawEventsOperation, RawLoadBudget, RawReadError, RawRevisionState,
 };
@@ -180,7 +179,7 @@ impl Operation for RawViewOperation {
             };
             return self.events_turn(turn);
         }
-        let value = read_value(result)?;
+        let value = result.value()?;
         match self.step {
             ViewStep::Status => {
                 self.status = decode(value)?;
@@ -282,7 +281,7 @@ impl Operation for RawStateOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, RawReadError> {
-        Ok(Next::Done(decode(read_value(result)?)?))
+        Ok(Next::Done(decode(result.value()?)?))
     }
 }
 

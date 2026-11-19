@@ -9,11 +9,10 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{OFFERED_DIRECTORY_KEYSPACE, SYNCED_FOLDER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::offered_directory::OfferedDirectory;
+use aruna_core::structs::synced_folder::bucket_folder;
 use aruna_core::structs::{FolderState, SyncedFolder};
 use aruna_core::types::Value;
 use thiserror::Error;
-
-use crate::device::sync::repository::bucket_folder;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum BucketGuardError {
@@ -127,7 +126,7 @@ mod tests {
     #[test]
     fn folder_bucket_checked() {
         let folder_id = Ulid::from_bytes([3; 16]);
-        let bucket = crate::device::sync::repository::folder_bucket(folder_id);
+        let bucket = aruna_core::structs::synced_folder::folder_bucket(folder_id);
         let mut operation = BucketGuardOperation::new(bucket);
         operation.first().unwrap();
         let folder =

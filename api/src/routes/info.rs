@@ -28,13 +28,12 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_drivers::driver::drive;
-use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
+use aruna_operations::device_node::realm_documents::{installed_displays, installed_management_urls};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::federation::totals::DataTotalsOperation;
 use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
 use aruna_operations::node::contacts::PeerContactsOperation;
-use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
 use aruna_operations::placement::mutation::PlacementMutationOperation;
 use aruna_operations::placement::provision::ProvisionBindingOperation;
@@ -47,6 +46,7 @@ use aruna_operations::realm::mutate_placement::{
 use aruna_operations::realm::node_name::{NodeDisplays, ReadNamesOperation};
 use aruna_operations::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};
 use aruna_operations::relay::targets::management_node_urls;
+use aruna_operations::s3::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::s3::usage::LoadCountersOperation;
 use aruna_wire::info::{
     AddressStatus, BackendStatus, BlobServiceStatus, ConnectionAddressInfo, DatabaseServiceStatus,

@@ -26,11 +26,11 @@ GROUPS = (
     (
         "identity and realm",
         frozenset(
-            "abe auth realm realm_vault node_vault secrets session users groups device onboarding "
+            "abe auth realm realm_vault node_vault secrets session users groups device_node onboarding "
             "placement shard sync owner_index document_repository endpoint_screening forward tasks".split()
         ),
     ),
-    ("data", frozenset("s3 blob staging replication distribution metadata git shares connectors".split())),
+    ("data", frozenset("s3 blob staging replication distribution metadata git shares connectors device".split())),
     ("work and integrations", frozenset("jobs plugins assistant notifications federation harvest node".split())),
 )
 ANY_CRATE = "*"

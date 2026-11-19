@@ -773,3 +773,43 @@ fn names_other_answers() {
         })
     ));
 }
+
+fn stored(event: StorageEvent) -> IoResult {
+    IoResult::Event(Box::new(Event::Storage(event)))
+}
+
+// A batch read or iteration effect, used inside a caller's transaction, answers like its call.
+#[test]
+fn reads_effect_answers() {
+    let key = Key::from(vec![1]);
+    let value = Value::from(vec![2]);
+    let batch = StorageEvent::BatchReadResult {
+        values: vec![(key.clone(), Some(value.clone()))],
+    };
+    assert_eq!(stored(batch).value(), Ok(Some(value.clone())));
+    let iter = StorageEvent::IterResult {
+        values: vec![(key.clone(), value.clone())],
+        next_start_after: Some(key.clone()),
+    };
+    assert_eq!(stored(iter).page(), Ok((vec![(key.clone(), value)], Some(key))));
+}
+
+// A storage failure an effect answers with reads as the runner reports its own calls' failures.
+#[test]
+fn maps_storage_errors() {
+    let conflict = StorageEvent::Error {
+        error: StorageError::TransactionConflict,
+    };
+    assert_eq!(stored(conflict).page(), Err(IoError::Conflict));
+    let timeout = StorageEvent::Error {
+        error: StorageError::Timeout,
+    };
+    assert_eq!(
+        stored(timeout).values(),
+        Err(IoError::Storage(StorageError::Timeout))
+    );
+    assert!(matches!(
+        stored(StorageEvent::SyncAllFinished).page(),
+        Err(IoError::Unexpected { .. })
+    ));
+}

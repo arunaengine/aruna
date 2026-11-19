@@ -17,6 +17,7 @@ pub mod purge;
 pub mod reclaim;
 pub mod reclaim_sweep;
 pub mod records;
+pub(crate) mod request;
 pub(crate) mod release;
 pub mod sweep_timer;
 pub(crate) mod trail;

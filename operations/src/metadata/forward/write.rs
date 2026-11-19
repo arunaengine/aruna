@@ -11,12 +11,12 @@ use aruna_core::metadata::protocol::{
 use aruna_core::structs::SyncRefusal;
 use thiserror::Error;
 
-use crate::device::edit::DeviceEditError;
 use crate::forward::routing::HolderWriteError;
 use crate::forward::transport::ForwardError;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::delete_document::DeleteDocumentError;
+use crate::metadata::device::edit::DeviceEditError;
 use crate::metadata::update_document::UpdateDocumentError;
 
 #[derive(Debug, Error, PartialEq)]

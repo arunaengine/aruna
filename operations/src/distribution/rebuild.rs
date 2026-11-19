@@ -26,8 +26,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::metadata::call_results::page_rows;
-
 use super::handoff::{
     HandoffError, account_row, activation_reads, decode_account, plan_activation,
 };
@@ -369,7 +367,7 @@ impl Operation for RebuildStepOperation {
         match self.state {
             StepState::Read => self.planned(result.values()?),
             StepState::PageRows => {
-                let (rows, truncated) = page_rows(result)?;
+                let (rows, truncated) = result.page()?;
                 self.plan_page(rows, truncated)
             }
             StepState::Write => {
@@ -491,7 +489,7 @@ impl Operation for RebuildOperation {
                 self.advance(account)
             }
             State::Probe(walk) => {
-                let (rows, more) = page_rows(result)?;
+                let (rows, more) = result.page()?;
                 let kind = StepKind::Page {
                     walk,
                     probe_end: rows.last().map(|(key, _)| key.to_vec()),

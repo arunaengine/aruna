@@ -26,6 +26,7 @@ pub mod placement;
 pub mod put;
 pub mod range_list;
 pub mod read;
+pub mod read_access;
 mod refresh_mint;
 mod refresh_observe;
 pub mod search;

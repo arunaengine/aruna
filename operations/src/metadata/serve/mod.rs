@@ -7,6 +7,7 @@ mod forwards;
 mod held;
 mod mirror;
 mod paths;
+mod publish;
 mod pulls;
 mod reads;
 mod writes;

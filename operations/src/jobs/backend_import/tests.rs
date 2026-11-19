@@ -7,7 +7,7 @@ use super::reads::{
     StoredIntentsOperation, TrailOperation, exact_of, version_row,
 };
 use super::*;
-use crate::jobs::blob_request::BlobRequest;
+use crate::blob::request::BlobRequest;
 use crate::jobs::import_listing::{ListingNote, NoteError, NoteListingOperation};
 use crate::jobs::page_intents::PageIntentsOperation;
 use aruna_core::calls::{IoResult, Next};

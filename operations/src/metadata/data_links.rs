@@ -35,7 +35,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_bounded};
-use crate::metadata::call_results::page_rows;
 
 const PAGE_SIZE: usize = 256;
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -206,7 +205,7 @@ impl Operation for DocumentRowsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<Vec<u8>>>, DataLinkError> {
-        let (rows, next) = page_rows(result)?;
+        let (rows, next) = result.page()?;
         let keys = rows
             .into_iter()
             .filter_map(|(key, _)| key.get(16..).map(<[u8]>::to_vec));
@@ -306,7 +305,7 @@ impl Operation for LocalMembersOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, DataLinkError> {
         if self.sets.is_empty() {
-            let (rows, next) = page_rows(result)?;
+            let (rows, next) = result.page()?;
             self.seen += rows.len();
             self.next = next;
             for (_, value) in rows {
@@ -609,7 +608,7 @@ impl Operation for RetryUnverifiedOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Option<Vec<u8>>>, DataLinkError> {
         match std::mem::replace(&mut self.stage, RetryStage::Settle) {
             RetryStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.next = next.map(|next| next.to_vec());
                 for (key, value) in rows {
                     if let Some((realm_id, version_id, document_id)) = unverified_parts(&key) {

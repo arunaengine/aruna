@@ -11,11 +11,11 @@ use aruna_core::types::GroupId;
 use ulid::Ulid;
 
 use super::refresh::{RefreshOutcome, RefreshReplicaOperation, refusal_reason};
-use super::replica::{
+use crate::device::replica::{
     DeselectDocumentOperation, ReplicaOrigin, ReplicaRecord, ReplicaScanError, SelectionError,
     TrackCreatedOperation,
 };
-use super::replica_store::{
+use crate::device::replica_store::{
     cache_budget, cache_usage, delete_replica, read_replica, store_replica,
 };
 use aruna_core::structs::identity::realm::NodeRealm;

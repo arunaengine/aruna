@@ -7,7 +7,6 @@ pub mod contacts;
 pub mod counter_check;
 pub mod heartbeat;
 pub mod info;
-pub mod realm_usage;
 mod rebuild_counts;
 pub mod recovery_run;
 pub mod summary_refresh;

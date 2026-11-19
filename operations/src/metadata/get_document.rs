@@ -21,7 +21,6 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::effect_event;
 use crate::metadata::deletion_guard::metadata_call;
 
 /// Reads the registry row, then its graph lifecycle and materialization status in one batch,
@@ -108,7 +107,7 @@ impl GetDocumentOperation {
     }
 
     fn exported(&mut self, result: IoResult) -> GetTurn {
-        match effect_event(result)? {
+        match result.event()? {
             Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => {
                 let record = self
                     .record

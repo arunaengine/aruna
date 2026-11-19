@@ -39,7 +39,6 @@ use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::{effect_event, read_value, read_values};
 use crate::metadata::id_mapping::{mapping_revision, mapping_route_for, transition_entries};
 use crate::metadata::profile::rules::{
     crate_is_profile, not_profiled_status, profile_path_rule, stamp_unprofiled,
@@ -275,7 +274,7 @@ impl CreateDocumentOperation {
     }
 
     fn validated(&mut self, result: IoResult) -> CreateTurn {
-        match effect_event(result)? {
+        match result.event()? {
             Event::Metadata(MetadataEvent::ValidationResult { .. }) if self.skip_existing_check => {
                 self.commit()
             }
@@ -293,7 +292,7 @@ impl CreateDocumentOperation {
     }
 
     fn existing_read(&mut self, result: IoResult) -> CreateTurn {
-        match read_value(result)? {
+        match result.value()? {
             Some(bytes) => {
                 postcard::from_bytes::<MetadataRegistryRecord>(&bytes)
                     .map_err(aruna_core::errors::ConversionError::from)?;
@@ -506,7 +505,7 @@ impl CreateCommitOperation {
     }
 
     fn fence_read(&mut self, result: IoResult) -> CommitTurn {
-        let values = read_values(result)?;
+        let values = result.values()?;
         let [acceptance, realm_config, group_fence] =
             <[_; 3]>::try_from(values).map_err(|_| IoError::Unexpected {
                 expected: "three create fence values",
@@ -563,7 +562,7 @@ impl CreateCommitOperation {
     }
 
     fn pid_fence_read(&mut self, result: IoResult) -> CommitTurn {
-        let value = read_value(result)?;
+        let value = result.value()?;
         let Some((config, placement, holders)) = self.pending.take() else {
             return Err(CreateDocumentError::PlacementFenced);
         };

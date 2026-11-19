@@ -33,7 +33,6 @@ use super::workspace::{
 use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::connectors::root_record::{parse_root, read_root};
 use crate::jobs::lifecycle::stage::{StageError, StageInputOperation, StagedInput};
-use crate::jobs::read_access::{SourceReadError, SourceReadOperation};
 use crate::jobs::store::JobMutation;
 use crate::jobs::store::job_calls::change_job;
 use crate::jobs::store::mutation_error::JobMutationError;
@@ -41,6 +40,7 @@ use crate::jobs::store::store_call::StoreCall;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
+use crate::s3::object::read_access::{SourceReadError, SourceReadOperation};
 use crate::staging::granted_read::GrantedReadOperation;
 use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};
 

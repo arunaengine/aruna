@@ -25,7 +25,7 @@ use aruna_core::structs::storage::usage::usage_group_key;
 use aruna_core::types::RoleId;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::AuthorizeEitherOperation;
-use aruna_operations::device::realm_documents::install_group_docs;
+use aruna_operations::device_node::realm_documents::install_group_docs;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::git::GitError;
@@ -1355,7 +1355,7 @@ pub(crate) async fn run_group_usage(
     let local = crate::routes::info::load_usage_counters(state, usage_group_key(group_id)).await?;
     let realm = crate::routes::info::load_realm_usage(
         state,
-        aruna_operations::node::realm_usage::RealmUsageScope::Group(group_id),
+        aruna_operations::s3::realm_usage::RealmUsageScope::Group(group_id),
     )
     .await?;
 

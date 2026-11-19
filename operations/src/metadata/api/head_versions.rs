@@ -13,7 +13,6 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
 use super::prefix_scan::PrefixScanOperation;
-use crate::metadata::call_results::read_values;
 
 /// The current versions found, and whether every head under the prefix was read.
 pub type HeadVersions = (Vec<(VersionKey, BlobVersion)>, bool);
@@ -134,7 +133,7 @@ impl Operation for HeadVersionsOperation {
                     .map_err(|_| HeadVersionsError::Unavailable)?;
                 self.heads_turn(turn)
             }
-            None => self.versions_read(read_values(result)?),
+            None => self.versions_read(result.values()?),
         }
     }
 }

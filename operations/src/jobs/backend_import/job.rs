@@ -24,7 +24,7 @@ use super::{
     ImportJob, ImportRun, ItemError, LIST_PAGE, Outcome, PageReads, checkpoint_key, retryable,
     tally,
 };
-use crate::jobs::blob_request::BlobRequest;
+use crate::blob::request::BlobRequest;
 use crate::jobs::page_intents::{IntentReadError, PageIntentsOperation, PathIntents};
 use crate::jobs::run_rows::{ReadStateOperation, SettledRowsOperation, StateReadError};
 use crate::jobs::store::mutation_error::JobMutationError;

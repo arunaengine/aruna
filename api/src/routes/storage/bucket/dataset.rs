@@ -15,8 +15,9 @@ use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, validate_ide
 use aruna_core::structs::storage::data::link::DataLink;
 use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
 use aruna_drivers::driver::drive;
+use aruna_operations::metadata::forward::read::DatasetSummaryOperation;
 use aruna_operations::metadata::forward::routed::write::RouteDeleteOperation;
-use aruna_operations::s3::bucket::dataset::{BucketMetadataOperation, DatasetSummaryOperation};
+use aruna_operations::s3::bucket::dataset::BucketMetadataOperation;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

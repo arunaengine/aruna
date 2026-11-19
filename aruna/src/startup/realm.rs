@@ -13,7 +13,7 @@ use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_drivers::driver::node_facts;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
-use aruna_operations::device::realm_documents::fetch_realm_documents;
+use aruna_operations::device_node::realm_documents::fetch_realm_documents;
 use aruna_operations::metadata::projection::{MetadataProjectionError, ReplayPageOperation};
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};

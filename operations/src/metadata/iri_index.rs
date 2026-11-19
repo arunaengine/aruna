@@ -32,7 +32,6 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::api::access::{child_results, children};
-use crate::metadata::call_results::page_rows;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 use crate::metadata::record_reads::DocumentRecordOperation;
@@ -217,7 +216,7 @@ impl BacklinksOperation {
     }
 
     fn rows(&mut self, result: IoResult) -> BacklinkTurn {
-        let (values, next) = page_rows(result)?;
+        let (values, next) = result.page()?;
         self.budget.rows =
             (self.budget.rows.checked_sub(values.len())).ok_or(BacklinkError::BudgetExhausted)?;
         for (_, value) in values {
@@ -242,7 +241,7 @@ impl BacklinksOperation {
     }
 
     fn group_found(&mut self, result: IoResult) -> BacklinkTurn {
-        let (values, _) = page_rows(result)?;
+        let (values, _) = result.page()?;
         let Some(prefix) = values.first().and_then(|(key, _)| key.get(..64)) else {
             return Ok(Next::Done(self.page()));
         };
@@ -686,7 +685,7 @@ impl Operation for RebuildIrisOperation {
                 "rebuild not started".to_string(),
             )),
             Some(RebuildStage::Page) => {
-                let (rows, next) = page_rows(result).map_err(|error| backend(&error))?;
+                let (rows, next) = result.page().map_err(|error| backend(&error))?;
                 self.next = next;
                 let records: Vec<MetadataRegistryRecord> = rows
                     .iter()

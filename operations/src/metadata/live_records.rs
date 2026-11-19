@@ -21,8 +21,6 @@ use aruna_core::types::{Key, TxnId, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::read_values;
-
 #[derive(Debug, Error, PartialEq)]
 pub enum LiveRecordsError {
     #[error("metadata candidate limit exceeded")]
@@ -112,7 +110,7 @@ impl Operation for LiveRecordsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, LiveRecordsError> {
-        let values = read_values(result)?;
+        let values = result.values()?;
         Ok(Next::Done(self.live(values)?))
     }
 }

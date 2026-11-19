@@ -20,7 +20,6 @@ use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::routing::distinct_holders;
-use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
     mint_forward_document,
@@ -190,7 +189,7 @@ impl RouteCreateOperation {
                 "no holder was asked".into(),
             ));
         };
-        let Event::Net(NetEvent::MetadataAnswer(answer)) = effect_event(result)? else {
+        let Event::Net(NetEvent::MetadataAnswer(answer)) = result.event()? else {
             return Err(MetadataWriteError::Undeliverable(
                 "unexpected answer to a forwarded create".into(),
             ));
