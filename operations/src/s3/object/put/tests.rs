@@ -492,7 +492,7 @@ pub async fn test_put_object() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -776,7 +776,7 @@ pub async fn deduplicates_blob() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -943,7 +943,7 @@ async fn setup_two_backends(temp_root: &str) -> (DriverContext, String, String) 
     let cold_root = format!("{temp_root}/cold");
     std::fs::create_dir_all(&hot_root).unwrap();
     std::fs::create_dir_all(&cold_root).unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -1241,7 +1241,7 @@ pub async fn overwrite_retains_index() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -1426,7 +1426,7 @@ async fn mismatch_cleans_blob() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -1737,7 +1737,7 @@ async fn plain_owns_copy() {
     use aruna_core::structs::storage::format::StoredLayout;
     use aruna_core::structs::storage::routing::PlainTarget;
     let temp = tempdir().unwrap();
-    let storage = storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+    let storage = storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
     let backend = BackendRef::Group(Ulid::from_parts(2, 2));
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = iroh::SecretKey::generate().public();

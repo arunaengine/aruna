@@ -41,7 +41,7 @@ async fn full_context() -> (TempDir, DriverContext) {
     let temp_root = temp_handle.path().to_str().expect("utf8 path");
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).expect("blob root");
-    let storage_handle = storage::FjallStorage::open(temp_root).expect("storage opens");
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).expect("storage opens");
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .expect("net handle");

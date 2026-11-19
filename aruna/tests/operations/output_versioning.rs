@@ -91,7 +91,7 @@ async fn setup() -> Harness {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
 
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let config = NetConfig {
         realm_id,

@@ -665,7 +665,7 @@ mod tests {
 
     struct FinalizeFixture {
         _tempdir: TempDir,
-        storage_handle: storage::StorageHandle,
+        storage_handle: storage::handle::StorageHandle,
         context: Arc<DriverContext>,
         realm_signing_key: SigningKey,
         realm_id: RealmId,
@@ -676,7 +676,8 @@ mod tests {
 
     async fn setup_finalize_fixture() -> FinalizeFixture {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = Arc::new(DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -759,7 +760,7 @@ mod tests {
     }
 
     async fn read_secret_state(
-        storage_handle: &storage::StorageHandle,
+        storage_handle: &storage::handle::StorageHandle,
         enrollment_id: Ulid,
     ) -> OnboardingSecretState {
         let state_value = match storage_handle
@@ -901,7 +902,7 @@ mod tests {
     }
 
     async fn read_outbox_rows(
-        storage_handle: &storage::StorageHandle,
+        storage_handle: &storage::handle::StorageHandle,
     ) -> Vec<NotificationOutboxRecord> {
         match storage_handle
             .send_storage_effect(StorageEffect::Iter {
@@ -1343,7 +1344,8 @@ mod tests {
     #[tokio::test]
     async fn emit_warns_absent() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

@@ -224,7 +224,8 @@ pub(crate) mod tests {
 
     pub(crate) fn context() -> (TempDir, DriverContext) {
         let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

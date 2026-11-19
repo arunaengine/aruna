@@ -343,7 +343,8 @@ mod tests {
 
     fn open_context(tempdir: &tempfile::TempDir) -> DriverContext {
         DriverContext {
-            storage_handle: storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap(),
+            storage_handle: storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap())
+                .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -457,7 +458,8 @@ mod tests {
     #[tokio::test]
     async fn reserves_same_node() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -532,7 +534,8 @@ mod tests {
     #[tokio::test]
     async fn expired_reservation_reclaimed() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

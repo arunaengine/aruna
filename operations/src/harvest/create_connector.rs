@@ -408,7 +408,8 @@ mod tests {
     #[tokio::test]
     async fn persists_connector_record() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

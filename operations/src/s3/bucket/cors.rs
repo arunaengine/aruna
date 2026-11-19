@@ -216,7 +216,7 @@ mod tests {
     fn make_context() -> DriverContext {
         let temp_dir = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
         std::mem::forget(temp_dir);
         DriverContext {
             storage_handle,
