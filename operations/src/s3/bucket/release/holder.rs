@@ -109,7 +109,10 @@ impl Operation for ReadCrateOperation {
             Err(error) => return Err(CrateReadError::Failed(error.to_string())),
         };
         self.collecting = Some((found.metadata, found.info.size));
-        let collect = BlobEffect::CollectStream { blob: found.blob };
+        let collect = BlobEffect::CollectStream {
+            blob: found.blob,
+            limit: None,
+        };
         Ok(Next::Call(Effect::Blob(collect).into()))
     }
 }

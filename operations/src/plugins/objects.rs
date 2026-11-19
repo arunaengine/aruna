@@ -269,16 +269,17 @@ impl Operation for ReadObject {
                     return Err(self.too_large());
                 }
                 self.phase = ReadPhase::Collect;
-                let collect = BlobEffect::CollectStream { blob: got.blob };
+                let collect = BlobEffect::CollectStream {
+                    blob: got.blob,
+                    limit: Some(self.max_bytes as u64),
+                };
                 Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(collect)))))
             }
             ReadPhase::Collect => match result.event()? {
                 Event::Blob(BlobEvent::StreamCollected { bytes: Ok(bytes) }) => {
-                    match bytes.len() > self.max_bytes {
-                        true => Err(self.too_large()),
-                        false => Ok(Next::Done(bytes)),
-                    }
+                    Ok(Next::Done(bytes))
                 }
+                Event::Blob(BlobEvent::StreamTooLarge { .. }) => Err(self.too_large()),
                 Event::Blob(BlobEvent::StreamCollected { bytes: Err(error) }) => {
                     Err(CallError(unavailable(error)))
                 }
