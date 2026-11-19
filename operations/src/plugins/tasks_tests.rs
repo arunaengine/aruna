@@ -2,40 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
-use aruna_core::plugin_installs::InstallState;
-use aruna_core::structs::identity::realm::RealmId;
-
 use super::*;
-use crate::tests::records::node;
-
-const REALM: RealmId = RealmId([3; 32]);
-
-fn install() -> PluginInstall {
-    PluginInstall {
-        install_id: Ulid::from_bytes([1; 16]),
-        group_id: Ulid::from_bytes([2; 16]),
-        plugin: "map-reads".to_string(),
-        version: "0.1.0".to_string(),
-        digest: "sha256:aa".to_string(),
-        state: InstallState::Active,
-        paused: false,
-        settings: "{}".to_string(),
-        grants: Default::default(),
-        account: UserId::local(Ulid::from_bytes([3; 16]), REALM),
-        role_id: Ulid::from_bytes([4; 16]),
-        receiver: node(1),
-        granted_by: UserId::local(Ulid::from_bytes([5; 16]), REALM),
-        request: "sha256:bb".to_string(),
-        revision: 1,
-        active_since_ms: Some(1),
-        failed: None,
-        prerequisites: Vec::new(),
-        activated_by: None,
-        widened: None,
-        secrets: Default::default(),
-    }
-}
+use crate::plugins::screen::tests::install;
 
 fn recipe() -> Recipe {
     Recipe {
