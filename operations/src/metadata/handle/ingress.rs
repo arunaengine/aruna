@@ -7,26 +7,16 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::SyncRelationship;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::bucket_permission_path;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::telemetry::record_elapsed_ms;
-use aruna_core::types::GroupId;
-use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use tracing::Span;
 
-use super::peer_auth::authorize_peer;
+use super::MetadataHandle;
 use super::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, read_budget,
     write_body_at, write_message_at, write_stream_body, write_transport_message,
 };
-use super::{
-    MetadataHandle, RollbackRequest, create_sync_bucket, sync_identity_matches, valid_sync_request,
-};
-use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
@@ -35,13 +25,6 @@ use crate::metadata::message_kind::transport_message_kind;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::metadata::read_peer::ReadPeerOperation;
 use crate::metadata::serve::{ServeError, ServeNode, ServeRequestOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::staging::bucket_guard::BucketGuardOperation;
-use crate::staging::offered_directory::OfferedDirectoryError;
-use crate::sync::sync_relationship::{
-    DeleteRelationshipOperation, GetRelationshipOperation, RemoveOutgoingOperation,
-    StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
-};
 use aruna_core::metadata::AuthToken;
 
 impl MetadataHandle {
@@ -60,303 +43,9 @@ impl MetadataHandle {
         let check = ReadPeerOperation::new((peer, realm_id), auth_token, trusted);
         drive(check, context).await
     }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn apply_sync_mirror(
-        &self,
-        context: &Arc<DriverContext>,
-        peer: NodeId,
-        auth_token: Option<AuthToken>,
-        relationship: SyncRelationship,
-        source_group_id: Option<GroupId>,
-        delete: bool,
-        extras: PolicyRequestExtras,
-        rollback: bool,
-    ) -> MetadataTransportMessage {
-        let Some(net_handle) = self.inner.net_handle.as_ref() else {
-            return MetadataTransportMessage::Reject("mirror_internal".to_string());
-        };
-        let vouched = matches!(auth_token, Some(AuthToken::Internal(_)));
-        let auth = match authorize_peer(
-            &self.inner.auth_validation,
-            &self.inner.storage_handle,
-            peer,
-            Some(*net_handle.realm_id()),
-            auth_token,
-            true,
-        )
-        .await
-        {
-            Ok(Some(auth)) => auth,
-            Ok(None) => {
-                return MetadataTransportMessage::Reject("access_denied".to_string());
-            }
-            Err(_) => return MetadataTransportMessage::Reject("access_denied".to_string()),
-        };
-
-        let Some(source_bucket) = relationship.source.bucket() else {
-            return MetadataTransportMessage::Reject("invalid_relationship".to_string());
-        };
-        let Some(target_bucket) = relationship.target.bucket() else {
-            return MetadataTransportMessage::Reject("invalid_relationship".to_string());
-        };
-        if !valid_sync_request(
-            &relationship,
-            source_bucket,
-            target_bucket,
-            *net_handle.realm_id(),
-            auth.user_id,
-            delete,
-        ) {
-            return MetadataTransportMessage::Reject("invalid_relationship".to_string());
-        }
-
-        let local_node = net_handle.node_id();
-        let (local_bucket, direction) =
-            if relationship.source.node_id == peer && relationship.target.node_id == local_node {
-                (target_bucket, SyncRelationshipDirection::Incoming)
-            } else if delete
-                && relationship.target.node_id == peer
-                && relationship.source.node_id == local_node
-            {
-                (source_bucket, SyncRelationshipDirection::Outgoing)
-            } else {
-                return MetadataTransportMessage::Reject("invalid_relationship".to_string());
-            };
-
-        if delete {
-            let rollback = rollback.then_some(RollbackRequest {
-                peer,
-                local_node,
-                vouched,
-            });
-            return delete_mirror(
-                context,
-                net_handle,
-                &auth,
-                &relationship,
-                local_bucket,
-                direction,
-                extras,
-                rollback,
-            )
-            .await;
-        }
-
-        // A read-only bucket refuses a mirror like a denied write, before any bucket is created.
-        match drive(BucketGuardOperation::new(local_bucket), context.as_ref())
-            .await
-            .map_err(OfferedDirectoryError::from)
-        {
-            Ok(()) => {}
-            Err(OfferedDirectoryError::ReadOnly(_)) => {
-                return MetadataTransportMessage::Reject("access_denied".to_string());
-            }
-            Err(_) => return MetadataTransportMessage::Reject("mirror_internal".to_string()),
-        }
-        let (group_id, create_bucket) = match drive(
-            GetBucketOperation::new(local_bucket.to_string()),
-            context.as_ref(),
-        )
-        .await
-        {
-            Ok(bucket_info) => (bucket_info.group_id, false),
-            Err(GetBucketError::NotFound) => {
-                let Some(source_group_id) = source_group_id else {
-                    return MetadataTransportMessage::Reject("invalid_relationship".to_string());
-                };
-                (source_group_id, true)
-            }
-            Err(_) => return MetadataTransportMessage::Reject("mirror_internal".to_string()),
-        };
-        let path = bucket_permission_path(
-            *net_handle.realm_id(),
-            group_id,
-            net_handle.node_id(),
-            local_bucket,
-        );
-        match drive(
-            AuthorizeOperation::new(
-                *net_handle.realm_id(),
-                &auth,
-                &path,
-                &Permission::WRITE,
-                extras,
-            ),
-            context.as_ref(),
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(AuthorizeError::CheckFailed(_) | AuthorizeError::Storage(_)) => {
-                return MetadataTransportMessage::Reject("mirror_internal".to_string());
-            }
-            Err(_) => return MetadataTransportMessage::Reject("access_denied".to_string()),
-        }
-        if create_bucket
-            && create_sync_bucket(context.as_ref(), local_bucket, group_id, &relationship)
-                .await
-                .is_err()
-        {
-            return MetadataTransportMessage::Reject("mirror_internal".to_string());
-        }
-
-        match drive(
-            StoreRelationshipOperation::new(relationship, direction),
-            context.as_ref(),
-        )
-        .await
-        {
-            Ok(_) => MetadataTransportMessage::SyncMirrorCreated,
-            Err(_) => MetadataTransportMessage::Reject("mirror_internal".to_string()),
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn delete_mirror(
-    context: &Arc<DriverContext>,
-    net_handle: &NetHandle,
-    auth: &aruna_core::structs::identity::auth::AuthContext,
-    relationship: &SyncRelationship,
-    local_bucket: &str,
-    direction: SyncRelationshipDirection,
-    extras: PolicyRequestExtras,
-    rollback: Option<RollbackRequest>,
-) -> MetadataTransportMessage {
-    let stored = match drive(
-        GetRelationshipOperation::new(relationship.id, direction),
-        context.as_ref(),
-    )
-    .await
-    {
-        Ok(stored) => stored,
-        Err(SyncRelationshipError::NotFound) => {
-            return MetadataTransportMessage::SyncMirrorDeleted;
-        }
-        Err(_) => return MetadataTransportMessage::Reject("mirror_internal".to_string()),
-    };
-    if !sync_identity_matches(&stored, relationship) {
-        return MetadataTransportMessage::Reject("invalid_relationship".to_string());
-    }
-    if let Some(request) = rollback {
-        // A rollback never falls back to the WRITE-checked delete.
-        if !request.allows(&stored, relationship) {
-            return MetadataTransportMessage::Reject("invalid_relationship".to_string());
-        }
-    } else {
-        // A present bucket must pass the origin's authorization boundary.
-        match drive(
-            GetBucketOperation::new(local_bucket.to_string()),
-            context.as_ref(),
-        )
-        .await
-        {
-            Ok(bucket_info) => {
-                let path = bucket_permission_path(
-                    *net_handle.realm_id(),
-                    bucket_info.group_id,
-                    net_handle.node_id(),
-                    local_bucket,
-                );
-                match drive(
-                    AuthorizeOperation::new(
-                        *net_handle.realm_id(),
-                        auth,
-                        &path,
-                        &Permission::WRITE,
-                        extras,
-                    ),
-                    context.as_ref(),
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(AuthorizeError::CheckFailed(_) | AuthorizeError::Storage(_)) => {
-                        return MetadataTransportMessage::Reject("mirror_internal".to_string());
-                    }
-                    Err(_) => return MetadataTransportMessage::Reject("access_denied".to_string()),
-                }
-            }
-            Err(GetBucketError::NotFound) => {}
-            Err(_) => {
-                return MetadataTransportMessage::Reject("mirror_internal".to_string());
-            }
-        }
-    }
-    // Retain the peer's readable reference records when detaching an outgoing mirror.
-    let removed = match direction {
-        SyncRelationshipDirection::Outgoing => {
-            drive(RemoveOutgoingOperation::new(stored), context.as_ref()).await
-        }
-        SyncRelationshipDirection::Incoming => {
-            drive(
-                DeleteRelationshipOperation::new(stored, direction),
-                context.as_ref(),
-            )
-            .await
-        }
-    };
-    match removed {
-        Ok(()) => MetadataTransportMessage::SyncMirrorDeleted,
-        Err(_) => MetadataTransportMessage::Reject("mirror_internal".to_string()),
-    }
 }
 
 impl MetadataHandle {
-    async fn mirror_request(
-        &self,
-        context: &Arc<DriverContext>,
-        peer: NodeId,
-        message: MetadataTransportMessage,
-    ) -> MetadataTransportMessage {
-        match message {
-            MetadataTransportMessage::CreateSyncMirror {
-                auth_token,
-                source_group_id,
-                relationship,
-                extras,
-            } => {
-                Box::pin(async {
-                    self.apply_sync_mirror(
-                        context,
-                        peer,
-                        auth_token,
-                        *relationship,
-                        Some(source_group_id),
-                        false,
-                        extras,
-                        false,
-                    )
-                    .await
-                })
-                .await
-            }
-            MetadataTransportMessage::DeleteSyncMirror {
-                auth_token,
-                relationship,
-                extras,
-                rollback,
-            } => {
-                Box::pin(async {
-                    self.apply_sync_mirror(
-                        context,
-                        peer,
-                        auth_token,
-                        *relationship,
-                        None,
-                        true,
-                        extras,
-                        rollback,
-                    )
-                    .await
-                })
-                .await
-            }
-            _ => unreachable!("request family routed incorrectly"),
-        }
-    }
-
     /// This node's audit page for a peer, under its forwarded caller and the merge deadline.
     async fn serve_audit(
         &self,
@@ -661,10 +350,6 @@ impl MetadataHandle {
             Err(ServeError::Io(error)) => return (reject(error.to_string()), None),
         };
         match message {
-            message @ (MetadataTransportMessage::CreateSyncMirror { .. }
-            | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
-                (self.mirror_request(context, peer, message).await, None)
-            }
             message @ (MetadataTransportMessage::ForwardCreateDocument { .. }
             | MetadataTransportMessage::ForwardUpdateDocument { .. }
             | MetadataTransportMessage::ForwardDeleteDocument { .. }

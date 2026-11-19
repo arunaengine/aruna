@@ -2,19 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::storage::format::Compression;
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "test-hooks")]
 use std::sync::atomic::AtomicBool;
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
-use aruna_core::metadata::MetadataError;
-use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
@@ -26,7 +19,6 @@ use crate::auth::bearer_token::{
 use crate::auth::error::ArunaBearerError;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::write_peer::forwarded_checks;
-use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use aruna_core::structs::identity::auth::AuthContext;
 
 mod effects;
@@ -40,80 +32,6 @@ mod pull_serve;
 mod transport;
 
 const METADATA_CHUNK_SIZE: usize = 64 * 1024;
-
-fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> bool {
-    left.id == right.id
-        && left.source == right.source
-        && left.target == right.target
-        && left.mode == right.mode
-        && left.replicate_deletes == right.replicate_deletes
-        && left.created_by == right.created_by
-        && left.created_at == right.created_at
-}
-
-/// The sender of a mirror rollback, as the transport authenticated it.
-#[derive(Clone, Copy, Debug)]
-struct RollbackRequest {
-    peer: NodeId,
-    local_node: NodeId,
-    /// The token was node-vouched, never a user bearer.
-    vouched: bool,
-}
-
-impl RollbackRequest {
-    /// Only the source peer of this exact incoming mirror may roll it back without WRITE.
-    fn allows(&self, stored: &SyncRelationship, request: &SyncRelationship) -> bool {
-        self.vouched
-            && request.source.node_id == self.peer
-            && request.target.node_id == self.local_node
-            && sync_identity_matches(stored, request)
-    }
-}
-
-fn valid_sync_request(
-    relationship: &SyncRelationship,
-    source_bucket: &str,
-    target_bucket: &str,
-    realm_id: RealmId,
-    user_id: UserId,
-    delete: bool,
-) -> bool {
-    !source_bucket.is_empty()
-        && !target_bucket.is_empty()
-        && relationship.source.key_prefix() != Some("")
-        && relationship.target.key_prefix() != Some("")
-        && relationship.source.realm_id == realm_id
-        && relationship.target.realm_id == realm_id
-        && relationship.created_by == user_id
-        && (delete || (!source_bucket.starts_with("ws-") && !target_bucket.starts_with("ws-")))
-}
-
-async fn create_sync_bucket(
-    context: &DriverContext,
-    bucket: &str,
-    group_id: GroupId,
-    relationship: &SyncRelationship,
-) -> Result<(), CreateBucketError> {
-    drive(
-        CreateBucketOperation::new(
-            bucket.to_string(),
-            BucketInfo {
-                group_id,
-                created_at: relationship.created_at,
-                created_by: relationship.created_by,
-                cors_configuration: None,
-                storage_routing: Vec::new(),
-                placement_policies: Vec::new(),
-                placement_policy_generation: 0,
-                compression: Compression::Off,
-                distribution: None,
-            },
-        ),
-        context,
-    )
-    .await?;
-    Ok(())
-}
 
 /// The directory below the metadata storage path that holds the range search indexes.
 const RANGE_INDEX_DIR: &str = "range-indexes";

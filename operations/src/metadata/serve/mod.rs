@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod exports;
+mod mirror;
 mod paths;
 mod reads;
 
@@ -14,6 +15,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use thiserror::Error;
 
 use self::exports::{ExportAsk, ExportServeOperation};
+use self::mirror::{MirrorRequest, MirrorServeOperation};
 use self::paths::{PathAsk, PathReadOperation};
 use self::reads::{CallerReadOperation, ReadReply};
 use crate::distribution::imports::{HandedImport, StagingSpecOperation};
@@ -56,6 +58,7 @@ pub enum ServeError {
 enum Waiting {
     Read,
     Path,
+    Mirror,
     Export,
     Spec,
     Page,
@@ -108,7 +111,9 @@ impl Waiting {
     fn answer(self, result: IoResult) -> Result<ServedReply, ServeError> {
         let reply = match self {
             Self::Export => return Ok(result.child::<ServedReply, IoError>()??),
-            Self::Read | Self::Path => result.child::<MetadataTransportMessage, IoError>()??,
+            Self::Read | Self::Path | Self::Mirror => {
+                result.child::<MetadataTransportMessage, IoError>()??
+            }
             Self::Spec => MetadataTransportMessage::StagingSpecResult {
                 result: (result.child::<HandedImport, MetadataReadError>()?).map(Box::new),
             },
@@ -157,6 +162,11 @@ impl ServeRequestOperation {
         self.call(Waiting::Path, IoCall::child(read))
     }
 
+    fn mirror(&mut self, request: MirrorRequest) -> ServeTurn {
+        let mirror = MirrorServeOperation::new(self.peer, self.node.local, request);
+        self.call(Waiting::Mirror, IoCall::child(mirror))
+    }
+
     fn export(&mut self, digest: [u8; 32], ask: ExportAsk) -> ServeTurn {
         let export = ExportServeOperation::new((self.peer, self.node), digest, ask);
         self.call(Waiting::Export, IoCall::child(export))
@@ -189,6 +199,32 @@ impl Operation for ServeRequestOperation {
             return self.call(Waiting::Read, IoCall::child(read));
         }
         match message {
+            MetadataTransportMessage::CreateSyncMirror {
+                auth_token,
+                source_group_id,
+                relationship,
+                extras,
+            } => self.mirror(MirrorRequest {
+                token: auth_token,
+                relationship: *relationship,
+                source_group: Some(source_group_id),
+                extras: Some(extras),
+                delete: false,
+                rollback: false,
+            }),
+            MetadataTransportMessage::DeleteSyncMirror {
+                auth_token,
+                relationship,
+                extras,
+                rollback,
+            } => self.mirror(MirrorRequest {
+                token: auth_token,
+                relationship: *relationship,
+                source_group: None,
+                extras: Some(extras),
+                delete: true,
+                rollback,
+            }),
             MetadataTransportMessage::QueryDocument {
                 auth_token,
                 config_digest,
