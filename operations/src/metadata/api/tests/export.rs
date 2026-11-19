@@ -4,11 +4,11 @@
 
 use super::list::summary_request;
 use super::*;
-use crate::driver::drive;
 use crate::metadata::api::export::ExportOperation;
 use crate::metadata::api::read_types::metadata_read_request;
 use crate::metadata::registry_cache::RegistryReadOperation;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEffect};
+use aruna_drivers::driver::drive;
 
 fn raw_request(document_id: Ulid) -> ExportMetadataRequest {
     ExportMetadataRequest {

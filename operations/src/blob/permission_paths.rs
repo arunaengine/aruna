@@ -75,7 +75,6 @@ impl Operation for ResolvePathsOperation {
 mod tests {
     use super::{MAX_HASH_ALIASES, ResolvePathsError, ResolvePathsOperation};
     use crate::blob::records::add_index_effect;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
@@ -83,6 +82,7 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::HashIndex;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::DriverContext;
 use crate::testing::{export_rocrate_jsonld, send_metadata_effect};
 use aruna_core::NodeId;
 use aruna_core::events::Event;
@@ -15,6 +14,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
+use aruna_drivers::driver::DriverContext;
 use aruna_graph::GraphHandle;
 use aruna_storage::FjallStorage;
 use aruna_storage::StorageHandle;

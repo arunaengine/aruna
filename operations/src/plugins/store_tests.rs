@@ -7,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::types::TxnId;
 
 use super::rows::{Rows, StoreError};
-use crate::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 
 /// Plugin row reads and writes; `direct` runs each on its own.
 pub struct Txn<'a> {

@@ -895,7 +895,6 @@ impl ReferenceLookupOperation {
 mod tests {
     use super::super::data_links::tests::apply_rows;
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::tests::calls::{child, runs_child};
     use aruna_core::effects::StorageEffect;
     use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
@@ -903,6 +902,7 @@ mod tests {
     use aruna_core::storage_entries::{iri_reference_key, materialization_status_entry};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::FjallStorage;
     use aruna_storage::StorageHandle;
 

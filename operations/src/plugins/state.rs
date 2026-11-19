@@ -276,11 +276,11 @@ impl Operation for RemoveState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
     use crate::plugins::host_calls::call_intent;
     use crate::plugins::intents::{Begun, begin};
     use crate::plugins::rows::tests::{page_result, values_result};
     use crate::plugins::runs::tests::opened;
+    use aruna_drivers::driver::drive;
     use aruna_plugins::broker::Intent;
 
     fn put(key: &str, value: &[u8], expected: Option<u64>, ordinal: u32) -> StateWrite {

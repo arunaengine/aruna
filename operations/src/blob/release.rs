@@ -1070,11 +1070,11 @@ impl Operation for DropRowOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::format::{EncodingClass, StoredFormat, StoredLayout};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::FjallStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;

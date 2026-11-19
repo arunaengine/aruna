@@ -6,7 +6,6 @@
 use aruna_core::plugin_installs::PluginInstall;
 
 use super::*;
-use crate::driver::drive;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::calls::*;
 #[allow(unused_imports)]
@@ -18,6 +17,7 @@ use crate::plugins::runs::tests::queued;
 pub(crate) use crate::plugins::test_support::{path, ready, request, scope};
 use crate::plugins::work::read_work;
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
+use aruna_drivers::driver::drive;
 
 #[tokio::test]
 async fn repeat_finds_work() {

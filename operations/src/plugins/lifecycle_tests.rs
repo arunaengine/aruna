@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::drive;
 use crate::plugins::account::{AccountChange, EnsureRole, Teardown};
 use crate::plugins::calls::*;
 use crate::plugins::grants::role_paths;
@@ -15,6 +14,7 @@ use aruna_core::UserId;
 use aruna_core::structs::identity::admin_audit::AuditIndex;
 use aruna_core::structs::identity::auth::{PathRestriction, Permission as Access};
 use aruna_core::time::unix_timestamp_secs;
+use aruna_drivers::driver::drive;
 use serde_json::json;
 
 fn needs_write() -> Value {

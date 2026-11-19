@@ -1370,13 +1370,13 @@ impl Operation for ReclaimUploadsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::encryption::SealPlan;
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use aruna_core::structs::storage::transition::{TransitionKind, TransitionTarget};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::StorageHandle;
     use std::time::SystemTime;
     use ulid::Ulid;

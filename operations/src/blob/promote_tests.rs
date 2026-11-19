@@ -689,7 +689,6 @@ fn claim_mismatch_unregistered() {
 pub(crate) mod received {
     use super::*;
     use crate::blob::unlocked::{DropReceivedOperation, PromoteUnlockedOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::s3::object::copy::sealed::{SealedCopyInput, SealedCopyOperation};
     use crate::s3::object::copy::test::{seed_authority, seed_bucket};
     use crate::tests::s3::full_context;
@@ -699,6 +698,7 @@ pub(crate) mod received {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, ResolvedBackend};
     use aruna_core::structs::storage::encryption::{SealPlan, public_key_of};
+    use aruna_drivers::driver::{DriverContext, drive};
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
 
@@ -999,7 +999,7 @@ pub(crate) mod received {
         assert!(effects.is_empty() && first.is_complete());
         let conflict = PromoteError::Storage(StorageError::TransactionConflict);
         assert_eq!(first.finalize(), Err(conflict));
-        let owners = crate::driver::drive_retry(|| fence.clone(), &context, b"fence").await;
+        let owners = aruna_drivers::driver::drive_retry(|| fence.clone(), &context, b"fence").await;
         assert_eq!(owners.unwrap().len(), 2);
         assert_eq!(
             drive(

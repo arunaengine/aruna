@@ -1078,7 +1078,6 @@ mod tests {
         ProcessCleanupOperation, ReconcileTargetOperation, RowOutcome,
     };
     use crate::blob::migration::shared::MigrationError;
-    use crate::driver::{DriverContext, drive, node_routing};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -1092,6 +1091,7 @@ mod tests {
     use aruna_core::structs::storage::multipart::{
         BackendUpload, MultipartUpload, MultipartUploadStatus,
     };
+    use aruna_drivers::driver::{DriverContext, drive, node_routing};
     use aruna_storage::scan::iter_prefix_page;
     use aruna_storage::storage::{FjallStorage, StorageHandle};
     use std::collections::HashMap;

@@ -222,9 +222,9 @@ impl Operation for PidChangeOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::handle::Handle;
+    use aruna_drivers::driver::{DriverContext, drive};
 
     async fn change(
         ctx: &DriverContext,
@@ -615,13 +615,13 @@ mod tests {
 
         assert!(fence_open(&ctx, &route).await);
 
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(
                 realm(),
                 route.placement,
                 1,
             ),
-            &crate::driver::DriverContext::storage_only(ctx.storage_handle.clone()),
+            &aruna_drivers::driver::DriverContext::storage_only(ctx.storage_handle.clone()),
         )
         .await
         .expect("the departing holder closes the fence");

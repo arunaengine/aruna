@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::drive;
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::event_trigger;
@@ -17,6 +16,7 @@ use aruna_core::keyspaces::PLUGIN_RUNS_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::SourceKind;
 use aruna_core::plugin_runs::{RUNS_QUEUED, timer_key};
+use aruna_drivers::driver::drive;
 
 const HOUR: u64 = 3600 * 1000;
 

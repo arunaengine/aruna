@@ -2,11 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
-use crate::driver::drive;
 use crate::groups::create_group::CreateGroupConfig;
 use crate::groups::create_group::CreateGroupOperation;
-use crate::jobs::context::JobContext;
 use crate::plugins::account::ReadGroupAuth;
 use crate::plugins::calls::install_plugin;
 use crate::plugins::calls::prepare_install;
@@ -84,6 +81,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::driver::drive;
+use aruna_drivers::jobs::context::JobContext;
 use aruna_plugins::artifact::ArtifactDigest;
 use aruna_plugins::artifact::attach_manifest;
 use aruna_plugins::artifact::read_manifest;
@@ -822,9 +822,9 @@ pub async fn ready_copy(
     PluginInstall,
     PluginWorkSpec,
 ) {
-    use crate::driver::drive;
     use crate::s3::object::put::PutObjectOperation;
     use crate::testing_objects::{put_config, seed_bucket, with_blob};
+    use aruna_drivers::driver::drive;
     let install = copier(fixture).await;
     let root = tempfile::tempdir().unwrap();
     let blob = with_blob(&fixture.ctx, root.path()).await;
@@ -863,8 +863,8 @@ pub async fn leaks(fixture: &Fixture, canary: &str) -> Vec<&'static str> {
 pub async fn drain_blob_batch(ctx: &DriverContext) -> crate::replication::drain::BlobDrainResult {
     let drain = crate::replication::drain::ProcessBatchOperation::new(
         crate::replication::page::deliver::MetadataPages,
-        crate::driver::node_routing(ctx),
+        aruna_drivers::driver::node_routing(ctx),
         ctx.node_and_realm(),
     );
-    crate::driver::drive(drain, ctx).await.unwrap()
+    aruna_drivers::driver::drive(drain, ctx).await.unwrap()
 }

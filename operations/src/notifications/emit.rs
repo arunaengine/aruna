@@ -99,7 +99,6 @@ pub(crate) fn emit_notifications_effect(records: Vec<NotificationRecord>) -> Eff
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::notifications::unexpected;
     use crate::tests::notifications::{context_with_storage, record, user};
     use aruna_core::effects::StorageEffect;
@@ -109,6 +108,7 @@ mod tests {
         NotificationClass, notification_outbox_key,
     };
     use aruna_core::task::{TaskEffect, TaskKey};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;

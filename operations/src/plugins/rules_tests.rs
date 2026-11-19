@@ -156,12 +156,12 @@ pub(crate) async fn plain_secret(
     (name, kind): (&str, &str),
     settings: &[(&str, &str)],
 ) {
-    use crate::driver::drive;
     use crate::secrets::SecretChange;
     use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
     use aruna_core::compute::Secret;
     use aruna_core::secret_registers::SecretOwner;
     use aruna_core::secrets::{SecretFields, SecretKind};
+    use aruna_drivers::driver::drive;
     let field = match kind {
         "bearer" => "token",
         _ => "value",

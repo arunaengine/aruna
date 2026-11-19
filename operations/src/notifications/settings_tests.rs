@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::notifications::setting_rows::{
     ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
 };
@@ -20,6 +19,7 @@ use aruna_core::structs::execution::notification::{NotificationClass, Notificati
 use aruna_core::structs::execution::setting::SettingHead;
 use aruna_core::structs::execution::webhook::WebhookSubscription;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_drivers::driver::{DriverContext, drive};
 use ulid::Ulid;
 
 const SECRET: &[u8] = b"canary-hook-17";

@@ -706,7 +706,6 @@ fn row_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive, node_routing};
     use crate::s3::bucket::rename::tests::{BUCKET, group, put, rule, setup};
     use aruna_core::keyspaces::{
         BACKEND_INDEX_KEYSPACE, IMPORT_PATTERN_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -719,6 +718,7 @@ mod tests {
     };
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule};
+    use aruna_drivers::driver::{DriverContext, drive, node_routing};
     use std::time::SystemTime;
     use ulid::Ulid;
 

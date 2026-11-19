@@ -419,13 +419,13 @@ fn stored_time(value: Option<&Value>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
     use crate::tests::notifications::{context, record, temp_storage, user};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
     use aruna_core::storage_entries::inbox_update_entry;
     use aruna_core::structs::execution::notification::NotificationClass;
+    use aruna_drivers::driver::drive;
     use aruna_storage::StorageHandle;
 
     async fn upsert_with_report(

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::testing::write_entries;
 use aruna_core::UserId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
@@ -16,6 +15,7 @@ use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
 use aruna_core::task::TaskKey;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
@@ -241,7 +241,7 @@ async fn fence_rejects_create() {
     let config = activated_config(event.record.realm_id, &[node(1), node(2), node(3)]);
     let event = stamped(event, &config);
     store_realm_config(&storage, &config).await;
-    crate::driver::drive(
+    aruna_drivers::driver::drive(
         crate::placement::process_transitions::CloseFenceOperation::new(
             event.record.realm_id,
             event.record.placement,
@@ -528,7 +528,7 @@ async fn timer_for_marker() {
         .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
         .await;
 
-    let mut context = crate::testing::test_context(storage.clone());
+    let mut context = aruna_drivers::testing::test_context(storage.clone());
     context.task_handle = Some(task_handle.clone());
     drive(ProjectionTimerOperation::new(), &context)
         .await

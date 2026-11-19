@@ -12,7 +12,6 @@ use aruna_core::secrets::SecretFields;
 use serde_json::json;
 
 use super::*;
-use crate::driver::drive;
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::install::{pick_version, read_manifest};
@@ -26,6 +25,7 @@ use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugins::{Refusal, ReleaseError};
 use aruna_core::secrets::UseRule;
+use aruna_drivers::driver::drive;
 use ulid::Ulid;
 
 #[tokio::test]

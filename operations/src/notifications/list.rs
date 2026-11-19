@@ -141,11 +141,11 @@ impl Operation for ListNotificationsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
     use crate::tests::notifications::{context_with_storage, seed, user};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::execution::notification::{NotificationClass, notification_inbox_key};
+    use aruna_drivers::driver::drive;
     use ulid::Ulid;
 
     fn record(recipient: UserId, created_at_ms: u64) -> NotificationRecord {

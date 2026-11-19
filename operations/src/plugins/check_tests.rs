@@ -4,10 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::drive;
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
+use aruna_drivers::driver::drive;
 
 fn kind(result: Result<PluginInstall, CallError>) -> Option<ErrorKind> {
     result.err().map(|error| error.0.kind)

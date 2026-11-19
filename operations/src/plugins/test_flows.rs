@@ -13,7 +13,6 @@ pub mod cleanup {
 }
 
 pub mod decide {
-    use crate::driver::drive;
     use crate::plugins::runs::list_runs;
     use crate::plugins::test_support::Fixture;
     use crate::plugins::test_support::created;
@@ -21,6 +20,7 @@ pub mod decide {
     use aruna_core::plugin_runs::ForwardRow;
     use aruna_core::plugin_runs::PluginRun;
     use aruna_core::plugin_runs::SourceEvent;
+    use aruna_drivers::driver::drive;
 
     /// A created dataset journaled now, and its forward row for `install`.
     pub fn event(install: &PluginInstall, resource: &str, now: u64) -> (SourceEvent, ForwardRow) {
@@ -42,7 +42,6 @@ pub mod decide {
 }
 
 pub mod events {
-    use crate::driver::drive;
     use crate::plugins::calls::decide_batch;
     use crate::plugins::flow_support::matcher::config;
     use crate::plugins::runs::list_runs;
@@ -55,6 +54,7 @@ pub mod events {
     use aruna_core::plugin_runs::ForwardRow;
     use aruna_core::plugin_runs::RunTrigger;
     use aruna_core::plugin_runs::SourceEvent;
+    use aruna_drivers::driver::drive;
     use ulid::Ulid;
 
     /// A created dataset journaled at `at`, with its origin anchor there too.
@@ -99,7 +99,6 @@ pub mod events {
 }
 
 pub mod submit {
-    use crate::driver::DriverContext;
     use crate::plugins::submit::UploadRequest;
     use crate::plugins::test_support::Fixture;
     use crate::plugins::test_support::edit_config;
@@ -107,6 +106,7 @@ pub mod submit {
     use crate::plugins::work::RequestContext;
     use crate::testing_objects::seed_bucket;
     use aruna_core::plugin_installs::PluginInstall;
+    use aruna_drivers::driver::DriverContext;
     use ulid::Ulid;
 
     /// An install granted the group's data whose `catalog` connection injects the slot `api_key`.
@@ -158,9 +158,9 @@ pub mod submit {
         fixture: &Fixture,
         install: &PluginInstall,
     ) -> (tempfile::TempDir, DriverContext) {
-        use crate::driver::drive;
         use crate::s3::object::put::PutObjectOperation;
         use crate::testing_objects::{put_config, with_blob};
+        use aruna_drivers::driver::drive;
         let root = tempfile::tempdir().unwrap();
         let blob = with_blob(&fixture.ctx, root.path()).await;
         let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);

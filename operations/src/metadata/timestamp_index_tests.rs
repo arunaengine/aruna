@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{DriverContext, drive};
 use crate::metadata::repository::create_outbox_entries;
 use crate::metadata::timestamp_sweep::{SWEEP_SCAN_LIMIT, TimestampSweepOperation};
 use crate::metadata::updated_page::UpdatedPageOperation;
@@ -13,6 +12,7 @@ use aruna_core::handle::Handle;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::storage;
 use tempfile::tempdir;
 use ulid::Ulid;

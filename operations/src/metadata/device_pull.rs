@@ -1215,7 +1215,6 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
 
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::{ConversionError, StorageError};
@@ -1229,6 +1228,7 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
 

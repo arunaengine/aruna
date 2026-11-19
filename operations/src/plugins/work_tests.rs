@@ -10,8 +10,6 @@ use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 use super::*;
-use crate::driver::{DriverContext, drive};
-use crate::jobs::context::PayloadHandler;
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::page_call;
@@ -23,6 +21,8 @@ pub(crate) use crate::plugins::test_support::edit_work;
 use crate::plugins::test_support::installed;
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::jobs::context::PayloadHandler;
 
 const SOURCE: &str = "/realm/g/group/data/node/in/a.txt";
 const TARGET: &str = "/realm/g/group/data/node/out/a.txt";
@@ -61,7 +61,7 @@ struct WorkHolds;
 impl PayloadHandler for WorkHolds {
     fn run<'a>(
         &'a self,
-        _: &'a crate::jobs::context::JobContext,
+        _: &'a aruna_drivers::jobs::context::JobContext,
         _: &'a JobPayload,
     ) -> Option<futures_util::future::BoxFuture<'a, aruna_core::jobs::JobRunOutcome>> {
         None

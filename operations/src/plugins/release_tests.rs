@@ -141,8 +141,8 @@ async fn refusals_per_step() {
 
 #[tokio::test]
 async fn node_secrets_local() {
-    use crate::driver::drive;
     use crate::secrets::node::{NodeChange, NodeSecretOperation};
+    use aruna_drivers::driver::drive;
     let fixture = Fixture::keyed().await;
     fixture
         .ctx
@@ -220,7 +220,7 @@ async fn change_secret(
         now_ms: 10 + seed as u64,
         write_ids: [1, 2, 3].map(|part| Ulid::from_parts(80 + seed as u64, part)),
     };
-    crate::driver::drive(OwnerSecretOperation::new(input), &fixture.ctx)
+    aruna_drivers::driver::drive(OwnerSecretOperation::new(input), &fixture.ctx)
         .await
         .unwrap();
 }
