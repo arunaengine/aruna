@@ -161,7 +161,6 @@ mod pure_tests {
     use aruna_core::structs::identity::user::User;
     use aruna_core::types::{Key, Value};
     use std::collections::HashMap;
-    use ulid::Ulid;
 
     fn actor(realm_id: RealmId, user_id: UserId) -> Actor {
         Actor {
@@ -172,13 +171,7 @@ mod pure_tests {
     }
 
     fn user(realm_id: RealmId, seed: u8, name: &str) -> User {
-        User {
-            user_id: UserId::local(Ulid::from_bytes([seed; 16]), realm_id),
-            name: name.to_string(),
-            subject_ids: Vec::new(),
-            alias_user_ids: Default::default(),
-            attributes: Default::default(),
-        }
+        crate::tests::realm::named_user(realm_id, seed, name)
     }
 
     fn entry(user: &User) -> (Key, Value) {

@@ -35,7 +35,7 @@ use super::read::keep_status;
 
 use crate::device::replica::ReplicaOrigin;
 use aruna_core::metadata::{ProfileValidationCompleteness, ProfileValidationState};
-use aruna_core::structs::placement::record::{METADATA_HANDLE, PlacementStrategy};
+use aruna_core::structs::placement::record::METADATA_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 fn node(seed: u8) -> NodeId {
@@ -136,27 +136,7 @@ fn auth_policies_differ() {
 }
 
 fn config_and_placement() -> (RealmConfigDocument, PlacementRef) {
-    let mut config = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
-    let strategy = PlacementStrategy {
-        strategy_id: Ulid::from_bytes([4u8; 16]),
-        name: "default".to_string(),
-        replica_count: Some(2),
-        distinct_locations: false,
-        affinity: Vec::new(),
-        shard_count: 64,
-    };
-    config.default_strategy_id = Some(strategy.strategy_id);
-    config.strategies = vec![strategy.clone()];
-    for seed in 1..=4u8 {
-        config.ensure_node(node(seed), RealmNodeKind::Server);
-    }
-    (
-        config,
-        PlacementRef {
-            strategy_id: strategy.strategy_id,
-            shard: 9,
-        },
-    )
+    crate::tests::calls::placed_config()
 }
 
 #[test]

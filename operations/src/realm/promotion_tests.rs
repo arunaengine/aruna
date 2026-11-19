@@ -16,14 +16,7 @@ fn node(seed: u8) -> NodeId {
 
 /// Node 1 manages, node 2 serves, node 3 is a device.
 fn realm() -> (SigningKey, RealmId, RealmConfigDocument) {
-    let key = generate_signing_key();
-    let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
-    let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-    document.ensure_node(node(1), RealmNodeKind::Management);
-    document.ensure_node(node(2), RealmNodeKind::Server);
-    let owner = UserId::nil(realm_id);
-    document.ensure_node(node(3), RealmNodeKind::User { owner });
-    (key, realm_id, document)
+    crate::tests::realm::promotion_realm([node(1), node(2), node(3)])
 }
 
 fn pem(key: &SigningKey) -> RealmKeyPem {

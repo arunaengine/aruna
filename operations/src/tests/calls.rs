@@ -120,3 +120,29 @@ pub(crate) fn asked<T: Debug, E: Debug>(turn: Result<Next<T>, E>) -> (NodeId, st
     };
     (request.peer, request.timeout)
 }
+
+/// A realm config with nodes 1 to 4 as servers and a default strategy, and a placement in it.
+pub(crate) fn placed_config() -> (
+    RealmConfigDocument,
+    aruna_core::structs::placement::record::PlacementRef,
+) {
+    let mut config = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
+    let strategy = PlacementStrategy {
+        strategy_id: Ulid::from_bytes([4u8; 16]),
+        name: "default".to_string(),
+        replica_count: Some(2),
+        distinct_locations: false,
+        affinity: Vec::new(),
+        shard_count: 64,
+    };
+    config.default_strategy_id = Some(strategy.strategy_id);
+    config.strategies = vec![strategy.clone()];
+    for seed in 1..=4u8 {
+        config.ensure_node(node(seed), RealmNodeKind::Server);
+    }
+    let placement = aruna_core::structs::placement::record::PlacementRef {
+        strategy_id: strategy.strategy_id,
+        shard: 9,
+    };
+    (config, placement)
+}

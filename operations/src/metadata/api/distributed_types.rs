@@ -46,15 +46,7 @@ pub(super) fn record_object_result(
     span: &Span,
     result: &Result<SearchNodePage, MetadataReadError>,
 ) {
-    match result {
-        Ok(page) => {
-            span.record("result", "ok");
-            span.record("hit_count", page.hits.len() as u64);
-        }
-        Err(_) => {
-            span.record("result", "error");
-        }
-    }
+    super::distributed::record_hits(span, result.as_ref().ok().map(|page| page.hits.len()))
 }
 
 pub(super) fn record_preflight_node(
