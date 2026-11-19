@@ -50,10 +50,11 @@ fn single_server() -> RealmConfigDocument {
 fn nil_actor_skipped() {
     let realm_id = user(1, 2).realm_id;
     let mut emit = EmitWatchOperation::new(event(UserId::nil(realm_id)), node_id(1), Vec::new());
-    assert_eq!(emit.first(), Ok(Next::Done(())));
+    assert_eq!(emit.first(), Ok(Next::Done(true)));
 }
 
-/// Without the realm config only remote holders get the event; a failed forward only warns.
+/// Without the realm config only remote holders get the event; a holder not reached leaves it
+/// unsettled for a later run.
 #[test]
 fn remote_forward_only() {
     let holders = vec![node_id(1), node_id(2)];
@@ -66,7 +67,20 @@ fn remote_forward_only() {
     ));
     assert_eq!(emit.state, EmitState::Forward(node_id(2)));
     let failed = child::<NotificationTransportMessage, _>(Err(RemoteError("down".into())));
-    assert_eq!(emit.next(failed), Ok(Next::Done(())));
+    assert_eq!(emit.next(failed), Ok(Next::Done(false)));
+}
+
+/// A holder that refuses the event settles it: a refusal does not pass on a later run.
+#[test]
+fn refused_forward_settles() {
+    let holders = vec![node_id(2)];
+    let mut emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), holders);
+    emit.first().unwrap();
+    let unread = child::<RealmConfigDocument, _>(Err(GetConfigError::DocumentNotFound));
+    emit.next(unread).unwrap();
+    let refused = NotificationTransportMessage::Reject("not a holder".into());
+    let refused = child::<_, RemoteError>(Ok(refused));
+    assert_eq!(emit.next(refused), Ok(Next::Done(true)));
 }
 
 /// A matching watch held here makes this node a holder; the expansion's new records wake their
@@ -107,7 +121,7 @@ fn local_watch_expands() {
     assert!(matches!(emit.next(woken), Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(
         emit.next(child::<_, InterestError>(Ok(true))),
-        Ok(Next::Done(()))
+        Ok(Next::Done(true))
     );
 }
 
@@ -138,7 +152,7 @@ fn event_reads_holders() {
     );
     let found = holders_answer(Some((node_id(1), vec![node_id(2)])));
     assert!(matches!(emit.next(found), Ok(Next::Call(IoCall::Child(_)))));
-    assert_eq!(emit.next(child::<(), IoError>(Ok(()))), Ok(Next::Done(())));
+    assert_eq!(emit.next(child::<bool, IoError>(Ok(true))), Ok(Next::Done(true)));
 
     let mut failed = EmitEventOperation::new(event);
     failed.first().unwrap();
@@ -150,7 +164,7 @@ fn event_reads_holders() {
         got: "another",
     };
     assert_eq!(
-        failed.next(child::<(), IoError>(Err(error.clone()))),
+        failed.next(child::<bool, IoError>(Err(error.clone()))),
         Err(error)
     );
 }
@@ -160,7 +174,7 @@ fn event_reads_holders() {
 fn event_without_net() {
     let mut emit = EmitEventOperation::new(event(user(1, 2)));
     emit.first().unwrap();
-    assert_eq!(emit.next(holders_answer(None)), Ok(Next::Done(())));
+    assert_eq!(emit.next(holders_answer(None)), Ok(Next::Done(true)));
 
     let mut wrong = EmitEventOperation::new(event(user(1, 2)));
     wrong.first().unwrap();

@@ -1,9 +1,10 @@
 //! Emits the watch events producers queued as rows, oldest first, and deletes each row once its
-//! emission ran; a failed emission only warns, as it did when producers emitted themselves.
+//! emission settled; an emission that may pass later keeps its row for a rerun.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::WATCH_OUTBOX_KEYSPACE;
@@ -16,8 +17,10 @@ use super::origin::EmitEventOperation;
 
 /// Rows one page of the drain reads at most.
 pub(crate) const WATCH_DRAIN_PAGE: usize = 64;
+/// When the drain runs again after an emission that did not settle; its row waits until then.
+pub const WATCH_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-type Turn = Result<Next<()>, IoError>;
+type Turn = Result<Next<Option<Duration>>, IoError>;
 
 #[derive(Clone, Debug, PartialEq)]
 enum DrainStep {
@@ -26,14 +29,15 @@ enum DrainStep {
     Delete,
 }
 
-/// One drain run: every queued event is emitted and its row deleted, page by page, until the
-/// keyspace is empty. A row that does not decode is deleted without an emission.
+/// One drain run over every queued event, page by page: a settled emission deletes its row, one
+/// that may pass later keeps it for a rerun with the same event id, and an unreadable row goes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WatchDrainOperation {
     step: DrainStep,
     pending: VecDeque<(Key, Option<WatchEvent>)>,
     current: Option<Key>,
-    more: bool,
+    after: Option<Key>,
+    unsettled: bool,
 }
 
 impl Default for WatchDrainOperation {
@@ -48,7 +52,8 @@ impl WatchDrainOperation {
             step: DrainStep::Page,
             pending: VecDeque::new(),
             current: None,
-            more: false,
+            after: None,
+            unsettled: false,
         }
     }
 
@@ -57,16 +62,16 @@ impl WatchDrainOperation {
         Ok(Next::Call(IoCall::Page {
             space: WATCH_OUTBOX_KEYSPACE.to_string(),
             prefix: Key::from(Vec::new()),
-            after: None,
+            after: self.after.clone(),
             limit: WATCH_DRAIN_PAGE,
         }))
     }
 
     fn next_row(&mut self) -> Turn {
         let Some((key, event)) = self.pending.pop_front() else {
-            return match self.more {
-                true => self.read_page(),
-                false => Ok(Next::Done(())),
+            return match self.after {
+                Some(_) => self.read_page(),
+                None => Ok(Next::Done(self.unsettled.then_some(WATCH_RETRY_AFTER))),
             };
         };
         self.current = Some(key);
@@ -88,7 +93,7 @@ impl WatchDrainOperation {
 }
 
 impl Operation for WatchDrainOperation {
-    type Output = ();
+    type Output = Option<Duration>;
     type Error = IoError;
 
     fn first(&mut self) -> Turn {
@@ -99,7 +104,8 @@ impl Operation for WatchDrainOperation {
         match self.step {
             DrainStep::Page => {
                 let (rows, next) = result.page()?;
-                self.more = next.is_some();
+                // Rows kept for a rerun are passed: the next page starts after them.
+                self.after = next;
                 for (key, value) in rows {
                     let event = WatchEvent::from_bytes(value.as_ref())
                         .inspect_err(|error| warn!(%error, "Deleting an unreadable watch row"))
@@ -108,12 +114,17 @@ impl Operation for WatchDrainOperation {
                 }
                 self.next_row()
             }
-            DrainStep::Emit => {
-                if let Err(error) = result.child::<(), IoError>()? {
-                    warn!(%error, "A queued watch event could not be emitted");
+            DrainStep::Emit => match result.child::<bool, IoError>()? {
+                Ok(true) => self.delete(),
+                outcome => {
+                    if let Err(error) = outcome {
+                        warn!(%error, "A queued watch event could not be emitted");
+                    }
+                    self.unsettled = true;
+                    self.current = None;
+                    self.next_row()
                 }
-                self.delete()
-            }
+            },
             DrainStep::Delete => {
                 result.done()?;
                 self.next_row()
@@ -152,30 +163,36 @@ mod tests {
         assert!(matches!(drain.first(), Ok(Next::Call(IoCall::Page { .. }))));
         let emit = drain.next(page(vec![(key.clone(), value)], None));
         assert!(matches!(emit, Ok(Next::Call(IoCall::Child(_)))));
-        let emitted = IoResult::Child(ChildOutcome::new(Ok::<(), IoError>(())));
+        let emitted = IoResult::Child(ChildOutcome::new(Ok::<bool, IoError>(true)));
         let row = (WATCH_OUTBOX_KEYSPACE.to_string(), key);
         let delete = Ok(Next::Call(IoCall::Delete(vec![row])));
         assert_eq!(drain.next(emitted), delete);
-        assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(())));
+        assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(None)));
     }
 
-    // A failed emission still deletes its row, and a full page reads the next one.
+    // An emission that did not settle, or failed, keeps its row; the next page starts after it,
+    // and the run asks to run again.
     #[test]
-    fn failure_still_deletes() {
+    fn unsettled_keeps_row() {
         let (_, key, value) = watch_event_entry(&event()).unwrap();
         let mut drain = WatchDrainOperation::new();
         drain.first().unwrap();
+        let after = Key::from(vec![1]);
         drain
-            .next(page(vec![(key, value)], Some(Key::from(vec![1]))))
+            .next(page(vec![(key.clone(), value.clone())], Some(after.clone())))
             .unwrap();
-        let failed = Err::<(), IoError>(IoError::Unfinished);
+        let open = IoResult::Child(ChildOutcome::new(Ok::<bool, IoError>(false)));
+        let next_page = IoCall::Page {
+            space: WATCH_OUTBOX_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: Some(after),
+            limit: WATCH_DRAIN_PAGE,
+        };
+        assert_eq!(drain.next(open), Ok(Next::Call(next_page)));
+        drain.next(page(vec![(key, value)], None)).unwrap();
+        let failed = Err::<bool, IoError>(IoError::Unfinished);
         let failed = IoResult::Child(ChildOutcome::new(failed));
-        assert!(matches!(
-            drain.next(failed),
-            Ok(Next::Call(IoCall::Delete(_)))
-        ));
-        let more = drain.next(IoResult::Done);
-        assert!(matches!(more, Ok(Next::Call(IoCall::Page { .. }))));
+        assert_eq!(drain.next(failed), Ok(Next::Done(Some(WATCH_RETRY_AFTER))));
     }
 
     // An unreadable row is deleted without an emission.
