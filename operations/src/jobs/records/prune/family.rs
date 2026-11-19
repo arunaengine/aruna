@@ -18,12 +18,14 @@ use aruna_core::structs::execution::job::record_keys::{
 };
 use aruna_core::structs::execution::job::record_rows::{PendingRecord, from_bytes, to_bytes};
 use aruna_core::structs::execution::job::{
-    CLOCK_MARGIN_MS, FamilyTombstone, HoldReason, JobDeletes, JobFamilyId, JobFamilyRecord,
-    JobRecordEnvelope, JobWrites, LogicalJobState, NotRun, PruneInput, PruneVerdict, RETENTION_MS,
-    TOMBSTONE_RETENTION_MS, job_record_key, last_record_ms, pending_expired, prune_verdict,
+    CLOCK_MARGIN_MS, ExpiryReason, FamilyTombstone, HoldReason, JobDeletes, JobFamilyId,
+    JobFamilyRecord, JobRecordEnvelope, JobWrites, LogicalJobSpec, LogicalJobState, NotRun,
+    PruneInput, PruneVerdict, RETENTION_MS, TOMBSTONE_RETENTION_MS, job_record_key, last_record_ms,
+    pending_expired, prune_verdict,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Key, Value};
+use tracing::warn;
 use ulid::Ulid;
 
 use super::pages::PrunePagesOperation;
@@ -32,6 +34,7 @@ use super::{
     slot_of,
 };
 use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::cancel::PublishCancelOperation;
 use crate::jobs::lifecycle::closure::CloseLaunchesOperation;
 use crate::jobs::lifecycle::membership::{MembershipViewOperation, family_not_run};
 use crate::jobs::lifecycle::reservation::reservation_key;
@@ -39,6 +42,7 @@ use crate::jobs::lifecycle::witness_arm::{WitnessDeadline, deadline_index_key, d
 use crate::jobs::records::admit::MAX_PENDING_RECORDS;
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::reduce::reduce_family;
+use crate::jobs::route::JobRouteError;
 use crate::secrets::owner::WriterView;
 
 #[derive(Debug, PartialEq)]
@@ -54,6 +58,8 @@ enum FamilyStep {
     Outbox,
     Deadline,
     Commit(PruneStep),
+    /// The expiry cancel of an undecided family, published after its row moved.
+    Expiry(PruneStep),
 }
 
 /// One due row of one family: drop it when stale, continue an unfinished deletion, or decide.
@@ -73,6 +79,8 @@ pub struct PruneFamilyOperation {
     closed: BTreeSet<Ulid>,
     not_run: NotRun,
     local_work: bool,
+    /// The spec of a family that expired here, cancelled once its index row moved.
+    expiring: Option<Box<LogicalJobSpec>>,
     step: FamilyStep,
 }
 
@@ -94,6 +102,7 @@ impl PruneFamilyOperation {
             closed: BTreeSet::new(),
             not_run: NotRun::default(),
             local_work: false,
+            expiring: None,
             step: FamilyStep::Rows,
         }
     }
@@ -265,6 +274,15 @@ impl PruneFamilyOperation {
                     deadline_index_key(&self.family),
                 );
                 Ok(Next::Call(IoCall::Read(vec![row])))
+            }
+            // The cancel settles the family, so it is prunable once retention passed again.
+            PruneVerdict::Expire => {
+                self.expiring = (self.records.iter()).find_map(|envelope| match &envelope.record {
+                    JobFamilyRecord::Spec(spec) => Some(spec.clone()),
+                    _ => None,
+                });
+                let expired = std::mem::take(&mut self.expired);
+                self.moved(self.now_ms.saturating_add(RETENTION_MS), expired)
             }
             PruneVerdict::Held { reason, recheck_ms } => {
                 let later = match reason {
@@ -447,11 +465,30 @@ impl Operation for PruneFamilyOperation {
             }
             FamilyStep::Deadline => self.enter(result.value()?),
             FamilyStep::Commit(outcome) => match result.child::<bool, IoError>()? {
-                Ok(true) => Ok(Next::Done(outcome)),
+                Ok(true) => match self.expiring.take() {
+                    Some(spec) => {
+                        let reason = ExpiryReason::Retention;
+                        let cancel = PublishCancelOperation::expiry(
+                            *spec,
+                            reason,
+                            self.serving,
+                            self.now_ms,
+                        );
+                        self.step = FamilyStep::Expiry(outcome);
+                        Ok(Next::Call(IoCall::child(cancel)))
+                    }
+                    None => Ok(Next::Done(outcome)),
+                },
                 // The family was indexed again meanwhile; a later pass decides.
                 Ok(false) => Ok(Next::Done(PruneStep::Moved)),
                 Err(error) => Err(error.into()),
             },
+            FamilyStep::Expiry(outcome) => {
+                if let Err(error) = result.child::<(), JobRouteError>()? {
+                    warn!(error = %error, "Expiry cancel of an undecided family was not published");
+                }
+                Ok(Next::Done(outcome))
+            }
         }
     }
 }

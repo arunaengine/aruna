@@ -75,6 +75,8 @@ pub enum HoldReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PruneVerdict {
     Prunable,
+    /// Undecided, but every rule after the first holds: a holder cancels it with an expiry.
+    Expire,
     /// `recheck_ms` is the earliest time the reason can change by itself; `None` when another
     /// event must change it first.
     Held {
@@ -94,12 +96,34 @@ pub fn prune_verdict(input: &PruneInput<'_>) -> PruneVerdict {
         input.state,
         LogicalJobState::Succeeded | LogicalJobState::Failed | LogicalJobState::Cancelled
     );
-    if !settled && !input.not_run.family {
-        return held(HoldReason::Undecided, None);
+    let verdict = open_work(input);
+    match (settled || input.not_run.family, verdict) {
+        (true, verdict) => verdict,
+        (false, PruneVerdict::Prunable) => PruneVerdict::Expire,
+        (false, _) => held(HoldReason::Undecided, None),
     }
+}
+
+/// Whether every execution stopped and every launch was received or closed, both or not run.
+pub fn work_settled(
+    records: &[JobRecordEnvelope],
+    closed: &BTreeSet<Ulid>,
+    not_run: &NotRun,
+) -> bool {
+    open_item(records, closed, not_run, 0).is_none()
+}
+
+/// The first execution without a stop record or launch without a receipt or closure, with the
+/// time its launch closure is due.
+fn open_item(
+    records: &[JobRecordEnvelope],
+    closed: &BTreeSet<Ulid>,
+    not_run: &NotRun,
+    now_ms: u64,
+) -> Option<(HoldReason, Option<u64>)> {
     let mut stopped = BTreeSet::new();
     let mut received = BTreeSet::new();
-    for envelope in input.records {
+    for envelope in records {
         match &envelope.record {
             JobFamilyRecord::Stop(stop) => {
                 stopped.insert(stop.execution_id);
@@ -110,25 +134,35 @@ pub fn prune_verdict(input: &PruneInput<'_>) -> PruneVerdict {
             _ => {}
         }
     }
-    for envelope in input.records {
+    for envelope in records {
         match &envelope.record {
             JobFamilyRecord::Receipt(receipt)
                 if !stopped.contains(&receipt.execution_id)
-                    && !input.not_run.executions.contains(&receipt.execution_id) =>
+                    && !not_run.executions.contains(&receipt.execution_id) =>
             {
-                return held(HoldReason::Running(receipt.executor_node_id), None);
+                return Some((HoldReason::Running(receipt.executor_node_id), None));
             }
             JobFamilyRecord::Launch(launch)
                 if !received.contains(&launch.launch_id)
-                    && !input.closed.contains(&launch.launch_id)
-                    && !input.not_run.launches.contains(&launch.launch_id) =>
+                    && !closed.contains(&launch.launch_id)
+                    && !not_run.launches.contains(&launch.launch_id) =>
             {
                 let due = launch.closure_due();
-                let recheck = (due > input.now_ms).then_some(due);
-                return held(HoldReason::LaunchOpen(launch.target.node_id), recheck);
+                let recheck = (due > now_ms).then_some(due);
+                return Some((HoldReason::LaunchOpen(launch.target.node_id), recheck));
             }
             _ => {}
         }
+    }
+    None
+}
+
+/// Rules 2 to 6 and 8, the same for a decided family and for one that may expire.
+fn open_work(input: &PruneInput<'_>) -> PruneVerdict {
+    let held = |reason, recheck_ms| PruneVerdict::Held { reason, recheck_ms };
+    let open = open_item(input.records, input.closed, input.not_run, input.now_ms);
+    if let Some((reason, recheck)) = open {
+        return held(reason, recheck);
     }
     if input.local_work {
         return held(HoldReason::LocalWork, None);

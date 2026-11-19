@@ -11,8 +11,8 @@ use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    CancelAuthority, ExecutionClaim, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId,
-    JobProjection, JobRecordEnvelope, JobRecordKind, LogicalJobSpec, tagged,
+    CancelAuthority, ExecutionClaim, ExpiryReason, JobCancelRecord, JobFamilyId, JobFamilyRecord,
+    JobId, JobProjection, JobRecordEnvelope, JobRecordKind, LogicalJobSpec, tagged,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -258,6 +258,19 @@ impl PublishCancelOperation {
         }
     }
 
+    /// Cancels a family without an outcome in the submitter's name. Only a holder does; another
+    /// node publishes nothing.
+    pub fn expiry(
+        spec: LogicalJobSpec,
+        reason: ExpiryReason,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        let auth = AuthContext::new(spec.created_by, spec.realm_id);
+        let authority = CancelAuthority::Expiry(reason);
+        Self::new(spec, &auth, authority, serving, now_ms)
+    }
+
     fn node(
         &self,
     ) -> Result<(NodeId, aruna_core::structs::identity::realm::RealmId), JobRouteError> {
@@ -275,6 +288,9 @@ impl PublishCancelOperation {
             .ok_or_else(|| unavailable("job family holder view unavailable"))?;
         if view.holds(local) {
             return self.sign();
+        }
+        if matches!(self.authority, CancelAuthority::Expiry(_)) {
+            return Ok(Next::Done(()));
         }
         // A forwarded cancel names no deletion, so only a holder records one.
         if self.authority == CancelAuthority::Deletion {
@@ -816,6 +832,32 @@ mod tests {
             outsider.next(config(&family)),
             Err(JobRouteError::Unavailable(_))
         ));
+    }
+
+    // An expiry is signed by a holder in the submitter's name; any other node publishes nothing.
+    #[test]
+    fn expiry_names_submitter() {
+        let family = Family::new([1; 32]);
+        let spec = family.spec();
+        let reason = ExpiryReason::Retention;
+        let serving = Some((node(1), REALM));
+        let mut holder = PublishCancelOperation::expiry(spec.clone(), reason, serving, 5);
+        holder.first().expect("the config is read");
+        let next = holder.next(config(&family));
+        let Ok(Next::Call(IoCall::Effect(effect))) = &next else {
+            panic!("{next:?}");
+        };
+        let Effect::Net(NetEffect::ExecutionSign(claim)) = effect.as_ref() else {
+            panic!("not a signing effect: {effect:?}");
+        };
+        let JobFamilyRecord::Cancel(record) = &claim.record else {
+            panic!("not a cancel record");
+        };
+        let named = (record.requested_by, record.authority);
+        assert_eq!(named, (spec.created_by, CancelAuthority::Expiry(reason)));
+        let mut outsider = PublishCancelOperation::expiry(spec, reason, Some((node(9), REALM)), 5);
+        outsider.first().expect("the config is read");
+        assert_eq!(outsider.next(config(&family)), Ok(Next::Done(())));
     }
 
     // A forwarded cancel tries the next holder until one answers for the family.

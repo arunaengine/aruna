@@ -2340,7 +2340,7 @@ fn prunes_settled_family() {
 
     let held = |input: PruneInput<'_>| match prune_verdict(&input) {
         PruneVerdict::Held { reason, .. } => reason,
-        PruneVerdict::Prunable => panic!("held family was prunable"),
+        verdict => panic!("held family was {verdict:?}"),
     };
     assert_eq!(
         held(PruneInput {
@@ -2384,7 +2384,13 @@ fn prunes_settled_family() {
             now_ms: u64::MAX,
             ..input
         };
-        assert_eq!(held(undecided), HoldReason::Undecided, "{state:?}");
+        // Without an outcome but with every other rule met, the family expires instead.
+        assert_eq!(prune_verdict(&undecided), PruneVerdict::Expire, "{state:?}");
+        let working = PruneInput {
+            local_work: true,
+            ..undecided
+        };
+        assert_eq!(held(working), HoldReason::Undecided, "{state:?}");
     }
 }
 

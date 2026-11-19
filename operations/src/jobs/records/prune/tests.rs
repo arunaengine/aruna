@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use aruna_core::calls::ChildOutcome;
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_RECORD_KEYSPACE, FAMILY_TOMBSTONE_KEYSPACE,
@@ -10,12 +12,17 @@ use aruna_core::keyspaces::{
 use aruna_core::structs::execution::job::record_keys::{alias_key, family_prefix, prune_rows_at};
 use aruna_core::structs::execution::job::record_rows::to_bytes;
 use aruna_core::structs::execution::job::{
-    FamilyTombstone, JobId, JobRecordEnvelope, SubmissionId,
+    ExpiryReason, FamilyTombstone, JobId, JobRecordEnvelope, PhysicalExecutionState, RETENTION_MS,
+    SubmissionId,
 };
 use aruna_core::types::Key;
+use ulid::Ulid;
 
 use super::*;
+use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::cancel::PublishCancelOperation;
 use crate::jobs::records::family::FamilyReadError;
+use crate::jobs::route::JobRouteError;
 
 fn family() -> JobFamilyId {
     JobFamilyId {
@@ -197,6 +204,42 @@ fn tombstone_expires_late() {
     ));
     let expired = commit_call(true, gone, Vec::new());
     assert_eq!(after_tombstone(&tombstone, expiry), expired);
+}
+
+// An undecided family whose work all settled moves a retention later and is cancelled with an
+// expiry once its row moved.
+#[test]
+fn undecided_family_expires() {
+    let fixture = crate::tests::records::Family::new([48u8; 32]);
+    let spec = fixture.spec();
+    let records = fixture.run(1, 0, PhysicalExecutionState::Failed)[..2].to_vec();
+    let now = spec.created_at_ms + 2 * RETENTION_MS;
+    let mut prune = PruneFamilyOperation::new(fixture.family(), 7, None);
+    prune.stamp(now);
+    prune.first().unwrap();
+    prune.next(IoResult::Values(vec![slot(7), None])).unwrap();
+    prune
+        .next(child(Ok::<_, FamilyReadError>(records)))
+        .unwrap();
+    let closures = prune.next(empty_page()).unwrap();
+    assert!(matches!(closures, Next::Call(IoCall::Child(_))));
+    let closed = child(Ok::<_, LifecycleError>(BTreeSet::<Ulid>::new()));
+    prune.next(closed).unwrap();
+    let due = vec![(
+        FAMILY_PRUNE_KEYSPACE.to_string(),
+        prune_due_key(7, &fixture.family()),
+    )];
+    let later = prune_rows_at(&fixture.family(), now + RETENTION_MS).to_vec();
+    let moved = PruneCommitOperation::new(Some((fixture.family(), 7)), due, later);
+    assert_eq!(
+        prune.next(empty_page()),
+        Ok(Next::Call(IoCall::child(moved)))
+    );
+    let cancel = PublishCancelOperation::expiry(spec, ExpiryReason::Retention, None, now);
+    let asked = prune.next(child(Ok::<_, IoError>(true)));
+    assert_eq!(asked, Ok(Next::Call(IoCall::child(cancel))));
+    let published = child(Ok::<_, JobRouteError>(()));
+    assert_eq!(prune.next(published), Ok(Next::Done(PruneStep::Moved)));
 }
 
 // The pass stops at the first row that is not due yet and reports when it is.
