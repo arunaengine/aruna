@@ -15,6 +15,7 @@ use aruna_core::alpn::{ADMISSION_CLOSE, MEMBERSHIP_CLOSE};
 use aruna_core::auth::revocation_live;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
+use aruna_core::entropy::shuffle;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::keyspaces::{
@@ -31,7 +32,6 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, KeySpace, Value};
-use rand::seq::SliceRandom;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -301,6 +301,7 @@ pub struct FetchDocumentsOperation {
     asked: Option<NodeId>,
     selection: Selection,
     installed: bool,
+    entropy: u128,
 }
 
 type Fetching = Result<Next<bool>, IoError>;
@@ -338,6 +339,7 @@ impl FetchDocumentsOperation {
             asked: None,
             selection: Selection::default(),
             installed: false,
+            entropy: 0,
         }
     }
 
@@ -364,7 +366,7 @@ impl FetchDocumentsOperation {
             return Ok(Next::Done(false));
         };
         let mut peers = realm_peers(&config, node_id);
-        peers.shuffle(&mut rand::rng());
+        shuffle(&mut peers, self.entropy);
         self.start(owner, peers)
     }
 
@@ -509,6 +511,10 @@ fn marker_of(row: Option<Value>) -> RealmMarker {
 impl Operation for FetchDocumentsOperation {
     type Output = bool;
     type Error = IoError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.entropy = entropy;
+    }
 
     fn first(&mut self) -> Fetching {
         let Some((_, realm_id)) = self.ids else {
