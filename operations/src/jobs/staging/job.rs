@@ -28,7 +28,7 @@ use super::{
 use crate::connectors::get_connector::{
     GetSourceError, GetSourceInput, GetSourceOperation, GetSourceResult,
 };
-use crate::jobs::executor::JobRunOutcome;
+use aruna_core::jobs::JobRunOutcome;
 
 #[derive(Debug, PartialEq)]
 enum Step {

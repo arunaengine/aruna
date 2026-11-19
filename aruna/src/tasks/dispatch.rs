@@ -11,9 +11,9 @@ use aruna_core::structs::execution::job::{JobError, JobPayload, JobResultPayload
 use aruna_core::time::unix_timestamp_millis;
 
 use super::job_host::{run_backend_import, run_hosted, run_staging_job, run_storage_purge};
+use aruna_core::jobs::JobRunOutcome;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::context::JobContext;
-use aruna_operations::jobs::executor::JobRunOutcome;
 use aruna_operations::jobs::persistent_id::{MintPidOperation, RegisterIdentifiersOperation};
 use aruna_operations::notifications::email_job::EmailJobOperation;
 use aruna_operations::notifications::settings::{BACKOFF_START_MS, DeliveryOutcome};

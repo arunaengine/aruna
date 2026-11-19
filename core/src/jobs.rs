@@ -1,4 +1,5 @@
-//! Defines the job control request and response verbs and the wire records they carry.
+//! Defines the job control request and response verbs, the wire records they carry, and the
+//! outcome and progress reporter of a job run.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -6,8 +7,10 @@ use std::any::Any;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
-use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Poll, Waker};
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -668,4 +671,124 @@ pub enum JobEvent {
         result: Result<u64, ZipFailure>,
     },
     ZipClosed(Result<(), String>),
+}
+
+/// In-memory progress with a persisted snapshot taken on flush and lease renew.
+#[derive(Clone)]
+pub struct ProgressReporter {
+    inner: Arc<ProgressInner>,
+}
+
+struct ProgressInner {
+    current: AtomicU64,
+    total: Mutex<Option<u64>>,
+    unit: String,
+    pause: Mutex<Option<SystemTime>>,
+    /// Set once this execution committed a resumable checkpoint.
+    checkpointed: AtomicBool,
+    /// Set by a committed checkpoint until the heartbeat persists its progress.
+    flush: AtomicBool,
+    /// The heartbeat waiting in `flush_requested`, woken by a checkpoint.
+    waker: Mutex<Option<Waker>>,
+}
+
+impl ProgressReporter {
+    pub fn from_progress(progress: &JobProgress) -> Self {
+        Self {
+            inner: Arc::new(ProgressInner {
+                current: AtomicU64::new(progress.current),
+                total: Mutex::new(progress.total),
+                unit: progress.unit.clone(),
+                pause: Mutex::new(None),
+                checkpointed: AtomicBool::new(false),
+                flush: AtomicBool::new(false),
+                waker: Mutex::new(None),
+            }),
+        }
+    }
+
+    pub fn set_total(&self, total: u64) {
+        *self.inner.total.lock().expect("progress mutex poisoned") = Some(total);
+    }
+
+    pub fn set_current(&self, current: u64) {
+        self.inner.current.store(current, Ordering::Relaxed);
+    }
+
+    /// Records the end of a pause a source asked for, `None` once the job goes on.
+    pub fn set_pause(&self, until: Option<SystemTime>) {
+        *self
+            .inner
+            .pause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = until;
+    }
+
+    pub fn advance(&self, delta: u64) {
+        self.inner.current.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    /// Records that a durable checkpoint advanced, so a later transient failure costs no attempt.
+    pub fn checkpoint(&self) {
+        self.inner.checkpointed.store(true, Ordering::Relaxed);
+        self.inner.flush.store(true, Ordering::SeqCst);
+        let waker = (self.inner.waker.lock())
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Completes once a checkpoint asked for its progress to be persisted. A request that
+    /// nobody waited for completes the next call at once.
+    pub fn flush_requested(&self) -> impl std::future::Future<Output = ()> + '_ {
+        std::future::poll_fn(move |cx| {
+            if self.inner.flush.swap(false, Ordering::SeqCst) {
+                return Poll::Ready(());
+            }
+            *(self.inner.waker.lock()).unwrap_or_else(PoisonError::into_inner) =
+                Some(cx.waker().clone());
+            // A checkpoint between the first check and the stored waker woke nobody.
+            match self.inner.flush.swap(false, Ordering::SeqCst) {
+                true => Poll::Ready(()),
+                false => Poll::Pending,
+            }
+        })
+    }
+
+    pub fn checkpointed(&self) -> bool {
+        self.inner.checkpointed.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot(&self) -> JobProgress {
+        JobProgress {
+            current: self.inner.current.load(Ordering::Relaxed),
+            total: *self.inner.total.lock().expect("progress mutex poisoned"),
+            unit: self.inner.unit.clone(),
+            paused_until: *self
+                .inner
+                .pause
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum JobRunOutcome {
+    Succeeded(JobResultPayload),
+    Failed(JobError),
+    /// A dependency such as metadata projection is not readable yet. The
+    /// runtime requeues without incrementing the bounded execution attempts.
+    Deferred(JobError),
+    /// Like `Deferred`, but runs again only after the given delay.
+    DeferredFor(JobError, Duration),
+    Cancelled,
+    Interrupted,
+    /// Needs these locked bucket keys; the runtime parks the job without spending an attempt.
+    AwaitingKey(Vec<KeyWait>),
+    /// The outcome cannot be known and the effect must not run again: the job ends
+    /// `Indeterminate` and locally exhausted, never `Failed`.
+    Undecided(JobError),
 }

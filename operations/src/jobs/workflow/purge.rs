@@ -26,7 +26,6 @@ use aruna_core::structs::storage::storage_purge::{
 use aruna_core::types::Key;
 use ulid::Ulid;
 
-use super::super::executor::JobRunOutcome;
 use super::super::store::job_calls::{RenewOutcome, flush_progress, put_purge_checkpoint};
 use super::super::store::mutation_error::JobMutationError;
 use super::super::store::row_calls::read_purge_checkpoint;
@@ -54,6 +53,7 @@ use crate::s3::object::versions::{
     ListVersionsResult,
 };
 use crate::s3::purge_fence::PurgeFenceError;
+use aruna_core::jobs::JobRunOutcome;
 
 const PURGE_BATCH_SIZE: usize = 1_000;
 /// How often a paused purge looks whether it was resumed.

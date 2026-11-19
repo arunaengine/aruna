@@ -5,7 +5,6 @@
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::jobs::context::JobContext;
-use crate::jobs::executor::ProgressReporter;
 use crate::jobs::export::ExportFailure;
 use crate::jobs::export::archive::recognize_entities;
 use crate::jobs::export::open::OpenCandidateOperation;
@@ -20,6 +19,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
 use aruna_core::events::StorageEvent;
 use aruna_core::id::NodeId;
+use aruna_core::jobs::ProgressReporter;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};

@@ -12,6 +12,7 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     GROUP_KEYSPACE, IMPORT_INTENT_KEYSPACE, REALM_CONFIG_KEYSPACE,
@@ -50,7 +51,6 @@ use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::jobs::context::JobContext;
-use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;

@@ -19,10 +19,10 @@ use aruna_core::structs::execution::job::JobResultPayload;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use aruna_core::jobs::JobRunOutcome;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::context::JobContext;
-use aruna_operations::jobs::executor::JobRunOutcome;
 
 // A job cancelled or shut down while its source's `Retry-After` pauses it ends with that stop,
 // not with a failed attempt.

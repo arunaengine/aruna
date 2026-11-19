@@ -30,7 +30,7 @@ use ulid::Ulid;
 use super::JobScope;
 #[cfg(test)]
 use super::invenio::Session;
-use crate::jobs::executor::ProgressReporter;
+use aruna_core::jobs::ProgressReporter;
 
 pub const NOW_MS: u64 = 1_700_000_000_000;
 

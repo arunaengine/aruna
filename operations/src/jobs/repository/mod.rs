@@ -17,7 +17,7 @@ use ulid::Ulid;
 
 use crate::harvest::read_connector::ConnectorView;
 
-use super::executor::ProgressReporter;
+use aruna_core::jobs::ProgressReporter;
 
 pub mod check;
 pub mod connector;

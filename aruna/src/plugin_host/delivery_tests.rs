@@ -5,6 +5,7 @@
 use crate::plugin_host::plugin_work::run_plugin_work;
 use crate::plugin_host::worker::Worker;
 use crate::plugin_host::worker::tests::worker_on;
+use aruna_core::jobs::JobRunOutcome;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::PluginRun;
 use aruna_core::plugin_runs::RunState;
@@ -18,7 +19,6 @@ use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::driver::drive;
-use aruna_operations::jobs::executor::JobRunOutcome;
 use aruna_operations::jobs::store::row_calls;
 use aruna_operations::plugins::calls::notify_work;
 use aruna_operations::plugins::calls::read_config;

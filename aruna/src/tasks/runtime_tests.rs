@@ -11,6 +11,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
 use aruna_core::heartbeat::RunningJobs;
 use aruna_core::id::NodeId;
+use aruna_core::jobs::ProgressReporter;
 use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::{
     AttemptIntent, JobClaim, JobExecutionClass, JobId, JobPayload, JobRecord, JobResultPayload,
@@ -20,7 +21,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::context::ExternalReconciler;
-use aruna_operations::jobs::executor::{ProgressReporter, RangeTurns};
+use aruna_operations::jobs::executor::RangeTurns;
 use aruna_operations::jobs::runtime::*;
 use aruna_operations::jobs::runtime_steps::requeue_call;
 use aruna_operations::jobs::store::JobMutation;

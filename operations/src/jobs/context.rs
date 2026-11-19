@@ -11,7 +11,8 @@ use futures_util::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
 use crate::driver::DriverContext;
-use crate::jobs::executor::{JobRunOutcome, ProgressReporter, RangeTurns};
+use crate::jobs::executor::RangeTurns;
+use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 
 pub struct JobContext {
     pub driver: Arc<DriverContext>,

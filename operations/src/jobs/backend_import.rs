@@ -41,7 +41,6 @@ use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use ulid::Ulid;
 
-use super::executor::JobRunOutcome;
 use super::page_intents::PathIntents;
 use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
@@ -50,6 +49,7 @@ use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, RuleScan, intent_keys,
 };
 use crate::s3::purge_fence::PurgeFenceError;
+use aruna_core::jobs::JobRunOutcome;
 
 /// What every operation of one import job knows about its run.
 #[derive(Clone, Debug, PartialEq)]

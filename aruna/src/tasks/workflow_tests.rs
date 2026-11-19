@@ -14,6 +14,7 @@ use aruna_core::compute::{
     ExecutorKind, FenceContext, LogLimits, LogTails, NOBODY, NetworkAccess, ReconcileEvidence,
     ResumePoint, StagingMode, TaskOutput, TaskSpec, UserSpec,
 };
+use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 use aruna_core::structs::execution::job::{
     AttemptIntent, ExecutionSpec, JobError, JobErrorKind, JobId, JobPayload, JobRecord,
     JobResultPayload, JobState, MAX_MESSAGE_BYTES, OutputDestination, OutputSelection,
@@ -26,7 +27,6 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::effect_adapters::job::with_job_host;
 use aruna_operations::jobs::context::JobContext;
-use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::jobs::store::test_calls::{
     begin_external_running, claim_job, handoff_external_attempt, insert_job, mutate_job,

@@ -13,10 +13,10 @@ use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdFailure, PersistentIdMapping};
 use ulid::Ulid;
 
-use crate::jobs::executor::JobRunOutcome;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::persistent_id::forward::{PidNode, PidRouteOperation, outcome_mapping};
 use crate::metadata::protocol::{PersistentIdOutcome, PersistentIdRequest};
+use aruna_core::jobs::JobRunOutcome;
 
 /// How long identifier registration waits for a missing mapping without using attempts.
 const IDENTIFIER_WAIT_MS: u64 = 600_000;

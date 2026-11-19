@@ -12,11 +12,11 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::storage::blob::UserAccess;
 use ulid::Ulid;
 
-use super::super::executor::JobRunOutcome;
 use super::super::store::job_calls::{authorize_cleanup, record_attempt_tombstone};
 use super::super::store::mutation_error::JobMutationError;
 use super::compute::{attempt_call, compute_answer};
 use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
+use aruna_core::jobs::JobRunOutcome;
 
 #[derive(Debug, PartialEq)]
 enum CleanupStep {
@@ -302,11 +302,11 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::context::JobContext;
-    use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::test_calls::{insert_job, record_attempt_intent};
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;
+    use aruna_core::jobs::ProgressReporter;
 
     async fn run_terminal_cleanup(
         ctx: &JobContext,

@@ -25,11 +25,11 @@ use super::{
     validation_message,
 };
 use crate::federation::import::{ConfirmSourceOperation, ImportError};
-use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::run_rows::{
     ReadStateOperation, SettledRowsOperation, StateReadError, job_state_key, state_row,
 };
 use crate::jobs::store::mutation_error::JobMutationError;
+use aruna_core::jobs::JobRunOutcome;
 
 /// A runner failure of the import job; its checkpoint stays for the next attempt.
 #[derive(Debug, PartialEq, thiserror::Error)]

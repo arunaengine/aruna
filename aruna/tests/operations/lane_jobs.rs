@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::jobs::JobRunOutcome;
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_operations::jobs::context::JobContext;
-use aruna_operations::jobs::executor::JobRunOutcome;
 use aruna_operations::jobs::staging::lanes::LANE_ROWS;
 use aruna_operations::jobs::staging::lanes::parse_lanes;
 use aruna_operations::tests::staging::spec;
@@ -89,8 +89,8 @@ async fn prefix_split_lanes() {
 // A file the submitter may not write fails alone; the rest of its page registers.
 #[tokio::test]
 async fn denied_file_counted() {
+    use aruna_core::jobs::JobRunOutcome;
     use aruna_core::structs::execution::job::JobResultPayload;
-    use aruna_operations::jobs::executor::JobRunOutcome;
     let keys = (0..20).map(|index| format!("a/{index:04}")).collect();
     let (endpoint, server) = s3_listing(keys).await;
     let (ctx, spec, _dir) = job_context(endpoint, &[("a", "ta")], Some("ta/0007")).await;
@@ -124,6 +124,7 @@ async fn job_context(
     prefixes: &[(&str, &str)],
     denied: Option<&str>,
 ) -> (JobContext, StagingJobSpec, tempfile::TempDir) {
+    use aruna_core::jobs::ProgressReporter;
     use aruna_core::structs::execution::job::{JobClaim, JobPayload, JobProgress, JobRecord};
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::blob::object_permission_path;
@@ -131,7 +132,6 @@ async fn job_context(
         SourceConnectorInput, SourceConnectorOperation,
     };
     use aruna_operations::driver::drive;
-    use aruna_operations::jobs::executor::ProgressReporter;
     use aruna_operations::tests::staging::{create_test_bucket, setup_driver_context};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
@@ -201,10 +201,10 @@ async fn job_context(
 /// checking that each one has a head and no lane row is left.
 async fn import(keys: Vec<String>, prefixes: &[(&str, &str)]) -> u64 {
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::jobs::JobRunOutcome;
     use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
     use aruna_core::structs::execution::job::JobResultPayload;
     use aruna_core::structs::storage::blob::BlobHeadKey;
-    use aruna_operations::jobs::executor::JobRunOutcome;
 
     let (endpoint, server) = s3_listing(keys.clone()).await;
     let (ctx, spec, _dir) = job_context(endpoint, prefixes, None).await;

@@ -14,10 +14,11 @@ use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::executor::{ProgressReporter, RangeTurns};
+use super::executor::RangeTurns;
 use super::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
 use crate::jobs::context::ExternalReconciler;
 use crate::jobs::context::PayloadHandler;
+use aruna_core::jobs::ProgressReporter;
 
 struct RunningJob {
     /// Per-execution identity: a re-spawned job at the same id gets a fresh nonce so a
