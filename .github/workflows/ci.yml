@@ -95,6 +95,13 @@ jobs:
           cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --profile ci --partition hash:${{ matrix.shard }}/4
 
+      # The node's Docker cases are ignored by default; this runner has a daemon.
+      - name: Run the node Docker cases
+        run: >-
+          cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
+          -E 'package(aruna) & binary(integration) & test(/^(compute_execution|mcp_artifacts)::/)'
+
       - name: Upload JUnit report
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -336,8 +343,6 @@ jobs:
     runs-on: ubuntu-latest
     # Hang cap for the daemon-backed compute suite, not a performance budget.
     timeout-minutes: 60
-    env:
-      ARUNA_COMPUTE_REQUIRE_DOCKER: "1"
 
     steps:
       - name: Check out repository
@@ -346,8 +351,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
 
-      # A required daemon job must fail when Docker is unavailable instead of
-      # letting the ignored cases skip past a broken environment.
+      # Fails early with a clear message when Docker is unavailable; the cases fail without it too.
       - name: Require the Docker daemon
         run: docker info >/dev/null
 
