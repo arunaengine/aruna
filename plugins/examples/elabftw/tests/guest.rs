@@ -18,12 +18,14 @@ use aruna_plugin_types::calls::{
 use aruna_plugin_types::manifest::SettingKind;
 use aruna_plugin_types::permission::Permission;
 use aruna_plugin_types::trigger::TriggerKind;
+use aruna_plugins::CancellationToken;
 use aruna_plugins::broker::{
     Broker, CallContext, FileChange, MetadataCreate, MetadataPatch, SendRequest, StatePut,
 };
+use aruna_plugins::host::wit::aruna::plugin::types::{Trigger, WatchEvent};
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::package::{load_manifest, package};
-use aruna_plugins::{CancellationToken, Compiled, Invocation, Runtime, Trigger, WatchEvent};
+use aruna_plugins::runtime::{Compiled, Invocation, Runtime};
 use elabftw_sync::host::{Fault, Host, Kind, Method, Request};
 use serde_json::{Value, json};
 use support::{BUCKET, START, World};

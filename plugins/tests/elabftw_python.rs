@@ -16,12 +16,14 @@ use aruna_plugin_types::calls::{
     ObjectPage, Response,
 };
 use aruna_plugin_types::permission::Permission;
+use aruna_plugins::CancellationToken;
 use aruna_plugins::broker::{
     Broker, CallContext, MetadataCreate, MetadataPatch, SendRequest, StatePut,
 };
+use aruna_plugins::host::wit::aruna::plugin::types::Trigger;
 use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
-use aruna_plugins::{CancellationToken, Invocation, Runtime, Trigger};
+use aruna_plugins::runtime::{Invocation, Runtime};
 use common::{limits, require};
 
 mod common;
