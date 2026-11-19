@@ -480,10 +480,134 @@ fn screens_session_support() {
     open.network = NetworkAccess::Open;
     let outcome = plan(
         &open,
-        vec![candidate(target, "docker")],
+        vec![candidate(target, "kubernetes")],
         &config(Vec::new()),
     );
     assert!(outcome.selected.is_some());
+
+    // A Docker backend without the channel runs on a remote daemon, which has no session
+    // bridge for any session, open network included.
+    let outcome = plan(
+        &open,
+        vec![candidate(target, "docker")],
+        &config(Vec::new()),
+    );
+    assert!(outcome.selected.is_none());
+    assert_eq!(verdict(&outcome, target), RejectionVerdict::Session);
+}
+
+#[test]
+fn screens_backend_limits() {
+    // A walltime above the backend maximum and a workload kind the backend refuses leave the
+    // scan; the kind defaults refuse sessions on Slurm and Apptainer.
+    use crate::compute::backend::Suitability;
+    let target = node(2);
+    let screened = |request: &PlanRequest, candidate: TargetCandidate| {
+        let outcome = plan(request, vec![candidate], &config(Vec::new()));
+        outcome
+            .selected
+            .is_none()
+            .then(|| verdict(&outcome, target))
+    };
+    let batch = request(Vec::new());
+    let walltime = batch.resources.max_walltime_ms;
+
+    let mut bounded = candidate(target, "slurm");
+    bounded.capability.max_walltime_ms = Some(walltime - 1);
+    assert_eq!(
+        screened(&batch, bounded.clone()),
+        Some(RejectionVerdict::WalltimeLimit)
+    );
+    bounded.capability.max_walltime_ms = Some(walltime);
+    assert_eq!(screened(&batch, bounded), None);
+
+    let mut session = batch.clone();
+    session.session = true;
+    session.network = NetworkAccess::Open;
+    for kind in ["slurm", "apptainer"] {
+        assert_eq!(
+            screened(&session, candidate(target, kind)),
+            Some(RejectionVerdict::Unsuitable),
+            "{kind}"
+        );
+    }
+    assert_eq!(screened(&session, candidate(target, "kubernetes")), None);
+
+    let mut refusing = candidate(target, "kubernetes");
+    refusing.capability.suitability.batch = Suitability::Refused;
+    assert_eq!(
+        screened(&batch, refusing),
+        Some(RejectionVerdict::Unsuitable)
+    );
+}
+
+#[test]
+fn screens_group_allowance() {
+    // A backend's allow-list admits only the groups it names; an empty list admits every group,
+    // and an advertisement naming more than the bound is never trusted.
+    use crate::compute::MAX_BACKEND_GROUPS;
+    let target = node(2);
+    let batch = request(Vec::new());
+    let screened = |candidate: TargetCandidate| {
+        let outcome = plan(&batch, vec![candidate], &config(Vec::new()));
+        outcome
+            .selected
+            .is_none()
+            .then(|| verdict(&outcome, target))
+    };
+    let mut limited = candidate(target, "slurm");
+    limited.capability.groups = vec![ulid::Ulid::from_bytes([9u8; 16])];
+    assert_eq!(
+        screened(limited.clone()),
+        Some(RejectionVerdict::GroupNotAllowed)
+    );
+    limited.capability.groups.push(batch.group_id);
+    assert_eq!(screened(limited.clone()), None);
+    assert_eq!(screened(candidate(target, "slurm")), None);
+
+    limited.capability.groups = (0..=MAX_BACKEND_GROUPS as u128)
+        .map(ulid::Ulid::from)
+        .collect();
+    assert!(limited.capability.validate(target).is_err());
+}
+
+#[test]
+fn screens_backend_name() {
+    // A request that names a backend takes it over another of the same kind; a kind and a
+    // name that disagree reject every candidate; an unknown name ends the plan, retryable
+    // only when the round was incomplete; and the name alone changes the plan digest.
+    let target = node(2);
+    let compute = config(Vec::new());
+    let mut lab = candidate(target, "docker");
+    lab.capability.backend = "lab".to_string();
+    let scan = vec![candidate(target, "docker"), lab.clone()];
+    let mut named = request(Vec::new());
+    named.backend = Some("lab".to_string());
+    assert_eq!(
+        selected(&named, scan.clone(), &compute).target.backend,
+        "lab"
+    );
+
+    let mut conflicting = named.clone();
+    conflicting.executor_constraint = Some("slurm".to_string());
+    assert!(
+        plan(&conflicting, scan.clone(), &compute)
+            .selected
+            .is_none()
+    );
+
+    let mut unknown = request(Vec::new());
+    unknown.backend = Some("missing".to_string());
+    let outcome = plan(&unknown, scan.clone(), &compute);
+    assert!(outcome.selected.is_none() && !outcome.retryable);
+    assert_eq!(verdict(&outcome, target), RejectionVerdict::BackendName);
+    assert!(paged(&unknown, &scan, &compute).finish(true).retryable);
+
+    let only = vec![lab];
+    assert_ne!(
+        selected(&named, only.clone(), &compute).plan_digest,
+        selected(&request(Vec::new()), only, &compute).plan_digest
+    );
 }
 
 #[test]
@@ -659,11 +783,22 @@ fn digest_covers_inputs() {
 
     let mut moved = plan_request.clone();
     moved.inputs[0].holders = vec![holder(node(6), "us")];
-    assert_ne!(selected(&moved, scan, &compute).plan_digest, base);
+    assert_ne!(selected(&moved, scan.clone(), &compute).plan_digest, base);
 
     let elsewhere = vec![candidate(node(3), "docker")];
     assert_ne!(
         selected(&plan_request, elsewhere, &compute).plan_digest,
+        base
+    );
+
+    let mut renamed = scan.clone();
+    renamed[0].capability.backend = "lab-docker".to_string();
+    assert_ne!(selected(&plan_request, renamed, &compute).plan_digest, base);
+
+    let mut reconfigured = scan.clone();
+    reconfigured[0].capability.config_generation += 1;
+    assert_ne!(
+        selected(&plan_request, reconfigured, &compute).plan_digest,
         base
     );
 }
