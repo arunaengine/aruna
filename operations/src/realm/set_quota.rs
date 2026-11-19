@@ -400,7 +400,7 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetQuotaError> {
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use crate::testing::path_context;
+    use aruna_drivers::testing::path_context;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::structs::identity::realm::{

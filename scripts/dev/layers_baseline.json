@@ -56,7 +56,7 @@
     "group_cycle_modules": 17,
     "group_mutual_pairs": 17,
     "mixed_files": 0,
-    "pure_async_refs": 3,
+    "pure_async_refs": 2,
     "runner_refs": 0,
     "silent_skips": 9,
     "state_clones": 0,

@@ -209,7 +209,7 @@ mod tests {
             1,
         );
         let row = graph_lifecycle_entry(&lifecycle).unwrap();
-        crate::testing::write_entries(&storage_handle, vec![row]).await;
+        aruna_drivers::testing::write_entries(&storage_handle, vec![row]).await;
 
         let context = DriverContext {
             storage_handle,

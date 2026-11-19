@@ -703,7 +703,7 @@ pub(crate) mod received {
     use tokio::io::AsyncWriteExt;
 
     async fn put(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&context.storage_handle, space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, space, key, value).await;
     }
 
     pub(crate) async fn fixture() -> (tempfile::TempDir, DriverContext, SealPlan, UserId) {

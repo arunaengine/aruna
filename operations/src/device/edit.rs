@@ -620,7 +620,7 @@ mod tests {
         });
         let record = record();
         assert!(matches!(
-            crate::testing::send_metadata_effect(
+            aruna_drivers::testing::send_metadata_effect(
                 &context,
                 MetadataEffect::CreateCrate {
                     request: MetadataCrateRequest {

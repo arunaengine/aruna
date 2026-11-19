@@ -467,7 +467,7 @@ fn apply_reducer_federation(
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use crate::testing::path_context;
+    use aruna_drivers::testing::path_context;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentDot;
     use aruna_core::document::DocumentOutboxRecord;
@@ -519,7 +519,7 @@ mod tests {
     }
 
     async fn write(ctx: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
+        aruna_drivers::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
     }
 
     async fn seed(ctx: &DriverContext, actor: &Actor, kind: RealmNodeKind, admin: bool) {

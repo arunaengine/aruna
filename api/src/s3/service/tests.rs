@@ -50,7 +50,7 @@ use aruna_operations::s3::object::list::ListContinuationToken;
 use aruna_operations::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
 use aruna_operations::s3::object::metadata_drain::RefreshReferenceOperation;
 use aruna_operations::s3::object::put::PutObjectResult;
-use aruna_operations::testing::read_value;
+use aruna_drivers::testing::read_value;
 use aruna_storage::storage;
 use futures_util::{StreamExt, stream};
 use http::Extensions;

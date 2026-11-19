@@ -6,8 +6,6 @@ use aruna_core::NodeId;
 use aruna_core::document::{DocumentOutboxRecord, DocumentReconcileResult};
 use aruna_core::document_apply::ApplyError;
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::row_plan::PlanOperation;
@@ -18,7 +16,6 @@ use aruna_core::structured_id::{BucketId, ClockHealthError, PlacementHandle};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
-use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
@@ -31,74 +28,6 @@ use crate::sync::document_outbox::{
 use crate::sync::reconcile::SyncTopicsOperation;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
-
-/// A storage driver context with a task plane, shared behind an `Arc`.
-pub fn task_context(storage: StorageHandle) -> std::sync::Arc<DriverContext> {
-    std::sync::Arc::new(DriverContext {
-        task_handle: Some(TaskHandle::new()),
-        ..test_context(storage)
-    })
-}
-
-/// A storage-only driver context on a store opened at `root`.
-pub fn path_context(root: &str) -> DriverContext {
-    test_context(aruna_storage::FjallStorage::open(root).expect("open the test store"))
-}
-
-/// A storage-only driver context on a fresh temporary store.
-pub fn temp_context() -> (tempfile::TempDir, DriverContext) {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let context = path_context(dir.path().to_str().expect("temp path"));
-    (dir, context)
-}
-
-/// Writes one value outside a transaction; panics on any other answer.
-pub async fn write_value(
-    storage: &StorageHandle,
-    key_space: &str,
-    key: impl Into<ByteView>,
-    value: impl Into<ByteView>,
-) {
-    let write = StorageEffect::Write {
-        key_space: key_space.to_string(),
-        key: key.into(),
-        value: value.into(),
-        txn_id: None,
-    };
-    match storage.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => panic!("unexpected storage event: {other:?}"),
-    }
-}
-
-/// Writes `writes` in one batch outside a transaction; panics on any other answer.
-pub async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        other => panic!("unexpected storage event: {other:?}"),
-    }
-}
-
-/// The stored value of `key`; panics on any answer but a read result.
-pub async fn read_value(storage: &StorageHandle, keyspace: &str, key: Vec<u8>) -> Option<ByteView> {
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: keyspace.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        panic!("unexpected storage read event")
-    };
-    value
-}
 
 /// The outbox record stored at `key`.
 pub async fn read_outbox_record(
@@ -323,41 +252,10 @@ pub async fn prune_jobs_exist(
     Ok(!due.jobs.is_empty())
 }
 
-pub struct RecordingTaskHandler {
-    pub seen: tokio::sync::mpsc::Sender<aruna_core::task::TaskKey>,
-}
-
-#[async_trait::async_trait]
-impl aruna_tasks::InboundTaskHandler for RecordingTaskHandler {
-    async fn handle_timer(&self, key: aruna_core::task::TaskKey) {
-        let _ = self.seen.send(key).await;
-    }
-}
-
 /// A fresh job id for `(handle, bucket)` at the current time, as a submit would mint it.
 pub fn fresh_job_id(handle: PlacementHandle, bucket: BucketId) -> Result<JobId, ClockHealthError> {
     let mut ids = IdMint::new(ulid::Ulid::generate().random());
     crate::jobs::submit::mint_job_id(handle, bucket, &mut ids, unix_timestamp_millis())
-}
-
-/// The graph handle a test installed on its context.
-pub fn installed_graph_handle(context: &DriverContext) -> &aruna_graph::GraphHandle {
-    context
-        .graph_handle
-        .as_ref()
-        .expect("graph handle installed")
-}
-
-/// Runs one metadata effect on this node's graph store and answers with its event; an effect
-/// that names a graph skips the deletion guard here.
-pub async fn send_metadata_effect(context: &DriverContext, effect: MetadataEffect) -> Event {
-    match &context.graph_handle {
-        Some(graph) => Event::Metadata(graph.run(effect).await),
-        None => Event::Metadata(MetadataEvent::Error {
-            graph_iri: None,
-            error: MetadataError::HandleMissing,
-        }),
-    }
 }
 
 /// The RO-Crate JSON-LD of one graph.
@@ -398,22 +296,6 @@ pub fn reference_refresh(
             RealmId([9u8; 32]),
         ),
     }
-}
-
-/// The stored user `user_id`; panics when the read answers anything else.
-pub async fn read_user(
-    context: &DriverContext,
-    user_id: aruna_core::UserId,
-) -> aruna_core::structs::identity::user::User {
-    let key = user_id.to_bytes().to_vec();
-    let value = read_value(
-        &context.storage_handle,
-        aruna_core::keyspaces::USER_KEYSPACE,
-        key,
-    )
-    .await
-    .expect("the user is stored");
-    aruna_core::structs::identity::user::User::from_bytes(&value).unwrap()
 }
 
 /// Claims of `user_id` issued by `realm_id`, valid for ten minutes from now.

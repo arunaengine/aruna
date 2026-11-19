@@ -23,7 +23,7 @@ use aruna_drivers::testing::test_context;
 use aruna_operations::metadata::api::read_types::ApiQueryMode;
 use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
-use aruna_operations::testing::installed_graph_handle;
+use aruna_drivers::testing::installed_graph_handle;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

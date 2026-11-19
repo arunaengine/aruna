@@ -918,7 +918,7 @@ mod tests {
         key_space: &str,
         key: Vec<u8>,
     ) -> Option<aruna_core::types::Value> {
-        crate::testing::read_value(&context.storage_handle, key_space, key).await
+        aruna_drivers::testing::read_value(&context.storage_handle, key_space, key).await
     }
 
     async fn read_usage_counters(context: &DriverContext, key: Vec<u8>) -> UsageCounters {

@@ -1084,7 +1084,7 @@ async fn superseded_merge_journaled() {
     let source = MetadataBatchSource::UpsertDataEntity {
         jsonld: r#"{"@id":"./d.txt","@type":"File","name":"d"}"#.to_string(),
     };
-    let planned = aruna_operations::testing::send_metadata_effect(
+    let planned = aruna_drivers::testing::send_metadata_effect(
         &broker.ctx,
         MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
@@ -1620,7 +1620,7 @@ async fn unprojected_event_refused() {
         source: source.clone(),
     };
     let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) =
-        aruna_operations::testing::send_metadata_effect(&broker.ctx, plan).await
+        aruna_drivers::testing::send_metadata_effect(&broker.ctx, plan).await
     else {
         panic!("expected a planned batch");
     };

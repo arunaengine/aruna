@@ -742,7 +742,7 @@ mod tests {
     }
 
     async fn read_user(context: &DriverContext, user_id: UserId) -> User {
-        aruna_operations::testing::read_user(context, user_id).await
+        aruna_drivers::testing::read_user(context, user_id).await
     }
 
     async fn read_realm_config(

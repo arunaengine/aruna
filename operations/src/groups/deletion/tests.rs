@@ -78,7 +78,7 @@ pub fn node(seed: u8) -> aruna_core::NodeId {
 }
 
 pub async fn write(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {
-    crate::testing::write_value(&context.storage_handle, space, key, value).await;
+    aruna_drivers::testing::write_value(&context.storage_handle, space, key, value).await;
 }
 
 pub async fn read(context: &DriverContext, space: &str, key: Vec<u8>) -> Option<Value> {

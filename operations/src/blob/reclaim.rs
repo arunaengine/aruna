@@ -412,7 +412,7 @@ mod tests {
         BackendStatusOperation, RECLAIM_TICK_LIMIT, ReclaimOutcome, ReclaimSweepError,
         ReclaimSweepOperation,
     };
-    use crate::testing::path_context;
+    use aruna_drivers::testing::path_context;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
@@ -487,7 +487,7 @@ mod tests {
     }
 
     async fn write(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     async fn read(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {

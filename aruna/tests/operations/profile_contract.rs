@@ -1417,7 +1417,7 @@ async fn graph_exists(
         aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(
             document_id,
         );
-    match aruna_operations::testing::send_metadata_effect(
+    match aruna_drivers::testing::send_metadata_effect(
         &test.context,
         MetadataEffect::ContainsGraph { graph_iri },
     )

@@ -1150,7 +1150,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn context() -> (TempDir, DriverContext) {
-        crate::testing::temp_context()
+        aruna_drivers::testing::temp_context()
     }
 
     pub(crate) fn realm(seed: u8) -> RealmId {

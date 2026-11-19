@@ -70,7 +70,7 @@ mod tests {
     }
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
-        crate::testing::temp_context()
+        aruna_drivers::testing::temp_context()
     }
 
     fn user(realm: RealmId, seed: u8) -> UserId {

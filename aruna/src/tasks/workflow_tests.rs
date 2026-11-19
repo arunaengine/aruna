@@ -60,7 +60,7 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use super::workflow_fixtures::{execution_spec, node_id};
-use aruna_operations::testing::task_context;
+use aruna_drivers::testing::task_context;
 
 /// The context of a call about `backend`: one whose registry holds it.
 fn with_backend(context: &DriverContext, backend: &Arc<dyn ExecutorBackend>) -> DriverContext {

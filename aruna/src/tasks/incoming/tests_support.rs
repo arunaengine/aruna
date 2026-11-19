@@ -36,7 +36,7 @@ use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::sync::outbox_record::write_outbox_effect;
 use aruna_tasks::InboundTaskHandler;
 
-pub(crate) use aruna_operations::testing::RecordingTaskHandler;
+pub(crate) use aruna_drivers::testing::RecordingTaskHandler;
 
 pub(crate) fn job_id() -> JobId {
     aruna_operations::testing::fresh_job_id(

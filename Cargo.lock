@@ -717,6 +717,7 @@ dependencies = [
  "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
+ "async-trait",
  "bytes",
  "byteview",
  "chacha20poly1305",

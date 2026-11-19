@@ -635,7 +635,7 @@ mod tests {
 
     async fn store(context: &Arc<DriverContext>, entry: &PublishEntry) {
         let (key_space, key, value) = publish_entry(entry).unwrap();
-        crate::testing::write_value(&context.storage_handle, &key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, &key_space, key, value).await;
     }
 
     async fn claim_state(
