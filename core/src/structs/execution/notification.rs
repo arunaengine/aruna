@@ -678,7 +678,7 @@ mod tests {
             },
         ] {
             let record = NotificationRecord::new(
-                ulid::Ulid::new(),
+                ulid::Ulid::generate(),
                 recipient,
                 NotificationClass::Direct,
                 kind,
@@ -739,14 +739,14 @@ mod tests {
         let r = user(1, 2);
         let t = 1_000_000u64;
         let transient = NotificationRecord::new(
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             r,
             NotificationClass::Transient,
             added(3),
             t,
         );
         let direct =
-            NotificationRecord::new(ulid::Ulid::new(), r, NotificationClass::Direct, added(3), t);
+            NotificationRecord::new(ulid::Ulid::generate(), r, NotificationClass::Direct, added(3), t);
         let kt = notification_prune_key(&transient);
         let kd = notification_prune_key(&direct);
         assert!(kt < kd);
@@ -781,7 +781,7 @@ mod tests {
     fn write_entries_index() {
         let r = user(1, 2);
         let record = NotificationRecord::new(
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             r,
             NotificationClass::Direct,
             added(3),
@@ -820,7 +820,7 @@ mod tests {
     #[test]
     fn expires_at_saturates() {
         let record = NotificationRecord::new(
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             user(1, 2),
             NotificationClass::Direct,
             NotificationKind::NodeOnboarded {
@@ -932,7 +932,7 @@ mod tests {
             size_bytes: 1,
         };
         let deleted = NotificationRecord::new(
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             recipient,
             NotificationClass::Direct,
             NotificationKind::BucketDeleted {
@@ -944,7 +944,7 @@ mod tests {
         );
         let notice = |recipient, kind, at| {
             NotificationRecord::new(
-                ulid::Ulid::new(),
+                ulid::Ulid::generate(),
                 recipient,
                 NotificationClass::Direct,
                 kind,

@@ -760,7 +760,7 @@ mod tests {
         stages
             .clone()
             .scope(async {
-                time_stage("inner", async {}).await;
+                record_stage("inner", Duration::from_millis(2));
                 record_stage("manual", Duration::from_millis(3));
             })
             .await;

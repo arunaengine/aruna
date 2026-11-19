@@ -36,7 +36,7 @@ fn digest_ignores_minter() {
 #[test]
 fn deliveries_keep_dedup() {
     let notification = crate::structs::execution::notification::NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         user(1, 2),
         crate::structs::execution::notification::NotificationClass::Direct,
         crate::structs::execution::notification::NotificationKind::AddedToGroup {
