@@ -2,8 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::holders::dht_registration_effect;
-use crate::blob::records::{HeadAliasContext, release_rows};
 use crate::connectors::root_record::{compact_version, root_write};
 use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
@@ -22,6 +20,7 @@ use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
 };
+use aruna_core::blob_records::{HeadAliasContext, dht_registration_effect, release_rows};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{BlobEffect, Effect};

@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
-use crate::blob::holders::dht_registration_effect;
-use crate::blob::records::{HeadAliasContext, release_rows};
 use crate::distribution::guard::{GuardError, WriteAuthority, authority_reads, record_authority};
 use crate::distribution::inventory::{AddedVersion, stamp_head, stamp_version, version_written};
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
@@ -22,6 +20,7 @@ use crate::s3::usage::{
 };
 use crate::s3::write_cleanup::{ReleaseWrite, RollbackWrite, WriteCleanup};
 use aruna_core::UserId;
+use aruna_core::blob_records::{HeadAliasContext, dht_registration_effect, release_rows};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};

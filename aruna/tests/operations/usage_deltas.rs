@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
+use aruna_core::blob_records::HeadAliasContext;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -34,7 +35,6 @@ use aruna_core::structs::storage::usage::{
 };
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
-use aruna_operations::blob::records::HeadAliasContext;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;

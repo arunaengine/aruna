@@ -1058,7 +1058,7 @@ async fn deletes_version() {
 
 /// Seeds versions of `sealed` that share one pending archive, the last one current.
 async fn seed_pending(storage: &storage::StorageHandle, versions: &[Ulid]) -> BackendLocation {
-    use crate::blob::records::owner_write_effect;
+    use aruna_core::blob_records::owner_write_effect;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::encryption::BucketKeyRef;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};

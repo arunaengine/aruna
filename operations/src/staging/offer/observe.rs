@@ -30,8 +30,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::usage::UsageDelta;
 use ulid::Ulid;
 
-use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::s3::usage::{RowChange, UsageCounterUpdate};
+use aruna_core::blob_records::{HeadAliasContext, build_transition_effects, write_version_effect};
 
 use super::super::offered_directory::{ObservationScope, OfferedDirectoryError};
 

@@ -10,16 +10,15 @@ use super::sources::{
     learn_probe_hash, merge_candidates,
 };
 use super::*;
-use crate::blob::permission_paths::MAX_HASH_ALIASES;
 use crate::jobs::repository::test_support::{
     artifact, job_id, job_scope as scoped_job, local_scope, other_node, owner_node, realm,
 };
 use crate::tests::export::{crate_document, job_context, probe_sources, recognized_entities, scope_of};
-use aruna_test_support::export::{FIXTURE_BYTES, remote_spec};
 use aruna_blob::archive::zip_date;
 use aruna_blob::archive::zip_entry;
 use aruna_core::archive_path::safe_zip_path;
 use aruna_core::archive_path::synthesized_path;
+use aruna_core::blob_paths::MAX_HASH_ALIASES;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::BlobEvent;
 use aruna_core::events::Event;
@@ -31,6 +30,7 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::context::JobContext;
+use aruna_test_support::export::{FIXTURE_BYTES, remote_spec};
 use bytes::Bytes;
 use futures_util::io::AsyncWriteExt;
 use serde_json::Value as JsonValue;

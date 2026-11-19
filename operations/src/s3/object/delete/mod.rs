@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::records::HeadAliasContext;
 use crate::distribution::guard::{GuardError, authority_reads, write_epoch};
 use crate::distribution::inventory::{
     AddedVersion, HeadChange, InventoryChange, stamp_head, stamp_version, version_written,
@@ -13,6 +12,7 @@ use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
 use aruna_core::UserId;
+use aruna_core::blob_records::HeadAliasContext;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;

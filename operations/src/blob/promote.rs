@@ -34,11 +34,10 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::blob::holders::dht_registration_effect;
-use crate::blob::records::{HeadAliasContext, add_index_effect};
 use crate::distribution::inventory::{
     AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, entry_of,
 };
+use aruna_core::blob_records::{HeadAliasContext, add_index_effect, dht_registration_effect};
 
 /// Owner rows promoted per transaction.
 pub const PROMOTE_PAGE: usize = 64;

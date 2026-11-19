@@ -11,6 +11,8 @@ pub mod archive_path;
 pub mod audit;
 pub mod auth;
 pub mod backoff;
+pub mod blob_paths;
+pub mod blob_records;
 pub mod calls;
 pub mod compute;
 pub mod config_authority;

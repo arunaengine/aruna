@@ -29,11 +29,11 @@ use crate::auth::permission_rules::{
     PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
-use crate::blob::permission_paths::{MAX_HASH_ALIASES, ResolvePathsError, ResolvePathsOperation};
 use crate::jobs::import::{job_call, stops_of};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use aruna_core::blob_paths::{MAX_HASH_ALIASES, ResolvePathsError, ResolvePathsOperation};
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// What the source lookups of one export run have learned, so each is asked only once.

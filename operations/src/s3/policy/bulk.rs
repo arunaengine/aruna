@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::records::HeadAliasContext;
 use crate::distribution::guard::{GuardError, authority_reads, write_authority};
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::resolve_set::{
@@ -12,6 +11,7 @@ use crate::placement::policy::resolve_set::{
 use crate::s3::policy::successor::{
     CapturedDefault, MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
+use aruna_core::blob_records::HeadAliasContext;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;

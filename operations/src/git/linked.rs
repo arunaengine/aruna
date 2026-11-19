@@ -23,13 +23,13 @@ use super::calls::{child_member, group_call, group_results, member_outcome};
 use super::{GitError, download, location, objects};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::metadata::global_entries::{LocalVersionError, LocalVersionOperation};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectInfo};
 use crate::s3::object::read::ObjectInfoOperation;
+use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};
 use aruna_core::request_policy::PolicyRequestExtras;
 
