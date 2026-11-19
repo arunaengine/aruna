@@ -15,8 +15,8 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
 
 use crate::auth::bearer_token::{
-    DecodeTokenOperation, IssuerTrust, RevocationCheck, TokenChecks, UserCutoffOperation,
-    claims_auth,
+    DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
+    UserCutoffOperation, claims_auth,
 };
 use crate::auth::error::ArunaBearerError;
 use crate::metadata::call_results::read_value;
@@ -43,7 +43,7 @@ pub(crate) fn forwarded_checks(local_realm: Option<RealmId>, blind: bool) -> Tok
         trust: IssuerTrust::Stored,
         revocation,
         linked_realm: local_realm,
-        keys: None,
+        keys: IssuerKeys::Net,
     }
 }
 

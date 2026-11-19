@@ -19,7 +19,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_operations::auth::bearer_token::{
-    DecodeTokenOperation, IssuerKeyCache, IssuerTrust, RevocationCheck, TokenChecks,
+    DecodeTokenOperation, IssuerKeyCache, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
 };
 use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -670,7 +670,7 @@ impl ServerState {
             trust: IssuerTrust::Listed(trusted.iter().copied().collect()),
             revocation,
             linked_realm: Some(self.get_realm_id()),
-            keys: Some(self.identity.issuer_keys.clone()),
+            keys: IssuerKeys::Cached(self.identity.issuer_keys.clone()),
         }
     }
 

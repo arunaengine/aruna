@@ -883,6 +883,11 @@ pub enum NetEffect {
     LocalNode,
     /// Asks for the realm this node serves; answers `NetEvent::LocalRealm`.
     LocalRealm,
+    /// Asks whether a trusted issuer's public key is one this node checked; answers
+    /// `NetEvent::IssuerKey`.
+    IssuerKey {
+        key: [u8; 32],
+    },
     /// Asks which holders this node's watch interest matches; answers `NetEvent::WatchHolders`.
     WatchHolders {
         realm_id: crate::structs::identity::realm::RealmId,

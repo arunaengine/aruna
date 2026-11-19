@@ -153,6 +153,11 @@ async fn dispatch_unboxed(
             let realm = context.net_handle.as_ref().map(|net| *net.realm_id());
             Event::Net(NetEvent::LocalRealm(realm))
         }
+        Effect::Net(NetEffect::IssuerKey { key }) => {
+            let checked =
+                (context.net_handle.as_ref()).is_some_and(|net| net.issuer_keys().check(key));
+            Event::Net(NetEvent::IssuerKey(checked))
+        }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
         Effect::Outbound(OutboundEffect::ListRange(listing)) => {
             net::dispatch_listing(*listing, context).await

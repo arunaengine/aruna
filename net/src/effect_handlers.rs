@@ -313,6 +313,7 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         | NetEffect::PeerContacts { .. }
         | NetEffect::LocalNode
         | NetEffect::LocalRealm
+        | NetEffect::IssuerKey { .. }
         | NetEffect::WatchHolders { .. }
         | NetEffect::RegisterInterest { .. }
         | NetEffect::RetractInterest(_)
@@ -671,6 +672,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::PeerContacts { .. } => "peer_contacts",
         NetEffect::LocalNode => "local_node",
         NetEffect::LocalRealm => "local_realm",
+        NetEffect::IssuerKey { .. } => "issuer_key",
         NetEffect::WatchHolders { .. } => "watch_holders",
         NetEffect::RegisterInterest { .. } => "register_interest",
         NetEffect::RetractInterest(_) => "retract_interest",

@@ -503,6 +503,8 @@ pub enum NetEvent {
     LocalNode(Option<crate::NodeId>),
     /// The realm this node serves, `None` without a network.
     LocalRealm(Option<crate::structs::identity::realm::RealmId>),
+    /// Whether the issuer key is a valid public key; `false` also when it went unchecked.
+    IssuerKey(bool),
     /// This node's id and the holders its watch interest matches; `None` without a net handle.
     WatchHolders(Option<(crate::NodeId, Vec<crate::NodeId>)>),
     Heartbeat(crate::heartbeat::HeartbeatEvent),
@@ -1071,6 +1073,7 @@ impl Event {
                     PeerContacts,
                     LocalNode,
                     LocalRealm,
+                    IssuerKey,
                     WatchHolders,
                     Heartbeat,
                     HeartbeatSilence,

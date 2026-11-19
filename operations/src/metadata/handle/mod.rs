@@ -20,7 +20,9 @@ use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
 
 use super::protocol::METADATA_IO_TIMEOUT;
-use crate::auth::bearer_token::{DecodeTokenOperation, IssuerKeyCache, TokenChecks, claims_auth};
+use crate::auth::bearer_token::{
+    DecodeTokenOperation, IssuerKeyCache, IssuerKeys, TokenChecks, claims_auth,
+};
 use crate::auth::error::ArunaBearerError;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::write_peer::forwarded_checks;
@@ -156,7 +158,7 @@ impl AuthValidationState {
     /// once it has any, the token's own issuing realm answers.
     async fn validate(&self, token: &str) -> Result<AuthContext, ArunaBearerError> {
         let checks = TokenChecks {
-            keys: Some(self.issuer_keys.clone()),
+            keys: IssuerKeys::Cached(self.issuer_keys.clone()),
             ..forwarded_checks(self.realm_id, false)
         };
         let context = DriverContext::storage_only(self.storage_handle.clone());

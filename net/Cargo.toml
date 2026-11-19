@@ -22,6 +22,7 @@ aruna-storage = { workspace = true }
 blake3 = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
+lru = { workspace = true }
 fjall = { workspace = true }
 opentelemetry = { workspace = true }
 tokio = { workspace = true }

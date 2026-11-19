@@ -6,10 +6,13 @@ use crate::auth::error::ArunaBearerError;
 use crate::document_repository::read_row;
 use aruna_core::UserId;
 use aruna_core::auth::{
-    REALMS_LIST_KEY, REVOCATION_GRACE_SECS, bearer_token_hash, valid_token_lifetime,
+    KEY_CACHE_CAPACITY, KEY_CACHE_TTL, REALMS_LIST_KEY, REVOCATION_GRACE_SECS, bearer_token_hash,
+    valid_token_lifetime,
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, FEDERATION_KEYSPACE, USER_KEYSPACE};
 use aruna_core::link::{alias_claims_key, alias_owner};
 use aruna_core::operation::Operation;
@@ -311,12 +314,25 @@ pub struct TokenChecks {
     pub revocation: RevocationCheck,
     /// The realm whose linked logins this node can resolve.
     pub linked_realm: Option<RealmId>,
-    pub keys: Option<Arc<IssuerKeyCache>>,
+    pub keys: IssuerKeys,
+}
+
+/// Where a trusted issuer's decoding key comes from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum IssuerKeys {
+    /// Built again for every token.
+    Uncached,
+    /// Kept in this process cache.
+    Cached(Arc<IssuerKeyCache>),
+    /// Checked once and kept by the net handle.
+    Net,
 }
 
 #[derive(PartialEq)]
 enum DecodeStage {
     Trust,
+    /// Waits for the net handle's answer on this issuer key.
+    Key([u8; 32]),
     Config,
     Link,
 }
@@ -329,6 +345,7 @@ pub struct DecodeTokenOperation {
     checks: TokenChecks,
     now_ms: u64,
     stage: DecodeStage,
+    trusted: HashSet<RealmId>,
     claims: Option<TokenClaims>,
 }
 
@@ -348,12 +365,13 @@ impl DecodeTokenOperation {
             checks,
             now_ms: 0,
             stage: DecodeStage::Trust,
+            trusted: HashSet::new(),
             claims: None,
         }
     }
 
-    /// Checks the signature and the claims, then the revocation state.
-    fn verify(&mut self, trusted: &HashSet<RealmId>) -> DecodeTurn {
+    /// Finds the issuer key, then checks the signature, the claims and the revocation state.
+    fn verify(&mut self, trusted: HashSet<RealmId>) -> DecodeTurn {
         let unverified = insecure_decode::<TokenClaims>(&self.token)?.claims;
         let issuer = match (
             unverified.issuer_pubkey.as_deref(),
@@ -362,14 +380,26 @@ impl DecodeTokenOperation {
             (Some(issuer_pubkey), true) => issuer_pubkey,
             _ => &unverified.iss,
         };
-        // Only trusted realm or delegated issuers may populate the bounded cache;
+        // Only trusted realm or delegated issuers may populate a bounded cache;
         // untrusted issuers are verified with an ephemeral key that is discarded.
-        let key = match (&self.checks.keys, issuer_trusted(trusted, &unverified)) {
-            (Some(keys), Ok(())) => keys.get_or_insert(issuer)?,
+        let key = match (&self.checks.keys, issuer_trusted(&trusted, &unverified)) {
+            (IssuerKeys::Cached(keys), Ok(())) => keys.get_or_insert(issuer)?,
+            (IssuerKeys::Net, Ok(())) => {
+                let key = issuer_bytes(issuer)?;
+                self.trusted = trusted;
+                self.stage = DecodeStage::Key(key);
+                let check = Effect::Net(NetEffect::IssuerKey { key });
+                return Ok(Next::Call(IoCall::Effect(Box::new(check))));
+            }
             _ => bearer_decoding_key(issuer)?,
         };
+        self.check_signed(&trusted, &key)
+    }
+
+    /// Checks the signature with `key`, then the claims and the revocation state.
+    fn check_signed(&mut self, trusted: &HashSet<RealmId>, key: &DecodingKey) -> DecodeTurn {
         let validation = Validation::new(Algorithm::EdDSA);
-        let claims = decode::<TokenClaims>(&self.token, &key, &validation)?.claims;
+        let claims = decode::<TokenClaims>(&self.token, key, &validation)?.claims;
         validate_bearer_claims(trusted, now_secs(self.now_ms), &claims)?;
         // The issuing realm from the verified claims, so a foreign token is judged
         // by its origin realm's revocation set and not by the serving node's.
@@ -435,7 +465,7 @@ impl Operation for DecodeTokenOperation {
 
     fn first(&mut self) -> DecodeTurn {
         match self.checks.trust.clone() {
-            IssuerTrust::Listed(trusted) => self.verify(&trusted),
+            IssuerTrust::Listed(trusted) => self.verify(trusted),
             IssuerTrust::Stored => Ok(Next::Call(aruna_core::rows::read_row(
                 API_STATE_KEYSPACE,
                 REALMS_LIST_KEY,
@@ -447,7 +477,16 @@ impl Operation for DecodeTokenOperation {
         match self.stage {
             DecodeStage::Trust => {
                 let trusted = stored_realms(value(result));
-                self.verify(&trusted)
+                self.verify(trusted)
+            }
+            DecodeStage::Key(bytes) => {
+                // A key the net handle has not checked is built here, which rejects a bad one.
+                let key = match checked_key(result) {
+                    true => DecodingKey::from_ed_der(&bytes),
+                    false => raw_decoding_key(bytes)?,
+                };
+                let trusted = std::mem::take(&mut self.trusted);
+                self.check_signed(&trusted, &key)
             }
             DecodeStage::Config => self.config_read(read_config(value(result)?)?),
             DecodeStage::Link => {
@@ -533,19 +572,26 @@ fn verify_realm_delegation(
 }
 
 pub fn bearer_decoding_key(issuer_pubkey: &str) -> Result<DecodingKey, ArunaBearerError> {
-    let issuer_pubkey: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(issuer_pubkey)?
+    raw_decoding_key(issuer_bytes(issuer_pubkey)?)
+}
+
+fn issuer_bytes(issuer_pubkey: &str) -> Result<[u8; 32], ArunaBearerError> {
+    (base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(issuer_pubkey)?)
         .try_into()
-        .map_err(|_| ArunaBearerError::InvalidIssuerKey)?;
+        .map_err(|_| ArunaBearerError::InvalidIssuerKey)
+}
+
+fn raw_decoding_key(issuer_pubkey: [u8; 32]) -> Result<DecodingKey, ArunaBearerError> {
     let public_key = VerifyingKey::from_bytes(&issuer_pubkey)?;
     let public_key_pem = public_key.to_public_key_pem(LineEnding::default())?;
     Ok(DecodingKey::from_ed_pem(public_key_pem.as_bytes())?)
 }
 
-/// Maximum number of issuer decoding keys retained in the process cache.
-pub const KEY_CACHE_CAPACITY: usize = 1024;
-/// Time an issuer decoding key is retained before it is refreshed.
-pub const KEY_CACHE_TTL: Duration = Duration::from_secs(3600);
+// Whether the net handle answered that the issuer key is a checked public key.
+fn checked_key(result: IoResult) -> bool {
+    let answer = aruna_core::rows::event(result);
+    matches!(answer, Ok(Event::Net(NetEvent::IssuerKey(true))))
+}
 
 /// Bounded, TTL + LRU cache of issuer decoding keys keyed by base64 public key.
 pub struct IssuerKeyCache {

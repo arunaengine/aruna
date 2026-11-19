@@ -15,7 +15,7 @@ use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::bearer_token::{
-    DecodeTokenOperation, IssuerTrust, RevocationCheck, TokenChecks,
+    DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
 };
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::auth::error::ArunaBearerError;
@@ -469,7 +469,7 @@ impl DoctorValidationState {
                 self.revoked_token_hashes.iter().cloned().collect(),
             ),
             linked_realm: None,
-            keys: None,
+            keys: IssuerKeys::Uncached,
         };
         let mut decode = DecodeTokenOperation::new(token, checks);
         decode.stamp(unix_timestamp_millis());

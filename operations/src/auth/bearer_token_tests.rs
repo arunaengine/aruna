@@ -263,7 +263,7 @@ fn decoding(minted: &Minted, revocation: RevocationCheck) -> DecodeTokenOperatio
         trust: IssuerTrust::Listed(HashSet::from([minted.realm_id])),
         revocation,
         linked_realm: Some(minted.realm_id),
-        keys: None,
+        keys: IssuerKeys::Uncached,
     };
     let mut operation = DecodeTokenOperation::new(&minted.token, checks);
     operation.stamp(minted.now * 1000);
@@ -291,6 +291,30 @@ fn linked_login_checked() {
         unlinked.next(owner_answer(None)),
         Err(ArunaBearerError::TokenRevoked)
     ));
+}
+
+#[test]
+fn net_key_checked() {
+    // The net handle's answer only spares the key check; an unchecked key is built here.
+    let minted = linked_token();
+    for checked in [true, false] {
+        let mut operation = decoding(&minted, RevocationCheck::Skipped);
+        operation.checks.keys = IssuerKeys::Net;
+        let Ok(Next::Call(IoCall::Effect(effect))) = operation.first() else {
+            panic!("expected the issuer key check");
+        };
+        let key = minted.realm_id.0;
+        assert_eq!(*effect, Effect::Net(NetEffect::IssuerKey { key }));
+        let answer = IoResult::Event(Box::new(Event::Net(NetEvent::IssuerKey(checked))));
+        assert!(matches!(
+            operation.next(answer),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let Ok(Next::Done(claims)) = operation.next(owner_answer(Some(minted.local))) else {
+            panic!("expected the claims");
+        };
+        assert_eq!(claims.via, Some(minted.via.to_string()));
+    }
 }
 
 #[test]

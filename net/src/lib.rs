@@ -20,6 +20,7 @@ pub mod error;
 mod eviction;
 pub mod frames;
 mod heartbeat;
+pub mod issuer_keys;
 pub mod job_control;
 pub mod notification;
 pub mod shard_manifest;
@@ -132,6 +133,7 @@ struct NetInner {
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     heartbeats: Arc<heartbeat::HeartbeatTable>,
     peer_contacts: contacts::PeerContacts,
+    issuer_keys: issuer_keys::IssuerKeys,
     /// Test hook: the payload of the next answer a frame request drops as if lost.
     #[cfg(feature = "test-hooks")]
     dropped_answer: parking_lot::Mutex<Option<Vec<u8>>>,
@@ -551,6 +553,11 @@ impl NetHandle {
     /// When this node last saw each authorized peer.
     pub fn peer_contacts(&self) -> contacts::PeerContacts {
         self.inner.peer_contacts.clone()
+    }
+
+    /// The trusted issuer keys this node checked.
+    pub fn issuer_keys(&self) -> &issuer_keys::IssuerKeys {
+        &self.inner.issuer_keys
     }
 
     /// Test hook: the next frame request whose answer payload is `payload` fails as if the
@@ -1136,6 +1143,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::PeerContacts { .. }) => "peer_contacts",
         Effect::Net(NetEffect::LocalNode) => "local_node",
         Effect::Net(NetEffect::LocalRealm) => "local_realm",
+        Effect::Net(NetEffect::IssuerKey { .. }) => "issuer_key",
         Effect::Net(NetEffect::WatchHolders { .. }) => "watch_holders",
         Effect::Net(NetEffect::RegisterInterest { .. }) => "register_interest",
         Effect::Net(NetEffect::RetractInterest(_)) => "retract_interest",
