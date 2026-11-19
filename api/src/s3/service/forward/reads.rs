@@ -8,11 +8,12 @@ use std::time::{Duration, SystemTime};
 
 use aruna_core::member_read::MemberBody;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
-use aruna_core::time::unix_timestamp_millis;
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_operations::distribution::status::node_reach;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::object::member_read::{
-    MemberFailure, MemberKey, MemberRead, MemberReadOperation, MemberRefusal,
+    MemberCallOperation, MemberFailure, MemberKey, MemberRead, MemberReadOperation, MemberRefusal,
+    MemberTextOperation,
 };
 use aruna_operations::s3::object::range_list::DelegatedCaller;
 use http::HeaderMap;
@@ -30,8 +31,6 @@ use crate::s3::service::ArunaS3Service;
 
 /// How long an anonymous caller's stand-in credential lasts; the delegation is shorter.
 const ANONYMOUS_SECS: u64 = 60;
-/// How long a holder may take to start its answer; the body then streams without a bound.
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Marks an answer a copy gave for ranges whose coordinator could not answer; it may be behind.
 pub(in crate::s3::service) const STALE_HEADER: &str = "x-aruna-stale";
@@ -191,22 +190,11 @@ pub(in crate::s3::service) fn anonymous_window(user: &UserAccess) -> UserAccess 
     user
 }
 
-/// The holder's answer, or the holder as unreachable when it does not start answering in time.
-async fn answer_within(
-    forward: &Forward,
-    answer: impl Future<Output = S3Result<reqwest::Response>>,
-) -> S3Result<reqwest::Response> {
-    match tokio::time::timeout(ANSWER_TIMEOUT, answer).await {
-        Ok(answer) => answer,
-        Err(_) => Err(super::unreachable_error(forward, "not answering in time")),
-    }
-}
-
 impl ArunaS3Service {
     fn member_operation(
         &self,
         user: &UserAccess,
-        binding: &aruna_core::structs::storage::distribution::DistributionBinding,
+        binding: &DistributionBinding,
         key: MemberKey,
     ) -> MemberReadOperation {
         let ids = self.state.node_and_realm();
@@ -214,7 +202,7 @@ impl ArunaS3Service {
     }
 
     /// A member's failure as this node's answer; a copy's refusal is marked.
-    fn member_error(&self, failure: MemberFailure) -> S3Error {
+    pub(super) fn member_error(&self, failure: MemberFailure) -> S3Error {
         let error = match failure.refusal {
             MemberRefusal::Refused {
                 node_id,
@@ -243,9 +231,13 @@ impl ArunaS3Service {
                 };
                 super::unreachable_error(&forward, &reach)
             }
+            MemberRefusal::NoHolder { set_id, range_id } => {
+                super::list::incomplete(set_id, range_id)
+            }
+            MemberRefusal::Broken(reason) => s3_error!(ServiceUnavailable, "{reason}"),
             MemberRefusal::Route(error) => guard_error(&error),
             MemberRefusal::Failed(reason) => {
-                s3_error!(InternalError, "Could not delegate the read: {reason}")
+                s3_error!(InternalError, "Could not delegate the request: {reason}")
             }
         };
         match failure.stale {
@@ -299,30 +291,43 @@ impl ArunaS3Service {
         answer.map_err(|failure| self.member_error(failure))
     }
 
+    /// Sends one request to the coordinator and returns its successful answer.
+    pub(super) async fn forward_write(
+        &self,
+        user: &UserAccess,
+        forward: &Forward,
+        request: ForwardRequest,
+    ) -> S3Result<MemberBody> {
+        let ids = self.state.node_and_realm();
+        let caller = delegated_caller(user);
+        let call = MemberCallOperation::write(ids, caller, forward.clone(), request);
+        (drive(call, self.state.as_ref()).await)
+            .map_err(|refusal| self.member_error(refusal.into()))
+    }
+
     /// Sends one read to the chosen holder; a holder that fails is skipped for a while.
     pub(in crate::s3::service) async fn forward_read(
         &self,
         user: &UserAccess,
         forward: &Forward,
         request: ForwardRequest,
-    ) -> S3Result<reqwest::Response> {
-        let user = anonymous_window(user);
-        let result = answer_within(forward, self.forward_write(&user, forward, request)).await;
-        if let Err(error) = &result
-            && error
-                .status_code()
-                .is_none_or(|status| status.is_server_error())
-        {
-            let context: &aruna_operations::driver::DriverContext = self.state.as_ref();
-            context.avoid_holder(forward.node_id, unix_timestamp_millis());
-        }
-        result
+    ) -> S3Result<MemberBody> {
+        let ids = self.state.node_and_realm();
+        let caller = delegated_caller(user);
+        let call = MemberCallOperation::read(ids, caller, forward.clone(), request);
+        (drive(call, self.state.as_ref()).await)
+            .map_err(|refusal| self.member_error(refusal.into()))
+    }
+
+    /// The text of a member's answer; a broken or oversized one is an error.
+    pub(super) async fn answer_text(&self, body: MemberBody) -> S3Result<String> {
+        (drive(MemberTextOperation::of_body(body), self.state.as_ref()).await)
+            .map_err(|refusal| self.member_error(refusal.into()))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::list::unreachable;
     use super::*;
 
     fn holder_answer(status: u16) -> MemberBody {
@@ -348,23 +353,6 @@ mod tests {
                 .collect(),
             stream: aruna_core::stream::BackendStream::new(chunks),
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn silent_holder_unreachable() {
-        let forward = Forward {
-            set_id: Ulid::nil(),
-            range_id: Ulid::nil(),
-            node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
-        };
-        let error = answer_within(&forward, std::future::pending())
-            .await
-            .unwrap_err();
-        assert!(unreachable(&error));
-        let answered = http::Response::builder().status(200).body("abc").unwrap();
-        let answered = async { Ok(reqwest::Response::from(answered)) };
-        let answer = answer_within(&forward, answered).await;
-        assert_eq!(answer.unwrap().status(), 200);
     }
 
     #[test]
