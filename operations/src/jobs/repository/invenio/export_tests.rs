@@ -219,7 +219,7 @@ fn export_runs_step() {
             ExportIdentity::default()
         ))))
     );
-    let prepared = child::<_, TransferError>(Ok((record(), [5; 32])));
+    let prepared = child::<_, TransferError>(Ok((record(), [5u8; 32])));
     assert!(matches!(
         operation.next(prepared),
         Ok(Next::Call(IoCall::Child(_)))
