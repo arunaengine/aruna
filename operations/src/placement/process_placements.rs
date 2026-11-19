@@ -826,6 +826,7 @@ impl PlacementRecordOperation {
             record.placement,
             self.local,
             record.selected_peers.clone(),
+            self.now_ms / 1_000,
         );
         let Ok(effect) = write_placement_effect(&refreshed) else {
             return Ok(Next::Done(true));

@@ -985,7 +985,7 @@ impl OperationsTaskHandler {
                     warn!("Cannot record a timed bucket lock without net handle");
                     return;
                 };
-                let now_ms = aruna_core::time::unix_timestamp_millis();
+                let now_ms = unix_timestamp_millis();
                 let operation = LockBucketOperation::timed(ticket, net_handle.node_id(), now_ms);
                 if let Err(error) = drive(operation, &self.context).await {
                     warn!(error = %error, "Timed bucket lock failed");

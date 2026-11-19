@@ -617,7 +617,7 @@ fn record_step(value: Value, nodes: &[NodeId], local: NodeId) -> PlacementRecord
 }
 
 fn stored_record(realm_id: RealmId, placement: PlacementRef) -> Value {
-    let record = new_placement(realm_id, placement, node(1), Vec::new());
+    let record = new_placement(realm_id, placement, node(1), Vec::new(), 1);
     postcard::to_allocvec(&record).unwrap().into()
 }
 

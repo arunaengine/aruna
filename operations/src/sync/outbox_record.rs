@@ -11,7 +11,6 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::keyspaces::{OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{Key, TxnId, Value};
 use byteview::ByteView;
 use ulid::Ulid;
@@ -119,7 +118,7 @@ pub fn new_identified_record(
         placement,
         // Unfenced by default; a fence-admitted writer stamps its generation.
         generation: 0,
-        updated_at: unix_timestamp_secs(),
+        updated_at: outbox_id.timestamp_ms() / 1_000,
         allow_genesis,
     }
 }
