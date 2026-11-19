@@ -21,7 +21,7 @@ use aruna_operations::plugins::admitted::{
     Admitted, CancelAsk, ChangeAsk, InfoAsk, ListAsk, NativeAsk, OutputsAsk, StateAsk,
 };
 use aruna_operations::plugins::check::RunScope;
-use aruna_operations::plugins::creates::{FinishCreate, stored_created};
+use aruna_operations::plugins::creates::{CreatePlan, stored_created};
 use aruna_operations::plugins::dataset::file_entity;
 use aruna_operations::plugins::grants::object_path;
 use aruna_operations::plugins::held::{AskRelease, HeldSecrets};
@@ -29,9 +29,9 @@ use aruna_operations::plugins::host_calls::{
     CallEnd, CallFailure, RecordCall, StateChange, begun_reply, call_intent, version_id,
 };
 use aruna_operations::plugins::host_steps::{
-    AdmitCall, ApplyChange, CallStep, ChangeInput, CheckConfigured, CheckReply, ConfiguredCall,
-    ConnectionAsk, ConnectionPlan, Granted, GrantedCall, ListDatasets, NativeCall, PrepareChange,
-    PrepareConnection, PrepareCreate, ReadDataset, ReadFiles, ReadPlace, ReplyPlan,
+    AdmitCall, ChangeInput, ChangeMutation, ChangePlan, CheckConfigured, CheckReply, Checked,
+    ConfiguredCall, ConnectionAsk, ConnectionPlan, Granted, GrantedCall, ListDatasets, NativeCall,
+    PrepareChange, PrepareConnection, PrepareCreate, ReadDataset, ReadFiles, ReadPlace, ReplyPlan,
 };
 use aruna_operations::plugins::intents::{begin, unknown_row};
 use aruna_operations::plugins::job_work::JobState;
@@ -131,42 +131,37 @@ impl RunBroker {
         }
     }
 
-    /// Checks a metadata change, then routes it and records its outcome in the call's intent.
-    async fn routed_change(
+    /// A metadata change: its checks, then the write routed and its outcome recorded in the call's
+    /// intent.
+    fn change(
         &self,
-        prepare: PrepareChange,
-        intent: &Intent,
-        mutation: impl FnOnce(Option<String>) -> UpdateDocumentMutation,
-    ) -> Result<String, HostError> {
-        let step = drive(prepare, &self.ctx).await;
-        let ready = match step.map_err(|failure| self.failed(failure))? {
-            CallStep::Replied(reply) => return Ok(reply),
-            CallStep::Proceed(ready) => ready,
+        cx: &CallContext,
+        (resource, expected, intent): (&str, &str, &Intent),
+        (input, mutation): (ChangeInput, ChangeMutation),
+    ) -> Result<Checked<PrepareChange, ChangePlan>, HostError> {
+        let (place, revision) = (self.read_place(cx), (resource, expected));
+        let prepare = PrepareChange::new(place, revision, call_intent(intent), input)?;
+        let plan = ChangePlan {
+            scope: self.scope.clone(),
+            network_node: self.ctx.net_handle.as_ref().map(|net| net.node_id()),
+            mutation,
+            intent: call_intent(intent),
         };
-        let mutation = mutation(ready.entity.clone());
-        let place = (
-            &self.scope,
-            self.ctx.net_handle.as_ref().map(|net| net.node_id()),
-        );
-        let apply = ApplyChange::new(place, ready, mutation, call_intent(intent));
-        let applied = drive(apply, &self.ctx).await;
-        applied.map_err(|failure| failure.error)
+        Ok(Checked::new(prepare, plan))
     }
 
-    /// Runs a revision-checked change of one file entity under the write grants. A file it names
-    /// must be readable through `objects.read`, as for a restricted REST writer.
-    async fn file_write(
+    /// A revision-checked change of one file entity under the write grants. A file it names must
+    /// be readable through `objects.read`, as for a restricted REST writer.
+    fn file_change(
         &self,
         cx: &CallContext,
         change: &FileChange,
         mutation: UpdateDocumentMutation,
         file: Option<Value>,
-    ) -> Result<String, HostError> {
-        let revision = (change.resource.as_str(), change.expected.as_str());
-        let intent = call_intent(&change.intent);
-        let input = ChangeInput::File(file);
-        let prepare = PrepareChange::new(self.read_place(cx), revision, intent, input)?;
-        (self.routed_change(prepare, &change.intent, |_| mutation)).await
+    ) -> Result<Checked<PrepareChange, ChangePlan>, HostError> {
+        let target = (change.resource.as_str(), change.expected.as_str(), &change.intent);
+        let input = (ChangeInput::File(file), ChangeMutation::Given(mutation));
+        self.change(cx, target, input)
     }
 
     /// Records a fresh effect's outcome in its intent.
@@ -292,14 +287,11 @@ impl Broker for RunBroker {
         cx: &CallContext,
         patch: MetadataPatch,
     ) -> Result<String, HostError> {
-        let revision = (patch.resource.as_str(), patch.expected.as_str());
-        let intent = call_intent(&patch.intent);
-        let input = ChangeInput::Patch(patch.patch.clone());
-        let prepare = PrepareChange::new(self.read_place(cx), revision, intent, input)?;
-        let mutation = |entity: Option<String>| UpdateDocumentMutation::UpsertContextualEntity {
-            jsonld: entity.unwrap_or_default(),
-        };
-        self.routed_change(prepare, &patch.intent, mutation).await
+        let target = (patch.resource.as_str(), patch.expected.as_str(), &patch.intent);
+        let input = (ChangeInput::Patch(patch.patch.clone()), ChangeMutation::Dataset);
+        let change = self.change(cx, target, input)?;
+        let written = drive(change, &self.ctx).await;
+        written.map_err(|failure| self.failed(failure))
     }
 
     async fn metadata_create(
@@ -310,18 +302,14 @@ impl Broker for RunBroker {
         let place = (create.path.as_str(), create.key.as_str());
         let intent = call_intent(&create.intent);
         let prepare = PrepareCreate::new(&self.scope, place, &create.dataset, intent)?;
-        let step = drive(prepare, &self.ctx).await;
-        let ready = match step.map_err(|failure| self.failed(failure))? {
-            CallStep::Replied(reply) => return stored_created(&reply),
-            CallStep::Proceed(ready) => ready,
+        let plan = CreatePlan {
+            network_node: self.ctx.net_handle.as_ref().map(|net| net.node_id()),
+            key: create.key.clone(),
+            run_id: self.scope.run.run_id,
+            intent: call_intent(&create.intent),
         };
-        let intent = call_intent(&create.intent);
-        let node = self.ctx.net_handle.as_ref().map(|net| net.node_id());
-        let finish = FinishCreate::new(ready, node, &create.key, (self.scope.run.run_id, intent));
-        let reply = drive(finish, &self.ctx)
-            .await
-            .map_err(|failure| failure.error)?;
-        stored_created(&reply)
+        let created = drive(Checked::new(prepare, plan), &self.ctx).await;
+        stored_created(&created.map_err(|failure| self.failed(failure))?)
     }
 
     async fn metadata_put_file(
@@ -334,7 +322,9 @@ impl Broker for RunBroker {
             jsonld: file.clone(),
         };
         let file: Value = serde_json::from_str(&file).unwrap_or(Value::Null);
-        self.file_write(cx, &change, mutation, Some(file)).await
+        let write = self.file_change(cx, &change, mutation, Some(file))?;
+        let written = drive(write, &self.ctx).await;
+        written.map_err(|failure| self.failed(failure))
     }
 
     async fn metadata_remove_file(
@@ -347,7 +337,9 @@ impl Broker for RunBroker {
         }
         let id = change.file.clone();
         let mutation = UpdateDocumentMutation::RemoveDataEntity { id };
-        self.file_write(cx, &change, mutation, None).await
+        let write = self.file_change(cx, &change, mutation, None)?;
+        let written = drive(write, &self.ctx).await;
+        written.map_err(|failure| self.failed(failure))
     }
 
     async fn objects_info(

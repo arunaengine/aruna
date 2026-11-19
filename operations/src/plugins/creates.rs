@@ -18,7 +18,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::host_calls::{CallEnd, CallFailure, RecordCall};
-use super::host_steps::{Granted, ReadyCreate};
+use super::host_steps::{Granted, ProceedPlan, ReadyCreate};
 use super::rows::{StoreError, decode, done, encode, read_call, row, values};
 use super::unavailable;
 use crate::auth::error::AuthorizeError;
@@ -387,6 +387,25 @@ impl FinishCreate {
             (None, Some(end)) => self.record(Err(end)),
             (None, None) => self.record(Err(CallEnd::Maybe("no outcome".to_string()))),
         }
+    }
+}
+
+/// Creates a checked new document from this node under the call's key and intent.
+#[derive(Debug, PartialEq)]
+pub struct CreatePlan {
+    pub network_node: Option<NodeId>,
+    pub key: String,
+    pub run_id: Ulid,
+    pub intent: CallIntent,
+}
+
+impl ProceedPlan for CreatePlan {
+    type Ready = ReadyCreate;
+    type Call = FinishCreate;
+
+    fn call(self, ready: ReadyCreate) -> FinishCreate {
+        let call = (self.run_id, self.intent);
+        FinishCreate::new(ready, self.network_node, &self.key, call)
     }
 }
 
