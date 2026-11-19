@@ -154,7 +154,7 @@ pub(super) fn drain_delay(result: &MetadataDrainResult) -> Duration {
 // Parked materialization jobs come back on their own backoff, so a node that hit
 // the failure cap during a storm converges again without an operator or restart.
 async fn sweep_dead_letters(context: &DriverContext) {
-    if let Err(error) = drive(RequeueDeadLettersOperation::new(), &context.bulk()).await {
+    if let Err(error) = drive(RequeueParkedOperation::new(), &context.bulk()).await {
         warn!(error = ?error, "Failed to requeue metadata materialization dead letters");
     }
 }

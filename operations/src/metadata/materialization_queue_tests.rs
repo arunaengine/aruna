@@ -146,7 +146,7 @@ async fn materialization_jobs_exist(
 async fn requeue_dead_letters(
     storage: &StorageHandle,
 ) -> Result<usize, MetadataMaterializationError> {
-    drive(RequeueDeadLettersOperation::new(), &context(storage)).await
+    drive(RequeueParkedOperation::new(), &context(storage)).await
 }
 
 async fn prune_jobs(
@@ -1166,7 +1166,7 @@ fn requeue_reads_guard() {
         parks: 1,
         requeue_at_ms: 1,
     };
-    let mut requeue = RequeueDeadLetterOperation::new(dead_letter);
+    let mut requeue = RequeueJobOperation::new(dead_letter);
     assert_eq!(requeue.transaction(), TransactionMode::Write);
     requeue.stamp(7);
     assert_eq!(

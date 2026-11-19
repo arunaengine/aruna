@@ -82,7 +82,7 @@ use crate::metadata::data_links::RetryUnverifiedOperation;
 use crate::metadata::materialization_queue::{
     JobsExistOperation, MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER,
     MaterializationBatchOperation, MetadataDrainResult, NEXT_BATCH_AFTER, NextTimerOperation,
-    RequeueDeadLettersOperation, materialization_group_concurrency,
+    RequeueParkedOperation, materialization_group_concurrency,
 };
 use crate::metadata::projection::{
     DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,

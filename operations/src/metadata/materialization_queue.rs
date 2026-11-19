@@ -960,7 +960,7 @@ enum RequeueStage {
 /// node converges once the cause clears. Dead letters the document has moved
 /// past are dropped instead. Answers the number of jobs requeued.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RequeueDeadLettersOperation {
+pub(crate) struct RequeueParkedOperation {
     now_ms: u64,
     due_ms: u64,
     rows: VecDeque<(Key, Value)>,
@@ -969,7 +969,7 @@ pub(crate) struct RequeueDeadLettersOperation {
     stage: RequeueStage,
 }
 
-impl RequeueDeadLettersOperation {
+impl RequeueParkedOperation {
     pub(crate) fn new() -> Self {
         Self {
             now_ms: 0,
@@ -1004,7 +1004,7 @@ impl RequeueDeadLettersOperation {
             }
             let job = &dead_letter.job;
             self.stage = RequeueStage::Requeue(job.document_id, job.event_id);
-            let requeue = RequeueDeadLetterOperation::new(dead_letter);
+            let requeue = RequeueJobOperation::new(dead_letter);
             return Ok(Next::Call(IoCall::child(requeue)));
         }
         if let Some(after) = self.next.take() {
@@ -1021,7 +1021,7 @@ impl RequeueDeadLettersOperation {
     }
 }
 
-impl Operation for RequeueDeadLettersOperation {
+impl Operation for RequeueParkedOperation {
     type Output = usize;
     type Error = MetadataMaterializationError;
 
@@ -1087,13 +1087,13 @@ enum ParkedStage {
 /// the requeued job is pruned as obsolete on the next scan. The transactional status guard
 /// conflicts with a newer event instead of restoring stale work.
 #[derive(Debug, PartialEq)]
-struct RequeueDeadLetterOperation {
+struct RequeueJobOperation {
     dead_letter: DeadLetterRecord,
     now_ms: u64,
     stage: ParkedStage,
 }
 
-impl RequeueDeadLetterOperation {
+impl RequeueJobOperation {
     fn new(dead_letter: DeadLetterRecord) -> Self {
         Self {
             dead_letter,
@@ -1157,7 +1157,7 @@ impl RequeueDeadLetterOperation {
     }
 }
 
-impl Operation for RequeueDeadLetterOperation {
+impl Operation for RequeueJobOperation {
     type Output = bool;
     type Error = MetadataMaterializationError;
 
