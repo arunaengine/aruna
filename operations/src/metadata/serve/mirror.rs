@@ -19,10 +19,11 @@ use aruna_core::user::id::UserId;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::forward::write_peer::WritePeerOperation;
-use crate::replication::sync_relationship::{
-    DeleteRelationshipOperation, GetRelationshipOperation, RemoveOutgoingOperation,
-    StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
-};
+use crate::replication::sync_relationship::delete::DeleteRelationshipOperation;
+use crate::replication::sync_relationship::get::GetRelationshipOperation;
+use crate::replication::sync_relationship::remove::RemoveOutgoingOperation;
+use crate::replication::sync_relationship::store::StoreRelationshipOperation;
+use crate::replication::sync_relationship::{SyncRelationshipDirection, SyncRelationshipError};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::write_guard::{BucketGuardError, BucketGuardOperation};
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};

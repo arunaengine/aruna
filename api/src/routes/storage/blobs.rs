@@ -21,10 +21,11 @@ use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, Repli
 use aruna_drivers::driver::{drive, drive_until};
 use aruna_operations::blob::holders::{GetHoldersError, GetHoldersOperation};
 use aruna_operations::distribution::resolve::key_holders;
-use aruna_operations::replication::locations::{
-    LocationSummaryError, LocationSummaryOperation, QueuedNodesOperation, QueuedReplicas,
-    RelationshipNodesOperation, RemoteLocationOperation,
-};
+use aruna_operations::replication::locations::LocationSummaryError;
+use aruna_operations::replication::locations::local::LocationSummaryOperation;
+use aruna_operations::replication::locations::queued::{QueuedNodesOperation, QueuedReplicas};
+use aruna_operations::replication::locations::relationships::RelationshipNodesOperation;
+use aruna_operations::replication::locations::remote::RemoteLocationOperation;
 use aruna_operations::replication::plaintext::{EncryptionCheckOperation, HolderCheckOperation};
 use aruna_operations::replication::queue::QueueBlobOperation;
 use axum::extract::{Query, State};

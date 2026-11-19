@@ -32,7 +32,8 @@ use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, redeem_ticket, unsigned_ticket,
 };
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
+use aruna_operations::replication::locations::LocationSummaryError;
+use aruna_operations::replication::locations::remote::RemoteLocationOperation;
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::body::Body;

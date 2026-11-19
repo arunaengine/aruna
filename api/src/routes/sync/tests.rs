@@ -28,7 +28,7 @@ use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::mirror_repair::SyncMirrorRecord;
 use aruna_core::user::id::UserId;
 use aruna_drivers::testing::test_context;
-use aruna_operations::replication::mirror_repair::DrainRepairsOperation;
+use aruna_operations::replication::mirror_repair::drain::DrainRepairsOperation;
 use tempfile::TempDir;
 
 fn test_node(seed: u8) -> NodeId {

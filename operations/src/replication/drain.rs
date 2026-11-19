@@ -55,9 +55,9 @@ use super::version_replication::{
 use crate::groups::routing::{QuotaOperation, RoutingInputsError};
 use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::queue_backoff::{due_after, min_due_at, retry_delay_ms};
-use crate::replication::mirror_repair::{
-    KickRepairOperation, StoreStatusOperation, SyncMirrorError,
-};
+use crate::replication::mirror_repair::SyncMirrorError;
+use crate::replication::mirror_repair::kick::KickRepairOperation;
+use crate::replication::mirror_repair::status::StoreStatusOperation;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::storage::replication_queue::MemberTarget;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;

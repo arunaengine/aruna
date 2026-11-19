@@ -30,12 +30,11 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::peer_trust::is_sync_eligible;
-use crate::replication::mirror_repair::{
-    KickRepairOperation, StoreStatusOperation, SyncMirrorError,
-};
-use crate::replication::sync_relationship::{
-    GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
-};
+use crate::replication::mirror_repair::SyncMirrorError;
+use crate::replication::mirror_repair::kick::KickRepairOperation;
+use crate::replication::mirror_repair::status::StoreStatusOperation;
+use crate::replication::sync_relationship::get::GetRelationshipOperation;
+use crate::replication::sync_relationship::{SyncRelationshipDirection, SyncRelationshipError};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -744,9 +743,8 @@ mod tests {
     async fn denial_journals_failure() {
         // A native read whose creator lost READ fails the relationship and journals its
         // `sync_failed` with that status write, with no replication job queued.
-        use crate::replication::sync_relationship::{
-            StoreRelationshipOperation, SyncRelationshipDirection,
-        };
+        use crate::replication::sync_relationship::SyncRelationshipDirection;
+        use crate::replication::sync_relationship::store::StoreRelationshipOperation;
         use aruna_core::structs::storage::blob::BucketInfo;
         use aruna_core::structs::storage::format::Compression;
         let tempdir = tempfile::tempdir().unwrap();

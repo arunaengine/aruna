@@ -2,21 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod create;
-mod delete;
-mod get;
-mod list;
-mod remove;
-mod store;
+pub mod create;
+pub mod delete;
+pub mod get;
+pub mod list;
+pub mod remove;
+pub mod store;
 #[cfg(test)]
 mod tests;
-
-pub use create::CreateRelationshipOperation;
-pub use delete::DeleteRelationshipOperation;
-pub use get::GetRelationshipOperation;
-pub use list::ListRelationshipsOperation;
-pub use remove::RemoveOutgoingOperation;
-pub use store::StoreRelationshipOperation;
 
 use aruna_core::calls::{IoCall, IoError};
 use aruna_core::errors::{ConversionError, StorageError};

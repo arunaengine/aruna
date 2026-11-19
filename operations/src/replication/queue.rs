@@ -504,7 +504,7 @@ mod tests {
         .await
     }
     use super::super::version_replication::SourceAuthorizationError;
-    use crate::replication::mirror_repair::StoreStatusOperation;
+    use crate::replication::mirror_repair::status::StoreStatusOperation;
     use aruna_core::effects::Effect;
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{

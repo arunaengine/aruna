@@ -2,8 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::create::CreateRelationshipOperation;
+use super::delete::DeleteRelationshipOperation;
+use super::get::GetRelationshipOperation;
+use super::list::ListRelationshipsOperation;
+use super::store::StoreRelationshipOperation;
 use super::*;
-use crate::replication::mirror_repair::MirrorRecordOperation;
+use crate::replication::mirror_repair::record::MirrorRecordOperation;
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;

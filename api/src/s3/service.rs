@@ -96,10 +96,10 @@ use aruna_operations::auth::request_authorization::BucketAccessOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::placement::policy::gate::GateOperation;
-use aruna_operations::replication::mirror_repair::{KickRepairOperation, MirrorRecordOperation};
-use aruna_operations::replication::sync_relationship::{
-    CreateRelationshipOperation, SyncRelationshipDirection,
-};
+use aruna_operations::replication::mirror_repair::kick::KickRepairOperation;
+use aruna_operations::replication::mirror_repair::record::MirrorRecordOperation;
+use aruna_operations::replication::sync_relationship::SyncRelationshipDirection;
+use aruna_operations::replication::sync_relationship::create::CreateRelationshipOperation;
 use aruna_operations::s3::bucket::cors::{DeleteCorsOperation, GetCorsOperation, PutCorsOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;

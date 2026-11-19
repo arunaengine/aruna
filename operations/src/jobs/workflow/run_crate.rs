@@ -55,7 +55,8 @@ use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::realm::mutate_placement::node_kind;
-use crate::replication::locations::{LocationSummaryError, RemoteLocationOperation};
+use crate::replication::locations::LocationSummaryError;
+use crate::replication::locations::remote::RemoteLocationOperation;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };

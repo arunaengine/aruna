@@ -166,8 +166,9 @@ use aruna_operations::realm::announce_presence::{
 use aruna_operations::replication::drain::{
     ProcessBatchOperation, REPLICATION_RETRY_AFTER, RestoreDrainOperation,
 };
-use aruna_operations::replication::mirror_repair::{
-    DrainRepairsOperation, REPAIR_RETRY_AFTER, RestoreTimerOperation,
+use aruna_operations::replication::mirror_repair::REPAIR_RETRY_AFTER;
+use aruna_operations::replication::mirror_repair::drain::{
+    DrainRepairsOperation, RestoreTimerOperation,
 };
 use aruna_operations::replication::page::deliver::MetadataPages;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
