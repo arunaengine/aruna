@@ -531,8 +531,6 @@ pub enum NetEvent {
     CursorSigned(Option<iroh::Signature>),
     /// The peer's last-contact time is refreshed.
     PeerContact,
-    /// The JSON-LD summary of a dataset, or why it could not be read.
-    DatasetSummary(Result<String, crate::structs::storage::dataset_description::DescriptionError>),
     Shard(Box<ShardNetEvent>),
     /// Whether sync topics took the requested peers.
     TopicPeers(Result<(), TopicPeerError>),
@@ -1063,7 +1061,6 @@ impl Event {
                     DocumentPeers,
                     GrantedRead,
                     DelegatedRead,
-                    DatasetSummary,
                     PeerContact,
                     GrantSign,
                     DelegationSign,

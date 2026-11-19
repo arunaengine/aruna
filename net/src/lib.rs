@@ -1098,7 +1098,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::RefreshDocumentPeers(_)) => "refresh_document_peers",
         Effect::Net(NetEffect::GrantedRead(_)) => "granted_read",
         Effect::Net(NetEffect::DelegatedRead(_)) => "delegated_read",
-        Effect::Net(NetEffect::DatasetSummary(_)) => "dataset_summary",
         Effect::Net(NetEffect::PeerContact(_)) => "peer_contact",
         Effect::Net(NetEffect::GrantSign(_)) => "grant_sign",
         Effect::Net(NetEffect::DelegationSign(_)) => "delegation_sign",

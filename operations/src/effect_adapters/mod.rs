@@ -130,10 +130,6 @@ async fn dispatch_unboxed(
         }
         // Peer contacts live on the net handle the runner holds.
         Effect::Net(NetEffect::PeerContact(peer)) => net::note_contact(peer, context),
-        // The routed export reads through the handles the runner holds.
-        Effect::Net(NetEffect::DatasetSummary(request)) => {
-            metadata::dispatch_summary(*request, context).await
-        }
         Effect::Net(NetEffect::Shard(effect)) => {
             Box::pin(shard::dispatch_shard(*effect, context)).await
         }

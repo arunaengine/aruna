@@ -847,8 +847,6 @@ pub enum NetEffect {
     /// Refreshes the last-contact time of a peer whose request was just accepted; answers
     /// `NetEvent::PeerContact`.
     PeerContact(NodeId),
-    /// Reads a dataset's summary from its holders; answers `NetEvent::DatasetSummary`.
-    DatasetSummary(Box<crate::structs::storage::dataset_description::DatasetSummaryRequest>),
     /// Asks how long each node has been silent; answers `NetEvent::HeartbeatSilence`.
     HeartbeatSilence(Vec<NodeId>),
     /// Works on this node's shard topics; answers `NetEvent::Shard`.

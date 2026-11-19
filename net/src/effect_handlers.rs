@@ -18,7 +18,6 @@ use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::execution::job::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::dataset_description::DescriptionError;
 use aruna_core::structs::storage::distribution::delegation::{Delegation, SignedDelegation};
 use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
 use aruna_core::structs::storage::distribution::{SignedSnapshot, SignedStatement, StatementClaim};
@@ -276,10 +275,6 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         )),
         // Peer contacts live on the net handle the runner holds.
         NetEffect::PeerContact(_) => NetEvent::PeerContact,
-        // The routed export reads through the handles the runner holds.
-        NetEffect::DatasetSummary(_) => {
-            NetEvent::DatasetSummary(Err(DescriptionError::Unavailable))
-        }
         // Metadata requests ride the metadata transport the runner holds.
         NetEffect::MetadataRequest(request) => NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
             peer: request.peer,
@@ -676,7 +671,6 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::RefreshDocumentPeers(_) => "refresh_document_peers",
         NetEffect::GrantedRead(_) => "granted_read",
         NetEffect::DelegatedRead(_) => "delegated_read",
-        NetEffect::DatasetSummary(_) => "dataset_summary",
         NetEffect::PeerContact(_) => "peer_contact",
         NetEffect::GrantSign(_) => "grant_sign",
         NetEffect::DelegationSign(_) => "delegation_sign",
