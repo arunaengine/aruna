@@ -370,4 +370,16 @@ mod tests {
             AttemptPhase::SystemError { .. }
         ));
     }
+
+    #[test]
+    fn exports_vault_env() {
+        // Slurm sources this file and Apptainer reads the same names, so both deliver it.
+        let attempt = aruna_core::compute::AttemptRef::new("job", 0);
+        let mut spec = TaskSpec::new(attempt, "image");
+        let password = aruna_core::compute::Secret::new("it's");
+        spec.vault_env
+            .insert("WEBIN_PASSWORD".to_string(), password);
+        let script = env_script(&spec).unwrap();
+        assert!(script.contains("export APPTAINERENV_WEBIN_PASSWORD='it'\\''s'\n"));
+    }
 }
