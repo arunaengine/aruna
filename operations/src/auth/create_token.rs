@@ -164,7 +164,6 @@ mod test {
     use crate::auth::create_token::{
         CreateTokenConfig, CreateTokenError, CreateTokenOperation, mint_token,
     };
-    use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::operation::Operation;
@@ -172,6 +171,7 @@ mod test {
         NodeCapabilities, SessionKind, SessionRef, TokenClaims,
     };
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;

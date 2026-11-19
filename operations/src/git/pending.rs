@@ -377,9 +377,9 @@ mod tests {
         self, answered, asks_child, asks_store, child, dataset, git_node, ran,
     };
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::git::GitAnswer;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_drivers::driver::{DriverContext, drive};
 
     // Rows sort by the order the store handed out, whatever the commit ids are.
     #[test]

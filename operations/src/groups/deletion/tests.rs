@@ -35,11 +35,11 @@ use ulid::Ulid;
 
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
-use crate::driver::{DriverContext, drive};
 #[cfg(test)]
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
 #[cfg(test)]
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
+use aruna_drivers::driver::{DriverContext, drive};
 
 pub struct Fixture {
     pub dir: TempDir,

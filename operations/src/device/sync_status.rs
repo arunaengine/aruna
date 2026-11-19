@@ -540,13 +540,13 @@ mod tests {
     use crate::device::publish_queue::publish_entry;
     use crate::device::replica::ReplicaOrigin;
     use crate::device::sync_note::{NoteSyncOperation, SyncNote};
-    use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::{FolderMode, RemoteBinding};
+    use aruna_drivers::driver::{DriverContext, drive};
     use std::sync::Arc;
 
     fn replica(state: ReplicaState) -> ReplicaRecord {
@@ -733,7 +733,7 @@ mod tests {
             outbound_handle: None,
         });
         let now = unix_timestamp_millis();
-        let note = |note| crate::driver::drive(NoteSyncOperation::new(note, now), &context);
+        let note = |note| aruna_drivers::driver::drive(NoteSyncOperation::new(note, now), &context);
         note(SyncNote::Contact).await.unwrap();
         assert!(
             drive(read_sync_state(), &context)

@@ -266,7 +266,6 @@ mod tests {
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
     use crate::connectors::descriptor::build_source_binding;
     use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
-    use crate::driver::drive;
     use crate::tests::connectors::{
         create_connector, defers_pending, reference_rows, source_metadata, vault_context,
         write_reference,
@@ -275,6 +274,7 @@ mod tests {
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::staging::StagingStrategy;
     use aruna_core::structs::storage::blob::BlobVersion;
+    use aruna_drivers::driver::drive;
 
     fn connector_secret(connector_id: Ulid, user: &str) -> SourceConnectorSecret {
         SourceConnectorSecret::new(

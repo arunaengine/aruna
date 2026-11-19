@@ -4,10 +4,10 @@
 
 use super::*;
 use crate::distribution::test_record::{record, store_record};
-use crate::driver::{DriverContext, drive};
 use aruna_core::calls::IoCall;
 use aruna_core::structs::storage::distribution::snapshot::Deletion;
 use aruna_core::types::{Key, Value};
+use aruna_drivers::driver::{DriverContext, drive};
 
 #[test]
 fn counts_sets_once() {

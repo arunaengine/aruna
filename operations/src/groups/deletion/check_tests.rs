@@ -39,8 +39,8 @@ use super::check::CheckOperation;
 #[cfg(test)]
 use super::check::{CheckNodeOperation, ScanOperation};
 use super::tests::{Fixture, node, read, write};
-use crate::driver::drive;
 use crate::s3::bucket::create::CreateBucketOperation;
+use aruna_drivers::driver::drive;
 
 /// Creates the buckets and denies the caller READ on `hidden` at `seed`.
 pub async fn buckets(fixture: &Fixture, seed: u8, names: &[&str]) {

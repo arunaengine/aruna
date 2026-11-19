@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use aruna_core::NodeId;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentEvent, DocumentSyncRevision, DocumentTarget,
@@ -17,6 +16,7 @@ use aruna_core::structs::{
     build_quarantine_entries, quarantine_row_entry, quarantine_usage_entry,
 };
 use aruna_core::types::{Key, Value};
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::storage;
 use ulid::Ulid;
 

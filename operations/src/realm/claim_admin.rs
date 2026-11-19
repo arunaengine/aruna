@@ -327,7 +327,6 @@ fn materialize_admin_assignment(
 #[cfg(test)]
 mod tests {
     use super::{ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult};
-    use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
@@ -342,6 +341,7 @@ mod tests {
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::auth::{Actor, Role};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;

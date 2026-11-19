@@ -709,9 +709,9 @@ impl Operation for AwaitingJobsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::jobs::key_locks::KeyUnlockedOperation;
-    use crate::testing::test_context;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::test_context;
     use aruna_storage::StorageHandle;
 
     async fn next_blob_timer(storage: &StorageHandle) -> Result<Option<Duration>, BlobQueueError> {
@@ -720,12 +720,12 @@ mod tests {
     }
 
     async fn process_transitions(
-        context: &crate::driver::DriverContext,
+        context: &aruna_drivers::driver::DriverContext,
     ) -> Result<Option<Duration>, String> {
         let process = crate::blob::migration::queue::ProcessTransitionsOperation::new(
             context.node_and_realm(),
         );
-        crate::driver::drive(process, context)
+        aruna_drivers::driver::drive(process, context)
             .await
             .map_err(|error| error.to_string())
     }
@@ -778,7 +778,7 @@ mod tests {
         let blob_root = format!("{root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage = aruna_storage::FjallStorage::open(root).unwrap();
-        let net = aruna_net::NetHandle::new(crate::testing::local_net(), storage.clone())
+        let net = aruna_net::NetHandle::new(aruna_drivers::testing::local_net(), storage.clone())
             .await
             .unwrap();
         let config = BackendConfig {

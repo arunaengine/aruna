@@ -210,9 +210,9 @@ impl Operation for UpdateRepositoryOperation {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
     use crate::harvest::read_connector::GetRepositoryOperation;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use tempfile::{TempDir, tempdir};
 

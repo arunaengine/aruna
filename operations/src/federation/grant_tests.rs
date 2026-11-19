@@ -10,7 +10,6 @@ use aruna_core::transfer::{ExportGrant, GrantError, GrantRecord};
 use ulid::Ulid;
 use url::Url;
 
-use crate::driver::{DriverContext, drive};
 use crate::federation::grant::{
     AdmitGrantOperation, IssueExportOperation, IssueGrantConfig, ReadGrantOperation,
     RevokeGrantOperation, record_key,
@@ -27,6 +26,7 @@ use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRef};
 use aruna_core::transfer::PinnedSource;
 use aruna_core::transfer::{MAX_TRANSFER_SECS, TransferError};
+use aruna_drivers::driver::{DriverContext, drive};
 use ed25519_dalek::SigningKey;
 use tempfile::{TempDir, tempdir};
 

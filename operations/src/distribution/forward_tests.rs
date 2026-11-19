@@ -10,7 +10,7 @@ use aruna_core::structs::storage::distribution::{
 };
 
 use super::*;
-use crate::driver::drive;
+use aruna_drivers::driver::drive;
 
 fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])

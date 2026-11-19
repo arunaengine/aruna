@@ -455,7 +455,6 @@ fn materialize_realm_role(
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
-    use crate::driver::{DriverContext, drive};
     use crate::realm::add_role::{
         RealmRoleConfig, RealmRoleError, RealmRoleOperation, RoleWrite, Step,
     };
@@ -475,6 +474,7 @@ pub mod test {
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;

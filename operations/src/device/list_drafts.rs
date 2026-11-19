@@ -66,10 +66,10 @@ mod tests {
     use super::ListDraftsOperation;
     use crate::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
     use crate::device::publish_queue::{PUBLISH_PAGE_SIZE, PublishEntry};
-    use crate::driver::drive;
     use crate::tests::device::context;
     use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_drivers::driver::drive;
     use ulid::Ulid;
 
     // A full queue stops after the page that fills it, and a bad row fails.

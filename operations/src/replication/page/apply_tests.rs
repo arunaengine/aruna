@@ -37,8 +37,8 @@ use crate::distribution::test_record::{
     binding, member, realm, replicated, secret, store_record, with_settings,
 };
 use crate::distribution::test_store::{context, install, open};
-use crate::driver::drive;
 use crate::replication::protocol::VersionReplicationManifest;
+use aruna_drivers::driver::drive;
 
 struct Member {
     _dir: TempDir,

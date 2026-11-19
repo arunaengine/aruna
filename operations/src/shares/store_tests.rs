@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive, drive_retry};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::share::{ShareAction, ShareMode, ShareTarget, ShareUses};
+use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_storage::storage::FjallStorage;
 
 fn context(dir: &tempfile::TempDir) -> DriverContext {

@@ -6,7 +6,6 @@ use crate::tests::shard::flat_config;
 use std::sync::Arc;
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::shard::restore_plan::{
     RESTORE_CHUNK_TOPICS, RESTORE_TOPIC_COUNT, RESTORE_UNIT_BUDGET, shared_topic_peers,
 };
@@ -18,6 +17,7 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::record::PlacementStrategy;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::storage::FjallStorage;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;

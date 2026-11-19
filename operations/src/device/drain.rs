@@ -606,12 +606,12 @@ mod tests {
     use crate::device::delete_draft::DeleteDraftOperation;
     use crate::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
     use crate::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::tests::device::{context, read_value};
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_drivers::driver::{DriverContext, drive};
     use std::sync::Arc;
 
     fn entry() -> PublishEntry {

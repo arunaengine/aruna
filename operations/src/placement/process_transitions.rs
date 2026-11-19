@@ -1265,8 +1265,8 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::realm::load_config::config_unavailable;
+    use aruna_drivers::driver::{DriverContext, drive};
     use byteview::ByteView;
 
     fn node(seed: u8) -> NodeId {
@@ -1946,9 +1946,9 @@ mod tests {
         };
         assert!(fence::admits(value.as_ref(), 1));
 
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 1),
-            &crate::driver::DriverContext::storage_only(storage.clone()),
+            &aruna_drivers::driver::DriverContext::storage_only(storage.clone()),
         )
         .await
         .expect("the departing holder closes the fence");
@@ -2002,24 +2002,24 @@ mod tests {
             }
         };
 
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 3),
-            &crate::driver::DriverContext::storage_only(storage.clone()),
+            &aruna_drivers::driver::DriverContext::storage_only(storage.clone()),
         )
         .await
         .unwrap();
         assert_eq!(stored().await, 3);
         // A stale re-close never reopens the bucket.
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 2),
-            &crate::driver::DriverContext::storage_only(storage.clone()),
+            &aruna_drivers::driver::DriverContext::storage_only(storage.clone()),
         )
         .await
         .unwrap();
         assert_eq!(stored().await, 3);
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 4),
-            &crate::driver::DriverContext::storage_only(storage.clone()),
+            &aruna_drivers::driver::DriverContext::storage_only(storage.clone()),
         )
         .await
         .unwrap();
@@ -2027,20 +2027,20 @@ mod tests {
 
         let (lower, higher) = tokio::join!(
             async {
-                crate::driver::drive(
+                aruna_drivers::driver::drive(
                     crate::placement::process_transitions::CloseFenceOperation::new(
                         realm_id, placement, 5,
                     ),
-                    &crate::driver::DriverContext::storage_only(storage.clone()),
+                    &aruna_drivers::driver::DriverContext::storage_only(storage.clone()),
                 )
                 .await
             },
             async {
-                crate::driver::drive(
+                aruna_drivers::driver::drive(
                     crate::placement::process_transitions::CloseFenceOperation::new(
                         realm_id, placement, 6,
                     ),
-                    &crate::driver::DriverContext::storage_only(storage.clone()),
+                    &aruna_drivers::driver::DriverContext::storage_only(storage.clone()),
                 )
                 .await
             },
@@ -2073,9 +2073,9 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
 
-        crate::driver::drive(
+        aruna_drivers::driver::drive(
             crate::placement::process_transitions::CloseFenceOperation::new(realm_id, placement, 4),
-            &crate::driver::DriverContext::storage_only(storage.clone()),
+            &aruna_drivers::driver::DriverContext::storage_only(storage.clone()),
         )
         .await
         .unwrap();

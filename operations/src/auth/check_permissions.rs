@@ -87,13 +87,13 @@ mod test {
     use ulid::Ulid;
 
     use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
     use crate::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::realm::assign_role::{AssignRolesInput, AssignRolesOperation};
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     #[tokio::test]
     pub async fn public_roles_readonly() {

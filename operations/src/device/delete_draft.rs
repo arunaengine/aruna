@@ -92,11 +92,11 @@ impl Operation for DeleteDraftOperation {
 mod tests {
     use super::{DeleteDraftError, DeleteDraftOperation};
     use crate::device::publish_queue::{PublishEntry, PublishState, publish_entry};
-    use crate::driver::{DriverContext, drive};
     use crate::tests::device::context;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_drivers::driver::{DriverContext, drive};
     use ulid::Ulid;
 
     fn entry() -> PublishEntry {

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive, drive_retry};
 use crate::sync::mirror_repair::{MirrorRecordOperation, SyncMirrorIntent};
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
@@ -11,6 +10,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
 use aruna_core::{NodeId, UserId};
+use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_storage::storage::FjallStorage;
 use byteview::ByteView;
 use std::time::SystemTime;

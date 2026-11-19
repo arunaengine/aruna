@@ -73,11 +73,11 @@ async fn realm_admin_deletes() {
     );
 }
 use crate::connectors::repository::read_secret_effect;
-use crate::driver::drive;
 use crate::groups::fence::GroupWriteOperation;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
+use aruna_drivers::driver::drive;
 
 #[tokio::test]
 async fn prepared_restart_survives() {

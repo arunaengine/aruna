@@ -443,8 +443,8 @@ mod test {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     fn actor(realm_id: RealmId, node_seed: u8, user_seed: u8) -> Actor {
         Actor {

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use crate::secrets::tests::{create, name, token};
 use crate::testing::path_context;
@@ -12,6 +11,7 @@ use aruna_core::realm_vault::RealmSealKey;
 use aruna_core::secrets::SecretFields;
 use aruna_core::structs::identity::admin_audit::{AuditIndex, audit_prefix};
 use aruna_core::structs::identity::auth::Actor;
+use aruna_drivers::driver::{DriverContext, drive};
 use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
 

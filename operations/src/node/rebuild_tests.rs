@@ -35,9 +35,9 @@ use tempfile::tempdir;
 use ulid::Ulid;
 
 use super::{RebuildStatsError, RebuildStatsOperation};
-use crate::driver::DriverContext;
 use crate::node::rebuild_counts::CounterDeltas;
 use crate::testing::path_context;
+use aruna_drivers::driver::DriverContext;
 
 const GROUP_A: GroupId = Ulid::from_parts(1, 1);
 const GROUP_B: GroupId = Ulid::from_parts(2, 2);

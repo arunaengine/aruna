@@ -235,8 +235,8 @@ pub async fn has_row(handle: &StorageHandle, position: Vec<u8>) -> bool {
     get(handle, INVENTORY_KEYSPACE, position).await.is_some()
 }
 
-pub fn context(handle: &StorageHandle) -> crate::driver::DriverContext {
-    crate::driver::DriverContext {
+pub fn context(handle: &StorageHandle) -> aruna_drivers::driver::DriverContext {
+    aruna_drivers::driver::DriverContext {
         storage_handle: handle.clone(),
         net_handle: None,
         blob_handle: None,
@@ -359,11 +359,11 @@ impl Feeder {
     }
 
     /// One bounded pass over each walk; true when it changed an index or a row.
-    pub async fn pass(&mut self, context: &crate::driver::DriverContext) -> bool {
+    pub async fn pass(&mut self, context: &aruna_drivers::driver::DriverContext) -> bool {
         use crate::distribution::feed_walks::FeedPassOperation;
         let cursors = std::mem::take(&mut self.cursors);
         let pass = FeedPassOperation::new(self.limits, cursors);
-        match crate::driver::drive(pass, context).await {
+        match aruna_drivers::driver::drive(pass, context).await {
             Ok(pass) => {
                 self.cursors = pass.cursors;
                 pass.busy

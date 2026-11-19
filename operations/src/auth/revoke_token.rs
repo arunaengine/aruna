@@ -644,7 +644,6 @@ mod tests {
         RevokeTokenOperation, reducer_state_key,
     };
     use crate::document_repository::GetConfigOperation;
-    use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::sync::outbox_record::admin_outbox_prefix;
     use aruna_core::UserId;
@@ -661,6 +660,7 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::{Key, Value};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;

@@ -20,7 +20,6 @@ mod tests {
     use crate::distribution::replica_shares::{
         BindingShareOperation, GroupShare, ReplicaSharesOperation,
     };
-    use crate::driver::{DriverContext, drive};
     use crate::replication::members::BoundRecordOperation;
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::effects::StorageEffect;
@@ -35,6 +34,7 @@ mod tests {
     };
     use aruna_core::structs::storage::usage::UsageCounters;
     use aruna_core::types::{GroupId, Value};
+    use aruna_drivers::driver::{DriverContext, drive};
     use std::collections::BTreeMap;
     use ulid::Ulid;
 

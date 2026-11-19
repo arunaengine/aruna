@@ -182,10 +182,10 @@ impl Operation for AdmitTransferOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
     use crate::federation::import::tests::{
         context, descriptor, principal, realm, record, seed_cutoff, signer,
     };
+    use aruna_drivers::driver::drive;
 
     const NOW: u64 = 100;
 

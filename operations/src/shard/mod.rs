@@ -117,11 +117,11 @@ impl Operation for AssembleManifestOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::storage_entries::shard_manifest_entry;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use std::sync::Arc;

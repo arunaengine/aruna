@@ -1341,7 +1341,7 @@ mod pure_tests {
 
 #[cfg(test)]
 mod tests {
-    use crate::driver::DriverContext;
+    use aruna_drivers::driver::DriverContext;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use irokle::Storage as _;
     use ulid::Ulid;
@@ -1403,7 +1403,9 @@ mod tests {
                 BTreeSet::new(),
                 BTreeSet::new(),
             );
-            let (withheld, _) = crate::driver::drive(genesis, &context).await.unwrap();
+            let (withheld, _) = aruna_drivers::driver::drive(genesis, &context)
+                .await
+                .unwrap();
             assert!(!withheld, "a sole holder mints and keeps its topic");
             let state = node
                 .storage()

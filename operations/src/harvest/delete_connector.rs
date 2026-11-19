@@ -98,11 +98,11 @@ impl Operation for DeleteRepositoryOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
     use crate::harvest::read_connector::ListRepositoryOperation;
     use crate::harvest::update_connector::tests::{context, create};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_drivers::driver::drive;
 
     #[tokio::test]
     async fn delete_scoped_group() {

@@ -5,9 +5,9 @@
 
 use super::*;
 use crate::distribution::test_store::{apply, context, counters, install, open, range, write};
-use crate::driver::drive;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_drivers::driver::drive;
 use aruna_storage::storage::StorageHandle;
 
 fn set() -> Ulid {

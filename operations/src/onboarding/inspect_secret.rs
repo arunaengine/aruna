@@ -130,10 +130,10 @@ impl Operation for InspectSecretOperation {
 #[cfg(test)]
 mod tests {
     use super::{InspectSecretError, InspectSecretInput, InspectSecretOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
     use crate::onboarding::reserve_secret::{ReserveSecretInput, ReserveSecretOperation};
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;

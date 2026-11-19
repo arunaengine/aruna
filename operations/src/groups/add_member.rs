@@ -577,12 +577,12 @@ pub mod test {
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    use crate::driver::{DriverContext, drive};
     use crate::groups::add_member::{
         AddUserError, AddUserInput, AddUserOperation, MemberAddition, Step,
     };
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     fn node(seed: u8) -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

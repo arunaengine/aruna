@@ -466,13 +466,13 @@ pub mod test {
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    use crate::driver::{DriverContext, drive};
     use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::remove_role::{
         RemoveGroupConfig, RemoveGroupError, RemoveGroupOperation, RoleRemoval,
     };
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     async fn test_context() -> (DriverContext, NetHandle, TempDir) {
         let random_path = tempdir().unwrap();

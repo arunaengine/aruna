@@ -124,10 +124,10 @@ mod tests {
 
     use super::*;
     use crate::device::replica::{ReplicaOrigin, replica_key, replica_size};
-    use crate::driver::drive;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{DEVICE_GRAPH_KEYSPACE, DEVICE_REPLICA_KEYSPACE};
+    use aruna_drivers::driver::drive;
 
     // A graph stays counted after its replica row goes: nothing removes it locally yet.
     #[tokio::test]

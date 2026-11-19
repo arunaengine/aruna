@@ -196,13 +196,13 @@ impl Operation for RecoverInitialOperation {
 #[cfg(test)]
 mod tests {
     use super::{RecoverInitialInput, RecoverInitialOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::onboarding::consume_secret::{
         ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation,
     };
     use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
     use crate::onboarding::list_secrets::ListSecretsOperation;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;

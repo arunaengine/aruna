@@ -490,7 +490,6 @@ fn apply_reducer_federation(
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use crate::driver::{DriverContext, drive};
     use crate::testing::path_context;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentDot;
@@ -502,6 +501,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         OidcProviderConfig, RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
+    use aruna_drivers::driver::{DriverContext, drive};
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;

@@ -7,7 +7,6 @@ use super::super::testing::{
     projection, ran, record,
 };
 use super::*;
-use crate::driver::{DriverContext, drive};
 use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::Effect;
 use aruna_core::effects::StorageEffect;
@@ -21,6 +20,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::FjallStorage;
 
 const OLDER: Ulid = Ulid::from_parts(1, 10);

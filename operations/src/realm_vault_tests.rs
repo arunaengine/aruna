@@ -11,9 +11,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 
-use crate::driver::{DriverContext, drive};
 use crate::tests::policy::realm_view;
 use aruna_core::handle::Handle;
+use aruna_drivers::driver::{DriverContext, drive};
 
 const SECRET: &[u8] = b"canary-9e41";
 

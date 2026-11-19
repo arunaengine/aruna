@@ -13,14 +13,14 @@ use crate::session::index::MAX_USER_SESSIONS;
 /// A realm whose user `session_config` creates sessions for, on real storage.
 async fn session_realm() -> (
     tempfile::TempDir,
-    crate::driver::DriverContext,
+    aruna_drivers::driver::DriverContext,
     CreateSessionConfig,
     aruna_core::id::NodeId,
 ) {
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     let dir = tempfile::tempdir().unwrap();
     let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = crate::driver::DriverContext {
+    let context = aruna_drivers::driver::DriverContext {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
@@ -44,7 +44,7 @@ async fn session_realm() -> (
         node_weight: None,
         node_labels: Default::default(),
     };
-    crate::driver::drive(CreateRealmOperation::new(realm), &context)
+    aruna_drivers::driver::drive(CreateRealmOperation::new(realm), &context)
         .await
         .unwrap();
     (dir, context, config, node_id)
@@ -52,7 +52,7 @@ async fn session_realm() -> (
 
 /// Stores the user document of `config`'s user with the given attributes.
 async fn store_user(
-    context: &crate::driver::DriverContext,
+    context: &aruna_drivers::driver::DriverContext,
     config: &CreateSessionConfig,
     node_id: aruna_core::id::NodeId,
     attributes: std::collections::HashMap<String, String>,
@@ -86,8 +86,8 @@ async fn store_user(
 // the user's cutoff, and the next sign-in still works.
 #[tokio::test]
 async fn revokes_past_capacity() {
-    use crate::driver::drive;
     use crate::session::revoke::RevokeSessionOperation;
+    use aruna_drivers::driver::drive;
     let (_dir, context, config, node_id) = session_realm().await;
     let now = aruna_core::time::unix_timestamp_secs();
     let base = now - 1_000;
@@ -126,7 +126,7 @@ async fn revokes_past_capacity() {
         expiry: now + 3_600,
         ..config
     };
-    crate::driver::drive(MakeRoomOperation::new(node_id, next), &context)
+    aruna_drivers::driver::drive(MakeRoomOperation::new(node_id, next), &context)
         .await
         .unwrap();
 }
@@ -135,7 +135,7 @@ async fn revokes_past_capacity() {
 // before; none of its sessions are ended.
 #[tokio::test]
 async fn service_keeps_limit() {
-    use crate::driver::drive;
+    use aruna_drivers::driver::drive;
     for known in [true, false] {
         let (_dir, context, config, node_id) = session_realm().await;
         if known {
@@ -162,7 +162,8 @@ async fn service_keeps_limit() {
             expiry: now + 3_600,
             ..config.clone()
         };
-        let refused = crate::driver::drive(MakeRoomOperation::new(node_id, next), &context).await;
+        let refused =
+            aruna_drivers::driver::drive(MakeRoomOperation::new(node_id, next), &context).await;
         assert_eq!(
             refused,
             Err(CreateSessionError::LimitReached { oldest: base })
@@ -181,7 +182,7 @@ async fn service_keeps_limit() {
 // cutoff, so its token is not refused at once.
 #[tokio::test]
 async fn issues_at_cutoff() {
-    use crate::driver::drive;
+    use aruna_drivers::driver::drive;
     let (_dir, context, config, node_id) = session_realm().await;
     let now = aruna_core::time::unix_timestamp_secs();
     let actor = aruna_core::structs::identity::auth::Actor {
@@ -201,7 +202,7 @@ async fn issues_at_cutoff() {
         expiry: now + 3_600,
         ..config
     };
-    let created = crate::driver::drive(MakeRoomOperation::new(node_id, next), &context)
+    let created = aruna_drivers::driver::drive(MakeRoomOperation::new(node_id, next), &context)
         .await
         .unwrap();
     assert_eq!(created.session.created_at, now + 1);
@@ -211,7 +212,7 @@ async fn issues_at_cutoff() {
 // A user at the session limit still signs in: the oldest session is signed out instead.
 #[tokio::test]
 async fn full_user_login() {
-    use crate::driver::drive;
+    use aruna_drivers::driver::drive;
     let (_dir, context, config, node_id) = session_realm().await;
     store_user(&context, &config, node_id, Default::default()).await;
     // The cutoff is read against the wall clock, so the sessions are recent.
@@ -240,7 +241,7 @@ async fn full_user_login() {
         Err(CreateSessionError::LimitReached { oldest: base })
     );
 
-    crate::driver::drive(MakeRoomOperation::new(node_id, next), &context)
+    aruna_drivers::driver::drive(MakeRoomOperation::new(node_id, next), &context)
         .await
         .unwrap();
 

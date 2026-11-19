@@ -16,9 +16,9 @@ use aruna_storage::FjallStorage;
 use tempfile::tempdir;
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
+use aruna_drivers::driver::{DriverContext, drive};
 
 async fn bao_peer_admitted(
     context: &DriverContext,
@@ -414,8 +414,8 @@ async fn checks_advance_policy() {
 #[tokio::test]
 async fn denies_offered_bucket() {
     use crate::device::sync::repository::folder_bucket;
-    use crate::driver::drive;
     use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+    use aruna_drivers::driver::drive;
 
     let fixture = crate::tests::staging::setup_driver_context().await;
     let context = &fixture.driver_context;

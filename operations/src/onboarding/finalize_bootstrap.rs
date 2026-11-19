@@ -574,7 +574,6 @@ mod tests {
         OnboardedNoticeOperation, SyncTopicsOperation, onboarding_node_kind,
     };
     use crate::document_repository::{GetConfigError, GetConfigOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
     use crate::onboarding::reserve_secret::ReserveSecretError;
     use crate::onboarding::secret_state::secret_state_key;
@@ -598,6 +597,7 @@ mod tests {
     };
     use aruna_core::structs::placement::record::{BindingScope, DocumentClass};
     use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;

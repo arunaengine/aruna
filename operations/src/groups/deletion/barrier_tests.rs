@@ -22,10 +22,10 @@ use ulid::Ulid;
 
 use super::prepare::PrepareOperation;
 use super::tests::{Fixture, context, node, read, write};
-use crate::driver::drive;
 use crate::groups::fence::GroupWriteOperation;
 use crate::onboarding::issue_ticket::{IssueSyncInput, IssueSyncOperation};
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
+use aruna_drivers::driver::drive;
 
 fn enrollment(fixture: &Fixture) -> EnsureConfigOperation {
     EnsureConfigOperation::new(EnsureConfigParams {

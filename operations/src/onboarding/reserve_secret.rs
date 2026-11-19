@@ -324,7 +324,6 @@ impl Operation for ReserveSecretOperation {
 #[cfg(test)]
 mod tests {
     use super::{ReserveSecretError, ReserveSecretInput, ReserveSecretOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
@@ -333,6 +332,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use byteview::ByteView;
     use tempfile::tempdir;

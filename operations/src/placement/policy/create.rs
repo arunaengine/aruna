@@ -460,7 +460,6 @@ impl Operation for PolicyWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::placement::policy::read::{PolicySource, ReadPolicyConfig, ReadPolicyOperation};
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -471,6 +470,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::PlacementSelector;
     use aruna_core::structs::placement::policy::document::verify_policy_authority;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;

@@ -25,12 +25,12 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
 use crate::testing::path_context;
 use aruna_core::placement::transition::{TransitionRequest, plan_transition};
 use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits,
 };
+use aruna_drivers::driver::{DriverContext, drive};
 
 fn node(seed: u8) -> aruna_core::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()

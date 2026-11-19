@@ -15,7 +15,7 @@ use aruna_storage::storage::StorageHandle;
 use super::*;
 use crate::distribution::inventory::{AddedVersion, HeadChange, InventoryChange, InventoryUpdate};
 use crate::distribution::test_store::{apply, context, install, open, range};
-use crate::driver::drive;
+use aruna_drivers::driver::drive;
 
 fn set() -> Ulid {
     Ulid::from_bytes([7; 16])
