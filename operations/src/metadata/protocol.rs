@@ -81,6 +81,18 @@ pub struct MetadataPathResolution {
     pub conflicts: Vec<Ulid>,
 }
 
+/// The bearer token a revocation names. It travels as a plain string, and its Debug output never
+/// shows it, since operations that hold the message are recorded with Debug.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RevocationTarget(pub String);
+
+impl std::fmt::Debug for RevocationTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RevocationTarget(redacted)")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetadataTransportMessage {
     QueryGraphs {
@@ -252,7 +264,7 @@ pub enum MetadataTransportMessage {
     /// publish realm administration events.
     ForwardTokenRevocation {
         auth_token: AuthToken,
-        token: String,
+        token: RevocationTarget,
     },
     ForwardedTokenRevoked,
     #[serde(rename = "ForwardedTokenRevocationCapacity")]

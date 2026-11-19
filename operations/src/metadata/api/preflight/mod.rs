@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::hidden_token;
 use super::preflight_types::{
     MetadataExcludedForm, MetadataIndexState, MetadataPreflightLocation, MetadataResolvedTarget,
     MetadataStorageOperation, MetadataVisibleReference, ReferenceCoverage, ReferenceExecution,
@@ -184,7 +185,7 @@ pub(super) struct ResolvedPreflightTargets {
     pub(super) complete: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub(super) struct PreflightPlan {
     pub(super) auth: AuthContext,
     pub(super) bearer_token: Option<String>,
@@ -194,6 +195,22 @@ pub(super) struct PreflightPlan {
     pub(super) mode: Option<ApiQueryMode>,
     pub(super) target_nodes: Option<Vec<NodeId>>,
     pub(super) allow_partial: bool,
+}
+
+/// Shows whether a bearer is forwarded, never its value.
+impl std::fmt::Debug for PreflightPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreflightPlan")
+            .field("auth", &self.auth)
+            .field("bearer_token", &hidden_token(&self.bearer_token))
+            .field("cursor", &self.cursor)
+            .field("page_size", &self.page_size)
+            .field("mode", &self.mode)
+            .field("target_nodes", &self.target_nodes)
+            .field("allow_partial", &self.allow_partial)
+            .finish()
+    }
 }
 
 #[derive(Debug, PartialEq)]

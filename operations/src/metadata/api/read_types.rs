@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::hidden_token;
 use super::{AuthContext, MetadataFanoutStats, MetadataQueryResults, NodeId, Permission, Ulid};
 
 /// The canonical `metadata.read` policy request for one record path and caller,
@@ -24,7 +25,7 @@ pub enum ApiQueryMode {
     Distributed,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct DocumentQueryRequest {
     pub document_id: Ulid,
     pub auth: Option<AuthContext>,
@@ -34,7 +35,22 @@ pub struct DocumentQueryRequest {
     pub allow_partial: bool,
 }
 
-#[derive(Debug, Clone)]
+/// Shows whether a bearer is forwarded, never its value.
+impl std::fmt::Debug for DocumentQueryRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DocumentQueryRequest")
+            .field("document_id", &self.document_id)
+            .field("auth", &self.auth)
+            .field("bearer_token", &hidden_token(&self.bearer_token))
+            .field("query", &self.query)
+            .field("mode", &self.mode)
+            .field("allow_partial", &self.allow_partial)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct MetadataQueryRequest {
     pub auth: Option<AuthContext>,
     pub bearer_token: Option<String>,
@@ -43,6 +59,22 @@ pub struct MetadataQueryRequest {
     pub mode: Option<ApiQueryMode>,
     pub target_nodes: Option<Vec<NodeId>>,
     pub allow_partial: bool,
+}
+
+/// Shows whether a bearer is forwarded, never its value.
+impl std::fmt::Debug for MetadataQueryRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetadataQueryRequest")
+            .field("auth", &self.auth)
+            .field("bearer_token", &hidden_token(&self.bearer_token))
+            .field("graph_iris", &self.graph_iris)
+            .field("query", &self.query)
+            .field("mode", &self.mode)
+            .field("target_nodes", &self.target_nodes)
+            .field("allow_partial", &self.allow_partial)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::hidden_token;
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -343,7 +344,7 @@ pub type QueryCaller = (Option<AuthContext>, Option<String>);
 /// Runs one query across the realm. A bounded join no partition answers alone runs each side
 /// across the realm and joins them; otherwise each node answers for its own graphs and the parts
 /// merge, in order when ordered. Complete answers per credential scope use the query cache.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct DistributedQueryOperation {
     realm_id: RealmId,
     local_node: NodeId,
@@ -361,6 +362,30 @@ pub struct DistributedQueryOperation {
     cache_key: Option<[u8; 32]>,
     cache_stamp: Option<[u64; 2]>,
     stage: DistributedStage,
+}
+
+/// Shows whether a bearer is forwarded, never its value.
+impl std::fmt::Debug for DistributedQueryOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DistributedQueryOperation")
+            .field("realm_id", &self.realm_id)
+            .field("local_node", &self.local_node)
+            .field("caller", &(&self.caller.0, hidden_token(&self.caller.1)))
+            .field("graph_iris", &self.graph_iris)
+            .field("query", &self.query)
+            .field("scope", &self.scope)
+            .field("validate", &self.validate)
+            .field("deadline_ms", &self.deadline_ms)
+            .field("now_ms", &self.now_ms)
+            .field("form", &self.form)
+            .field("select_limit", &self.select_limit)
+            .field("ordered", &self.ordered)
+            .field("cache_key", &self.cache_key)
+            .field("cache_stamp", &self.cache_stamp)
+            .field("stage", &self.stage)
+            .finish()
+    }
 }
 
 impl DistributedQueryOperation {
