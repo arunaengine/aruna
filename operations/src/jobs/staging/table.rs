@@ -1409,11 +1409,9 @@ impl Operation for PutFolderOperation {
                 ))))
             }
             PutStep::Replicate => {
-                result
-                    .child::<bool, IoError>()?
-                    .map_err(|error| {
-                        ItemFailure::Stage(format!("replication queue failed: {error}"))
-                    })?;
+                result.child::<bool, IoError>()?.map_err(|error| {
+                    ItemFailure::Stage(format!("replication queue failed: {error}"))
+                })?;
                 Ok(Next::Done(()))
             }
         }

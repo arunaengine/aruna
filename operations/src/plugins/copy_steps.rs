@@ -25,7 +25,9 @@ use crate::s3::object::get::GetObjectError;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::transfer::copy::{CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions};
+use crate::transfer::copy::{
+    CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions,
+};
 
 /// A bucket and key inside it.
 type Place = (String, String);

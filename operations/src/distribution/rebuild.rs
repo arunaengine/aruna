@@ -547,7 +547,7 @@ pub struct BeginRebuildsOperation {
 
 impl BeginRebuildsOperation {
     /// Pages of `account_page` accounts; each rebuild records walk pages of `walk` rows and bytes.
-    pub(super) fn new(account_page: usize, walk: (usize, usize)) -> Self {
+    pub(crate) fn new(account_page: usize, walk: (usize, usize)) -> Self {
         Self {
             walk,
             pages: PrefixPages::new(RANGE_ACCOUNT_KEYSPACE, Vec::new(), account_page),

@@ -33,11 +33,7 @@ pub struct SyncMirrorRecord {
 
 impl SyncMirrorRecord {
     /// A fresh record staged at `now_ms`: a delete is due at once, a reconcile after the grace.
-    pub fn new(
-        relationship: SyncRelationship,
-        intent: SyncMirrorIntent,
-        now_ms: u64,
-    ) -> Self {
+    pub fn new(relationship: SyncRelationship, intent: SyncMirrorIntent, now_ms: u64) -> Self {
         let due_at_ms = match intent {
             SyncMirrorIntent::Reconcile => {
                 now_ms.saturating_add(RECONCILE_GRACE.as_millis() as u64)
