@@ -182,6 +182,8 @@ fn task_state(projection: Option<&JobProjection>) -> &'static str {
         Some(LogicalJobState::Succeeded) => "succeeded",
         Some(LogicalJobState::Failed) => "failed",
         Some(LogicalJobState::Cancelled) => "cancelled",
+        // The guest state set is fixed by the WIT; a family whose nodes all left never ran.
+        Some(LogicalJobState::NotRun) => "unknown",
     }
 }
 
