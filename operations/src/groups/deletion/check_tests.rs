@@ -9,7 +9,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
-use aruna_core::operation::TransactionMode;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::group_delete::GroupDeletionError;
 use aruna_core::structs::identity::group_delete::MembershipFence;

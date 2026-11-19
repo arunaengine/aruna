@@ -116,7 +116,6 @@ async fn caps_declared_outputs() {
         compute_handle: None,
         outbound_handle: None,
     };
-    let realm_id = RealmId([1u8; 32]);
     let mut spec = ExecutionSpec {
         group_id: Ulid::from_bytes([3u8; 16]),
         name: None,

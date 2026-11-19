@@ -239,7 +239,7 @@ async fn envelope_of(
     version_id: Ulid,
 ) -> Result<(ObjectEnvelope, EnvelopeArchive), AbeError> {
     let operation = EnvelopeOperation::new("bucket".to_string(), key.to_string(), version_id);
-    run(CallRun::new(operation), storage, None, Race::Off).await
+    run(operation, storage, None, Race::Off).await
 }
 
 /// The pending row of a version, whatever bucket key prefixes it.

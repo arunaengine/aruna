@@ -421,10 +421,12 @@ async fn import_records(
     let mut feeder = feed.await.unwrap();
     server.abort();
     // The index catches up with what the jobs wrote.
-    while background {
-        let pass = aruna_drivers::driver::drive(feeder.next_pass(), &fixture.driver).await;
-        if !feeder.passed(pass) {
-            break;
+    if background {
+        loop {
+            let pass = aruna_drivers::driver::drive(feeder.next_pass(), &fixture.driver).await;
+            if !feeder.passed(pass) {
+                break;
+            }
         }
     }
     let index = ended.elapsed().as_secs_f64();
