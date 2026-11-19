@@ -9,8 +9,6 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-# Integration tests build as one binary; declare each new tests/ file in tests/main.rs.
-autotests = false
 
 [features]
 # Pure test fixtures for the tests of other crates; only dev-dependencies enable it.

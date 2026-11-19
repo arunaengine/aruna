@@ -168,7 +168,6 @@ CLOCK_RE = re.compile(
     r"\b(?:(?:SystemTime|Instant|Utc)::now|unix_timestamp_(?:secs|millis)|(?<!\.)(?<!fn )now_ms(?=\s*\()"
     r"|Ulid::(?:new|generate)|thread_rng|OsRng|rand::(?:random|rng)|Uuid::new_v4|getrandom)\b"
 )
-EFFECT_OP_RE = re.compile(r"\bimpl(?:\s*<[^{;]*?>)?\s+(?:[\w:]+::)?EffectOperation\s+for\b")
 PAUSE_RE = re.compile(r"\bstart_paused\b|\bpause\s*\(\s*\)")
 # The shared bounded poll helper; the one real sleep in tests the guard does not count.
 POLL_HELPER = ("clock/src/testing.rs", "poll_until")
@@ -819,12 +818,6 @@ def report(root, baseline, show_all):
         now, before = lines.get(module, 0), baseline["async_lines"].get(module, 0)
         if show_all or now != before:
             print(f"  {module}: {now} (baseline {before})")
-    effect_ops = [
-        source.rel
-        for source in sources
-        for _ in EFFECT_OP_RE.finditer(source.masked)
-    ]
-    print(f"EffectOperation implementations outside tests: {len(effect_ops)}, reported only")
     for key, label in COUNTS:
         now, limit = counts[key], baseline["structural"][key]
         print(f"{label}: {now} (baseline {limit})")
