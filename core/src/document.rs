@@ -411,6 +411,28 @@ impl DocumentReconcileResult {
     }
 }
 
+/// The follow-up of an [`AppliedSync`] the node drain runs next, in this order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppliedStep {
+    #[default]
+    Usage,
+    Interest,
+    Mail,
+    Metadata,
+}
+
+impl AppliedStep {
+    /// The follow-up after this one, `None` after the last.
+    pub fn after(self) -> Option<Self> {
+        match self {
+            Self::Usage => Some(Self::Interest),
+            Self::Interest => Some(Self::Mail),
+            Self::Mail => Some(Self::Metadata),
+            Self::Metadata => None,
+        }
+    }
+}
+
 /// A reconcile a shard pull applied, kept until the node drain ran its usage, watch, mail and
 /// metadata follow-ups. The id orders the rows and is the generation of the usage refresh.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,6 +442,8 @@ pub struct AppliedSync {
     /// The realm this node serves, when it runs a net transport.
     pub realm_id: Option<RealmId>,
     pub result: DocumentReconcileResult,
+    /// The drain stores each finished follow-up here, so a rerun after a restart goes on.
+    pub next: AppliedStep,
 }
 
 impl AppliedSync {
