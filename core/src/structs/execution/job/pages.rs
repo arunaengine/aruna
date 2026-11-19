@@ -169,6 +169,7 @@ pub fn launch_entries(pages: Vec<InputPage>) -> Result<Vec<PlannedInput>, PageEr
 mod tests {
     use super::super::input::InputContent;
     use super::*;
+    use crate::structs::execution::job::input::InputContent;
 
     fn pin(index: u32, padding: usize) -> PlannedInput {
         PlannedInput {

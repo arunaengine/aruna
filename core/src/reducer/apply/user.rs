@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::reducer::paths::{user_alias_path};
+use crate::reducer::paths::user_alias_path;
 
 impl AdminDocumentState {
     pub(super) fn apply_user(
