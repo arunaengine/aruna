@@ -31,20 +31,11 @@ use crate::driver::{DriverContext, drive};
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
-use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::message_kind::transport_message_kind;
-use crate::metadata::protocol::metadata_read_error;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
-use crate::metadata::read_peer::{PeerReader, ReadPeerOperation, SearchPeerOperation};
-use crate::metadata::search_cursor::MAX_PAGINATION_DEPTH;
-use crate::metadata::serve::{ServeError, ServeRequestOperation};
-use crate::metadata::text_search::LocalSearchOperation;
+use crate::metadata::read_peer::ReadPeerOperation;
+use crate::metadata::serve::{ServeError, ServeNode, ServeRequestOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::local_search::LocalBucketSearch;
-use crate::s3::bucket::release::publish::{HolderAnswerOperation, PublishError};
-use crate::s3::bucket::search::SearchBucketsInput;
-use crate::s3::object::search::SearchObjectsInput;
-use crate::s3::object::search_scan::SearchObjectsOperation;
 use crate::staging::bucket_guard::BucketGuardOperation;
 use crate::staging::offered_directory::OfferedDirectoryError;
 use crate::sync::sync_relationship::{
@@ -52,7 +43,6 @@ use crate::sync::sync_relationship::{
     StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
 use aruna_core::metadata::AuthToken;
-use aruna_core::node_state::ReadInfoOperation;
 
 impl MetadataHandle {
     /// The caller of a read `peer` forwarded, as [`ReadPeerOperation`] checks it.
@@ -68,22 +58,6 @@ impl MetadataHandle {
             .map(|net| *net.realm_id())
             .ok_or(MetadataReadError::Unavailable)?;
         let check = ReadPeerOperation::new((peer, realm_id), auth_token, trusted);
-        drive(check, context).await
-    }
-
-    /// The caller of a search or release request `peer` forwarded, as `reader` admits it.
-    async fn search_caller(
-        &self,
-        context: &DriverContext,
-        peer: NodeId,
-        auth_token: Option<AuthToken>,
-        reader: PeerReader,
-    ) -> Result<AuthContext, MetadataReadError> {
-        let net = self.inner.net_handle.as_ref();
-        let realm_id = net
-            .map(|net| *net.realm_id())
-            .ok_or(MetadataReadError::Unavailable)?;
-        let check = SearchPeerOperation::new((peer, realm_id), auth_token, reader);
         drive(check, context).await
     }
 
@@ -330,260 +304,6 @@ async fn delete_mirror(
 }
 
 impl MetadataHandle {
-    async fn graph_request(
-        &self,
-        context: &DriverContext,
-        peer: NodeId,
-        message: MetadataTransportMessage,
-    ) -> MetadataTransportMessage {
-        let net = self.inner.net_handle.as_ref();
-        let (Some(_), Some(net)) = (context.graph_handle.as_ref(), net) else {
-            return match message {
-                MetadataTransportMessage::QueryGraphs { .. } => {
-                    MetadataTransportMessage::QueryResults {
-                        result: Err(MetadataReadError::Unavailable),
-                    }
-                }
-                _ => MetadataTransportMessage::SearchResults {
-                    result: Err(MetadataReadError::Unavailable),
-                },
-            };
-        };
-        let realm_id = *net.realm_id();
-        let (auth_token, graph_iris, group_id, query, limit, reference) = match message {
-            MetadataTransportMessage::QueryGraphs {
-                auth_token,
-                graph_iris,
-                sparql,
-            } => {
-                let result = match self.read_caller(context, peer, auth_token, false).await {
-                    Ok(auth) => {
-                        let query = LocalQueryOperation::new((realm_id, auth), graph_iris, sparql);
-                        Box::pin(drive(query, context))
-                            .await
-                            .map_err(metadata_read_error)
-                    }
-                    Err(error) => Err(error),
-                };
-                return MetadataTransportMessage::QueryResults { result };
-            }
-            MetadataTransportMessage::SearchGraphs {
-                auth_token,
-                graph_iris,
-                query,
-                limit,
-                group_id,
-            } => (auth_token, graph_iris, group_id, query, limit, None),
-            MetadataTransportMessage::FilteredSearchGraphs {
-                auth_token,
-                graph_iris,
-                query,
-                limit,
-                predicate_iri,
-                object_iri,
-                group_id,
-            } => {
-                let reference = Some((predicate_iri, object_iri));
-                (auth_token, graph_iris, group_id, query, limit, reference)
-            }
-            _ => unreachable!("request family routed incorrectly"),
-        };
-        let result = match self.read_caller(context, peer, auth_token, false).await {
-            Ok(auth) => {
-                let ask = (query, limit.clamp(1, MAX_PAGINATION_DEPTH));
-                let search = LocalSearchOperation::new(
-                    (realm_id, auth),
-                    (graph_iris, group_id),
-                    ask,
-                    reference,
-                );
-                Box::pin(drive(search, context))
-                    .await
-                    .map_err(metadata_read_error)
-            }
-            Err(error) => Err(error),
-        };
-        MetadataTransportMessage::SearchResults { result }
-    }
-
-    async fn preflight_request(
-        &self,
-        context: &Arc<DriverContext>,
-        peer: NodeId,
-        message: MetadataTransportMessage,
-    ) -> MetadataTransportMessage {
-        match message {
-            MetadataTransportMessage::ReferencePreflight {
-                auth_token,
-                request,
-            } => {
-                Box::pin(async {
-                    let result = match self.read_caller(context, peer, auth_token, false).await {
-                        Ok(auth) => match context.net_handle.as_ref() {
-                            Some(net) => {
-                                let local = net.node_id();
-                                let read = ReadInfoOperation::new(vec![local]);
-                                let endpoint = drive(read, context.as_ref())
-                                    .await
-                                    .ok()
-                                    .and_then(|mut documents| documents.remove(&local))
-                                    .and_then(|document| document.urls.s3);
-                                let local = (*net.realm_id(), net.node_id());
-                                let preflight =
-                                    super::super::api::preflight::local::references_preflight_local(
-                                        local, auth, *request, endpoint,
-                                    );
-                                drive(preflight, context.as_ref())
-                                    .await
-                                    .map(Box::new)
-                                    .map_err(crate::forward::transport::read_error)
-                            }
-                            None => Err(MetadataReadError::Unavailable),
-                        },
-                        Err(error) => Err(error),
-                    };
-                    MetadataTransportMessage::ReferencePreflightResults { result }
-                })
-                .await
-            }
-            _ => unreachable!("request family routed incorrectly"),
-        }
-    }
-
-    async fn bucket_request(
-        &self,
-        context: &Arc<DriverContext>,
-        peer: NodeId,
-        message: MetadataTransportMessage,
-    ) -> MetadataTransportMessage {
-        match message {
-            MetadataTransportMessage::SearchBuckets {
-                auth_token,
-                query,
-                key,
-                extras,
-                limit,
-                group_id,
-                start_after,
-                database,
-            } => {
-                Box::pin(async {
-                    match (self.search_caller(context, peer, auth_token, PeerReader::Buckets)).await
-                    {
-                        Ok(auth) => match self.inner.net_handle.as_ref() {
-                            Some(net_handle) => match crate::driver::drive(
-                                LocalBucketSearch::new(SearchBucketsInput {
-                                    auth,
-                                    realm_id: *net_handle.realm_id(),
-                                    node_id: net_handle.node_id(),
-                                    query,
-                                    key,
-                                    extras,
-                                    limit,
-                                    group_id,
-                                    start_after: start_after.map(Into::into),
-                                    database,
-                                }),
-                                context.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(hits) => MetadataTransportMessage::BucketSearchResults {
-                                    result: Ok(hits),
-                                },
-                                Err(_) => MetadataTransportMessage::BucketSearchResults {
-                                    result: Err(MetadataReadError::Unavailable),
-                                },
-                            },
-                            None => MetadataTransportMessage::BucketSearchResults {
-                                result: Err(MetadataReadError::Unavailable),
-                            },
-                        },
-                        Err(error) => {
-                            MetadataTransportMessage::BucketSearchResults { result: Err(error) }
-                        }
-                    }
-                })
-                .await
-            }
-            MetadataTransportMessage::SearchObjects {
-                auth_token,
-                query,
-                key_match,
-                bucket,
-                limit,
-                start_after,
-                as_of,
-            } => {
-                Box::pin(async {
-                    match (self.search_caller(context, peer, auth_token, PeerReader::Objects)).await
-                    {
-                        Ok(auth) => match self.inner.net_handle.as_ref() {
-                            Some(net_handle) => match crate::driver::drive(
-                                SearchObjectsOperation::new(
-                                    SearchObjectsInput {
-                                        auth,
-                                        realm_id: *net_handle.realm_id(),
-                                        node_id: net_handle.node_id(),
-                                        query,
-                                        key_match,
-                                        bucket,
-                                        limit,
-                                        start_after,
-                                        as_of,
-                                    },
-                                    context.storage_handle.range_indexes().is_some(),
-                                ),
-                                context.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(page) => MetadataTransportMessage::ObjectSearchResults {
-                                    result: Ok(page),
-                                },
-                                Err(_) => MetadataTransportMessage::ObjectSearchResults {
-                                    result: Err(MetadataReadError::Unavailable),
-                                },
-                            },
-                            None => MetadataTransportMessage::ObjectSearchResults {
-                                result: Err(MetadataReadError::Unavailable),
-                            },
-                        },
-                        Err(error) => {
-                            MetadataTransportMessage::ObjectSearchResults { result: Err(error) }
-                        }
-                    }
-                })
-                .await
-            }
-            MetadataTransportMessage::ReleaseHolder {
-                auth_token,
-                bucket,
-                ask,
-            } => {
-                let result = Box::pin(async {
-                    let reader = PeerReader::Release;
-                    let auth = self
-                        .search_caller(context, peer, auth_token, reader)
-                        .await?;
-                    let net_handle =
-                        (self.inner.net_handle.as_ref()).ok_or(MetadataReadError::Unavailable)?;
-                    let scope = (*net_handle.realm_id(), net_handle.node_id());
-                    let answer = HolderAnswerOperation::new(scope, &auth, (bucket.as_str(), ask));
-                    crate::driver::drive(answer, context.as_ref())
-                        .await
-                        .map_err(|error| match error {
-                            PublishError::Forbidden(_) => MetadataReadError::Forbidden,
-                            _ => MetadataReadError::Unavailable,
-                        })
-                })
-                .await;
-                MetadataTransportMessage::ReleaseHolderResults { result }
-            }
-            _ => unreachable!("request family routed incorrectly"),
-        }
-    }
-
     async fn mirror_request(
         &self,
         context: &Arc<DriverContext>,
@@ -1140,26 +860,18 @@ impl MetadataHandle {
         audit_deadline: tokio::time::Instant,
         message: MetadataTransportMessage,
     ) -> (MetadataTransportMessage, Option<Vec<u8>>) {
-        let serve = ServeRequestOperation::new(peer, context.node_and_realm(), message);
+        let serving = ServeNode {
+            local: context.node_and_realm(),
+            graph: context.graph_handle.is_some(),
+            indexed: context.storage_handle.range_indexes().is_some(),
+        };
+        let serve = ServeRequestOperation::new(peer, serving, message);
         let message = match drive(serve, context.as_ref()).await {
             Ok(reply) => return reply,
             Err(ServeError::Unserved(message)) => *message,
             Err(ServeError::Io(error)) => return (reject(error.to_string()), None),
         };
         match message {
-            message @ (MetadataTransportMessage::QueryGraphs { .. }
-            | MetadataTransportMessage::SearchGraphs { .. }
-            | MetadataTransportMessage::FilteredSearchGraphs { .. }) => {
-                (self.graph_request(context, peer, message).await, None)
-            }
-            message @ MetadataTransportMessage::ReferencePreflight { .. } => {
-                (self.preflight_request(context, peer, message).await, None)
-            }
-            message @ (MetadataTransportMessage::SearchBuckets { .. }
-            | MetadataTransportMessage::SearchObjects { .. }
-            | MetadataTransportMessage::ReleaseHolder { .. }) => {
-                (self.bucket_request(context, peer, message).await, None)
-            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)

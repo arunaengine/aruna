@@ -7,8 +7,19 @@ use crate::s3::bucket::get::GetBucketError;
 use crate::tests::calls::{caller_of, child, node, runs_child};
 use aruna_core::structs::identity::auth::AuthContext;
 
-fn local() -> Option<(NodeId, RealmId)> {
-    Some((node(1), RealmId([1u8; 32])))
+fn local() -> ServeNode {
+    ServeNode {
+        local: Some((node(1), RealmId([1u8; 32]))),
+        graph: true,
+        indexed: false,
+    }
+}
+
+fn no_realm() -> ServeNode {
+    ServeNode {
+        local: None,
+        ..local()
+    }
 }
 
 fn reply(turn: ServeTurn) -> MetadataTransportMessage {
@@ -21,8 +32,8 @@ fn reply(turn: ServeTurn) -> MetadataTransportMessage {
 #[test]
 fn realm_ask_unavailable() {
     // A node without a realm answers a realm request without asking anything.
-    let mut serve =
-        ServeRequestOperation::new(node(2), None, MetadataTransportMessage::PromotionCheck);
+    let request = MetadataTransportMessage::PromotionCheck;
+    let mut serve = ServeRequestOperation::new(node(2), no_realm(), request);
     assert_eq!(
         reply(serve.first()),
         MetadataTransportMessage::PromotionReady {
@@ -68,12 +79,33 @@ fn other_request_unserved() {
 }
 
 fn owner_read(realm: bool) -> CallerReadOperation {
-    let realm_id = realm.then_some(RealmId([1u8; 32]));
-    CallerReadOperation::new(
-        (node(2), realm_id),
-        None,
-        CallerRead::Owner("b".to_string()),
-    )
+    let request = MetadataTransportMessage::BucketOwner {
+        auth_token: None,
+        bucket: "b".to_string(),
+    };
+    let serving = if realm { local() } else { no_realm() };
+    CallerReadOperation::new(node(2), serving, request, ReadReply::Owner)
+}
+
+#[test]
+fn graph_read_needs_store() {
+    // Without the graph store a graph read answers before the caller is checked.
+    let request = MetadataTransportMessage::QueryGraphs {
+        auth_token: None,
+        graph_iris: None,
+        sparql: "ASK {}".to_string(),
+    };
+    let serving = ServeNode {
+        graph: false,
+        ..local()
+    };
+    let mut read = CallerReadOperation::new(node(2), serving, request, ReadReply::Query);
+    assert_eq!(
+        read.first(),
+        Ok(Next::Done(MetadataTransportMessage::QueryResults {
+            result: Err(MetadataReadError::Unavailable)
+        }))
+    );
 }
 
 #[test]
