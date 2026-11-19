@@ -88,7 +88,7 @@ fn owner_read(realm: bool) -> CallerReadOperation {
 }
 
 #[test]
-fn graph_read_needs_store() {
+fn graph_needs_store() {
     // Without the graph store a graph read answers before the caller is checked.
     let request = MetadataTransportMessage::QueryGraphs {
         auth_token: None,
