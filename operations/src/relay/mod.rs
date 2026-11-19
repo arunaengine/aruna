@@ -8,3 +8,4 @@ pub mod hook;
 pub mod management;
 pub mod targets;
 pub mod tool;
+pub mod tool_route;

@@ -12,142 +12,51 @@ use crate::routes::storage::relay::node_directed;
 use aruna_core::NodeId;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_operations::distribution::guard::GuardError;
-use aruna_operations::distribution::resolve::key_holders;
-use aruna_operations::distribution::routing::route_read;
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
-use aruna_operations::metadata::api::search_types::BucketSearchRequest;
-use aruna_operations::relay::tool::{
-    Holder, RouteError, ToolCall, ToolCallOperation, ToolRefusal, add_holder, pick_node,
-    search_done,
-};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::relay::tool::{RouteError, ToolCall, ToolCallOperation, ToolRefusal};
+use aruna_operations::relay::tool_route::{Missed, ToolNodeOperation, ToolRoute, ToolRouteError};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::str::FromStr;
-use std::time::Duration;
-
-const SEARCH_PAGE: usize = 50;
-/// How long finding the node that holds a bucket may take, every search page included.
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// What a holder search could not cover: the nodes that did not answer, and whether nodes
-/// failed, node discovery failed or the search ran out of time.
-#[derive(Debug, Default)]
-pub(crate) struct Missed {
-    pub nodes: Vec<NodeId>,
-    pub incomplete: bool,
-}
 
 impl McpServer {
+    /// Where a data tool call on `bucket` and `key` asks to run.
+    fn tool_route(
+        &self,
+        (parts, auth): (&http::request::Parts, &AuthContext),
+        bucket: &str,
+        named: Option<NodeId>,
+        key: &str,
+    ) -> ToolRoute {
+        ToolRoute {
+            realm_id: self.state.get_realm_id(),
+            here: self.state.get_node_id(),
+            auth: auth.clone(),
+            bearer: request_bearer(parts).map(|carrier| carrier.as_str().to_string()),
+            bucket: bucket.to_string(),
+            named,
+            key: key.to_string(),
+        }
+    }
+
     /// The node a data tool call on `bucket` and `key` runs on, `None` for this node.
     pub(crate) async fn bucket_node(
         &self,
-        (parts, auth): (&http::request::Parts, &AuthContext),
+        call: (&http::request::Parts, &AuthContext),
         bucket: &str,
         named: Option<&str>,
         key: &str,
     ) -> Result<Option<NodeId>, CallToolResult> {
         // A call another node forwarded runs here; one meant for another node is refused.
-        if node_directed(&self.state, &parts.headers).map_err(server_error)? {
+        if node_directed(&self.state, &call.0.headers).map_err(server_error)? {
             return Ok(None);
         }
         let named = named.map(parse_node).transpose()?;
-        let (here, context) = (self.state.get_node_id(), self.state.get_ctx());
-        let mut info = None;
-        if named.is_none_or(|named| named == here) {
-            info = match drive(GetBucketOperation::new(bucket.to_string()), &context).await {
-                Ok(info) => Some(info),
-                Err(GetBucketError::NotFound) => None,
-                Err(error) => return Err(map_bucket_error(error)),
-            };
-        }
-        // A member that keeps no records of the key's range sends the call to one that does.
-        let mut routed = None;
-        if let Some(binding) = info.as_ref().and_then(|info| info.distribution.as_ref()) {
-            let route = drive(route_read(binding, key, false), &context).await;
-            if let ReadRoute::Holder { node_id, .. } = route.map_err(guard_error)? {
-                routed = Some(node_id);
-            }
-        }
-        let (mut holders, mut missed) = (Vec::new(), Missed::default());
-        if named.is_none() && info.is_none() {
-            (holders, missed) = self.find_holders(parts, auth, bucket, key).await?;
-        }
-        let mut members = Vec::new();
-        if let Some(set_id) = holders.first().and_then(|holder| holder.set_id) {
-            members = drive(key_holders(set_id, key), &context)
-                .await
-                .unwrap_or_default();
-        }
-        pick_node(here, (named, info.is_some(), routed), &holders, &members)
-            .map_err(|error| route_error(error, bucket, &missed))
-    }
-
-    /// The nodes holding a bucket named `bucket` whose `key` the caller may read, each
-    /// distributed bucket once, and what the search could not cover before it stopped.
-    pub(crate) async fn find_holders(
-        &self,
-        parts: &http::request::Parts,
-        auth: &AuthContext,
-        bucket: &str,
-        key: &str,
-    ) -> Result<(Vec<Holder>, Missed), CallToolResult> {
-        let bearer = request_bearer(parts).map(|carrier| carrier.as_str().to_string());
-        let deadline = tokio::time::Instant::now() + DISCOVERY_TIMEOUT;
-        let (mut holders, mut cursor) = (Vec::<Holder>::new(), None);
-        let context = self.state.get_ctx();
-        loop {
-            let search = search_buckets_distributed(
-                self.state.get_realm_id(),
-                self.state.get_node_id(),
-                BucketSearchRequest {
-                    auth: auth.clone(),
-                    bearer_token: bearer.clone(),
-                    query: bucket.to_string(),
-                    key: (!key.is_empty()).then(|| key.to_string()),
-                    extras: None,
-                    limit: SEARCH_PAGE,
-                    group_id: None,
-                    cursor,
-                    target_nodes: None,
-                    database: false,
-                },
-            );
-            let search = drive(search, context.as_ref());
-            // Out of time, a bucket of the same name elsewhere is not ruled out.
-            let Ok(page) = tokio::time::timeout_at(deadline, search).await else {
-                return Err(explained(
-                    ServerError::ServiceUnavailable,
-                    format!(
-                        "the realm search for bucket {bucket} did not finish in time; retry, or \
-                         pass node_id from list_buckets"
-                    ),
-                ));
-            };
-            let page = (page.map_err(crate::metadata::map_api_error)).map_err(server_error)?;
-            let stats = page.fanout_stats;
-            let page_state = (!page.hits.is_empty(), stats.nodes_failed > 0);
-            for hit in page.hits.into_iter().filter(|hit| hit.bucket == bucket) {
-                let holder = Holder {
-                    node_id: hit.node_id,
-                    set_id: hit.set_id,
-                };
-                add_holder(&mut holders, holder);
-            }
-            cursor = page.next_cursor;
-            if search_done(!holders.is_empty(), page_state, cursor.is_none()) {
-                let missed = Missed {
-                    nodes: stats.failed_partitions,
-                    incomplete: stats.nodes_failed > 0,
-                };
-                return Ok((holders, missed));
-            }
-        }
+        let route = ToolNodeOperation::new(self.tool_route(call, bucket, named, key));
+        (drive(route, &self.state.get_ctx()).await).map_err(|error| route_failure(error, bucket))
     }
 
     /// Runs `tool` with `input` on `node_id` as the caller and decodes its answer; the call is
@@ -244,6 +153,24 @@ fn named_error(mut result: CallToolResult, node_id: NodeId) -> CallToolResult {
         result.content = vec![ContentBlock::text(text)];
     }
     result
+}
+
+/// Why a tool call has no node, as this node's answer.
+fn route_failure(error: ToolRouteError, bucket: &str) -> CallToolResult {
+    match error {
+        ToolRouteError::Bucket(error) => map_bucket_error(error),
+        ToolRouteError::Guard(error) => guard_error(error),
+        ToolRouteError::Search(error) => server_error(crate::metadata::map_api_error(error)),
+        ToolRouteError::SearchLate => explained(
+            ServerError::ServiceUnavailable,
+            format!(
+                "the realm search for bucket {bucket} did not finish in time; retry, or pass \
+                 node_id from list_buckets"
+            ),
+        ),
+        ToolRouteError::Route(error, missed) => route_error(error, bucket, &missed),
+        ToolRouteError::Io(error) => internal_error(error),
+    }
 }
 
 fn guard_error(error: GuardError) -> CallToolResult {
