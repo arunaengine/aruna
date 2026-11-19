@@ -190,8 +190,9 @@ impl ScreenTask {
 
     /// The grant check of the next target, or the install once every target passed.
     fn advance(&mut self) -> Result<Next<PluginInstall>, ScreenError> {
+        let target = self.targets.pop_front();
         let install = self.install()?;
-        let Some((permission, path)) = self.targets.pop_front() else {
+        let Some((permission, path)) = target else {
             return Ok(Next::Done(install.clone()));
         };
         let access = match permission {

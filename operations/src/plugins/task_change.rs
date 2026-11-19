@@ -133,12 +133,12 @@ impl ChangeTask {
 
     fn put(
         &mut self,
-        (key, row): (Vec<u8>, &WorkRow),
+        (key, work): (Vec<u8>, &WorkRow),
         task: &TaskRow,
         changed: Changed,
     ) -> ChangeNext {
         let (space, task_key) = task_place(self.install_id, self.work_id);
-        let rows = vec![row_of(key, row)?, row(space, task_key, encode(task)?)];
+        let rows = vec![row_of(key, work)?, row(space, task_key, encode(task)?)];
         self.phase = Phase::Written(changed);
         Ok(Next::Call(IoCall::Write(rows)))
     }

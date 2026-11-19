@@ -146,7 +146,7 @@ impl StartTask {
     fn next_object(
         &mut self,
         checked: Box<Checked>,
-        mut objects: VecDeque<(String, String, Option<Ulid>, bool)>,
+        objects: VecDeque<(String, String, Option<Ulid>, bool)>,
     ) -> StartNext {
         let Some((_, object, ..)) = objects.front() else {
             return self.screen(checked);

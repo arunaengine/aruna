@@ -183,7 +183,8 @@ impl SendTask {
                 .find(|captured| captured.destination_key == input.dest_key)?;
             Some((bucket.clone(), key.clone(), captured.version_id))
         });
-        self.next_mark(Box::new((config, submission)), versions.collect())
+        let versions = versions.collect();
+        self.next_mark(Box::new((config, submission)), versions)
     }
 
     fn next_mark(

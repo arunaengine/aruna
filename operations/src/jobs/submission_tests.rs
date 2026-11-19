@@ -228,24 +228,8 @@ fn bounds_inline_inputs() {
         name: None,
         description: None,
     };
-    let mut spec = ExecutionSpec {
-        group_id: Ulid::from_bytes([3u8; 16]),
-        name: None,
-        description: None,
-        tags: Default::default(),
-        image: "alpine:3".to_string(),
-        entrypoint: None,
-        command: Vec::new(),
-        workdir: None,
-        env: Default::default(),
-        resources: Default::default(),
-        executor_constraint: None,
-        inputs: vec![inline(16)],
-        file_outputs: Vec::new(),
-        workspace_outputs: Vec::new(),
-        output_prefixes: Vec::new(),
-        collision_policy: Default::default(),
-    };
+    let mut spec = submission(None).spec;
+    spec.inputs = vec![inline(16)];
     // Without the plugin host's tags nobody may put bytes into a spec.
     assert!(validate_execution(&mut spec.clone(), WorkspaceMode::None, None).is_err());
     let work = "aruna-engine.org/plugin-work".to_string();
