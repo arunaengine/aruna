@@ -10,7 +10,10 @@ use crate::keyspaces::ABE_DUE_KEYSPACE;
 use crate::structs::identity::auth::PathRestriction;
 use crate::types::{Key, Value};
 use crate::{NodeId, UserId};
-use aruna_kpabe::{Attribute, Envelope, Policy, UserKey, frame_context};
+use aruna_kpabe::envelope::Envelope;
+use aruna_kpabe::frame_context;
+use aruna_kpabe::policy::{Attribute, Policy};
+use aruna_kpabe::scheme::UserKey;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -318,7 +321,8 @@ impl KeyGrant {
         let transport = [&self.enc[..], &self.ciphertext].concat();
         let key = UserKey::open(&parameters, &transport, |_| Ok(opened))?;
         let cipher = Envelope::from_bytes(&parameters, &envelope.abe)?;
-        let object = aruna_kpabe::open(&parameters, &key, &cipher, &envelope.context.bytes()?)?;
+        let object =
+            aruna_kpabe::envelope::open(&parameters, &key, &cipher, &envelope.context.bytes()?)?;
         let private = SharedSecret::new(SecretBytes::new(object.as_bytes().to_vec()));
         check_object(private.bytes(), envelope)?;
         Ok(private)
@@ -515,7 +519,8 @@ mod tests {
             |scope: &KeyScope,
              (parameters, object, write, epoch): (&AbeParameters, &str, u8, u64)| {
                 let policy = scope.policy(&here, &[1]).unwrap();
-                let key = aruna_kpabe::issue(&public, &master, &policy, &mut SysRng).unwrap();
+                let key =
+                    aruna_kpabe::scheme::issue(&public, &master, &policy, &mut SysRng).unwrap();
                 let plan = EnvelopePlan {
                     parameters: parameters.clone(),
                     epoch,
@@ -527,7 +532,9 @@ mod tests {
                     create_envelope(plan, &mut crate::key_seal::SeedRng::new(&[7; 32])).unwrap();
                 let context = envelope.context.bytes().unwrap();
                 Envelope::from_bytes(&public, &envelope.abe)
-                    .is_ok_and(|abe| aruna_kpabe::open(&public, &key, &abe, &context).is_ok())
+                    .is_ok_and(|abe| {
+                        aruna_kpabe::envelope::open(&public, &key, &abe, &context).is_ok()
+                    })
             };
         let (sub, exact) = (
             |v: &str| KeyScope::Subtree(v.into()),

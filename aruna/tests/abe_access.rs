@@ -20,7 +20,9 @@ use aruna_core::structs::storage::abe_access::{
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
+use aruna_kpabe::envelope::Envelope;
+use aruna_kpabe::policy::{Attribute, Policy};
+use aruna_kpabe::scheme::UserKey;
 use aruna_operations::abe::{
     KeyAction, KeyError, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
 };
@@ -109,20 +111,26 @@ fn abe_master() {
     let (parameters, master) =
         derive_master(&SecretBytes::new(clamped.to_vec()), &context).unwrap();
     let policy = KeyScope::Subtree("foo/".into()).policy(&a, &[1]).unwrap();
-    let user = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng).unwrap();
+    let user = aruna_kpabe::scheme::issue(&parameters, &master, &policy, &mut SysRng).unwrap();
     for epoch in [1, 2] {
         let attrs = [
             Attribute::Domain(a.domain().unwrap()),
             Attribute::Epoch(epoch),
             Attribute::Prefix(b"foo/".to_vec()),
         ];
-        let sealed =
-            aruna_kpabe::seal(&parameters, &attrs, &[8; 32], b"envelope", &mut SysRng).unwrap();
+        let sealed = aruna_kpabe::envelope::seal(
+            &parameters,
+            &attrs,
+            &[8; 32],
+            b"envelope",
+            &mut SysRng,
+        )
+        .unwrap();
         assert_eq!(
-            aruna_kpabe::open(&parameters, &user, &sealed, b"envelope").is_ok(),
+            aruna_kpabe::envelope::open(&parameters, &user, &sealed, b"envelope").is_ok(),
             epoch == 1
         );
-        assert!(aruna_kpabe::open(&parameters, &user, &sealed, b"substituted").is_err());
+        assert!(aruna_kpabe::envelope::open(&parameters, &user, &sealed, b"substituted").is_err());
     }
     assert!(Policy::new(&a.domain().unwrap(), &[], &[]).is_err());
     let scope = KeyScope::Subtree("foo/".into());
@@ -222,7 +230,7 @@ async fn abe_read() -> TestResult<()> {
         let parameters = context.request.parameters.public()?;
         let master = context.request.parameters.recompute(&bucket_private)?;
         let policy = context.request.scope.policy(&context.request.parameters,&context.request.epochs)?;
-        let key = aruna_kpabe::issue(&parameters,&master,&policy,&mut SysRng)?;
+        let key = aruna_kpabe::scheme::issue(&parameters,&master,&policy,&mut SysRng)?;
         let aad = context.bytes()?;
         assert_eq!(aad,bytes(&proposal["aad"]));
         let sealed = key.seal(|plain|seal_to(&user_public,GRANT_PURPOSE,&aad,plain, &mut aruna_core::key_seal::SeedRng::new(&[7; 32])).map_err(|_|aruna_kpabe::Error))?;
@@ -247,7 +255,7 @@ async fn abe_read() -> TestResult<()> {
         let status = response.status(); let env: Value = response.json().await?;
         assert_eq!(status,StatusCode::OK,"{env}");
         let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-        let object = aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
+        let object = aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
         let object_header = STANDARD.encode(object.as_bytes());
         let content_route = format!("{}/api/v1/data/blobs/content",seed.base_url);
         let response = client.get(query_url(&content_route,&query)?).bearer_auth(&token).send().await?;
@@ -266,7 +274,7 @@ async fn abe_read() -> TestResult<()> {
         let status = response.status(); let env: Value = response.json().await?;
         assert_eq!(status,StatusCode::OK,"{env}");
         let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-        let multi_key = aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
+        let multi_key = aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
         let response = client.get(query_url(&content_route,&multi_query)?).bearer_auth(&token)
             .header("x-aruna-object-key",STANDARD.encode(multi_key.as_bytes())).send().await?;
         assert_eq!(response.status(),StatusCode::OK);
@@ -278,7 +286,7 @@ async fn abe_read() -> TestResult<()> {
             let status = response.status(); let env: Value = response.json().await?;
             assert_eq!(status,StatusCode::OK,"{env}");
             let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-            let pending_key = aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
+            let pending_key = aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
             let response = client.get(query_url(&content_route,&pending_query)?).bearer_auth(&token)
                 .header("x-aruna-object-key",STANDARD.encode(pending_key.as_bytes())).send().await?;
             assert_eq!(response.status(),StatusCode::OK);
@@ -291,7 +299,7 @@ async fn abe_read() -> TestResult<()> {
         let response = client.get(query_url(&envelope_route,&wrong_query)?).bearer_auth(&token).send().await?;
         let env: Value = response.json().await?;
         let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-        assert!(aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"])).is_err());
+        assert!(aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"])).is_err());
         let response = client.get(&encryption).bearer_auth(&token).send().await?;
         let status: Value = response.json().await?;
         assert_eq!(status["unlock"]["state"],"locked");
@@ -302,7 +310,7 @@ async fn abe_read() -> TestResult<()> {
         assert_eq!(response.status(),StatusCode::OK);
         let env: Value = response.json().await?;
         let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-        assert!(aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"])).is_err());
+        assert!(aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"])).is_err());
         let copy_query = [("bucket",BUCKET),("key","foo/copy"),("version_id",&copy_version)];
         let response = client.get(query_url(&envelope_route,&copy_query)?).bearer_auth(&token).send().await?;
         assert_eq!(response.status(),StatusCode::CONFLICT);
@@ -319,7 +327,7 @@ async fn abe_read() -> TestResult<()> {
             let status = response.status(); let env: Value = response.json().await?;
             assert_eq!(status,StatusCode::OK,"{env}");
             let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-            let object = aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
+            let object = aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
             let response = client.get(query_url(&content_route,&query)?).bearer_auth(&token)
                 .header("x-aruna-object-key",STANDARD.encode(object.as_bytes())).send().await?;
             assert_eq!(response.status(),StatusCode::OK);
@@ -416,8 +424,12 @@ async fn abe_restart() -> TestResult<()> {
         let env: Value = response.json().await?;
         assert_eq!(status, StatusCode::OK, "{env}");
         let cipher = Envelope::from_bytes(&parameters, &bytes(&env["envelope"]["abe"]))?;
-        let object =
-            aruna_kpabe::open(&parameters, &key, &cipher, &bytes(&env["context"]["bytes"]))?;
+        let object = aruna_kpabe::envelope::open(
+            &parameters,
+            &key,
+            &cipher,
+            &bytes(&env["context"]["bytes"]),
+        )?;
         let content_route = format!("{}/api/v1/data/blobs/content", seed.base_url);
         let response = client
             .get(query_url(&content_route, &query)?)
@@ -561,7 +573,7 @@ async fn abe_restart_child() -> TestResult<()> {
         .request
         .scope
         .policy(&context.request.parameters, &context.request.epochs)?;
-    let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
+    let key = aruna_kpabe::scheme::issue(&parameters, &master, &policy, &mut SysRng)?;
     let aad = context.bytes()?;
     let sealed = key.seal(|plain| {
         seal_to(
@@ -812,7 +824,7 @@ async fn abe_holders() -> TestResult<()> {
         let parameters = context.request.parameters.public()?;
         let master = context.request.parameters.recompute(&bucket_private)?;
         let policy = context.request.scope.policy(&context.request.parameters, &context.request.epochs)?;
-        let issued = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
+        let issued = aruna_kpabe::scheme::issue(&parameters, &master, &policy, &mut SysRng)?;
         let seal = |record: &Value| -> TestResult<Value> {
             let context: GrantContext = postcard::from_bytes(&bytes(record))?;
             let sealed = issued.seal(|plain| seal_to(&reader_public, GRANT_PURPOSE, &context.bytes().unwrap(), plain, &mut aruna_core::key_seal::SeedRng::new(&[7; 32])).map_err(|_| aruna_kpabe::Error))?;
@@ -850,7 +862,7 @@ async fn abe_holders() -> TestResult<()> {
         let query = [("bucket", BUCKET), ("key", "foo/data"), ("version_id", &version)];
         let (_, envelope) = send(http.get(query_url(&envelope_route, &query)?).bearer_auth(&reader)).await?;
         let cipher = Envelope::from_bytes(&parameters, &bytes(&envelope["envelope"]["abe"]))?;
-        let object = aruna_kpabe::open(&parameters, &key, &cipher, &bytes(&envelope["context"]["bytes"]))?;
+        let object = aruna_kpabe::envelope::open(&parameters, &key, &cipher, &bytes(&envelope["context"]["bytes"]))?;
         let header = STANDARD.encode(object.as_bytes());
         let response = http.get(query_url(&content, &query)?).header("x-aruna-object-key", &header).send().await?;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -1667,7 +1679,7 @@ async fn abe_rotation() -> TestResult<()> {
                 assert_eq!(status, StatusCode::OK, "{env}");
                 let cipher = Envelope::from_bytes(&parameters, &bytes(&env["envelope"]["abe"]))?;
                 let context = bytes(&env["context"]["bytes"]);
-                let object = aruna_kpabe::open(&parameters, &key, &cipher, &context)?;
+                let object = aruna_kpabe::envelope::open(&parameters, &key, &cipher, &context)?;
                 objects.push(STANDARD.encode(object.as_bytes()));
             }
             Ok::<_, Box<dyn std::error::Error>>(objects)
@@ -1816,7 +1828,7 @@ async fn abe_conversion() -> TestResult<()> {
         assert_eq!(status, StatusCode::OK, "{env}");
         let cipher = Envelope::from_bytes(&parameters, &bytes(&env["envelope"]["abe"]))?;
         let context = bytes(&env["context"]["bytes"]);
-        let object = aruna_kpabe::open(&parameters, &key, &cipher, &context)?;
+        let object = aruna_kpabe::envelope::open(&parameters, &key, &cipher, &context)?;
         let response = http
             .post(format!("{encryption}/lock"))
             .bearer_auth(token)
@@ -1890,7 +1902,7 @@ fn sealed_grant(record: &Value, bucket_private: &SecretBytes) -> TestResult<KeyG
     let parameters = r.parameters.public()?;
     let master = r.parameters.recompute(bucket_private)?;
     let policy = r.scope.policy(&r.parameters, &r.epochs)?;
-    let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
+    let key = aruna_kpabe::scheme::issue(&parameters, &master, &policy, &mut SysRng)?;
     let recipient = r.recipient_public.unwrap();
     let sealed = key.seal(|plain| {
         seal_to(
@@ -1909,7 +1921,7 @@ fn sealed_grant(record: &Value, bucket_private: &SecretBytes) -> TestResult<KeyG
     })
 }
 
-type HeldKey = (Vec<u64>, aruna_kpabe::PublicParameters, UserKey);
+type HeldKey = (Vec<u64>, aruna_kpabe::scheme::PublicParameters, UserKey);
 
 /// The epochs, parameters and user keys of the caller's grants, opened with `private`.
 async fn user_keys(base: &str, token: &str, private: &SecretBytes) -> TestResult<Vec<HeldKey>> {
@@ -1954,7 +1966,7 @@ async fn opens(
     let epoch = env["context"]["epoch"].as_u64().unwrap();
     let opened = keys.iter().any(|(_, p, user)| {
         Envelope::from_bytes(p, &abe)
-            .is_ok_and(|c| aruna_kpabe::open(p, user, &c, &context).is_ok())
+            .is_ok_and(|c| aruna_kpabe::envelope::open(p, user, &c, &context).is_ok())
     });
     Ok((epoch, opened))
 }
