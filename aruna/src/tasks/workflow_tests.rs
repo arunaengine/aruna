@@ -10,12 +10,14 @@ use aruna_compute::session::{Session, SessionConfig};
 use aruna_core::UserId;
 use aruna_core::compute::session::EndReason;
 use aruna_core::compute::{
-    AdoptableEvidence, AttemptPhase, AttemptStatus, CancelEvidence, LogLimits, LogTails, NOBODY,
-    NetworkAccess, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, UserSpec,
+    AdoptableEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence,
+    ExecutorKind, FenceContext, LogLimits, LogTails, NOBODY, NetworkAccess, ReconcileEvidence,
+    ResumePoint, StagingMode, TaskOutput, TaskSpec, UserSpec,
 };
 use aruna_core::structs::execution::job::{
-    JobErrorKind, JobResultPayload, JobState, MAX_MESSAGE_BYTES, OutputDestination,
-    OutputSelection, SessionReportDetail, SessionReportRow, WorkspaceMode,
+    AttemptIntent, ExecutionSpec, JobError, JobErrorKind, JobId, JobPayload, JobRecord,
+    JobResultPayload, JobState, MAX_MESSAGE_BYTES, OutputDestination, OutputSelection,
+    SessionReportDetail, SessionReportRow, WorkspaceMode,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
@@ -35,19 +37,23 @@ use aruna_operations::jobs::workflow::attempt::{AttemptScope, RunWiring};
 use aruna_operations::jobs::workflow::credential::{
     MintCredentialOperation, RunIdentity, WorkspaceAccessOperation,
 };
-use aruna_operations::jobs::workflow::finalize::exit_message;
+use aruna_operations::jobs::workflow::finalize::{FinalizeGoal, FinalizeOperation, exit_message};
 use aruna_operations::jobs::workflow::inventory::CollectOutputsOperation;
-use aruna_operations::jobs::workflow::prepare::{NETWORK_TAG_KEY, PreparedTask, build_task_spec};
+use aruna_operations::jobs::workflow::prepare::{
+    NETWORK_TAG_KEY, PrepareAttemptOperation, PreparedTask, build_task_spec,
+};
+use aruna_operations::jobs::workflow::recovery::RecoverSubmitOperation;
 use aruna_operations::jobs::workflow::settle::{ParkAttemptOperation, SettleScope};
-use aruna_operations::jobs::workflow::supervise::WalltimeAnchorOperation;
+use aruna_operations::jobs::workflow::supervise::{SuperviseOperation, WalltimeAnchorOperation};
 use aruna_operations::jobs::workflow::*;
 use aruna_operations::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -1789,8 +1795,8 @@ async fn crate_write_idempotent() {
         range_turns: Default::default(),
         handlers: Default::default(),
     };
-    let write = super::run_crate::WriteCrateOperation::new(job_id, ctx.driver.node_and_realm());
-    let outcome = super::run_crate::crate_outcome(drive(write, &ctx.driver).await);
+    let write = run_crate::WriteCrateOperation::new(job_id, ctx.driver.node_and_realm());
+    let outcome = run_crate::crate_outcome(drive(write, &ctx.driver).await);
     match outcome {
         JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource }) => {
             assert_eq!(resource, "already-there");

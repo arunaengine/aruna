@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::tasks::runner::shutdown_jobs;
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -295,11 +296,7 @@ impl NodeShutdown {
         let job_grace = JOB_SHUTDOWN_GRACE.min(job_budget);
         let mut job_report = None;
         phase("jobs", job_budget, async {
-            job_report = Some(
-                self.jobs_runtime
-                    .shutdown(&self.driver_ctx, job_grace)
-                    .await,
-            );
+            job_report = Some(shutdown_jobs(&self.jobs_runtime, &self.driver_ctx, job_grace).await);
         })
         .await;
         let jobs_drained = job_report

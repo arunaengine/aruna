@@ -8,7 +8,9 @@ use super::workflow_fixtures::{execution_spec, node_id};
 use crate::tasks::runner::ComputeReconciler;
 use aruna_compute::ExecutorRegistry;
 use aruna_core::UserId;
-use aruna_core::structs::execution::job::{AttemptIntent, JobClaim, JobId};
+use aruna_core::structs::execution::job::{
+    AttemptIntent, JobClaim, JobId, JobPayload, JobRecord, JobState,
+};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
@@ -19,9 +21,9 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::test_calls::{
     insert_job, read_job_record, record_attempt_intent,
 };
-use aruna_operations::jobs::workflow::reconcile::*;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use std::sync::Arc;
 use tempfile::tempdir;
 use ulid::Ulid;
 

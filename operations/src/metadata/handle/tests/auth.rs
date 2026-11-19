@@ -17,6 +17,7 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use byteview::ByteView;
+use std::collections::HashSet;
 pub(super) async fn assert_auth_rejected(state: &AuthValidationState, token: &str, expected: &str) {
     let error = remote_auth_context(state, Some(AuthToken::bearer(token).unwrap()))
         .await

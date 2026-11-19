@@ -11,7 +11,7 @@ use crate::metadata::{
 };
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::rocrate::replace_metadata_rocrate;
-use crate::routes::metadata::tests::drain_metadata_background;
+use crate::tests::metadata_fixtures::drain_metadata_background;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};

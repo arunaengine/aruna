@@ -4,7 +4,6 @@
 
 use super::enrollment_status;
 use aruna_core::UserId;
-use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind};
 use aruna_core::structs::identity::realm::RealmId;
@@ -12,14 +11,8 @@ use aruna_operations::driver::drive;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use axum::extract::State;
 use axum::http::StatusCode;
-use base64::Engine;
-use ed25519_dalek::pkcs8::EncodePrivateKey;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
-
-#[path = "merge_tests.rs"]
-mod merge;
 
 // An unclaimed enrollment past its expiry is dead: reporting it as pending
 // would show an enrollment in flight that can never complete.

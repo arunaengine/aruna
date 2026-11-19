@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::tasks::runner::recover_stale_jobs;
 use aruna_operations::jobs::store::test_calls::{claim_job, insert_job, read_job_record};
 
 pub(super) use super::support::*;
@@ -124,10 +125,12 @@ async fn paused_runtime_waits() {
     .expect("job exists");
     assert_eq!(stored.state, JobState::Claimed);
     assert_eq!(
-        runtime
-            .recover_stale_jobs(&aruna_operations::testing::test_context(storage.clone()))
-            .await
-            .unwrap(),
+        recover_stale_jobs(
+            &runtime,
+            &aruna_operations::testing::test_context(storage.clone())
+        )
+        .await
+        .unwrap(),
         1
     );
     runtime.start();

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::tasks::runner::recover_until_stopped;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -216,11 +217,10 @@ pub(crate) async fn start(
                 });
             }
             StartupPhase::RecoverStaleJobs => {
-                if let Err(error) = jobs_runtime
-                    .recover_until_stopped(&driver_ctx, stop, || {
-                        matches!(observed_exit(), Some((_, ServiceExit::StopsNode)))
-                    })
-                    .await
+                if let Err(error) = recover_until_stopped(&jobs_runtime, &driver_ctx, stop, || {
+                    matches!(observed_exit(), Some((_, ServiceExit::StopsNode)))
+                })
+                .await
                 {
                     warn!(error = %error, "Failed to recover stale jobs at startup");
                 }

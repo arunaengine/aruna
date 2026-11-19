@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::tasks::runner::{claim_producer, spawn_job};
 use aruna_operations::driver::node_routing;
 use aruna_operations::federation::registration::PublishRegistrationOperation;
 use std::time::SystemTime;
@@ -628,7 +629,6 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_mirror_repair(&self) {
-        #[cfg(feature = "test-hooks")]
         if self
             .context
             .metadata_handle
@@ -776,7 +776,7 @@ impl OperationsTaskHandler {
                 .await;
             return;
         };
-        let Some(claim_producer) = self.jobs_runtime.claim_producer().await else {
+        let Some(claim_producer) = claim_producer(&self.jobs_runtime).await else {
             return;
         };
         // Per class: one aggregate would claim rows of a saturated class only to
@@ -830,7 +830,7 @@ impl OperationsTaskHandler {
                 }
                 continue;
             }
-            self.jobs_runtime.spawn(self.context.clone(), record);
+            spawn_job(&self.jobs_runtime, self.context.clone(), record);
         }
         drop(claim_producer);
 

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna::tasks::runner::{recover_stale_jobs, spawn_job, wait_for_terminal};
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -103,7 +104,7 @@ async fn restart_recovers_jobs() -> Result<(), Box<dyn std::error::Error>> {
         compute_handle: None,
         outbound_handle: None,
     });
-    let recovered = runtime.recover_stale_jobs(&context).await?;
+    let recovered = recover_stale_jobs(&runtime, &context).await?;
     assert_eq!(recovered, 2, "both in-flight jobs are re-queued at startup");
 
     drive_until_terminal(&context, &runtime).await?;
@@ -139,12 +140,12 @@ async fn drive_until_terminal(
     )
     .await?;
     for record in batch.claimed {
-        runtime.spawn(context.clone(), record);
+        spawn_job(runtime, context.clone(), record);
     }
 
     let (a, b) = tokio::join!(
-        runtime.wait_for_terminal(&context, job_a(), Duration::from_secs(60)),
-        runtime.wait_for_terminal(&context, job_b(), Duration::from_secs(60)),
+        wait_for_terminal(runtime, &context, job_a(), Duration::from_secs(60)),
+        wait_for_terminal(runtime, &context, job_b(), Duration::from_secs(60)),
     );
     if a.is_none() || b.is_none() {
         return Err("jobs did not reach terminal state after restart".into());

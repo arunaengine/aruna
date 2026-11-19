@@ -2,40 +2,47 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::tasks::runner::{handle_panic, run_job};
+use crate::tasks::runner::{
+    claim_producer, finish_job, recover_stale_jobs, recover_until_stopped, run_job, shutdown_jobs,
+    spawn_job, wait_for_terminal,
+};
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
+use aruna_core::heartbeat::RunningJobs;
 use aruna_core::id::NodeId;
+use aruna_core::jobs::{JobKind, RunningJobView};
 use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::{
     AttemptIntent, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
-    ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload, RoCrateLimits,
+    ImportRoCrateTarget, JobClaim, JobExecutionClass, JobId, JobPayload, JobRecord,
+    JobResultPayload, RoCrateLimits,
 };
-use aruna_core::structs::execution::job::{JobError, JobErrorKind, JobState};
+use aruna_core::structs::execution::job::{JobError, JobState};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::JOB_MAX_ATTEMPTS;
-use aruna_operations::jobs::context::JobContext;
-use aruna_operations::jobs::executor::JobRunOutcome;
+use aruna_operations::jobs::context::ExternalReconciler;
+use aruna_operations::jobs::executor::{ProgressReporter, RangeTurns};
 use aruna_operations::jobs::runtime::*;
 use aruna_operations::jobs::runtime_steps::requeue_call;
 use aruna_operations::jobs::store::JobMutation;
 use aruna_operations::jobs::store::job_calls::{AdoptOutcome, ClaimOutcome, RequeueOutcome};
 use aruna_operations::jobs::store::mutation_error::JobMutationError;
 use aruna_operations::jobs::store::test_calls::{
-    adopt_external_attempt, cancel_running_job, claim_job, complete_job, insert_job,
-    list_job_entries, mutate_job, read_job_record, record_attempt_intent, requeue_job,
-    set_cancel_requested,
+    adopt_external_attempt, cancel_running_job, claim_job, complete_job, insert_job, mutate_job,
+    read_job_record, record_attempt_intent, requeue_job, set_cancel_requested,
 };
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_operations::jobs::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP, JOB_MAX_ATTEMPTS};
 use aruna_operations::testing::task_context;
+use aruna_storage::{FjallStorage, StorageHandle};
 use byteview::ByteView;
 use futures_util::future::FutureExt;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 fn node_id(seed: u8) -> NodeId {
@@ -155,9 +162,8 @@ async fn probe_reaches_success() {
     let job_id = JobId::from_bytes([1u8; 16]);
     let claimed = claim(&ctx, probe_record(job_id, 3, 0, None)).await;
 
-    runtime.spawn(ctx.clone(), claimed);
-    let state = runtime
-        .wait_for_terminal(&ctx, job_id, Duration::from_secs(10))
+    spawn_job(&runtime, ctx.clone(), claimed);
+    let state = wait_for_terminal(&runtime, &ctx, job_id, Duration::from_secs(10))
         .await
         .unwrap();
     assert_eq!(state, JobState::Succeeded);
@@ -179,7 +185,7 @@ async fn cancel_running_cleanup() {
     let marker_str = marker.to_str().unwrap().to_string();
     let claimed = claim(&ctx, probe_record(job_id, 10_000, 5, Some(marker_str))).await;
 
-    runtime.spawn(ctx.clone(), claimed);
+    spawn_job(&runtime, ctx.clone(), claimed);
     for _ in 0..100 {
         if marker.exists() {
             break;
@@ -192,8 +198,7 @@ async fn cancel_running_cleanup() {
     );
     assert!(runtime.request_cancel(job_id));
 
-    let state = runtime
-        .wait_for_terminal(&ctx, job_id, Duration::from_secs(10))
+    let state = wait_for_terminal(&runtime, &ctx, job_id, Duration::from_secs(10))
         .await
         .unwrap();
     assert_eq!(state, JobState::Cancelled);
@@ -221,9 +226,8 @@ async fn cancel_before_run() {
     record.has_run = true;
     let claimed = claim(&ctx, record).await;
 
-    runtime.spawn(ctx.clone(), claimed);
-    let state = runtime
-        .wait_for_terminal(&ctx, job_id, Duration::from_secs(10))
+    spawn_job(&runtime, ctx.clone(), claimed);
+    let state = wait_for_terminal(&runtime, &ctx, job_id, Duration::from_secs(10))
         .await
         .unwrap();
     assert_eq!(state, JobState::Cancelled);
@@ -401,7 +405,7 @@ async fn recover_requeues_inflight() {
     insert_job(&context, &record).await.unwrap();
 
     for restart in 0..(JOB_MAX_ATTEMPTS + 2) {
-        assert_eq!(runtime.recover_stale_jobs(&context).await.unwrap(), 1);
+        assert_eq!(recover_stale_jobs(&runtime, &context).await.unwrap(), 1);
         let recovered = read_job_record(&context, job_id, None)
             .await
             .unwrap()
@@ -425,9 +429,8 @@ async fn finished_at_fresh() {
     let claimed = claim(&ctx, probe_record(job_id, 30, 10, None)).await;
 
     let t_before = unix_timestamp_millis();
-    runtime.spawn(ctx.clone(), claimed);
-    let state = runtime
-        .wait_for_terminal(&ctx, job_id, Duration::from_secs(10))
+    spawn_job(&runtime, ctx.clone(), claimed);
+    let state = wait_for_terminal(&runtime, &ctx, job_id, Duration::from_secs(10))
         .await
         .unwrap();
     assert_eq!(state, JobState::Succeeded);
@@ -449,9 +452,8 @@ async fn progress_writes_throttled() {
     let claimed = claim(&ctx, probe_record(job_id, 10_000, 0, None)).await;
 
     let before = storage.snapshot_metrics().requests_total;
-    runtime.spawn(ctx.clone(), claimed);
-    let state = runtime
-        .wait_for_terminal(&ctx, job_id, Duration::from_secs(10))
+    spawn_job(&runtime, ctx.clone(), claimed);
+    let state = wait_for_terminal(&runtime, &ctx, job_id, Duration::from_secs(10))
         .await
         .unwrap();
     assert_eq!(state, JobState::Succeeded);
@@ -475,9 +477,9 @@ async fn shutdown_releases_lease() {
     let claimed = claim(&ctx, probe_record(job_id, 100, 20, None)).await;
 
     let runtime = JobsRuntime::new();
-    runtime.spawn(ctx.clone(), claimed);
+    spawn_job(&runtime, ctx.clone(), claimed);
     wait_running(&ctx, job_id).await;
-    let report = runtime.shutdown(&ctx, Duration::ZERO).await;
+    let report = shutdown_jobs(&runtime, &ctx, Duration::ZERO).await;
     // The payload's own Interrupted release races the shutdown sweep; both
     // hand the lease back attempt-free, so only the sum is deterministic.
     assert_eq!(report.released + report.finished + report.skipped, 1);
@@ -494,9 +496,8 @@ async fn shutdown_releases_lease() {
     // The next node picks it straight back up and drives it to success.
     let restarted = JobsRuntime::new();
     let reclaimed = reclaim(&ctx, job_id).await;
-    restarted.spawn(ctx.clone(), reclaimed);
-    let state = restarted
-        .wait_for_terminal(&ctx, job_id, Duration::from_secs(20))
+    spawn_job(&restarted, ctx.clone(), reclaimed);
+    let state = wait_for_terminal(&restarted, &ctx, job_id, Duration::from_secs(20))
         .await
         .unwrap();
     assert_eq!(state, JobState::Succeeded);
@@ -511,15 +512,15 @@ async fn shutdown_awaits_producer() {
     let job_id = JobId::from_bytes([0x15; 16]);
     let claimed = claim(&ctx, probe_record(job_id, 1, 0, None)).await;
     let runtime = JobsRuntime::new();
-    let producer = runtime.claim_producer().await.unwrap();
+    let producer = claim_producer(&runtime).await.unwrap();
 
-    let mut shutdown = Box::pin(runtime.shutdown(&ctx, Duration::ZERO));
+    let mut shutdown = Box::pin(shutdown_jobs(&runtime, &ctx, Duration::ZERO));
     assert!(
         shutdown.as_mut().now_or_never().is_none(),
         "shutdown must wait for the active claim producer"
     );
 
-    runtime.spawn(ctx.clone(), claimed);
+    spawn_job(&runtime, ctx.clone(), claimed);
     drop(producer);
     tokio::time::timeout(Duration::from_secs(30), shutdown)
         .await
@@ -626,9 +627,9 @@ async fn restarts_keep_attempts() {
     for restart in 0..(JOB_MAX_ATTEMPTS + 2) {
         let runtime = JobsRuntime::new();
         let claimed = reclaim(&ctx, job_id).await;
-        runtime.spawn(ctx.clone(), claimed);
+        spawn_job(&runtime, ctx.clone(), claimed);
         wait_running(&ctx, job_id).await;
-        runtime.shutdown(&ctx, Duration::ZERO).await;
+        shutdown_jobs(&runtime, &ctx, Duration::ZERO).await;
 
         let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.state, JobState::Queued, "restart {restart}");
@@ -647,7 +648,7 @@ async fn shutdown_skips_cleanup() {
     let claimed = claim(&ctx, probe_record(job_id, 10_000, 5, Some(marker_str))).await;
 
     let runtime = JobsRuntime::new();
-    runtime.spawn(ctx.clone(), claimed);
+    spawn_job(&runtime, ctx.clone(), claimed);
     wait_running(&ctx, job_id).await;
     for _ in 0..100 {
         if marker.exists() {
@@ -657,7 +658,7 @@ async fn shutdown_skips_cleanup() {
     }
     assert!(marker.exists(), "probe should create its marker");
 
-    let report = runtime.shutdown(&ctx, Duration::from_secs(10)).await;
+    let report = shutdown_jobs(&runtime, &ctx, Duration::from_secs(10)).await;
     assert_eq!(report.finished, 1, "the probe winds down inside the grace");
 
     let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
@@ -675,7 +676,7 @@ async fn shutdown_spares_takeover() {
     let claimed = claim(&ctx, probe_record(job_id, 10_000, 5, None)).await;
 
     let runtime = JobsRuntime::new();
-    runtime.spawn(ctx.clone(), claimed);
+    spawn_job(&runtime, ctx.clone(), claimed);
     wait_running(&ctx, job_id).await;
 
     // The lease lapses and a peer takes the job over while we still hold it locally.
@@ -686,7 +687,7 @@ async fn shutdown_spares_takeover() {
         .await
         .unwrap();
 
-    let report = runtime.shutdown(&ctx, Duration::ZERO).await;
+    let report = shutdown_jobs(&runtime, &ctx, Duration::ZERO).await;
     assert_eq!(report.released, 0);
     assert_eq!(report.skipped, 1);
 
@@ -732,9 +733,7 @@ async fn wait_times_out() {
         .await
         .unwrap();
 
-    let result = runtime
-        .wait_for_terminal(&context, job_id, Duration::from_millis(100))
-        .await;
+    let result = wait_for_terminal(&runtime, &context, job_id, Duration::from_millis(100)).await;
     assert_eq!(result, None);
 }
 
@@ -752,7 +751,7 @@ async fn panic_frees_slot() {
     *panic_at = Some(0);
     let claimed = claim(&ctx, record).await;
 
-    runtime.spawn(ctx.clone(), claimed);
+    spawn_job(&runtime, ctx.clone(), claimed);
     let mut freed = false;
     for _ in 0..400 {
         if runtime.available_slots() == 1 {
@@ -765,9 +764,8 @@ async fn panic_frees_slot() {
 
     let ok = JobId::from_bytes([0xAB; 16]);
     let claimed = claim(&ctx, probe_record(ok, 2, 0, None)).await;
-    runtime.spawn(ctx.clone(), claimed);
-    let state = runtime
-        .wait_for_terminal(&ctx, ok, Duration::from_secs(10))
+    spawn_job(&runtime, ctx.clone(), claimed);
+    let state = wait_for_terminal(&runtime, &ctx, ok, Duration::from_secs(10))
         .await
         .unwrap();
     assert_eq!(
@@ -789,11 +787,11 @@ async fn zombie_keeps_survivor() {
     let survivor = runtime.register_test_execution(job_id, JobExecutionClass::InProcess);
     assert_ne!(zombie, survivor);
 
-    runtime.finish(&ctx, job_id, zombie).await;
+    finish_job(&runtime, &ctx, job_id, zombie).await;
     assert_eq!(runtime.running_count(), 1, "zombie must not evict survivor");
     assert!(runtime.request_cancel(job_id), "survivor still registered");
 
-    runtime.finish(&ctx, job_id, survivor).await;
+    finish_job(&runtime, &ctx, job_id, survivor).await;
     assert_eq!(runtime.running_count(), 0);
 }
 
@@ -827,7 +825,7 @@ async fn deferred_for_delay() {
     let claimed = claim(&driver, record).await;
     let attempts = claimed.attempts;
 
-    runtime.spawn(task_context(storage.clone()), claimed);
+    spawn_job(&runtime, task_context(storage.clone()), claimed);
     let mut finished = runtime.state().running[&job_id].completion.subscribe();
     tokio::time::timeout(Duration::from_secs(60), finished.wait_for(|done| *done))
         .await
@@ -858,7 +856,7 @@ async fn counts_running_jobs() {
     let job_id = JobId::from_bytes([0x6B; 16]);
     let claimed = claim(&ctx, probe_record(job_id, 2, 0, None)).await;
 
-    runtime.spawn(ctx, claimed);
+    spawn_job(&runtime, ctx, claimed);
     assert_eq!(
         runtime.running_jobs(),
         RunningJobs {
@@ -888,7 +886,7 @@ async fn counts_running_jobs() {
             }
         );
     }
-    runtime.finish(&task_context(storage), job_id, nonce).await;
+    finish_job(&runtime, &task_context(storage), job_id, nonce).await;
     assert_eq!(runtime.running_jobs(), RunningJobs::default());
 }
 
@@ -1026,7 +1024,7 @@ async fn recover_reconciles_external() {
     insert_job(&context, &record).await.unwrap();
 
     // No in-process job was recovered; the external one was reconciled, not requeued.
-    assert_eq!(runtime.recover_stale_jobs(&context).await.unwrap(), 0);
+    assert_eq!(recover_stale_jobs(&runtime, &context).await.unwrap(), 0);
     let after = read_job_record(&context, job_id, None)
         .await
         .unwrap()
@@ -1096,7 +1094,7 @@ async fn stop_between_units() {
 
     let stop = CancellationToken::new();
     let failure = std::sync::atomic::AtomicBool::new(false);
-    let recover = runtime.recover_until_stopped(&context, &stop, || {
+    let recover = recover_until_stopped(&runtime, &context, &stop, || {
         failure.load(std::sync::atomic::Ordering::SeqCst)
     });
     tokio::pin!(recover);
@@ -1137,8 +1135,7 @@ async fn cancel_before_recovery() {
     let stop = CancellationToken::new();
     stop.cancel();
     assert_eq!(
-        runtime
-            .recover_until_stopped(&context, &stop, || false)
+        recover_until_stopped(&runtime, &context, &stop, || false)
             .await
             .unwrap(),
         0
@@ -1206,7 +1203,7 @@ async fn recovery_spares_attempts() {
 
     for restart in 0..(JOB_MAX_ATTEMPTS + 2) {
         expire_lease(&context, job_id).await;
-        assert_eq!(runtime.recover_stale_jobs(&context).await.unwrap(), 0);
+        assert_eq!(recover_stale_jobs(&runtime, &context).await.unwrap(), 0);
         let after = read_job_record(&context, job_id, None)
             .await
             .unwrap()

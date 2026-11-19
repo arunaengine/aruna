@@ -504,6 +504,7 @@ mod tests {
     use crate::explorer::ExplorerError;
     use crate::migrate::tests::{read, write};
     use crate::migrate::{MigrateOutput, migrate_output};
+    use aruna::tasks::runner::recover_stale_jobs;
     use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::compute::ExecutionTargetId;
@@ -968,7 +969,7 @@ mod tests {
             .unwrap();
         let listed: Vec<JobId> = jobs.iter().map(|job| job.job_id).collect();
         assert_eq!(listed, [kept_job]);
-        let recovered = JobsRuntime::new().recover_stale_jobs(&context).await;
+        let recovered = recover_stale_jobs(&JobsRuntime::new(), &context).await;
         assert_eq!(recovered, Ok(0), "startup recovery reads what is left");
     }
 

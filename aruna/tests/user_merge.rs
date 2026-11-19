@@ -6,8 +6,9 @@ use super::{
     RegisterUserRequest, RegisterUserResponse, TestNode, TestOidcClaims, register_via_oidc,
     sign_claims, spawn_oidc_provider, spawn_test_node,
 };
-use crate::routes::access::users::GetUserResponse;
+use aruna_api::routes::access::users::GetUserResponse;
 use aruna_core::keys::generate_signing_key;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_wire::users::GetTokenResponse;
 use axum::http::StatusCode;
 use ed25519_dalek::SigningKey;
@@ -17,7 +18,7 @@ const ISSUER: &str = "https://issuer.example";
 const KID: &str = "main-key";
 
 fn now() -> u64 {
-    super::super::now_timestamp()
+    unix_timestamp_secs()
 }
 
 fn login_token(key: &SigningKey, subject: &str, name: &str, email: Option<(&str, bool)>) -> String {

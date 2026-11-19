@@ -26,7 +26,7 @@ use ulid::Ulid;
 use super::remove_drained_backends;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_operations::driver::DriverContext;
-use aruna_operations::groups::backends::{backend_key, index_key};
+use aruna_operations::groups::backends::{backend_key, index_key, record_writes};
 
 fn context(root: &str) -> DriverContext {
     let storage_handle = aruna_storage::FjallStorage::open(root).unwrap();
@@ -61,7 +61,7 @@ async fn write(context: &DriverContext, key_space: &str, key: Key, value: Vec<u8
 
 async fn seed(context: &DriverContext, backend_id: Ulid, disabled: bool) {
     let stored = record(backend_id, disabled);
-    for (key_space, key, value) in super::record_writes(&stored).unwrap() {
+    for (key_space, key, value) in record_writes(&stored).unwrap() {
         write(context, &key_space, key, value.to_vec()).await;
     }
     let secret = GroupStorageSecret {

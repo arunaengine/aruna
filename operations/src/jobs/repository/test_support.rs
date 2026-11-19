@@ -10,6 +10,7 @@ use aruna_core::calls::{ChildOutcome, IoResult};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
+#[cfg(test)]
 use aruna_core::repository::remote::InvenioAccess;
 use aruna_core::repository::remote::{JobStop, NodeScope, RemoteAnswer, RemoteFailure};
 use aruna_core::repository::{LinkDirection, LinkRemote, LinkStatus, RepositoryLink};
@@ -27,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use super::JobScope;
+#[cfg(test)]
 use super::invenio::Session;
 use crate::jobs::executor::ProgressReporter;
 

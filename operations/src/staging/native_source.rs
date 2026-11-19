@@ -58,9 +58,9 @@ type Reject = NativeReferenceReject;
 /// What a peer's request prepared: the answer's metadata and, for a read, its bytes.
 #[derive(Debug, PartialEq)]
 pub struct PreparedReference {
-    pub(crate) metadata: SourceMetadata,
-    pub(crate) group_id: Option<GroupId>,
-    pub(crate) body: Option<BackendStream<Result<Bytes, StreamError>>>,
+    pub metadata: SourceMetadata,
+    pub group_id: Option<GroupId>,
+    pub body: Option<BackendStream<Result<Bytes, StreamError>>>,
 }
 
 fn request_operation(request: &NativeReferenceRequest) -> &'static str {

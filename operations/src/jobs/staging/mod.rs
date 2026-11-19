@@ -458,7 +458,6 @@ pub(crate) mod pure_tests {
     use crate::staging::page::rows::MAX_ERROR_SAMPLE;
     use crate::tests::staging::test_spec;
     use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
-    use aruna_core::structs::execution::staging::StagingStrategy;
 
     /// A run of the test spec.
     pub(super) fn test_run() -> StagingRun {
