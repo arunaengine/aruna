@@ -19,7 +19,7 @@ use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::api::fanout::search_buckets_distributed;
+use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
 use aruna_operations::metadata::api::search_types::BucketSearchRequest;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -179,7 +179,6 @@ impl McpServer {
         let context = self.state.get_ctx();
         loop {
             let search = search_buckets_distributed(
-                context.as_ref(),
                 self.state.get_realm_id(),
                 self.state.get_node_id(),
                 BucketSearchRequest {
@@ -195,6 +194,7 @@ impl McpServer {
                     database: false,
                 },
             );
+            let search = drive(search, context.as_ref());
             // Out of time, a bucket of the same name elsewhere is not ruled out.
             let Ok(page) = tokio::time::timeout_at(deadline, search).await else {
                 return Err(explained(

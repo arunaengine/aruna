@@ -21,7 +21,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_operations::metadata::api::fanout::search_buckets_distributed;
+use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
 use aruna_operations::metadata::api::search_types::BucketSearchRequest;
 use aruna_operations::placement::policy::GateOperation;
 use aruna_operations::replication::live_queue::{CompletePutInput, CompletePutOperation};
@@ -359,23 +359,25 @@ impl McpServer {
         authorize_search(self, &auth, extras.clone()).await?;
         // Every node checks the caller on its own buckets and leaves out what it may not read.
         let bearer = request_bearer(&parts).map(|carrier| carrier.as_str().to_string());
-        let result = search_buckets_distributed(
+        let result = drive(
+            search_buckets_distributed(
+                self.state.get_realm_id(),
+                self.state.get_node_id(),
+                BucketSearchRequest {
+                    auth: auth.clone(),
+                    bearer_token: bearer,
+                    query: String::new(),
+                    key: None,
+                    // The tool's policies apply on each node, before members of a bucket merge.
+                    extras: Some(extras.clone()),
+                    limit: BUCKET_PAGE,
+                    group_id: None,
+                    cursor: input.cursor,
+                    target_nodes: None,
+                    database: false,
+                },
+            ),
             self.state.get_ctx().as_ref(),
-            self.state.get_realm_id(),
-            self.state.get_node_id(),
-            BucketSearchRequest {
-                auth: auth.clone(),
-                bearer_token: bearer,
-                query: String::new(),
-                key: None,
-                // The tool's policies apply on each node, before members of a bucket merge.
-                extras: Some(extras.clone()),
-                limit: BUCKET_PAGE,
-                group_id: None,
-                cursor: input.cursor,
-                target_nodes: None,
-                database: false,
-            },
         )
         .await
         .map_err(crate::metadata::map_api_error)

@@ -53,7 +53,7 @@ pub struct BucketSearchRequest {
     pub database: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BucketSearchExecution {
     pub hits: Vec<BucketSearchHit>,
     /// Continues the listing; `None` once every node reached its end.

@@ -4,25 +4,19 @@
 
 use super::fanout_types::{
     MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall,
-    RealmNodeDiscovery,
+    RealmNodeDiscovery, pattern_contains_service,
 };
-use super::fanout_types::{fanout_bearer, metadata_node_call, pattern_contains_service};
 use super::field;
 
 use super::super::handle::QUERY_MAX_BYTES;
 use super::preflight::discover_realm_nodes;
 use super::{
-    ApiQueryMode, BucketPage, BucketSearchExecution, BucketSearchRequest,
-    DISTRIBUTED_QUERY_DEADLINE, HashSet, Instant, MetadataApiError, MetadataReadError, NodeId,
-    QUERY_FANOUT_LIMIT, QUERY_MAX_NODES, QUERY_MAX_ROWS, RealmId, SearchBucketsInput, Span,
-    debug_span, deduplicate_fanout_nodes, map_read_error, query_fingerprint, record_elapsed_ms,
-    select_fanout_nodes, short_display_id, stream, warn,
+    ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, HashSet, Instant, MetadataApiError,
+    MetadataReadError, NodeId, QUERY_FANOUT_LIMIT, QUERY_MAX_NODES, QUERY_MAX_ROWS, RealmId, Span,
+    debug_span, deduplicate_fanout_nodes, map_read_error, record_elapsed_ms, select_fanout_nodes,
+    short_display_id, stream, warn,
 };
 use crate::driver::DriverContext;
-use crate::s3::bucket::local_search::LocalBucketSearch;
-
-use super::bucket_page::{NodePosition, decode_cursor, encode_cursor, merge_pages, retired_nodes};
-use super::distributed::record_bucket_result;
 use futures_util::StreamExt;
 use tracing::Instrument;
 
@@ -399,207 +393,6 @@ where
                     .collect(),
                 fanout_stats,
             ))
-        }
-    }
-}
-
-pub async fn search_buckets_distributed(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    request: BucketSearchRequest,
-) -> Result<BucketSearchExecution, MetadataApiError> {
-    let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
-    let limit = request.limit.clamp(1, 50);
-    let subject = query_fingerprint(
-        &request.query,
-        None,
-        Some(ApiQueryMode::Distributed),
-        None,
-        None,
-    );
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    let remote_auth_token = fanout_bearer(request.bearer_token.as_deref());
-    let cursor = decode_cursor(request.cursor.as_deref())?;
-    let positions = cursor.positions.clone();
-    let group_id = request.group_id;
-    let database = request.database;
-    let done = (positions.iter())
-        .filter(|entry| entry.done)
-        .filter_map(|entry| NodeId::from_bytes(&entry.node_id).ok())
-        .collect();
-    let local_call: MetadataNodeCall<BucketPage> = metadata_node_call(
-        (
-            context.clone(),
-            request.auth,
-            realm_id,
-            (
-                request.query.clone(),
-                request.key.clone(),
-                request.extras.clone(),
-            ),
-            limit,
-            positions.clone(),
-        ),
-        move |(context, auth, realm_id, (query, key, extras), limit, positions), node_id| async move {
-            let Some(start_after) = start_after(&positions, node_id) else {
-                return Ok(BucketPage::default());
-            };
-            crate::driver::drive(
-                LocalBucketSearch::new(SearchBucketsInput {
-                    auth,
-                    realm_id,
-                    node_id,
-                    query,
-                    key,
-                    extras,
-                    limit,
-                    group_id,
-                    start_after: start_after.map(Into::into),
-                    database,
-                }),
-                &context,
-            )
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)
-        },
-    );
-    let remote_call: MetadataNodeCall<BucketPage> = metadata_node_call(
-        (
-            handle,
-            remote_auth_token,
-            (request.query, request.key, request.extras),
-            limit,
-            positions.clone(),
-        ),
-        move |(handle, auth_token, (query, key, extras), limit, positions), node_id| async move {
-            let Some(start_after) = start_after(&positions, node_id) else {
-                return Ok(BucketPage::default());
-            };
-            handle
-                .request_bucket_search(
-                    node_id,
-                    auth_token,
-                    (query, key, extras, limit),
-                    (group_id, database),
-                    start_after,
-                )
-                .await
-        },
-    );
-    let (parts, mut fanout_stats) = run_metadata_fanout(
-        context,
-        realm_id,
-        local_node_id,
-        MetadataFanoutScope::new(Some(ApiQueryMode::Distributed), request.target_nodes, true)
-            .with_subject(subject)
-            .with_deadline(deadline)
-            .with_skip(done),
-        MetadataFanoutOperation::BucketSearch,
-        local_call,
-        remote_call,
-        record_bucket_result,
-        map_read_error,
-    )
-    .await?;
-    let asked = (
-        &fanout_stats.failed_partitions[..],
-        &fanout_stats.omitted[..],
-    );
-    let retired = retired_nodes(&parts);
-    let (hits, cursor) = merge_pages(parts, asked, cursor, limit);
-    // A retired node's part ended early, so the page is partial though its scan is done.
-    fanout_stats.nodes_failed += retired.len();
-    fanout_stats.failed_partitions.extend(retired);
-    Ok(BucketSearchExecution {
-        hits,
-        next_cursor: encode_cursor(&cursor),
-        fanout_stats,
-    })
-}
-
-/// Where a node's next page starts; `None` for a node that already reached its end.
-fn start_after(positions: &[NodePosition], node_id: NodeId) -> Option<Option<Vec<u8>>> {
-    match NodePosition::of(positions, node_id) {
-        Some(entry) if entry.done => None,
-        entry => Some(entry.and_then(|entry| entry.after.clone())),
-    }
-}
-
-type Matches = Vec<crate::metadata::secondary_ids::IdentifierMatch>;
-
-/// Asks every realm node's reverse index, since each node indexes only the mappings it holds.
-/// Returns the merged readable matches and whether any node failed to answer.
-pub async fn lookup_identifier_distributed(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    auth: Option<super::AuthContext>,
-    bearer_token: Option<String>,
-    identifier: (
-        aruna_core::structs::secondary_id::SecondaryIdKind,
-        String,
-        Option<String>,
-    ),
-) -> Result<(Matches, bool), MetadataApiError> {
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    let local_call: MetadataNodeCall<Matches> = metadata_node_call(
-        (context.clone(), auth, realm_id, identifier.clone()),
-        |(context, auth, realm_id, (kind, value, endpoint)), _| async move {
-            use crate::metadata::identifier_lookup::{IdentifierLookupOperation, IdentifierQuery};
-            let query = IdentifierQuery {
-                kind,
-                value,
-                endpoint,
-            };
-            crate::driver::drive(
-                IdentifierLookupOperation::new(realm_id, auth, query),
-                &context,
-            )
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)
-        },
-    );
-    let remote_call: MetadataNodeCall<Matches> = metadata_node_call(
-        (handle, fanout_bearer(bearer_token.as_deref()), identifier),
-        |(handle, auth_token, (kind, value, endpoint)), node_id| async move {
-            handle
-                .request_identifier_lookup(node_id, auth_token, kind, value, endpoint)
-                .await
-        },
-    );
-    let (parts, stats) = run_metadata_fanout(
-        context,
-        realm_id,
-        local_node_id,
-        MetadataFanoutScope::new(Some(ApiQueryMode::Distributed), None, true),
-        MetadataFanoutOperation::IdentifierLookup,
-        local_call,
-        remote_call,
-        record_lookup_result,
-        map_read_error,
-    )
-    .await?;
-    let matches = crate::metadata::secondary_ids::merge_matches(
-        parts.into_iter().flat_map(|(_, matches)| matches),
-    );
-    Ok((matches, stats.nodes_failed > 0 || stats.discovery_failed))
-}
-
-fn record_lookup_result(span: &Span, result: &Result<Matches, MetadataReadError>) {
-    match result {
-        Ok(matches) => {
-            span.record("result", "ok");
-            span.record("hit_count", matches.len() as u64);
-        }
-        Err(_) => {
-            span.record("result", "error");
         }
     }
 }

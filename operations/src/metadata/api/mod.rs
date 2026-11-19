@@ -85,6 +85,7 @@ use aruna_core::placement::{
 };
 
 mod bucket_page;
+pub mod bucket_search;
 mod distributed;
 pub mod distributed_types;
 pub mod document_query;
@@ -93,6 +94,7 @@ pub mod export_types;
 pub mod fanout;
 pub mod fanout_types;
 mod head_versions;
+pub mod identifier_fanout;
 pub mod links;
 pub mod list;
 pub mod list_types;

@@ -4,12 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::cursor::OBJECT_CURSOR_CONTEXT;
-use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -23,7 +23,8 @@ use super::fanout_types::{
     fanout_bearer,
 };
 use super::node_fanout::{
-    DiscoveryOperation, FanoutParts, NodeCalls, NodeFanoutOperation, member_child,
+    DiscoveryOperation, FanoutParts, NodeCalls, NodeFanoutOperation, child_part, member_child,
+    peer_answer, peer_request,
 };
 use super::path_types::deduplicate_fanout_nodes;
 use super::search::{
@@ -36,8 +37,7 @@ use super::search_types::{
 };
 use super::{DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError, map_read_error};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::fetch::peer_reply;
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::load_config::config_unavailable;
 use crate::s3::object::search::{SearchNodePage, SearchObjectsError, SearchObjectsInput};
 use crate::s3::object::search_scan::SearchObjectsOperation;
@@ -82,14 +82,7 @@ impl NodeCalls for ObjectCalls {
             start_after: self.start(node),
             as_of: self.input.as_of,
         };
-        // A request that cannot be encoded reaches the peer empty and answers as unavailable.
-        let frame = encode_message(&message).unwrap_or_default();
-        let request = MetadataRequestEffect {
-            peer: node,
-            frame,
-            timeout,
-        };
-        Effect::Net(NetEffect::MetadataRequest(Box::new(request)))
+        peer_request(node, &message, timeout)
     }
 
     fn read(
@@ -99,16 +92,10 @@ impl NodeCalls for ObjectCalls {
         event: Event,
     ) -> Result<SearchNodePage, MetadataReadError> {
         if local {
-            let Event::Child(outcome) = event else {
-                return Err(MetadataReadError::Unavailable);
-            };
-            let page = outcome.take::<SearchNodePage, SearchObjectsError>();
-            return page
-                .and_then(Result::ok)
-                .ok_or(MetadataReadError::Unavailable);
+            return child_part::<SearchNodePage, SearchObjectsError>(event);
         }
-        match peer_reply(node, IoResult::Event(Box::new(event)))? {
-            Ok(MetadataTransportMessage::ObjectSearchResults { result }) => result,
+        match peer_answer(node, event)? {
+            MetadataTransportMessage::ObjectSearchResults { result } => result,
             _ => Err(MetadataReadError::Unavailable),
         }
     }

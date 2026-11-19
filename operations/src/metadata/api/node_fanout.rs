@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, EffectGroup, GroupForm};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -25,6 +25,8 @@ use super::{
     QUERY_FANOUT_LIMIT, QUERY_MAX_NODES, map_read_error,
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::forward::fetch::peer_reply;
+use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::realm::get_nodes::{
     GetNodesError, GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
@@ -162,6 +164,42 @@ impl Operation for DiscoveryOperation {
             }
         }
     }
+}
+
+/// The request of `message` to `node` within `timeout`. A message that cannot be encoded reaches
+/// the peer empty, which answers it as unavailable.
+pub(super) fn peer_request(
+    node: NodeId,
+    message: &MetadataTransportMessage,
+    timeout: Duration,
+) -> Effect {
+    let frame = encode_message(message).unwrap_or_default();
+    let request = MetadataRequestEffect {
+        peer: node,
+        frame,
+        timeout,
+    };
+    Effect::Net(NetEffect::MetadataRequest(Box::new(request)))
+}
+
+/// The decoded answer of `node` to a [`peer_request`] member.
+pub(super) fn peer_answer(
+    node: NodeId,
+    event: Event,
+) -> Result<MetadataTransportMessage, MetadataReadError> {
+    match peer_reply(node, IoResult::Event(Box::new(event)))? {
+        Ok(message) => Ok(message),
+        Err(_) => Err(MetadataReadError::Unavailable),
+    }
+}
+
+/// The output of a child member; any failure of the child reads as unavailable.
+pub(super) fn child_part<T: 'static, E: 'static>(event: Event) -> Result<T, MetadataReadError> {
+    let Event::Child(outcome) = event else {
+        return Err(MetadataReadError::Unavailable);
+    };
+    let part = outcome.take::<T, E>().and_then(Result::ok);
+    part.ok_or(MetadataReadError::Unavailable)
 }
 
 /// How one fanout asks a node and reads its answer.
