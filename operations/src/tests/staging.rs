@@ -386,7 +386,7 @@ impl Fixture {
             .unwrap();
         spec.connector_id = connector.connector.connector_id;
         let scope = (spec.auth_context.realm_id, spec.group_id, spec.node_id);
-        spec.auth_context = crate::testing_access::seed_access(&driver, scope, "/none").await;
+        spec.auth_context = aruna_drivers::testing::seed_access(&driver, scope, "/none").await;
         let owner = spec.auth_context.user_id;
         for name in ["lists", &spec.bucket] {
             let bucket = create_test_bucket(&driver, spec.group_id, owner, name).await;

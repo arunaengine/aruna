@@ -1037,7 +1037,7 @@ mod tests {
         };
         let scope = (realm_id, group_id, local);
         let owner =
-            crate::testing_access::seed_open_access(&context, scope, "none/**", None, vec![policy])
+            aruna_drivers::testing::seed_open_access(&context, scope, "none/**", None, vec![policy])
                 .await;
         let info = BucketInfo {
             group_id,

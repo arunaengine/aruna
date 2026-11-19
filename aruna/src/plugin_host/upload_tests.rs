@@ -22,7 +22,8 @@ use aruna_operations::plugins::work::{
     Identity, RequestContext, SendBoundary, WorkKind, read_work, reserve,
 };
 use aruna_operations::s3::object::put::PutObjectOperation;
-use aruna_operations::testing_objects::{put_config, seed_bucket, with_blob};
+use aruna_operations::testing_objects::put_config;
+use aruna_drivers::testing::{seed_bucket, with_blob};
 
 const CONTENT: &[u8] = b"ACGTACGT";
 

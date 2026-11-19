@@ -947,7 +947,8 @@ pub(crate) mod test {
     use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
     use std::sync::atomic::Ordering;
     #[allow(unused_imports)]
-    pub(crate) use crate::testing_objects::{put_config, seed_bucket, with_blob};
+    pub(crate) use crate::testing_objects::put_config;
+    pub(crate) use aruna_drivers::testing::{seed_bucket, with_blob};
     use crate::tests::policy::{seed_gate, subject};
     use crate::tests::s3::{full_context, spawn_reference_server, write_version};
     use aruna_core::effects::StorageEffect;

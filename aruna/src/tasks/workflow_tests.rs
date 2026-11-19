@@ -1683,7 +1683,7 @@ async fn recovery_reuses_credential() {
         served_by: None,
     };
     let scope = (RealmId([1; 32]), spec.group_id, local);
-    let owner = aruna_operations::testing_access::seed_access(&ctx, scope, "/none")
+    let owner = aruna_drivers::testing::seed_access(&ctx, scope, "/none")
         .await
         .user_id;
     let (stored, input) = (spec.clone(), captured.clone());
@@ -1736,7 +1736,7 @@ async fn workspace_run_credential() {
     let mut spec = execution_spec();
     spec.executor_constraint = Some("docker".to_string());
     let scope = (RealmId([1; 32]), spec.group_id, local);
-    let owner = aruna_operations::testing_access::seed_access(&ctx, scope, "/none")
+    let owner = aruna_drivers::testing::seed_access(&ctx, scope, "/none")
         .await
         .user_id;
     let stored = spec.clone();
