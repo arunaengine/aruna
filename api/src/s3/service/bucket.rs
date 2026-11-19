@@ -8,6 +8,7 @@ use crate::s3::auth::map_authorize_error;
 use crate::s3::error::IntoS3Error;
 use crate::s3::scope::resolve_scope;
 use aruna_core::bucket_read::GetBucketOperation;
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 use aruna_core::metadata::AuthToken;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -23,7 +24,6 @@ use aruna_operations::replication::mirror_repair::request::MirrorRequestOperatio
 use aruna_operations::replication::mirror_repair::{
     KickRepairOperation, MirrorRecordOperation, RemoveMirrorOperation,
 };
-use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use aruna_operations::replication::sync_relationship::{
     DeleteRelationshipOperation, ListRelationshipsOperation, StoreRelationshipOperation,
     SyncRelationshipDirection,
@@ -403,7 +403,7 @@ impl ArunaS3Service {
         version_id: ulid::Ulid,
         delete_marker: bool,
     ) {
-        let result = match drive(
+        if let Err(error) = drive(
             LiveVersionOperation::new(LiveVersionInput {
                 local_node_id: self.node_id,
                 auth_context,
@@ -416,22 +416,14 @@ impl ArunaS3Service {
         )
         .await
         {
-            Ok(result) => result,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    bucket,
-                    key,
-                    version_id = %version_id,
-                    delete_marker,
-                    "Failed to queue live replication after committed write; durable obligation remains for repair"
-                );
-                return;
-            }
-        };
-
-        if result.queued > 0 && !result.scheduled {
-            warn!(bucket, key, version_id = %version_id, queued = result.queued, "Live replication jobs persisted but drain scheduling was not acknowledged");
+            warn!(
+                error = %error,
+                bucket,
+                key,
+                version_id = %version_id,
+                delete_marker,
+                "Failed to queue live replication after committed write; durable obligation remains for repair"
+            );
         }
     }
 }

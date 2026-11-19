@@ -19,7 +19,7 @@ use aruna_core::types::GroupId;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::queue::{BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult};
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 
 /// A committed put, as its live replication and its watchers need it.
 #[derive(Clone, Debug, PartialEq)]
@@ -188,21 +188,15 @@ impl Operation for QueueLiveOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         let input = &self.input;
         let (bucket, key, version_id) = (&input.bucket, &input.key, input.version_id);
-        match result.child::<QueueBlobResult, BlobQueueError>()? {
-            Ok(queued) if queued.queued > 0 && !queued.scheduled => {
-                warn!(bucket, key, version_id = %version_id, queued = queued.queued, "Live replication jobs persisted but drain scheduling was not acknowledged");
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    bucket,
-                    key,
-                    version_id = %version_id,
-                    delete_marker = input.delete_marker,
-                    "Failed to queue live replication after committed write; durable obligation remains for repair"
-                );
-            }
+        if let Err(error) = result.child::<bool, IoError>()? {
+            warn!(
+                error = %error,
+                bucket,
+                key,
+                version_id = %version_id,
+                delete_marker = input.delete_marker,
+                "Failed to queue live replication after committed write; durable obligation remains for repair"
+            );
         }
         Ok(Next::Done(()))
     }
@@ -303,17 +297,14 @@ mod tests {
     #[test]
     fn queue_failure_warns() {
         // The committed write stands, so the failure ends in a warning only.
-        let failed = Err::<QueueBlobResult, _>(BlobQueueError::Storage(StorageError::Timeout));
+        let failed = Err::<bool, _>(IoError::Storage(StorageError::Timeout));
         let turn = queueing().next(IoResult::Child(ChildOutcome::new(failed)));
         assert_eq!(turn, Ok(Next::Done(())));
     }
 
     #[test]
     fn queue_ends_done() {
-        let queued = Ok::<_, BlobQueueError>(QueueBlobResult {
-            queued: 1,
-            scheduled: true,
-        });
+        let queued = Ok::<_, IoError>(true);
         let turn = queueing().next(IoResult::Child(ChildOutcome::new(queued)));
         assert_eq!(turn, Ok(Next::Done(())));
     }

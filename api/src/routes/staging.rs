@@ -20,6 +20,7 @@ use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::job_request::SubmitJobError;
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 use aruna_core::staging_checkpoint::ReadCheckpointOperation;
 use aruna_core::structs::execution::job::{
     JobPayload, JobRecord, JobState, StagingJobCheckpoint, StagingJobItem, StagingJobPhase,
@@ -38,7 +39,6 @@ use aruna_operations::auth::request_authorization::rules_operation;
 use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};
 use aruna_operations::distribution::routing::{bound_view, route_read};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use aruna_operations::s3::object::head_source::HeadSourceError;
 use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
@@ -1958,7 +1958,7 @@ pub(crate) async fn queue_live_replication(
     version_id: ulid::Ulid,
     delete_marker: bool,
 ) {
-    let result = match drive(
+    if let Err(error) = drive(
         LiveVersionOperation::new(LiveVersionInput {
             local_node_id: state.get_node_id(),
             auth_context,
@@ -1971,22 +1971,14 @@ pub(crate) async fn queue_live_replication(
     )
     .await
     {
-        Ok(result) => result,
-        Err(error) => {
-            warn!(
-                error = %error,
-                bucket,
-                key,
-                version_id = %version_id,
-                delete_marker,
-                "Failed to queue live replication after committed staging snapshot; durable obligation remains for repair"
-            );
-            return;
-        }
-    };
-
-    if result.queued > 0 && !result.scheduled {
-        warn!(bucket, key, version_id = %version_id, queued = result.queued, "Live replication jobs persisted but drain scheduling was not acknowledged");
+        warn!(
+            error = %error,
+            bucket,
+            key,
+            version_id = %version_id,
+            delete_marker,
+            "Failed to queue live replication after committed staging snapshot; durable obligation remains for repair"
+        );
     }
 }
 

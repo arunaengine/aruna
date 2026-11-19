@@ -2,24 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
-use aruna_core::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
+use aruna_core::live_version::drain_scheduled;
+use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::replication_queue::{
-    BlobJobRecord, LiveObligationRecord, LiveReplicationContinuation, ReferenceAdvance,
-    ReplicateScopeInput, blob_job_entry, blob_job_key, blob_job_preferred, live_obligation_entry,
+    BlobJobRecord, ReplicateScopeInput, blob_job_entry, blob_job_key, blob_job_preferred,
     schedule_blob_drain,
 };
-use aruna_core::task::TaskEvent;
 use aruna_core::types::{Key, KeySpace, Value};
-use aruna_core::{NodeId, UserId};
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 use super::plaintext::{consent_delete, consent_row, job_consent};
@@ -57,18 +53,6 @@ impl From<IoError> for BlobQueueError {
 }
 
 type QueueTurn = Result<Next<QueueBlobResult>, BlobQueueError>;
-
-/// Whether the drain timer was set; the queued work is durable either way.
-fn drain_scheduled(result: IoResult) -> bool {
-    match result.event() {
-        Ok(Event::Task(TaskEvent::TimerScheduled { .. })) => true,
-        Ok(Event::Task(TaskEvent::Error { .. })) => false,
-        other => {
-            warn!(event = ?other, "Queued replication work persisted but drain scheduling returned an unexpected event");
-            false
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QueueBlobState {
@@ -219,144 +203,6 @@ impl Operation for QueueBlobOperation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveVersionInput {
-    pub local_node_id: NodeId,
-    pub auth_context: AuthContext,
-    pub bucket: String,
-    pub key: String,
-    pub version_id: Ulid,
-    pub delete_marker: bool,
-}
-
-/// Stores a live obligation in one transaction, unless a readable one is already there.
-#[derive(Debug, PartialEq)]
-struct ObligationWrite {
-    key: Key,
-    value: Value,
-    writing: bool,
-}
-
-impl Operation for ObligationWrite {
-    type Output = ();
-    type Error = BlobQueueError;
-
-    fn first(&mut self) -> Result<Next<()>, BlobQueueError> {
-        let read = read_row(REPLICATION_OBLIGATION_KEYSPACE, self.key.clone());
-        Ok(Next::Call(read))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<()>, BlobQueueError> {
-        if self.writing {
-            result.done()?;
-            return Ok(Next::Done(()));
-        }
-        let stored = result.value()?;
-        if stored.is_some_and(|value| LiveObligationRecord::from_bytes(&value).is_ok()) {
-            return Ok(Next::Done(()));
-        }
-        self.writing = true;
-        Ok(Next::Call(IoCall::Write(vec![(
-            REPLICATION_OBLIGATION_KEYSPACE.to_string(),
-            self.key.clone(),
-            self.value.clone(),
-        )])))
-    }
-
-    fn transaction(&self) -> TransactionMode {
-        TransactionMode::Write
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum LiveVersionState {
-    WriteObligation,
-    ScheduleDrain,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct LiveVersionOperation {
-    input: LiveVersionInput,
-    reference_advance: Option<ReferenceAdvance>,
-    state: LiveVersionState,
-}
-
-impl LiveVersionOperation {
-    pub fn new(input: LiveVersionInput) -> Self {
-        Self {
-            input,
-            reference_advance: None,
-            state: LiveVersionState::WriteObligation,
-        }
-    }
-
-    pub fn with_reference_advance(mut self, advance: ReferenceAdvance) -> Self {
-        self.reference_advance = Some(advance);
-        self
-    }
-
-    fn seed_record(&self) -> LiveObligationRecord {
-        let mut record = LiveObligationRecord::new(
-            self.input.local_node_id,
-            self.input.auth_context.clone(),
-            self.input.bucket.clone(),
-            self.input.key.clone(),
-            self.input.version_id,
-            self.input.delete_marker,
-        );
-        if let Some(advance) = self.reference_advance {
-            record = record.with_reference_advance(advance);
-        }
-        record.continuation = Some(LiveReplicationContinuation::default());
-        record
-    }
-
-    /// A lost conflict means another writer stored the obligation, so the drain still runs.
-    fn obligation_written(&mut self, written: Result<(), BlobQueueError>) -> QueueTurn {
-        match written {
-            Err(error) if !Self::is_conflict(&error) => return Err(error),
-            _ => {}
-        }
-        self.state = LiveVersionState::ScheduleDrain;
-        Ok(Next::Call(schedule_blob_drain().into()))
-    }
-}
-
-impl Operation for LiveVersionOperation {
-    type Output = QueueBlobResult;
-    type Error = BlobQueueError;
-
-    fn first(&mut self) -> QueueTurn {
-        let (_, key, value) = live_obligation_entry(&self.seed_record())?;
-        let write = ObligationWrite {
-            key,
-            value,
-            writing: false,
-        };
-        Ok(Next::Call(IoCall::child(write)))
-    }
-
-    fn next(&mut self, result: IoResult) -> QueueTurn {
-        match self.state {
-            LiveVersionState::WriteObligation => {
-                self.obligation_written(result.child::<(), BlobQueueError>()?)
-            }
-            LiveVersionState::ScheduleDrain => Ok(Next::Done(QueueBlobResult {
-                queued: 0,
-                scheduled: drain_scheduled(result),
-            })),
-        }
-    }
-
-    fn is_conflict(error: &BlobQueueError) -> bool {
-        matches!(
-            error,
-            BlobQueueError::Io(IoError::Conflict)
-                | BlobQueueError::Storage(StorageError::TransactionConflict)
-        )
-    }
-}
-
 /// Rows of the job queue one page of the statistics reads.
 const STATS_PAGE_SIZE: usize = 256;
 
@@ -418,9 +264,10 @@ mod tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         NODE_STATE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
+        REPLICATION_OBLIGATION_KEYSPACE,
     };
     use aruna_core::plugin_runs::{SourceEvent, SourceKind};
     use aruna_core::structs::{SyncMode, SyncRelationship, SyncState};
@@ -659,13 +506,15 @@ mod tests {
     }
     use super::super::version_replication::SourceAuthorizationError;
     use crate::replication::mirror_repair::StoreStatusOperation;
+    use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::effects::Effect;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
+    use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-    use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
+    use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
@@ -683,9 +532,11 @@ mod tests {
         blob_job_entry, blob_job_key, build_live_obligation, continuation_newer,
         live_obligation_entry, live_obligation_key, queued_prefixes, relationship_job,
     };
-    use aruna_core::structs::storage::replication_queue::{ReplicationMode, SyncOrigin};
+    use aruna_core::structs::storage::replication_queue::{
+        ReferenceAdvance, ReplicationMode, SyncOrigin,
+    };
     use aruna_core::structs::{ReferenceHandling, SyncStatusSnapshot, sync_relationship_key};
-    use aruna_core::task::TaskKey;
+    use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_net::NetHandle;
     use aruna_storage::FjallStorage;
     use std::time::{Duration, SystemTime};
@@ -1488,87 +1339,9 @@ mod tests {
         );
     }
 
-    fn live_operation() -> LiveVersionOperation {
-        LiveVersionOperation::new(LiveVersionInput {
-            local_node_id: node(1),
-            auth_context: auth_context(),
-            bucket: "bucket".to_string(),
-            key: "key".to_string(),
-            version_id: Ulid::from_parts(3, 3),
-            delete_marker: false,
-        })
-    }
 
-    fn live_written(result: Result<(), BlobQueueError>) -> IoResult {
-        IoResult::Child(ChildOutcome::new(result))
-    }
 
-    #[test]
-    fn obligation_write_once() {
-        // The obligation is written in one transaction, only when no readable one exists.
-        let record = live_operation().seed_record();
-        let (space, key, value) = live_obligation_entry(&record).unwrap();
-        let write = || ObligationWrite {
-            key: key.clone(),
-            value: value.clone(),
-            writing: false,
-        };
-        let mut missing = write();
-        assert_eq!(missing.transaction(), TransactionMode::Write);
-        assert_eq!(
-            missing.first(),
-            Ok(Next::Call(read_row(&space, key.clone())))
-        );
-        assert_eq!(
-            missing.next(IoResult::Values(vec![None])),
-            Ok(Next::Call(IoCall::Write(vec![(
-                space.clone(),
-                key.clone(),
-                value.clone()
-            )])))
-        );
-        assert_eq!(missing.next(IoResult::Done), Ok(Next::Done(())));
 
-        let mut stored = write();
-        stored.first().unwrap();
-        let row = IoResult::Values(vec![Some(value.clone())]);
-        assert_eq!(stored.next(row), Ok(Next::Done(())));
-
-        let mut unreadable = write();
-        unreadable.first().unwrap();
-        let row = IoResult::Values(vec![Some(vec![0xff].into())]);
-        assert!(matches!(
-            unreadable.next(row),
-            Ok(Next::Call(IoCall::Write(_)))
-        ));
-    }
-
-    #[test]
-    fn live_conflict_drains() {
-        // A conflict means another writer stored the obligation; other failures end the run.
-        let mut operation = live_operation();
-        assert!(matches!(
-            operation.first(),
-            Ok(Next::Call(IoCall::Child(_)))
-        ));
-        let conflict = Err(BlobQueueError::from(IoError::Conflict));
-        assert!(is_drain(&operation.next(live_written(conflict))));
-        assert_eq!(
-            operation.next(timer_set()),
-            Ok(Next::Done(QueueBlobResult {
-                queued: 0,
-                scheduled: true
-            }))
-        );
-
-        let mut failing = live_operation();
-        failing.first().unwrap();
-        let error = BlobQueueError::Storage(StorageError::Timeout);
-        let failed = failing.next(live_written(Err(BlobQueueError::Storage(
-            StorageError::Timeout,
-        ))));
-        assert_eq!(failed, Err(error));
-    }
 
     #[tokio::test]
     async fn retry_preserves_fields() {
@@ -2445,7 +2218,7 @@ mod tests {
         .await
         .expect("relationship queue succeeds");
 
-        assert_eq!(result.queued, 0);
+        assert!(!result, "a node without tasks arms no drain");
         assert_eq!(read_obligations(&storage).await.len(), 1);
         repair_live(&storage).await;
         let jobs = read_jobs(&storage).await;
@@ -2498,7 +2271,7 @@ mod tests {
         .await
         .expect("relationship queue succeeds");
 
-        assert_eq!(result.queued, 0);
+        assert!(!result, "a node without tasks arms no drain");
         repair_live(&storage).await;
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);
@@ -2633,7 +2406,7 @@ mod tests {
         .expect("live queue succeeds");
 
         repair_live(&storage).await;
-        assert_eq!(result.queued, 0);
+        assert!(!result, "a node without tasks arms no drain");
         let jobs = read_jobs(&storage).await;
         assert_eq!(
             jobs,

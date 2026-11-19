@@ -49,9 +49,6 @@ use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation}
 use crate::placement::policy::gate::PolicyGateError;
 use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
-use crate::replication::queue::{
-    BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult,
-};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -70,6 +67,7 @@ use crate::staging::read_source::{
     ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
 };
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 
 /// Directories the queue holds before the table is read further.
@@ -1412,7 +1410,7 @@ impl Operation for PutFolderOperation {
             }
             PutStep::Replicate => {
                 result
-                    .child::<QueueBlobResult, BlobQueueError>()?
+                    .child::<bool, IoError>()?
                     .map_err(|error| {
                         ItemFailure::Stage(format!("replication queue failed: {error}"))
                     })?;
