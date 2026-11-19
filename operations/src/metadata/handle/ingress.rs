@@ -18,8 +18,8 @@ use tracing::Span;
 
 use super::peer_auth::{authorize_peer, config_digest_matches};
 use super::transport::{
-    close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
-    read_budget, write_body_at, write_message_at, write_stream_body, write_transport_message,
+    close_stream, close_stream_at, drain_request_stream, drain_stream_at, read_budget,
+    write_body_at, write_message_at, write_stream_body, write_transport_message,
 };
 use super::{
     MetadataHandle, RollbackRequest, create_sync_bucket, sync_identity_matches, valid_sync_request,

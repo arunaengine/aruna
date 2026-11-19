@@ -2,13 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::metadata::message_kind::MetadataRequestDelivery;
 use aruna_core::structs::storage::format::Compression;
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "test-hooks")]
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -21,6 +19,7 @@ use aruna_net::NetHandle;
 use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
 
+use super::protocol::METADATA_IO_TIMEOUT;
 use crate::auth::bearer_token::{DecodeTokenOperation, IssuerKeyCache, TokenChecks, claims_auth};
 use crate::auth::error::ArunaBearerError;
 use crate::driver::{DriverContext, drive};
@@ -38,11 +37,7 @@ mod peer_auth;
 mod pull_serve;
 mod transport;
 
-const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long a sender waits for a member's answer to a reference page.
-const PAGE_ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 const METADATA_CHUNK_SIZE: usize = 64 * 1024;
-const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
 
 fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> bool {
     left.id == right.id
@@ -126,42 +121,6 @@ pub struct MetadataHandle {
     inner: Arc<MetadataInner>,
 }
 
-#[derive(Debug)]
-pub(crate) struct MetadataRequestError {
-    delivery: MetadataRequestDelivery,
-    error: MetadataError,
-}
-
-impl MetadataRequestError {
-    fn definitely_not_sent(error: MetadataError) -> Self {
-        Self {
-            delivery: MetadataRequestDelivery::DefinitelyNotSent,
-            error,
-        }
-    }
-
-    pub(crate) fn possibly_sent(error: MetadataError) -> Self {
-        Self {
-            delivery: MetadataRequestDelivery::PossiblySent,
-            error,
-        }
-    }
-
-    pub(crate) fn delivery(&self) -> MetadataRequestDelivery {
-        self.delivery
-    }
-
-    pub(crate) fn into_metadata_error(self) -> MetadataError {
-        self.error
-    }
-}
-
-impl std::fmt::Display for MetadataRequestError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(formatter)
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct MetadataHandleOptions {}
 
@@ -171,8 +130,6 @@ struct MetadataInner {
     net_handle: Option<NetHandle>,
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
     sync_pulls: self::pull_serve::PullRegistry,
-    #[cfg(feature = "test-hooks")]
-    drop_ack: AtomicBool,
     #[cfg(feature = "test-hooks")]
     repair_hold: AtomicBool,
 }
@@ -237,19 +194,9 @@ impl MetadataHandle {
                 )),
                 sync_pulls: Default::default(),
                 #[cfg(feature = "test-hooks")]
-                drop_ack: AtomicBool::new(false),
-                #[cfg(feature = "test-hooks")]
                 repair_hold: AtomicBool::new(false),
             }),
         }
-    }
-
-    /// Test hook: the next sync mirror create reports a timeout after the target stored it.
-    #[cfg(feature = "test-hooks")]
-    pub fn drop_create_ack(&self) {
-        self.inner
-            .drop_ack
-            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Test hook: sync mirror repair on this node waits until `release_repair`.
@@ -272,13 +219,6 @@ impl MetadataHandle {
         self.inner
             .repair_hold
             .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    #[cfg(feature = "test-hooks")]
-    fn take_dropped_ack(&self) -> bool {
-        self.inner
-            .drop_ack
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The device pulls this node is running.

@@ -49,41 +49,11 @@ pub(crate) async fn write_encoded_message(
     Ok(())
 }
 
-pub async fn read_message(stream: &mut BiStream) -> Result<MetadataTransportMessage, String> {
-    read_message_cap(&mut stream.1, MAX_MESSAGE_SIZE).await
-}
-
 pub(crate) async fn read_message_budget<R>(
     reader: &mut R,
     max_size: usize,
     byte_budget: &Arc<Semaphore>,
 ) -> Result<(MetadataTransportMessage, OwnedSemaphorePermit), String>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    let (message, permit) = read_message_inner(reader, max_size, Some(byte_budget)).await?;
-    permit
-        .ok_or_else(|| "metadata inbound frame budget missing".to_string())
-        .map(|permit| (message, permit))
-}
-
-pub(crate) async fn read_message_cap<R>(
-    reader: &mut R,
-    max_size: usize,
-) -> Result<MetadataTransportMessage, String>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    read_message_inner(reader, max_size, None)
-        .await
-        .map(|(message, _)| message)
-}
-
-async fn read_message_inner<R>(
-    reader: &mut R,
-    max_size: usize,
-    byte_budget: Option<&Arc<Semaphore>>,
-) -> Result<(MetadataTransportMessage, Option<OwnedSemaphorePermit>), String>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
@@ -110,19 +80,11 @@ where
         return Err("metadata audit frame exceeds maximum size".to_string());
     }
 
-    let permit = match byte_budget {
-        Some(byte_budget) => {
-            let permits = u32::try_from(len)
-                .map_err(|_| "metadata frame length is unsupported".to_string())?;
-            Some(
-                byte_budget
-                    .clone()
-                    .try_acquire_many_owned(permits)
-                    .map_err(|_| "metadata inbound frame budget unavailable".to_string())?,
-            )
-        }
-        None => None,
-    };
+    let permits =
+        u32::try_from(len).map_err(|_| "metadata frame length is unsupported".to_string())?;
+    let permit = (byte_budget.clone())
+        .try_acquire_many_owned(permits)
+        .map_err(|_| "metadata inbound frame budget unavailable".to_string())?;
 
     let mut variant = [0u8; POSTCARD_VARIANT_BYTES];
     let variant_len = len.min(POSTCARD_VARIANT_BYTES);
