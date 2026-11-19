@@ -34,7 +34,7 @@ fn dataset(install: &PluginInstall, resource: &str, at_ms: u64) -> SourceEvent {
 }
 
 /// Matches the pending rows as a node that did not know any install yet.
-async fn unmatched(fixture: &crate::plugins::install::tests::Fixture, now: u64) {
+async fn unmatched(fixture: &aruna_test_support::plugins::Fixture, now: u64) {
     let mut bare = config(fixture).await;
     bare.installs.clear();
     let local = fixture.actor.node_id;
@@ -46,7 +46,7 @@ async fn unmatched(fixture: &crate::plugins::install::tests::Fixture, now: u64) 
 #[tokio::test]
 async fn late_install() {
     // Active elsewhere, committed here before this node had the install: one row, once.
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = installed(&fixture).await;
     let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
     journal(&fixture, &dataset(&install, "D1", now)).await;
@@ -73,7 +73,7 @@ async fn late_install() {
 
 #[tokio::test]
 async fn widened_grant() {
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = installed(&fixture).await;
     let (local, now, auth) = (
         fixture.actor.node_id,
@@ -126,7 +126,7 @@ async fn widened_grant() {
 #[tokio::test]
 async fn widened_sync() {
     // A sync row journaled while the grant left its path out is read once the grant widens.
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = installed(&fixture).await;
     let (local, now, auth) = (
         fixture.actor.node_id,
@@ -171,7 +171,7 @@ async fn widened_sync() {
 
 #[tokio::test]
 async fn growth_rules() {
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let mut install = installed(&fixture).await;
     let since = install.active_since_ms.unwrap();
     let wide = Coverage::from([(
@@ -211,7 +211,7 @@ async fn growth_rules() {
 
 #[tokio::test]
 async fn cut_replay_continues() {
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = installed(&fixture).await;
     let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
     for (n, resource) in ["D1", "D2", "D3"].into_iter().enumerate() {
@@ -234,7 +234,7 @@ async fn cut_replay_continues() {
 #[tokio::test]
 async fn unreadable_clock() {
     // Six minutes off with two minutes of round trip: the replay starts at the earliest row.
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = installed(&fixture).await;
     let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
     journal(&fixture, &dataset(&install, "D0", now - 24 * 60 * MINUTE)).await;
@@ -266,7 +266,7 @@ async fn unreadable_clock() {
 
 #[tokio::test]
 async fn pruned_journal() {
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = install_artifact(&fixture, echoed_sync()).await;
     let local = fixture.actor.node_id;
     let now = install.active_since_ms.unwrap() + JOURNAL_RETENTION_MS + 60 * MINUTE;

@@ -38,7 +38,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, StructuredId};
 use aruna_drivers::driver::drive;
 use aruna_drivers::testing::send_metadata_effect;
-use aruna_drivers::testing::send_metadata_effect;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
@@ -62,7 +61,6 @@ use aruna_test_support::documents::reconcile_topics;
 use aruna_test_support::metadata::export_rocrate_jsonld;
 use aruna_test_support::metadata::process_materialization_batch;
 use aruna_test_support::projection::project_create_events;
-use aruna_test_support::projection::replay_event_log;
 use aruna_test_support::projection::replay_event_log;
 use tokio::time::sleep;
 use ulid::Ulid;

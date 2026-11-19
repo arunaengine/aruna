@@ -19,7 +19,7 @@ use aruna_core::structs::identity::group::{GroupAuthorizationDocument, owner_gro
 use aruna_core::structs::identity::group_delete::*;
 use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
 use aruna_drivers::driver::drive;
-use aruna_test_support::groups::{Fixture, context, node, read, write};
+use aruna_test_support::groups::{Fixture, node, read, write};
 use std::collections::VecDeque;
 use std::time::SystemTime;
 use ulid::Ulid;

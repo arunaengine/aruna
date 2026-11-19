@@ -27,7 +27,6 @@ use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::sync::outbox_record::outbox_key;
 use aruna_storage::FjallStorage;
 use aruna_test_support::documents::restore_outbox_timers;
-use aruna_test_support::documents::restore_outbox_timers;
 use aruna_test_support::documents::{read_outbox_record, read_outbox_records};
 use byteview::ByteView;
 use tempfile::tempdir;

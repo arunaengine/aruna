@@ -218,7 +218,7 @@ pub(crate) mod tests {
         use crate::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
         use crate::metadata::create_entry::CreateEntryOperation;
         use aruna_core::metadata::api::CreateDocumentPayload;
-        let fixture = crate::plugins::install::tests::Fixture::new().await;
+        let fixture = aruna_test_support::plugins::Fixture::new().await;
         let mut ctx = fixture.ctx.clone();
         let dir = tempfile::tempdir().unwrap();
         let storage = fixture.ctx.storage_handle.clone();

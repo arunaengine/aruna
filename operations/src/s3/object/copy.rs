@@ -955,7 +955,7 @@ pub(crate) mod test {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
     use aruna_drivers::driver::{DriverContext, drive, node_routing};
-    pub(crate) use aruna_drivers::testing::{seed_bucket, with_blob};
+    pub(crate) use aruna_drivers::testing::seed_bucket;
     use aruna_test_support::s3::{full_context, spawn_reference_server, write_version};
     use futures_util::StreamExt;
     use std::collections::HashMap;

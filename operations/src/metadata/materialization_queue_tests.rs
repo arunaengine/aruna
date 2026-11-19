@@ -23,7 +23,6 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::testing::write_entries;
-use aruna_drivers::testing::write_entries;
 use aruna_test_support::metadata::process_materialization_batch;
 
 use crate::tests::metadata::storage_key_exists;

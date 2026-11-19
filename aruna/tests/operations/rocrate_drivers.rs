@@ -63,7 +63,6 @@ use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use aruna_test_support::metadata::process_materialization_batch;
 use aruna_test_support::projection::replay_event_log;
-use aruna_test_support::projection::replay_event_log;
 use async_zip::{Compression, StringEncoding, ZipEntryBuilder, ZipString};
 use axum::Router;
 use axum::http::header;

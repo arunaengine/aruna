@@ -259,7 +259,12 @@ async fn record_pages_resume() {
     let indexes = RangeIndexes::new(fixture._dir.path().join("range-indexes"));
     let indexes = fixture.driver.storage_handle.install_range_indexes(indexes);
     let mut feeder = Feeder::new(FeedLimits::default());
-    while feeder.passed(aruna_drivers::driver::drive(feeder.next_pass(), &fixture.driver).await) {}
+    loop {
+        let pass = aruna_drivers::driver::drive(feeder.next_pass(), &fixture.driver).await;
+        if !feeder.passed(pass) {
+            break;
+        }
+    }
     for row in [0, MAX_PAGE_ENTRIES, rows - 1, rows + 299] {
         let query = KeyQuery {
             start: Bound::Unbounded,
@@ -416,7 +421,12 @@ async fn import_records(
     let mut feeder = feed.await.unwrap();
     server.abort();
     // The index catches up with what the jobs wrote.
-    while background && feeder.pass(&fixture.driver).await {}
+    while background {
+        let pass = aruna_drivers::driver::drive(feeder.next_pass(), &fixture.driver).await;
+        if !feeder.passed(pass) {
+            break;
+        }
+    }
     let index = ended.elapsed().as_secs_f64();
     if background {
         assert!(

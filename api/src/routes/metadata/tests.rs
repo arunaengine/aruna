@@ -66,7 +66,6 @@ use aruna_test_support::metadata::process_materialization_batch;
 use aruna_test_support::metadata::{process_graph_tombstones, prune_jobs_exist};
 use aruna_test_support::projection::drain_projection_queue;
 use aruna_test_support::projection::schedule_projection_drain;
-use aruna_test_support::projection::schedule_projection_drain;
 use serde_json::json;
 use std::collections::HashSet;
 use std::time::SystemTime;

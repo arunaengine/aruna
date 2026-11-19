@@ -39,7 +39,6 @@ use aruna_operations::blob::cleanup::{
 use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
 use aruna_operations::s3::multipart::complete::{
     CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
-    CompleteUploadResult,
 };
 use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
 use aruna_operations::s3::multipart::part_upload::{UploadPartInput, UploadPartOperation};

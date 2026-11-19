@@ -227,7 +227,7 @@ async fn node_checks_relay() {
 
 #[test]
 fn delivery_admitted_once() {
-    let run = crate::plugins::runs::tests::queued(Ulid::from_parts(1, 1), 1);
+    let run = aruna_test_support::plugins::queued(Ulid::from_parts(1, 1), 1);
     let ids = (run.install_id, Some("d1".to_string()));
     let mut plan = AdmitHook::new(run.clone(), ids.clone(), 9).unwrap();
     assert!(matches!(plan.first().unwrap(), Next::Call(IoCall::Read(_))));

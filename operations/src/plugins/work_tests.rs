@@ -375,7 +375,7 @@ async fn prunes_settled_rows() {
     let ctx = &fixture.ctx;
     let mut rows = Vec::new();
     for seq in [1, 2] {
-        let run = crate::plugins::runs::tests::queued(install.install_id, seq);
+        let run = aruna_test_support::plugins::queued(install.install_id, seq);
         drive(crate::plugins::runs::admit(run.clone()), ctx)
             .await
             .unwrap();
