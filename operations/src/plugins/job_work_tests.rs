@@ -128,7 +128,7 @@ mod operations {
     use crate::plugins::work::tests::proposed;
 
     fn job() -> JobId {
-        JobId::from_bytes(Ulid::from_parts(8, 8).to_bytes())
+        JobId::from_bytes([8; 16])
     }
 
     fn row() -> WorkRow {
@@ -177,13 +177,14 @@ mod operations {
     #[test]
     fn state_reads_record() {
         let install = fixtures::install();
+        let row = dispatched();
         let mut state = JobState::new((&install, node(3)), "id");
         assert!(is_child(&state.first()));
-        assert!(is_child(&state.next(row_result(dispatched()))));
+        assert!(is_child(&state.next(row_result(row.clone()))));
         let Ok(Next::Done(status)) = state.next(no_record()) else {
             panic!("the record ends the status");
         };
-        assert_eq!(status.id, dispatched().work_id.to_string());
+        assert_eq!(status.id, row.work_id.to_string());
     }
 
     #[test]
