@@ -11,7 +11,7 @@ use ulid::Ulid;
 
 use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
-use crate::structs::synced_folder::{SyncPullAck, SyncPullStatus, SyncRefusal};
+use crate::structs::{SyncPullAck, SyncPullStatus, SyncRefusal};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskKey {
