@@ -94,8 +94,11 @@ pub(crate) fn begin(
 }
 
 pub(crate) fn event(run: u64, at_ms: u64, event: &Event) {
-    let detail = shown(&format!("{event:?}"));
     let label = event.label();
+    let detail = match RAW_PAYLOADS.contains(&label) {
+        true => String::from("<payload not recorded>"),
+        false => shown(&format!("{event:?}")),
+    };
     push(run, at_ms, Entry::Event { label, detail });
 }
 
@@ -125,7 +128,24 @@ fn shown(text: &str) -> String {
 }
 
 /// Field names whose values never enter a record.
-const SECRET_MARKERS: [&str; 5] = ["secret", "token", "password", "credential", "private"];
+const SECRET_MARKERS: [&str; 6] = [
+    "secret",
+    "token",
+    "password",
+    "credential",
+    "private",
+    "bearer",
+];
+
+/// Events that carry raw stored, streamed or received bytes; a record keeps only their label.
+const RAW_PAYLOADS: [&str; 6] = [
+    "StorageEvent::ReadResult",
+    "StorageEvent::BatchReadResult",
+    "StorageEvent::IterResult",
+    "BlobEvent::StreamCollected",
+    "BlobEvent::MessageReceived",
+    "NetEvent::Dht",
+];
 
 /// `Debug` text with the value of every field whose name holds a secret marker replaced.
 fn redact(text: &str) -> String {
@@ -233,6 +253,17 @@ fn entry_bytes(entry: &Entry) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Raw payload events keep their label; the stored bytes never enter the record.
+    #[test]
+    fn payload_bytes_hidden() {
+        let read = Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+            key: byteview::ByteView::from(b"key".as_slice()),
+            value: Some(byteview::ByteView::from(b"stored secret".as_slice())),
+        });
+        assert!(RAW_PAYLOADS.contains(&read.label()));
+        assert!(redact(r#"Call { bearer: "abc", id: 1 }"#).contains("bearer: <redacted>"));
+    }
 
     #[test]
     fn redacts_secret_fields() {
