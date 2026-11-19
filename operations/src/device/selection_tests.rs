@@ -85,3 +85,52 @@ fn reserve_failure_unavailable() {
     let failed = IoResult::Child(ChildOutcome::new(Err::<(), _>(IoError::Unfinished)));
     assert_eq!(select.next(failed), Err(SelectionError::Unavailable));
 }
+
+fn record() -> MetadataRegistryRecord {
+    let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([7; 32]);
+    MetadataRegistryRecord {
+        realm_id,
+        group_id: Ulid::from_bytes([1; 16]),
+        document_id: id(),
+        document_path: "notes".to_string(),
+        graph_iri: MetadataRegistryRecord::graph_iri_for(id()),
+        public: false,
+        permission_path: String::new(),
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
+        holder_node_ids: Vec::new(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        establishing_event_id: Ulid::from(1),
+        last_event_id: Ulid::from(1),
+    }
+}
+
+/// A keep of a document this device does not hold, stepped to the answer of its usage read.
+fn keeping(budget: u64) -> KeepReadOperation {
+    let mut keep = keep_read(None, &record());
+    assert!(matches!(keep.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let absent = child(None::<ReplicaRecord>);
+    assert!(matches!(
+        keep.next(absent),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(keep.step, KeepStep::Budget);
+    assert!(matches!(
+        keep.next(child(budget)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    keep
+}
+
+// The stored budget decides whether a new copy fits the cache.
+#[test]
+fn budget_bounds_keep() {
+    let used = || IoResult::Child(ChildOutcome::new(Ok::<u64, ReplicaScanError>(10)));
+    assert_eq!(keeping(10).next(used()), Ok(Next::Done(())));
+    let mut room = keeping(11);
+    assert!(matches!(
+        room.next(used()),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(room.step, KeepStep::Reserve);
+}

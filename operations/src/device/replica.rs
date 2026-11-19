@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::OnceLock;
-
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
@@ -26,8 +24,6 @@ use super::publish_queue::{PublishEntry, PublishState};
 /// Bytes of replica records and graphs past which a device keeps no further document it only
 /// read, unless the owner set another budget.
 pub const DEFAULT_CACHE_BYTES: u64 = 2_000_000_000;
-
-static CACHE_BUDGET: OnceLock<u64> = OnceLock::new();
 
 /// Rows one scan reads at a time.
 const REPLICA_PAGE_SIZE: usize = 128;
@@ -431,15 +427,6 @@ impl Operation for CacheUsageOperation {
             None => Next::Done(total),
         })
     }
-}
-
-/// Sets the owner's cache budget once at startup.
-pub fn set_cache_budget(bytes: u64) {
-    let _ = CACHE_BUDGET.set(bytes);
-}
-
-pub fn cache_budget() -> u64 {
-    CACHE_BUDGET.get().copied().unwrap_or(DEFAULT_CACHE_BYTES)
 }
 
 /// The bytes one replica record takes, its render included.
