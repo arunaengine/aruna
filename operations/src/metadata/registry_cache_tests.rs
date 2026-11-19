@@ -57,7 +57,7 @@ fn fresh_snapshot_answers() {
 fn stale_snapshot_refills() {
     let mut read = RegistryReadOperation::new();
     read.first().unwrap();
-    let refill = IoCall::child(RegistryFillOperation::new());
+    let refill = IoCall::background(RegistryFillOperation::new());
     let expected = Next::Then {
         output: Arc::new(vec![record(1)]),
         calls: vec![refill],

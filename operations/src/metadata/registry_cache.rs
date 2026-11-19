@@ -181,8 +181,8 @@ enum ReadStage {
 }
 
 /// This node's live registry records from the registry cache. A fresh snapshot answers at once;
-/// an expired one answers too and is refilled after the answer; without one the cache is filled
-/// first.
+/// an expired one answers too and starts a refill run beside the caller; without one the cache
+/// is filled first.
 #[derive(Debug, PartialEq)]
 pub struct RegistryReadOperation {
     stage: ReadStage,
@@ -217,7 +217,7 @@ impl Operation for RegistryReadOperation {
                 true => Ok(Next::Done(records)),
                 false => Ok(Next::Then {
                     output: records,
-                    calls: vec![IoCall::child(RegistryFillOperation::new())],
+                    calls: vec![IoCall::background(RegistryFillOperation::new())],
                 }),
             },
             MetadataEvent::RegistrySnapshot { records: None, .. } => {

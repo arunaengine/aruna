@@ -17,7 +17,7 @@ use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, OBJECT_METADATA_KEYSPACE};
-use aruna_core::operation::{Operation, Runnable, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -57,18 +57,6 @@ use crate::s3::object::lookup::{LookupError, summary_from_value};
 
 type Turn<T> = Result<Next<T>, GetObjectError>;
 type Read = Result<GetObjectResult, GetObjectError>;
-
-/// Starts `operation` beside the caller while a background slot is free.
-fn background<O, K>(operation: O) -> IoCall
-where
-    O: Runnable<K> + 'static,
-    K: 'static,
-    O::Output: Send + 'static,
-    O::Error: Send + 'static,
-{
-    let child = boxed_suboperation(operation, |_| Event::Delayed);
-    Effect::Background(child).into()
-}
 
 /// The token credential of one S3 request and the limits of a promotion it starts.
 #[derive(Clone, Debug, PartialEq)]
@@ -336,7 +324,7 @@ impl Operation for KeepReadOperation {
             Ok(KeepStart::Settled(kept)) => Ok(Next::Done(kept)),
             Ok(KeepStart::Background(source)) => {
                 self.starting = true;
-                Ok(Next::Call(background(source)))
+                Ok(Next::Call(IoCall::background(source)))
             }
             Err(_) => Ok(Next::Done(false)),
         }
@@ -380,7 +368,7 @@ impl Operation for PullReadOperation {
             return Ok(Next::Done(pulled.result));
         };
         self.read = Some(pulled.result);
-        Ok(Next::Call(background(fill)))
+        Ok(Next::Call(IoCall::background(fill)))
     }
 }
 

@@ -110,6 +110,19 @@ impl IoCall {
             Event::Child(ChildOutcome::new(result))
         }))
     }
+
+    /// Starts `operation` beside the caller while a background slot is free; the caller gets
+    /// only `TaskEvent::BackgroundStarted` and never the child's result.
+    pub fn background<O, K>(operation: O) -> Self
+    where
+        O: Runnable<K> + 'static,
+        K: 'static,
+        O::Output: Send + 'static,
+        O::Error: Send + 'static,
+    {
+        let child = boxed_suboperation(operation, |_| Event::Delayed);
+        Self::Effect(Box::new(Effect::Background(child)))
+    }
 }
 
 /// A child's `Result<Output, Error>`, boxed so events stay free of operation types. The value
