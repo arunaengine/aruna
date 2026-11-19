@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::sync::{Mutex, OnceLock};
 
 use aruna_core::MetaResourceId;
@@ -103,9 +104,6 @@ pub struct CreateDocumentOperation {
     pub(crate) route_profile_status: Option<ProfileValidationStatus>,
     /// The author's commit message for the ARC snapshot of this create.
     message: Option<String>,
-    /// The phase-time and identity source. Production uses the default source;
-    /// tests replace it before the first record is built.
-    phase_source: crate::metadata::MetadataPhaseSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -183,20 +181,7 @@ impl CreateDocumentOperation {
             stage: CreateStage::Validate,
             route_profile_status,
             message: None,
-            phase_source: crate::metadata::MetadataPhaseSource::default(),
         }
-    }
-
-    /// Replaces the phase-time and identity source before the first record is
-    /// built. Production never calls this; tests call the same implementation
-    /// with fixed samplers.
-    #[cfg(test)]
-    pub(crate) fn with_phase_source(
-        mut self,
-        phase_source: crate::metadata::MetadataPhaseSource,
-    ) -> Self {
-        self.phase_source = phase_source;
-        self
     }
 
     pub fn new_generated_id(config: CreateDocumentConfig) -> Self {
@@ -238,7 +223,6 @@ impl CreateDocumentOperation {
             stage: CreateStage::Validate,
             route_profile_status: self.route_profile_status.clone(),
             message: self.message.clone(),
-            phase_source: self.phase_source,
         }
     }
 
@@ -344,7 +328,7 @@ impl CreateDocumentOperation {
             config: self.config.clone(),
             route_profile_status: self.route_profile_status.clone(),
             message: self.message.clone(),
-            phase_source: self.phase_source,
+            ids: IdMint::new(0),
             stage: CommitStage::Fence,
             pending: None,
             created: None,
@@ -424,7 +408,8 @@ pub struct CreateCommitOperation {
     config: CreateDocumentConfig,
     route_profile_status: Option<ProfileValidationStatus>,
     message: Option<String>,
-    phase_source: crate::metadata::MetadataPhaseSource,
+    /// The fresh ids of this run.
+    ids: IdMint,
     stage: CommitStage,
     pending: Option<Resolved>,
     created: Option<CreateDocumentResult>,
@@ -498,8 +483,8 @@ impl CreateCommitOperation {
         }
     }
 
-    fn create_event_record(&self, record: &MetadataRegistryRecord) -> MetadataEventRecord {
-        let event_id = self.phase_source.next_id();
+    fn create_event_record(&mut self, record: &MetadataRegistryRecord) -> MetadataEventRecord {
+        let event_id = self.ids.mint(self.now_ms);
         let mut record = record.clone();
         record.establishing_event_id = event_id;
         record.last_event_id = event_id;
@@ -734,6 +719,10 @@ impl Operation for CreateCommitOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
     fn transaction(&self) -> TransactionMode {
@@ -1373,18 +1362,16 @@ mod tests {
             GroupId::from_bytes([0x43; 16]),
             document_id,
         ))
-        .with_phase_source(crate::metadata::MetadataPhaseSource::fixed(
-            || 0,
-            || Ulid::from_bytes([0x77; 16]),
-        ))
         .commit_operation();
         commit.stamp(1_700_000_000_000);
+        commit.seed(0x77);
 
         let record = commit.build_record(Vec::new(), PlacementRef::NIL);
         assert_eq!(record.created_at_ms, 1_700_000_000_000);
         assert_eq!(record.updated_at_ms, 1_700_000_000_000);
         let event = commit.create_event_record(&record);
-        assert_eq!(event.event_id, Ulid::from_bytes([0x77; 16]));
+        let minted = IdMint::new(0x77).mint(1_700_000_000_000);
+        assert_eq!(event.event_id, minted);
         assert_eq!(event.occurred_at_ms, 1_700_000_000_000);
     }
 

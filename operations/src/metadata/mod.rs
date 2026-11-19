@@ -64,51 +64,6 @@ pub mod visibility_index;
 pub(crate) mod visible_scope;
 pub mod write_peer;
 
-/// The phase-time and identity samples a metadata operation stamps records
-/// with. Production keeps the defaults and samples per phase; tests replace the
-/// source so fixed inputs produce byte-identical records.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct MetadataPhaseSource {
-    now_ms: fn() -> u64,
-    next_id: fn() -> ulid::Ulid,
-}
-
-impl PartialEq for MetadataPhaseSource {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::fn_addr_eq(self.now_ms, other.now_ms)
-            && std::ptr::fn_addr_eq(self.next_id, other.next_id)
-    }
-}
-
-impl Eq for MetadataPhaseSource {}
-
-impl Default for MetadataPhaseSource {
-    fn default() -> Self {
-        Self {
-            now_ms: aruna_core::time::unix_timestamp_millis,
-            next_id: ulid::Ulid::generate,
-        }
-    }
-}
-
-impl MetadataPhaseSource {
-    /// A source with explicit samplers, for tests that fix a trace.
-    #[cfg(test)]
-    pub(crate) fn fixed(now_ms: fn() -> u64, next_id: fn() -> ulid::Ulid) -> Self {
-        Self { now_ms, next_id }
-    }
-
-    /// The current phase's wall clock in milliseconds.
-    pub(crate) fn now_ms(self) -> u64 {
-        (self.now_ms)()
-    }
-
-    /// A fresh identity for one record this phase mints.
-    pub(crate) fn next_id(self) -> ulid::Ulid {
-        (self.next_id)()
-    }
-}
-
 pub use builtin::builtin_shapes;
 pub use message_kind::transport_message_kind;
 pub use protocol::{
