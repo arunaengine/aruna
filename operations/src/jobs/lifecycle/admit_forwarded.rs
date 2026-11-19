@@ -178,7 +178,11 @@ impl AdmitForwardedOperation {
     fn with_pages(&mut self, config: RealmConfigDocument, pages: Vec<InputPage>) -> ForwardedNext {
         let entries = spec_entries(pages).map_err(|_| SubmissionRefusal::IdentityMismatch)?;
         let (inputs, captured): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
-        self.request.spec.inputs = inputs;
+        self.request
+            .spec
+            .inputs
+            .retain(|input| input.source.is_inline());
+        self.request.spec.inputs.extend(inputs);
         self.request.captured_inputs = captured;
         self.normalize(config)
     }
@@ -251,7 +255,10 @@ impl AdmitForwardedOperation {
         manifest: Option<PageManifest>,
     ) -> ForwardedNext {
         if manifest.is_some() {
-            self.request.spec.inputs.clear();
+            self.request
+                .spec
+                .inputs
+                .retain(|input| input.source.is_inline());
             self.request.captured_inputs.clear();
         }
         self.request.input_pages = manifest;

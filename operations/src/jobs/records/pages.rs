@@ -337,7 +337,12 @@ impl Operation for SpecInputsOperation {
         let pages = result.child::<Vec<InputPage>, PageReadError>()??;
         let (inputs, captured): (Vec<_>, Vec<_>) = spec_entries(pages)?.into_iter().unzip();
         let mut filled = self.spec.clone();
-        filled.payload.inputs = inputs;
+        // Inline inputs carry no capture, so they stay in the spec beside the pages.
+        filled
+            .payload
+            .inputs
+            .retain(|input| input.source.is_inline());
+        filled.payload.inputs.extend(inputs);
         filled.captured_inputs = captured;
         Ok(Next::Done(filled))
     }
@@ -437,14 +442,15 @@ pub struct StoreEntriesOperation {
 }
 
 impl StoreEntriesOperation {
-    /// The inputs of a request with their captures; every input must have one.
+    /// The inputs of a request with their captures; every input that names an object must have
+    /// one, and inline inputs stay in the spec.
     pub fn request(
         submission: SubmissionId,
         inputs: &[InputSelection],
         captured: &[CapturedInput],
     ) -> Self {
-        let pairs: Option<Vec<_>> = inputs
-            .iter()
+        let pairs: Option<Vec<_>> = (inputs.iter())
+            .filter(|input| !input.source.is_inline())
             .map(|input| {
                 let capture = captured
                     .iter()

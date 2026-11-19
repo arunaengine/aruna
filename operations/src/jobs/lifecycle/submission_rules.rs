@@ -9,6 +9,7 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::SubmissionRefusal;
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionSpec, InputContent, InputSelection, SubmissionId, WorkspaceMode,
+    object_count,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -349,7 +350,7 @@ pub(super) fn peer_refusal(refusal: PeerAuthRefusal) -> SubmissionRefusal {
 /// from the node it names, and every output pinned to that ingress.
 pub(super) fn forwarded_request_fits(request: &SubmissionRequest, ingress: NodeId) -> bool {
     let (spec, captured) = (&request.spec, &request.captured_inputs);
-    captured.len() == spec.inputs.len()
+    captured.len() == object_count(&spec.inputs)
         && captured.iter().all(|captured| {
             spec.inputs
                 .iter()
