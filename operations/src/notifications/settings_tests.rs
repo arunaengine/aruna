@@ -143,7 +143,7 @@ fn open_call(peer: NodeId) -> Result<Next<Delivery>, IoError> {
     let target = SettingChannel::Webhook.target(owner(), Ulid::from_bytes([4u8; 16]));
     let message = MetadataTransportMessage::OpenSetting {
         target,
-        bytes: on_setting(),
+        bytes: SecretBytes::new(on_setting()),
     };
     let request = MetadataRequestEffect {
         peer,

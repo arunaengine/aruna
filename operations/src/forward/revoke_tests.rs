@@ -55,7 +55,7 @@ fn claims(sub: UserId, iss: RealmId, exp: u64) -> TokenClaims {
 fn message(token: &str) -> MetadataTransportMessage {
     MetadataTransportMessage::ForwardTokenRevocation {
         auth_token: AuthToken::bearer(CALLER_TOKEN).unwrap(),
-        token: token.to_string(),
+        token: Secret::new(token),
     }
 }
 
@@ -144,7 +144,7 @@ fn other_message_rejected() {
 fn internal_token_denied() {
     let message = MetadataTransportMessage::ForwardTokenRevocation {
         auth_token: AuthToken::Internal(caller()),
-        token: "target".to_string(),
+        token: Secret::new("target"),
     };
     assert_eq!(
         operation(message).next(config_read()),

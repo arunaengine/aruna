@@ -202,6 +202,7 @@ impl DeliveryOperation {
             let serve = ServeSecretOperation::new(self.local_realm, node, node, request);
             return Ok(Next::Call(IoCall::child(serve)));
         }
+        let bytes = SecretBytes::new(bytes);
         let message = MetadataTransportMessage::OpenSetting { target, bytes };
         let frame = match encode_message(&message) {
             Ok(frame) => frame,

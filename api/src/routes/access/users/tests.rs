@@ -1565,7 +1565,9 @@ async fn foreign_realm_unimplemented() {
         node.context.as_ref(),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expose()
+    .to_string();
 
     let response = reqwest::Client::new()
         .get(format!(

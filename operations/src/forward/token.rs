@@ -10,14 +10,15 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{
     ForwardAuthError, ForwardedCallerOperation, forward_auth_error, write_check,
 };
-use crate::forward::fetch::{peer_call, peer_reply};
+use crate::forward::fetch::{PeerFrame, peer_call, peer_reply};
 use crate::forward::routing::distinct_holders;
 use crate::forward::transport::{ForwardError, reject};
 use crate::metadata::message_kind::transport_message_kind;
-use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError, encode_message};
+use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
 use aruna_core::NodeId;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::compute::Secret;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, PeerRequestError};
 use aruna_core::metadata::AuthToken;
@@ -46,7 +47,7 @@ pub struct ForwardRevokeOperation {
     realm_id: RealmId,
     local: Option<NodeId>,
     subject: Vec<u8>,
-    frame: Result<Vec<u8>, String>,
+    frame: Result<PeerFrame, String>,
     now_ms: u64,
     deadline_ms: u64,
     /// Reversed, so the next peer pops off the end.
@@ -65,12 +66,13 @@ impl ForwardRevokeOperation {
     ) -> Self {
         let mut subject = bearer_token_hash(&token).into_bytes();
         subject.extend_from_slice(&salt.to_bytes());
+        let token = Secret::new(token);
         let message = MetadataTransportMessage::ForwardTokenRevocation { auth_token, token };
         Self {
             realm_id,
             local,
             subject,
-            frame: encode_message(&message),
+            frame: PeerFrame::encode(&message),
             now_ms: 0,
             deadline_ms: 0,
             peers: Vec::new(),
@@ -106,7 +108,7 @@ impl ForwardRevokeOperation {
         };
         self.asked = Some(peer);
         let timeout = Duration::from_millis(remaining).min(REVOKE_ATTEMPT_TIMEOUT);
-        Ok(Next::Call(peer_call(peer, frame.clone(), timeout)))
+        Ok(Next::Call(peer_call(peer, frame.bytes(), timeout)))
     }
 
     fn answered(
@@ -258,7 +260,7 @@ impl ApplyRevokeOperation {
         let MetadataTransportMessage::ForwardTokenRevocation { token, .. } = &self.message else {
             return done(reject("unexpected token revocation message"));
         };
-        let target = match AuthToken::bearer(token) {
+        let target = match AuthToken::bearer(token.expose()) {
             Ok(target) => target,
             Err(error) => return done(reject(format!("invalid token revocation target: {error}"))),
         };
@@ -280,7 +282,7 @@ impl ApplyRevokeOperation {
         let AuthToken::Bearer(caller_token) = auth_token else {
             return denied(WriteAuthError::Unauthorized);
         };
-        let token_hash = bearer_token_hash(token);
+        let token_hash = bearer_token_hash(token.expose());
         let self_hash = bearer_token_hash(caller_token.as_str()) == token_hash;
         let expires_at = claims.exp;
         let now = self.now_ms / 1000;
@@ -560,7 +562,7 @@ mod tests {
     fn apply_message(token: &str) -> MetadataTransportMessage {
         MetadataTransportMessage::ForwardTokenRevocation {
             auth_token: AuthToken::bearer("caller-token").unwrap(),
-            token: token.to_string(),
+            token: Secret::new(token),
         }
     }
 

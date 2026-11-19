@@ -420,6 +420,16 @@ mod settings {
     }
 
     #[test]
+    fn setting_debug_hidden() {
+        let (target, _) = email(1, true);
+        let request = ServeRequest::Setting {
+            target,
+            bytes: vec![201; 32],
+        };
+        assert!(!format!("{request:?}").contains("201, 201"));
+    }
+
+    #[test]
     fn setting_needs_key() {
         // A management node without the realm keys cannot open a setting for a peer.
         let config = config();

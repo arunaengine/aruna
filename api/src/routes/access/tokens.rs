@@ -258,7 +258,9 @@ mod tests {
             &ctx,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expose()
+        .to_string();
         (dir, state, realm_id, user_id, token)
     }
 
@@ -517,7 +519,9 @@ mod tests {
             &state.get_ctx(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expose()
+        .to_string();
         state.add_trusted_realm(foreign_realm_id).await;
         // Revocation lookups fail closed, so a trusted realm's token is only
         // usable here once that realm's replicated config is present.

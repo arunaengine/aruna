@@ -7,10 +7,10 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{
     ForwardAuthError, ForwardedCallerOperation, forward_auth_error, write_check,
 };
-use crate::forward::fetch::{peer_call, peer_reply};
+use crate::forward::fetch::{PeerFrame, peer_call, peer_reply};
 use crate::forward::transport::reject;
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
-use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError, encode_message};
+use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
 use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -65,7 +65,7 @@ pub struct ForwardGroupOperation {
     auth_token: Option<AuthToken>,
     display_name: String,
     request_id: Ulid,
-    frame: Vec<u8>,
+    frame: PeerFrame,
     /// Reversed, so the next peer pops off the end.
     peers: Vec<NodeId>,
     asked: Option<NodeId>,
@@ -86,7 +86,7 @@ impl ForwardGroupOperation {
             auth_token: Some(auth_token),
             display_name,
             request_id,
-            frame: Vec::new(),
+            frame: PeerFrame::default(),
             peers: Vec::new(),
             asked: None,
         }
@@ -111,7 +111,7 @@ impl ForwardGroupOperation {
             auth_token: self.auth_token.take(),
             display_name: self.display_name.clone(),
         };
-        self.frame = encode_message(&message).map_err(|_| ForwardGroupError::Unavailable)?;
+        self.frame = PeerFrame::encode(&message).map_err(|_| ForwardGroupError::Unavailable)?;
         Ok(())
     }
 
@@ -120,7 +120,7 @@ impl ForwardGroupOperation {
     fn ask_next(&mut self) -> Result<Next<CreatedGroup>, ForwardGroupError> {
         let peer = self.peers.pop().ok_or(ForwardGroupError::Unavailable)?;
         self.asked = Some(peer);
-        let frame = self.frame.clone();
+        let frame = self.frame.bytes();
         Ok(Next::Call(peer_call(peer, frame, CREATE_ATTEMPT_TIMEOUT)))
     }
 

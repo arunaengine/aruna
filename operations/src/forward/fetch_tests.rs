@@ -6,6 +6,12 @@ use super::*;
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
 
+#[test]
+fn frame_debug_hidden() {
+    let frame = PeerFrame(vec![201; 32]);
+    assert!(!format!("{frame:?}").contains("201, 201"));
+}
+
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }

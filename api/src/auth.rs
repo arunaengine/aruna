@@ -1104,7 +1104,9 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expose()
+        .to_string();
         let headers_for = |token: &str| {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -1555,7 +1557,11 @@ mod test {
             restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
-        let management_token = drive(token_operation, &driver_ctx).await.unwrap();
+        let management_token = drive(token_operation, &driver_ctx)
+            .await
+            .unwrap()
+            .expose()
+            .to_string();
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1596,7 +1602,11 @@ mod test {
             restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
-        let server_token = drive(token_operation, &driver_ctx).await.unwrap();
+        let server_token = drive(token_operation, &driver_ctx)
+            .await
+            .unwrap()
+            .expose()
+            .to_string();
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1740,7 +1750,9 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expose()
+        .to_string();
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1852,7 +1864,11 @@ mod test {
             restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
-        let management_token = drive(token_operation, &driver_ctx).await.unwrap();
+        let management_token = drive(token_operation, &driver_ctx)
+            .await
+            .unwrap()
+            .expose()
+            .to_string();
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1896,7 +1912,11 @@ mod test {
             restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
-        let management_token = drive(token_operation, &driver_ctx).await.unwrap();
+        let management_token = drive(token_operation, &driver_ctx)
+            .await
+            .unwrap()
+            .expose()
+            .to_string();
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1945,7 +1965,11 @@ mod test {
             restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
-        let server_token = drive(token_operation, &driver_ctx).await.unwrap();
+        let server_token = drive(token_operation, &driver_ctx)
+            .await
+            .unwrap()
+            .expose()
+            .to_string();
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1979,7 +2003,11 @@ mod test {
             restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
-        let server_token = drive(token_operation, &driver_ctx).await.unwrap();
+        let server_token = drive(token_operation, &driver_ctx)
+            .await
+            .unwrap()
+            .expose()
+            .to_string();
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2012,7 +2040,11 @@ mod test {
             restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
-        let server_token = drive(token_operation, &driver_ctx).await.unwrap();
+        let server_token = drive(token_operation, &driver_ctx)
+            .await
+            .unwrap()
+            .expose()
+            .to_string();
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2181,7 +2213,9 @@ mod test {
             &driver_ctx,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expose()
+        .to_string();
 
         handle_token(&state, &token).await.unwrap();
         handle_token(&state, &token).await.unwrap();

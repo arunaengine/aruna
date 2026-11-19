@@ -252,7 +252,7 @@ pub enum MetadataTransportMessage {
     /// publish realm administration events.
     ForwardTokenRevocation {
         auth_token: AuthToken,
-        token: String,
+        token: aruna_core::compute::Secret,
     },
     ForwardedTokenRevoked,
     #[serde(rename = "ForwardedTokenRevocationCapacity")]
@@ -672,7 +672,7 @@ pub enum MetadataTransportMessage {
     /// The sealed secret of a setting document, asked of a management node; Debug hides it.
     OpenSetting {
         target: DocumentTarget,
-        bytes: Vec<u8>,
+        bytes: aruna_core::compute::SecretBytes,
     },
     OpenSettingResult {
         result: Result<aruna_core::compute::SecretBytes, MetadataReadError>,
@@ -1098,8 +1098,48 @@ mod tests {
         });
         assert_auth_token(MetadataTransportMessage::ForwardTokenRevocation {
             auth_token: AuthToken::bearer("revoke-token").unwrap(),
-            token: "target-token".to_string(),
+            token: aruna_core::compute::Secret::new("target-token"),
         });
+    }
+
+    #[test]
+    fn revocation_debug_hidden() {
+        let message = MetadataTransportMessage::ForwardTokenRevocation {
+            auth_token: AuthToken::bearer("caller-token").unwrap(),
+            token: aruna_core::compute::Secret::new("target-token"),
+        };
+        let shown = format!("{message:?}");
+        assert!(!shown.contains("caller-token"));
+        assert!(!shown.contains("target-token"));
+    }
+
+    #[test]
+    fn revocation_wire_same() {
+        let token = aruna_core::compute::Secret::new("target-token");
+        assert_eq!(
+            postcard::to_allocvec(&token).unwrap(),
+            postcard::to_allocvec("target-token").unwrap()
+        );
+    }
+
+    #[test]
+    fn setting_debug_hidden() {
+        let message = MetadataTransportMessage::OpenSetting {
+            target: DocumentTarget::RealmConfig {
+                realm_id: RealmId::from_bytes([1; 32]),
+            },
+            bytes: aruna_core::compute::SecretBytes::new(vec![201; 32]),
+        };
+        assert!(!format!("{message:?}").contains("201, 201"));
+    }
+
+    #[test]
+    fn setting_wire_same() {
+        let bytes = aruna_core::compute::SecretBytes::new(vec![201; 32]);
+        assert_eq!(
+            postcard::to_allocvec(&bytes).unwrap(),
+            postcard::to_allocvec(&vec![201u8; 32]).unwrap()
+        );
     }
 
     #[test]
