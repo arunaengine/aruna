@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -46,15 +46,23 @@ const CLEAR_BATCH: usize = 1024;
 /// How soon the drain looks again while a bootstrap waits for its jobs.
 pub const BOOTSTRAP_POLL: Duration = Duration::from_secs(5);
 
-/// The set after which the next drain continues; a restart begins at the first set.
-static SET_CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// Where the next drain goes on, kept by the input between drains; a restart begins anew.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CatchUpCursors {
+    /// The set after which the next drain continues.
+    pub set_after: Option<Vec<u8>>,
+    /// The range each walk of a set and member continues at, so later ranges get their turn.
+    pub turns: HashMap<(Ulid, Ulid), usize>,
+}
 
-/// The range each walk of a set and member continues at, so later ranges get their turn.
-static RANGE_TURNS: Mutex<Option<HashMap<(Ulid, Ulid), usize>>> = Mutex::new(None);
+/// The ranges walks of a set and member continue at next.
+type Turns = Vec<((Ulid, Ulid), usize)>;
 
 type Turn<T> = Result<Next<T>, BlobQueueError>;
 /// What a walk leaves: its outcome and the page budget still unused.
-type Walked = (Outcome, usize);
+type Walked = (Outcome, usize, Turns);
+/// Whether a bootstrap still waits, and where the next drain goes on.
+pub type Waited = (bool, CatchUpCursors);
 
 fn failed(error: impl std::fmt::Display) -> BlobQueueError {
     BlobQueueError::UnexpectedEvent(error.to_string())
@@ -66,21 +74,6 @@ fn catch_up_page(after: Option<Vec<u8>>, limit: usize) -> IoCall {
         prefix: Key::from(Vec::new()),
         after: after.map(Into::into),
         limit,
-    }
-}
-
-/// The range index a walk continues at; with `next` it records where the next walk starts.
-fn turn(walk: (Ulid, Ulid), next: Option<usize>) -> usize {
-    let Ok(mut turns) = RANGE_TURNS.lock() else {
-        return 0;
-    };
-    let turns = turns.get_or_insert_with(HashMap::new);
-    match next {
-        Some(index) => {
-            turns.insert(walk, index);
-            index
-        }
-        None => turns.get(&walk).copied().unwrap_or(0),
     }
 }
 
@@ -141,6 +134,7 @@ enum DrainStep {
 #[derive(Debug, PartialEq)]
 pub struct ProcessBootstrapOperation {
     serving: Option<(NodeId, RealmId)>,
+    cursors: CatchUpCursors,
     budget: usize,
     waiting: bool,
     rows: VecDeque<(Key, Value)>,
@@ -148,9 +142,10 @@ pub struct ProcessBootstrapOperation {
 }
 
 impl ProcessBootstrapOperation {
-    pub fn new(serving: Option<(NodeId, RealmId)>) -> Self {
+    pub fn new(serving: Option<(NodeId, RealmId)>, cursors: CatchUpCursors) -> Self {
         Self {
             serving,
+            cursors,
             budget: PAGE_BUDGET,
             waiting: false,
             rows: VecDeque::new(),
@@ -158,9 +153,13 @@ impl ProcessBootstrapOperation {
         }
     }
 
-    fn next_set(&mut self) -> Turn<bool> {
+    fn done(&mut self, waiting: bool) -> Turn<Waited> {
+        Ok(Next::Done((waiting, std::mem::take(&mut self.cursors))))
+    }
+
+    fn next_set(&mut self) -> Turn<Waited> {
         let Some((key, seen)) = self.rows.pop_front() else {
-            return Ok(Next::Done(self.waiting));
+            return self.done(self.waiting);
         };
         let set_id = <[u8; 16]>::try_from(&key[..]).map(Ulid::from_bytes);
         let (Ok(set_id), Some((local, realm_id))) = (set_id, self.serving) else {
@@ -173,29 +172,27 @@ impl ProcessBootstrapOperation {
             local,
             set_id,
         };
-        let run = SetWalkOperation::new(walk, self.serving, self.budget);
+        let turns = self.cursors.turns.clone();
+        let run = SetWalkOperation::new(walk, self.serving, self.budget, turns);
         self.step = DrainStep::Walk(key, seen, set_id);
         Ok(Next::Call(IoCall::child(run)))
     }
 }
 
 impl Operation for ProcessBootstrapOperation {
-    type Output = bool;
+    type Output = Waited;
     type Error = BlobQueueError;
 
-    fn first(&mut self) -> Turn<bool> {
+    fn first(&mut self) -> Turn<Waited> {
         if self.serving.is_none() {
-            return Ok(Next::Done(false));
+            return self.done(false);
         }
         // Sets after the last batch come next, so waiting sets never starve later ones.
-        let after = SET_CURSOR
-            .lock()
-            .map(|cursor| cursor.clone())
-            .unwrap_or(None);
+        let after = self.cursors.set_after.clone();
         Ok(Next::Call(catch_up_page(after, SET_BATCH)))
     }
 
-    fn next(&mut self, result: IoResult) -> Turn<bool> {
+    fn next(&mut self, result: IoResult) -> Turn<Waited> {
         match std::mem::replace(&mut self.step, DrainStep::Dropped) {
             DrainStep::Page => {
                 let (rows, _) = result.page()?;
@@ -204,9 +201,7 @@ impl Operation for ProcessBootstrapOperation {
                     .flatten();
                 // A pass that stopped short of the end looks again soon.
                 self.waiting |= next.is_some();
-                if let Ok(mut cursor) = SET_CURSOR.lock() {
-                    *cursor = next;
-                }
+                self.cursors.set_after = next;
                 self.rows = rows.into();
                 self.next_set()
             }
@@ -216,8 +211,9 @@ impl Operation for ProcessBootstrapOperation {
             }
             DrainStep::Walk(key, seen, set_id) => {
                 match result.child::<Walked, BlobQueueError>()? {
-                    Ok((outcome, budget)) => {
+                    Ok((outcome, budget, turns)) => {
                         self.budget = budget;
+                        self.cursors.turns.extend(turns);
                         match outcome {
                             Outcome::Settled => {
                                 let settle = SettleMarkerOperation::new(
@@ -300,6 +296,9 @@ struct SetWalkOperation {
     walk: SetWalk,
     serving: Option<(NodeId, RealmId)>,
     budget: usize,
+    /// Where each member walk starts, and where the walks of this run go on next.
+    turns: HashMap<(Ulid, Ulid), usize>,
+    moved: Turns,
     step: SetStep,
     scope: Option<Arc<WalkScope>>,
     targets: VecDeque<DistributionMember>,
@@ -308,11 +307,18 @@ struct SetWalkOperation {
 }
 
 impl SetWalkOperation {
-    fn new(walk: SetWalk, serving: Option<(NodeId, RealmId)>, budget: usize) -> Self {
+    fn new(
+        walk: SetWalk,
+        serving: Option<(NodeId, RealmId)>,
+        budget: usize,
+        turns: HashMap<(Ulid, Ulid), usize>,
+    ) -> Self {
         Self {
             walk,
             serving,
             budget,
+            turns,
+            moved: Vec::new(),
             step: SetStep::Record,
             scope: None,
             targets: VecDeque::new(),
@@ -330,7 +336,7 @@ impl SetWalkOperation {
 
     fn record_read(&mut self, view: Option<DistributionView>) -> Turn<Walked> {
         let Some(view) = view else {
-            return Ok(Next::Done((Outcome::Settled, self.budget)));
+            return Ok(Next::Done((Outcome::Settled, self.budget, Vec::new())));
         };
         let snapshot = view.head.snapshot;
         let members = &snapshot.config.members;
@@ -390,14 +396,20 @@ impl SetWalkOperation {
         let scope = self.scope.clone().ok_or(IoError::Unfinished)?;
         self.step = SetStep::Part;
         if let Some(target) = self.targets.pop_front() {
-            let walk = WalkMemberOperation::new(scope, target, self.budget);
+            let walked = (self.walk.set_id, target.member_id);
+            let start = self.turns.get(&walked).copied().unwrap_or(0);
+            let walk = WalkMemberOperation::new(scope, target, self.budget, start);
             return Ok(Next::Call(IoCall::child(walk)));
         }
         if let Some(fill) = self.fills.pop_front() {
             let fill = FillRangeOperation::new(scope, fill, self.budget);
             return Ok(Next::Call(IoCall::child(fill)));
         }
-        Ok(Next::Done((self.outcome, self.budget)))
+        Ok(Next::Done((
+            self.outcome,
+            self.budget,
+            std::mem::take(&mut self.moved),
+        )))
     }
 }
 
@@ -427,12 +439,17 @@ impl Operation for SetWalkOperation {
                     true => Outcome::Settled,
                     false => Outcome::Waiting,
                 };
-                Ok(Next::Done((outcome, self.budget)))
+                Ok(Next::Done((
+                    outcome,
+                    self.budget,
+                    std::mem::take(&mut self.moved),
+                )))
             }
             SetStep::Part => {
-                let (outcome, budget) = result.child::<Walked, BlobQueueError>()??;
+                let (outcome, budget, moved) = result.child::<Walked, BlobQueueError>()??;
                 self.outcome = self.outcome.and(outcome);
                 self.budget = budget;
+                self.moved.extend(moved);
                 self.next_part()
             }
         }
@@ -514,11 +531,11 @@ impl Operation for FillRangeOperation {
     fn first(&mut self) -> Turn<Walked> {
         let snapshot = &self.scope.snapshot;
         let (Some(range), Some(_)) = (self.range(), snapshot.member(self.fill.member_id)) else {
-            return Ok(Next::Done((Outcome::Settled, self.budget)));
+            return Ok(Next::Done((Outcome::Settled, self.budget, Vec::new())));
         };
         // Until its node opened the range, the copy has nowhere to receive versions.
         if !self.fill.admitted {
-            return Ok(Next::Done((Outcome::Waiting, self.budget)));
+            return Ok(Next::Done((Outcome::Waiting, self.budget, Vec::new())));
         }
         let key = bootstrap_key(self.scope.walk.set_id, self.fill.member_id, range.range_id);
         Ok(Next::Call(read_cursor(key)))
@@ -533,7 +550,7 @@ impl Operation for FillRangeOperation {
                     return self.hand(cursor.watermark);
                 }
                 if self.budget == 0 {
-                    return Ok(Next::Done((Outcome::Waiting, 0)));
+                    return Ok(Next::Done((Outcome::Waiting, 0, Vec::new())));
                 }
                 self.budget -= 1;
                 let scope = &self.scope;
@@ -557,12 +574,12 @@ impl Operation for FillRangeOperation {
             FillStep::Page => match page_answer(result)? {
                 PageProgress::Done { watermark } => self.hand(watermark),
                 PageProgress::Waiting | PageProgress::Queued(_) => {
-                    Ok(Next::Done((Outcome::Waiting, self.budget)))
+                    Ok(Next::Done((Outcome::Waiting, self.budget, Vec::new())))
                 }
             },
             FillStep::Hand => {
                 let outcome = result.child::<Outcome, BlobQueueError>()??;
-                Ok(Next::Done((outcome, self.budget)))
+                Ok(Next::Done((outcome, self.budget, Vec::new())))
             }
         }
     }
@@ -583,6 +600,9 @@ struct WalkMemberOperation {
     scope: Arc<WalkScope>,
     target: DistributionMember,
     budget: usize,
+    /// The range this walk starts at, and the one the next walk starts at.
+    start: usize,
+    next_turn: Option<usize>,
     now_ms: u64,
     ranges: Vec<KeyRange>,
     order: VecDeque<usize>,
@@ -594,7 +614,7 @@ struct WalkMemberOperation {
 }
 
 impl WalkMemberOperation {
-    fn new(scope: Arc<WalkScope>, target: DistributionMember, budget: usize) -> Self {
+    fn new(scope: Arc<WalkScope>, target: DistributionMember, budget: usize, start: usize) -> Self {
         let local = scope.local.member_id;
         let ranges: Vec<KeyRange> = (scope.snapshot)
             .catch_up_ranges(local, target.member_id)
@@ -605,6 +625,8 @@ impl WalkMemberOperation {
             scope,
             target,
             budget,
+            start,
+            next_turn: None,
             now_ms: 0,
             ranges,
             order: VecDeque::new(),
@@ -619,8 +641,14 @@ impl WalkMemberOperation {
         (self.scope.walk.set_id, self.target.member_id)
     }
 
+    fn moved(&self) -> Turns {
+        (self.next_turn.iter())
+            .map(|index| (self.turns(), *index))
+            .collect()
+    }
+
     fn waiting(&self) -> Turn<Walked> {
-        Ok(Next::Done((Outcome::Waiting, self.budget)))
+        Ok(Next::Done((Outcome::Waiting, self.budget, self.moved())))
     }
 
     fn next_range(&mut self) -> Turn<Walked> {
@@ -644,7 +672,7 @@ impl WalkMemberOperation {
         }
         if self.budget == 0 {
             // The next drain starts at this range; nothing is stated before all are done.
-            turn(self.turns(), Some(self.current));
+            self.next_turn = Some(self.current);
             return self.waiting();
         }
         self.budget -= 1;
@@ -694,9 +722,9 @@ impl Operation for WalkMemberOperation {
 
     fn first(&mut self) -> Turn<Walked> {
         if self.ranges.is_empty() {
-            return Ok(Next::Done((Outcome::Settled, self.budget)));
+            return Ok(Next::Done((Outcome::Settled, self.budget, Vec::new())));
         }
-        let first = turn(self.turns(), None) % self.ranges.len();
+        let first = self.start % self.ranges.len();
         self.order = (first..self.ranges.len()).chain(0..first).collect();
         self.next_range()
     }
@@ -730,7 +758,7 @@ impl Operation for WalkMemberOperation {
             },
             MemberStep::Hand => {
                 let outcome = result.child::<Outcome, BlobQueueError>()??;
-                Ok(Next::Done((outcome, self.budget)))
+                Ok(Next::Done((outcome, self.budget, self.moved())))
             }
         }
     }
@@ -941,8 +969,9 @@ mod tests {
 
     #[test]
     fn offline_skips_bootstrap() {
-        let mut process = ProcessBootstrapOperation::new(None);
-        assert_eq!(process.first(), Ok(Next::Done(false)));
+        let mut process = ProcessBootstrapOperation::new(None, CatchUpCursors::default());
+        let done = Ok(Next::Done((false, CatchUpCursors::default())));
+        assert_eq!(process.first(), done);
     }
 
     #[test]
@@ -963,10 +992,17 @@ mod tests {
         let target = snapshot.member(member(2)).unwrap();
         let second = &snapshot.config.ranges[1];
         let key = bootstrap_key(walk.set_id, target.member_id, second.range_id);
-        for _ in 0..2 {
-            let run = WalkMemberOperation::new(scope.clone(), target.clone(), 1);
-            let (outcome, _) = drive(run, &context).await.unwrap();
+        let walked = (walk.set_id, target.member_id);
+        let mut start = 0;
+        for round in 0..2 {
+            let run = WalkMemberOperation::new(scope.clone(), target.clone(), 1, start);
+            let (outcome, _, moved) = drive(run, &context).await.unwrap();
             assert_eq!(outcome, Outcome::Waiting);
+            if round == 0 {
+                // The budget ran out at the second range, so the next walk starts there.
+                assert_eq!(moved, [(walked, 1)]);
+            }
+            start = moved.last().map_or(start, |(_, index)| *index);
         }
         assert!(
             get(&handle, BOOTSTRAP_KEYSPACE, key).await.is_some(),

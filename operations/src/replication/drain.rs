@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
-use super::catch_up::{BOOTSTRAP_POLL, BootstrapWaitingOperation, ProcessBootstrapOperation};
+use super::catch_up::{
+    BOOTSTRAP_POLL, BootstrapWaitingOperation, CatchUpCursors, ProcessBootstrapOperation, Waited,
+};
 use super::members::{BoundRecord, BoundRecordOperation, RecordError, member_publication};
 use super::obligations::{LiveRepairResult, ProcessObligationsOperation};
 use super::page::PAGE_RECORDS;
@@ -81,6 +83,8 @@ pub struct BlobDrainResult {
     pub failed: usize,
     pub has_more_due: bool,
     pub next_due_after: Option<Duration>,
+    /// Where the next drain's bootstrap work goes on; the input keeps it for that drain.
+    pub catch_up: CatchUpCursors,
 }
 
 #[derive(Debug, PartialEq)]
@@ -258,6 +262,7 @@ enum BatchStep {
 /// a bounded number of other jobs is delivered one by one.
 #[derive(Debug, PartialEq)]
 pub struct ProcessBatchOperation<T> {
+    catch_up: CatchUpCursors,
     now_ms: u64,
     transport: T,
     routing: NodeRouting,
@@ -284,6 +289,7 @@ type BatchTurn = Turn<BlobDrainResult>;
 impl<T: PageTransport> ProcessBatchOperation<T> {
     pub fn new(transport: T, routing: NodeRouting, serving: Serving) -> Self {
         Self {
+            catch_up: CatchUpCursors::default(),
             now_ms: 0,
             transport,
             routing,
@@ -304,6 +310,12 @@ impl<T: PageTransport> ProcessBatchOperation<T> {
             succeeded: 0,
             failed: 0,
         }
+    }
+
+    /// Goes on with the bootstrap work where the previous drain left it.
+    pub fn with_catch_up(mut self, cursors: CatchUpCursors) -> Self {
+        self.catch_up = cursors;
+        self
     }
 
     fn call(&mut self, step: BatchStep, call: IoCall) -> BatchTurn {
@@ -449,6 +461,7 @@ impl<T: PageTransport> ProcessBatchOperation<T> {
             failed: self.failed,
             has_more_due: self.has_more_due,
             next_due_after: next.filter(|_| !self.has_more_due),
+            catch_up: std::mem::take(&mut self.catch_up),
         }))
     }
 }
@@ -468,12 +481,16 @@ impl<T: PageTransport> Operation for ProcessBatchOperation<T> {
         match std::mem::replace(&mut self.step, BatchStep::Cursor) {
             BatchStep::Repair => {
                 self.repair = result.child::<LiveRepairResult, BlobQueueError>()??;
-                let bootstrap = ProcessBootstrapOperation::new(self.serving);
+                let cursors = self.catch_up.clone();
+                let bootstrap = ProcessBootstrapOperation::new(self.serving, cursors);
                 self.call(BatchStep::Bootstrap, IoCall::child(bootstrap))
             }
             BatchStep::Bootstrap => {
-                self.bootstrap = match result.child::<bool, BlobQueueError>()? {
-                    Ok(waiting) => waiting,
+                self.bootstrap = match result.child::<Waited, BlobQueueError>()? {
+                    Ok((waiting, cursors)) => {
+                        self.catch_up = cursors;
+                        waiting
+                    }
                     Err(error) => {
                         warn!(%error, "Distributed bucket bootstrap failed; retrying");
                         true
