@@ -15,6 +15,7 @@ use aruna_operations::distribution::status::node_reach;
 use aruna_operations::s3::object::member_read::{
     MemberFailure, MemberRead, MemberReadOperation, MemberRefusal, MemberTextOperation,
 };
+pub(crate) use aruna_operations::s3::object::member_rest::RELAY_NODE_HEADER;
 use aruna_operations::s3::object::member_rest::{
     RestAnswer, RestAsk, RestCall, RestCallOperation, rest_url,
 };
@@ -34,10 +35,6 @@ use crate::server::state::ServerState;
 
 /// The distributed bucket a relayed request is meant for; its target refuses another bucket.
 pub(crate) const RELAY_SET_HEADER: &str = "x-aruna-relay-set";
-/// The node a node-directed read is meant for; the target refuses a header naming another node.
-pub(crate) const RELAY_NODE_HEADER: &str = "x-aruna-relay-node";
-/// Bytes of a node's answer read at most; a longer answer fails instead of filling memory.
-pub(crate) const MAX_ANSWER_BYTES: usize = 16 * 1024 * 1024;
 
 /// The coordinator a REST write goes to when this node does not coordinate the key's range.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,18 +69,6 @@ pub(crate) fn relayed_set(bucket: &BucketInfo, headers: &HeaderMap) -> ServerRes
                 .into(),
         )),
     }
-}
-
-/// The body of a node's answer, at most [`MAX_ANSWER_BYTES`]; a broken body is an error.
-pub(crate) async fn capped_body(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
-        if body.len() + chunk.len() > MAX_ANSWER_BYTES {
-            return Err(format!("the answer exceeds {MAX_ANSWER_BYTES} bytes"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 /// The coordinator a REST write to `key` goes to, or `None` when this node writes it. A request
@@ -460,14 +445,6 @@ mod tests {
             range_id: Ulid::from_bytes([2; 16]),
             node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
         }
-    }
-
-    #[tokio::test]
-    async fn answers_are_capped() {
-        let answer = |body: Vec<u8>| reqwest::Response::from(http::Response::new(body));
-        assert_eq!(capped_body(answer(b"{}".to_vec())).await.unwrap(), b"{}");
-        let oversized = vec![b'x'; MAX_ANSWER_BYTES + 1];
-        assert!(capped_body(answer(oversized)).await.is_err());
     }
 
     #[test]
