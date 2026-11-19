@@ -405,7 +405,8 @@ async fn usage_counts_documents() {
 
     let storage_dir = tempdir().unwrap();
     let metadata_dir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let node_id = iroh::SecretKey::generate().public();
     let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),
@@ -575,7 +576,8 @@ fn quota_capacity_unavailable() {
 
 async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir) {
     let tempdir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,

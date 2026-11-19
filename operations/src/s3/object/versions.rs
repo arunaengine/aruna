@@ -736,7 +736,11 @@ mod test {
         }
     }
 
-    async fn seed_head(storage_handle: &storage::StorageHandle, key: &str, version_id: Ulid) {
+    async fn seed_head(
+        storage_handle: &storage::handle::StorageHandle,
+        key: &str,
+        version_id: Ulid,
+    ) {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -751,7 +755,7 @@ mod test {
     }
 
     async fn seed_version(
-        storage_handle: &storage::StorageHandle,
+        storage_handle: &storage::handle::StorageHandle,
         key: &str,
         version_id: Ulid,
         version: BlobVersion,
@@ -770,7 +774,7 @@ mod test {
     }
 
     async fn seed_materialized(
-        storage_handle: &storage::StorageHandle,
+        storage_handle: &storage::handle::StorageHandle,
         key: &str,
         version_id: Ulid,
         hash: [u8; 32],
@@ -816,7 +820,7 @@ mod test {
     async fn newest_first_returned() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
@@ -864,7 +868,7 @@ mod test {
     async fn head_breaks_tie() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
@@ -903,7 +907,7 @@ mod test {
     async fn delete_markers_included() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
@@ -948,7 +952,7 @@ mod test {
     async fn markers_resume() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         // Two keys, "a" with two versions and "b" with one version.
@@ -1010,7 +1014,7 @@ mod test {
     async fn delimiter_groups() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["a.txt", "dir/1", "dir/2", "z.txt"].iter().enumerate() {
@@ -1050,7 +1054,7 @@ mod test {
     async fn reference_metadata_returned() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let version_id = Ulid::generate();
@@ -1118,7 +1122,7 @@ mod test {
     async fn keys_sort() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["b", "aa", "a/1"].iter().enumerate() {
@@ -1149,7 +1153,7 @@ mod test {
     async fn scan_cap_truncates() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         // Three delimiter groups; each head round makes bounded progress so the
@@ -1209,7 +1213,7 @@ mod test {
     async fn keeps_all_versions() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         // Seed more versions than the scan limit; every storage page must

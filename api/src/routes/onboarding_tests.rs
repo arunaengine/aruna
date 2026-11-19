@@ -59,7 +59,8 @@ async fn setup_management_state() -> (
     TempDir,
 ) {
     let tempdir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
     let net_handle = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),

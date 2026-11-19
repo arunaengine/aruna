@@ -736,7 +736,8 @@ mod tests {
 
     fn test_context() -> (TempDir, DriverContext) {
         let tempdir = tempdir().expect("tempdir must be created");
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         storage_handle.open_vault(NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,

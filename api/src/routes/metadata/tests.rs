@@ -3393,7 +3393,7 @@ pub(crate) async fn setup_network_state() -> TestState {
 }
 
 async fn setup_closed_storage() -> Arc<ServerState> {
-    let (storage_handle, receivers) = storage::StorageHandle::new();
+    let (storage_handle, receivers) = storage::handle::StorageHandle::new();
     drop(receivers);
 
     let realm_id = test_realm_id(3);

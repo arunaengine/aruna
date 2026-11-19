@@ -329,7 +329,8 @@ mod tests {
     #[tokio::test]
     async fn persists_connector_secret() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
@@ -397,7 +398,8 @@ mod tests {
     #[tokio::test]
     async fn given_id_registered() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
@@ -450,7 +452,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_id_once() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,

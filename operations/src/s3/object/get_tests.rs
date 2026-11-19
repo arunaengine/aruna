@@ -404,7 +404,7 @@ fn range_drift_restarts() {
 pub async fn test_get_object() {
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -568,7 +568,7 @@ pub async fn test_get_object() {
 async fn routed_missing_blob() {
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
 
     let bucket = "s3test".to_string();
     let key = "missing.txt".to_string();
@@ -675,7 +675,7 @@ async fn routed_missing_blob() {
 pub async fn hash_mismatch_rejected() {
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -832,7 +832,7 @@ async fn bound_connector_used() {
     let endpoint = spawn_reference_server(b"hello reference").await;
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
@@ -1015,7 +1015,7 @@ async fn drift_creates_successor() {
     let endpoint = spawn_reference_server(b"hello reference").await;
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
@@ -2055,7 +2055,7 @@ async fn historical_drift_fails() {
     let endpoint = spawn_reference_server(b"hello reference").await;
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await

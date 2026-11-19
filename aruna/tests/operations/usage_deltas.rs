@@ -75,7 +75,8 @@ struct Harness {
 
 async fn setup() -> Harness {
     let temp_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
     setup_on(temp_dir, storage_handle).await
 }
 
@@ -1344,7 +1345,7 @@ struct Faulty {
 
 async fn setup_faulty() -> Faulty {
     let temp_dir = tempfile::tempdir().unwrap();
-    let real = storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+    let real = storage::worker::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
     let (proxy, receivers) = real.proxy_channels();
     let fault: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
@@ -1442,7 +1443,7 @@ impl Faulty {
         .unwrap();
         self.real.close().await;
         let storage_handle =
-            storage::FjallStorage::open(_temp_dir.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(_temp_dir.path().to_str().unwrap()).unwrap();
         Harness {
             _temp_dir,
             driver: DriverContext {

@@ -26,7 +26,7 @@ pub(crate) fn metadata_test() -> MetadataTest {
     let storage_dir = tempdir().expect("storage dir");
     let metadata_dir = tempdir().expect("metadata dir");
     let storage_handle =
-        storage::FjallStorage::open(storage_dir.path().to_str().expect("storage path"))
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().expect("storage path"))
             .expect("storage opens");
     let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),

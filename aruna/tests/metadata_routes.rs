@@ -813,7 +813,8 @@ async fn setup_access_state() -> DistributedAccessState {
 
 async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
     let node_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(node_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(node_dir.path().to_str().unwrap()).unwrap();
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),

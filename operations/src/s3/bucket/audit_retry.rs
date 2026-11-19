@@ -376,7 +376,8 @@ mod tests {
     #[tokio::test]
     async fn kept_records_resume() {
         let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -453,7 +454,8 @@ mod tests {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = Arc::new(DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

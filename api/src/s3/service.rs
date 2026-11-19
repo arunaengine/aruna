@@ -126,7 +126,7 @@ use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjec
 use aruna_operations::s3::object::get::GetObjectInput as GOI;
 use aruna_operations::s3::object::head::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListBucketOperation};
-use aruna_operations::s3::object::member_read::MemberRead;
+use aruna_operations::s3::object::member_read::{MemberPayload, MemberRead, MemberRequest};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput as LOVI, ListVersionsOperation};
 use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed};
@@ -1078,7 +1078,7 @@ impl S3 for ArunaS3Service {
             .forward_target(&req.extensions, bucket_info.as_ref(), &req.input.key)
             .await?
         {
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Put,
                 operation: "PutObject",
                 bucket: req.input.bucket.clone(),
@@ -1090,7 +1090,7 @@ impl S3 for ArunaS3Service {
                         body,
                         forward::trailer_checksum(trailer_algorithm, trailing_headers.clone()),
                     ),
-                    None => forward::ForwardBody::Empty,
+                    None => MemberPayload::Empty,
                 },
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
@@ -1361,14 +1361,14 @@ impl S3 for ArunaS3Service {
                         .await
                 }
                 CopyPath::Delegate => {
-                    let request = forward::ForwardRequest {
+                    let request = MemberRequest {
                         method: aruna_core::member_read::MemberMethod::Put,
                         operation: "CopyObject",
                         bucket: dest_bucket,
                         key: dest_key,
                         query: forward::passed_query(req.uri.query()),
                         headers: forward::passed_headers(&req.headers, None),
-                        body: forward::ForwardBody::Empty,
+                        body: MemberPayload::Empty,
                     };
                     let response = self.forward_write(&user_access, &forward, request).await?;
                     self.delegated_copy(response).await
@@ -1472,14 +1472,14 @@ impl S3 for ArunaS3Service {
             .forward_target(&req.extensions, bucket_info.as_ref(), &req.input.key)
             .await?
         {
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Post,
                 operation: "CreateMultipartUpload",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: forward::passed_headers(&req.headers, None),
-                body: forward::ForwardBody::Empty,
+                body: MemberPayload::Empty,
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return self
@@ -1613,7 +1613,7 @@ impl S3 for ArunaS3Service {
                     _ => body,
                 }
             });
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Put,
                 operation: "UploadPart",
                 bucket: req.input.bucket.clone(),
@@ -1625,7 +1625,7 @@ impl S3 for ArunaS3Service {
                         body,
                         forward::trailer_checksum(trailer_algorithm, trailing_headers.clone()),
                     ),
-                    None => forward::ForwardBody::Empty,
+                    None => MemberPayload::Empty,
                 },
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
@@ -1813,14 +1813,14 @@ impl S3 for ArunaS3Service {
                     self.relay_part(&user_access, &forward, target, read).await
                 }
                 CopyPath::Delegate => {
-                    let request = forward::ForwardRequest {
+                    let request = MemberRequest {
                         method: aruna_core::member_read::MemberMethod::Put,
                         operation: "UploadPartCopy",
                         bucket: req.input.bucket,
                         key: req.input.key,
                         query: forward::passed_query(req.uri.query()),
                         headers: forward::passed_headers(&req.headers, None),
-                        body: forward::ForwardBody::Empty,
+                        body: MemberPayload::Empty,
                     };
                     let response = self.forward_write(&user_access, &forward, request).await?;
                     self.delegated_part(response).await
@@ -1897,14 +1897,14 @@ impl S3 for ArunaS3Service {
             let mut headers = forward::passed_headers(&req.headers, Some(body.len() as i64));
             headers.retain(|(name, _)| name != "content-type");
             headers.push(("content-type".to_string(), "application/xml".to_string()));
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Post,
                 operation: "CompleteMultipartUpload",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers,
-                body: forward::ForwardBody::Known(bytes::Bytes::from(body)),
+                body: MemberPayload::Known(bytes::Bytes::from(body)),
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return self.forwarded_complete(response).await;
@@ -2082,14 +2082,14 @@ impl S3 for ArunaS3Service {
             .forward_upload(&req.extensions, bucket_info, &req.input.key)
             .await?
         {
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Delete,
                 operation: "AbortMultipartUpload",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: Vec::new(),
-                body: forward::ForwardBody::Empty,
+                body: MemberPayload::Empty,
             };
             self.forward_write(&user_access, &forward, request).await?;
             return Ok(S3Response::new(AbortMultipartUploadOutput::default()));
@@ -2608,14 +2608,14 @@ impl S3 for ArunaS3Service {
             .forward_upload(&req.extensions, bucket_info, &req.input.key)
             .await?
         {
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Get,
                 operation: "ListParts",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: Vec::new(),
-                body: forward::ForwardBody::Empty,
+                body: MemberPayload::Empty,
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return self
@@ -2843,14 +2843,14 @@ impl S3 for ArunaS3Service {
                 .forward_target(&req.extensions, bucket_info, &req.input.key)
                 .await?
         {
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Delete,
                 operation: "DeleteObject",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: Vec::new(),
-                body: forward::ForwardBody::Empty,
+                body: MemberPayload::Empty,
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return Ok(Self::forwarded_delete(&response));

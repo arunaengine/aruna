@@ -376,7 +376,7 @@ mod tests {
     async fn setup_context() -> (DriverContext, NetHandle, RealmId, iroh::PublicKey, TempDir) {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -670,7 +670,8 @@ mod tests {
         storage_handle.close().await;
 
         let reopened = DriverContext {
-            storage_handle: storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap(),
+            storage_handle: storage::worker::FjallStorage::open(temp_dir.path().to_str().unwrap())
+                .unwrap(),
             blob_handle: None,
             net_handle: None,
             graph_handle: None,

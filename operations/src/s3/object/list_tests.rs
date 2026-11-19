@@ -481,7 +481,7 @@ async fn reference_object_lists() {
 }
 
 async fn seed_materialized_keys(
-    storage_handle: &storage::StorageHandle,
+    storage_handle: &storage::handle::StorageHandle,
     bucket: &str,
     keys: &[&str],
     created_by: UserId,
@@ -551,7 +551,7 @@ async fn seed_materialized_keys(
 }
 
 async fn seed_deleted_keys(
-    storage_handle: &storage::StorageHandle,
+    storage_handle: &storage::handle::StorageHandle,
     bucket: &str,
     keys: &[&str],
     created_by: UserId,
