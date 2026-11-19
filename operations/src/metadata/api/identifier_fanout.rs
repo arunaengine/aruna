@@ -19,7 +19,7 @@ use super::fanout_types::{MetadataFanoutOperation, MetadataFanoutScope, fanout_b
 use super::node_fanout::{
     FanoutParts, NodeCalls, NodeFanoutOperation, child_part, peer_answer, peer_request,
 };
-use super::{ApiQueryMode, MetadataApiError, MetadataReadError, map_read_error};
+use super::{ApiQueryMode, MetadataApiError, MetadataReadError};
 use crate::metadata::identifier_lookup::{IdentifierLookupOperation, IdentifierQuery};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::secondary_ids::{IdentifierMatch, merge_matches};
@@ -119,7 +119,6 @@ impl Operation for IdentifierFanoutOperation {
             scope,
             MetadataFanoutOperation::IdentifierLookup,
             calls,
-            map_read_error,
         );
         Ok(Next::Call(IoCall::child(fanout)))
     }

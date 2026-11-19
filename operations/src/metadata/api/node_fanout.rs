@@ -269,7 +269,6 @@ pub(super) struct NodeFanoutOperation<C: NodeCalls> {
     scope: MetadataFanoutScope,
     label: MetadataFanoutOperation,
     calls: C,
-    map_local_error: fn(MetadataReadError) -> MetadataApiError,
     now_ms: u64,
     deadline_ms: Option<u64>,
     stage: FanoutStage,
@@ -282,7 +281,6 @@ impl<C: NodeCalls> NodeFanoutOperation<C> {
         scope: MetadataFanoutScope,
         label: MetadataFanoutOperation,
         calls: C,
-        map_local_error: fn(MetadataReadError) -> MetadataApiError,
     ) -> Self {
         Self {
             realm_id,
@@ -291,7 +289,6 @@ impl<C: NodeCalls> NodeFanoutOperation<C> {
             scope,
             label,
             calls,
-            map_local_error,
             now_ms: 0,
             stage: FanoutStage::Start,
             stats: MetadataFanoutStats::default(),
@@ -387,7 +384,7 @@ impl<C: NodeCalls> NodeFanoutOperation<C> {
     ) -> Result<FanoutParts<C::Part>, MetadataApiError> {
         let node = self.local_node;
         let result = self.node_result(node, results.into_iter().next());
-        let part = result.map_err(self.map_local_error)?;
+        let part = result.map_err(map_read_error)?;
         let stats = MetadataFanoutStats {
             nodes_queried: 1,
             ..MetadataFanoutStats::default()

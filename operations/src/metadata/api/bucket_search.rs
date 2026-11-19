@@ -23,7 +23,7 @@ use super::node_fanout::{
     FanoutParts, NodeCalls, NodeFanoutOperation, child_part, peer_answer, peer_request,
 };
 use super::search_types::{BucketSearchExecution, BucketSearchRequest};
-use super::{ApiQueryMode, MetadataApiError, MetadataReadError, map_read_error, query_fingerprint};
+use super::{ApiQueryMode, MetadataApiError, MetadataReadError, query_fingerprint};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::s3::bucket::local_search::LocalBucketSearch;
 use crate::s3::bucket::search::{BucketPage, SearchBucketsError, SearchBucketsInput};
@@ -158,7 +158,6 @@ impl Operation for BucketSearchOperation {
             scope,
             MetadataFanoutOperation::BucketSearch,
             calls,
-            map_read_error,
         );
         Ok(Next::Call(IoCall::child(fanout)))
     }

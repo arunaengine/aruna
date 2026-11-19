@@ -33,7 +33,7 @@ use super::super::preflight_types::{
 use super::super::realm_search::{cursor_signers, resume_cursor};
 use super::super::{
     ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MAX_PAGINATION_DEPTH, MetadataApiError,
-    MetadataReadError, map_read_error,
+    MetadataReadError,
 };
 use super::local::references_preflight_local;
 use super::targets::ResolveTargetsOperation;
@@ -260,7 +260,6 @@ impl ReferencesPreflightOperation {
             scope,
             MetadataFanoutOperation::ReferencePreflight,
             calls,
-            map_read_error,
         )
         .until(self.deadline());
         self.stage = PreflightStage::Fanout(resolved, cursor);
