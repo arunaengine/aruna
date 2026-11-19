@@ -14,9 +14,11 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
+use tracing::{debug_span, field};
 use ulid::Ulid;
 
 use crate::metadata::iri_index::{MetadataIriError, ReferenceLookupOperation, ReferenceMatches};
+use crate::metadata::read_timing::ReadTiming;
 use crate::metadata::registry_cache::{Registry, RegistryReadOperation, cache_answer};
 use crate::metadata::search_cursor::{compare_hits, tie_order};
 use crate::metadata::visible_scope::ReadScopeOperation;
@@ -29,12 +31,17 @@ fn graph_call(effect: MetadataEffect) -> IoCall {
     IoCall::Effect(Box::new(Effect::Metadata(effect)))
 }
 
+fn unexpected(answer: &MetadataEvent) -> MetadataError {
+    MetadataError::Backend(format!("unexpected metadata search answer: {answer:?}"))
+}
+
 #[derive(Debug, PartialEq)]
 enum SearchStage {
     Registry,
     References,
     Scope(Option<Matches>),
     Search,
+    Describe,
 }
 
 /// One text search over the local graphs a caller may read. Without a graph, group or reference
@@ -50,6 +57,7 @@ pub struct LocalSearchOperation {
     limit: usize,
     reference: Option<(String, String)>,
     stage: SearchStage,
+    timing: ReadTiming,
 }
 
 impl LocalSearchOperation {
@@ -68,6 +76,20 @@ impl LocalSearchOperation {
             limit,
             reference,
             stage: SearchStage::Registry,
+            timing: ReadTiming::default(),
+        }
+    }
+
+    // The read's span ends with its hit count or error, as the handle's search span did.
+    fn settle(&self, turn: &Turn) {
+        match turn {
+            Ok(Next::Done(hits)) => {
+                self.timing.note("result", "ok");
+                self.timing.note("hit_count", hits.len() as u64);
+                self.timing.finish(None);
+            }
+            Err(error) => self.timing.finish(Some(error)),
+            Ok(_) => {}
         }
     }
 
@@ -84,13 +106,18 @@ impl LocalSearchOperation {
     }
 
     fn search(&mut self, visible: Vec<MetadataRegistryRecord>, matches: Option<Matches>) -> Turn {
+        self.timing.lap("authorization_ms");
+        if !self.realm_wide() {
+            self.timing.note("authorized_graphs", visible.len() as u64);
+        }
         if self.limit == 0 || visible.is_empty() {
             return Ok(Next::Done(Vec::new()));
         }
-        self.stage = SearchStage::Search;
         if let Some(matches) = matches.filter(|_| self.query.trim().is_empty()) {
+            self.stage = SearchStage::Describe;
             return Ok(Next::Call(self.describe(visible, &matches)));
         }
+        self.stage = SearchStage::Search;
         Ok(Next::Call(graph_call(MetadataEffect::SearchScope {
             records: visible,
             exact: !self.realm_wide(),
@@ -122,8 +149,27 @@ impl Operation for LocalSearchOperation {
     type Output = Vec<MetadataSearchHit>;
     type Error = MetadataError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.timing.stamp(now_ms);
+    }
+
     // A reference filter names its candidates through the backlink index, never the registry.
     fn first(&mut self) -> Turn {
+        self.timing.open(debug_span!(
+            "metadata.search.local",
+            query_len = self.query.len() as u64,
+            limit = self.limit as u64,
+            graph_filter_count = self.graph_iris.as_ref().map_or(0, Vec::len) as u64,
+            registry_records = field::Empty,
+            authorized_graphs = field::Empty,
+            lazy = self.realm_wide(),
+            registry_ms = field::Empty,
+            authorization_ms = field::Empty,
+            craqle_search_ms = field::Empty,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+            hit_count = field::Empty,
+        ));
         if (self.graph_iris.as_ref()).is_some_and(|graphs| graphs.len() > REGISTRY_CANDIDATE_LIMIT)
         {
             return Err(MetadataError::Backend(
@@ -144,21 +190,36 @@ impl Operation for LocalSearchOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Turn {
+        let turn = self.step(result);
+        self.settle(&turn);
+        turn
+    }
+}
+
+impl LocalSearchOperation {
+    fn step(&mut self, result: IoResult) -> Turn {
         match std::mem::replace(&mut self.stage, SearchStage::Search) {
             SearchStage::Registry => {
                 let records = result.child::<Registry, MetadataError>()??;
+                self.timing.lap("registry_ms");
+                self.timing.note("registry_records", records.len() as u64);
                 self.scope(&records, None)
             }
             SearchStage::References => {
                 let found = result.child::<ReferenceMatches, MetadataIriError>()?;
                 let (records, matches) = found?;
+                self.timing.restart();
                 self.scope(&records, Some(matches))
             }
             SearchStage::Scope(matches) => {
                 let visible = result.child::<Vec<MetadataRegistryRecord>, MetadataError>()??;
                 self.search(visible, matches)
             }
-            SearchStage::Search => match cache_answer(result)? {
+            SearchStage::Describe => match cache_answer(result)? {
+                MetadataEvent::SearchResult { hits } => Ok(Next::Done(hits)),
+                other => Err(unexpected(&other)),
+            },
+            SearchStage::Search => match self.searched(result)? {
                 MetadataEvent::SearchResult { mut hits } => {
                     // The realm-wide search answers in index order; the search cursor's
                     // watermark needs the score-descending order instead.
@@ -167,11 +228,14 @@ impl Operation for LocalSearchOperation {
                     }
                     Ok(Next::Done(hits))
                 }
-                other => Err(MetadataError::Backend(format!(
-                    "unexpected metadata search answer: {other:?}"
-                ))),
+                other => Err(unexpected(&other)),
             },
         }
+    }
+
+    fn searched(&mut self, result: IoResult) -> Result<MetadataEvent, MetadataError> {
+        self.timing.lap("craqle_search_ms");
+        cache_answer(result)
     }
 }
 

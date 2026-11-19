@@ -469,8 +469,8 @@ impl crate::GraphHandle {
                 nodes_queried,
             } => {
                 let entry = (results, nodes_queried);
-                queries.insert(key, entry, (stamp, generation()), Instant::now());
-                MetadataEvent::QueryCacheEntry { stamp, entry: None }
+                let accepted = queries.insert(key, entry, (stamp, generation()), Instant::now());
+                MetadataEvent::QueryCacheStored { accepted }
             }
             MetadataEffect::QueryCacheStamp => MetadataEvent::QueryCacheEntry {
                 stamp: queries.stamp(generation()),

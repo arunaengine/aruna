@@ -4,13 +4,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aruna_core::metadata::{MetadataEffect, MetadataEvent, MetadataSearchHit};
 use aruna_core::search_enrichment::{hit_snippet, hit_title, hit_types};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::telemetry::{record_elapsed_ms, record_error};
 use craqle::SearchHit;
-use tracing::Span;
+use tracing::{Span, debug_span, field};
 
 use crate::GraphHandle;
 use crate::read::{Properties, ReadScope};
@@ -71,10 +72,32 @@ impl GraphHandle {
                 exact,
                 sparql,
             } => {
+                let span = debug_span!(
+                    "metadata.backend.craqle.query_graphs",
+                    lazy = !exact,
+                    graph_count = field::Empty,
+                    query_len = sparql.len() as u64,
+                    elapsed_ms = field::Empty,
+                    result = field::Empty,
+                    row_count = field::Empty,
+                    triple_count = field::Empty,
+                );
+                if exact {
+                    span.record("graph_count", graph_iris.len() as u64);
+                }
+                let started = Instant::now();
                 let scope = self.scope_of(graph_iris, exact);
-                match self.query(scope, sparql, QUERY_DEADLINE, &span).await {
-                    Ok(results) => MetadataEvent::QueryResult { results },
-                    Err(error) => failed(error),
+                let result = self.query(scope, sparql, QUERY_DEADLINE, &span).await;
+                record_elapsed_ms(&span, "elapsed_ms", started);
+                match result {
+                    Ok(results) => {
+                        results.record_on(&span);
+                        MetadataEvent::QueryResult { results }
+                    }
+                    Err(error) => {
+                        record_error(&span, &error.to_string());
+                        failed(error)
+                    }
                 }
             }
             MetadataEffect::SearchScope {
@@ -88,18 +111,40 @@ impl GraphHandle {
                     .collect();
                 let mut graphs = by_graph.keys().cloned().collect::<Vec<_>>();
                 graphs.sort_unstable();
+                let span = debug_span!(
+                    "metadata.backend.craqle.search",
+                    lazy = !exact,
+                    graph_count = field::Empty,
+                    query_len = query.len() as u64,
+                    limit = limit as u64,
+                    elapsed_ms = field::Empty,
+                    result = field::Empty,
+                    hit_count = field::Empty,
+                );
+                if exact {
+                    span.record("graph_count", graphs.len() as u64);
+                }
+                let started = Instant::now();
                 let keep = |graph_iri: &str| by_graph.contains_key(graph_iri);
                 let scope = self.scope_of(graphs, exact);
-                match self.search(scope, query.clone(), limit, keep, &span).await {
-                    Ok(hits) => MetadataEvent::SearchResult {
-                        hits: (hits.into_iter())
+                let result = self.search(scope, query.clone(), limit, keep, &span).await;
+                record_elapsed_ms(&span, "elapsed_ms", started);
+                match result {
+                    Ok(hits) => {
+                        let hits = (hits.into_iter())
                             .filter_map(|(hit, properties)| {
                                 let record = by_graph.get(&hit.graph_id)?;
                                 Some(search_hit(hit, record, &properties, &query))
                             })
-                            .collect(),
-                    },
-                    Err(error) => failed(error),
+                            .collect::<Vec<_>>();
+                        span.record("result", "ok");
+                        span.record("hit_count", hits.len() as u64);
+                        MetadataEvent::SearchResult { hits }
+                    }
+                    Err(error) => {
+                        record_error(&span, &error.to_string());
+                        failed(error)
+                    }
                 }
             }
             MetadataEffect::DescribeHits { targets } => {

@@ -15,9 +15,11 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use spargebra::{Query, SparqlParser};
+use tracing::{debug_span, field};
 
 use crate::metadata::api::fanout_types::pattern_contains_service;
 use crate::metadata::query_cache::{LocalScopeKind, ScopeDigest, graphs_digest, local_key};
+use crate::metadata::read_timing::ReadTiming;
 use crate::metadata::registry_cache::{Registry, RegistryReadOperation, cache_answer};
 use crate::metadata::visible_scope::ReadScopeOperation;
 
@@ -82,6 +84,7 @@ pub struct LocalQueryOperation {
     stamp: [u64; 2],
     key: [u8; 32],
     stage: QueryStage,
+    timing: ReadTiming,
 }
 
 impl LocalQueryOperation {
@@ -98,6 +101,19 @@ impl LocalQueryOperation {
             stamp: [0; 2],
             key: [0; 32],
             stage: QueryStage::Stamp,
+            timing: ReadTiming::default(),
+        }
+    }
+
+    // The read's span ends with its result or error, as the handle's query span did.
+    fn settle(&self, turn: &Turn) {
+        match turn {
+            Ok(Next::Done(results)) => {
+                self.timing.results(results);
+                self.timing.finish(None);
+            }
+            Err(error) => self.timing.finish(Some(error)),
+            Ok(_) => {}
         }
     }
 
@@ -119,6 +135,9 @@ impl LocalQueryOperation {
                 local_key(LocalScopeKind::Lazy, &digest.finish(), &self.sparql)
             }
         };
+        if self.graph_iris.is_some() {
+            self.timing.note("authorized_graphs", graphs.len() as u64);
+        }
         self.key = key.bytes();
         self.stage = QueryStage::Cached(graphs);
         Ok(Next::Call(graph_call(MetadataEffect::QueryCacheGet {
@@ -127,6 +146,8 @@ impl LocalQueryOperation {
     }
 
     fn query(&mut self, graph_iris: Vec<String>) -> Turn {
+        self.timing.note("cache", "miss");
+        self.timing.restart();
         self.stage = QueryStage::Query;
         Ok(Next::Call(graph_call(MetadataEffect::QueryScope {
             graph_iris,
@@ -140,9 +161,29 @@ impl Operation for LocalQueryOperation {
     type Output = MetadataQueryResults;
     type Error = MetadataError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.timing.stamp(now_ms);
+    }
+
     // The stamp is taken before any read, so a change racing this query keeps its result out
     // of the cache.
     fn first(&mut self) -> Turn {
+        let span = debug_span!(
+            "metadata.query.local",
+            query_len = self.sparql.len() as u64,
+            graph_filter_count = self.graph_iris.as_ref().map_or(0, Vec::len) as u64,
+            registry_records = field::Empty,
+            authorized_graphs = field::Empty,
+            registry_ms = field::Empty,
+            authorization_ms = field::Empty,
+            craqle_query_ms = field::Empty,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+            row_count = field::Empty,
+            triple_count = field::Empty,
+            cache = field::Empty,
+        );
+        self.timing.open(span);
         parse_metadata_query(&self.sparql)?;
         if (self.graph_iris.as_ref()).is_some_and(|graphs| graphs.len() > REGISTRY_CANDIDATE_LIMIT)
         {
@@ -154,9 +195,18 @@ impl Operation for LocalQueryOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Turn {
+        let turn = self.step(result);
+        self.settle(&turn);
+        turn
+    }
+}
+
+impl LocalQueryOperation {
+    fn step(&mut self, result: IoResult) -> Turn {
         match std::mem::replace(&mut self.stage, QueryStage::Query) {
             QueryStage::Stamp => match cache_answer(result)? {
                 MetadataEvent::QueryCacheEntry { stamp, .. } => {
+                    self.timing.restart();
                     self.stamp = stamp;
                     self.stage = QueryStage::Registry;
                     Ok(Next::Call(IoCall::child(RegistryReadOperation::new())))
@@ -165,6 +215,8 @@ impl Operation for LocalQueryOperation {
             },
             QueryStage::Registry => {
                 let records = result.child::<Registry, MetadataError>()??;
+                self.timing.lap("registry_ms");
+                self.timing.note("registry_records", records.len() as u64);
                 let filter = (self.graph_iris.as_deref(), None);
                 let caller = (self.realm_id, self.auth.clone());
                 let scope = ReadScopeOperation::new(caller, &records, filter);
@@ -173,17 +225,21 @@ impl Operation for LocalQueryOperation {
             }
             QueryStage::Scope => {
                 let visible = result.child::<Vec<MetadataRegistryRecord>, MetadataError>()??;
+                self.timing.lap("authorization_ms");
                 self.lookup(visible)
             }
             QueryStage::Cached(graph_iris) => match cache_answer(result)? {
                 MetadataEvent::QueryCacheEntry {
                     entry: Some((results, _)),
                     ..
-                } => Ok(Next::Done(results)),
+                } => {
+                    self.timing.note("cache", "hit");
+                    Ok(Next::Done(results))
+                }
                 MetadataEvent::QueryCacheEntry { entry: None, .. } => self.query(graph_iris),
                 other => Err(unexpected(&other)),
             },
-            QueryStage::Query => match cache_answer(result)? {
+            QueryStage::Query => match self.queried(result)? {
                 MetadataEvent::QueryResult { results } => {
                     let store = MetadataEffect::QueryCachePut {
                         key: self.key,
@@ -197,8 +253,19 @@ impl Operation for LocalQueryOperation {
                 other => Err(unexpected(&other)),
             },
             // A refused store only leaves the result out of the cache.
-            QueryStage::Store(results) => Ok(Next::Done(results)),
+            QueryStage::Store(results) => {
+                if let Ok(MetadataEvent::QueryCacheStored { accepted: true }) = cache_answer(result)
+                {
+                    self.timing.note("cache", "stored");
+                }
+                Ok(Next::Done(results))
+            }
         }
+    }
+
+    fn queried(&mut self, result: IoResult) -> Result<MetadataEvent, MetadataError> {
+        self.timing.lap("craqle_query_ms");
+        cache_answer(result)
     }
 }
 

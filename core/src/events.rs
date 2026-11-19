@@ -934,6 +934,7 @@ impl MetadataEvent {
                 ProfileChecked,
                 RegistrySnapshot,
                 RegistryStored,
+                QueryCacheStored,
                 Error,
             }
         )

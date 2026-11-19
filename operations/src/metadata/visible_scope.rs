@@ -16,10 +16,12 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key};
+use tracing::{debug_span, field};
 
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::access::{ReadAccess, ReadAccessOperation};
 use crate::metadata::call_results::page_rows;
+use crate::metadata::read_timing::ReadTiming;
 use crate::metadata::registry_cache::cache_answer;
 
 type Turn<T> = Result<Next<T>, MetadataError>;
@@ -92,6 +94,9 @@ pub(crate) struct ReadScopeOperation {
     candidates: Vec<MetadataRegistryRecord>,
     deleted: HashSet<String>,
     stage: ScopeStage,
+    /// The listed records and the graph filter's length, for the selection span.
+    counts: (usize, usize),
+    timing: ReadTiming,
 }
 
 impl ReadScopeOperation {
@@ -116,6 +121,8 @@ impl ReadScopeOperation {
             candidates,
             deleted: HashSet::new(),
             stage: ScopeStage::Generation,
+            counts: (records.len(), graph_iris.map_or(0, <[String]>::len)),
+            timing: ReadTiming::default(),
         }
     }
 
@@ -136,12 +143,26 @@ impl ReadScopeOperation {
         )))))
     }
 
+    // Records how the selection decided each candidate, as the handle's selection span did.
     fn visible(&mut self, access: &ReadAccess) -> Vec<MetadataRegistryRecord> {
-        let deleted = &self.deleted;
-        std::mem::take(&mut self.candidates)
-            .into_iter()
-            .filter(|record| !deleted.contains(&record.graph_iri) && access.shows(record))
-            .collect()
+        let candidates = std::mem::take(&mut self.candidates);
+        let evaluated = candidates.len();
+        let (live, deleted): (Vec<_>, Vec<_>) =
+            (candidates.into_iter()).partition(|record| !self.deleted.contains(&record.graph_iri));
+        let public = live.iter().filter(|record| record.public).count();
+        let private = live.len() - public;
+        let visible = (live.into_iter())
+            .filter(|record| access.shows(record))
+            .collect::<Vec<_>>();
+        let timing = &self.timing;
+        timing.note("filtered_count", (self.counts.0 - evaluated) as u64);
+        timing.note("deleted_count", deleted.len() as u64);
+        timing.note("public_count", public as u64);
+        timing.note("private_checked_count", private as u64);
+        timing.note("denied_count", (public + private - visible.len()) as u64);
+        timing.note("visible_count", visible.len() as u64);
+        timing.finish(None);
+        visible
     }
 }
 
@@ -149,7 +170,26 @@ impl Operation for ReadScopeOperation {
     type Output = Vec<MetadataRegistryRecord>;
     type Error = MetadataError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.timing.stamp(now_ms);
+    }
+
     fn first(&mut self) -> Turn<Vec<MetadataRegistryRecord>> {
+        self.timing.open(debug_span!(
+            "metadata.authorization.select_records",
+            record_count = self.counts.0 as u64,
+            graph_filter_count = self.counts.1 as u64,
+            visible_count = field::Empty,
+            deleted_count = field::Empty,
+            filtered_count = field::Empty,
+            lifecycle_cache_hits = field::Empty,
+            lifecycle_cache_misses = field::Empty,
+            lifecycle_reads = 1u64,
+            public_count = field::Empty,
+            private_checked_count = field::Empty,
+            denied_count = field::Empty,
+            elapsed_ms = field::Empty,
+        ));
         let generation = Effect::Metadata(MetadataEffect::CacheGeneration);
         Ok(Next::Call(IoCall::Effect(Box::new(generation))))
     }
@@ -171,7 +211,18 @@ impl Operation for ReadScopeOperation {
             }
             // A refused refresh only leaves the cache to the next fill.
             ScopeStage::Refresh => {
-                cache_answer(result)?;
+                let accepted = match cache_answer(result)? {
+                    MetadataEvent::RegistryStored { accepted } => accepted,
+                    _ => false,
+                };
+                let evaluated = self.candidates.len() as u64;
+                let (hits, misses) = if accepted {
+                    (evaluated, 0)
+                } else {
+                    (0, evaluated)
+                };
+                self.timing.note("lifecycle_cache_hits", hits);
+                self.timing.note("lifecycle_cache_misses", misses);
                 let auth = self.auth.clone();
                 let access = ReadAccessOperation::new(self.realm_id, auth, &self.candidates);
                 Ok(Next::Call(IoCall::child(access)))

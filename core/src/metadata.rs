@@ -1263,6 +1263,16 @@ impl MetadataQueryResults {
             Self::Graph(_) => "graph",
         }
     }
+
+    /// Records the kind and size of these results on a query span.
+    pub fn record_on(&self, span: &tracing::Span) {
+        span.record("result", self.kind());
+        match self {
+            Self::Solutions(rows) => span.record("row_count", rows.len() as u64),
+            Self::Boolean(_) => span.record("row_count", 1u64),
+            Self::Graph(triples) => span.record("triple_count", triples.len() as u64),
+        };
+    }
 }
 
 /// A row of SPARQL solutions: variable name to term text.
@@ -1756,6 +1766,10 @@ pub enum MetadataEvent {
         generation: u64,
     },
     /// Whether a registry fill or deletion refresh was kept.
+    /// Whether the query cache kept a result.
+    QueryCacheStored {
+        accepted: bool,
+    },
     RegistryStored {
         accepted: bool,
     },
