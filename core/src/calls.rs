@@ -16,7 +16,7 @@ use crate::errors::StorageError;
 use crate::keyspaces::USAGE_STATS_KEYSPACE;
 use crate::events::{Event, GroupEvent, StorageEvent};
 use crate::operation::{
-    AfterConflict, EffectOperation, HoldScope, Operation, Runnable, SubOperation, TransactionMode,
+    AfterConflict, HoldScope, Operation, SubOperation, TransactionMode,
     boxed_suboperation,
 };
 use crate::structs::storage::distribution::accounting::RangeCounters;
@@ -99,11 +99,10 @@ pub enum IoResult {
 }
 
 impl IoCall {
-    /// Runs `operation` of either kind as a child; its result comes back as [`IoResult::Child`].
-    pub fn child<O, K>(operation: O) -> Self
+    /// Runs `operation` as a child; its result comes back as [`IoResult::Child`].
+    pub fn child<O>(operation: O) -> Self
     where
-        O: Runnable<K> + 'static,
-        K: 'static,
+        O: Operation + 'static,
         O::Output: PartialEq + 'static,
         O::Error: PartialEq + 'static,
     {
@@ -114,10 +113,9 @@ impl IoCall {
 
     /// Starts `operation` beside the caller while a background slot is free; the caller gets
     /// only `TaskEvent::BackgroundStarted` and never the child's result.
-    pub fn background<O, K>(operation: O) -> Self
+    pub fn background<O>(operation: O) -> Self
     where
-        O: Runnable<K> + 'static,
-        K: 'static,
+        O: Operation + 'static,
         O::Output: Send + 'static,
         O::Error: Send + 'static,
     {
@@ -349,7 +347,7 @@ impl From<IoError> for crate::errors::AuthorizationError {
 /// storage calls in the operation's transaction mode, commits its outcome
 /// and aborts on an error.
 #[derive(Debug)]
-pub(crate) struct CallRun<P: Operation> {
+pub struct CallRun<P: Operation> {
     operation: P,
     mode: TransactionMode,
     txn_id: Option<TxnId>,
@@ -447,7 +445,8 @@ impl<P: Operation> PartialEq for CallRun<P> {
 }
 
 impl<P: Operation> CallRun<P> {
-    pub(crate) fn new(operation: P) -> Self {
+    /// The machine that runs `operation` from its first call.
+    pub fn new(operation: P) -> Self {
         Self {
             mode: operation.transaction(),
             operation,
@@ -578,16 +577,17 @@ impl<P: Operation> CallRun<P> {
     }
 }
 
-impl<P: Operation> EffectOperation for CallRun<P> {
-    type Output = P::Output;
-    type Error = P::Error;
-
-    fn start(&mut self) -> Effects {
+/// The effect protocol the runner and the child wrappers drive: `start` asks the first effects,
+/// `step` feeds each event, `is_complete` ends the run and `finalize` reads its outcome.
+impl<P: Operation> CallRun<P> {
+    /// The effects of the operation's first call.
+    pub fn start(&mut self) -> Effects {
         let turn = self.operation.first();
         self.advance(turn)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    /// Feeds one event; an event the run does not wait for fails it.
+    pub fn step(&mut self, event: Event) -> Effects {
         match std::mem::replace(&mut self.state, State::Created) {
             State::Starting(call) => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
@@ -645,11 +645,12 @@ impl<P: Operation> EffectOperation for CallRun<P> {
         }
     }
 
-    fn is_complete(&self) -> bool {
+    pub fn is_complete(&self) -> bool {
         matches!(self.state, State::Finished(_))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
+    /// The outcome; a run that did not finish reports `IoError::Unfinished`.
+    pub fn finalize(self) -> Result<P::Output, P::Error> {
         match self.state {
             State::Finished(result) => result,
             State::After { output, .. } => Ok(output),
@@ -657,7 +658,8 @@ impl<P: Operation> EffectOperation for CallRun<P> {
         }
     }
 
-    fn abort(&mut self) -> Effects {
+    /// The cleanup of a run that stops before it finished; its effects are best effort.
+    pub fn abort(&mut self) -> Effects {
         match std::mem::replace(&mut self.state, State::Created) {
             State::After { output, .. } => {
                 self.state = State::Finished(Ok(output));
@@ -671,32 +673,35 @@ impl<P: Operation> EffectOperation for CallRun<P> {
         }
     }
 
-    fn stamp(&mut self, now_ms: u64) {
+    /// The runner's clock in Unix milliseconds, given before `start` and each `step`.
+    pub fn stamp(&mut self, now_ms: u64) {
         self.operation.stamp(now_ms);
     }
 
-    fn seed(&mut self, entropy: u128) {
+    /// The runner's entropy for this run, given once before `start`.
+    pub fn seed(&mut self, entropy: u128) {
         self.operation.seed(entropy);
     }
 
-    fn hold_scope(&self) -> Option<HoldScope> {
+    pub fn hold_scope(&self) -> Option<HoldScope> {
         self.operation.hold_scope()
     }
 
-    fn expected_error(error: &Self::Error) -> bool {
+    pub fn expected_error(error: &P::Error) -> bool {
         P::expected_error(error)
     }
 
-    fn is_conflict(error: &Self::Error) -> bool {
+    pub fn is_conflict(error: &P::Error) -> bool {
         P::is_conflict(error)
     }
 
-    fn conflict_retries() -> u32 {
-        P::conflict_retries()
+    pub fn on_conflict(&mut self, attempt: u32) -> AfterConflict<P::Output> {
+        self.operation.on_conflict(attempt)
     }
 
-    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<P::Output> {
-        self.operation.on_conflict(attempt)
+    /// Whether a deadline still runs `abort` after a commit; only a commit's own cleanup does.
+    pub fn abort_after_commit(&self) -> bool {
+        false
     }
 }
 

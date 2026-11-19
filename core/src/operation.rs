@@ -1,4 +1,4 @@
-//! Declares the operation traits the runner drives: calls and results, or effects and events.
+//! Declares the operation trait the runner drives with calls and results, and its child wrappers.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -66,18 +66,22 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
         Vec::new()
     }
 
-    /// See [`EffectOperation::stamp`].
+    /// The runner's clock in Unix milliseconds, given right before `first` and each `next`.
+    /// An operation that needs the time keeps it here instead of reading a clock; tests forge it.
     fn stamp(&mut self, _now_ms: u64) {}
 
-    /// See [`EffectOperation::seed`].
+    /// The runner's entropy for this run, given once before `first`. It carries a run slot that
+    /// no other run of the process shares; keep it in an [`crate::id_mint::IdMint`] to mint ids.
     fn seed(&mut self, _entropy: u128) {}
 
-    /// See [`EffectOperation::hold_scope`].
+    /// The backend scope this operation holds from before its first call until it ends, so no
+    /// two operations with the same scope overlap.
     fn hold_scope(&self) -> Option<HoldScope> {
         None
     }
 
-    /// See [`EffectOperation::expected_error`].
+    /// Whether an error is an ordinary client-visible outcome (not found, denied), which the
+    /// runner logs at debug so polling clients cannot flood the error stream.
     fn expected_error(_error: &Self::Error) -> bool
     where
         Self: Sized,
@@ -93,7 +97,8 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
         *error == Self::Error::from(IoError::Conflict)
     }
 
-    /// See [`EffectOperation::conflict_retries`].
+    /// How often the runner's conflict retry reruns the operation after a conflict before it
+    /// returns the error: reruns after the first run, so three attempts are two retries.
     fn conflict_retries() -> u32
     where
         Self: Sized,
@@ -149,92 +154,15 @@ impl<T> AfterConflict<T> {
     }
 }
 
-/// An operation written against raw effects and events: `start` returns the first effects,
-/// `step` consumes each dispatched event, `is_complete` ends the stream, `finalize` reads the
-/// outcome, `abort` requests cleanup. It goes away once every one is an [`Operation`].
-pub trait EffectOperation: Send + std::fmt::Debug + PartialEq {
-    type Output: Send + std::fmt::Debug;
-    type Error: Send + std::fmt::Debug;
-
-    fn start(&mut self) -> Effects;
-    fn step(&mut self, events: Event) -> Effects;
-    fn is_complete(&self) -> bool;
-    /// Consumes the operation once the runner stops and reads its outcome. The
-    /// loop calls it even after an early stop, so a nonterminal state must return
-    /// an error rather than a successful default.
-    fn finalize(self) -> Result<Self::Output, Self::Error>;
-    /// Requests cleanup effects for a run that stops before completion. They are
-    /// requests the runner may drop, time out, or hand to storage, so returning
-    /// them is not proof that cleanup finished.
-    fn abort(&mut self) -> Effects;
-
-    /// Whether an error is an ordinary client-visible outcome (not found, denied)
-    /// rather than an operational failure. Expected errors are logged at debug so
-    /// polling clients cannot flood the error stream and its span exporter.
-    fn expected_error(_error: &Self::Error) -> bool
-    where
-        Self: Sized,
-    {
-        false
-    }
-
-    /// The runner's clock in Unix milliseconds, given right before `start` and each `step`.
-    /// An operation that needs the time keeps it here instead of reading a clock; tests forge it.
-    fn stamp(&mut self, _now_ms: u64) {}
-
-    /// The runner's entropy for this run, given once before `start`. It carries a run slot that
-    /// no other run of the process shares; keep it in an [`crate::id_mint::IdMint`] to mint ids.
-    fn seed(&mut self, _entropy: u128) {}
-
-    /// The backend scope this operation holds from before its first effect until it ends, so
-    /// no two operations with the same scope overlap.
-    fn hold_scope(&self) -> Option<HoldScope> {
-        None
-    }
-
-    /// Whether an error is a lost transaction conflict that a fresh run of the operation may
-    /// avoid. The runner's conflict retry reruns the operation only after such an error.
-    fn is_conflict(_error: &Self::Error) -> bool
-    where
-        Self: Sized,
-    {
-        false
-    }
-
-    /// How often the runner's conflict retry reruns the operation after a conflict before it
-    /// returns the error: reruns after the first run, so three attempts are two retries.
-    fn conflict_retries() -> u32
-    where
-        Self: Sized,
-    {
-        3
-    }
-
-    /// See [`Operation::on_conflict`].
-    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<Self::Output>
-    where
-        Self: Sized,
-    {
-        AfterConflict::rerun_within(attempt, Self::conflict_retries())
-    }
-
-    /// Whether a deadline must still run `abort` after one of the operation's
-    /// transactions committed. Only an operation whose `abort` protects already
-    /// committed work may opt in.
-    fn abort_after_commit(&self) -> bool {
-        false
-    }
-}
-
 pub trait SubOperation: Send + std::fmt::Debug {
     fn start(&mut self) -> Effects;
     fn step(&mut self, event: Event) -> Effects;
     fn is_complete(&self) -> bool;
     fn finalize(self: Box<Self>) -> Event;
     fn abort(&mut self) -> Effects;
-    /// See [`EffectOperation::stamp`].
+    /// See [`Operation::stamp`].
     fn stamp(&mut self, _now_ms: u64) {}
-    /// See [`EffectOperation::seed`].
+    /// See [`Operation::seed`].
     fn seed(&mut self, _entropy: u128) {}
     /// The backend scope this child holds while it runs.
     fn hold_scope(&self) -> Option<HoldScope> {
@@ -252,16 +180,16 @@ impl PartialEq for dyn SubOperation {
 
 struct MappedSubOperation<O, F>
 where
-    O: EffectOperation,
+    O: Operation,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send,
 {
-    operation: Option<O>,
+    operation: Option<CallRun<O>>,
     map_result: Option<F>,
 }
 
 impl<O, F> PartialEq for MappedSubOperation<O, F>
 where
-    O: EffectOperation,
+    O: Operation,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send,
 {
     fn eq(&self, other: &Self) -> bool {
@@ -271,7 +199,7 @@ where
 
 impl<O, F> std::fmt::Debug for MappedSubOperation<O, F>
 where
-    O: EffectOperation,
+    O: Operation,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -283,10 +211,10 @@ where
 
 impl<O, F> MappedSubOperation<O, F>
 where
-    O: EffectOperation,
+    O: Operation,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send,
 {
-    fn new(operation: O, map_result: F) -> Self {
+    fn new(operation: CallRun<O>, map_result: F) -> Self {
         Self {
             operation: Some(operation),
             map_result: Some(map_result),
@@ -296,7 +224,7 @@ where
 
 impl<O, F> SubOperation for MappedSubOperation<O, F>
 where
-    O: EffectOperation + 'static,
+    O: Operation + 'static,
     O::Output: Send + 'static,
     O::Error: Send + 'static,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send + 'static,
@@ -355,7 +283,7 @@ where
     }
 
     fn hold_scope(&self) -> Option<HoldScope> {
-        self.operation.as_ref().and_then(O::hold_scope)
+        self.operation.as_ref().and_then(CallRun::hold_scope)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -369,33 +297,28 @@ where
     }
 }
 
-/// Boxes an operation of either kind as a child whose outcome `map_result` turns into an event.
-pub fn boxed_suboperation<O, K, F>(operation: O, map_result: F) -> Box<dyn SubOperation>
+/// Boxes an operation as a child whose outcome `map_result` turns into an event.
+pub fn boxed_suboperation<O, F>(operation: O, map_result: F) -> Box<dyn SubOperation>
 where
-    O: Runnable<K> + 'static,
-    K: 'static,
+    O: Operation + 'static,
     O::Output: Send + 'static,
     O::Error: Send + 'static,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send + 'static,
 {
-    Box::new(MappedSubOperation::new(
-        operation.into_machine(),
-        map_result,
-    ))
+    Box::new(MappedSubOperation::new(CallRun::new(operation), map_result))
 }
 
 /// Boxes a child built by `build` that reruns after a lost conflict as `drive_retry` does: each
 /// rerun is a fresh build whose `on_conflict` decides, after a backoff seeded by `seed`.
-pub fn boxed_retry<O, K, B, F>(mut build: B, seed: &[u8], map_result: F) -> Box<dyn SubOperation>
+pub fn boxed_retry<O, B, F>(mut build: B, seed: &[u8], map_result: F) -> Box<dyn SubOperation>
 where
-    O: Runnable<K> + 'static,
-    K: 'static,
+    O: Operation + 'static,
     O::Output: Send + 'static,
     O::Error: Send + 'static,
     B: FnMut() -> O + Send + 'static,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send + 'static,
 {
-    let mut build = move || build().into_machine();
+    let mut build = move || CallRun::new(build());
     Box::new(RetrySubOperation {
         attempt: Some(Attempt::Running(build())),
         build,
@@ -408,9 +331,9 @@ where
 }
 
 /// A child that reruns per `on_conflict`. `attempt` is `None` only inside a method.
-struct RetrySubOperation<M: EffectOperation, B, F> {
+struct RetrySubOperation<P: Operation, B, F> {
     build: B,
-    attempt: Option<Attempt<M>>,
+    attempt: Option<Attempt<P>>,
     lost: u32,
     seed: Vec<u8>,
     now_ms: Option<u64>,
@@ -420,19 +343,19 @@ struct RetrySubOperation<M: EffectOperation, B, F> {
 }
 
 #[derive(Debug)]
-enum Attempt<M: EffectOperation> {
-    Running(M),
+enum Attempt<P: Operation> {
+    Running(CallRun<P>),
     /// A fresh build waits for its backoff.
-    Waiting(M),
-    Ended(Result<M::Output, M::Error>),
+    Waiting(CallRun<P>),
+    Ended(Result<P::Output, P::Error>),
 }
 
-impl<M: EffectOperation, B, F> RetrySubOperation<M, B, F>
+impl<P: Operation, B, F> RetrySubOperation<P, B, F>
 where
-    B: FnMut() -> M,
+    B: FnMut() -> CallRun<P>,
 {
     /// Starts a fresh run, then reads its outcome if it needed no I/O.
-    fn run(&mut self, mut run: M) -> Effects {
+    fn run(&mut self, mut run: CallRun<P>) -> Effects {
         if let Some(now_ms) = self.now_ms {
             run.stamp(now_ms);
         }
@@ -444,13 +367,13 @@ where
     }
 
     /// Keeps a running run; reads a finished one, where a lost conflict asks a fresh build.
-    fn settle(&mut self, run: M, mut effects: Effects) -> Effects {
+    fn settle(&mut self, run: CallRun<P>, mut effects: Effects) -> Effects {
         if !run.is_complete() {
             self.attempt = Some(Attempt::Running(run));
             return effects;
         }
         let error = match run.finalize() {
-            Err(error) if M::is_conflict(&error) => error,
+            Err(error) if P::is_conflict(&error) => error,
             result => {
                 self.attempt = Some(Attempt::Ended(result));
                 return effects;
@@ -472,7 +395,7 @@ where
 }
 
 /// Equal runs in the same phase; ended attempts compare by their count of lost runs only.
-impl<M: EffectOperation, B, F> PartialEq for RetrySubOperation<M, B, F> {
+impl<P: Operation, B, F> PartialEq for RetrySubOperation<P, B, F> {
     fn eq(&self, other: &Self) -> bool {
         let same = match (&self.attempt, &other.attempt) {
             (Some(Attempt::Running(one)), Some(Attempt::Running(two)))
@@ -484,7 +407,7 @@ impl<M: EffectOperation, B, F> PartialEq for RetrySubOperation<M, B, F> {
     }
 }
 
-impl<M: EffectOperation, B, F> std::fmt::Debug for RetrySubOperation<M, B, F> {
+impl<P: Operation, B, F> std::fmt::Debug for RetrySubOperation<P, B, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RetrySubOperation")
             .field("attempt", &self.attempt)
@@ -493,13 +416,13 @@ impl<M: EffectOperation, B, F> std::fmt::Debug for RetrySubOperation<M, B, F> {
     }
 }
 
-impl<M, B, F> SubOperation for RetrySubOperation<M, B, F>
+impl<P, B, F> SubOperation for RetrySubOperation<P, B, F>
 where
-    M: EffectOperation + 'static,
-    M::Output: Send + 'static,
-    M::Error: Send + 'static,
-    B: FnMut() -> M + Send + 'static,
-    F: FnOnce(Result<M::Output, M::Error>) -> Event + Send + 'static,
+    P: Operation + 'static,
+    P::Output: Send + 'static,
+    P::Error: Send + 'static,
+    B: FnMut() -> CallRun<P> + Send + 'static,
+    F: FnOnce(Result<P::Output, P::Error>) -> Event + Send + 'static,
 {
     fn start(&mut self) -> Effects {
         match self.attempt.take() {
@@ -584,39 +507,6 @@ where
             .as_any()
             .downcast_ref::<Self>()
             .is_some_and(|other| self == other)
-    }
-}
-
-/// Marks an [`EffectOperation`] for [`Runnable`].
-pub enum ByEffects {}
-
-/// Marks an [`Operation`] for [`Runnable`].
-pub enum ByCalls {}
-
-/// An operation of either kind, as the effect machine the runner drives. `K` only tells the
-/// two blanket implementations apart, so callers never name it.
-pub trait Runnable<K> {
-    type Output: Send + std::fmt::Debug;
-    type Error: Send + std::fmt::Debug;
-
-    fn into_machine(self) -> impl EffectOperation<Output = Self::Output, Error = Self::Error>;
-}
-
-impl<T: EffectOperation> Runnable<ByEffects> for T {
-    type Output = T::Output;
-    type Error = T::Error;
-
-    fn into_machine(self) -> impl EffectOperation<Output = Self::Output, Error = Self::Error> {
-        self
-    }
-}
-
-impl<T: Operation> Runnable<ByCalls> for T {
-    type Output = T::Output;
-    type Error = T::Error;
-
-    fn into_machine(self) -> impl EffectOperation<Output = Self::Output, Error = Self::Error> {
-        CallRun::new(self)
     }
 }
 

@@ -15,7 +15,8 @@ use aruna_core::heartbeat::{Heard, HeldHeartbeat, Here, MAX_HEARTBEAT_AGE};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::node_facts::{NodeFacts, class_labels, permille_of};
 use aruna_core::operation::SubOperation;
-use aruna_core::operation::{AfterConflict, EffectOperation, HoldScope, Runnable};
+use aruna_core::calls::CallRun;
+use aruna_core::operation::{AfterConflict, HoldScope, Operation};
 use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
 use aruna_core::types::{Effects, TxnId};
@@ -650,13 +651,13 @@ fn delivery(record: Option<u64>, event: &Event) -> u64 {
 
 /// Parent adapter: the operation borrows, while typed finalization stays in the
 /// parent entry points. The second field is the run's record number when recording is on.
-struct ParentRun<'a, O: EffectOperation>(&'a mut O, Option<u64>);
+struct ParentRun<'a, P: Operation>(&'a mut CallRun<P>, Option<u64>);
 
-impl<O: EffectOperation> Drive for ParentRun<'_, O> {
+impl<P: Operation> Drive for ParentRun<'_, P> {
     fn start(&mut self) -> Effects {
         let entropy = clock::next_entropy();
         let now = clock::stamp_time();
-        self.1 = recorder::begin(type_name::<O>(), now, || format!("{:?}", self.0));
+        self.1 = recorder::begin(type_name::<CallRun<P>>(), now, || format!("{:?}", self.0));
         self.0.stamp(now);
         self.0.seed(entropy);
         self.0.start()
@@ -1329,7 +1330,7 @@ fn local_hold(scope: HoldScope) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     holds.entry(scope).or_default().clone()
 }
 
-/// Drives an operation of either kind under one wall-clock deadline. Cleanup after expiry is
+/// Drives an operation under one wall-clock deadline. Cleanup after expiry is
 /// bounded and unresolved transaction ownership is handed to storage.
 #[tracing::instrument(
     name = "operation",
@@ -1337,27 +1338,24 @@ fn local_hold(scope: HoldScope) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     skip(operation, context),
     fields(operation = type_name::<O>())
 )]
-pub async fn drive_until<O, K>(
+pub async fn drive_until<O: Operation>(
     operation: O,
     context: &DriverContext,
     deadline: tokio::time::Instant,
-) -> Result<O::Output, O::Error>
-where
-    O: Runnable<K>,
-{
-    machine_until(operation.into_machine(), context, deadline).await
+) -> Result<O::Output, O::Error> {
+    machine_until(CallRun::new(operation), context, deadline).await
 }
 
-async fn machine_until<O: EffectOperation>(
-    mut operation: O,
+async fn machine_until<P: Operation>(
+    mut operation: CallRun<P>,
     context: &DriverContext,
     deadline: tokio::time::Instant,
-) -> Result<O::Output, O::Error> {
+) -> Result<P::Output, P::Error> {
     let scope = operation.hold_scope();
     let hold = take_hold(context, scope);
     let Ok(_hold) = tokio::time::timeout_at(deadline, hold).await else {
         warn!(
-            operation = %type_name::<O>(),
+            operation = %type_name::<CallRun<P>>(),
             "Operation deadline expired while it waited for its backend hold"
         );
         let _ = operation.abort();
@@ -1371,7 +1369,7 @@ async fn machine_until<O: EffectOperation>(
         Some(deadline),
         DeadlineAbort::OperationOptIn,
         ExpiryRecheck::Once,
-        Some(type_name::<O>()),
+        Some(type_name::<CallRun<P>>()),
     );
     let mut state = holding(scope, effects).await;
     let record = run.1;
@@ -1390,17 +1388,17 @@ async fn machine_until<O: EffectOperation>(
     let result = operation.finalize();
     record_end(record, &result);
     if let Err(error) = &result {
-        if O::expected_error(error) {
+        if P::expected_error(error) {
             debug!(
                 event = "operation.rejected",
-                operation = %type_name::<O>(),
+                operation = %type_name::<CallRun<P>>(),
                 error = ?error,
                 "Operation rejected"
             );
         } else {
             error!(
                 event = "operation.failed",
-                operation = %type_name::<O>(),
+                operation = %type_name::<CallRun<P>>(),
                 error = ?error,
                 "Operation failed"
             );
@@ -1409,7 +1407,7 @@ async fn machine_until<O: EffectOperation>(
     result
 }
 
-/// Drives an operation of either kind without a deadline. Transaction ownership and the effect
+/// Drives an operation without a deadline. Transaction ownership and the effect
 /// loop are the same as [`drive_until`]; only the deadline and its logging differ.
 #[tracing::instrument(
     name = "operation",
@@ -1417,18 +1415,18 @@ async fn machine_until<O: EffectOperation>(
     skip(operation, context),
     fields(operation = type_name::<O>())
 )]
-pub async fn drive<O, K>(operation: O, context: &DriverContext) -> Result<O::Output, O::Error>
-where
-    O: Runnable<K>,
-{
-    drive_machine(operation.into_machine(), context).await
-}
-
-async fn drive_machine<O: EffectOperation>(
-    mut operation: O,
+pub async fn drive<O: Operation>(
+    operation: O,
     context: &DriverContext,
 ) -> Result<O::Output, O::Error> {
-    let operation_name = type_name::<O>();
+    drive_machine(CallRun::new(operation), context).await
+}
+
+async fn drive_machine<P: Operation>(
+    mut operation: CallRun<P>,
+    context: &DriverContext,
+) -> Result<P::Output, P::Error> {
+    let operation_name = type_name::<CallRun<P>>();
 
     trace!(
         event = "operation.started",
@@ -1464,7 +1462,7 @@ async fn drive_machine<O: EffectOperation>(
             operation = %operation_name,
             "Completed operation"
         ),
-        Err(error) if O::expected_error(error) => debug!(
+        Err(error) if P::expected_error(error) => debug!(
             event = "operation.rejected",
             operation = %operation_name,
             error = ?error,
@@ -1483,38 +1481,32 @@ async fn drive_machine<O: EffectOperation>(
 /// Drives a fresh operation from `build`; after a conflict (`is_conflict`) it builds the next
 /// attempt and asks its `on_conflict` to rerun after a backoff seeded by `seed`, finish or fail.
 /// The same seed gives the same waits; distinct seeds spread conflicting writers out.
-pub async fn drive_retry<O, K>(
+pub async fn drive_retry<O: Operation>(
     mut build: impl FnMut() -> O,
     context: &DriverContext,
     seed: &[u8],
-) -> Result<O::Output, O::Error>
-where
-    O: Runnable<K>,
-{
-    retry_machine(move || build().into_machine(), context, seed, None).await
+) -> Result<O::Output, O::Error> {
+    retry_machine(move || CallRun::new(build()), context, seed, None).await
 }
 
 /// [`drive_retry`] with every attempt and backoff under one wall-clock deadline, as
 /// [`drive_until`] runs one attempt.
-pub async fn drive_retry_until<O, K>(
+pub async fn drive_retry_until<O: Operation>(
     mut build: impl FnMut() -> O,
     context: &DriverContext,
     seed: &[u8],
     deadline: tokio::time::Instant,
-) -> Result<O::Output, O::Error>
-where
-    O: Runnable<K>,
-{
-    let build = move || build().into_machine();
+) -> Result<O::Output, O::Error> {
+    let build = move || CallRun::new(build());
     retry_machine(build, context, seed, Some(deadline)).await
 }
 
-async fn retry_machine<O: EffectOperation>(
-    mut build: impl FnMut() -> O,
+async fn retry_machine<P: Operation>(
+    mut build: impl FnMut() -> CallRun<P>,
     context: &DriverContext,
     seed: &[u8],
     deadline: Option<tokio::time::Instant>,
-) -> Result<O::Output, O::Error> {
+) -> Result<P::Output, P::Error> {
     let mut operation = build();
     let mut attempt: u32 = 0;
     loop {
@@ -1523,7 +1515,7 @@ async fn retry_machine<O: EffectOperation>(
             None => drive_machine(operation, context).await,
         };
         let error = match result {
-            Err(error) if O::is_conflict(&error) => error,
+            Err(error) if P::is_conflict(&error) => error,
             result => return result,
         };
         attempt = attempt.saturating_add(1);
