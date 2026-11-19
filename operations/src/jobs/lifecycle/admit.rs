@@ -87,6 +87,7 @@ pub struct AdmitSubmissionOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmitState {
     ReadConfig,
+    ReadTombstone,
     Scan,
     ReadClosure,
     ReadQuota,
@@ -113,6 +114,16 @@ impl AdmitSubmissionOperation {
             submission_id: self.config.submission_id,
             request_digest: self.config.request_digest,
         }
+    }
+
+    /// A family still being deleted here answers before its old claims could be replayed.
+    fn read_tombstone(&mut self) -> Step {
+        self.state = AdmitState::ReadTombstone;
+        let row = (
+            FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+            family_prefix(&self.family()),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
     }
 
     /// Claims of every request family under this submission, so a replay and an
@@ -210,7 +221,7 @@ impl AdmitSubmissionOperation {
     }
 
     /// Checks the group still accepts writes and that the quota revision is the one the
-    /// caller's check observed, then reads the projection cache and the family tombstone.
+    /// caller's check observed, then reads the projection cache.
     fn read_cache(&mut self, result: IoResult) -> Step {
         let [quota, fence] = values::<2>(result)?;
         aruna_core::structs::identity::group_delete::check_group_write(fence.as_deref())?;
@@ -226,11 +237,10 @@ impl AdmitSubmissionOperation {
             return Err(StorageError::TransactionConflict.into());
         }
         self.state = AdmitState::ReadCache;
-        let family = family_prefix(&self.family());
-        Ok(Next::Call(IoCall::Read(vec![
-            (FAMILY_PROJECTION_KEYSPACE.to_string(), family.clone()),
-            (FAMILY_TOMBSTONE_KEYSPACE.to_string(), family),
-        ])))
+        Ok(Next::Call(IoCall::Read(vec![(
+            FAMILY_PROJECTION_KEYSPACE.to_string(),
+            family_prefix(&self.family()),
+        )])))
     }
 
     fn batch_writes(&self) -> Result<Vec<(String, Key, Value)>, LifecycleError> {
@@ -375,11 +385,19 @@ impl Operation for AdmitSubmissionOperation {
                     if self.view.is_none() {
                         return Err(LifecycleError::NotHolder);
                     }
-                    self.scan(None)
+                    self.read_tombstone()
                 }
                 Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
                 other => Err(self.unexpected("realm config read", other.label())),
             },
+            (AdmitState::ReadTombstone, result) => {
+                let [tombstone] = values::<1>(result)?;
+                let tombstone = tombstone.and_then(|row| from_bytes::<FamilyTombstone>(&row).ok());
+                if tombstone.is_some_and(|tombstone| !tombstone.finished) {
+                    return Err(LifecycleError::Pruning);
+                }
+                self.scan(None)
+            }
             (AdmitState::Scan, IoResult::Page { rows, next }) => {
                 self.keep_claims(rows)?;
                 match next {
@@ -390,17 +408,12 @@ impl Operation for AdmitSubmissionOperation {
             (AdmitState::ReadClosure, result) => self.closed(result),
             (AdmitState::ReadQuota, result) => self.read_cache(result),
             (AdmitState::ReadCache, result) => {
-                let [value, tombstone] = values::<2>(result)?;
+                let [value] = values::<1>(result)?;
                 self.cache = value
                     .as_ref()
                     .and_then(|value| ProjectionCache::decode(value));
                 if value.is_some() && self.cache.is_none() {
                     warn!("Job projection cache is unreadable");
-                }
-                // A keyed submission to a family that is still being deleted waits for it.
-                let tombstone = tombstone.and_then(|row| from_bytes::<FamilyTombstone>(&row).ok());
-                if tombstone.is_some_and(|tombstone| !tombstone.finished) {
-                    return Err(LifecycleError::Pruning);
                 }
                 // Verifies the two records this node signed against its own local view,
                 // then commits them, the alias row, and their replication entries together.
