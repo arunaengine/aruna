@@ -26,10 +26,14 @@ use crate::metadata::span_timing::ReadTiming;
 
 type Turn<T> = Result<Next<T>, MetadataError>;
 
+/// The graphs marked deleted and the number of lifecycle pages read for them.
+pub(crate) type DeletedGraphs = (HashSet<String>, u64);
+
 /// The graphs whose lifecycle row marks them deleted, in one sweep of the lifecycle keyspace.
 #[derive(Debug, PartialEq, Default)]
 pub(crate) struct DeletedGraphsOperation {
     deleted: HashSet<String>,
+    pages: u64,
 }
 
 impl DeletedGraphsOperation {
@@ -37,7 +41,7 @@ impl DeletedGraphsOperation {
         Self::default()
     }
 
-    fn page(after: Option<Key>) -> Turn<HashSet<String>> {
+    fn page(after: Option<Key>) -> Turn<DeletedGraphs> {
         Ok(Next::Call(IoCall::Page {
             space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
             prefix: Key::from(Vec::new()),
@@ -48,15 +52,16 @@ impl DeletedGraphsOperation {
 }
 
 impl Operation for DeletedGraphsOperation {
-    type Output = HashSet<String>;
+    type Output = DeletedGraphs;
     type Error = MetadataError;
 
-    fn first(&mut self) -> Turn<HashSet<String>> {
+    fn first(&mut self) -> Turn<DeletedGraphs> {
         Self::page(None)
     }
 
-    fn next(&mut self, result: IoResult) -> Turn<HashSet<String>> {
+    fn next(&mut self, result: IoResult) -> Turn<DeletedGraphs> {
         let (rows, next) = page_rows(result)?;
+        self.pages += 1;
         if self.deleted.len().saturating_add(rows.len()) > REGISTRY_CANDIDATE_LIMIT {
             return Err(MetadataError::Backend(
                 "metadata lifecycle candidate limit exceeded".to_string(),
@@ -71,7 +76,7 @@ impl Operation for DeletedGraphsOperation {
         }
         match next {
             Some(after) => Self::page(Some(after)),
-            None => Ok(Next::Done(std::mem::take(&mut self.deleted))),
+            None => Ok(Next::Done((std::mem::take(&mut self.deleted), self.pages))),
         }
     }
 }
@@ -206,7 +211,7 @@ impl Operation for ReadScopeOperation {
                 ))),
             },
             ScopeStage::Deleted(generation) => {
-                self.deleted = result.child::<HashSet<String>, MetadataError>()??;
+                (self.deleted, _) = result.child::<DeletedGraphs, MetadataError>()??;
                 self.refresh(generation)
             }
             // A refused refresh only leaves the cache to the next fill.
