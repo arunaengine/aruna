@@ -1191,7 +1191,20 @@ pub(crate) fn drive_suboperation<'a>(
                 "Starting suboperation"
             );
             let scope = operation.hold_scope();
-            let _hold = take_hold(context, scope).await;
+            let hold = take_hold(context, scope);
+            let held = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, hold).await,
+                None => Ok(hold.await),
+            };
+            // A child that never got its hold never started, so it has nothing to clean up.
+            let Ok(_hold) = held else {
+                warn!(
+                    operation = %operation_name,
+                    "Suboperation deadline expired while it waited for its backend hold"
+                );
+                let _ = operation.abort();
+                return operation.finalize();
+            };
             let mut run = SubRun(operation.as_mut(), None);
             let effects = drive_effects(&mut run, context, depth, deadline, None);
             let mut state = holding(scope, effects).await;
@@ -3309,6 +3322,52 @@ mod test {
         assert_eq!(drive_until(parent, &context, deadline).await, Ok(()));
         assert_eq!(*log.lock().unwrap(), ["child"]);
         assert!(reconcile_free(&context));
+    }
+
+    /// Runs a child without a hold of its own and answers whether the child failed.
+    #[derive(Debug, PartialEq)]
+    struct WaitingParent {
+        child: Option<Holding>,
+    }
+
+    impl Operation for WaitingParent {
+        type Output = bool;
+        type Error = IoError;
+
+        fn first(&mut self) -> Result<Next<bool>, IoError> {
+            let child = self.child.take().ok_or_else(refused)?;
+            Ok(Next::Call(IoCall::child(child)))
+        }
+
+        fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+            Ok(Next::Done(result.child::<(), IoError>()?.is_err()))
+        }
+    }
+
+    // A child that waits for a hold another run keeps ends at the deadline, without starting.
+    #[tokio::test]
+    async fn child_hold_capped() {
+        let (_directory, context) = net_context().await;
+        let log = Arc::default();
+        let mut holder = Holding::new("holder", &log);
+        holder.delay = Some(Duration::from_secs(7200));
+        let holder_started = holder.started.clone();
+        let task_context = context.clone();
+        let holder_task = tokio::spawn(async move { drive(holder, &task_context).await });
+        holder_started.notified().await;
+
+        // Paused time runs on to the deadline at once, before the hang cap and the holder.
+        tokio::time::pause();
+        let parent = WaitingParent {
+            child: Some(Holding::new("child", &log)),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let run = drive_until(parent, &context, deadline);
+        let ended = tokio::time::timeout(Duration::from_secs(60), run).await;
+        tokio::time::resume();
+        assert_eq!(ended.expect("the child stops waiting at the deadline"), Ok(true));
+        assert_eq!(*log.lock().unwrap(), ["holder"]);
+        holder_task.abort();
     }
 
     #[tokio::test]
