@@ -28,13 +28,13 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
 use aruna_operations::metadata::create_entry::CreateEntryOperation;
-use aruna_operations::plugins::dataset::merge_into;
 use aruna_operations::plugins::host_calls::VisibleObjects;
 use aruna_operations::plugins::store::Txn;
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::queued;
 use aruna_operations::testing::drain_projection_queue;
 use aruna_operations::testing::process_materialization_batch;
+use aruna_plugin_types::calls::merge_into;
 
 /// Runs the projection and graph work a write queued.
 async fn project(ctx: &DriverContext) {

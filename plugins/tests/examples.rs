@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 
 use aruna_plugin_types::calls::{
     Created, Document, Entry, ErrorKind, Field, FilePage, HostError, Intent, JobStatus, Listing,
-    ObjectInfo, ObjectPage, Response,
+    ObjectInfo, ObjectPage, Response, merge_into,
 };
 use aruna_plugin_types::permission::Permission;
 use aruna_plugins::broker::{
@@ -272,26 +272,6 @@ fn paged<T: Clone>(items: &[T], cursor: Option<String>) -> (Vec<T>, Option<Strin
     let next = start + PAGE;
     let page = items.iter().skip(start).take(PAGE).cloned().collect();
     (page, (next < items.len()).then(|| next.to_string()))
-}
-
-/// Applies a JSON merge patch by the host's rules; `merge_cases.json` holds both to the same cases.
-fn merge_into(target: &mut Value, patch: Value) {
-    let Value::Object(changes) = patch else {
-        *target = patch;
-        return;
-    };
-    if !target.is_object() {
-        *target = Value::Object(Map::new());
-    }
-    let Value::Object(fields) = target else {
-        return;
-    };
-    for (key, value) in changes {
-        match value {
-            Value::Null => drop(fields.remove(&key)),
-            value => merge_into(fields.entry(key).or_insert(Value::Null), value),
-        }
-    }
 }
 
 /// An entity id as the node stores it, by the rule of `normalize_entity_id` in
