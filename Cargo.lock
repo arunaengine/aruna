@@ -851,6 +851,7 @@ dependencies = [
  "futures-util",
  "globset",
  "hex",
+ "http",
  "iroh",
  "irokle",
  "jsonwebtoken",

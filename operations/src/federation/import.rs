@@ -61,7 +61,7 @@ pub enum ImportError {
     #[error("the source realm could not be reached: {0}")]
     Unreachable(String),
     #[error("the source realm answered {0}")]
-    Refused(reqwest::StatusCode),
+    Refused(http::StatusCode),
 }
 
 /// Header carrying a signed export grant as unpadded base64url JSON.
@@ -98,8 +98,8 @@ fn binding_key(principal: UserId, import_key: &str) -> Vec<u8> {
 }
 
 /// A failed or busy source stays temporary; only other answers refuse the grant.
-pub fn answer_error(status: reqwest::StatusCode) -> ImportError {
-    use reqwest::StatusCode;
+pub fn answer_error(status: http::StatusCode) -> ImportError {
+    use http::StatusCode;
     if status.is_server_error()
         || status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::REQUEST_TIMEOUT
@@ -260,7 +260,7 @@ impl Operation for ConfirmSourceOperation {
                     return Err(IoError::Unexpected { expected, got }.into());
                 };
                 let status = result.map_err(|error| ImportError::Unreachable(error.to_string()))?;
-                let status = reqwest::StatusCode::from_u16(status)
+                let status = http::StatusCode::from_u16(status)
                     .map_err(|error| ImportError::Unreachable(error.to_string()))?;
                 if !status.is_success() {
                     return Err(answer_error(status));
@@ -923,7 +923,7 @@ pub(crate) mod tests {
             operation.next(consumed(false)).unwrap();
             operation.next(answered(result))
         };
-        let refused = reqwest::StatusCode::FORBIDDEN;
+        let refused = http::StatusCode::FORBIDDEN;
         assert_eq!(answer(Ok(403)), Err(ImportError::Refused(refused)));
         assert!(matches!(answer(Ok(503)), Err(ImportError::Unreachable(_))));
         let down = aruna_core::outbound::OutboundError::Retryable("down".to_string());
@@ -1440,11 +1440,11 @@ pub(crate) mod tests {
     fn busy_source_waits() {
         // Source infrastructure and throttling defer the import; refusals of the grant end it.
         for code in [500, 502, 503, 504, 429, 408] {
-            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let status = http::StatusCode::from_u16(code).unwrap();
             assert!(matches!(answer_error(status), ImportError::Unreachable(_)));
         }
         for code in [400, 401, 403, 404, 410] {
-            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let status = http::StatusCode::from_u16(code).unwrap();
             assert_eq!(answer_error(status), ImportError::Refused(status));
         }
     }
