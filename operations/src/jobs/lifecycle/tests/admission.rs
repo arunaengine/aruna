@@ -282,6 +282,7 @@ fn identity_is_deterministic() {
         captured_inputs: Vec::new(),
         output_policies: Vec::new(),
         input_pages: None,
+        admit_by: None,
     };
     let identity = request.identity().expect("identity derives");
 

@@ -483,6 +483,7 @@ mod tests {
             captured_inputs: Vec::new(),
             output_policies: Vec::new(),
             input_pages: None,
+            admit_by: None,
         };
         LocalAdmission {
             identity: request.identity().expect("identity derives"),

@@ -75,6 +75,8 @@ pub struct SubmissionRequest {
     /// Inputs too large to travel inline: the lists are empty and the sender keeps the pages.
     /// The identity is always computed from the full lists.
     pub input_pages: Option<aruna_core::structs::execution::job::PageManifest>,
+    /// Unix ms after which no holder admits this request anew; only plugin tasks carry it.
+    pub admit_by: Option<u64>,
 }
 
 /// The replicated identity of one request.
@@ -104,8 +106,8 @@ impl SubmissionRequest {
                 self.created_by,
                 &self.spec,
                 self.ingress_node_id,
-                &self.captured_inputs,
-                &self.output_policies,
+                (&self.captured_inputs, &self.output_policies),
+                self.admit_by,
             )?,
         })
     }
@@ -123,8 +125,8 @@ fn request_digest(
     created_by: UserId,
     spec: &ExecutionSpec,
     ingress_node_id: NodeId,
-    captured_inputs: &[CapturedInput],
-    output_policies: &[PlacementPolicyRef],
+    (captured_inputs, output_policies): (&[CapturedInput], &[PlacementPolicyRef]),
+    admit_by: Option<u64>,
 ) -> Result<[u8; 32], ConversionError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(REQUEST_DIGEST_DOMAIN);
@@ -148,6 +150,10 @@ fn request_digest(
         .collect();
     hasher.update(&postcard::to_allocvec(&pins)?);
     hasher.update(&postcard::to_allocvec(output_policies)?);
+    // Absent for every request but a plugin task's, so other digests keep their bytes.
+    if let Some(admit_by) = admit_by {
+        hasher.update(&admit_by.to_be_bytes());
+    }
     Ok(*hasher.finalize().as_bytes())
 }
 
@@ -290,6 +296,47 @@ mod tests {
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
         }
+    }
+
+    #[test]
+    fn inline_changes_digest() {
+        // The bytes are part of the request, so other bytes are another request.
+        use aruna_core::structs::execution::job::{InputMode, InputSelection, InputSource};
+        let request = |bytes: &[u8]| {
+            let mut spec = session_spec();
+            spec.inputs.push(InputSelection {
+                source: InputSource::Inline {
+                    bytes: bytes.to_vec(),
+                },
+                source_node_id: None,
+                dest_key: "/in/manifest.txt".to_string(),
+                mode: InputMode::Snapshot,
+                container_path: Some("/in/manifest.txt".to_string()),
+                name: None,
+                description: None,
+            });
+            SubmissionRequest {
+                created_by: UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32])),
+                spec,
+                scope: SubmissionScope::Keyed("plugin-work/1".to_string()),
+                retention_ms: 1,
+                ingress_node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+                captured_inputs: Vec::new(),
+                output_policies: Vec::new(),
+                input_pages: None,
+                admit_by: None,
+            }
+        };
+        let (first, second) = (request(b"STUDY A"), request(b"STUDY B"));
+        let (first, second) = (first.identity().unwrap(), second.identity().unwrap());
+        assert_eq!(first.submission_id, second.submission_id);
+        assert_ne!(first.request_digest, second.request_digest);
+        // The admission deadline is part of the request; a resend keeps the same one.
+        let (mut bounded, mut again) = (request(b"STUDY A"), request(b"STUDY A"));
+        (bounded.admit_by, again.admit_by) = (Some(5), Some(5));
+        let bounded = bounded.identity().unwrap().request_digest;
+        assert_ne!(bounded, first.request_digest);
+        assert_eq!(bounded, again.identity().unwrap().request_digest);
     }
 
     #[test]
