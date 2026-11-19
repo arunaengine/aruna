@@ -522,5 +522,8 @@ impl Operation for RecoverJobOperation {
 }
 
 #[cfg(test)]
+#[path = "requeue_tests.rs"]
+mod requeue_tests;
+#[cfg(test)]
 #[path = "runtime_steps_tests.rs"]
 mod tests;

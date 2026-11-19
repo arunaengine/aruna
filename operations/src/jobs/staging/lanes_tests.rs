@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::jobs::context::JobContext;
 use crate::jobs::staging::initial_checkpoint;
 use crate::jobs::staging::pure_tests::{child_answer, test_connector, test_run};
-use crate::jobs::context::JobContext;
-use crate::tasks::job_host::run_staging_job;
+use crate::tests::staging::run_staging_job;
 use aruna_core::events::GroupResult;
 use aruna_core::structs::execution::job::{StagingJobError, StagingJobPrefix};
 use ulid::Ulid;
@@ -204,7 +204,7 @@ async fn job_context(
         object_permission_path(realm, group, node, &spec.bucket, key)
     });
     let denied = denied.as_deref().unwrap_or("/none");
-    spec.auth_context = crate::tests::access::seed_access(&driver, scope, denied).await;
+    spec.auth_context = crate::testing_access::seed_access(&driver, scope, denied).await;
     let owner = spec.auth_context.user_id;
     let bucket = create_test_bucket(&driver, spec.group_id, owner, &spec.bucket).await;
     spec.bucket_identity = bucket.identity();

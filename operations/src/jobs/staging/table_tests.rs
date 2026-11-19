@@ -19,10 +19,10 @@ use ulid::Ulid;
 
 use super::*;
 use crate::driver::{drive, node_routing};
+use crate::jobs::context::JobContext;
 use crate::jobs::executor::{JobRunOutcome, ProgressReporter};
 use crate::s3::object::search::{ObjectKeyMatch, SearchObjectsInput};
 use crate::s3::object::search_scan::SearchObjectsOperation;
-use crate::jobs::context::JobContext;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_core::time::unix_timestamp_millis;
 
@@ -213,7 +213,7 @@ impl Fixture {
             .unwrap();
         spec.connector_id = connector.connector.connector_id;
         let scope = (spec.auth_context.realm_id, spec.group_id, spec.node_id);
-        spec.auth_context = crate::tests::access::seed_access(&driver, scope, "/none").await;
+        spec.auth_context = crate::testing_access::seed_access(&driver, scope, "/none").await;
         let owner = spec.auth_context.user_id;
         for name in ["lists", &spec.bucket] {
             let bucket = create_test_bucket(&driver, spec.group_id, owner, name).await;
@@ -262,7 +262,7 @@ impl Fixture {
 
     async fn run(&self, seed: u8) -> (u64, u64) {
         let ctx = self.context(seed).await;
-        match crate::tasks::job_host::run_staging_job(&ctx, &self.spec).await {
+        match crate::tests::staging::run_staging_job(&ctx, &self.spec).await {
             JobRunOutcome::Succeeded(JobResultPayload::Staging {
                 completed_items,
                 failed_items,
@@ -577,7 +577,7 @@ async fn paused_job_stops() {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             stop.cancel();
         };
-        let run = crate::tasks::job_host::run_staging_job(&ctx, &fixture.spec);
+        let run = crate::tests::staging::run_staging_job(&ctx, &fixture.spec);
         let (outcome, ()) = tokio::join!(run, stopping);
         match cancel {
             true => assert!(matches!(outcome, JobRunOutcome::Cancelled)),
@@ -851,7 +851,7 @@ async fn record_pages_resume() {
         }
         stop.cancel();
     };
-    let run = crate::tasks::job_host::run_staging_job(&ctx, &specs[0]);
+    let run = crate::tests::staging::run_staging_job(&ctx, &specs[0]);
     let (outcome, ()) = tokio::join!(run, watch);
     assert!(matches!(outcome, JobRunOutcome::Interrupted));
     let resumed = JobContext {
@@ -861,8 +861,8 @@ async fn record_pages_resume() {
     let mut other = fixture.context_for(&specs[1], 51).await;
     other.range_turns = resumed.range_turns.clone();
     let (first, second) = tokio::join!(
-        crate::tasks::job_host::run_staging_job(&resumed, &specs[0]),
-        crate::tasks::job_host::run_staging_job(&other, &specs[1]),
+        crate::tests::staging::run_staging_job(&resumed, &specs[0]),
+        crate::tests::staging::run_staging_job(&other, &specs[1]),
     );
     let counts = |outcome| match outcome {
         JobRunOutcome::Succeeded(JobResultPayload::Staging {
@@ -1055,7 +1055,7 @@ async fn import_records(
     let started = std::time::Instant::now();
     // Each job runs as its own task, as on a node.
     let runs = runs.into_iter().map(|(job, spec)| {
-        tokio::spawn(async move { crate::tasks::job_host::run_staging_job(&job, &spec).await })
+        tokio::spawn(async move { crate::tests::staging::run_staging_job(&job, &spec).await })
     });
     let outcomes = futures_util::future::join_all(runs).await;
     let elapsed = started.elapsed().as_secs_f64();

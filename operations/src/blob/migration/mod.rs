@@ -2151,7 +2151,8 @@ mod tests {
         let (realm, group) = (RealmId::from_bytes([1; 32]), Ulid::from_parts(1, 1));
         let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
         let secret = object_permission_path(realm, group, node, "b", "secret/**");
-        let auth = crate::tests::access::seed_access(&context, (realm, group, node), &secret).await;
+        let auth =
+            crate::testing_access::seed_access(&context, (realm, group, node), &secret).await;
         let mut record = CompressionMigration::new(Compression::Off, 1);
         (record.moving, record.started_at_ms) = (true, 7);
         let grant = aruna_core::structs::storage::backend_import::TokenGrant {

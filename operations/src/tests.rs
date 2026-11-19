@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub(crate) mod access;
 pub(crate) mod calls;
 pub(crate) mod device;
 pub(crate) mod import;
@@ -15,4 +14,3 @@ pub(crate) mod policy;
 pub(crate) mod records;
 pub(crate) mod s3;
 pub(crate) mod staging;
-pub(crate) mod workflow;

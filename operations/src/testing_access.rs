@@ -16,7 +16,7 @@ use aruna_core::{NodeId, UserId};
 use ulid::Ulid;
 
 /// The group owner may write everywhere in the group except below `denied`.
-pub(crate) async fn seed_access(
+pub async fn seed_access(
     context: &DriverContext,
     scope: (RealmId, GroupId, NodeId),
     denied: &str,
@@ -25,7 +25,7 @@ pub(crate) async fn seed_access(
 }
 
 /// Like `seed_access`, plus a role that lets everyone read `public` and realm request policies.
-pub(crate) async fn seed_open_access(
+pub async fn seed_open_access(
     context: &DriverContext,
     (realm_id, group_id, node_id): (RealmId, GroupId, NodeId),
     denied: &str,

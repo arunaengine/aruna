@@ -156,3 +156,19 @@ pub(crate) fn sample_metadata() -> SourceMetadata {
         digests: Default::default(),
     }
 }
+
+/// Runs a staging job under the host of its job context, as the job runner does, without pacing.
+pub(crate) async fn run_staging_job(
+    ctx: &crate::jobs::context::JobContext,
+    spec: &aruna_core::structs::execution::job::StagingJobSpec,
+) -> crate::jobs::executor::JobRunOutcome {
+    let run = crate::jobs::staging::StagingRun {
+        spec: std::sync::Arc::new(spec.clone()),
+        job_id: ctx.job_id,
+        claim_token: ctx.claim_token,
+        routing: crate::driver::node_routing(&ctx.driver),
+        seed: 7,
+    };
+    let job = crate::jobs::staging::StagingJobOperation::new(run);
+    crate::effect_adapters::job::run_hosted(ctx, job).await
+}

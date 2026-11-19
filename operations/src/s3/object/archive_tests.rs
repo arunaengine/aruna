@@ -6,7 +6,7 @@
 use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use crate::tests::access::seed_access;
+use crate::testing_access::seed_access;
 use crate::tests::staging::{create_test_bucket, setup_driver_context};
 use aruna_blob::archive::{open_zip, zip_close, zip_counted};
 use aruna_core::NodeId;

@@ -51,6 +51,8 @@ pub mod sync;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod testing;
 #[cfg(any(test, feature = "test-hooks"))]
+pub mod testing_access;
+#[cfg(any(test, feature = "test-hooks"))]
 #[path = "test_objects.rs"]
 pub mod testing_objects;
 pub mod triggers;
