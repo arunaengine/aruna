@@ -76,7 +76,10 @@ fn foreign_source_refused() {
     let mut caller = PullCallerOperation::new((node(8), realm()), token(), request(false));
     assert!(matches!(caller.first(), Ok(Next::Call(IoCall::Child(_)))));
     let answered = caller.next(child(Ok::<_, ForwardAuthError>(auth())));
-    assert!(matches!(answered, Err(SyncRefusal::Invalid(_))));
+    assert!(matches!(
+        answered,
+        Err(PullError::Refused(SyncRefusal::Invalid(_)))
+    ));
 }
 
 #[test]
@@ -84,7 +87,7 @@ fn refused_caller_unauthorized() {
     let mut caller = PullCallerOperation::new((node(9), realm()), token(), request(false));
     caller.first().unwrap();
     let denied = caller.next(child(Err::<AuthContext, _>(ForwardAuthError::Forbidden)));
-    assert_eq!(denied, Err(SyncRefusal::Unauthorized));
+    assert_eq!(denied, Err(PullError::Refused(SyncRefusal::Unauthorized)));
 }
 
 #[test]
@@ -101,7 +104,7 @@ fn replay_admits_nothing() {
     let mut admit = AdmitPullOperation::new(node(1), auth(), request(false));
     admit.first().unwrap();
     let version = Ulid::from_parts(7, 7);
-    let replayed = admit.next(child(Ok::<_, SyncRefusal>(Some(version))));
+    let replayed = admit.next(child(Ok::<_, PullError>(Some(version))));
     assert_eq!(
         replayed,
         Ok(Next::Done(Admission::Replayed(replay_ack(version))))
@@ -113,10 +116,10 @@ fn missing_bucket_not_found() {
     let mut admit = AdmitPullOperation::new(node(1), auth(), request(false));
     admit.first().unwrap();
     admit
-        .next(child(Ok::<Option<Ulid>, SyncRefusal>(None)))
+        .next(child(Ok::<Option<Ulid>, PullError>(None)))
         .unwrap();
     let missing = admit.next(child(Err::<BucketInfo, _>(GetBucketError::NotFound)));
-    assert_eq!(missing, Err(SyncRefusal::NotFound));
+    assert_eq!(missing, Err(PullError::Refused(SyncRefusal::NotFound)));
 }
 
 #[test]
@@ -124,7 +127,7 @@ fn ordinary_bucket_checks_write() {
     let mut admit = AdmitPullOperation::new(node(1), auth(), request(false));
     admit.first().unwrap();
     admit
-        .next(child(Ok::<Option<Ulid>, SyncRefusal>(None)))
+        .next(child(Ok::<Option<Ulid>, PullError>(None)))
         .unwrap();
     admit
         .next(child(Ok::<_, GetBucketError>(bucket())))
@@ -134,7 +137,7 @@ fn ordinary_bucket_checks_write() {
         Ok(Next::Call(IoCall::Child(_)))
     ));
     let denied = admit.next(child(Err::<(), _>(AuthorizeError::PermissionDenied)));
-    assert_eq!(denied, Err(SyncRefusal::Forbidden));
+    assert_eq!(denied, Err(PullError::Refused(SyncRefusal::Forbidden)));
 }
 
 fn commit(deleted: bool) -> CommitPullOperation {
@@ -152,7 +155,7 @@ fn delete_queues_marker() {
     let mut pull = commit(true);
     pull.first().unwrap();
     assert!(matches!(
-        pull.next(child(Ok::<Option<Ulid>, SyncRefusal>(None))),
+        pull.next(child(Ok::<Option<Ulid>, PullError>(None))),
         Ok(Next::Call(IoCall::Child(_)))
     ));
     let marker = DeleteObjectResult {
@@ -171,14 +174,14 @@ fn delete_queues_marker() {
 fn failed_write_replays() {
     let mut pull = commit(false);
     pull.first().unwrap();
-    pull.next(child(Ok::<Option<Ulid>, SyncRefusal>(None)))
+    pull.next(child(Ok::<Option<Ulid>, PullError>(None)))
         .unwrap();
     let failed = pull.next(child(Err::<BaoReadOutput, _>(BaoReadError::Refused(
         BaoReadRefusal::HashMismatch,
     ))));
     assert!(matches!(failed, Ok(Next::Call(IoCall::Child(_)))));
     let committed = Ulid::from_parts(9, 9);
-    let answered = pull.next(child(Ok::<_, SyncRefusal>(Some(committed))));
+    let answered = pull.next(child(Ok::<_, PullError>(Some(committed))));
     assert_eq!(answered, Ok(Next::Done(replay_ack(committed))));
 }
 
@@ -186,14 +189,17 @@ fn failed_write_replays() {
 fn failed_write_refuses() {
     let mut pull = commit(false);
     pull.first().unwrap();
-    pull.next(child(Ok::<Option<Ulid>, SyncRefusal>(None)))
+    pull.next(child(Ok::<Option<Ulid>, PullError>(None)))
         .unwrap();
     pull.next(child(Err::<BaoReadOutput, _>(BaoReadError::Refused(
         BaoReadRefusal::HashMismatch,
     ))))
     .unwrap();
-    let refused = pull.next(child(Ok::<Option<Ulid>, SyncRefusal>(None)));
-    assert!(matches!(refused, Err(SyncRefusal::Invalid(_))));
+    let refused = pull.next(child(Ok::<Option<Ulid>, PullError>(None)));
+    assert!(matches!(
+        refused,
+        Err(PullError::Refused(SyncRefusal::Invalid(_)))
+    ));
 }
 
 #[test]
@@ -207,5 +213,5 @@ fn listing_needs_caller() {
     let mut list = ListHeadsOperation::new(node(9), (node(1), realm()), token(), listing);
     list.first().unwrap();
     let denied = list.next(child(Err::<AuthContext, _>(ForwardAuthError::Unauthorized)));
-    assert_eq!(denied, Err(SyncRefusal::Unauthorized));
+    assert_eq!(denied, Err(PullError::Refused(SyncRefusal::Unauthorized)));
 }

@@ -17,7 +17,8 @@ use tracing::warn;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::metadata::device_pull::{
     Admission, AdmitPullOperation, CommitPullOperation, ListHeadsOperation, PullCallerOperation,
-    ReceiptOperation, ServingNode, SetListing, receipt_of, refusal_kind, refused,
+    PullError, PullProgress, ReceiptOperation, ServingNode, SetListing, receipt_of, refusal_kind,
+    refused,
 };
 use crate::metadata::protocol::MetadataTransportMessage;
 
@@ -134,12 +135,18 @@ pub async fn accept_pull(
         Err(refusal) => return SyncPullStatus::Refused(refused(peer, &request, refusal)),
     };
     let caller = PullCallerOperation::new((peer, node.1), auth_token, request.clone());
-    let auth = match drive(caller, context.as_ref()).await {
+    let auth = match drive(caller, context.as_ref())
+        .await
+        .map_err(PullError::refusal)
+    {
         Ok(auth) => auth,
         Err(refusal) => return SyncPullStatus::Refused(refused(peer, &request, refusal)),
     };
     let admit = AdmitPullOperation::new(node.0, auth.clone(), request.clone());
-    let bucket = match drive(admit, context.as_ref()).await {
+    let bucket = match drive(admit, context.as_ref())
+        .await
+        .map_err(PullError::refusal)
+    {
         Ok(Admission::Replayed(ack)) => return SyncPullStatus::Done(ack),
         Ok(Admission::Admitted(bucket)) => bucket,
         Err(refusal) => return SyncPullStatus::Refused(refused(peer, &request, refusal)),
@@ -162,7 +169,9 @@ pub async fn accept_pull(
             request,
             PullProgress(bytes_done),
         );
-        let result = drive(commit, context.as_ref()).await;
+        let result = drive(commit, context.as_ref())
+            .await
+            .map_err(PullError::refusal);
         if let Err(refusal) = &result {
             warn!(peer = %peer, bucket = %bucket_name, refusal = refusal_kind(refusal), "A synced-folder pull failed");
         }
@@ -188,7 +197,9 @@ pub async fn pull_status(
         Err(refusal) => return SyncPullStatus::Refused(refusal),
     };
     let caller = PullCallerOperation::new((peer, realm_id), auth_token, request.clone());
-    let checked = drive(caller, context.as_ref()).await;
+    let checked = drive(caller, context.as_ref())
+        .await
+        .map_err(PullError::refusal);
     let key = match checked.and_then(|_| receipt_of(request)) {
         Ok(key) => key,
         Err(refusal) => return SyncPullStatus::Refused(refusal),
@@ -231,7 +242,9 @@ pub(crate) async fn serve_list_versions(
     let result = match serving(context) {
         Ok(node) => {
             let list = ListHeadsOperation::new(peer, node, auth_token, listing);
-            drive(list, context.as_ref()).await
+            drive(list, context.as_ref())
+                .await
+                .map_err(PullError::refusal)
         }
         Err(refusal) => Err(refusal),
     };

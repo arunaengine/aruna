@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNC_RECEIPT_KEYSPACE;
 use aruna_core::metadata::AuthToken;
@@ -68,6 +68,39 @@ use crate::staging::offered_directory::OfferedDirectoryError;
 
 /// How long a forwarded listing waits for the holder of a range.
 const HOLDER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Why a pull or listing operation ended without its answer: the refusal for the device, or a
+/// lost storage conflict the runner may retry.
+#[derive(Debug, PartialEq)]
+pub enum PullError {
+    Refused(SyncRefusal),
+    Conflict,
+}
+
+impl PullError {
+    /// The refusal the device is told; a conflict that outlived its retries is unavailable.
+    pub fn refusal(self) -> SyncRefusal {
+        match self {
+            Self::Refused(refusal) => refusal,
+            Self::Conflict => SyncRefusal::Unavailable,
+        }
+    }
+}
+
+impl From<SyncRefusal> for PullError {
+    fn from(refusal: SyncRefusal) -> Self {
+        Self::Refused(refusal)
+    }
+}
+
+impl From<IoError> for PullError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Conflict,
+            _ => Self::Refused(SyncRefusal::Unavailable),
+        }
+    }
+}
 
 /// The node and realm a pull or listing is served on.
 pub type ServingNode = (NodeId, RealmId);
@@ -132,14 +165,14 @@ impl PullCallerOperation {
 
 impl Operation for PullCallerOperation {
     type Output = AuthContext;
-    type Error = SyncRefusal;
+    type Error = PullError;
 
-    fn first(&mut self) -> Result<Next<AuthContext>, SyncRefusal> {
+    fn first(&mut self) -> Result<Next<AuthContext>, PullError> {
         let token = self.auth_token.take().ok_or(SyncRefusal::Unauthorized)?;
         Ok(Next::Call(caller(self.peer, self.realm_id, token)))
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<AuthContext>, SyncRefusal> {
+    fn next(&mut self, result: IoResult) -> Result<Next<AuthContext>, PullError> {
         let auth = called(result)?;
         own_source(self.peer, &self.request)?;
         Ok(Next::Done(auth))
@@ -163,9 +196,9 @@ impl ReceiptOperation {
 
 impl Operation for ReceiptOperation {
     type Output = Option<Ulid>;
-    type Error = SyncRefusal;
+    type Error = PullError;
 
-    fn first(&mut self) -> Result<Next<Option<Ulid>>, SyncRefusal> {
+    fn first(&mut self) -> Result<Next<Option<Ulid>>, PullError> {
         let Some(key) = self.key.take() else {
             return Ok(Next::Done(None));
         };
@@ -175,7 +208,7 @@ impl Operation for ReceiptOperation {
         )])))
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<Option<Ulid>>, SyncRefusal> {
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<Ulid>>, PullError> {
         let value = result.value().ok().flatten();
         let version = value.and_then(|value| <[u8; 16]>::try_from(value.as_ref()).ok());
         Ok(Next::Done(version.map(Ulid::from_bytes)))
@@ -230,15 +263,15 @@ impl AdmitPullOperation {
 
 impl Operation for AdmitPullOperation {
     type Output = Admission;
-    type Error = SyncRefusal;
+    type Error = PullError;
 
-    fn first(&mut self) -> Result<Next<Admission>, SyncRefusal> {
+    fn first(&mut self) -> Result<Next<Admission>, PullError> {
         Ok(Next::Call(IoCall::child(ReceiptOperation::new(
             &self.request,
         ))))
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<Admission>, SyncRefusal> {
+    fn next(&mut self, result: IoResult) -> Result<Next<Admission>, PullError> {
         let unavailable = |_| SyncRefusal::Unavailable;
         match std::mem::replace(&mut self.stage, AdmitStage::Receipt) {
             AdmitStage::Receipt => {
@@ -288,7 +321,7 @@ impl Operation for AdmitPullOperation {
 }
 
 impl AdmitPullOperation {
-    fn authorize(&mut self, bucket: BucketInfo) -> Result<Next<Admission>, SyncRefusal> {
+    fn authorize(&mut self, bucket: BucketInfo) -> Result<Next<Admission>, PullError> {
         let check = write_authorization(&self.auth, self.node_id, &bucket, &self.request);
         self.stage = AdmitStage::Write(bucket);
         Ok(Next::Call(IoCall::child(check)))
@@ -499,7 +532,7 @@ pub struct CommitPullOperation {
     stage: CommitStage,
 }
 
-type CommitTurn = Result<Next<SyncPullAck>, SyncRefusal>;
+type CommitTurn = Result<Next<SyncPullAck>, PullError>;
 
 impl CommitPullOperation {
     /// `routing` is this node's storage routing, which the write is placed by.
@@ -602,7 +635,7 @@ impl CommitPullOperation {
 
 impl Operation for CommitPullOperation {
     type Output = SyncPullAck;
-    type Error = SyncRefusal;
+    type Error = PullError;
 
     fn first(&mut self) -> CommitTurn {
         self.stage = CommitStage::Replay;
@@ -614,7 +647,7 @@ impl Operation for CommitPullOperation {
     fn next(&mut self, result: IoResult) -> CommitTurn {
         let unavailable = |_| SyncRefusal::Unavailable;
         match std::mem::replace(&mut self.stage, CommitStage::Start) {
-            CommitStage::Start => Err(SyncRefusal::Unavailable),
+            CommitStage::Start => Err(SyncRefusal::Unavailable.into()),
             CommitStage::Replay => {
                 let receipt = result
                     .child::<Option<Ulid>, SyncRefusal>()
@@ -731,10 +764,10 @@ impl Operation for CommitPullOperation {
             CommitStage::Failed(refusal) => {
                 // An overlapping pull of the same version committed first; its receipt is the
                 // answer.
-                let receipt = result.child::<Option<Ulid>, SyncRefusal>();
+                let receipt = result.child::<Option<Ulid>, PullError>();
                 match receipt {
                     Ok(Ok(Some(version_id))) => Ok(Next::Done(replay_ack(version_id))),
-                    _ => Err(refusal),
+                    _ => Err(refusal.into()),
                 }
             }
         }
@@ -817,11 +850,11 @@ impl ListHeadsOperation {
     }
 }
 
-type HeadsTurn = Result<Next<SyncVersionPage>, SyncRefusal>;
+type HeadsTurn = Result<Next<SyncVersionPage>, PullError>;
 
 impl Operation for ListHeadsOperation {
     type Output = SyncVersionPage;
-    type Error = SyncRefusal;
+    type Error = PullError;
 
     fn first(&mut self) -> HeadsTurn {
         let token = self.auth_token.take().ok_or(SyncRefusal::Unauthorized)?;
@@ -1027,7 +1060,7 @@ impl SetHeadsOperation {
             .map(|member| member.node_id)
             .find(|node_id| *node_id != local && *node_id != peer);
         let (Some(holder), true) = (holder, device) else {
-            return Err(SyncRefusal::Unavailable);
+            return Err(SyncRefusal::Unavailable.into());
         };
         let message = MetadataTransportMessage::ForwardListVersions {
             auth_token: AuthToken::internal(self.auth.clone()),
@@ -1044,7 +1077,7 @@ impl SetHeadsOperation {
 
 impl Operation for SetHeadsOperation {
     type Output = SyncVersionPage;
-    type Error = SyncRefusal;
+    type Error = PullError;
 
     fn first(&mut self) -> HeadsTurn {
         Ok(Next::Call(IoCall::child(bound_view(&self.binding))))
@@ -1112,7 +1145,7 @@ impl Operation for SetHeadsOperation {
                 Ok(MetadataTransportMessage::ForwardedVersions { result }) => {
                     Ok(Next::Done(result?))
                 }
-                _ => Err(SyncRefusal::Unavailable),
+                _ => Err(SyncRefusal::Unavailable.into()),
             },
         }
     }
@@ -1268,7 +1301,7 @@ mod tests {
     ) -> Result<SyncVersionPage, SyncRefusal> {
         let node = (peer, (peer, auth.realm_id));
         let set = SetHeadsOperation::new(node, auth.clone(), binding.clone(), listing);
-        drive(set, context).await
+        drive(set, context).await.map_err(PullError::refusal)
     }
 
     fn deny_policy(expression: &str) -> RequestPolicy {
