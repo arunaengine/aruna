@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE;
 use aruna_core::metadata::AuthToken;
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::rows::{done, outside_answer, outside_call, read_row, value};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -578,6 +578,10 @@ impl FinishBindingOperation {
 impl Operation for FinishBindingOperation {
     type Output = SyncedFolder;
     type Error = FolderError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(super::super::folder_scope(self.folder_id))
+    }
 
     fn first(&mut self) -> FinishTurn {
         Ok(Next::Call(IoCall::child(read_bound(self.folder_id))))

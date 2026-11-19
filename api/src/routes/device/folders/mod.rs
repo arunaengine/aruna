@@ -28,7 +28,6 @@ use aruna_core::types::Key;
 use aruna_operations::device::sync::actions::{
     ActionError, ApplyActionInput, ExpectedEntry, apply_action,
 };
-use aruna_operations::device::sync::folder_gate;
 use aruna_operations::device::sync::folders::{
     BindFolderInput, FolderError, bind_folder, finish_binding, folder_counters, list_actions,
     list_entries, list_folders, read_bound, read_entry, request_sync, set_folder_state,
@@ -384,13 +383,10 @@ async fn bind_synced_folder(
         .map_err(map_folder_error)?
         .folder_id;
     // Detached, so a dropped request still records the outcome; a crash leaves it to the next pass.
-    let folder = tokio::spawn(async move {
-        let _pass = folder_gate(folder_id).lock().await;
-        drive(finish_binding(folder_id), &context).await
-    })
-    .await
-    .map_err(|_| map_folder_error(FolderError::Unavailable))?
-    .map_err(map_folder_error)?;
+    let folder = tokio::spawn(async move { drive(finish_binding(folder_id), &context).await })
+        .await
+        .map_err(|_| map_folder_error(FolderError::Unavailable))?
+        .map_err(map_folder_error)?;
     Ok((
         StatusCode::CREATED,
         Json(folder_detail(&state, folder).await?),

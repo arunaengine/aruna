@@ -37,6 +37,9 @@ pub enum HoldScope {
     /// Changes to the metadata graphs of one of 32 shards, so a graph's deletion check and its
     /// change never interleave with a prune of that graph.
     GraphFence(u8),
+    /// The passes, bindings and cleanups of the device folders in one of 64 shards, so an
+    /// unbind waits for a pass in flight on its folder.
+    FolderPass(u8),
 }
 
 /// One use case as decisions without I/O: `first` and `next` return the next call or the

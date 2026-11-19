@@ -14,13 +14,12 @@ pub mod remove;
 pub mod repository;
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
@@ -32,7 +31,6 @@ use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use thiserror::Error;
-use tokio::sync::Mutex;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -102,13 +100,10 @@ impl ReconcileFolderError {
     }
 }
 
-static FOLDER_GATES: LazyLock<[Mutex<()>; 64]> =
-    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
-
-/// Held by whoever runs a folder's pass, binding or cleanup for its whole run, so an unbind
-/// waits for a pass in flight.
-pub fn folder_gate(folder_id: Ulid) -> &'static Mutex<()> {
-    &FOLDER_GATES[usize::from(folder_id.to_bytes()[15]) % 64]
+/// Held by a folder's pass, binding or cleanup for its whole run, so an unbind waits for a pass
+/// in flight. Folders share 64 shards of it.
+pub(crate) fn folder_scope(folder_id: Ulid) -> HoldScope {
+    HoldScope::FolderPass(folder_id.to_bytes()[15] % 64)
 }
 
 fn subset<T: Clone>(source: &BTreeMap<String, T>, keys: &[String]) -> BTreeMap<String, T> {
@@ -119,7 +114,7 @@ fn subset<T: Clone>(source: &BTreeMap<String, T>, keys: &[String]) -> BTreeMap<S
 }
 
 /// Reconciles one folder: observes the directory, lists the realm heads, decides every entry,
-/// then writes what the decisions allow. The caller holds the folder's gate.
+/// then writes what the decisions allow, holding the folder's pass scope.
 pub fn folder_pass(ids: Option<(NodeId, RealmId)>, folder: SyncedFolder) -> FolderPassOperation {
     let ids = ids.map(|(node_id, realm_id)| (realm_id, node_id));
     FolderPassOperation {
@@ -280,6 +275,10 @@ impl FolderPassOperation {
 impl Operation for FolderPassOperation {
     type Output = ReconcilePlan;
     type Error = ReconcileFolderError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(folder_scope(self.folder.folder_id))
+    }
 
     fn first(&mut self) -> PassTurn {
         Ok(Next::Call(IoCall::child(read_bound(self.folder.folder_id))))

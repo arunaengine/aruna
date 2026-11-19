@@ -1,5 +1,5 @@
 //! Runs the device's folder passes on the task loop: each folder's pass, binding or cleanup
-//! holds that folder's gate for its whole run.
+//! holds that folder's pass scope for its whole run.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -14,15 +14,14 @@ use tracing::warn;
 use aruna_operations::device::drain::{DrainOutcome, publish_pending};
 use aruna_operations::device::sync::folders::{finish_binding, finish_unbind, list_folders};
 use aruna_operations::device::sync::reconcile::ReconcilePlan;
-use aruna_operations::device::sync::{ReconcileFolderError, folder_gate, folder_pass, sync_timers};
+use aruna_operations::device::sync::{ReconcileFolderError, folder_pass, sync_timers};
 use aruna_operations::driver::{DriverContext, drive};
 
-/// Reconciles one folder under its gate.
+/// Reconciles one folder under its pass scope.
 pub async fn reconcile_folder(
     context: &Arc<DriverContext>,
     folder: &SyncedFolder,
 ) -> Result<ReconcilePlan, ReconcileFolderError> {
-    let _pass = folder_gate(folder.folder_id).lock().await;
     drive(
         folder_pass(context.node_and_realm(), folder.clone()),
         context,
@@ -44,22 +43,18 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
         match folder.state {
             // An unbind finishes here, also after a cancelled call or a restart.
             FolderState::Deleting => {
-                let _pass = folder_gate(folder_id).lock().await;
                 let unbind = finish_unbind(context.node_and_realm(), folder_id, node_id);
                 if let Err(error) = drive(unbind, context).await {
                     warn!(folder = %folder_id, reason = %error, "Could not finish the unbind");
                 }
             }
             // A bind cut short by a lost reply, a failed write or a restart finishes here.
-            FolderState::Binding { .. } => {
-                let _pass = folder_gate(folder_id).lock().await;
-                match drive(finish_binding(folder_id), context).await {
-                    Ok(_) => work = true,
-                    Err(error) => {
-                        warn!(folder = %folder_id, reason = %error, "Could not finish the folder binding");
-                    }
+            FolderState::Binding { .. } => match drive(finish_binding(folder_id), context).await {
+                Ok(_) => work = true,
+                Err(error) => {
+                    warn!(folder = %folder_id, reason = %error, "Could not finish the folder binding");
                 }
-            }
+            },
             FolderState::Active => match reconcile_folder(context, &folder).await {
                 Ok(plan) => work |= plan.uploads > 0 || plan.truncated,
                 Err(error) => {
