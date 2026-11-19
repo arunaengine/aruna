@@ -105,6 +105,11 @@ impl From<IoError> for PullError {
 /// The node and realm a pull or listing is served on.
 pub type ServingNode = (NodeId, RealmId);
 
+/// A failed step whose cause the device need not know.
+fn unavailable<E>(_: E) -> SyncRefusal {
+    SyncRefusal::Unavailable
+}
+
 fn forward_refusal(error: ForwardAuthError) -> SyncRefusal {
     match error {
         ForwardAuthError::Unauthorized | ForwardAuthError::Forbidden => SyncRefusal::Unauthorized,
@@ -272,12 +277,11 @@ impl Operation for AdmitPullOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Admission>, PullError> {
-        let unavailable = |_| SyncRefusal::Unavailable;
         match std::mem::replace(&mut self.stage, AdmitStage::Receipt) {
             AdmitStage::Receipt => {
                 // A replay answers with the version it produced, even after its range moved away.
                 let receipt = result
-                    .child::<Option<Ulid>, SyncRefusal>()
+                    .child::<Option<Ulid>, PullError>()
                     .map_err(unavailable)??;
                 if let Some(version_id) = receipt {
                     return Ok(Next::Done(Admission::Replayed(replay_ack(version_id))));
@@ -645,12 +649,11 @@ impl Operation for CommitPullOperation {
     }
 
     fn next(&mut self, result: IoResult) -> CommitTurn {
-        let unavailable = |_| SyncRefusal::Unavailable;
         match std::mem::replace(&mut self.stage, CommitStage::Start) {
             CommitStage::Start => Err(SyncRefusal::Unavailable.into()),
             CommitStage::Replay => {
                 let receipt = result
-                    .child::<Option<Ulid>, SyncRefusal>()
+                    .child::<Option<Ulid>, PullError>()
                     .map_err(unavailable)??;
                 if let Some(version_id) = receipt {
                     return Ok(Next::Done(replay_ack(version_id)));
@@ -862,7 +865,6 @@ impl Operation for ListHeadsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> HeadsTurn {
-        let unavailable = |_| SyncRefusal::Unavailable;
         match std::mem::replace(&mut self.stage, HeadsStage::Plain) {
             HeadsStage::Caller => {
                 self.auth = Some(called(result)?);
@@ -921,7 +923,7 @@ impl Operation for ListHeadsOperation {
             }
             HeadsStage::Set => {
                 let page = result
-                    .child::<SyncVersionPage, SyncRefusal>()
+                    .child::<SyncVersionPage, PullError>()
                     .map_err(unavailable)??;
                 Ok(Next::Done(page))
             }
@@ -1084,7 +1086,6 @@ impl Operation for SetHeadsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> HeadsTurn {
-        let unavailable = |_| SyncRefusal::Unavailable;
         match std::mem::replace(&mut self.stage, SetStage::Range) {
             SetStage::View => {
                 let view = result
