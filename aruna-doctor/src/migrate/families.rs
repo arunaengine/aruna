@@ -515,7 +515,7 @@ struct OldEnvelope {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use crate::explorer::ExplorerError;
     use crate::migrate::tests::{read, write};
     use crate::migrate::{MigrateOutput, migrate_output};
@@ -845,7 +845,7 @@ mod tests {
     }
 
     /// The storage key of a record of `kind` in `family`.
-    fn key(family: JobFamilyId, kind: JobRecordKind, seed: u8) -> Vec<u8> {
+    pub(crate) fn key(family: JobFamilyId, kind: JobRecordKind, seed: u8) -> Vec<u8> {
         let key = JobRecordKey {
             family,
             kind,

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::migrate::families::tests::key;
 use crate::migrate::migrate_output;
 use crate::migrate::tests::{read, strip, write};
 use aruna_core::UserId;
@@ -18,8 +19,7 @@ use aruna_core::structs::execution::job::{
     AttemptIntent, EffectiveResources, ExecutionSpec, JobAdmissionRecord, JobRetryPolicy,
 };
 use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, JobPayload, JobRecord, JobRecordEnvelope, JobRecordKey,
-    JobRecordKind,
+    JobFamilyId, JobFamilyRecord, JobPayload, JobRecord, JobRecordEnvelope, JobRecordKind,
 };
 use aruna_core::structs::storage::node_info::node_info_key;
 use aruna_operations::sync::outbox_record::new_outbox_record;
@@ -45,16 +45,6 @@ fn target() -> Target {
         node_id: secret().public(),
         executor_kind: "docker".to_string(),
     }
-}
-
-fn key(family: JobFamilyId, kind: JobRecordKind, seed: u8) -> Vec<u8> {
-    let key = JobRecordKey {
-        family,
-        kind,
-        subject: [seed; 32],
-        sequence: 0,
-    };
-    key.to_bytes().to_vec()
 }
 
 fn unnamed(record: Record) -> Vec<u8> {
