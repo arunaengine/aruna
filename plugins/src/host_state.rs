@@ -131,7 +131,7 @@ mod tests {
             vec![5, 9]
         );
         // An account named again starts its grace anew once it is unnamed later.
-        assert_eq!(first_seen(&[unnamed.clone()], &[], 12), Vec::<u64>::new());
+        assert_eq!(first_seen(std::slice::from_ref(&unnamed), &[], 12), Vec::<u64>::new());
         assert_eq!(first_seen(&[], &[unnamed], 20), vec![20]);
     }
 }

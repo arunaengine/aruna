@@ -101,7 +101,7 @@ mod tests {
     fn signs_own_claim() {
         let key = iroh::SecretKey::from_bytes(&[1u8; 32]);
         let claim = claim(key.public());
-        let PolicySignEvent::Signed(publication) = sign_publication(&key, claim.clone()) else {
+        let PolicySignEvent::Signed(publication) = sign_publication(&key, claim) else {
             panic!("own claim must be signed");
         };
         assert_eq!(*publication, claim.sign(&key));
