@@ -356,12 +356,12 @@ mod tests {
             JobId::from_bytes([7; 16]),
             true,
             record(document_id).permission_path,
-            mapping_revision(&None, 1),
+            mapping_revision(&None, Ulid::generate(), 1),
         );
         match ctx
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::BatchWrite {
-                writes: transition_entries(&None, &mapping).unwrap(),
+                writes: transition_entries(&None, &mapping, Ulid::generate()).unwrap(),
                 txn_id: None,
             }))
             .await
@@ -599,9 +599,11 @@ mod tests {
             JobId::from_bytes([7; 16]),
             true,
             record(document_id).permission_path,
-            mapping_revision(&Some(route.clone()), 1),
+            mapping_revision(&Some(route.clone()), Ulid::generate(), 1),
         );
-        let writes = transition_entries(&Some(route.clone()), &mapping).expect("entries build");
+        let outbox_id = Ulid::generate();
+        let writes = transition_entries(&Some(route.clone()), &mapping, outbox_id);
+        let writes = writes.expect("entries build");
         assert_eq!(outbox_row(&writes).generation, 1);
 
         assert!(fence_open(&ctx, &route).await);
@@ -644,7 +646,7 @@ mod tests {
             JobId::from_bytes([7; 16]),
             true,
             record(document_id).permission_path,
-            mapping_revision(&None, 1),
+            mapping_revision(&None, Ulid::generate(), 1),
         )
     }
 

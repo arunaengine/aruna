@@ -4,6 +4,7 @@
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{decode, done, encoded_row, read_row};
@@ -73,6 +74,8 @@ pub struct PidTransitionOperation {
     registry: Option<MetadataRegistryRecord>,
     applied: bool,
     deletes: Vec<(KeySpace, Key)>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl PidTransitionOperation {
@@ -86,6 +89,8 @@ impl PidTransitionOperation {
             registry: None,
             applied: false,
             deletes: Vec::new(),
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -155,7 +160,7 @@ impl PidTransitionOperation {
             retryable: true,
             recorded_at_ms: minted_at_ms,
         };
-        let revision = mapping_revision(&self.route, minted_at_ms);
+        let revision = mapping_revision(&self.route, self.ids.mint(self.now_ms), minted_at_ms);
         let mapping = self
             .mapping
             .as_mut()
@@ -172,14 +177,18 @@ impl PidTransitionOperation {
             .take()
             .ok_or(PersistentIdError::IntentMissing)?;
         let mut mapping = stored.clone();
+        let event_id = self.ids.mint(self.now_ms);
         let changed = match &self.transition {
             PidTransition::Mint {
                 minted_by,
                 minted_at_ms,
-            } => mapping.activate(*minted_by, mapping_revision(&self.route, *minted_at_ms)),
+            } => mapping.activate(
+                *minted_by,
+                mapping_revision(&self.route, event_id, *minted_at_ms),
+            ),
             PidTransition::Fail { failure } => mapping.fail(
                 failure.clone(),
-                mapping_revision(&self.route, failure.recorded_at_ms),
+                mapping_revision(&self.route, event_id, failure.recorded_at_ms),
             ),
             PidTransition::Withdraw {
                 withdrawn_by,
@@ -188,7 +197,7 @@ impl PidTransitionOperation {
             } => mapping.admin_withdraw(
                 *withdrawn_by,
                 reason.clone(),
-                mapping_revision(&self.route, *withdrawn_at_ms),
+                mapping_revision(&self.route, event_id, *withdrawn_at_ms),
             ),
         };
         if !changed {
@@ -229,11 +238,12 @@ impl PidTransitionOperation {
     }
 
     fn write(&mut self, extra: Vec<TransitionEntry>) -> PidTurn {
+        let outbox_id = self.ids.mint(self.now_ms);
         let mapping = self
             .mapping
             .as_ref()
             .ok_or(PersistentIdError::IntentMissing)?;
-        let mut writes = transition_entries(&self.route, mapping)?;
+        let mut writes = transition_entries(&self.route, mapping, outbox_id)?;
         writes.extend(extra);
         if let PidTransition::Withdraw { .. } = self.transition {
             self.deletes = secondary_index_deletes(mapping);
@@ -270,6 +280,14 @@ impl Operation for PidTransitionOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 
     fn first(&mut self) -> PidTurn {

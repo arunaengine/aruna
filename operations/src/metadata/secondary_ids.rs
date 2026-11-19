@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::structs::PersistentIdMapping;
@@ -39,6 +40,8 @@ pub struct AddIdentifiersOperation {
     input: AddIdentifiersInput,
     step: Step,
     merged: Option<PersistentIdMapping>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl AddIdentifiersOperation {
@@ -47,6 +50,8 @@ impl AddIdentifiersOperation {
             input,
             step: Step::Read,
             merged: None,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -64,7 +69,8 @@ impl AddIdentifiersOperation {
             .input
             .occurred_at_ms
             .max(mapping.revision.occurred_at_ms.saturating_add(1));
-        merged.revision = mapping_revision(&self.input.route, occurred_at_ms);
+        let event_id = self.ids.mint(self.now_ms);
+        merged.revision = mapping_revision(&self.input.route, event_id, occurred_at_ms);
         let Some(fence) = fence_call(&self.input.route) else {
             return self.write(merged);
         };
@@ -79,7 +85,8 @@ impl AddIdentifiersOperation {
     }
 
     fn write(&mut self, merged: PersistentIdMapping) -> AddTurn {
-        let writes = transition_entries(&self.input.route, &merged)?;
+        let outbox_id = self.ids.mint(self.now_ms);
+        let writes = transition_entries(&self.input.route, &merged, outbox_id)?;
         self.step = Step::Write;
         self.merged = Some(merged);
         Ok(Next::Call(IoCall::Write(writes)))
@@ -92,6 +99,14 @@ impl Operation for AddIdentifiersOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 
     fn first(&mut self) -> AddTurn {
