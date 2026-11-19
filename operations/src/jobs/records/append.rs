@@ -128,18 +128,18 @@ impl AppendRecordOperation {
         }
     }
 
-    /// Adds the records a peer sent along with the candidate; an attached spec is admitted first.
+    /// Adds the records a peer sent along with the candidate; they are admitted before it. A
+    /// record of another family is ignored.
     pub fn attach(mut self, attached: Vec<JobRecordEnvelope>) -> Self {
-        self.attached = attached;
+        let family = self.family();
+        self.attached = (attached.into_iter())
+            .filter(|envelope| envelope.family() == family)
+            .collect();
         self
     }
 
-    /// The attached spec of the candidate's own family; a spec of another family is ignored.
     fn attached_spec(&self) -> Option<&JobRecordEnvelope> {
-        let family = self.family();
-        (self.attached.iter()).find(|envelope| {
-            matches!(envelope.record, JobFamilyRecord::Spec(_)) && envelope.family() == family
-        })
+        (self.attached.iter()).find(|envelope| matches!(envelope.record, JobFamilyRecord::Spec(_)))
     }
 
     /// The group of the spec this append may start the family with.
@@ -280,6 +280,9 @@ impl AppendRecordOperation {
     fn read_evidence(&mut self) -> Step {
         let mut plan = EvidencePlan::default();
         plan.extend(&self.envelope().record);
+        for envelope in &self.attached {
+            plan.extend(&envelope.record);
+        }
         // Whether this node holds an accepted spec decides the admission rules.
         plan.kinds.insert(JobRecordKind::Spec);
         for (_, row) in &self.retained {
@@ -371,8 +374,8 @@ impl AppendRecordOperation {
             tombstone: self.tombstone.as_ref(),
         };
         let candidate = self.envelope().clone();
-        let spec = self.attached_spec();
-        let (admission, plan) = plan_bundle(&state, &self.retained, candidate, spec, relayed);
+        let (admission, plan) =
+            plan_bundle(&state, &self.retained, candidate, &self.attached, relayed);
         let writes = self.batch_writes(&plan)?;
         self.plan = Some(plan);
         let outcome = self.settle(admission);

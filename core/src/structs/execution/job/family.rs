@@ -1261,7 +1261,18 @@ impl JobRecordEnvelope {
         context: &JobRecordContext<'_>,
     ) -> Result<RecordVerdict, JobRecordError> {
         self.author(budget.scheduler_node_id, JobRecordKind::Budget)?;
-        self.holder(JobRecordKind::Budget, context)?;
+        // A target's receipt of a launch this budget admits is its historical authority.
+        let receipted = match (context.launch, context.receipt) {
+            (Some(launch), Some(receipt)) => {
+                receipt.launch_id == launch.launch_id
+                    && receipt.launch_digest == launch.digest()?
+                    && budget.admits(launch).is_ok()
+            }
+            _ => false,
+        };
+        if !receipted {
+            self.holder(JobRecordKind::Budget, context)?;
+        }
         if budget.max_launches == 0 {
             return Err(JobRecordError::Contract(JobContractError::EmptyRetry));
         }

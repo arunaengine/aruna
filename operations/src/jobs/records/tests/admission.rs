@@ -376,7 +376,13 @@ fn refuses_pruned_family() {
         plan.pending.is_empty(),
         "a missing spec makes no pending row"
     );
-    let (admission, plan) = plan_bundle(&state, &[], claim, Some(&replay), Some(node(2)));
+    let (admission, plan) = plan_bundle(
+        &state,
+        &[],
+        claim,
+        std::slice::from_ref(&replay),
+        Some(node(2)),
+    );
     assert_eq!(
         (admission, plan),
         (Admission::Pruned, AppendPlan::default())
@@ -397,14 +403,26 @@ fn bundles_fresh_spec() {
     let budget = family.sign(&family.holder, JobFamilyRecord::Budget(budget));
 
     let fresh = state(Some(&view), &empty);
-    let (admission, plan) = plan_bundle(&fresh, &[], budget.clone(), Some(&signed), Some(node(2)));
+    let (admission, plan) = plan_bundle(
+        &fresh,
+        &[],
+        budget.clone(),
+        std::slice::from_ref(&signed),
+        Some(node(2)),
+    );
     assert_eq!(admission, Admission::Authentic);
     assert_eq!(plan.admitted.len(), 2);
     let late = FamilyState {
         now_ms: spec.created_at_ms + TOMBSTONE_RETENTION_MS,
         ..fresh
     };
-    let (admission, plan) = plan_bundle(&late, &[], budget, Some(&signed), Some(node(2)));
+    let (admission, plan) = plan_bundle(
+        &late,
+        &[],
+        budget,
+        std::slice::from_ref(&signed),
+        Some(node(2)),
+    );
     assert_eq!((admission, plan), (Admission::Stale, AppendPlan::default()));
 }
 
@@ -447,4 +465,123 @@ fn starts_new_incarnation() {
 
     let admission = plan_append(&state, &[], spec, Some(node(2))).0;
     assert_eq!(admission, Admission::Authentic);
+}
+
+/// A scheduler that left the realm: its budget and launch reached no holder, its target's
+/// receipt did. Returns the held spec and the budget, launch and receipt.
+fn left_scheduler(family: &Family) -> (JobRecordEnvelope, [JobRecordEnvelope; 3]) {
+    let spec = family.spec();
+    let scheduler = secret(9);
+    let budget = family.budget(&spec, scheduler.public());
+    let launch = family.launch(&spec, scheduler.public(), 0);
+    let receipt = family.receipt(&launch, 1);
+    (
+        family.sign(&family.holder, JobFamilyRecord::Spec(Box::new(spec))),
+        [
+            family.sign(&scheduler, JobFamilyRecord::Budget(budget)),
+            family.sign(&scheduler, JobFamilyRecord::Launch(Box::new(launch))),
+            family.sign(&family.target, JobFamilyRecord::Receipt(Box::new(receipt))),
+        ],
+    )
+}
+
+// A holder that kept only the spec admits budget, launch and receipt together from the
+// executor's offer; the launch alone from a scheduler that is no holder is still refused.
+#[test]
+fn recovers_left_scheduler() {
+    let family = Family::new([46u8; 32]);
+    let view = family.view();
+    let (spec, [budget, launch, receipt]) = left_scheduler(&family);
+    let held = stored(&[spec]);
+    let state = state(Some(&view), &held);
+
+    let (admission, _) = plan_append(&state, &[], launch.clone(), Some(node(2)));
+    assert!(matches!(admission, Admission::Rejected(_)));
+    let bundle = [launch, budget];
+    let (admission, plan) = plan_bundle(&state, &[], receipt, &bundle, Some(node(2)));
+    assert_eq!(admission, Admission::Authentic);
+    let kinds: Vec<_> = (plan.admitted.iter())
+        .map(|admitted| admitted.envelope.key().kind)
+        .collect();
+    let expected = [
+        JobRecordKind::Budget,
+        JobRecordKind::Launch,
+        JobRecordKind::Receipt,
+    ];
+    assert_eq!(kinds, expected);
+}
+
+// A bundle with any bad budget or a launch the receipt does not bind admits nothing.
+#[test]
+fn refuses_broken_bundle() {
+    let family = Family::new([47u8; 32]);
+    let view = family.view();
+    let (spec, [budget, launch, receipt]) = left_scheduler(&family);
+    let held = stored(std::slice::from_ref(&spec));
+    let state = state(Some(&view), &held);
+    let JobFamilyRecord::Budget(fields) = &budget.record else {
+        panic!("budget fixture")
+    };
+    let JobFamilyRecord::Receipt(bound) = &receipt.record else {
+        panic!("receipt fixture")
+    };
+    let rebudget = |change: fn(&mut aruna_core::structs::execution::job::WitnessBudgetRecord)| {
+        let mut fields = *fields;
+        change(&mut fields);
+        family.sign(&secret(9), JobFamilyRecord::Budget(fields))
+    };
+    // The budget allows sequences 0 and 1 only.
+    let late = family.launch(&family.spec(), secret(9).public(), 2);
+    let late_receipt = family.receipt(&late, 2);
+    let late = family.sign(&secret(9), JobFamilyRecord::Launch(Box::new(late)));
+    let late_receipt = JobFamilyRecord::Receipt(Box::new(late_receipt));
+    let late_receipt = family.sign(&family.target, late_receipt);
+    let mut other = (**bound).clone();
+    other.launch_digest = [7u8; 32];
+    let pair = || vec![launch.clone(), budget.clone()];
+    let broken = [
+        (
+            vec![launch.clone(), rebudget(|budget| budget.max_launches = 0)],
+            receipt.clone(),
+        ),
+        (
+            vec![launch.clone(), rebudget(|budget| budget.max_launches = 3)],
+            receipt.clone(),
+        ),
+        (
+            vec![
+                launch.clone(),
+                rebudget(|budget| budget.source_spec_digest = [7u8; 32]),
+            ],
+            receipt.clone(),
+        ),
+        (vec![late.clone(), budget.clone()], late_receipt),
+        (
+            vec![
+                launch.clone(),
+                family.sign(&secret(8), budget.record.clone()),
+            ],
+            receipt.clone(),
+        ),
+        (
+            vec![
+                family.sign(&secret(8), launch.record.clone()),
+                budget.clone(),
+            ],
+            receipt.clone(),
+        ),
+        (pair(), family.sign(&family.holder, receipt.record.clone())),
+        (
+            pair(),
+            family.sign(&family.target, JobFamilyRecord::Receipt(Box::new(other))),
+        ),
+    ];
+    for (bundle, receipt) in broken {
+        let (admission, plan) = plan_bundle(&state, &[], receipt, &bundle, Some(node(2)));
+        assert_ne!(admission, Admission::Authentic);
+        assert!(
+            plan.admitted.is_empty(),
+            "nothing of {admission:?} is admitted"
+        );
+    }
 }
