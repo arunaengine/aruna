@@ -212,12 +212,21 @@ enum ReadStage {
 #[derive(Debug, PartialEq)]
 pub struct RegistryReadOperation {
     stage: ReadStage,
+    timing: ReadTiming,
 }
 
 impl RegistryReadOperation {
     pub fn new() -> Self {
         Self {
             stage: ReadStage::Snapshot,
+            timing: ReadTiming::default(),
+        }
+    }
+
+    fn cached(&self, hit: bool, stale: bool) {
+        self.timing.note("cache_hit", hit);
+        if hit {
+            self.timing.note("stale", stale);
         }
     }
 }
@@ -226,11 +235,39 @@ impl Operation for RegistryReadOperation {
     type Output = Registry;
     type Error = MetadataError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.timing.stamp(now_ms);
+    }
+
     fn first(&mut self) -> Turn<Registry> {
+        self.timing.open(debug_span!(
+            "metadata.registry.list_local",
+            cache_hit = field::Empty,
+            stale = field::Empty,
+            record_count = field::Empty,
+            elapsed_ms = field::Empty,
+        ));
         Ok(Next::Call(graph_call(MetadataEffect::RegistrySnapshot)))
     }
 
     fn next(&mut self, result: IoResult) -> Turn<Registry> {
+        let turn = self.step(result);
+        if let Ok(
+            Next::Done(records)
+            | Next::Then {
+                output: records, ..
+            },
+        ) = &turn
+        {
+            self.timing.note("record_count", records.len() as u64);
+            self.timing.finish(None);
+        }
+        turn
+    }
+}
+
+impl RegistryReadOperation {
+    fn step(&mut self, result: IoResult) -> Turn<Registry> {
         if self.stage == ReadStage::Fill {
             return Ok(Next::Done(result.child::<Registry, MetadataError>()??));
         }
@@ -239,14 +276,18 @@ impl Operation for RegistryReadOperation {
                 records: Some(records),
                 fresh,
                 ..
-            } => match fresh {
-                true => Ok(Next::Done(records)),
-                false => Ok(Next::Then {
-                    output: records,
-                    calls: vec![IoCall::background(RegistryFillOperation::new())],
-                }),
-            },
+            } => {
+                self.cached(true, !fresh);
+                match fresh {
+                    true => Ok(Next::Done(records)),
+                    false => Ok(Next::Then {
+                        output: records,
+                        calls: vec![IoCall::background(RegistryFillOperation::new())],
+                    }),
+                }
+            }
             MetadataEvent::RegistrySnapshot { records: None, .. } => {
+                self.cached(false, false);
                 self.stage = ReadStage::Fill;
                 Ok(Next::Call(IoCall::child(RegistryFillOperation::new())))
             }
