@@ -15,6 +15,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::error::token_grant;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::unify;
+use aruna_operations::device::scan_rows::ScanRowsOperation;
 use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::s3::bucket::linked::{
     BucketJob, BucketJobOperation, LinkedAction, LinkedError, RenameTotalOperation,
@@ -867,47 +868,39 @@ async fn file_keys(
     let mut keys: Vec<String> = row.and_then(|row| row.key).into_iter().collect();
     keys.extend(rule.aruna_key(path));
     // A pending write to the path names its key too.
-    let intents = aruna_storage::scan::iter_prefix_page(
-        &context.storage_handle,
+    let prefix = aruna_core::structs::storage::backend_import::intent_prefix(rule.import_id, path);
+    let scan = ScanRowsOperation::new(
         aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE,
-        Some(aruna_core::structs::storage::backend_import::intent_prefix(
-            rule.import_id,
-            path,
-        )),
-        None,
+        Some(prefix),
         INTENT_PAGE,
-        None,
     );
-    let (intents, more) = intents
+    let intents = drive(scan, &context)
         .await
-        .map_err(|error| ServerError::InternalError(error.into()))?;
-    if more.is_some() {
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    // More pending writes than one page leave the path unresolved, as before.
+    if intents.len() > INTENT_PAGE {
         return Ok(Vec::new());
     }
-    for (_, value) in intents {
+    for value in intents {
         let intent = aruna_core::structs::storage::backend_import::WriteIntent::from_bytes(&value);
         let intent = intent.map_err(|error| ServerError::InternalError(error.into()))?;
         keys.push(intent.key);
     }
     // A pending write to the path names its key too.
-    let intents = aruna_storage::scan::iter_prefix_page(
-        &context.storage_handle,
+    let prefix = aruna_core::structs::storage::backend_import::intent_prefix(rule.import_id, path);
+    let scan = ScanRowsOperation::new(
         aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE,
-        Some(aruna_core::structs::storage::backend_import::intent_prefix(
-            rule.import_id,
-            path,
-        )),
-        None,
+        Some(prefix),
         INTENT_PAGE,
-        None,
     );
-    let (intents, more) = intents
+    let intents = drive(scan, &context)
         .await
-        .map_err(|error| ServerError::InternalError(error.into()))?;
-    if more.is_some() {
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    // More pending writes than one page leave the path unresolved, as before.
+    if intents.len() > INTENT_PAGE {
         return Ok(Vec::new());
     }
-    for (_, value) in intents {
+    for value in intents {
         let intent = aruna_core::structs::storage::backend_import::WriteIntent::from_bytes(&value);
         let intent = intent.map_err(|error| ServerError::InternalError(error.into()))?;
         keys.push(intent.key);

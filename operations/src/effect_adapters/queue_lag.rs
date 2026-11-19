@@ -17,7 +17,7 @@ use byteview::ByteView;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::StorageHandle;
+use aruna_storage::StorageHandle;
 
 const SCAN_SIZE: usize = 1_024;
 const SCAN_PAGE_LIMIT: usize = 8;

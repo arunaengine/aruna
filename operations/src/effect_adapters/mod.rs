@@ -9,6 +9,7 @@ mod git;
 pub mod job;
 mod metadata;
 mod net;
+pub mod queue_lag;
 mod session;
 pub(crate) mod shard;
 mod storage;
