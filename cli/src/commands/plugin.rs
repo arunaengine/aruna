@@ -4,8 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
-use aruna_plugins::artifact::ArtifactDigest;
-use aruna_plugins::manifest::valid_plugin;
+use aruna_plugin_types::artifact::ArtifactDigest;
+use aruna_plugin_types::manifest::valid_plugin;
 use aruna_plugins::package::{build_project, rust_library};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

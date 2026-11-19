@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
-use crate::manifest::{Manifest, SettingKind};
-use crate::trigger::TriggerKind;
+use aruna_plugin_types::manifest::{Manifest, SettingKind};
+use aruna_plugin_types::trigger::TriggerKind;
 
 /// The files of a library folder in `plugins/sdk`, by name.
 macro_rules! library {

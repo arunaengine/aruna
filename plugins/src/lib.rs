@@ -1,18 +1,14 @@
-//! Plugin manifests, artifact sections and, with the `runtime` feature, the bounded WASM runtime.
+//! Builds plugin packages and, with the `runtime` feature, runs plugins in the bounded WASM
+//! runtime; manifests and artifacts are in `aruna-plugin-types`.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub mod artifact;
 #[cfg(feature = "build")]
 pub mod authored;
 #[cfg(feature = "build")]
 mod bundle;
-pub mod connection;
-pub mod manifest;
 #[cfg(feature = "build")]
 pub mod package;
-pub mod permission;
-pub mod trigger;
 
 #[cfg(feature = "runtime")]
 pub mod broker;
@@ -26,6 +22,8 @@ pub mod limits;
 mod runtime;
 #[cfg(feature = "runtime")]
 mod supervisor;
+#[cfg(feature = "runtime")]
+mod values;
 
 #[cfg(feature = "runtime")]
 pub use host::Limit;

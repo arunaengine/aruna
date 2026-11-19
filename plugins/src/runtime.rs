@@ -16,16 +16,17 @@ use wasmtime::component::{
 };
 use wasmtime::{Config, Engine, Store, Trap, UpdateDeadline};
 
-use crate::artifact::{ArtifactDigest, SectionError, read_manifest};
-use crate::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+use aruna_plugin_types::artifact::{ArtifactDigest, SectionError, read_manifest};
+use aruna_plugin_types::calls::{
+    Document, Entry, ErrorKind, HostError, Intent, Listing, ObjectInfo, ObjectPage, Response,
 };
+use aruna_plugin_types::manifest::{Manifest, ManifestError};
+use aruna_plugin_types::permission::Permission;
+
+use crate::broker::{Broker, CallContext, MetadataPatch, SendRequest, StatePut};
 use crate::host::wit::aruna::plugin::types::{Failure, Field, Invocation as GuestCall, Trigger};
 use crate::host::{Exceeded, Grants, Limit, Session, wit};
 use crate::limits::{Limits, RuntimeConfig};
-use crate::manifest::{Manifest, ManifestError};
-use crate::permission::Permission;
 
 /// Time between two epoch ticks; a running guest yields to the executor on each tick.
 const TICK: std::time::Duration = std::time::Duration::from_millis(10);
