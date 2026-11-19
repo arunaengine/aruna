@@ -390,10 +390,7 @@ impl Feeder {
     }
 
     /// Keeps the cursors of a finished pass; true when it changed an index or a row.
-    pub fn passed<E>(
-        &mut self,
-        pass: Result<crate::transfer::feed_walks::FeedPass, E>,
-    ) -> bool {
+    pub fn passed<E>(&mut self, pass: Result<crate::transfer::feed_walks::FeedPass, E>) -> bool {
         match pass {
             Ok(pass) => {
                 self.cursors = pass.cursors;

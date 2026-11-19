@@ -30,9 +30,7 @@ use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::rows::{read_row, values};
 use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::storage::mirror_repair::SyncMirrorRecord;
-use aruna_core::types::{Key, KeySpace, Value};
-use byteview::ByteView;
-use serde::{Deserialize, Serialize};
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
 pub const REPAIR_RETRY_AFTER: Duration = Duration::from_secs(1);

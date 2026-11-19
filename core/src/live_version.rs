@@ -202,7 +202,10 @@ mod tests {
     fn timer_set() -> IoResult {
         let key = TaskKey::DrainReplicationQueue;
         let after = Duration::ZERO;
-        IoResult::Event(Box::new(Event::Task(TaskEvent::TimerScheduled { key, after })))
+        IoResult::Event(Box::new(Event::Task(TaskEvent::TimerScheduled {
+            key,
+            after,
+        })))
     }
 
     #[test]
