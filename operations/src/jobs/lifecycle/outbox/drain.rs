@@ -13,13 +13,16 @@ use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::execution::job::record_rows::from_bytes;
-use aruna_core::structs::execution::job::{JobRecordEnvelope, JobRecordKey};
+use aruna_core::structs::execution::job::{
+    JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind,
+};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
 use tracing::warn;
 
-use super::{OUTBOX_DRAIN_BATCH, PublishRecordConfig, PublishRecordOperation};
+use super::{OUTBOX_DRAIN_BATCH, PublishOutcome, PublishRecordConfig, PublishRecordOperation};
 use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 
 const OUTBOX_CURSOR_KEY: &[u8] = b"job_family_outbox_cursor";
 
@@ -44,6 +47,8 @@ enum Phase {
     Record(Key),
     Clear,
     Publish(Box<PublishRecordOperation>),
+    /// The family's specs are read, to offer the record again with the one it binds.
+    Spec(Box<PublishRecordConfig>),
     WriteCursor,
     Rescan,
 }
@@ -123,19 +128,31 @@ impl DrainOutboxOperation {
                 key,
             )])));
         }
-        let mut publish = PublishRecordOperation::new(PublishRecordConfig {
+        self.publish(PublishRecordConfig {
             placement,
             holders,
             record: Box::new(frame),
             key: record_key,
-        });
+            attached: Vec::new(),
+        })
+    }
+
+    fn publish(&mut self, config: PublishRecordConfig) -> Step {
+        let mut publish = PublishRecordOperation::new(config);
         let step = publish.first();
         self.phase = Phase::Publish(Box::new(publish));
         self.after_publish(step)
     }
 
+    /// Reads the family's specs for a record a holder wants together with its spec.
+    fn load_spec(&mut self, config: PublishRecordConfig) -> Step {
+        let specs = LoadFamilyOperation::kind(config.key.family, JobRecordKind::Spec);
+        self.phase = Phase::Spec(Box::new(config));
+        Ok(Next::Call(IoCall::child(specs)))
+    }
+
     /// Hands the publish's calls on, or moves to the next entry once it ended.
-    fn after_publish(&mut self, step: Result<Next<bool>, LifecycleError>) -> Step {
+    fn after_publish(&mut self, step: Result<Next<PublishOutcome>, LifecycleError>) -> Step {
         match step {
             Ok(Next::Done(_)) => self.next_entry(),
             Ok(next) => Ok(next),
@@ -145,6 +162,29 @@ impl DrainOutboxOperation {
             }
         }
     }
+}
+
+/// The stored spec `envelope` names by digest; an update or a stop names none, so it takes the
+/// family's spec.
+fn bound_spec(
+    envelope: &JobRecordEnvelope,
+    specs: Vec<JobRecordEnvelope>,
+) -> Option<JobRecordFrame> {
+    let named = match &envelope.record {
+        JobFamilyRecord::Spec(_) => return None,
+        JobFamilyRecord::Claim(claim) => Some(claim.spec_digest),
+        JobFamilyRecord::Budget(budget) => Some(budget.source_spec_digest),
+        JobFamilyRecord::Launch(launch) => Some(launch.spec_digest),
+        JobFamilyRecord::Receipt(receipt) => Some(receipt.spec_digest),
+        JobFamilyRecord::Output(output) => Some(output.spec_digest),
+        JobFamilyRecord::Cancel(cancel) => Some(cancel.spec_digest),
+        JobFamilyRecord::Update(_) | JobFamilyRecord::Stop(_) => None,
+    };
+    let spec = specs.into_iter().find(|stored| match &stored.record {
+        JobFamilyRecord::Spec(spec) => named.is_none_or(|digest| digest == spec.spec_digest),
+        _ => false,
+    })?;
+    JobRecordFrame::new(spec).ok()
 }
 
 /// The stored record of one outbox entry as a frame, or `None` when it cannot be offered.
@@ -223,8 +263,29 @@ impl Operation for DrainOutboxOperation {
             },
             Phase::Publish(mut publish) => {
                 let step = publish.next(result);
+                if matches!(step, Ok(Next::Done(PublishOutcome::SpecNeeded))) {
+                    return self.load_spec(publish.config);
+                }
                 self.phase = Phase::Publish(publish);
                 self.after_publish(step)
+            }
+            Phase::Spec(mut config) => {
+                let specs = result.child::<Vec<JobRecordEnvelope>, FamilyReadError>();
+                let specs = match specs {
+                    Ok(Ok(specs)) => specs,
+                    Ok(Err(error)) => {
+                        warn!(error = %error, "The spec of a queued record is unreadable");
+                        return self.next_entry();
+                    }
+                    Err(_) => return Err(unfit("the specs of a family")),
+                };
+                match bound_spec(config.record.envelope(), specs) {
+                    Some(spec) => {
+                        config.attached = vec![spec];
+                        self.publish(*config)
+                    }
+                    None => self.next_entry(),
+                }
             }
             Phase::WriteCursor => match result {
                 IoResult::Done => {

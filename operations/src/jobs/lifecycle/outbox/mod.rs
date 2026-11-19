@@ -53,6 +53,18 @@ pub struct PublishRecordConfig {
     pub holders: Vec<NodeId>,
     pub record: Box<JobRecordFrame>,
     pub key: JobRecordKey,
+    /// The spec the record binds, offered with it to a holder that holds no spec of the family.
+    pub attached: Vec<JobRecordFrame>,
+}
+
+/// What one offer of a queued record left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// Every holder has the record, or it is refused for good; the entry is gone.
+    Cleared,
+    Queued,
+    /// A holder holds no spec of the family; the record goes again together with its spec.
+    SpecNeeded,
 }
 
 /// One queued record offered to the family holders at once. The entry is cleared only
@@ -65,6 +77,7 @@ pub struct PublishRecordOperation {
     asked: Vec<NodeId>,
     /// Whether the last call clears the entry instead of storing it.
     clearing: bool,
+    spec_needed: bool,
 }
 
 /// What the asked holders answered together.
@@ -86,6 +99,15 @@ impl PublishRecordOperation {
             },
             asked: Vec::new(),
             clearing: false,
+            spec_needed: false,
+        }
+    }
+
+    fn outcome(&self) -> PublishOutcome {
+        match (self.clearing, self.spec_needed) {
+            (true, _) => PublishOutcome::Cleared,
+            (false, true) => PublishOutcome::SpecNeeded,
+            (false, false) => PublishOutcome::Queued,
         }
     }
 
@@ -93,7 +115,7 @@ impl PublishRecordOperation {
         record_key(&self.config.key)
     }
 
-    fn clear(&mut self) -> Next<bool> {
+    fn clear(&mut self) -> Next<PublishOutcome> {
         self.clearing = true;
         Next::Call(IoCall::Delete(vec![(
             FAMILY_OUTBOX_KEYSPACE.to_string(),
@@ -101,7 +123,7 @@ impl PublishRecordOperation {
         )]))
     }
 
-    fn store(&mut self) -> Result<Next<bool>, LifecycleError> {
+    fn store(&mut self) -> Result<Next<PublishOutcome>, LifecycleError> {
         let value = to_bytes(&self.entry)?;
         Ok(Next::Call(IoCall::Write(vec![(
             FAMILY_OUTBOX_KEYSPACE.to_string(),
@@ -111,7 +133,7 @@ impl PublishRecordOperation {
     }
 
     /// Asks the next bounded set of holders that do not have the record yet, all at once.
-    fn offer(&mut self) -> Result<Next<bool>, LifecycleError> {
+    fn offer(&mut self) -> Result<Next<PublishOutcome>, LifecycleError> {
         let holder_count = self.config.holders.len();
         let start = self.entry.next_holder as usize % holder_count.max(1);
         let mut pending = Vec::new();
@@ -137,7 +159,7 @@ impl PublishRecordOperation {
         let message = MetadataTransportMessage::ForwardJobRecord {
             placement: self.config.placement,
             record: self.config.record.clone(),
-            attached: Vec::new(),
+            attached: self.config.attached.clone(),
         };
         let frame = match encode_message(&message) {
             Ok(frame) => frame,
@@ -217,7 +239,10 @@ impl PublishRecordOperation {
     }
 
     /// Notes the holders that accepted the record; clears the entry once every holder has it.
-    fn delivered_to(&mut self, holders: Vec<NodeId>) -> Result<Next<bool>, LifecycleError> {
+    fn delivered_to(
+        &mut self,
+        holders: Vec<NodeId>,
+    ) -> Result<Next<PublishOutcome>, LifecycleError> {
         for holder in holders {
             debug!(peer = %holder, "Job record replicated to a family holder");
             if self.config.holders.contains(&holder) && !self.entry.delivered.contains(&holder) {
@@ -239,7 +264,19 @@ impl PublishRecordOperation {
         &mut self,
         holder: NodeId,
         reason: JobRecordRejection,
-    ) -> Result<Next<bool>, LifecycleError> {
+    ) -> Result<Next<PublishOutcome>, LifecycleError> {
+        match reason {
+            // The family is too old or pruned there, so no holder ever takes it again.
+            JobRecordRejection::StaleFamily | JobRecordRejection::FamilyPruned => {
+                debug!(peer = %holder, "Family holder refused a record of an old family");
+                return Ok(self.clear());
+            }
+            JobRecordRejection::SpecNeeded if self.config.attached.is_empty() => {
+                self.spec_needed = true;
+                return self.store();
+            }
+            _ => {}
+        }
         warn!(peer = %holder, reason = ?reason, "Family holder refused a record");
         self.entry.rejections = self.entry.rejections.saturating_add(1);
         // A record every holder stands behind refusing will never be accepted, so it
@@ -257,21 +294,21 @@ impl PublishRecordOperation {
 }
 
 impl Operation for PublishRecordOperation {
-    type Output = bool;
+    type Output = PublishOutcome;
     type Error = LifecycleError;
 
-    fn first(&mut self) -> Result<Next<bool>, LifecycleError> {
+    fn first(&mut self) -> Result<Next<PublishOutcome>, LifecycleError> {
         Ok(Next::Call(IoCall::Read(vec![(
             FAMILY_OUTBOX_KEYSPACE.to_string(),
             self.row_key(),
         )])))
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<bool>, LifecycleError> {
+    fn next(&mut self, result: IoResult) -> Result<Next<PublishOutcome>, LifecycleError> {
         match result {
             IoResult::Values(values) => {
                 let Some(Some(value)) = values.into_iter().next() else {
-                    return Ok(Next::Done(false));
+                    return Ok(Next::Done(PublishOutcome::Cleared));
                 };
                 let mut entry = from_bytes::<OutboxEntry>(&value)?;
                 entry
@@ -288,7 +325,7 @@ impl Operation for PublishRecordOperation {
                     self.store()
                 }
             },
-            IoResult::Done => Ok(Next::Done(self.clearing)),
+            IoResult::Done => Ok(Next::Done(self.outcome())),
             _ => Err(LifecycleError::UnexpectedEvent {
                 state: "publish".to_string(),
                 expected: "outbox row, holder answers or a write",
@@ -315,6 +352,7 @@ mod tests {
             holders,
             record: Box::new(JobRecordFrame::new(envelope).expect("record frame")),
             key,
+            attached: Vec::new(),
         }
     }
 
@@ -333,7 +371,7 @@ mod tests {
         }
     }
 
-    fn asked(next: Result<Next<bool>, LifecycleError>) -> Vec<NodeId> {
+    fn asked(next: Result<Next<PublishOutcome>, LifecycleError>) -> Vec<NodeId> {
         let Ok(Next::Call(IoCall::Group(group))) = next else {
             panic!("expected a group of publish requests")
         };
@@ -348,8 +386,12 @@ mod tests {
     }
 
     fn refused(holder: NodeId) -> GroupResult {
+        refused_for(holder, JobRecordRejection::Invalid)
+    }
+
+    fn refused_for(holder: NodeId, reason: JobRecordRejection) -> GroupResult {
         let reply = MetadataTransportMessage::ForwardedJobRecord {
-            result: Err(JobRecordRejection::Invalid),
+            result: Err(reason),
         };
         GroupResult::Done(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
             MetadataAnswer {
@@ -374,7 +416,40 @@ mod tests {
             operation.next(IoResult::Group(GroupEvent::Finished { results })),
             Ok(Next::Call(IoCall::Delete(_)))
         ));
-        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(true)));
+        assert_eq!(
+            operation.next(IoResult::Done),
+            Ok(Next::Done(PublishOutcome::Cleared))
+        );
+    }
+
+    // A holder without the spec asks for the record again with it, spending no refusal; an old
+    // or pruned family clears the entry at once.
+    #[test]
+    fn offers_spec_again() {
+        let family = Family::new([13u8; 32]);
+        let refused = |reason| {
+            let mut operation = PublishRecordOperation::new(config(&family, vec![node(10)]));
+            operation.first().expect("outbox read");
+            operation.next(stored(&entry(0, 0))).expect("offer");
+            let results = vec![refused_for(node(10), reason)];
+            let answer = operation.next(IoResult::Group(GroupEvent::Finished { results }));
+            (operation, answer)
+        };
+        for reason in [
+            JobRecordRejection::StaleFamily,
+            JobRecordRejection::FamilyPruned,
+        ] {
+            let (_, answer) = refused(reason);
+            assert!(matches!(answer, Ok(Next::Call(IoCall::Delete(_)))));
+        }
+        let (mut operation, answer) = refused(JobRecordRejection::SpecNeeded);
+        let Ok(Next::Call(IoCall::Write(rows))) = answer else {
+            panic!("expected the outbox row write")
+        };
+        let kept = from_bytes::<OutboxEntry>(&rows[0].2).expect("outbox entry decodes");
+        assert_eq!(kept.rejections, 0);
+        let done = operation.next(IoResult::Done);
+        assert_eq!(done, Ok(Next::Done(PublishOutcome::SpecNeeded)));
     }
 
     #[test]
@@ -397,7 +472,10 @@ mod tests {
         let stored_entry = from_bytes::<OutboxEntry>(&rows[0].2).expect("outbox entry decodes");
         assert!(stored_entry.delivered.is_empty());
         assert_eq!(stored_entry.next_holder as usize, MAX_RECORD_HOLDERS);
-        assert_eq!(first.next(IoResult::Done), Ok(Next::Done(false)));
+        assert_eq!(
+            first.next(IoResult::Done),
+            Ok(Next::Done(PublishOutcome::Queued))
+        );
 
         let mut second = PublishRecordOperation::new(config(&family, holders.clone()));
         second.first().expect("outbox read");
