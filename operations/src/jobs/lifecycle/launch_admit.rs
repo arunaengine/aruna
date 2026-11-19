@@ -358,7 +358,7 @@ impl PullFamilyOperation {
                 holders.retain(|holder| *holder != scheduler);
                 holders.truncate(MAX_RECORD_HOLDERS.saturating_sub(1));
                 holders.insert(0, scheduler);
-                let family = (family.submission_id, family.request_digest);
+                let family = (family.submission_id, Some(family.request_digest));
                 FetchFamilyOperation::new(placement, holders, family, FETCH_DEADLINE)
             });
         Self {

@@ -23,7 +23,7 @@ pub mod cancel;
 pub mod chain;
 pub mod closure;
 pub mod family_reads;
-mod fetch;
+pub(crate) mod fetch;
 mod forward;
 pub mod held;
 pub mod ids;

@@ -29,8 +29,8 @@ use crate::metadata::protocol::{
 /// receiver asks only this long after it.
 pub const CLOCK_MARGIN_MS: u64 = 10 * 60 * 1000;
 
-/// How long one closure question to a node may take.
-const ASK_DEADLINE: Duration = Duration::from_secs(10);
+/// How long one closure or record question to a node may take.
+pub(crate) const ASK_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Closure rows one sweep pass reads at a time.
 const SWEEP_PAGE: usize = 500;
