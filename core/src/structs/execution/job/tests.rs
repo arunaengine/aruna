@@ -2266,3 +2266,189 @@ fn outcomes_stay_decided() {
     pending.push(envelope(JobFamilyRecord::Launch(Box::new(other)), 1));
     assert!(!not_run(&pending, &left, &config_clock(3)).family);
 }
+
+/// A successful family with one stopped execution: spec, launch, receipt, output, update, stop.
+fn finished_records() -> Vec<JobRecordEnvelope> {
+    vec![
+        envelope(JobFamilyRecord::Spec(Box::new(sample_spec())), 1),
+        envelope(JobFamilyRecord::Launch(Box::new(sample_launch())), 1),
+        envelope(JobFamilyRecord::Receipt(Box::new(sample_receipt())), 9),
+        envelope(JobFamilyRecord::Output(Box::new(output_record())), 9),
+        envelope(JobFamilyRecord::Update(Box::new(success_update())), 9),
+        envelope(JobFamilyRecord::Stop(Box::new(sample_stop())), 9),
+    ]
+}
+
+fn prune_input<'a>(
+    records: &'a [JobRecordEnvelope],
+    closed: &'a BTreeSet<Ulid>,
+    not_run: &'a NotRun,
+) -> PruneInput<'a> {
+    PruneInput {
+        records,
+        state: LogicalJobState::Succeeded,
+        truncated: false,
+        closed,
+        not_run,
+        local_work: false,
+        undelivered: false,
+        now_ms: last_record_ms(records) + RETENTION_MS + 1,
+    }
+}
+
+#[test]
+fn prunes_settled_family() {
+    // A settled family whose executions stopped and launches closed is prunable after its
+    // retention, and each other rule alone holds it.
+    let records = finished_records();
+    let (closed, not_run) = (BTreeSet::new(), NotRun::default());
+    let input = prune_input(&records, &closed, &not_run);
+    assert_eq!(prune_verdict(&input), PruneVerdict::Prunable);
+
+    let held = |input: PruneInput<'_>| match prune_verdict(&input) {
+        PruneVerdict::Held { reason, .. } => reason,
+        PruneVerdict::Prunable => panic!("held family was prunable"),
+    };
+    assert_eq!(
+        held(PruneInput {
+            truncated: true,
+            ..input
+        }),
+        HoldReason::Truncated
+    );
+    assert_eq!(
+        held(PruneInput {
+            local_work: true,
+            ..input
+        }),
+        HoldReason::LocalWork
+    );
+    assert_eq!(
+        held(PruneInput {
+            undelivered: true,
+            ..input
+        }),
+        HoldReason::Undelivered
+    );
+    let young = PruneInput {
+        now_ms: input.now_ms - 2,
+        ..input
+    };
+    assert_eq!(
+        prune_verdict(&young),
+        PruneVerdict::Held {
+            reason: HoldReason::Retention,
+            recheck_ms: Some(input.now_ms - 1)
+        }
+    );
+    for state in [
+        LogicalJobState::Indeterminate,
+        LogicalJobState::Running,
+        LogicalJobState::Queued,
+    ] {
+        let undecided = PruneInput {
+            state,
+            now_ms: u64::MAX,
+            ..input
+        };
+        assert_eq!(held(undecided), HoldReason::Undecided, "{state:?}");
+    }
+}
+
+#[test]
+fn holds_unstopped_execution() {
+    // A success does not hide a second execution without a stop record, and an execution that
+    // ended in an error without one holds too; a not-run execution counts as closed.
+    let mut records = finished_records();
+    let second = ExecutionReceipt {
+        execution_id: Ulid::from_bytes([30u8; 16]),
+        ..sample_receipt()
+    };
+    records.push(envelope(JobFamilyRecord::Receipt(Box::new(second)), 9));
+    let (closed, mut not_run) = (BTreeSet::new(), NotRun::default());
+    let input = prune_input(&records, &closed, &not_run);
+    assert_eq!(
+        prune_verdict(&input),
+        PruneVerdict::Held {
+            reason: HoldReason::Running(node_id(9)),
+            recheck_ms: None
+        }
+    );
+    not_run.executions.insert(Ulid::from_bytes([30u8; 16]));
+    let input = prune_input(&records, &closed, &not_run);
+    assert_eq!(prune_verdict(&input), PruneVerdict::Prunable);
+
+    let unstopped: Vec<_> = finished_records()[..5].to_vec();
+    let no_run = NotRun::default();
+    let cancelled = PruneInput {
+        state: LogicalJobState::Cancelled,
+        ..prune_input(&unstopped, &closed, &no_run)
+    };
+    assert!(matches!(
+        prune_verdict(&cancelled),
+        PruneVerdict::Held {
+            reason: HoldReason::Running(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn holds_open_launch() {
+    // A launch without receipt and closure holds the family until its closure time; a closure
+    // row or a not-run launch closes it, and a not-run family counts as settled.
+    let open = LaunchIntent {
+        launch_id: Ulid::from_bytes([31u8; 16]),
+        ..sample_launch()
+    };
+    let mut records = finished_records();
+    records.push(envelope(JobFamilyRecord::Launch(Box::new(open.clone())), 1));
+    let (mut closed, not_run) = (BTreeSet::new(), NotRun::default());
+    let early = PruneInput {
+        now_ms: open.closure_due() - 1,
+        ..prune_input(&records, &closed, &not_run)
+    };
+    assert_eq!(
+        prune_verdict(&early),
+        PruneVerdict::Held {
+            reason: HoldReason::LaunchOpen(node_id(9)),
+            recheck_ms: Some(open.closure_due())
+        }
+    );
+    closed.insert(open.launch_id);
+    assert_eq!(
+        prune_verdict(&prune_input(&records, &closed, &not_run)),
+        PruneVerdict::Prunable
+    );
+    let left = NotRun {
+        launches: [open.launch_id].into(),
+        family: true,
+        ..NotRun::default()
+    };
+    let unclosed = BTreeSet::new();
+    let input = PruneInput {
+        state: LogicalJobState::Indeterminate,
+        ..prune_input(&records, &unclosed, &left)
+    };
+    assert_eq!(prune_verdict(&input), PruneVerdict::Prunable);
+}
+
+#[test]
+fn horizon_bounds_pending() {
+    // A pending row expires at the horizon; a spec at the pruned C is refused, one after C plus
+    // the margin starts a new incarnation, and an old one is stale.
+    assert!(!pending_expired(1_000, 1_000 + TOMBSTONE_RETENTION_MS - 1));
+    assert!(pending_expired(1_000, 1_000 + TOMBSTONE_RETENTION_MS));
+    let now = 10 * TOMBSTONE_RETENTION_MS;
+    let last = now - 1_000_000;
+    assert_eq!(spec_freshness(last, now, Some(last)), Freshness::Pruned);
+    assert_eq!(
+        spec_freshness(last + CLOCK_MARGIN_MS + 1, now, Some(last)),
+        Freshness::Fresh
+    );
+    assert_eq!(
+        spec_freshness(now - TOMBSTONE_RETENTION_MS, now, None),
+        Freshness::Stale
+    );
+    assert_eq!(spec_freshness(now - 1, now, None), Freshness::Fresh);
+}

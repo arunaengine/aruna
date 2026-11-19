@@ -42,6 +42,7 @@ mod launch;
 mod local;
 mod membership;
 mod pages;
+mod prune;
 pub mod record_keys;
 pub mod record_rows;
 mod rows;
@@ -54,6 +55,7 @@ pub use launch::*;
 pub use local::*;
 pub use membership::*;
 pub use pages::*;
+pub use prune::*;
 pub use rows::*;
 
 #[cfg(test)]
