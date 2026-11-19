@@ -19,5 +19,8 @@ aruna-core = { workspace = true }
 tokio = { workspace = true, optional = true }
 ulid = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 nix = { workspace = true }
