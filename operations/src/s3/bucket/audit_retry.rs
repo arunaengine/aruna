@@ -425,9 +425,6 @@ mod tests {
 
     #[tokio::test]
     async fn retry_survives_crash() {
-        use crate::jobs::runtime::JobsRuntime;
-        use crate::tasks::incoming::OperationsTaskHandler;
-        use aruna_tasks::InboundTaskHandler;
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
@@ -442,8 +439,7 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         });
-        let handler = Arc::new(OperationsTaskHandler::new(context, JobsRuntime::new()));
-        // The handler is stopped after a growing number of steps, as a crash would stop it,
+        // The timer's run is stopped after a growing number of steps, as a crash would stop it,
         // and the last run completes.
         for steps in 0..=16 {
             let record = BucketAuditRecord {
@@ -468,8 +464,8 @@ mod tests {
             };
             let persist = aruna_storage::task_timers::persist_task_effect(&storage_handle, &arm);
             persist.await.unwrap();
-            let (fired, timer_key) = (Arc::clone(&handler), key.clone());
-            let run = tokio::spawn(async move { fired.handle_timer(timer_key).await });
+            let (fired, store) = (Arc::clone(&context), StoreAuditOperation::new(key.clone()));
+            let run = tokio::spawn(async move { crate::driver::drive(store, &fired).await });
             if steps < 16 {
                 for _ in 0..steps {
                     tokio::task::yield_now().await;

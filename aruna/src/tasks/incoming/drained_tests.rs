@@ -13,18 +13,20 @@ use aruna_core::keyspaces::{
     STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{BackendLocation, BlobCleanupWork, BlobLocationKey};
+use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::format::{EncodingClass, StoredFormat};
-use aruna_core::structs::storage::group_backend::GroupStorageSecret;
+use aruna_core::structs::storage::group_backend::{
+    GroupBackendKind, GroupStorage, GroupStorageSecret,
+};
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_core::types::Key;
 use tempfile::tempdir;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::groups::backends::remove::tests::record;
-use crate::groups::backends::{backend_key, index_key};
-use crate::tasks::incoming::remove_drained_backends;
+use super::remove_drained_backends;
 use aruna_core::structs::storage::blob::BackendRef;
+use aruna_operations::driver::DriverContext;
+use aruna_operations::groups::backends::{backend_key, index_key};
 
 fn context(root: &str) -> DriverContext {
     let storage_handle = aruna_storage::FjallStorage::open(root).unwrap();
@@ -68,7 +70,8 @@ async fn seed(context: &DriverContext, backend_id: Ulid, disabled: bool) {
         updated_at: SystemTime::UNIX_EPOCH,
     };
     let entry = GroupStorageSecret::vault_entry(backend_id);
-    let effect = crate::node_vault::write_secret(entry, secret.to_secret().unwrap(), None);
+    let effect =
+        aruna_operations::node_vault::write_secret(entry, secret.to_secret().unwrap(), None);
     context.storage_handle.send_effect(effect).await;
 }
 
@@ -76,9 +79,10 @@ async fn stored_secret(context: &DriverContext, backend_id: Ulid) -> Option<Grou
     let entry = GroupStorageSecret::vault_entry(backend_id);
     let event = context
         .storage_handle
-        .send_effect(crate::node_vault::read_secret(entry, None))
+        .send_effect(aruna_operations::node_vault::read_secret(entry, None))
         .await;
-    crate::node_vault::parse_secret(event, entry, GroupStorageSecret::from_bytes).unwrap()
+    aruna_operations::node_vault::parse_secret(event, entry, GroupStorageSecret::from_bytes)
+        .unwrap()
 }
 
 async fn read(context: &DriverContext, key_space: &str, key: Key) -> Option<Vec<u8>> {
@@ -240,4 +244,19 @@ async fn holding_backend_survives() {
     .await;
 
     assert_eq!(remove_drained_backends(&ctx).await.unwrap(), 0);
+}
+
+fn record(backend_id: Ulid, disabled: bool) -> GroupStorage {
+    GroupStorage {
+        backend_id,
+        group_id: Ulid::from_bytes([1u8; 16]),
+        name: "tenant".to_string(),
+        kind: GroupBackendKind::S3,
+        public_config: HashMap::new(),
+        created_at: SystemTime::UNIX_EPOCH,
+        updated_at: SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        disabled,
+        cleanup: CleanupStrategy::Retain,
+    }
 }

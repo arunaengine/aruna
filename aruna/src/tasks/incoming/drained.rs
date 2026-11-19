@@ -77,3 +77,7 @@ fn idle_backends(context: &DriverContext, disabled: Vec<GroupStorage>) -> Vec<(G
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "drained_tests.rs"]
+mod tests;
