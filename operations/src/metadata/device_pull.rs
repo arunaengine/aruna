@@ -29,14 +29,14 @@ use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::structs::{
     ORIGIN_DEVICE_TAG, RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull,
-    SyncPullAck, SyncRefusal, SyncVersionPage,
+    SyncPullAck, SyncRefusal, SyncVersionPage, refusal_kind,
 };
 use aruna_core::types::{GroupId, Key, Value};
 use futures_util::StreamExt;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
+use crate::auth::error::{AuthorizeError, pull_refusal};
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::{bound_view, local_fence, route_write};
@@ -424,18 +424,6 @@ fn authorization(
     AuthorizeOperation::new(auth.realm_id, auth, &path, &permission, extras)
 }
 
-/// Only a real denial refuses the caller; an unreadable policy state or a failed check is this
-/// node's problem and stays retryable.
-pub(crate) fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
-    match error {
-        AuthorizeError::PermissionDenied
-        | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => SyncRefusal::Forbidden,
-        AuthorizeError::Policy(PolicyEnforcementError::Unavailable(_))
-        | AuthorizeError::Storage(_)
-        | AuthorizeError::CheckFailed(_) => SyncRefusal::Unavailable,
-    }
-}
-
 type PullBody = BackendStream<Result<bytes::Bytes, StreamError>>;
 
 /// The device's bytes as the write consumes them, adding each chunk to `bytes_done`.
@@ -766,17 +754,6 @@ impl Operation for CommitPullOperation {
                 }
             }
         }
-    }
-}
-
-pub(crate) fn refusal_kind(refusal: &SyncRefusal) -> &'static str {
-    match refusal {
-        SyncRefusal::Unauthorized => "unauthorized",
-        SyncRefusal::Forbidden => "forbidden",
-        SyncRefusal::NotFound => "not_found",
-        SyncRefusal::Invalid(_) => "invalid",
-        SyncRefusal::Unavailable => "unavailable",
-        SyncRefusal::Coordinator(_) => "coordinator",
     }
 }
 

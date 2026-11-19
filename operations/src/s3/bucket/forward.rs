@@ -2,12 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::error::AuthorizeError;
+use crate::auth::error::{AuthorizeError, pull_refusal};
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::transport::reject;
 use crate::forward::write_peer::WritePeerOperation;
-use crate::metadata::device_pull::{pull_refusal, refusal_kind};
 use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
@@ -19,13 +18,13 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::operation::Operation;
 use aruna_core::request_policy::PolicyRequestExtras;
-use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::{SyncRefusal, refusal_kind};
 use aruna_core::types::GroupId;
 use std::time::{Duration, UNIX_EPOCH};
 use tracing::warn;

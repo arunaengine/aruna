@@ -669,6 +669,18 @@ pub enum SyncRefusal {
     Coordinator(crate::NodeId),
 }
 
+/// A stable label of `refusal` for logs.
+pub fn refusal_kind(refusal: &SyncRefusal) -> &'static str {
+    match refusal {
+        SyncRefusal::Unauthorized => "unauthorized",
+        SyncRefusal::Forbidden => "forbidden",
+        SyncRefusal::NotFound => "not_found",
+        SyncRefusal::Invalid(_) => "invalid",
+        SyncRefusal::Unavailable => "unavailable",
+        SyncRefusal::Coordinator(_) => "coordinator",
+    }
+}
+
 /// Where a realm node stands with one sync pull. A pull is accepted at once and polled until
 /// it is done, so its length is bounded by progress, not by one exchange.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
