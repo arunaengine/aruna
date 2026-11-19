@@ -8,7 +8,7 @@ use crate::jobs::repository::test_support::{
 };
 use crate::jobs::store::mutation::{Rows, run_in_memory};
 use aruna_core::events::StorageEvent;
-use aruna_core::repository::{LinkFailure, LinkPush, link_change_entry};
+use aruna_core::repository::link::{LinkFailure, LinkPush, link_change_entry};
 
 fn entry(due_at_ms: u64) -> LinkQueueEntry {
     LinkQueueEntry {

@@ -182,7 +182,7 @@ async fn link_routes_authorize() {
     for (key_space, key) in [
         (
             REPOSITORY_LINK_KEYSPACE,
-            aruna_core::repository::link_key(document_id, link_id),
+            aruna_core::repository::link::link_key(document_id, link_id),
         ),
         (LINK_SECRET_KEYSPACE, link_id.to_bytes().to_vec()),
     ] {
@@ -374,7 +374,7 @@ async fn holder_copy_refuses() {
         updated_at: now,
         generation: 1,
         warning: None,
-        direction: aruna_core::repository::LinkDirection::Push,
+        direction: aruna_core::repository::link::LinkDirection::Push,
         kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
     };
     let written = linked
@@ -652,7 +652,7 @@ async fn admin_rights_limited() {
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: REPOSITORY_LINK_KEYSPACE.into(),
-            key: aruna_core::repository::link_key(document_id, link_id).into(),
+            key: aruna_core::repository::link::link_key(document_id, link_id).into(),
             value: stored.to_bytes().unwrap().into(),
             txn_id: None,
         })
@@ -694,7 +694,8 @@ async fn admin_rights_limited() {
 
 /// Stores a pull link on the dataset the way a keep_updated import creates it.
 async fn pull_link_for(linked: &Linked) -> RepositoryLink {
-    use aruna_core::repository::{LinkDirection, LinkPull, RepositoryRecord};
+    use aruna_core::repository::RepositoryRecord;
+    use aruna_core::repository::link::{LinkDirection, LinkPull};
     let now = std::time::SystemTime::now();
     let mut link = RepositoryLink {
         link_id: Ulid::generate(),

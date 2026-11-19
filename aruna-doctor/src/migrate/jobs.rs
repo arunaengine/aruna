@@ -7,7 +7,8 @@ use super::staging::{self, LegacyStaging};
 use super::{Rewrites, decode_error, session_refs};
 use crate::explorer::ExplorerError;
 use aruna_core::id::NodeId;
-use aruna_core::repository::{ExportIdentity, LinkFailure, RepositoryRecord};
+use aruna_core::repository::link::LinkFailure;
+use aruna_core::repository::{ExportIdentity, RepositoryRecord};
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
 use aruna_core::structs::execution::job::{

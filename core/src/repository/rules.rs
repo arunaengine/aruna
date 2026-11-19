@@ -188,7 +188,7 @@ fn one() -> usize {
 
 /// The embedded rules of a kind; `None` for kinds without rules.
 pub fn rules(kind: RepositoryConnectorKind) -> Result<Option<&'static Rules>, RepositoryError> {
-    super::descriptor(kind).map(|kind| kind.rules()).transpose()
+    crate::repository::kind::descriptor(kind).map(|kind| kind.rules()).transpose()
 }
 
 /// Parses a kind's rules JSON and refuses rules the preview or export would not evaluate.

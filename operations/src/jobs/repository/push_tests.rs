@@ -8,7 +8,8 @@ use super::*;
 use crate::jobs::repository::test_support::{
     child, credential_key, job_id, job_scope, link, link_bytes, local_scope, scope, target,
 };
-use aruna_core::repository::{LinkFailure, RepositoryCredential};
+use aruna_core::repository::credential::RepositoryCredential;
+use aruna_core::repository::link::LinkFailure;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use serde::Serialize;
 

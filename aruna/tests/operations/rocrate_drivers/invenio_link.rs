@@ -12,7 +12,7 @@ use aruna_core::job_request::SubmitJobError;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
-use aruna_core::repository::{
+use aruna_core::repository::link::{
     LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, RepositoryLink, link_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -129,7 +129,7 @@ pub(super) async fn attach(
         updated_at: now,
         generation: 0,
         warning: None,
-        direction: aruna_core::repository::LinkDirection::Push,
+        direction: aruna_core::repository::link::LinkDirection::Push,
         kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
     };
     let change = LinkChange::Create {

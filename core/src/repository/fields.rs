@@ -4,7 +4,8 @@
 
 use serde_json::{Value, json};
 
-use super::{ExportIdentity, RepositoryError, kinds};
+use super::{ExportIdentity, RepositoryError};
+use crate::repository::kind::kinds;
 use crate::structs::secondary_id::{SecondaryIdKind, normalize_value};
 
 /// An identifier with its scheme, such as `doi`, `url` or `orcid`.

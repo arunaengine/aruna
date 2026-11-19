@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::repository::RepositoryCredential;
+use aruna_core::repository::credential::RepositoryCredential;
 use aruna_core::repository::remote::{InvenioAccess, JobStop, NodeScope};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};

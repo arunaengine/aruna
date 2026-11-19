@@ -23,7 +23,7 @@ use aruna_core::metadata::{
     MetadataRequestDurability, ProfileValidationStatus, deterministic_materialization_actor,
 };
 use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
-use aruna_core::repository::{link_change_entry, schedule_drain};
+use aruna_core::repository::link::{link_change_entry, schedule_drain};
 use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     dead_letter_entry, dead_letter_key, document_job_entry, document_job_key, document_job_prefix,

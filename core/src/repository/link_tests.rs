@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::credential_encryption::CredentialEncryptionKey;
-use crate::repository::RepositoryCredential;
+use crate::repository::credential::RepositoryCredential;
 use crate::structs::identity::realm::RealmId;
 
 fn job(nonce: u64) -> JobId {

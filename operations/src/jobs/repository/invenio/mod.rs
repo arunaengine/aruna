@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult};
-use aruna_core::repository::LinkFailure;
+use aruna_core::repository::link::LinkFailure;
 use aruna_core::repository::remote::{
     InvenioAccess, InvenioError, InvenioMethod, JobStop, RemoteAnswer, RemoteCall, RemoteFailure,
 };

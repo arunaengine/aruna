@@ -9,12 +9,11 @@ use aruna_core::operation::Operation;
 use aruna_core::repository::invenio::{
     export_fields, missing_fields, record_id, record_identifiers, validate_id,
 };
+use aruna_core::repository::link::LinkFailure;
 use aruna_core::repository::remote::{
     FileDigests, InvenioError, NodeScope, RemoteAnswer, RemoteCall,
 };
-use aruna_core::repository::{
-    ExportIdentity, LinkFailure, RepositoryDestination, RepositoryRecord,
-};
+use aruna_core::repository::{ExportIdentity, RepositoryDestination, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
 use aruna_core::structs::identity::auth::Permission;
@@ -67,7 +66,7 @@ impl ExportRun {
 
     fn connect_with(
         &self,
-        credential: Option<aruna_core::repository::RepositoryCredential>,
+        credential: Option<aruna_core::repository::credential::RepositoryCredential>,
         interruptible: bool,
     ) -> IoCall {
         IoCall::child(ConnectOperation::new(ConnectRequest {

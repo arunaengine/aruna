@@ -12,8 +12,8 @@ use aruna_core::id::NodeId;
 use aruna_core::user::id::UserId;
 #[cfg(test)]
 use aruna_core::repository::remote::InvenioAccess;
+use aruna_core::repository::link::{LinkDirection, LinkRemote, LinkStatus, RepositoryLink};
 use aruna_core::repository::remote::{JobStop, NodeScope, RemoteAnswer, RemoteFailure};
-use aruna_core::repository::{LinkDirection, LinkRemote, LinkStatus, RepositoryLink};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{ArtifactRef, JobId, JobProgress, RoCrateLimits};
 use aruna_core::structs::identity::realm::RealmId;
@@ -128,8 +128,8 @@ pub fn link() -> RepositoryLink {
 }
 
 /// The target of `link` before anything is published.
-pub fn target() -> aruna_core::repository::LinkTarget {
-    aruna_core::repository::LinkTarget {
+pub fn target() -> aruna_core::repository::link::LinkTarget {
+    aruna_core::repository::link::LinkTarget {
         link_id: link().link_id,
         published_id: None,
         parent_id: None,

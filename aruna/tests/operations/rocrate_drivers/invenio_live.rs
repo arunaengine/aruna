@@ -221,7 +221,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
 async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::change_link;
     use super::link::{change, current, drain, due_now, linked, run_push, succeeded};
-    use aruna_core::repository::{LinkFailure, LinkPatch, LinkStatus};
+    use aruna_core::repository::link::{LinkFailure, LinkPatch, LinkStatus};
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
@@ -411,7 +411,7 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::change_link;
     use super::link::{attach, current, drain, due_now, import_dataset, run_push, succeeded};
-    use aruna_core::repository::{LinkPatch, LinkReview};
+    use aruna_core::repository::link::{LinkPatch, LinkReview};
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
@@ -731,8 +731,9 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
 async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::drain_links;
     use super::driven::{change_link, list_links};
+    use aruna_core::repository::RepositoryPull;
     use aruna_core::repository::invenio::crate_versions;
-    use aruna_core::repository::{LinkPatch, RepositoryPull};
+    use aruna_core::repository::link::LinkPatch;
     use aruna_core::structs::secondary_id::SecondaryIdKind;
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;

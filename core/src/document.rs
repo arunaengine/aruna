@@ -22,7 +22,7 @@ use crate::keyspaces::{
     WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE, WEBHOOK_SETTINGS_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
-use crate::repository::link_key;
+use crate::repository::link::link_key;
 use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
 use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
 use crate::structs::execution::setting::setting_key;

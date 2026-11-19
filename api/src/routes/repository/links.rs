@@ -5,9 +5,9 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use aruna_core::repository::{
-    LinkFailure, LinkRemote, LinkStatus, RepositoryLink, capabilities, descriptor,
-};
+use aruna_core::repository::capabilities;
+use aruna_core::repository::kind::descriptor;
+use aruna_core::repository::link::{LinkFailure, LinkRemote, LinkStatus, RepositoryLink};
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -662,7 +662,7 @@ pub async fn create_link(
         updated_at: now,
         generation: 0,
         warning: None,
-        direction: aruna_core::repository::LinkDirection::Push,
+        direction: aruna_core::repository::link::LinkDirection::Push,
         kind,
     };
     let change = LinkChange::Create {
