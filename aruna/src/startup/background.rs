@@ -315,7 +315,7 @@ async fn publish_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::incoming::install_task_queues;
+    use crate::tasks::incoming::restore::install_task_queues;
 
     async fn test_background() -> (Background, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("temp dir");

@@ -4,7 +4,8 @@
 
 use super::harness::*;
 use super::*;
-use aruna_drivers::testing::freeze_clock;
+use crate::tasks::incoming::outbox::drive_sync_drain;
+use aruna_drivers::testing::{RecordingTaskHandler, freeze_clock};
 
 #[tokio::test]
 async fn restore_document_records() {

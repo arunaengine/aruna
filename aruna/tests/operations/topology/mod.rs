@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna::inbound::{initialize_incoming_fixture, initialize_net_holder};
-use aruna::tasks::incoming::start_task_queues;
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
@@ -1339,7 +1339,7 @@ pub async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
             node = %&node.node_id().to_string()[..8]
         );
         tracing::Instrument::instrument(
-            aruna::tasks::incoming::drive_sync_drain(node.context.clone()),
+            aruna::tasks::incoming::outbox::drive_sync_drain(node.context.clone()),
             span,
         )
     }))

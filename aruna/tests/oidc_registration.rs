@@ -4,7 +4,7 @@
 
 use crate::shared::oidc::spawn_oidc_provider;
 use aruna::inbound::initialize_incoming_fixture;
-use aruna::tasks::incoming::start_task_queues;
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::auth::OidcValidator;
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};

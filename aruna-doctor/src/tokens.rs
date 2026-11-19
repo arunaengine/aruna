@@ -524,7 +524,7 @@ mod tests {
     use crate::tests::fixtures::env_lock;
     use aruna::bootstrap::ensure_onboarding_secret;
     use aruna::inbound::initialize_net_holder;
-    use aruna::tasks::incoming::start_task_queues;
+    use aruna::tasks::incoming::restore::start_task_queues;
     use aruna_api::auth::OidcValidator;
     use aruna_api::routes::onboarding::ListSecretsResponse;
     use aruna_api::server::state::ServerState;

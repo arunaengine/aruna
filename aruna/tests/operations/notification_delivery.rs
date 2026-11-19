@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use aruna::inbound::initialize_net_holder;
-use aruna::tasks::incoming::{drain_notification_outbox, start_task_queues};
+use aruna::tasks::incoming::restore::{drain_notification_outbox, start_task_queues};
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::compute::SecretBytes;
 use aruna_core::effects::{Effect, StorageEffect};

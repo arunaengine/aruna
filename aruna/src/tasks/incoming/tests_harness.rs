@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::tasks::incoming::restore::{install_task_queues, start_task_queues};
 use crate::tasks::runner::recover_stale_jobs;
 use aruna_test_support::jobs::{claim_job, insert_job, read_job_record};
 

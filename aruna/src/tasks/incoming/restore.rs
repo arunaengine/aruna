@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::drained::remove_drained_backends;
 use super::*;
 use crate::tasks::runner::{claim_producer, spawn_job};
 use aruna_drivers::driver::node_routing;

@@ -3,13 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 #[path = "identity_enrollment.rs"]
-mod enrollment;
+pub mod enrollment;
 
-pub(crate) use enrollment::{
-    bootstrap_node_state, onboarding_realm_endpoints, refresh_onboarding_bootstrap,
-};
-
-pub use enrollment::{EnrollmentPlan, plan_enrollment};
+use enrollment::{EnrollmentPlan, plan_enrollment};
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;

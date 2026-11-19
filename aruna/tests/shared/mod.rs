@@ -14,7 +14,7 @@ use aruna::config::{Config, resolve_settings};
 use aruna::identity::{mark_onboarding_phase, mark_state_complete};
 use aruna::inbound::initialize_incoming_fixture;
 use aruna::settings::read_settings_from;
-use aruna::tasks::incoming::start_task_queues;
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::cors::CorsConfig;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
 use aruna_api::routes::credentials::{CreatePathRestriction, CreateS3Request, CreateS3Response};

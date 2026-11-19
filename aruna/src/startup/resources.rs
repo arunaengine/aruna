@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::inbound::initialize_net_holder;
-use crate::tasks::incoming::{TaskQueues, install_task_queues};
+use crate::tasks::incoming::TaskQueues;
+use crate::tasks::incoming::restore::install_task_queues;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
 use aruna_blob::blob::registry::BackendRegistry;
 use aruna_blob::blob::{BlobHandle, BlobHandler};

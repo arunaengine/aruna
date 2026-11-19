@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna::tasks::incoming::drain_notification_outbox;
+use aruna::tasks::incoming::restore::drain_notification_outbox;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};

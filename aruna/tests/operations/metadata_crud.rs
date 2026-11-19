@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna::tasks::incoming::start_task_queues;
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_core::StructuredId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
