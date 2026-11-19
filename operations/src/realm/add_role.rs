@@ -12,18 +12,16 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
-use aruna_core::types::{Key, KeySpace};
 use byteview::ByteView;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::epoch_due::DueMarks;
+use crate::realm::write_stage::{WriteStage, WriteStep};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -228,40 +226,21 @@ impl Operation for RealmRoleOperation {
     }
 }
 
-/// What the role transaction waits for.
-#[derive(Debug, PartialEq)]
-enum Stage {
-    Read,
-    Write,
-    Delete,
-    Marks,
-}
-
 /// Reads the realm authorization and its admin state, writes the role, and marks key epochs due
 /// when it narrowed access, in one write transaction.
 #[derive(Debug, PartialEq)]
 struct RoleWrite {
     input: RealmRoleConfig,
-    stage: Stage,
-    narrowed: bool,
+    write: WriteStage,
     written: Option<WrittenRole>,
-    deletes: Vec<(KeySpace, Key)>,
-    marks: DueMarks,
-    ids: IdMint,
-    now_ms: u64,
 }
 
 impl RoleWrite {
     fn new(input: RealmRoleConfig) -> Self {
         Self {
             input,
-            stage: Stage::Read,
-            narrowed: false,
+            write: WriteStage::default(),
             written: None,
-            deletes: Vec::new(),
-            marks: DueMarks::new(None, 0),
-            ids: IdMint::default(),
-            now_ms: 0,
         }
     }
 
@@ -293,11 +272,15 @@ impl RoleWrite {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_events =
-            apply_reducer_updates(&mut reducer_state, &self.input, &mut self.ids, self.now_ms)?;
+        let admin_events = apply_reducer_updates(
+            &mut reducer_state,
+            &self.input,
+            &mut self.write.ids,
+            self.write.now_ms,
+        )?;
         let roles_before = auth_doc.roles.clone();
         materialize_realm_role(&mut auth_doc, &self.input.role, &reducer_state);
-        self.narrowed = aruna_core::admin_documents::roles_narrowed(&roles_before, &auth_doc.roles);
+        let narrowed = aruna_core::admin_documents::roles_narrowed(&roles_before, &auth_doc.roles);
 
         let conflict_delete_keys =
             stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
@@ -330,17 +313,8 @@ impl RoleWrite {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.written = Some((auth_doc, !admin_events.is_empty()));
-        self.deletes = conflict_delete_keys;
-        self.stage = Stage::Write;
+        self.write.written(conflict_delete_keys, narrowed);
         Ok(Next::Call(IoCall::Write(writes)))
-    }
-
-    fn after_writes(&mut self) -> Result<Next<WrittenRole>, RealmRoleError> {
-        if self.narrowed {
-            self.stage = Stage::Marks;
-            return Ok(Next::Call(self.marks.first()));
-        }
-        self.finish()
     }
 
     fn finish(&mut self) -> Result<Next<WrittenRole>, RealmRoleError> {
@@ -356,12 +330,11 @@ impl Operation for RoleWrite {
     type Error = RealmRoleError;
 
     fn seed(&mut self, entropy: u128) {
-        self.ids = IdMint::new(entropy);
+        self.write.ids = IdMint::new(entropy);
     }
 
     fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-        self.marks.stamp(now_ms);
+        self.write.stamp(now_ms);
     }
 
     fn transaction(&self) -> TransactionMode {
@@ -375,27 +348,10 @@ impl Operation for RoleWrite {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<WrittenRole>, RealmRoleError> {
-        match self.stage {
-            Stage::Read => {
-                let [auth_doc, reducer] = aruna_core::rows::values::<2>(result)?;
-                self.emit_auth_write(auth_doc, reducer)
-            }
-            Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
-                self.stage = Stage::Delete;
-                Ok(Next::Call(IoCall::Delete(std::mem::take(
-                    &mut self.deletes,
-                ))))
-            }
-            Stage::Write | Stage::Delete => {
-                done(result)?;
-                self.after_writes()
-            }
-            Stage::Marks => match self.marks.next(result, true) {
-                Ok(Some(call)) => Ok(Next::Call(call)),
-                Ok(None) => self.finish(),
-                Err(error) => Err(StorageError::WriteError(error.to_string()).into()),
-            },
+        match self.write.step(result)? {
+            WriteStep::Read([auth_doc, reducer]) => self.emit_auth_write(auth_doc, reducer),
+            WriteStep::Call(call) => Ok(Next::Call(call)),
+            WriteStep::Done => self.finish(),
         }
     }
 }

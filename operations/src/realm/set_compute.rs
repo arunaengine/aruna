@@ -11,7 +11,7 @@ use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_COMPUTE_PATH};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
@@ -19,13 +19,14 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::compute_config::RealmComputeConfig;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::types::Value;
 use thiserror::Error;
 use tracing::warn;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::mutate_placement::is_management;
+use crate::realm::write_stage::{WriteStage, WriteStep};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -150,35 +151,21 @@ impl Operation for SetComputeOperation {
     }
 }
 
-/// What the config write transaction waits for.
-#[derive(Debug, PartialEq)]
-enum Stage {
-    Read,
-    Write,
-    Delete,
-}
-
 /// Reads the realm config and its admin state, then stores the change and its queued admin
 /// events in one write transaction.
 #[derive(Debug, PartialEq)]
 struct ComputeWrite {
     config: Arc<SetComputeConfig>,
-    stage: Stage,
+    write: WriteStage,
     document: Option<RealmConfigDocument>,
-    deletes: Vec<(KeySpace, Key)>,
-    ids: IdMint,
-    now_ms: u64,
 }
 
 impl ComputeWrite {
     fn new(config: Arc<SetComputeConfig>) -> Self {
         Self {
             config,
-            stage: Stage::Read,
+            write: WriteStage::default(),
             document: None,
-            deletes: Vec::new(),
-            ids: IdMint::default(),
-            now_ms: 0,
         }
     }
 
@@ -237,7 +224,7 @@ impl ComputeWrite {
             AdminDocumentOperation::ConfigComputeSet {
                 compute: self.config.compute.clone(),
             },
-            self.ids.mint(self.now_ms),
+            self.write.ids.mint(self.write.now_ms),
         )?;
         // Materialized reducer state keeps local and replicated compute conflict outcomes equal.
         apply_reducer_compute(&mut document, &reducer_state);
@@ -267,8 +254,7 @@ impl ComputeWrite {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.document = Some(document.clone());
-        self.deletes = stale_conflict_deletes;
-        self.stage = Stage::Write;
+        self.write.written(stale_conflict_deletes, false);
         Ok(Next::Call(IoCall::Write(writes)))
     }
 
@@ -285,11 +271,11 @@ impl Operation for ComputeWrite {
     type Error = SetComputeError;
 
     fn seed(&mut self, entropy: u128) {
-        self.ids = IdMint::new(entropy);
+        self.write.ids = IdMint::new(entropy);
     }
 
     fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
+        self.write.now_ms = now_ms;
     }
 
     fn transaction(&self) -> TransactionMode {
@@ -306,22 +292,10 @@ impl Operation for ComputeWrite {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetComputeError> {
-        match self.stage {
-            Stage::Read => {
-                let [document, reducer] = values::<2>(result)?;
-                self.emit_document_write(document, reducer)
-            }
-            Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
-                self.stage = Stage::Delete;
-                Ok(Next::Call(IoCall::Delete(std::mem::take(
-                    &mut self.deletes,
-                ))))
-            }
-            Stage::Write | Stage::Delete => {
-                done(result)?;
-                self.finish()
-            }
+        match self.write.step(result)? {
+            WriteStep::Read([document, reducer]) => self.emit_document_write(document, reducer),
+            WriteStep::Call(call) => Ok(Next::Call(call)),
+            WriteStep::Done => self.finish(),
         }
     }
 }
