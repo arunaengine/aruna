@@ -28,7 +28,7 @@ use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::effect_adapters::job::with_job_host;
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
-use aruna_operations::jobs::store::test_calls::{
+use aruna_test_support::jobs::{
     begin_external_running, claim_job, handoff_external_attempt, insert_job, mutate_job,
     put_crate_status, read_attempt_control, read_job_record, record_attempt_intent,
     record_attempt_started, set_cancel_requested, transition_to_preparing, transition_to_ready,
@@ -1683,13 +1683,14 @@ async fn recovery_reuses_credential() {
         served_by: None,
     };
     let scope = (RealmId([1; 32]), spec.group_id, local);
-    let owner = aruna_operations::testing_access::seed_access(&ctx, scope, "/none")
+    let owner = aruna_drivers::testing::seed_access(&ctx, scope, "/none")
         .await
         .user_id;
-    let record = mutate_job(&context, record.job_id, |record| {
-        record.payload = JobPayload::Execution(spec.clone());
+    let (stored, input) = (spec.clone(), captured.clone());
+    let record = mutate_job(&context, record.job_id, move |record| {
+        record.payload = JobPayload::Execution(stored.clone());
         record.created_by = owner;
-        record.captured_inputs = vec![captured.clone()];
+        record.captured_inputs = vec![input.clone()];
         record.workspace_bucket = Some("ws-test".to_string());
         Ok(aruna_operations::jobs::store::JobMutation::Persist)
     })
@@ -1735,11 +1736,12 @@ async fn workspace_run_credential() {
     let mut spec = execution_spec();
     spec.executor_constraint = Some("docker".to_string());
     let scope = (RealmId([1; 32]), spec.group_id, local);
-    let owner = aruna_operations::testing_access::seed_access(&ctx, scope, "/none")
+    let owner = aruna_drivers::testing::seed_access(&ctx, scope, "/none")
         .await
         .user_id;
-    let record = mutate_job(&context, record.job_id, |record| {
-        record.payload = JobPayload::Execution(spec.clone());
+    let stored = spec.clone();
+    let record = mutate_job(&context, record.job_id, move |record| {
+        record.payload = JobPayload::Execution(stored.clone());
         record.created_by = owner;
         record.workspace_mode = WorkspaceMode::Existing;
         record.workspace_bucket = Some("ws-test".to_string());

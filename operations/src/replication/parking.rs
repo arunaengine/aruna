@@ -1011,7 +1011,7 @@ mod tests {
 
     #[tokio::test]
     async fn parking_fences_rotation() {
-        let (_dir, storage) = crate::tests::s3::test_storage();
+        let (_dir, storage) = aruna_test_support::s3::test_storage();
         let context = test_context(storage.clone());
         let old = BucketKeyRef::new(Ulid::from_parts(11, 11), 1);
         source(&context, old).await;
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_archive_waits() {
-        let (_dir, storage) = crate::tests::s3::test_storage();
+        let (_dir, storage) = aruna_test_support::s3::test_storage();
         let context = test_context(storage.clone());
         let key = BucketKeyRef::new(Ulid::from_parts(13, 13), 1);
         let mut location = source(&context, key).await;

@@ -6,7 +6,7 @@
 use super::*;
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::distribution::held::{kept_location, kept_reads, kept_source_location};
-use crate::distribution::test_record::{binding, replicated, secret, store_record};
+use crate::distribution::test_record::{binding, replicated, secret};
 use crate::distribution::test_store::{context, open};
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -187,7 +187,7 @@ fn kept_reference_matches() {
 async fn asks_range_holders() {
     let (_dir, handle) = open();
     let (snapshot, record) = replicated(true, 1);
-    store_record(&handle, snapshot.set_id(), record).await;
+    aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), record).await;
     let bucket = BucketInfo {
         group_id: Ulid::from_bytes([90; 16]),
         created_at: SystemTime::UNIX_EPOCH,

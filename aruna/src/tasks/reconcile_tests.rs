@@ -18,7 +18,7 @@ use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::context::ExternalReconciler;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::JOB_MAX_ATTEMPTS;
-use aruna_operations::jobs::store::test_calls::{
+use aruna_test_support::jobs::{
     insert_job, read_job_record, record_attempt_intent,
 };
 use aruna_storage::FjallStorage;

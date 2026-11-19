@@ -12,7 +12,8 @@ use aruna_core::keyspaces::{
     BUCKET_STATS_DB, DHT_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE,
     S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Runnable};
+use aruna_core::operation::Operation;
+use aruna_core::calls::CallRun;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::identity::realm::RealmId;
@@ -1456,8 +1457,8 @@ async fn answer(context: &TestContext, effect: Effect) -> Option<Event> {
 async fn stall_completion(
     context: &TestContext,
     input: CompleteUploadInput,
-) -> impl EffectOperation<Output = CompleteUploadResult, Error = CompleteUploadError> {
-    let mut operation = CompleteUploadOperation::new(input).into_machine();
+) -> CallRun<CompleteUploadOperation> {
+    let mut operation = CallRun::new(CompleteUploadOperation::new(input));
     let mut queue: VecDeque<Effect> = operation.start().into_iter().collect();
     while let Some(effect) = queue.pop_front() {
         let Some(event) = answer(context, effect).await else {
@@ -1473,7 +1474,7 @@ async fn stall_completion(
 
 // Runs the calls a deadline's abort makes, so the record is left as production
 // would leave it.
-async fn run_abort(context: &TestContext, operation: &mut impl EffectOperation) {
+async fn run_abort(context: &TestContext, operation: &mut CallRun<impl Operation>) {
     for effect in operation.abort() {
         answer(context, effect).await;
     }

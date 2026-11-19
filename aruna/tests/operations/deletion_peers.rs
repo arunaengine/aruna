@@ -14,7 +14,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use ulid::Ulid;
 
 use aruna::inbound::initialize_incoming_fixture;
-use aruna_operations::groups::deletion::tests::{Fixture, read};
+use aruna_test_support::groups::{Fixture, read};
 
 async fn connect_fixture(fixture: &mut Fixture, seed: u8) -> NetHandle {
     let net = NetHandle::new(
@@ -110,7 +110,7 @@ async fn check_reports_nodes() {
     let second_net = connect_fixture(&mut second, 2).await;
     first_net.add_peer_addr(second_net.endpoint_addr()).await;
     second_net.add_peer_addr(first_net.endpoint_addr()).await;
-    aruna_operations::groups::deletion::check_tests::buckets(&second, 2, &["owned", "hidden"])
+    aruna_test_support::groups::buckets(&second, 2, &["owned", "hidden"])
         .await;
     let auth = first.auth.clone();
     let group_id = first.plan.group_id;
@@ -131,7 +131,7 @@ async fn check_reports_nodes() {
     let reply = |seed| {
         replies
             .iter()
-            .find(|(node, _)| *node == aruna_operations::groups::deletion::tests::node(seed))
+            .find(|(node, _)| *node == aruna_test_support::groups::node(seed))
             .map(|(_, result)| result.clone())
             .unwrap()
     };

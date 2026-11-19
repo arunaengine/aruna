@@ -38,7 +38,7 @@ fn input(caller: UserId) -> UnlockInput {
 }
 
 fn info() -> BucketInfo {
-    crate::tests::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
+    aruna_test_support::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
 }
 
 fn event(event: Event) -> IoResult {

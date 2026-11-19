@@ -8,7 +8,7 @@ use std::fmt::Debug;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
-use aruna_core::operation::{Operation, Runnable, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::types::{Key, Value};
 use tracing::warn;
 
@@ -25,11 +25,10 @@ pub(crate) enum ForwardOutcome {
 }
 
 /// One forward as a member of the drain's window.
-pub(crate) fn forward_member<O, K>(forward: O) -> Effect
+pub(crate) fn forward_member<O>(forward: O) -> Effect
 where
-    O: Runnable<K, Output = ForwardOutcome> + 'static,
+    O: Operation<Output = ForwardOutcome> + 'static,
     O::Error: PartialEq + 'static,
-    K: 'static,
 {
     Effect::SubOperation(boxed_suboperation(forward, |result| {
         Event::Child(ChildOutcome::new(result))

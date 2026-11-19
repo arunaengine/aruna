@@ -4,9 +4,9 @@
 
 use super::*;
 use crate::auth::UnrestrictedAuth;
-use crate::job_test_calls::insert_job;
-use crate::job_test_calls::put_job_entry;
-use crate::job_test_calls::{cancel_running_job, claim_job, read_job_record};
+use aruna_test_support::jobs::insert_job;
+use aruna_test_support::jobs::put_job_entry;
+use aruna_test_support::jobs::{cancel_running_job, claim_job, read_job_record};
 use crate::tests::execution::auth_for;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::{ExecutorBackend, SessionChannel};

@@ -60,7 +60,7 @@ use aruna_operations::realm::set_policies::{
 };
 use aruna_operations::sync::outbox_record::outbox_key;
 use aruna_operations::sync::outbox_record::{new_identified_record, write_outbox_effect};
-use aruna_operations::testing::read_outbox_record;
+use aruna_test_support::documents::read_outbox_record;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;

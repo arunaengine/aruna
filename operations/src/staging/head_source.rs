@@ -100,7 +100,7 @@ impl Operation for HeadSourceOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::staging::{
+    use aruna_test_support::staging::{
         create_http_connector, sample_connector, sample_metadata, sample_resolved_connector,
         setup_driver_context,
     };

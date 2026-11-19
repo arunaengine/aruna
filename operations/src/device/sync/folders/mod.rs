@@ -474,7 +474,7 @@ mod tests {
     // after the bucket delete finds it gone and finishes.
     #[tokio::test]
     async fn deletes_local_bucket() {
-        let fixture = crate::tests::staging::setup_driver_context().await;
+        let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
         let (_root, folder, _) = offered_folder(&context).await;
         let withdrawal = WithdrawOfferInput {
@@ -515,7 +515,7 @@ mod tests {
         use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
         use aruna_core::structs::storage::routing::RoutingSnapshot;
 
-        let fixture = crate::tests::staging::setup_driver_context().await;
+        let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
         let (_root, folder, _) = offered_folder(&context).await;
         let second = CreateMultipartOperation::new(CreateMultipartInput {
@@ -589,7 +589,7 @@ mod tests {
         use crate::s3::bucket::write_guard::BucketGuardOperation;
         use crate::staging::offered_directory::OfferedDirectoryError;
 
-        let fixture = crate::tests::staging::setup_driver_context().await;
+        let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
         let (_root, folder, _) = offered_folder(&context).await;
         let bucket = folder.local_bucket.clone();
@@ -631,7 +631,7 @@ mod tests {
         use crate::s3::bucket::write_guard::BucketGuardOperation;
         use crate::staging::offered_directory::OfferedDirectoryError;
 
-        let fixture = crate::tests::staging::setup_driver_context().await;
+        let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
         let (_root, folder, mut upload) = offered_folder(&context).await;
         upload.status = MultipartUploadStatus::Completing;

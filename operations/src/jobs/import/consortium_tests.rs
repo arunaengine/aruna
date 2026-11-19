@@ -20,7 +20,7 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::rewrite::validate_document;
-use crate::tests::staging::setup_driver_context;
+use aruna_test_support::staging::setup_driver_context;
 
 const ELABFTW: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),

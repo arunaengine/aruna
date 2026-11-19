@@ -1,12 +1,15 @@
-//! Runs the metadata projection for tests: the event log replay, logged events and the drain wake.
+//! Runs the metadata projection for tests: log replay, carried and logged events, and the drain.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_core::NodeId;
+use aruna_core::metadata::MetadataEventRecord;
 use aruna_operations::metadata::projection::{
-    MetadataProjectionError, ProjectLoggedOperation, ProjectionWakeOperation, ReplayPageOperation,
+    DrainProjectionOperation, MetadataProjectionError, PendingProjectionResult,
+    ProjectEventsOperation, ProjectLoggedOperation, ProjectionWakeOperation, ReplayPageOperation,
 };
 use ulid::Ulid;
 
@@ -24,6 +27,23 @@ pub async fn replay_event_log(context: &DriverContext) -> Result<usize, Metadata
             None => return Ok(projected),
         }
     }
+}
+
+/// Runs one pass of the pending projection drain.
+pub async fn drain_projection_queue(
+    context: &DriverContext,
+) -> Result<PendingProjectionResult, MetadataProjectionError> {
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    drive(DrainProjectionOperation::new(local_node), context).await
+}
+
+/// Projects carried events.
+pub async fn project_create_events(
+    context: &DriverContext,
+    events: Vec<MetadataEventRecord>,
+    local_node_id: Option<NodeId>,
+) -> Result<usize, MetadataProjectionError> {
+    drive(ProjectEventsOperation::new(events, local_node_id), context).await
 }
 
 /// Projects logged events by their document and event ids.

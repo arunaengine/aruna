@@ -5,7 +5,7 @@
 use super::*;
 use crate::jobs::staging::initial_checkpoint;
 use crate::jobs::staging::pure_tests::{child_answer, test_connector, test_run};
-use crate::tests::staging::spec;
+use aruna_test_support::staging::spec;
 use aruna_core::events::{Event, GroupResult};
 use aruna_core::jobs::{JobEvent, JobStops};
 use aruna_core::structs::execution::job::{StagingJobError, StagingJobPrefix};

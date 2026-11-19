@@ -31,7 +31,7 @@ use aruna_operations::jobs::runtime_steps::requeue_call;
 use aruna_operations::jobs::store::JobMutation;
 use aruna_operations::jobs::store::job_calls::{AdoptOutcome, ClaimOutcome, RequeueOutcome};
 use aruna_operations::jobs::store::mutation_error::JobMutationError;
-use aruna_operations::jobs::store::test_calls::{
+use aruna_test_support::jobs::{
     adopt_external_attempt, cancel_running_job, claim_job, complete_job, insert_job, mutate_job,
     read_job_record, record_attempt_intent, requeue_job, set_cancel_requested,
 };

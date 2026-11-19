@@ -17,7 +17,7 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::{SecretBytes, SharedSecret};
-use aruna_core::operation::Runnable;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
@@ -861,14 +861,14 @@ pub async fn bucket_audit(
 
 /// Runs `operation`, an install or an unlock, then resumes the work that waited for its key; a
 /// failed resume is only reported, since the key is usable either way.
-pub(crate) async fn activate_and_wake<O, K>(
+pub(crate) async fn activate_and_wake<O>(
     context: &DriverContext,
     operation: O,
     origin: (RealmId, NodeId),
     limits: &RoCrateLimits,
 ) -> Result<UnlockStatus, O::Error>
 where
-    O: Runnable<K, Output = UnlockStatus>,
+    O: Operation<Output = UnlockStatus>,
 {
     let status = drive(operation, context).await?;
     let now_ms = unix_timestamp_millis();

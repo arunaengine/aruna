@@ -5,7 +5,7 @@
 use super::*;
 use crate::auth::extract;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
-use crate::job_test_calls::mutate_job;
+use aruna_test_support::jobs::mutate_job;
 use crate::routes::metadata::repositories::{
     ApiRepositoryKind, RepositoryRequest, create_repository,
 };

@@ -1438,7 +1438,7 @@ async fn drift_creates_successor() {
 }
 
 fn observation(content_length: u64) -> SourceMetadata {
-    crate::tests::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
+    aruna_test_support::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
 }
 
 fn reference_source() -> VersionSourceBinding {
@@ -2198,7 +2198,7 @@ async fn read_reference_version(ctx: &DriverContext, version_id: Ulid) -> Source
 async fn offered_drift_replaces() {
     use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
 
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let context = &fixture.driver_context;
     let root = tempdir().unwrap();
     let file = root.path().join("data.bin");

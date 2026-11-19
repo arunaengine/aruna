@@ -519,8 +519,8 @@ impl Operation for DrainTimerOperation {
 mod tests {
     use super::*;
     use crate::jobs::JOB_LEASE_MS;
-    use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::test_calls::read_job_record;
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::Event;

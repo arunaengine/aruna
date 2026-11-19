@@ -840,6 +840,7 @@ dependencies = [
  "aruna-plugin-types",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-test-support",
  "astral_async_zip",
  "async-trait",
  "axum",
@@ -1038,15 +1039,28 @@ dependencies = [
 name = "aruna-test-support"
 version = "3.0.0-alpha.207"
 dependencies = [
+ "aruna-blob",
  "aruna-core",
  "aruna-drivers",
+ "aruna-graph",
+ "aruna-net",
  "aruna-operations",
+ "aruna-outbound",
  "aruna-storage",
  "aruna-tasks",
+ "axum",
+ "bytes",
  "chrono",
  "ed25519-dalek 3.0.0",
+ "futures-util",
+ "iroh",
  "irokle",
  "jsonwebtoken",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
  "ulid 3.0.0",
 ]
 

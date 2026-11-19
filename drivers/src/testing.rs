@@ -1,9 +1,14 @@
-//! Builds driver contexts, raw storage and graph calls, a local net config, a frozen clock and an
-//! RO-Crate import job record for the tests of the drivers, the operations and the node.
+//! Builds driver contexts, raw storage, graph, bucket and access rows, a local net config, a frozen
+//! clock and an RO-Crate import job record for the tests of the drivers, the operations and the node.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::HashMap;
+
+use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
+use aruna_core::egress::EgressPolicy;
+use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -12,11 +17,17 @@ use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId,
     JobPayload, JobRecord, RoCrateLimits,
 };
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+};
+use aruna_core::structs::storage::blob::{Backend, BackendConfig};
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::types::GroupId;
 use aruna_core::task::TaskKey;
 use aruna_graph::GraphHandle;
-use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::StorageHandle;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use byteview::ByteView;
@@ -212,4 +223,145 @@ pub async fn read_user(
     .await
     .expect("the user is stored");
     aruna_core::structs::identity::user::User::from_bytes(&value).unwrap()
+}
+
+/// `context` with a file system blob backend below `root` on the same storage.
+pub async fn with_blob(context: &DriverContext, root: &std::path::Path) -> DriverContext {
+    let storage_handle = context.storage_handle.clone();
+    let net_handle = NetHandle::new(local_net(), storage_handle.clone())
+        .await
+        .unwrap();
+    let config = BackendConfig {
+        backend_type: Backend::FileSystem,
+        bucket_prefix: Some("aruna_".to_string()),
+        max_bucket_size: Some(100000),
+        multipart_bucket: Some("multipart".to_string()),
+        root: root.to_str().unwrap().to_string(),
+        service_config: HashMap::new(),
+        timeouts: Default::default(),
+    };
+    let policy = EgressPolicy::loopback();
+    let blob = BlobHandler::with_egress(config, storage_handle, net_handle, policy).await;
+    let blob = blob.unwrap();
+    let (http, policy) = blob.repository_client();
+    DriverContext {
+        blob_handle: Some(blob),
+        outbound_handle: Some(aruna_outbound::OutboundHandle::new(http, policy)),
+        ..context.clone()
+    }
+}
+
+/// Stores bucket `bucket` of `group_id`, created by `user_id` with `policies`.
+pub async fn seed_bucket(
+    context: &DriverContext,
+    bucket: &str,
+    group_id: GroupId,
+    user_id: UserId,
+    policies: Vec<aruna_core::structs::placement::policy::PlacementPolicyRef>,
+) {
+    let info = aruna_core::structs::storage::blob::BucketInfo {
+        group_id,
+        created_at: std::time::UNIX_EPOCH,
+        created_by: user_id,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: policies,
+        placement_policy_generation: 1,
+        compression: Compression::Off,
+        distribution: None,
+    };
+    let _ = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: aruna_core::keyspaces::S3_BUCKET_KEYSPACE.to_string(),
+            key: bucket.as_bytes().to_vec().into(),
+            value: info.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+}
+
+/// The group owner may write everywhere in the group except below `denied`.
+pub async fn seed_access(
+    context: &DriverContext,
+    scope: (RealmId, GroupId, NodeId),
+    denied: &str,
+) -> AuthContext {
+    seed_open_access(context, scope, denied, None, Vec::new()).await
+}
+
+/// Like `seed_access`, plus a role that lets everyone read `public` and realm request policies.
+pub async fn seed_open_access(
+    context: &DriverContext,
+    (realm_id, group_id, node_id): (RealmId, GroupId, NodeId),
+    denied: &str,
+    public: Option<&str>,
+    policies: Vec<aruna_core::request_policy::RequestPolicy>,
+) -> AuthContext {
+    let owner = UserId::local(Ulid::from_parts(5, 5), realm_id);
+    let actor = Actor {
+        node_id,
+        user_id: owner,
+        realm_id,
+    };
+    let mut document = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+    for role in document.roles.values_mut() {
+        role.permissions
+            .insert(denied.to_string(), Permission::DENY);
+    }
+    if let Some(public) = public {
+        let role_id = Ulid::from_parts(6, 6);
+        document.roles.insert(
+            role_id,
+            aruna_core::structs::identity::auth::Role {
+                role_id,
+                name: "public".to_string(),
+                permissions: std::collections::HashMap::from([(
+                    public.to_string(),
+                    Permission::READ,
+                )]),
+                assigned_users: std::collections::HashSet::from([UserId::nil(realm_id)]),
+            },
+        );
+    }
+    let group = Group {
+        display_name: "Lab".to_string(),
+        group_id,
+        realm_id,
+        roles: document.roles.keys().copied().collect(),
+        owner,
+    };
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+    config.request_policies = policies;
+    let realm_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
+    let (realm_key, group_key) = (realm_id.as_bytes().to_vec(), group_id.to_bytes().to_vec());
+    let rows = [
+        (
+            REALM_CONFIG_KEYSPACE,
+            realm_key.clone(),
+            config.to_bytes(&actor),
+        ),
+        (AUTH_KEYSPACE, realm_key, realm_doc.to_bytes(&actor)),
+        (GROUP_KEYSPACE, group_key.clone(), group.to_bytes(&actor)),
+        (AUTH_KEYSPACE, group_key, document.to_bytes(&actor)),
+    ];
+    let writes = rows
+        .into_iter()
+        .map(|(space, key, value)| (space.to_string(), key.into(), value.unwrap().into()))
+        .collect();
+    let effect = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
+    };
+    let event = context.storage_handle.send_storage_effect(effect).await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+    AuthContext {
+        user_id: owner,
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    }
 }

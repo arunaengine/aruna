@@ -2,28 +2,27 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
-use crate::document_repository::GetConfigOperation;
-use crate::groups::routing::BucketRules;
-use crate::groups::routing::SnapshotOperation;
-use crate::placement::policy::GateOperation;
-use crate::replication::queue::LiveVersionInput;
-use crate::replication::queue::LiveVersionOperation;
-use crate::s3::bucket::create::CreateBucketOperation;
-use crate::s3::object::head::HeadObjectInput;
-use crate::s3::object::head::HeadObjectOperation;
-use crate::s3::object::put::PutObjectConfig;
-use crate::s3::object::put::PutObjectInput;
-use crate::s3::object::put::PutObjectOperation;
-use crate::s3::object::search::SearchObjectsInput;
-use crate::s3::object::search_scan::SearchObjectsOperation;
+use aruna_operations::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::groups::routing::BucketRules;
+use aruna_operations::groups::routing::SnapshotOperation;
+use aruna_operations::placement::policy::GateOperation;
+use aruna_operations::replication::queue::LiveVersionInput;
+use aruna_operations::replication::queue::LiveVersionOperation;
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::object::head::HeadObjectInput;
+use aruna_operations::s3::object::head::HeadObjectOperation;
+use aruna_operations::s3::object::put::PutObjectConfig;
+use aruna_operations::s3::object::put::PutObjectInput;
+use aruna_operations::s3::object::put::PutObjectOperation;
+use aruna_operations::s3::object::search::SearchObjectsInput;
+use aruna_operations::s3::object::search_scan::SearchObjectsOperation;
 use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::jobs::ProgressReporter;
 use aruna_core::search::ObjectKeyMatch;
 use aruna_core::stream::BackendStream;
-use aruna_core::stream::StreamError;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_core::structs::execution::job::{
     JobClaim, JobId, JobPayload, JobProgress, JobRecord, StagingJobPrefix,
@@ -362,7 +361,7 @@ pub struct Fixture {
 
 impl Fixture {
     pub async fn new(endpoint: &str, table: serde_json::Value) -> Self {
-        use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
+        use aruna_operations::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
         use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 
         let test = setup_driver_context().await;
@@ -386,7 +385,7 @@ impl Fixture {
             .unwrap();
         spec.connector_id = connector.connector.connector_id;
         let scope = (spec.auth_context.realm_id, spec.group_id, spec.node_id);
-        spec.auth_context = crate::testing_access::seed_access(&driver, scope, "/none").await;
+        spec.auth_context = aruna_drivers::testing::seed_access(&driver, scope, "/none").await;
         let owner = spec.auth_context.user_id;
         for name in ["lists", &spec.bucket] {
             let bucket = create_test_bucket(&driver, spec.group_id, owner, name).await;
@@ -416,7 +415,7 @@ impl Fixture {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::test_calls::insert_job(&self.driver, &record)
+        aruna_drivers::driver::drive(aruna_operations::jobs::store::row_calls::insert_job(&record), &self.driver)
             .await
             .unwrap();
         JobContext {
@@ -522,7 +521,7 @@ impl Fixture {
 
     /// The whole object read through the ordinary read, or why it was refused.
     pub async fn read(&self, key: &str) -> Result<Vec<u8>, String> {
-        use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
+        use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
         use futures_util::StreamExt;
         let auth = &self.spec.auth_context;
         let input = GetObjectInput {
@@ -598,7 +597,7 @@ pub async fn write_object(
         .quota
         .effective_group_ceiling(&bucket.group_id);
     let length = body.len() as u64;
-    let body = BackendStream::new(futures_util::stream::iter([Ok::<_, StreamError>(body)]));
+    let body = BackendStream::once(body);
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: auth.user_id,
         group_id: bucket.group_id,

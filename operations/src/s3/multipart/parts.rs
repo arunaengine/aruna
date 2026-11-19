@@ -156,7 +156,7 @@ impl Operation for ListPartsOperation {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::tests::s3::seed_upload;
+    use aruna_test_support::s3::seed_upload;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;

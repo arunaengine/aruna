@@ -17,7 +17,8 @@ use ulid::Ulid;
 
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
-use super::tests::{Fixture, context, node, read, write};
+use super::tests::{commit, prepare};
+use aruna_test_support::groups::{Fixture, context, node, read, write};
 
 #[tokio::test]
 async fn unauthorized_prepare_refuses() {
@@ -25,7 +26,7 @@ async fn unauthorized_prepare_refuses() {
     fixture.plan.requested_by =
         aruna_core::UserId::local(Ulid::from_bytes([8; 16]), fixture.plan.realm_id);
     assert_eq!(
-        fixture.prepare(1).await,
+        prepare(&fixture, 1).await,
         Err(GroupDeletionError::Unauthorized)
     );
     assert!(
@@ -60,8 +61,8 @@ async fn realm_admin_deletes() {
         authorization.to_bytes(&fixture.actor).unwrap(),
     )
     .await;
-    let proof = fixture.prepare(1).await.unwrap();
-    fixture.commit(vec![proof]).await.unwrap();
+    let proof = prepare(&fixture, 1).await.unwrap();
+    commit(&fixture, vec![proof]).await.unwrap();
     let key = aruna_core::structs::identity::group::owner_group_key(
         fixture.plan.owner,
         fixture.plan.group_id,
@@ -82,7 +83,7 @@ use aruna_drivers::driver::drive;
 #[tokio::test]
 async fn prepared_restart_survives() {
     let fixture = Fixture::new(&[1]).await;
-    fixture.prepare(1).await.unwrap();
+    prepare(&fixture, 1).await.unwrap();
     fixture.context.storage_handle.close().await;
     let reopened = context(fixture.dir.path());
     let writes = vec![(
@@ -133,12 +134,12 @@ async fn prepared_restart_survives() {
 #[tokio::test]
 async fn committed_restart_replays() {
     let fixture = Fixture::new(&[1]).await;
-    let proof = fixture.prepare(1).await.unwrap();
+    let proof = prepare(&fixture, 1).await.unwrap();
     let certificate = GroupDeleteCertificate {
         plan: fixture.plan.clone(),
         proofs: vec![proof.clone()],
     };
-    let event = fixture.commit(vec![proof]).await.unwrap();
+    let event = commit(&fixture, vec![proof]).await.unwrap();
     fixture.context.storage_handle.close().await;
     let reopened = context(fixture.dir.path());
     let replayed = drive(
@@ -175,14 +176,14 @@ async fn peers_commit_once() {
     let first = Fixture::new(&[1, 2]).await;
     let second = Fixture::new(&[1, 2]).await;
     let proofs = vec![
-        first.prepare(1).await.unwrap(),
-        second.prepare(2).await.unwrap(),
+        prepare(&first, 1).await.unwrap(),
+        prepare(&second, 2).await.unwrap(),
     ];
     let certificate = GroupDeleteCertificate {
         plan: first.plan.clone(),
         proofs: proofs.clone(),
     };
-    let event = first.commit(proofs).await.unwrap();
+    let event = commit(&first, proofs).await.unwrap();
     for _ in 0..2 {
         drive(
             CommitOperation::new(
@@ -214,7 +215,7 @@ async fn peers_commit_once() {
 #[tokio::test]
 async fn missing_vote_refuses() {
     let fixture = Fixture::new(&[1, 2]).await;
-    let proof = fixture.prepare(1).await.unwrap();
+    let proof = prepare(&fixture, 1).await.unwrap();
     let mut operation = CommitOperation::new(
         GroupDeleteCertificate {
             plan: fixture.plan.clone(),
@@ -242,7 +243,7 @@ async fn missing_vote_refuses() {
 #[tokio::test]
 async fn frozen_write_atomic() {
     let fixture = Fixture::new(&[1]).await;
-    fixture.prepare(1).await.unwrap();
+    prepare(&fixture, 1).await.unwrap();
     let writes = vec![(
         SOURCE_INDEX_KEYSPACE.to_string(),
         b"connector".to_vec().into(),
@@ -320,7 +321,7 @@ async fn pending_metadata_refuses() {
     )
     .await;
     assert_eq!(
-        fixture.prepare(1).await,
+        prepare(&fixture, 1).await,
         Err(super::tests::empty("pending metadata creation"))
     );
 }
@@ -336,7 +337,7 @@ async fn corrupt_resource_refuses() {
     )
     .await;
     assert!(matches!(
-        fixture.prepare(1).await,
+        prepare(&fixture, 1).await,
         Err(GroupDeletionError::Unavailable(_))
     ));
     assert!(

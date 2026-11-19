@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use crate::testing_access::seed_access;
-use crate::tests::staging::{create_test_bucket, setup_driver_context};
+use aruna_drivers::testing::seed_access;
+use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
 use aruna_blob::archive::{open_zip, zip_close, zip_counted};
 use aruna_core::NodeId;
 use aruna_core::calls::ChildOutcome;
@@ -36,7 +36,7 @@ fn folder(prefix: &str) -> SelectionEntry {
 }
 
 struct Fixture {
-    staging: crate::tests::staging::StagingTestContext,
+    staging: aruna_test_support::staging::StagingTestContext,
     auth: AuthContext,
     realm_id: RealmId,
     node_id: NodeId,

@@ -442,7 +442,7 @@ mod tests {
     }
 
     fn metadata(length: u64) -> SourceMetadata {
-        crate::tests::staging::sized_source(length, None)
+        aruna_test_support::staging::sized_source(length, None)
     }
 
     fn spool_plan(reference: bool) -> SpoolSourceOperation {
@@ -455,8 +455,8 @@ mod tests {
             true => {
                 let source = crate::connectors::descriptor::build_source_binding(
                     StagingStrategy::Snapshot,
-                    &crate::tests::staging::sample_connector(),
-                    &crate::tests::staging::sample_metadata(),
+                    &aruna_test_support::staging::sample_connector(),
+                    &aruna_test_support::staging::sample_metadata(),
                     "folder/file.txt".to_string(),
                     None,
                     None,

@@ -34,8 +34,8 @@ use aruna_operations::plugins::host_steps::GrantedCall;
 use aruna_operations::plugins::store::Txn;
 use aruna_operations::plugins::test_support::Fixture;
 use aruna_operations::plugins::test_support::queued;
-use aruna_operations::testing::drain_projection_queue;
-use aruna_operations::testing::process_materialization_batch;
+use aruna_test_support::projection::drain_projection_queue;
+use aruna_test_support::metadata::process_materialization_batch;
 use aruna_plugin_types::calls::merge_into;
 
 /// Runs the projection and graph work a write queued.
@@ -1061,7 +1061,7 @@ async fn superseded_merge_journaled() {
     };
     use aruna_core::plugin_runs::source_key;
     use aruna_operations::metadata::record_reads::DocumentRecordOperation;
-    use aruna_operations::testing::project_create_events;
+    use aruna_test_support::projection::project_create_events;
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;
     let revision = revision_of(&broker, document).await;

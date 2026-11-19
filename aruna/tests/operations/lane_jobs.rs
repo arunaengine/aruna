@@ -9,7 +9,7 @@ use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::staging::lanes::LANE_ROWS;
 use aruna_operations::jobs::staging::lanes::parse_lanes;
-use aruna_operations::tests::staging::spec;
+use aruna_test_support::staging::spec;
 use ulid::Ulid;
 
 /// An S3 endpoint that lists `keys` page by page, as ListObjectsV2 does.
@@ -132,7 +132,7 @@ async fn job_context(
     use aruna_operations::connectors::create_connector::{
         SourceConnectorInput, SourceConnectorOperation,
     };
-    use aruna_operations::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
@@ -167,7 +167,7 @@ async fn job_context(
         object_permission_path(realm, group, node, &spec.bucket, key)
     });
     let denied = denied.as_deref().unwrap_or("/none");
-    spec.auth_context = aruna_operations::testing_access::seed_access(&driver, scope, denied).await;
+    spec.auth_context = aruna_drivers::testing::seed_access(&driver, scope, denied).await;
     let owner = spec.auth_context.user_id;
     let bucket = create_test_bucket(&driver, spec.group_id, owner, &spec.bucket).await;
     spec.bucket_identity = bucket.identity();
@@ -179,7 +179,7 @@ async fn job_context(
         claim_token,
         lease_expires_ms: u64::MAX,
     });
-    aruna_operations::jobs::store::test_calls::insert_job(&driver, &record)
+    aruna_test_support::jobs::insert_job(&driver, &record)
         .await
         .unwrap();
     let ctx = JobContext {

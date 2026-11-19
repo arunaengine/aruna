@@ -1719,7 +1719,7 @@ mod tests {
     #[tokio::test]
     async fn replaced_member_departs() {
         // A join replaced this node's member 3 before its bucket was released.
-        use crate::distribution::test_record::{realm, replicated, secret, store_record};
+        use crate::distribution::test_record::{realm, replicated, secret};
         use crate::distribution::test_store::{context, get, open};
         use aruna_core::structs::storage::distribution::snapshot::Tombstone;
         use aruna_core::structs::storage::distribution::{DistributionView, SignedSnapshot};
@@ -1734,7 +1734,7 @@ mod tests {
             conflict: None,
         };
         let (_dir, handle) = open();
-        store_record(&handle, set_id, view.to_bytes().unwrap()).await;
+        aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), view.to_bytes().unwrap()).await;
         let left = DistributionBinding {
             member_id: Ulid::from_bytes([3; 16]),
             ..crate::distribution::test_record::binding(&snapshot, 2, 5)
@@ -1790,7 +1790,6 @@ mod tests {
     async fn drops_settled_imports() {
         // A former coordinator drops the imports it kept for a transfer no longer open only.
         use crate::distribution::imports::KeepResumeOperation;
-        use crate::distribution::test_record::store_record;
         use crate::distribution::test_record::{binding, member, realm, replicated, secret};
         use crate::distribution::test_store::{context, get, open};
         use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
@@ -1817,7 +1816,7 @@ mod tests {
             conflict: None,
         };
         let (_dir, handle) = open();
-        store_record(&handle, set_id, view.to_bytes().unwrap()).await;
+        aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec(), view.to_bytes().unwrap()).await;
         let info = BucketInfo {
             group_id: snapshot.config.owner_group,
             created_at: std::time::SystemTime::UNIX_EPOCH,

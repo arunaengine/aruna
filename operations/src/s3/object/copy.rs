@@ -943,9 +943,10 @@ pub(crate) mod test {
     use super::*;
     use crate::s3::object::get::GetObjectOperation;
     #[allow(unused_imports)]
-    pub(crate) use crate::testing_objects::{put_config, seed_bucket, with_blob};
+    pub(crate) use crate::testing_objects::put_config;
+    pub(crate) use aruna_drivers::testing::{seed_bucket, with_blob};
     use crate::tests::policy::{seed_gate, subject};
-    use crate::tests::s3::{full_context, spawn_reference_server, write_version};
+    use aruna_test_support::s3::{full_context, spawn_reference_server, write_version};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};

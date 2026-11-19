@@ -1,18 +1,52 @@
-//! Syncs and reconciles document topics and restores the outbox timers, as a node does.
+//! Reads the document outbox, restores its timers and syncs and reconciles topics, as a node does.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentReconcileResult;
+use aruna_core::document::{DocumentOutboxRecord, DocumentReconcileResult};
 use aruna_core::document_apply::ApplyError;
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
+use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
-use aruna_operations::sync::document_outbox::OutboxTimerOperation;
+use aruna_operations::sync::document_outbox::{
+    OutboxPagePlan, OutboxReadBatch, OutboxTailsOperation, OutboxTimerOperation, ReadOutboxPlan,
+};
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
+
+/// The outbox record stored at `key`.
+pub async fn read_outbox_record(
+    storage: &StorageHandle,
+    key: &[u8],
+) -> Result<Option<DocumentOutboxRecord>, ApplyError> {
+    let plan = ReadOutboxPlan { key: key.to_vec() };
+    drive(PlanOperation::new(plan), &test_context(storage.clone())).await
+}
+
+/// One page of outbox records under `prefix`.
+pub async fn read_outbox_records(
+    storage: &StorageHandle,
+    prefix: &[u8],
+    start_after: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<OutboxReadBatch, ApplyError> {
+    let plan = OutboxPagePlan {
+        prefix: prefix.to_vec(),
+        start_after,
+        limit,
+    };
+    drive(PlanOperation::new(plan), &test_context(storage.clone())).await
+}
+
+/// The last key of every outbox stream that holds a record.
+pub async fn read_outbox_tails(
+    storage: &StorageHandle,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ApplyError> {
+    drive(OutboxTailsOperation::new(), &test_context(storage.clone())).await
+}
 
 /// Arms the outbox drain on `tasks` as a restarting node does.
 pub async fn restore_outbox_timers(storage: &StorageHandle, tasks: &TaskHandle) {

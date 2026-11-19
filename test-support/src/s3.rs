@@ -1,5 +1,5 @@
-//! Opens temporary storage and full contexts for the S3 tests, with shared seeds, stored versions
-//! and a reference server.
+//! Opens temporary storage and full contexts for S3 tests, with seeds, stored versions and a
+//! reference server.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

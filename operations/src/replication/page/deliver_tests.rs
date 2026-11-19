@@ -27,7 +27,7 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use super::*;
-use crate::distribution::test_record::{binding, realm, replicated, secret, store_record};
+use crate::distribution::test_record::{binding, realm, replicated, secret};
 use crate::distribution::test_store::{context, install, open};
 use crate::replication::drain::ProcessBatchOperation;
 use crate::replication::page::apply::tests::source;
@@ -44,7 +44,7 @@ struct Node {
 /// A node holding the set's record and its member bucket of `seed`.
 async fn node(snapshot: &DistributionSnapshot, bytes: &[u8], seed: u8) -> Node {
     let (dir, handle) = open();
-    store_record(&handle, snapshot.set_id(), bytes.to_vec()).await;
+    aruna_drivers::testing::write_value(&handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes.to_vec()).await;
     install(&handle, snapshot.set_id(), &snapshot.config.ranges).await;
     let bucket = BucketInfo {
         group_id: snapshot.config.owner_group,

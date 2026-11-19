@@ -71,7 +71,7 @@ fn is_child<T>(next: &Result<Next<T>, JobError>) -> bool {
 }
 
 fn bucket(group_id: GroupId) -> BucketInfo {
-    crate::tests::s3::bucket_info(group_id, Default::default())
+    aruna_test_support::s3::bucket_info(group_id, Default::default())
 }
 
 /// The stored credential the mint of `spec` and `record` would accept.

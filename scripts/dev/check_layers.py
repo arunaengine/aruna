@@ -79,8 +79,12 @@ CRATE_TARGETS = {
     # Test helpers that drive operations; only dev-dependencies name it.
     "aruna-test-support": (
         "aruna-core",
+        "aruna-blob",
+        "aruna-graph",
+        "aruna-net",
         "aruna-operations",
         "aruna-drivers",
+        "aruna-outbound",
         "aruna-storage",
         "aruna-tasks",
     ),

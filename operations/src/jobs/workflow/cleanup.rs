@@ -300,7 +300,7 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::jobs::store::test_calls::{insert_job, record_attempt_intent};
+    use aruna_test_support::jobs::insert_job;
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;
@@ -495,7 +495,7 @@ mod tests {
             lease_expires_ms: 10_000,
         });
         insert_job(context, &record).await.unwrap();
-        record_attempt_intent(context, job_id, token, intent(job_id, kind), None, None, 2)
+        aruna_drivers::driver::drive(crate::jobs::store::job_calls::record_attempt_intent( job_id, token, intent(job_id, kind), None, None, 2, ), context)
             .await
             .unwrap()
             .record

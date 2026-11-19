@@ -1449,7 +1449,7 @@ mod tests {
         use crate::tests::device::store_folder;
         use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
 
-        let fixture = crate::tests::staging::setup_driver_context().await;
+        let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("note.txt"), b"note").unwrap();
@@ -1723,10 +1723,10 @@ mod tests {
     // no records of begins, and a forwarded listing that starts there is refused, not passed on.
     #[tokio::test]
     async fn lists_set_ranges() {
-        use crate::distribution::test_record::{binding, record, store_record};
+        use crate::distribution::test_record::{binding, record};
         let fixture = policy_fixture(None).await;
         let (snapshot, bytes) = record(true);
-        store_record(&fixture.context.storage_handle, snapshot.set_id(), bytes).await;
+        aruna_drivers::testing::write_value(&fixture.context.storage_handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
         let binding = binding(&snapshot, 1, 5);
         let listing = |cursor| SetListing {
             bucket: "spire".to_string(),
@@ -1751,10 +1751,10 @@ mod tests {
 
     #[tokio::test]
     async fn pulls_follow_coordinator() {
-        use crate::distribution::test_record::{binding, record, secret, store_record};
+        use crate::distribution::test_record::{binding, record, secret};
         let fixture = policy_fixture(None).await;
         let (snapshot, bytes) = record(true);
-        store_record(&fixture.context.storage_handle, snapshot.set_id(), bytes).await;
+        aruna_drivers::testing::write_value(&fixture.context.storage_handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
         let mut bucket = bucket_info(fixture.group_id, fixture.auth.user_id);
         bucket.distribution = Some(binding(&snapshot, 1, 5));
         assert_eq!(coordinates(&fixture.context, &bucket, "a").await, Ok(()));

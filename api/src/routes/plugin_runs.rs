@@ -1301,7 +1301,7 @@ mod tests {
     #[tokio::test]
     async fn lists_work_state() {
         // The receiver lists its work with the state of each job, to the group's admins only.
-        use crate::job_test_calls::insert_job;
+        use aruna_test_support::jobs::insert_job;
         use aruna_core::structs::execution::job::{
             JobId, JobPayload, JobRecord, JobState, PluginWorkAction, PluginWorkSpec,
         };

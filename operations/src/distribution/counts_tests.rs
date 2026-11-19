@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::distribution::test_record::{record, store_record};
+use crate::distribution::test_record::record;
 use aruna_core::calls::IoCall;
 use aruna_core::structs::storage::distribution::snapshot::Deletion;
 use aruna_core::types::{Key, Value};
@@ -57,7 +57,7 @@ async fn counts_owner_group() {
         outbound_handle: None,
     };
     let (snapshot, bytes) = record(true);
-    store_record(&context.storage_handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(&context.storage_handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), bytes).await;
     let owner = snapshot.config.owner_group;
 
     let all = drive(SetCountsOperation::new(None), &context)
@@ -104,11 +104,7 @@ async fn reads_deleting_record() {
         head: SignedSnapshot::sign(snapshot.clone(), realm(), &secret(1)).unwrap(),
         conflict: None,
     };
-    store_record(
-        &context.storage_handle,
-        snapshot.set_id(),
-        view.to_bytes().unwrap(),
-    )
+    aruna_drivers::testing::write_value(&context.storage_handle, aruna_core::keyspaces::DISTRIBUTION_KEYSPACE, snapshot.set_id().to_bytes().to_vec(), view.to_bytes().unwrap())
     .await;
 
     let counts = drive(

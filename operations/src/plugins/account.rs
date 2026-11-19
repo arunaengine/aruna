@@ -11,7 +11,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, USER_KEYSPACE,
 };
-use aruna_core::operation::{Operation, Runnable};
+use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::{InstallGuard, PluginInstall, Prerequisite};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::storage_entries::reducer_state_key;
@@ -94,10 +94,9 @@ pub(crate) fn read_user_result(result: IoResult) -> Result<Option<User>, Account
 }
 
 /// Runs `operation` as a child that answers only whether it worked and why not.
-fn step<O, K>(operation: O) -> IoCall
+fn step<O>(operation: O) -> IoCall
 where
-    O: Runnable<K> + 'static,
-    K: 'static,
+    O: Operation + 'static,
     O::Output: Send + 'static,
     O::Error: std::fmt::Display + Send + 'static,
 {

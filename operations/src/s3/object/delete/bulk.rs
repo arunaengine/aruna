@@ -121,7 +121,7 @@ mod test {
     use tempfile::TempDir;
 
     async fn test_context() -> (TempDir, DriverContext) {
-        crate::tests::s3::full_context().await
+        aruna_test_support::s3::full_context().await
     }
 
     async fn seed_object(

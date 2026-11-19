@@ -741,7 +741,7 @@ mod tests {
 
     #[tokio::test]
     async fn checks_bucket_access() {
-        use crate::tests::s3::test_storage;
+        use aruna_test_support::s3::test_storage;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::storage::blob::object_permission_path;
         use aruna_drivers::testing::test_context;
@@ -752,7 +752,7 @@ mod tests {
         let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
         let secret = object_permission_path(realm, rule.group_id, node, &rule.bucket, "secret/**");
         let scope = (realm, rule.group_id, node);
-        let auth = crate::testing_access::seed_access(&context, scope, &secret).await;
+        let auth = aruna_drivers::testing::seed_access(&context, scope, &secret).await;
 
         let load =
             |auth: &AuthContext| drive(RuleAccessOperation::new(auth, node, &rule), &context);

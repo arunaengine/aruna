@@ -226,7 +226,7 @@ async fn persists_receipt_first() {
         .expect("reservation is durable");
     assert_eq!(reservation.execution_id, execution_id);
     assert!(
-        crate::jobs::store::test_calls::read_job_record(&ctx, spec.job_id, None)
+        aruna_test_support::jobs::read_job_record(&ctx, spec.job_id, None)
             .await
             .expect("physical row read")
             .is_some()

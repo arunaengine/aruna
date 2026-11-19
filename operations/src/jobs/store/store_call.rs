@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id_mint::IdMint;
-use aruna_core::operation::{ByCalls, Operation};
+use aruna_core::operation::Operation;
 use aruna_core::rows::{done, read_row};
 use aruna_core::types::{Key, KeySpace, Value};
 use ulid::Ulid;
@@ -79,7 +79,7 @@ impl<T: 'static> StoreCall<T> {
         M: FnMut(O::Output) -> Result<T, JobMutationError> + Send + 'static,
     {
         Self {
-            start: Box::new(move |id| IoCall::child::<O, ByCalls>(build(id))),
+            start: Box::new(move |id| IoCall::child::<O>(build(id))),
             finish: Box::new(move |result| {
                 let output = result.child::<O::Output, JobMutationError>()?;
                 Ok(output.and_then(&mut map))

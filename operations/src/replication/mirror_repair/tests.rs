@@ -16,7 +16,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Runnable};
+use aruna_core::operation::Operation;
+use aruna_core::calls::CallRun;
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::Actor;
@@ -252,9 +253,9 @@ async fn outgoing(
 }
 
 /// Runs `operation` against storage until it asks to commit, and returns that commit.
-async fn run_to_commit<O: EffectOperation>(
+async fn run_to_commit<O: Operation>(
     context: &DriverContext,
-    operation: &mut O,
+    operation: &mut CallRun<O>,
 ) -> StorageEffect {
     let mut queue: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
     while let Some(effect) = queue.pop_front() {
@@ -329,8 +330,8 @@ async fn claims_conflict() {
         let relationship = relationship();
         let record = staged_record(&context, &relationship).await;
         let mut activation =
-            CreateRelationshipOperation::activate(relationship.clone()).into_machine();
-        let mut rollback = SettleReconcileOperation::new(record.clone()).into_machine();
+            CallRun::new(CreateRelationshipOperation::activate(relationship.clone()));
+        let mut rollback = CallRun::new(SettleReconcileOperation::new(record.clone()));
         let activation_commit = run_to_commit(&context, &mut activation).await;
         let rollback_commit = run_to_commit(&context, &mut rollback).await;
         let (first, second) = match activation_first {
