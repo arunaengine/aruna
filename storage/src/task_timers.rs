@@ -58,6 +58,7 @@ fn timer_is_restored(effect: &TaskEffect) -> bool {
             | TaskKey::PruneConnectorReferences
             | TaskKey::MaintainRanges
             | TaskKey::DrainWatchEvents
+            | TaskKey::DrainAppliedSync
     )
 }
 

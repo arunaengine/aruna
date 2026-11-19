@@ -101,6 +101,8 @@ pub const FILL_CLAIM_KEYSPACE: &str = "distribution_fill_claims";
 pub const DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
+/// Applied document reconciles whose follow-ups the node drain still runs, by reconcile id.
+pub const APPLIED_SYNC_KEYSPACE: &str = "document_applied_sync";
 pub const OUTBOX_INDEX_KEYSPACE: &str = "token_revocation_outbox_index";
 pub const SYNC_REVISION_KEYSPACE: &str = "document_sync_revisions";
 pub const SYNC_CONFLICT_KEYSPACE: &str = "document_sync_conflicts";
@@ -648,6 +650,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DOCUMENT_CONFLICT_KEYSPACE,
     APPLIED_OPS_KEYSPACE,
     SYNC_OUTBOX_KEYSPACE,
+    APPLIED_SYNC_KEYSPACE,
     OUTBOX_INDEX_KEYSPACE,
     SYNC_REVISION_KEYSPACE,
     SYNC_CONFLICT_KEYSPACE,

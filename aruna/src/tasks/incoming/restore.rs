@@ -380,6 +380,10 @@ impl TaskQueues {
         handler
             .reschedule_timer(TaskKey::DrainWatchEvents, Duration::ZERO)
             .await;
+        // Follow-ups of shard reconciles applied before a restart run once the drain does.
+        handler
+            .reschedule_timer(TaskKey::DrainAppliedSync, Duration::ZERO)
+            .await;
         if context.blob_handle.is_some() {
             let arm = ArmSweepOperation::new(TaskKey::SweepHiddenBlobs);
             if let Err(error) = drive(arm, &context).await {

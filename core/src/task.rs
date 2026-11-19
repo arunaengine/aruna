@@ -93,6 +93,8 @@ pub enum TaskKey {
     MaintainRanges,
     /// Emits the watch events producers queued as rows, then deletes the rows.
     DrainWatchEvents,
+    /// Runs the follow-ups of the reconciles shard pulls applied, then deletes their rows.
+    DrainAppliedSync,
 }
 
 impl TaskKey {
