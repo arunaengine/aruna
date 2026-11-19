@@ -10,6 +10,7 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::run_entropy;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE, STAGING_STATE_KEYSPACE,
@@ -437,6 +438,8 @@ fn prepared_rows_checked() {
     let prepared = prepare(entries.clone());
     let expected = prepared.rows.writes.clone();
     let mut operation = PageImportOperation::new(input(entries)).with_prepared(Some(prepared));
+    // The runner seeds every run with its own entropy; the preparation kept the default.
+    operation.seed(run_entropy(1, 1));
     let other = reference("data/x", observation("x"), false);
     let heads = vec![head(Ulid::from_parts(JOB_CREATED_MS - 5, 1)), None];
     let writes = run_to_writes(&mut operation, heads, Some(vec![other]));
@@ -1153,13 +1156,21 @@ async fn exchange(
 async fn count_exchanges(
     operation: PageImportOperation,
     handle: &aruna_storage::StorageHandle,
+    process: u32,
 ) -> (usize, Result<PageImportResult, PageImportError>) {
     let mut operation = operation.into_machine();
+    // Each run gets its own entropy, as the runner gives it.
+    let (now_ms, mut slot) = (2_000_000, 0);
+    operation.stamp(now_ms);
+    operation.seed(run_entropy(process, slot));
     let mut exchanges = 0;
     let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
     while let Some(effect) = effects.pop_front() {
         let event = match effect {
             Effect::SubOperation(mut child) => {
+                slot += 1;
+                child.stamp(now_ms);
+                child.seed(run_entropy(process, slot));
                 let mut inner: std::collections::VecDeque<Effect> =
                     child.start().into_iter().collect();
                 while let Some(effect) = inner.pop_front() {
@@ -1214,7 +1225,8 @@ async fn page_exchanges_measured() {
             expected_bucket: bound.clone(),
             ..input(entries.collect())
         };
-        let (exchanges, result) = count_exchanges(PageImportOperation::new(input), handle).await;
+        let operation = PageImportOperation::new(input);
+        let (exchanges, result) = count_exchanges(operation, handle, page as u32).await;
         assert_eq!(result.unwrap().registered, ENTRIES as u64);
         println!("distributed page {page}: {exchanges} storage exchanges for {ENTRIES} keys");
     }
@@ -1229,7 +1241,8 @@ async fn page_exchanges_measured() {
             ..input(entries.collect())
         };
         let started = std::time::Instant::now();
-        let (exchanges, result) = count_exchanges(PageImportOperation::new(input), handle).await;
+        let operation = PageImportOperation::new(input);
+        let (exchanges, result) = count_exchanges(operation, handle, 4 + page as u32).await;
         assert_eq!(result.unwrap().registered, GATHERED as u64);
         let elapsed = started.elapsed().as_millis();
         println!(
