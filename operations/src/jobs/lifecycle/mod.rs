@@ -24,7 +24,6 @@ pub mod family_reads;
 mod fetch;
 mod forward;
 pub mod held;
-pub mod ids;
 #[cfg(test)]
 mod ingress;
 mod input_capture;

@@ -22,9 +22,9 @@ use crate::jobs::lifecycle::admit::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation,
 };
 use crate::jobs::lifecycle::alias::AliasFamilyOperation;
-use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
 use crate::jobs::submit::SubmitJobError;
 use crate::tests::records::{Family, REALM, context, node, payload, secret, user};
+use aruna_core::job_request::{SubmissionRequest, SubmissionScope, store_workspace};
 use aruna_core::metadata::AuthToken;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;

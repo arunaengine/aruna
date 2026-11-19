@@ -24,7 +24,7 @@ use super::credential::{
 };
 use super::input_view::{CachedKeysOperation, ViewEntry, ViewError, view_bucket, view_entries};
 use super::inputs::LoadInputsOperation;
-use crate::jobs::lifecycle::ids::session_of;
+use aruna_core::job_request::session_of;
 
 pub const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 

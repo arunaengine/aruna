@@ -9,6 +9,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::{ExecutorCapability, NetworkAccess};
 use aruna_core::events::LaunchDecline;
 use aruna_core::id::NodeId;
+use aruna_core::job_request;
 use aruna_core::node_state::{
     DrainState, DrainStateError, DrainStateOperation, NodeInfoError, ReadInfoOperation,
 };
@@ -27,7 +28,6 @@ use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::types::Value;
 use ulid::Ulid;
 
-use super::ids;
 use super::plan::{REALM_STAGING, network_access};
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{PolicySets, compiled_policies, policy_reads, read_policies};
@@ -145,7 +145,7 @@ impl LocalCapabilityOperation {
                 .as_deref()
                 .is_some_and(|kind| kind.trim() != capability.kind.trim())
             || !capability.supports(REALM_STAGING)
-            || (ids::session_of(&spec.payload).is_some()
+            || (job_request::session_of(&spec.payload).is_some()
                 && network_access(spec) != NetworkAccess::Open
                 && !capability.session)
             || !capability.limits.fits(&spec.resources)
@@ -153,7 +153,7 @@ impl LocalCapabilityOperation {
             return Err(LaunchDecline::Unauthorized);
         }
         let labels =
-            ids::required_labels(&spec.payload).map_err(|_| LaunchDecline::Unauthorized)?;
+            job_request::required_labels(&spec.payload).map_err(|_| LaunchDecline::Unauthorized)?;
         let carried = |key: &str| capability.subject.labels.get(key).map(|value| value.trim());
         if !labels
             .iter()

@@ -34,7 +34,6 @@ use ulid::Ulid;
 use super::LifecycleError;
 use super::cancel::FlagLocalRunOperation;
 use super::fetch::{FetchFamilyOperation, FetchedFamily};
-use super::ids::workspace_of;
 use super::launch_checks::{CheckError, LaunchCheck, LaunchChecksOperation, Verdict};
 use super::outbox::schedule_outbox_drain;
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
@@ -51,6 +50,7 @@ use crate::jobs::records::pages::{
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::submit::{mint_configured_job, schedule_drain_effect};
+use aruna_core::job_request::workspace_of;
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -984,7 +984,7 @@ fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::jobs::lifecycle::ids;
+    use aruna_core::job_request;
     use aruna_core::scheduling::PlannedInput;
     use aruna_core::structs::execution::job::{InputMode, InputSelection, JobId, WorkspaceOutput};
 
@@ -1237,7 +1237,7 @@ mod tests {
             container_path: "/out/result.txt".to_string(),
             dest_key: "results/result.txt".to_string(),
         });
-        ids::store_workspace(
+        job_request::store_workspace(
             &mut spec.payload,
             WorkspaceMode::Existing,
             Some("existing".to_string()),

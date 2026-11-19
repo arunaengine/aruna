@@ -37,6 +37,7 @@ pub mod holder_choice;
 pub mod id;
 pub mod id_mint;
 pub mod injection;
+pub mod job_request;
 pub mod jobs;
 pub mod join_request;
 pub mod key_index;

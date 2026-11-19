@@ -6,13 +6,13 @@ use std::collections::BTreeSet;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
+use aruna_core::job_request;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{ExecutionSpec, OutputDestination, WorkspaceMode};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::types::GroupId;
 
-use super::ids;
 use crate::jobs::submit::SubmitJobError;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -44,7 +44,7 @@ impl OutputPoliciesOperation {
                 bucket.clone()
             })
             .collect();
-        let (mode, workspace) = ids::workspace_of(spec);
+        let (mode, workspace) = job_request::workspace_of(spec);
         if mode == WorkspaceMode::Existing
             && let Some(bucket) = workspace
         {

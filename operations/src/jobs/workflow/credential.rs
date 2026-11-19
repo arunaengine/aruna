@@ -26,10 +26,10 @@ use aruna_core::types::GroupId;
 use super::DEFAULT_WALLTIME;
 use super::workspace::{authorization_error, bucket_lookup_error};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::jobs::lifecycle::ids::session_of;
 use crate::s3::access::create::{CreateUserConfig, CreateUserError, CreateUserOperation};
 use crate::s3::access::get::{GetAccessError, GetAccessOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::job_request::session_of;
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.
 const CREDENTIAL_SLACK: Duration = Duration::from_secs(6 * 60 * 60);

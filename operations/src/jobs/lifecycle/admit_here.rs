@@ -28,7 +28,6 @@ use super::LifecycleError;
 use super::admit::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission,
 };
-use super::ids::{RequestIdentity, SubmissionRequest, effective_resources};
 use super::outbox::schedule_outbox_drain;
 use super::witness_arm::ArmFamilyOperation;
 use crate::jobs::quota::{QuotaCheckOperation, QuotaError, QuotaVerdict};
@@ -37,6 +36,7 @@ use crate::jobs::records::project::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
 };
 use crate::jobs::submit::SubmitJobError;
+use aruna_core::job_request::{RequestIdentity, SubmissionRequest, effective_resources};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// stored in the immutable spec, so a later config change cannot widen it.
@@ -464,11 +464,10 @@ mod tests {
     use super::*;
     use crate::tests::records::{Family, payload, user};
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::job_request::{SubmissionScope, store_workspace};
     use aruna_core::structs::execution::job::record_rows::PROJECTION_CACHE_VERSION;
     use aruna_core::structs::execution::job::{JobProjection, OutputSet, WorkspaceMode};
     use aruna_core::types::{Key, Value};
-
-    use super::super::ids::{SubmissionScope, store_workspace};
 
     fn admission(family: &Family) -> LocalAdmission {
         let mut spec = payload();

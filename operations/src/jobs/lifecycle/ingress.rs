@@ -4,7 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::jobs::lifecycle::ids::store_workspace;
     use crate::jobs::lifecycle::input_walk::RangeHolderOperation;
     use crate::jobs::lifecycle::submission_rules::{
         admitted_description, answers_input, batch_len, exact_version, pin_outputs,
@@ -16,6 +15,7 @@ mod tests {
     use crate::tests::records::captured_input;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::job_request::store_workspace;
     use aruna_core::jobs::SubmissionRefusal;
     use aruna_core::structs::execution::job::OutputDestination;
     use aruna_core::structs::execution::job::{CapturedInput, WorkspaceMode};

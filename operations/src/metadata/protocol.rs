@@ -35,11 +35,11 @@ use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::jobs::lifecycle::ids::SubmissionRequest;
 use crate::metadata::api::export_types::RoCrateExportView;
 use crate::metadata::api::preflight_types::{ReferenceNodeExecution, ReferenceNodeRequest};
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::update_document::UpdateDocumentMutation;
+use aruna_core::job_request::SubmissionRequest;
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::search::{BucketPage, ObjectKeyMatch, SearchNodePage};

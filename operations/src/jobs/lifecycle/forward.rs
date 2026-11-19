@@ -16,10 +16,10 @@ use aruna_core::structs::execution::job::SubmissionId;
 use tracing::{debug, warn};
 
 use super::admit_here::AcceptedSubmission;
-use super::ids::{RequestIdentity, SubmissionRequest};
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::protocol::metadata_request;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
+use aruna_core::job_request::{RequestIdentity, SubmissionRequest};
 
 /// Upper bound of one forwarded request; the transport's own step limits end it earlier.
 const FORWARD_DEADLINE: Duration = Duration::from_secs(60);
@@ -157,9 +157,8 @@ mod tests {
     use super::*;
     use crate::tests::records::{node, payload, user};
     use aruna_core::events::PeerRequestError;
+    use aruna_core::job_request::SubmissionScope;
     use aruna_core::structs::execution::job::{JobId, LogicalJobState};
-
-    use super::super::ids::SubmissionScope;
 
     fn request() -> SubmissionRequest {
         SubmissionRequest {

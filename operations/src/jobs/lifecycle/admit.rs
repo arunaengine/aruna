@@ -24,10 +24,10 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Key, Value};
 use tracing::{debug, warn};
 
-use super::ids::workspace_of;
 use super::{LifecycleError, stored_view};
 use crate::jobs::records::verify::{Evidence, FamilyView};
 use crate::jobs::records::{RECORD_PAGE_SIZE, RecordStoreError};
+use aruna_core::job_request::workspace_of;
 use aruna_core::structs::execution::job::record_keys::{
     alias_key, family_prefix, record_key, submission_prefix,
 };
