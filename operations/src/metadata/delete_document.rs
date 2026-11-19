@@ -851,7 +851,10 @@ mod call_tests {
             None,
             None,
         ));
+        // The runner stamps and seeds a retry like any run; pinned inputs give the same rows.
         let mut retried = operation(&actor, &stored).fresh_copy();
+        retried.stamp(fixed_ms());
+        retried.seed(ENTROPY);
         let second = written(after_reads(&mut retried, &stored, None, None));
         assert_eq!(first, second);
     }
