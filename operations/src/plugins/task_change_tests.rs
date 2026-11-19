@@ -135,6 +135,19 @@ fn end_keeps_claimed() {
 }
 
 #[test]
+fn report_needs_task() {
+    let report = TaskChange::Report(Some("mapped".to_string()));
+    let (_, next) = applied(report.clone(), &reserved(), Some(TaskRow::default()));
+    let Ok(Next::Call(IoCall::Write(rows))) = next else {
+        panic!("an existing task row keeps the report");
+    };
+    let task: TaskRow = decode(&rows[1].2).unwrap();
+    assert_eq!(task.report.as_deref(), Some("mapped"));
+    let (_, next) = applied(report, &reserved(), None);
+    assert_eq!(next, Ok(Next::Done(Changed::default())));
+}
+
+#[test]
 fn settle_keeps_report() {
     let mut dispatched = reserved();
     dispatched.state = WorkState::Dispatched;

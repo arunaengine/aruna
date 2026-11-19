@@ -52,6 +52,7 @@ pub mod state;
 pub mod submit;
 pub mod sweep;
 pub mod task_change;
+pub mod task_report;
 pub mod task_row;
 pub mod task_send;
 pub mod task_start;
