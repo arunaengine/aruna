@@ -128,6 +128,7 @@ class ClassifyTest(unittest.TestCase):
                     "operations/src/abe/mixed.rs": PURE_OP + "async fn helper() {}\n",
                     "operations/src/abe/plain.rs": "pub fn plain() {}\n// .await in a comment\n",
                     "operations/src/abe/sub.rs": "impl<T: Send> SubOperation for Step<T> {}\n",
+                    "operations/src/abe/tight.rs": "fn f() { let a = async{}; let b = async move{}; }\n",
                 }
             )
         )
@@ -136,8 +137,9 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(kinds["operations/src/abe/mixed.rs"], "mixed")
         self.assertEqual(kinds["operations/src/abe/plain.rs"], "plain")
         self.assertEqual(kinds["operations/src/abe/sub.rs"], "op")
+        self.assertEqual(kinds["operations/src/abe/tight.rs"], "async")
         self.assertEqual(kinds["operations/src/jobs/mod.rs"], "async")
-        self.assertEqual(check_layers.async_lines(ops), {"abe": 3, "jobs": 1})
+        self.assertEqual(check_layers.async_lines(ops), {"abe": 4, "jobs": 1})
 
     def test_use_paths(self):
         paths = check_layers.use_paths("crate::a::{b, c::{d as e, self}, f::*}")
