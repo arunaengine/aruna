@@ -300,7 +300,8 @@ impl UpdateInstall {
         changeable(&current)?;
         let plugin = pick_version(&config, &current.plugin, Some(&self.digest))?;
         let manifest = read_manifest(&plugin)?;
-        check_supported(&manifest)?;
+        let quota = (config.compute.effective_quota(&current.group_id)).unwrap_or_default();
+        check_supported(&manifest, &quota)?;
         let stored: Map<String, Value> =
             serde_json::from_str(&current.settings).unwrap_or_default();
         let settings = check_settings(&manifest, self.settings.as_ref().unwrap_or(&stored))?;

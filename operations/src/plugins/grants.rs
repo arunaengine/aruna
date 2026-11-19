@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use aruna_core::NodeId;
+use aruna_core::compute::quota::ComputeQuota;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
 use aruna_core::structs::identity::realm::RealmId;
@@ -65,10 +66,18 @@ impl InstallScope {
     }
 }
 
-/// Refuses what this version of Aruna cannot run yet: container work.
-pub(crate) fn check_supported(manifest: &Manifest) -> Result<(), GrantError> {
-    if manifest.requested().contains(&Permission::JobsRun) {
-        return Err(GrantError::Unsupported("jobs.run cannot be granted yet"));
+/// Refuses a task whose resources no job of the group may have: above the per-job CPU, RAM or
+/// walltime limit of the group's compute quota.
+pub(crate) fn check_supported(manifest: &Manifest, quota: &ComputeQuota) -> Result<(), GrantError> {
+    for recipe in manifest.recipes.values() {
+        let over = quota.job_cpu_cores.is_some_and(|cpu| recipe.cpu > cpu)
+            || quota.job_ram_bytes.is_some_and(|ram| recipe.memory > ram)
+            || (quota.job_walltime_ms).is_some_and(|time| recipe.time.saturating_mul(1000) > time);
+        if over {
+            return Err(GrantError::Unsupported(
+                "a task asks for more CPU, memory or time than the group's jobs may have",
+            ));
+        }
     }
     Ok(())
 }

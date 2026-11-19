@@ -293,7 +293,8 @@ impl PrepareInstall {
             request.version.as_deref().or(pinned),
         )?;
         let manifest = read_manifest(&plugin)?;
-        check_supported(&manifest)?;
+        let quota = (config.compute.effective_quota(&request.group_id)).unwrap_or_default();
+        check_supported(&manifest, &quota)?;
         let settings = check_settings(&manifest, &request.settings)?;
         let scope = InstallScope {
             realm_id: self.realm_id,
