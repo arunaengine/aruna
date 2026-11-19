@@ -111,6 +111,11 @@ impl ExecutorOffer {
         }
     }
 
+    /// Where the backend's attempts live.
+    pub fn home(&self) -> [u8; 32] {
+        self.home
+    }
+
     /// The advertisement of this backend under `subject`, at the site it actually runs on.
     pub fn capability(
         &self,

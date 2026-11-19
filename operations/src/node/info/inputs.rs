@@ -8,10 +8,11 @@ use std::fmt::Display;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ExecutorCapability;
+use aruna_core::compute::identity::BackendConfigRecord;
 use aruna_core::compute::offer::ExecutorOffer;
 use aruna_core::compute::quota::{
     ComputeDemandSnapshot, ComputeReservationSnapshot, JobReservationRecord, ResourceTotals,
-    availability,
+    availability, backend_reserved,
 };
 use aruna_core::document::DocumentTarget;
 use aruna_core::keyspaces::{
@@ -38,6 +39,7 @@ use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
 use crate::metadata::repository::FILL_PAGE_SIZE;
+use crate::node::backend_record::{BackendRecordError, BackendRecordOperation};
 use crate::node::info::write::revision_generation;
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::usage::{LoadCountersError, LoadCountersOperation};
@@ -88,12 +90,12 @@ pub(in crate::node) fn advertises_executors(config: &RealmConfigDocument, node_i
 }
 
 /// This node's advertised execution targets at its placement subject (none without one), with
-/// availability as static ceilings minus local reservations. Ranking only: exact admission stays
-/// the target-side reservation.
+/// availability as each backend's static ceilings minus its own local reservations. Ranking only:
+/// exact admission stays the target-side reservation.
 fn advertised_executors(
     offers: &[ExecutorOffer],
     record: Option<&NodeSubjectRecord>,
-    reserved: &ResourceTotals,
+    held: &[JobReservationRecord],
     now_ms: u64,
 ) -> Result<Vec<ExecutorCapability>, String> {
     let Some(record) = record else {
@@ -104,7 +106,8 @@ fn advertised_executors(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("failed to build executor advertisements: {error}"))?;
     for capability in &mut capabilities {
-        capability.availability = Some(availability(&capability.limits, reserved, now_ms));
+        let reserved = backend_reserved(held, &capability.backend);
+        capability.availability = Some(availability(&capability.limits, &reserved, now_ms));
     }
     Ok(capabilities)
 }
@@ -304,6 +307,8 @@ pub struct Telemetry {
 #[derive(Debug, PartialEq)]
 enum TelemetryStep {
     Subject,
+    /// The config record of the executor at this index, whose generation it advertises.
+    Record(usize),
     Counters,
     Documents,
 }
@@ -315,7 +320,7 @@ pub struct TelemetryOperation {
     config: RealmConfigDocument,
     node_id: NodeId,
     facts: NodeFacts,
-    reserved: ResourceTotals,
+    held: Vec<JobReservationRecord>,
     now_ms: u64,
     built: Option<(Vec<ExecutorCapability>, BTreeMap<String, String>)>,
     storage_bytes_used: u64,
@@ -327,14 +332,14 @@ impl TelemetryOperation {
         config: RealmConfigDocument,
         node_id: NodeId,
         facts: NodeFacts,
-        reserved: ResourceTotals,
+        held: Vec<JobReservationRecord>,
         now_ms: u64,
     ) -> Self {
         Self {
             config,
             node_id,
             facts,
-            reserved,
+            held,
             now_ms,
             built: None,
             storage_bytes_used: 0,
@@ -348,16 +353,29 @@ impl TelemetryOperation {
         record: Option<&NodeSubjectRecord>,
     ) -> Result<Next<Telemetry>, InfoFlowError> {
         let facts = &self.facts;
-        let executors = advertised_executors(&facts.offers, record, &self.reserved, self.now_ms)
+        let executors = advertised_executors(&facts.offers, record, &self.held, self.now_ms)
             .map_err(InfoFlowError::Step)?;
         // Class labels stay advertisement only and never enter the placement selector input.
         let mut labels =
             placement_labels(&self.config, self.node_id).map_err(InfoFlowError::Step)?;
         labels.extend(facts.class_labels.clone());
         self.built = Some((executors, labels));
-        self.step = TelemetryStep::Counters;
-        let counters = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
-        Ok(Next::Call(IoCall::child(counters)))
+        self.record_next(0)
+    }
+
+    /// Stores the config record of the executor at `index`, then reads the usage counters.
+    fn record_next(&mut self, index: usize) -> Result<Next<Telemetry>, InfoFlowError> {
+        let executors = self.built.as_ref().map(|(executors, _)| executors);
+        let capability = executors.and_then(|executors| executors.get(index));
+        let (Some(capability), Some(offer)) = (capability, self.facts.offers.get(index)) else {
+            self.step = TelemetryStep::Counters;
+            let counters = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
+            return Ok(Next::Call(IoCall::child(counters)));
+        };
+        let digests = (offer.home(), capability.config_digest);
+        let record = BackendRecordOperation::new(&capability.backend, digests);
+        self.step = TelemetryStep::Record(index);
+        Ok(Next::Call(IoCall::child(record)))
     }
 }
 
@@ -388,6 +406,14 @@ impl Operation for TelemetryOperation {
             TelemetryStep::Subject => {
                 let record = child_answer::<Option<NodeSubjectRecord>, InfoFlowError>(result)?;
                 self.build(record.as_ref())
+            }
+            TelemetryStep::Record(index) => {
+                let record = child_answer::<BackendConfigRecord, BackendRecordError>(result)?;
+                let executors = self.built.as_mut().map(|(executors, _)| executors);
+                if let Some(capability) = executors.and_then(|executors| executors.get_mut(index)) {
+                    capability.config_generation = record.config_generation;
+                }
+                self.record_next(index + 1)
             }
             TelemetryStep::Counters => {
                 let counters: UsageCounters = child_answer::<_, LoadCountersError>(result)?;
@@ -510,7 +536,7 @@ pub(super) mod tests {
     }
 
     fn telemetry(facts: NodeFacts) -> TelemetryOperation {
-        TelemetryOperation::new(config(), node(), facts, ResourceTotals::default(), NOW)
+        TelemetryOperation::new(config(), node(), facts, Vec::new(), NOW)
     }
 
     #[test]
@@ -539,6 +565,40 @@ pub(super) mod tests {
             telemetry.labels.get("class").map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn records_config_generation() {
+        use aruna_core::structs::placement::policy::PlacementSubject;
+        let mut facts = facts();
+        let caps = aruna_core::compute::offer::BackendCaps::default();
+        let names = ("lab".to_string(), "docker".to_string());
+        facts.offers = vec![ExecutorOffer::new(names, [1; 32], caps)];
+        let subject = PlacementSubject {
+            node_id: node(),
+            generation: 1,
+            location: String::new(),
+            labels: BTreeMap::new(),
+            executor_kind: None,
+            local_to_controller: true,
+        };
+        let capability =
+            ExecutorCapability::new("lab".to_string(), "docker".to_string(), subject).unwrap();
+        let digests = ([1; 32], capability.config_digest);
+        let mut operation = telemetry(facts);
+        operation.built = Some((vec![capability], BTreeMap::new()));
+        let record = IoCall::child(BackendRecordOperation::new("lab", digests));
+        assert_eq!(operation.record_next(0), Ok(Next::Call(record)));
+        // The stored generation is what the advertisement carries, then the counters follow.
+        let stored = BackendConfigRecord {
+            config_generation: 4,
+            ..BackendConfigRecord::seed(digests.0, digests.1)
+        };
+        let counters = IoCall::child(LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec()));
+        let answer = operation.next(child::<_, BackendRecordError>(Ok(stored)));
+        assert_eq!(answer, Ok(Next::Call(counters)));
+        let built = operation.built.as_ref().unwrap();
+        assert_eq!(built.0[0].config_generation, 4);
     }
 
     #[test]

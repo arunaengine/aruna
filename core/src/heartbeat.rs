@@ -220,7 +220,7 @@ pub fn live_telemetry(
                     held.heartbeat
                         .availability
                         .iter()
-                        .find(|(kind, _)| *kind == executor.kind)
+                        .find(|(name, _)| *name == executor.backend)
                 })
                 .map(|(_, availability)| ExecutorAvailability {
                     observed_at_ms,
