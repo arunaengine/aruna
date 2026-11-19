@@ -33,7 +33,7 @@ async fn notification_drain_holder() {
     write_realm_config(&storage, realm_id, &config, net_handle.node_id()).await;
 
     let record = notification_record(realm_id, 1_700_000_000_000);
-    let outbox = new_outbox_record(ulid::Ulid::new(), record.clone());
+    let outbox = new_outbox_record(ulid::Ulid::generate(), record.clone());
     write_notification_outbox(&storage, &outbox).await;
 
     let context = Arc::new(DriverContext {
@@ -63,7 +63,7 @@ async fn notification_drain_unresolvable() {
     let net_handle = make_net_handle(realm_id, &storage, [22u8; 32]).await;
 
     let record = notification_record(realm_id, 1_700_000_000_000);
-    let outbox = new_outbox_record(ulid::Ulid::new(), record);
+    let outbox = new_outbox_record(ulid::Ulid::generate(), record);
     write_notification_outbox(&storage, &outbox).await;
 
     let task_handle = TaskHandle::new();
@@ -129,7 +129,7 @@ async fn notification_delivers_holder() {
     };
 
     let record = NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         NotificationKind::AddedToGroup {
@@ -138,7 +138,7 @@ async fn notification_delivers_holder() {
         },
         1_700_000_000_000,
     );
-    let outbox = new_outbox_record(ulid::Ulid::new(), record.clone());
+    let outbox = new_outbox_record(ulid::Ulid::generate(), record.clone());
     write_notification_outbox(&storage_a, &outbox).await;
 
     let context_b = Arc::new(DriverContext {
@@ -231,7 +231,7 @@ async fn drain_retries_queueing() {
         size_bytes: 1,
     };
     let record = NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         kind,
@@ -239,7 +239,7 @@ async fn drain_retries_queueing() {
     );
     write_notification_outbox(
         &storage,
-        &new_outbox_record(ulid::Ulid::new(), record.clone()),
+        &new_outbox_record(ulid::Ulid::generate(), record.clone()),
     )
     .await;
 
@@ -323,7 +323,7 @@ fn notification_recipient(realm_id: RealmId) -> UserId {
 fn notification_record(realm_id: RealmId, created_at_ms: u64) -> NotificationRecord {
     let recipient = notification_recipient(realm_id);
     NotificationRecord::new(
-        ulid::Ulid::new(),
+        ulid::Ulid::generate(),
         recipient,
         NotificationClass::Direct,
         NotificationKind::AddedToGroup {

@@ -525,7 +525,7 @@ mod tests {
                 size_bytes: 1,
             };
             NotificationRecord::new(
-                ulid::Ulid::new(),
+                ulid::Ulid::generate(),
                 recipient,
                 NotificationClass::Direct,
                 kind,
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(upsert_inbox_records(&storage, &stored).await, Ok(4));
 
         let deletion = NotificationRecord::new(
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             recipient,
             NotificationClass::Direct,
             NotificationKind::BucketDeleted {
@@ -580,7 +580,7 @@ mod tests {
         let group_id = ulid::Ulid::from_parts(1, 1);
         let record = |kind, at| {
             NotificationRecord::new(
-                ulid::Ulid::new(),
+                ulid::Ulid::generate(),
                 recipient,
                 NotificationClass::Direct,
                 kind,

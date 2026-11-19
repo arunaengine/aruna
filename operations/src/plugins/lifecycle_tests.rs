@@ -484,6 +484,8 @@ mod operations {
             expected: install.revision,
             next: Some(install.clone()),
             action: AdminAuditAction::PluginUpdated,
+            ids: aruna_core::id_mint::IdMint::default(),
+            now_ms: 0,
         };
         assert!(is_child(&commit.first()));
         assert!(is_child(&commit.next(write_done())));

@@ -117,8 +117,6 @@ pub struct CreateUserOperation {
     pages: Option<PrefixPages>,
     /// The administrator who issues this credential for another account, audited with it.
     issuer: Option<UserId>,
-    now_ms: u64,
-    ids: IdMint,
 }
 
 /// The encrypted buckets a new credential reads with its token, and the audit rows of each.
@@ -203,8 +201,6 @@ impl CreateUserOperation {
             stale: Vec::new(),
             pages: None,
             issuer: None,
-            now_ms: 0,
-            ids: IdMint::default(),
         }
     }
 
@@ -408,6 +404,7 @@ impl CreateUserOperation {
     }
 
     fn write_credentials(&mut self) -> CreateTurn {
+        let audit_id = self.issuer.map(|_| self.ids.mint(self.now_ms));
         let access = self.new_access()?;
         let mut writes = vec![
             (
@@ -421,9 +418,8 @@ impl CreateUserOperation {
                 encode_index(&self.index)?,
             ),
         ];
-        if let Some(actor) = self.issuer {
+        if let (Some(actor), Some(audit_id)) = (self.issuer, audit_id) {
             let action = AdminAuditAction::ServiceCredentialIssued;
-            let audit_id = self.ids.mint(self.now_ms);
             let mut audit =
                 AdminAuditRecord::new(audit_id, action, actor, self.config.user_identity);
             audit.group_id = Some(self.config.group_id);
@@ -493,14 +489,6 @@ impl Operation for CreateUserOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
-    }
-
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
-
-    fn seed(&mut self, entropy: u128) {
-        self.ids = IdMint::new(entropy);
     }
 }
 

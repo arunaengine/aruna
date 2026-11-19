@@ -254,8 +254,9 @@ impl ExtendBucketOperation {
 
     fn audit(&mut self) -> ExtendTurn {
         let status = self.status.as_ref().ok_or(ExtendError::NotFinished)?;
-        let mut record = self.record(status.key, AuditOutcome::Applied, status.deadline_ms);
-        record.sequence = Some(status.sequence);
+        let (key, deadline_ms, sequence) = (status.key, status.deadline_ms, status.sequence);
+        let mut record = self.record(key, AuditOutcome::Applied, deadline_ms);
+        record.sequence = Some(sequence);
         self.keep_outcome(record)
     }
 

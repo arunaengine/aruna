@@ -11,7 +11,7 @@ use crate::key_seal::seal_to;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::ArchiveKey;
 use crate::vault_format::key_fingerprint;
-use hpke::rand_core::{CryptoRng, Rng};
+use hpke::rand_core::CryptoRng;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fmt;

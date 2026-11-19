@@ -1832,7 +1832,7 @@ pub async fn run_writer(
             &actor,
             group_id,
             &document_path,
-            &mut crate::fresh_ids(),
+            &mut aruna_core::id_mint::IdMint::new(rand::random()),
             aruna_core::time::unix_timestamp_millis(),
         )
         .map_err(|error| format!("mint failed writer={writer} index={index}: {error:?}"))?

@@ -403,6 +403,7 @@ impl OwnerSecretOperation {
                 None,
                 self.input.actor,
                 self.input.now_ms,
+                &mut self.ids,
             )?;
             self.notices = !notices.is_empty();
             writes.extend(notices);

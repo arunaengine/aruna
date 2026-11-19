@@ -18,7 +18,7 @@ async fn watch_origins_converge() {
         let owner = UserId::local(Ulid::from_parts(seed as u64, 1), realm_id);
         let watch_id = Ulid::from_parts(seed as u64, 2);
         let mut subscription = WatchSubscription::new(
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             owner,
             format!("watch/{seed}"),
             event_mask,
