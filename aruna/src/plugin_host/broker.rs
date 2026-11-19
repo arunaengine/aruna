@@ -341,8 +341,9 @@ impl Broker for RunBroker {
         cx: &CallContext,
         request: SendRequest,
     ) -> Result<Response, HostError> {
+        let ask = Self::ask(&request);
         let parts = (request.body, request.intent.as_ref().map(call_intent));
-        let send = SendCall::new(&self.scope, Self::ask(&request), parts, cx.max_bytes);
+        let send = SendCall::new(&self.scope, ask, parts, cx.max_bytes);
         let answer = drive(send, &self.ctx).await;
         answer.map_err(|failure| self.failed(failure))
     }
