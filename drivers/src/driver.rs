@@ -1515,248 +1515,122 @@ mod test {
         BlobEvent, Event, GroupEvent, GroupResult, StagingSourceEvent, StorageEvent,
         SubOperationEvent,
     };
-    use aruna_core::operation::{
-        AfterConflict, EffectOperation, HoldScope, Operation, boxed_suboperation,
-    };
+    use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
-    use aruna_core::task::{TaskEffect, TaskKey};
     use aruna_core::types::TxnId;
     use aruna_storage::storage;
     use byteview::ByteView;
     use futures_util::FutureExt;
     use futures_util::future::BoxFuture;
     use std::collections::VecDeque;
-    use std::convert::Infallible;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::time::Duration;
     use tempfile::tempdir;
 
+    /// Writes one row in a write transaction and reads it back inside it.
     #[derive(Debug, PartialEq)]
     pub struct TestOperation {
-        pub state: u8,
-        pub txn_id: Option<aruna_core::types::TxnId>,
+        read: bool,
     }
 
     impl TestOperation {
         pub fn new() -> Self {
-            TestOperation {
-                state: 0,
-                txn_id: None,
-            }
+            TestOperation { read: false }
         }
     }
 
-    impl EffectOperation for TestOperation {
+    impl Operation for TestOperation {
         type Output = ();
-        type Error = ();
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            self.state = 1;
-
-            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
+        fn transaction(&self) -> TransactionMode {
+            TransactionMode::Write
         }
 
-        fn step(&mut self, events: aruna_core::events::Event) -> aruna_core::types::Effects {
-            match (events, self.state) {
-                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
-                    self.state = 2;
-                    self.txn_id = Some(txn_id);
-                    eprintln!("Transaction started with id {:?}", txn_id);
-                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
-                        key_space: "default".to_string(),
-                        key: ByteView::from(*b"key1"),
-                        value: ByteView::from(*b"value1"),
-                        txn_id: Some(txn_id),
-                    })]
-                }
-                (Event::Storage(StorageEvent::WriteResult { key: _ }), 2) => {
-                    self.state = 3;
-                    eprintln!("Write completed, committing transaction.");
-                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                        txn_id: self.txn_id.unwrap(),
-                    })]
-                }
-                (Event::Storage(StorageEvent::TransactionCommitted { txn_id: _ }), 3) => {
-                    self.state = 4;
-                    eprintln!("Transaction committed, reading back value.");
-                    smallvec::smallvec![Effect::Storage(StorageEffect::Read {
-                        key_space: "default".to_string(),
-                        key: ByteView::from(*b"key1"),
-                        txn_id: None,
-                    })]
-                }
-                (Event::Storage(StorageEvent::ReadResult { key, value }), 4) => {
-                    self.state = 5;
+        fn first(&mut self) -> Result<Next<()>, IoError> {
+            Ok(Next::Call(IoCall::Write(vec![row(b"key1", b"value1")])))
+        }
 
-                    eprintln!("Read key: {:?}, value: {:?}", key, value);
-                    assert_eq!(key, ByteView::from(*b"key1"));
-                    assert_eq!(value, Some(ByteView::from(*b"value1")));
-                    self.state = 6;
-                    smallvec::smallvec![]
-                }
-
-                a => {
-                    eprintln!("Unexpected event/state combination {:?}", a);
-                    smallvec::smallvec![]
-                }
+        fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+            if self.read {
+                assert_eq!(result.value()?, Some(ByteView::from(*b"value1")));
+                return Ok(Next::Done(()));
             }
-        }
-
-        fn is_complete(&self) -> bool {
-            self.state == 6
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            Ok(())
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![]
+            result.done()?;
+            self.read = true;
+            let key = ("default".to_string(), ByteView::from(*b"key1"));
+            Ok(Next::Call(IoCall::Read(vec![key])))
         }
     }
 
+    /// Stages a marker in a write transaction and fails when `fail` holds. Its cleanup writes
+    /// an abort marker outside any transaction.
     #[derive(Debug, PartialEq)]
     struct MarkerAbortOperation {
-        state: u8,
         fail: bool,
-        txn_id: Option<TxnId>,
     }
 
-    impl EffectOperation for MarkerAbortOperation {
+    impl Operation for MarkerAbortOperation {
         type Output = ();
-        type Error = ();
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            self.state = 1;
-            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
+        fn transaction(&self) -> TransactionMode {
+            TransactionMode::Write
         }
 
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            match (event, self.state) {
-                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
-                    self.txn_id = Some(txn_id);
-                    self.state = 2;
-                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
-                        key_space: "default".to_string(),
-                        key: ByteView::from(*b"staged-marker"),
-                        value: ByteView::from(*b"staged"),
-                        txn_id: Some(txn_id),
-                    })]
-                }
-                (Event::Storage(StorageEvent::WriteResult { .. }), 2) if self.fail => {
-                    self.state = 4;
-                    smallvec::smallvec![]
-                }
-                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
-                    self.state = 3;
-                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                        txn_id: self.txn_id.expect("transaction id recorded")
-                    })]
-                }
-                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 3) => {
-                    self.state = 4;
-                    smallvec::smallvec![]
-                }
-                _ => smallvec::smallvec![],
+        fn first(&mut self) -> Result<Next<()>, IoError> {
+            Ok(Next::Call(IoCall::Write(vec![row(b"staged-marker", b"staged")])))
+        }
+
+        fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+            result.done()?;
+            match self.fail {
+                true => Err(refused()),
+                false => Ok(Next::Done(())),
             }
         }
 
-        fn is_complete(&self) -> bool {
-            self.state == 4
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            if self.fail { Err(()) } else { Ok(()) }
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: "default".to_string(),
-                key: ByteView::from(*b"abort-marker"),
-                value: ByteView::from(*b"ran"),
-                txn_id: None,
-            })]
+        fn abort(&mut self) -> Vec<IoCall> {
+            vec![IoCall::Write(vec![row(b"abort-marker", b"ran")])]
         }
     }
 
+    /// Stages a marker in a write transaction, then waits on a spool that never ends.
     #[derive(Debug)]
     struct DeadlineOperation {
-        state: u8,
-        txn_id: Option<TxnId>,
+        staged: bool,
         ready: Arc<tokio::sync::Notify>,
     }
 
     impl PartialEq for DeadlineOperation {
         fn eq(&self, other: &Self) -> bool {
-            self.state == other.state && self.txn_id == other.txn_id
+            self.staged == other.staged
         }
     }
 
-    impl EffectOperation for DeadlineOperation {
+    impl Operation for DeadlineOperation {
         type Output = bool;
-        type Error = ();
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            self.state = 1;
-            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
+        fn transaction(&self) -> TransactionMode {
+            TransactionMode::Write
         }
 
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            match (event, self.state) {
-                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
-                    self.txn_id = Some(txn_id);
-                    self.state = 2;
-                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
-                        key_space: "default".to_string(),
-                        key: ByteView::from(*b"staged-marker"),
-                        value: ByteView::from(*b"staged"),
-                        txn_id: Some(txn_id),
-                    })]
-                }
-                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
-                    self.ready.notify_one();
-                    self.state = 3;
-                    smallvec::smallvec![Effect::Blob(BlobEffect::SpoolHidden {
-                        namespace: ulid::Ulid::from_bytes([7u8; 16]),
-                        name: "deadline".to_string(),
-                        created_by: aruna_core::UserId::default(),
-                        max_bytes: None,
-                        deadline: None,
-                        blob: aruna_core::stream::BackendStream::new(
-                            futures_util::stream::pending::<
-                                Result<bytes::Bytes, aruna_core::stream::StreamError>,
-                            >(),
-                        ),
-                    })]
-                }
-                (Event::Blob(_), 3) => {
-                    self.state = 4;
-                    smallvec::smallvec![]
-                }
-                _ => smallvec::smallvec![],
+        fn first(&mut self) -> Result<Next<bool>, IoError> {
+            Ok(Next::Call(IoCall::Write(vec![row(b"staged-marker", b"staged")])))
+        }
+
+        fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+            if self.staged {
+                return Ok(Next::Done(true));
             }
-        }
-
-        fn is_complete(&self) -> bool {
-            self.state == 4
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            Ok(self.state == 4)
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            self.state = 4;
-            smallvec::smallvec![]
+            result.done()?;
+            self.staged = true;
+            self.ready.notify_one();
+            Ok(Next::Call(IoCall::from(pending_blob())))
         }
     }
 
@@ -2014,11 +1888,7 @@ mod test {
         };
 
         let result = drive(
-            MarkerAbortOperation {
-                state: 0,
-                fail: false,
-                txn_id: None,
-            },
+            MarkerAbortOperation { fail: false },
             &context,
         )
         .await;
@@ -2048,17 +1918,14 @@ mod test {
         };
 
         let result = drive(
-            MarkerAbortOperation {
-                state: 0,
-                fail: true,
-                txn_id: None,
-            },
+            MarkerAbortOperation { fail: true },
             &context,
         )
         .await;
 
         assert!(result.is_err());
-        assert!(marker_absent(&context).await);
+        // An operation's own error runs its cleanup calls after the rollback.
+        assert!(!marker_absent(&context).await);
         assert_eq!(staged_value(&context).await, None);
         assert!(transaction_reopens(&context).await);
     }
@@ -2067,11 +1934,7 @@ mod test {
     async fn deadline_commit_safe() {
         let (_directory, context) = test_context();
         let result = crate::driver::drive_until(
-            MarkerAbortOperation {
-                state: 0,
-                fail: false,
-                txn_id: None,
-            },
+            MarkerAbortOperation { fail: false },
             &context,
             tokio::time::Instant::now() + std::time::Duration::from_secs(30),
         )
@@ -2095,8 +1958,7 @@ mod test {
         let task = tokio::spawn(async move {
             drive(
                 DeadlineOperation {
-                    state: 0,
-                    txn_id: None,
+                    staged: false,
                     ready: task_ready,
                 },
                 &task_context,
@@ -2155,8 +2017,7 @@ mod test {
         let _clock = freeze_clock();
         let ready = Arc::new(tokio::sync::Notify::new());
         let operation = DeadlineOperation {
-            state: 0,
-            txn_id: None,
+            staged: false,
             ready: ready.clone(),
         };
         // Shorter than STORAGE_REQUEST_TIMEOUT so the advance below can only
@@ -2169,7 +2030,7 @@ mod test {
 
         ready.notified().await;
         tokio::time::advance(std::time::Duration::from_secs(6)).await;
-        assert!(task.await.unwrap().unwrap());
+        assert_eq!(task.await.unwrap(), Err(IoError::Aborted));
         // Real time again: auto-advance would fire the request timeouts of the
         // storage roundtrips below before the worker thread can answer.
         tokio::time::resume();
@@ -2177,157 +2038,48 @@ mod test {
         assert!(transaction_reopens(&context).await);
     }
 
-    #[derive(Debug, PartialEq)]
+    /// Commits a staged row, then waits after the commit on a spool that never ends; its
+    /// stream tells `ready` once the adapter reads it.
+    #[derive(Debug)]
     struct CommitDeadline {
-        state: u8,
-        txn_id: TxnId,
-        output: Option<Result<(), u8>>,
+        ready: Arc<tokio::sync::Notify>,
     }
 
-    impl EffectOperation for CommitDeadline {
+    impl PartialEq for CommitDeadline {
+        fn eq(&self, _: &Self) -> bool {
+            true
+        }
+    }
+
+    impl Operation for CommitDeadline {
         type Output = ();
-        type Error = u8;
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            self.state = 1;
-            smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                txn_id: self.txn_id,
-            })]
+        fn transaction(&self) -> TransactionMode {
+            TransactionMode::Write
         }
 
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            if matches!(
-                event,
-                Event::Storage(StorageEvent::TransactionCommitted { .. })
-            ) {
-                self.state = 2;
-                return smallvec::smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: "default".to_string(),
-                    key: ByteView::from(*b"after-commit"),
-                    txn_id: None,
-                })];
-            }
-            smallvec::smallvec![]
+        fn first(&mut self) -> Result<Next<()>, IoError> {
+            Ok(Next::Call(IoCall::Write(vec![row(b"committed", b"kept")])))
         }
 
-        fn is_complete(&self) -> bool {
-            self.output.is_some()
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            // Mirrors the operations whose finalize assumes a terminal state.
-            self.output.expect("operation must set output")
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            self.output.get_or_insert(Err(self.state));
-            smallvec::smallvec![]
+        fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+            result.done()?;
+            let wait = IoCall::from(announced_blob(self.ready.clone()));
+            Ok(Next::Then {
+                output: (),
+                calls: vec![wait],
+            })
         }
     }
 
     #[tokio::test]
     async fn deadline_after_commit() {
-        // The commit suppresses the abort effects, so the driver still has to
-        // hand finalize a terminal operation instead of an unset output.
-        let (_directory, context) = test_context();
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::StartTransaction { read: false })
-            .await
-        else {
-            panic!("transaction starts");
-        };
-
-        let result = crate::driver::drive_until(
-            CommitDeadline {
-                state: 0,
-                txn_id,
-                output: None,
-            },
-            &context,
-            tokio::time::Instant::now(),
-        )
-        .await;
-
-        assert_eq!(result, Err(2));
-    }
-
-    /// Opts in only after its commit, like a multipart completion that must
-    /// reopen the upload its committed mark left `Completing`.
-    #[derive(Debug)]
-    struct LateOptIn {
-        state: u8,
-        ready: Arc<tokio::sync::Notify>,
-    }
-
-    impl PartialEq for LateOptIn {
-        fn eq(&self, other: &Self) -> bool {
-            self.state == other.state
-        }
-    }
-
-    impl EffectOperation for LateOptIn {
-        type Output = ();
-        type Error = ();
-
-        fn start(&mut self) -> aruna_core::types::Effects {
-            self.state = 1;
-            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        }
-
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            match (event, self.state) {
-                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
-                    self.state = 2;
-                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                        txn_id
-                    })]
-                }
-                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 2) => {
-                    self.ready.notify_one();
-                    self.state = 3;
-                    smallvec::smallvec![pending_blob()]
-                }
-                (Event::Storage(StorageEvent::WriteResult { .. }), 4) => {
-                    self.state = 5;
-                    smallvec::smallvec![]
-                }
-                _ => smallvec::smallvec![],
-            }
-        }
-
-        fn is_complete(&self) -> bool {
-            self.state == 5
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            if self.state == 5 { Ok(()) } else { Err(()) }
-        }
-
-        fn abort_after_commit(&self) -> bool {
-            self.state >= 3
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            self.state = 4;
-            smallvec::smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: "default".to_string(),
-                key: ByteView::from(*b"abort-marker"),
-                value: ByteView::from(*b"ran"),
-                txn_id: None,
-            })]
-        }
-    }
-
-    #[tokio::test]
-    async fn late_opt_in() {
-        // The storage roundtrips run in real time; only the deadline uses virtual time.
+        // A deadline after the commit leaves the committed outcome: no cleanup runs, and the
+        // runner still hands back a finished result. Only the deadline uses virtual time.
         let (_directory, context) = blob_context().await;
         let ready = Arc::new(tokio::sync::Notify::new());
-        let operation = LateOptIn {
-            state: 0,
+        let operation = CommitDeadline {
             ready: ready.clone(),
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
