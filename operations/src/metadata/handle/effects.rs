@@ -53,12 +53,7 @@ async fn run_effect(context: &DriverContext, effect: MetadataEffect) -> Metadata
             },
         };
     }
-    match effect {
-        MetadataEffect::SyncBestEffort { graph_iri, peers } => {
-            super::lifecycle::sync_best_effort(context, graph_iri, peers)
-        }
-        other => graph.run(other).await,
-    }
+    graph.run(effect).await
 }
 
 /// The RO-Crate JSON-LD of one graph.

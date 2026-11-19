@@ -15,6 +15,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
+use aruna_graph::GraphHandle;
 use aruna_storage::FjallStorage;
 use ed25519_dalek::SigningKey;
 use serde::Serialize;

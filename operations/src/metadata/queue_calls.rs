@@ -4,7 +4,6 @@
 
 use super::tests::{create_event, node};
 use super::*;
-use crate::metadata::deletion_guard::metadata_call;
 use aruna_core::storage_entries::create_event_entry;
 
 type Error = MetadataMaterializationError;
@@ -437,17 +436,11 @@ fn batch_syncs_graphs() {
         deletes: vec![global_row(job_key())],
     };
     assert!(is_child(&batch.next(child(Ok::<_, Error>(plan)))));
-    let sync = MetadataEffect::SyncBestEffort {
-        graph_iri: graph_iri.clone(),
-        peers: vec![node(2)],
-    };
-    let call = metadata_call(sync);
+    let sync = GraphSyncOperation::new(graph_iri, vec![node(2)]);
+    let call = IoCall::background(sync);
     same_call(batch.next(child(Ok::<(), Error>(()))), Ok(Next::Call(call)));
-    let scheduled = MetadataEvent::GraphSyncScheduled {
-        graph_iri,
-        peers: vec![node(2)],
-    };
-    let timer = batch.next(IoResult::Event(Box::new(Event::Metadata(scheduled))));
+    let started = TaskEvent::BackgroundStarted { started: true };
+    let timer = batch.next(IoResult::Event(Box::new(Event::Task(started))));
     assert!(is_child(&timer));
     let result = drain_result(batch.next(child(Ok::<(), LinkError>(()))));
     assert_eq!(result.processed, 1);

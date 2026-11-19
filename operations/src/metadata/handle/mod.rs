@@ -17,7 +17,6 @@ use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::types::GroupId;
-use aruna_graph::GraphHandle;
 use aruna_net::NetHandle;
 use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
@@ -38,10 +37,8 @@ pub(crate) mod frames;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
 pub use self::pull_serve::{accept_pull, pull_status};
 mod ingress;
-mod lifecycle;
 mod peer_auth;
 mod pull_serve;
-mod sync;
 mod transport;
 
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -49,8 +46,6 @@ const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const PAGE_ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 const METADATA_CHUNK_SIZE: usize = 64 * 1024;
 const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
-const GRAPH_SYNC_ATTEMPTS: usize = 3;
-const GRAPH_SYNC_AFTER: Duration = Duration::from_millis(250);
 
 fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> bool {
     left.id == right.id
@@ -124,14 +119,6 @@ async fn create_sync_bucket(
     )
     .await?;
     Ok(())
-}
-
-/// The metadata handle and the graph store of `context`.
-fn handles(context: &DriverContext) -> Result<(&MetadataHandle, &GraphHandle), MetadataError> {
-    match (&context.metadata_handle, &context.graph_handle) {
-        (Some(metadata), Some(graph)) => Ok((metadata, graph)),
-        _ => Err(MetadataError::HandleMissing),
-    }
 }
 
 /// The directory below the metadata storage path that holds the range search indexes.

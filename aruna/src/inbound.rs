@@ -986,10 +986,10 @@ async fn serve_shard_stream(
 
 /// Reconciles the metadata store with document sync and prunes deleted graphs.
 async fn run_maintenance(context: &DriverContext, source: &'static str, attempt: usize) {
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+    let Some(graph) = context.graph_handle.as_ref() else {
         return;
     };
-    if let Err(error) = metadata_handle.reconcile_document_sync(context).await {
+    if let Err(error) = graph.reconcile().await {
         warn!(
             source,
             attempt,

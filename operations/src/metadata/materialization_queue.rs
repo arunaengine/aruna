@@ -10,7 +10,7 @@ use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::events::{Event, GroupEvent, GroupResult, TaskEvent};
 use aruna_core::keyspaces::{
     DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE,
     MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
@@ -44,6 +44,7 @@ use crate::metadata::call_results::page_rows;
 use crate::metadata::checkpoint::{CheckpointError, CheckpointOperation};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
+use crate::metadata::topic_sync::GraphSyncOperation;
 use crate::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
 
 use super::data_links::{DataLinkError, LinkRows};
@@ -430,11 +431,8 @@ impl MaterializationBatchOperation {
             return self.timer();
         };
         self.stage = BatchStage::Sync(sync.graph_iri.clone());
-        let effect = MetadataEffect::SyncBestEffort {
-            graph_iri: sync.graph_iri,
-            peers: sync.peers,
-        };
-        Ok(Next::Call(metadata_call(effect)))
+        let graph_sync = GraphSyncOperation::new(sync.graph_iri, sync.peers);
+        Ok(Next::Call(IoCall::background(graph_sync)))
     }
 
     // Finished jobs may queue link pushes, and the link drain stops once its queue is empty.
@@ -529,9 +527,9 @@ impl Operation for MaterializationBatchOperation {
             },
             BatchStage::Sync(graph_iri) => {
                 match event(result) {
-                    Ok(Event::Metadata(MetadataEvent::GraphSyncScheduled { .. })) => {}
-                    Ok(Event::Metadata(MetadataEvent::Error { error, .. })) => {
-                        warn!(error = ?error, graph_iri = %graph_iri, "Failed to schedule metadata graph sync after materialization");
+                    Ok(Event::Task(TaskEvent::BackgroundStarted { started: true })) => {}
+                    Ok(Event::Task(TaskEvent::BackgroundStarted { started: false })) => {
+                        warn!(graph_iri = %graph_iri, "No background slot for the metadata graph sync after materialization");
                     }
                     other => {
                         warn!(event = ?other, graph_iri = %graph_iri, "Unexpected metadata graph sync result after materialization");
