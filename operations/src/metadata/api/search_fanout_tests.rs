@@ -107,7 +107,7 @@ fn short_page_ends() {
 }
 
 #[test]
-fn full_page_signs_cursor() {
+fn full_page_signs() {
     let mut search = started(request(ApiQueryMode::Local, 1, None));
     search.first().unwrap();
     let parts = vec![(node(1), (vec![hit("./a", 0.9), hit("./b", 0.8)], 2))];
@@ -212,7 +212,7 @@ fn filtered_search_merges() {
 }
 
 #[test]
-fn remote_search_asks_peer() {
+fn remote_asks_peer() {
     let ask = SearchAsk {
         graph_iris: None,
         query: "reads".to_string(),

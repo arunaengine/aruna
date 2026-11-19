@@ -680,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_change_wakes_drain() {
+    fn commit_wakes_drain() {
         let id = Ulid::from_bytes([5; 16]);
         let transition = PidTransition::Mint {
             minted_by: user(),
@@ -721,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn networked_change_needs_config() {
+    fn network_needs_config() {
         let id = Ulid::from_bytes([5; 16]);
         let change = PidChange::AddIdentifiers {
             identifiers: Vec::new(),

@@ -65,7 +65,7 @@ fn at_export(view: RoCrateExportView) -> (ExportOperation, ExportTurn) {
 }
 
 #[test]
-fn summary_exports_at_cursor() {
+fn summary_exports_cursor() {
     let (mut export, turn) = at_export(RoCrateExportView::Summary);
     let cursor = record(5).last_event_id;
     assert_eq!(
@@ -109,7 +109,7 @@ fn full_rechecks_cursor() {
 }
 
 #[test]
-fn page_refuses_two_cursors() {
+fn page_refuses_cursors() {
     let mut export = ExportOperation::new(realm(), {
         let mut request = request(RoCrateExportView::Page);
         request.offset = Some(1);
@@ -147,7 +147,7 @@ fn unmaterialized_unavailable() {
 }
 
 #[test]
-fn raw_reads_one_snapshot() {
+fn raw_reads_snapshot() {
     let mut raw = RawExportOperation::new(realm(), request(RoCrateExportView::Raw));
     assert_eq!(raw.transaction(), TransactionMode::ReadSnapshot);
     // The record read is the first call of the embedded live record read.

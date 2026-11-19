@@ -122,7 +122,7 @@ fn routed_create_emits() {
 }
 
 #[test]
-fn pinned_foreign_realm_refused() {
+fn foreign_pin_refused() {
     let mut create = pinned(node(1));
     create.auth = auth(RealmId::from_bytes([9; 32]));
     assert_eq!(create.first(), Err(CreateAuthorizedError::Forbidden));

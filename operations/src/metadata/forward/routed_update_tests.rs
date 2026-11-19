@@ -66,7 +66,7 @@ fn unreadable_config_undeliverable() {
 }
 
 #[test]
-fn device_reads_replica_first() {
+fn device_replica_first() {
     // A node outside the sync set edits its own replica when it may.
     let mut update = route(None);
     update.first().unwrap();
@@ -77,7 +77,7 @@ fn device_reads_replica_first() {
 }
 
 #[test]
-fn expected_revision_skips_device() {
+fn revision_skips_device() {
     // Only a holder can check an expected revision, so the change is routed at once.
     let mut update = route(Some(Ulid::from_parts(4, 4)));
     update.first().unwrap();
@@ -87,7 +87,7 @@ fn expected_revision_skips_device() {
 }
 
 #[test]
-fn device_edit_errors_mapped() {
+fn edit_errors_mapped() {
     let mut update = route(None);
     update.stage = UpdateStage::Device;
     let missing = child(Err::<MetadataRegistryRecord, _>(DeviceEditError::NoReplica));

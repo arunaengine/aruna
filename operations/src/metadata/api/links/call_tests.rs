@@ -57,7 +57,7 @@ fn foreign_part_resolves() {
 }
 
 #[test]
-fn owned_part_reads_bucket() {
+fn part_reads_bucket() {
     let mut resolve = resolve_part(node(1), node_link(node(1)));
     assert!(matches!(resolve.first(), Ok(Next::Call(IoCall::Child(_)))));
     let Ok(Next::Done(target)) = resolve.next(bucket(Ok(info()))) else {
@@ -91,7 +91,7 @@ fn missing_bucket_refused() {
 }
 
 #[test]
-fn part_of_asks_links() {
+fn part_asks_links() {
     let mut part = part_of((realm(), node(1)), (None, None), "data", "reads/a");
     part.first().unwrap();
     assert!(matches!(
@@ -111,7 +111,7 @@ fn part_of_asks_links() {
 }
 
 #[test]
-fn file_queries_name_prefixes() {
+fn file_queries_prefixes() {
     let mut queries = file_queries((realm(), node(1)), "data", "reads/a", None);
     queries.first().unwrap();
     assert!(matches!(

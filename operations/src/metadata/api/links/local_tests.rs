@@ -164,7 +164,7 @@ fn hidden_match_confirmed() {
 }
 
 #[test]
-fn preview_pages_both_ranges() {
+fn preview_pages_ranges() {
     let mut preview = SetPreviewOperation::new((realm(), None), set_id(), None, 1);
     let Ok(Next::Call(IoCall::Effect(_))) = preview.first() else {
         panic!("expected the prefix range");

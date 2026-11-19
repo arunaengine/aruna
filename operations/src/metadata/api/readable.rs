@@ -282,7 +282,7 @@ mod call_tests {
     }
 
     #[test]
-    fn private_reads_rules_first() {
+    fn private_rules_first() {
         let private = record(false);
         let mut check = RecordReadableOperation::new(
             private.realm_id,
@@ -311,7 +311,7 @@ mod call_tests {
     }
 
     #[test]
-    fn path_reads_rules_policies() {
+    fn path_reads_policies() {
         let realm_id = RealmId::from_bytes([1; 32]);
         let group_id = Ulid::from_parts(2, 2);
         let path = record(false).permission_path;

@@ -170,7 +170,7 @@ mod call_tests {
 
     // Its update child holds the document; a hold here too would wait on itself forever.
     #[test]
-    fn leaves_hold_to_update() {
+    fn update_holds_document() {
         let checkpoint = CheckpointOperation::new(Some(node(1)), record(vec![node(1)]));
         assert_eq!(checkpoint.hold_scope(), None);
     }

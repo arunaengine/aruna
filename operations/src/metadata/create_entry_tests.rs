@@ -80,7 +80,7 @@ fn nil_id_mints() {
 }
 
 #[test]
-fn scaffold_creates_then_wakes() {
+fn scaffold_create_wakes() {
     // A supplied id persists and a scaffold carries no Profile, so the create runs at once.
     let document_id = Ulid::from_parts(9, 9);
     let template = CreateDocumentOperation::new(config(document_id, scaffold()));

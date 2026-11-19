@@ -51,7 +51,7 @@ fn request(path: &str, auth: Option<AuthContext>) -> MetadataLookupRequest {
 }
 
 #[test]
-fn local_keeps_path_claims() {
+fn local_keeps_claims() {
     let mut local = LocalPathOperation::new(realm(), (group(), "datasets/a"), None, None);
     assert!(matches!(local.first(), Ok(Next::Call(IoCall::Child(_)))));
     let claims = vec![

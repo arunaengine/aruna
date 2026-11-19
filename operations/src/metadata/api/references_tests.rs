@@ -34,7 +34,7 @@ fn malformed_iri_refused() {
 }
 
 #[test]
-fn empty_page_summarizes_graph() {
+fn empty_page_summarizes() {
     let iri = MetadataRegistryRecord::graph_iri_for(Ulid::from_parts(3, 3));
     let mut references = ReferencesOperation::new(realm(), request(&iri));
     assert!(matches!(
@@ -73,7 +73,7 @@ fn spent_budget_unavailable() {
 }
 
 #[test]
-fn unknown_graph_has_no_summary() {
+fn unknown_graph_omitted() {
     let graph = ReferenceEntriesOperation::graph((realm(), None), "https://example.test/x");
     let mut graph = graph;
     assert_eq!(graph.first(), Ok(Next::Done(Vec::new())));

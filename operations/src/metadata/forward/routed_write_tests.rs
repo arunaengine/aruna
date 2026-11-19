@@ -111,7 +111,7 @@ fn forwarded_delete_confirmed() {
 }
 
 #[test]
-fn unsent_edit_tries_next() {
+fn unsent_tries_next() {
     let mut apply = batch();
     apply.holders = VecDeque::from([node(3)]);
     apply.asked = Some(node(2));
