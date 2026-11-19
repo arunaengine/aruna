@@ -771,7 +771,8 @@ async fn blocked_keeps_backoff() {
         strategy_id: Ulid::from_bytes([48; 16]),
         shard: 1,
     };
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox_record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         Vec::new(),
@@ -1122,7 +1123,8 @@ async fn draining_a_topics() {
         "the rank-0 shard topic must not exist before the config change is drained"
     );
 
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox_record::new_identified_record(
+        ulid::Ulid::generate(),
         net.node_id(),
         DocumentTarget::RealmConfig { realm_id },
         Vec::new(),
@@ -1180,7 +1182,8 @@ async fn retry_publishes_once() {
     net.refresh_document_peers(&config)
         .await
         .expect("refresh peers");
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox_record::new_identified_record(
+        ulid::Ulid::generate(),
         net.node_id(),
         DocumentTarget::RealmConfig { realm_id },
         Vec::new(),
@@ -1404,7 +1407,8 @@ async fn pull_reaches_holder() {
 
     let mut change = change();
     change.placement = placement;
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox_record::new_identified_record(
+        ulid::Ulid::generate(),
         net.node_id(),
         target,
         vec![ex_holder.node_id()],
@@ -1471,7 +1475,8 @@ fn admin_outbox(
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     let user_id = aruna_core::UserId::nil(realm_id);
-    aruna_operations::sync::outbox_record::new_outbox_record(
+    aruna_operations::sync::outbox_record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target,
         Vec::new(),
@@ -1515,7 +1520,8 @@ fn shard_change(seed: u8) -> DocumentChange {
 }
 
 fn shard_topic_record(origin_seq: u64) -> DocumentOutboxRecord {
-    aruna_operations::sync::outbox_record::new_outbox_record(
+    aruna_operations::sync::outbox_record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         vec![node(2)],

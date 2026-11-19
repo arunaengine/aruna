@@ -683,6 +683,7 @@ impl CreateCommitOperation {
             create_event.record.document_id,
             create_event.node_id,
         );
+        let revision_id = self.ids.mint(self.now_ms);
         let mapping = PersistentIdMapping::requested(
             create_event.record.document_id,
             profile,
@@ -690,9 +691,10 @@ impl CreateCommitOperation {
             job_id,
             create_event.record.public,
             create_event.record.permission_path.clone(),
-            mapping_revision(&route, create_event.occurred_at_ms),
+            mapping_revision(&route, revision_id, create_event.occurred_at_ms),
         );
-        writes.extend(transition_entries(&route, &mapping).map_err(|error| {
+        let outbox_id = self.ids.mint(self.now_ms);
+        writes.extend(transition_entries(&route, &mapping, outbox_id).map_err(|error| {
             aruna_core::errors::ConversionError::FromStrError(error.to_string())
         })?);
         Ok(writes)

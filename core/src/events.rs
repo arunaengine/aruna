@@ -373,6 +373,10 @@ pub enum BlobEvent {
     Remote(
         Result<crate::repository::remote::RemoteAnswer, crate::repository::remote::RemoteFailure>,
     ),
+    /// A collected stream went past the byte limit its read set; the rest was not read.
+    StreamTooLarge {
+        limit: u64,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -1028,6 +1032,7 @@ impl Event {
                     BucketExists,
                     BucketDeleted,
                     Remote,
+                    StreamTooLarge,
                 }
             ),
             Event::StagingSource(event) => variant_label!(

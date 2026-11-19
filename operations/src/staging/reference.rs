@@ -37,7 +37,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::plugin_runs::journaled;
-use aruna_core::rows::{read_row, value, values};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{
@@ -563,10 +563,10 @@ impl Operation for WriteReferenceOperation {
         let (bucket, key) = (self.write.bucket.clone(), self.write.key.clone());
         match self.state {
             WriteState::Fence => {
-                check_fence_row(value(result)?.as_deref(), &bucket, &key)?;
+                check_fence_row(result.value()?.as_deref(), &bucket, &key)?;
                 self.read(WriteState::Bucket, S3_BUCKET_KEYSPACE, bucket.into_bytes())
             }
-            WriteState::Bucket => self.bucket_read(value(result)?),
+            WriteState::Bucket => self.bucket_read(result.value()?),
             WriteState::Authority => {
                 let [record, fence] = values::<2>(result)?;
                 let binding = self.binding.as_ref().ok_or(StorageError::InvalidEffect)?;
@@ -576,7 +576,7 @@ impl Operation for WriteReferenceOperation {
             WriteState::Connector => {
                 let (connector, _) =
                     (self.write.connector_guard.as_ref()).ok_or(StorageError::InvalidEffect)?;
-                guard_record(connector, value(result)?)?;
+                guard_record(connector, result.value()?)?;
                 let read = IoCall::from(read_secret_effect(connector.connector_id, None));
                 self.call(WriteState::Secret, read)
             }
@@ -597,10 +597,10 @@ impl Operation for WriteReferenceOperation {
                 let checked = self.mirror.checked_sub(1);
                 let connector = (checked.and_then(|index| self.write.mirror_guards.get(index)))
                     .ok_or(StorageError::InvalidEffect)?;
-                guard_record(connector, value(result)?)?;
+                guard_record(connector, result.value()?)?;
                 self.next_mirror()
             }
-            WriteState::Planned => match Self::existing(value(result)?)? {
+            WriteState::Planned => match Self::existing(result.value()?)? {
                 Some(existing) if self.same_reference(&existing) => {
                     self.finish((self.version_id, false))
                 }
@@ -610,7 +610,7 @@ impl Operation for WriteReferenceOperation {
                 None => self.pointer(),
             },
             WriteState::Pointer => {
-                self.pointer = (value(result)?.as_ref())
+                self.pointer = (result.value()?.as_ref())
                     .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
                     .transpose()?;
                 match self.pointer.as_ref() {
@@ -622,7 +622,7 @@ impl Operation for WriteReferenceOperation {
                 }
             }
             WriteState::Current => {
-                let existing = Self::existing(value(result)?)?;
+                let existing = Self::existing(result.value()?)?;
                 let kept = (self.write.preassigned_version_id.is_none())
                     .then(|| {
                         existing

@@ -261,7 +261,7 @@ pub struct CreateWatchOperation {
 
 impl CreateWatchOperation {
     pub fn new(
-        watch_id: Ulid,
+        (watch_id, outbox_id): (Ulid, Ulid),
         local: aruna_core::NodeId,
         owner: UserId,
         (path_prefix, event_mask): (String, WatchEventMask),
@@ -276,7 +276,7 @@ impl CreateWatchOperation {
             now_ms,
             authorization,
         )?;
-        let replication = watch_upsert_replication(local, &subscription)?;
+        let replication = watch_upsert_replication((local, outbox_id), &subscription)?;
         Ok(Self {
             subscription,
             replication: Some(replication),
@@ -438,7 +438,7 @@ mod call_tests {
         let mut holder = StoreWatchOperation::create(subscription(), None);
         holder.replication = Some(
             crate::notifications::watch::records::watch_delete_replication(
-                crate::tests::locations::node_id(1),
+                (crate::tests::locations::node_id(1), Ulid::from_parts(9, 8)),
                 user(1, 2),
                 Ulid::from_parts(9, 9),
                 1_000,
@@ -466,7 +466,7 @@ mod call_tests {
         let binding = WatchAuthorizationBinding::default();
         let new = || {
             CreateWatchOperation::new(
-                Ulid::from_parts(4, 4),
+                (Ulid::from_parts(4, 4), Ulid::from_parts(4, 5)),
                 local,
                 user(1, 2),
                 (prefix.clone(), mask),

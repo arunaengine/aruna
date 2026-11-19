@@ -7,7 +7,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE};
 use aruna_core::metadata::{MaterializationState, MaterializationStatusRecord};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{materialization_status_key, metadata_document_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use serde::de::DeserializeOwned;
@@ -16,7 +16,7 @@ use ulid::Ulid;
 use aruna_core::errors::StorageReadError;
 
 fn decoded<T: DeserializeOwned>(result: IoResult) -> Result<Option<T>, StorageReadError> {
-    value(result)?
+    result.value()?
         .map(|bytes| postcard::from_bytes(&bytes).map_err(ConversionError::from))
         .transpose()
         .map_err(StorageReadError::Conversion)

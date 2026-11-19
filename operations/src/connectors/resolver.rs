@@ -115,7 +115,7 @@ impl Operation for ResolveConnectorOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SourceResolutionError> {
         let Some(connector) = self.connector.take() else {
-            let connector = decode_row(rows::value(result)?, SourceConnector::from_bytes)?;
+            let connector = decode_row(result.value()?, SourceConnector::from_bytes)?;
             self.connector = Some(connector.ok_or(SourceResolutionError::NotFound)?);
             let read = read_secret_effect(self.input.connector_id, None);
             return Ok(Next::Call(read.into()));

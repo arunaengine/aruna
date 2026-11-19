@@ -11,7 +11,8 @@ async fn restore_document_records() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox_record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         vec![node(2)],
@@ -35,7 +36,8 @@ async fn restore_document_timer() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox_record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         vec![node(2)],
@@ -154,7 +156,8 @@ async fn drain_keeps_timer() {
     let temp_dir = tempdir().expect("temp dir");
     let storage = FjallStorage::open(temp_dir.path().to_str().expect("storage opens"))
         .expect("storage opens");
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox_record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         vec![node(2)],
@@ -224,7 +227,8 @@ async fn outbox_sync_retry() {
         outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox_record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         vec![node(2)],
@@ -274,7 +278,8 @@ async fn retained_outbox_timer() {
         outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox_record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         vec![node(2)],

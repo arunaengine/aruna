@@ -12,7 +12,7 @@ use aruna_core::repository::remote::NodeScope;
 use aruna_core::repository::{
     LinkStatus, RepositoryCredential, RepositoryLink, link_key, link_prefix,
 };
-use aruna_core::rows::{PrefixPages, all_values, value};
+use aruna_core::rows::{PrefixPages, all_values};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::types::{Key, Value};
@@ -88,7 +88,7 @@ impl Operation for ReadLinkOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Turn<Option<RepositoryLink>> {
-        Ok(Next::Done(parse_link(value(result)?)?))
+        Ok(Next::Done(parse_link(result.value()?)?))
     }
 }
 

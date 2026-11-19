@@ -1,12 +1,13 @@
-//! The plugin host's node-wide state, kept for the life of the node process: the host call and
-//! webhook rates per install, the memory budget of artifact copies, and when each account no
-//! install names was first seen. Operations reach it through the runner's plugin effect.
+//! The plugin host's node-wide process state: call and webhook rates, the artifact memory budget,
+//! when unnamed accounts were first seen, and run secrets. Operations reach it through effects.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, PoisonError};
+
+use zeroize::Zeroizing;
 
 /// Host calls per second one install makes on average, and at most at once.
 pub const CALL_RATE: f64 = 50.0;
@@ -30,6 +31,12 @@ static HOOK_BUCKETS: Buckets = LazyLock::new(Default::default);
 static RESERVED: AtomicU32 = AtomicU32::new(0);
 /// When this node first saw each unnamed account; a restart starts the grace again.
 static SEEN: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Default::default);
+/// The secret fields each broker of a running run holds, by run, broker and slot, per value id.
+static HELD: LazyLock<Mutex<HashMap<(Holder, String), Held>>> = LazyLock::new(Default::default);
+
+/// A run and one broker instance of it; a later attempt's broker is another holder.
+pub type Holder = (u128, u128);
+type Held = BTreeMap<u128, Zeroizing<Vec<u8>>>;
 
 /// Takes one host call of install `install` at `now_ms`; `false` when it is over its rate.
 pub fn take_call(install: u128, now_ms: u64) -> bool {
@@ -92,9 +99,58 @@ pub fn first_seen(named: &[String], unnamed: &[String], now_ms: u64) -> Vec<u64>
         .collect()
 }
 
+/// The newest value write id whose fields `holder` holds for `slot`.
+pub fn held_value(holder: Holder, slot: &str) -> Option<u128> {
+    let held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+    let values = held.get(&(holder, slot.to_string()))?;
+    values.keys().next_back().copied()
+}
+
+/// Keeps `fields` as value `value` of the holder's `slot` when given, and answers the fields the
+/// holder keeps for that value; `None` when it keeps none.
+pub fn hold_value(
+    holder: Holder,
+    slot: &str,
+    value: u128,
+    fields: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+    let values = held.entry((holder, slot.to_string())).or_default();
+    if let Some(fields) = fields {
+        values.insert(value, Zeroizing::new(fields));
+    }
+    values.get(&value).map(|fields| fields.to_vec())
+}
+
+/// Forgets every secret `holder` holds, once its broker is gone; other holders keep theirs.
+pub fn forget_held(holder: Holder) {
+    let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+    held.retain(|(kept, _), _| *kept != holder);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn holds_per_broker() {
+        let run = 91 << 64 | 1;
+        let (holder, other, later) = ((run, 1), (run + 1, 1), (run, 2));
+        assert_eq!(held_value(holder, "token"), None);
+        assert_eq!(hold_value(holder, "token", 4, None), None);
+        assert_eq!(hold_value(holder, "token", 4, Some(vec![1])), Some(vec![1]));
+        assert_eq!(hold_value(holder, "token", 7, Some(vec![2])), Some(vec![2]));
+        assert_eq!(held_value(holder, "token"), Some(7));
+        // An older value stays held, so a call that checked it still finds its fields.
+        assert_eq!(hold_value(holder, "token", 4, None), Some(vec![1]));
+        assert_eq!(held_value(other, "token"), None);
+        // A later broker of the same run keeps its fields when the older one is gone.
+        assert_eq!(hold_value(later, "token", 7, Some(vec![3])), Some(vec![3]));
+        forget_held(holder);
+        assert_eq!(held_value(holder, "token"), None);
+        assert_eq!(held_value(later, "token"), Some(7));
+        forget_held(later);
+    }
 
     #[test]
     fn refills_steadily() {

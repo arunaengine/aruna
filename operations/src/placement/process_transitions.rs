@@ -21,7 +21,7 @@ use aruna_core::placement::fence::{fence_read, stored_generation};
 use aruna_core::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
-use aruna_core::rows::{PrefixPages, done, read_row, value};
+use aruna_core::rows::{PrefixPages, done, read_row};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -1184,7 +1184,7 @@ impl Operation for FenceAttemptOperation {
             done(result)?;
             return Ok(Next::Done(()));
         }
-        let current = stored_generation(value(result)?.as_ref());
+        let current = stored_generation(result.value()?.as_ref());
         if current.is_some_and(|current| current >= self.generation) {
             return Ok(Next::Done(()));
         }

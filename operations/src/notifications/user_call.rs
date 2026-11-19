@@ -181,15 +181,16 @@ impl UserCallOperation {
                 now_ms,
             } => {
                 let watch = (path_prefix.clone(), *event_mask);
-                let watch_id = self.ids.mint(*now_ms);
+                let ids = (self.ids.mint(*now_ms), self.ids.mint(*now_ms));
                 let authorization = authorization.clone();
                 let create =
-                    CreateWatchOperation::new(watch_id, local, user, watch, authorization, *now_ms)
+                    CreateWatchOperation::new(ids, local, user, watch, authorization, *now_ms)
                         .map_err(watch_error)?;
                 IoCall::child(create)
             }
             UserCall::DeleteWatch { watch_id, now_ms } => {
-                let replication = watch_delete_replication(local, user, *watch_id, *now_ms);
+                let place = (local, self.ids.mint(*now_ms));
+                let replication = watch_delete_replication(place, user, *watch_id, *now_ms);
                 IoCall::child(StoreWatchOperation::delete(
                     user,
                     *watch_id,

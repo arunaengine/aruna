@@ -8,7 +8,7 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{ByCalls, Operation};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::{done, read_row};
 use aruna_core::types::{Key, KeySpace, Value};
 use ulid::Ulid;
 
@@ -203,7 +203,7 @@ impl<T: Send + std::fmt::Debug> Operation for RowRead<T> {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<T>, JobMutationError> {
-        (self.decode)(value(result)?).map(Next::Done)
+        (self.decode)(result.value()?).map(Next::Done)
     }
 }
 

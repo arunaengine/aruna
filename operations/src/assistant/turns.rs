@@ -55,7 +55,7 @@ impl Operation for ReadChatOperation {
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(Next::Done(turns));
         }
-        let head = live_head(rows::value(result)?)?;
+        let head = live_head(result.value()?)?;
         let from = self.after.map_or(head.first_seq, |after| {
             after.saturating_add(1).max(head.first_seq)
         });
@@ -244,7 +244,7 @@ impl Operation for WriteTurnOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ChatStoreError> {
         match std::mem::replace(&mut self.stage, WriteTurnStage::Head) {
             WriteTurnStage::Head => {
-                let head = live_head(rows::value(result)?)?;
+                let head = live_head(result.value()?)?;
                 self.head(head)
             }
             WriteTurnStage::Turns(head) => self.turns(head, rows::page(result)?.0),

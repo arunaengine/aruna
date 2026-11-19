@@ -229,7 +229,7 @@ impl Operation for ReplaceSourceOperation {
         let connector_id = self.input.connector_id;
         match &mut self.stage {
             Stage::Current => {
-                let existing = decode_row(rows::value(result)?, SourceConnector::from_bytes)?;
+                let existing = decode_row(result.value()?, SourceConnector::from_bytes)?;
                 self.prepare_replacement(existing.ok_or(ReplaceSourceError::NotFound)?);
                 self.stage = Stage::Secret;
                 Ok(Next::Call(read_secret_effect(connector_id, None).into()))

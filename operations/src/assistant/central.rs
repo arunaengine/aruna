@@ -126,7 +126,7 @@ impl Operation for SetCentralOperation {
             rows::done(result)?;
             return Ok(Next::Done(()));
         }
-        if decode_central(rows::value(result)?.as_ref())? != self.expected {
+        if decode_central(result.value()?.as_ref())? != self.expected {
             return Err(CentralStoreError::Stale);
         }
         let (space, key) = central_row();
@@ -177,7 +177,7 @@ impl Operation for ChargeUsageOperation {
             rows::done(result)?;
             return Ok(Next::Done(charged));
         }
-        let usage = decode_usage(rows::value(result)?.as_ref())?;
+        let usage = decode_usage(result.value()?.as_ref())?;
         let next =
             charge(usage, self.today, self.limit).map_err(CentralStoreError::QuotaReached)?;
         let (space, key) = usage_row(self.user_id);

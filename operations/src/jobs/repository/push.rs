@@ -10,7 +10,7 @@ use aruna_core::repository::remote::NodeScope;
 use aruna_core::repository::{
     LinkStatus, LinkTarget, PushOutcome, RepositoryDestination, RepositoryLink, RepositoryRecord,
 };
-use aruna_core::rows::{decode, encode, value, values};
+use aruna_core::rows::{decode, encode, values};
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobError, JobErrorKind, JobId};
 use aruna_core::structs::identity::auth::AuthContext;
 use byteview::ByteView;
@@ -43,7 +43,7 @@ pub(crate) fn read_checkpoint(job_id: JobId) -> IoCall {
 
 /// The checkpoint a [`read_checkpoint`] call found.
 pub(crate) fn parse_checkpoint(result: IoResult) -> Result<Option<ExportCheckpoint>, String> {
-    let row = value(result).map_err(|error| error.to_string())?;
+    let row = result.value().map_err(|error| error.to_string())?;
     row.map(|bytes| decode(&bytes).map_err(|error| error.to_string()))
         .transpose()
 }
@@ -317,7 +317,7 @@ impl Operation for SettlePushOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Option<String>>, LinkError> {
         match std::mem::replace(&mut self.step, SettleStep::Change) {
             SettleStep::Link => {
-                let link = match value(result).map_err(LinkError::from).and_then(parse_link) {
+                let link = match result.value().map_err(LinkError::from).and_then(parse_link) {
                     Ok(Some(link)) if link.active_job == Some(self.job_id) => link,
                     Ok(_) => return Ok(Next::Done(None)),
                     Err(error) => return Ok(Next::Done(Some(error.to_string()))),
@@ -405,7 +405,7 @@ impl Operation for GuardOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, TransferError> {
-        let link = parse_link(value(result)?).map_err(stored)?;
+        let link = parse_link(result.value()?).map_err(stored)?;
         match link {
             Some(link)
                 if link.active_job == Some(self.job_id) && link.status != LinkStatus::Paused =>

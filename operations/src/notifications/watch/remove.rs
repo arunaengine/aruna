@@ -4,6 +4,7 @@
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
@@ -34,6 +35,7 @@ pub struct RemoveWatchOperation {
     owner: UserId,
     watch_id: Ulid,
     state: RemoveState,
+    ids: IdMint,
 }
 
 impl RemoveWatchOperation {
@@ -43,6 +45,7 @@ impl RemoveWatchOperation {
             owner,
             watch_id,
             state: RemoveState::Config,
+            ids: IdMint::default(),
         }
     }
 
@@ -53,8 +56,8 @@ impl RemoveWatchOperation {
         if let Err(reason) = checked {
             return reject(reason);
         }
-        let replication =
-            watch_delete_replication(input.local, self.owner, self.watch_id, input.now_ms);
+        let place = (input.local, self.ids.mint(input.now_ms));
+        let replication = watch_delete_replication(place, self.owner, self.watch_id, input.now_ms);
         let store = StoreWatchOperation::delete(self.owner, self.watch_id, Some(replication));
         self.state = RemoveState::Store;
         Ok(Next::Call(IoCall::child(store)))
@@ -64,6 +67,10 @@ impl RemoveWatchOperation {
 impl Operation for RemoveWatchOperation {
     type Output = NotificationTransportMessage;
     type Error = DeliverError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 
     fn first(&mut self) -> AnswerTurn {
         let realm_id = self.owner.realm_id;
