@@ -1693,7 +1693,7 @@ async fn late_merges_chain() {
         crate_render(&["newer", "first"]),
         crate_render(&["newer", "first", "second"]),
     ];
-    let prepare = crate::metadata::raw_revision::prepare_merged_event;
+    let prepare = crate::metadata::raw_revision::tests::prepare_merged_event;
     let mut fresh = RawStateCache::default();
     let stored = prepare(&context, &newer, renders[0].clone(), 0, &mut fresh)
         .await
