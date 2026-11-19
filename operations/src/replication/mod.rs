@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub(crate) mod bao_read;
+pub mod bao_read;
 pub(crate) mod bootstrap;
 pub mod catch_up;
 pub mod drain;

@@ -26,22 +26,22 @@ use archive::blocking_omissions;
 use aruna_core::repository::remote::NodeScope;
 use resolve::ExportCandidate;
 
-pub(crate) mod archive;
+pub mod archive;
 mod assemble;
-mod consent;
+pub mod consent;
 mod job;
-mod open;
-mod probe;
+pub mod open;
+pub mod probe;
 mod publish;
-mod resolve;
+pub mod resolve;
 mod snapshot;
-mod sources;
+pub mod sources;
 
 pub use consent::{ConsentCheckError, UnheldBucketOperation};
 pub use job::{ExportJobError, ExportJobOperation};
 pub use snapshot::CrateJsonOperation;
 
-const METADATA_PATH: &str = aruna_core::repository::rules::CRATE_FILES[0];
+pub const METADATA_PATH: &str = aruna_core::repository::rules::CRATE_FILES[0];
 const REPORT_PATH: &str = aruna_core::repository::rules::CRATE_FILES[1];
 const REMOTE_ATTEMPTS: usize = 8;
 const MAX_LOCAL_CANDIDATES: usize = REMOTE_ATTEMPTS / 2;
@@ -167,7 +167,7 @@ impl ExportCheckpoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ExportEntity {
+pub struct ExportEntity {
     entity_id: String,
     local_path: Option<String>,
     storage_key: Option<StorageKey>,
@@ -186,7 +186,7 @@ struct ExportEntity {
 }
 
 #[derive(Debug, PartialEq)]
-struct ProbedEntry {
+pub struct ProbedEntry {
     entity_index: usize,
     candidate_index: usize,
     size: u64,
@@ -207,7 +207,7 @@ struct PlannedEntry {
 }
 
 #[derive(Debug, PartialEq)]
-enum ExportFailure {
+pub enum ExportFailure {
     Permanent(String),
     Retryable(String),
     /// A local input's bucket key is locked; the job waits for it.
@@ -231,7 +231,7 @@ enum ExportFailure {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum OpenStatus {
+pub enum OpenStatus {
     Denied,
     /// An export into another realm needs a bucket key of this copy that the caller lacks.
     NotHolder,
@@ -241,7 +241,7 @@ enum OpenStatus {
 }
 
 #[derive(Debug, PartialEq)]
-enum CandidateOpen {
+pub enum CandidateOpen {
     Opened(BaoReadOutput),
     Status(OpenStatus),
 }
@@ -270,7 +270,7 @@ impl ExportScope {
 
 /// What looking up and opening the sources of an export needs.
 #[derive(Clone, Debug, PartialEq)]
-struct SourceScope {
+pub struct SourceScope {
     spec: Arc<ExportRoCrateSpec>,
     owner_node: NodeId,
 }

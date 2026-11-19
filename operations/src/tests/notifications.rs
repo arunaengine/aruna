@@ -16,13 +16,13 @@ use aruna_storage::storage::{FjallStorage, StorageHandle};
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
 
-pub(crate) fn temp_storage() -> (TempDir, StorageHandle) {
+pub fn temp_storage() -> (TempDir, StorageHandle) {
     let directory = tempdir().unwrap();
     let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
     (directory, storage)
 }
 
-pub(crate) fn context(storage: &StorageHandle) -> DriverContext {
+pub fn context(storage: &StorageHandle) -> DriverContext {
     DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
@@ -35,16 +35,16 @@ pub(crate) fn context(storage: &StorageHandle) -> DriverContext {
     }
 }
 
-pub(crate) fn context_with_storage() -> (TempDir, DriverContext) {
+pub fn context_with_storage() -> (TempDir, DriverContext) {
     let (directory, storage) = temp_storage();
     (directory, context(&storage))
 }
 
-pub(crate) fn user(realm: u8, seed: u8) -> UserId {
+pub fn user(realm: u8, seed: u8) -> UserId {
     UserId::new(Ulid::from_bytes([seed; 16]), RealmId([realm; 32]))
 }
 
-pub(crate) fn record(
+pub fn record(
     recipient: UserId,
     class: NotificationClass,
     created_at_ms: u64,
@@ -60,14 +60,14 @@ pub(crate) fn record(
     )
 }
 
-pub(crate) async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
+pub async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
     let upsert = UpsertInboxOperation::new(records.to_vec());
     let outcome = drive(upsert, &context(storage)).await;
     assert_eq!(outcome.map(|outcome| outcome.written), Ok(records.len()));
 }
 
 /// Stores one register write of a setting on this node, as a local write or sync would.
-pub(crate) async fn store_setting(
+pub async fn store_setting(
     storage: &StorageHandle,
     target: &DocumentTarget,
     bytes: Vec<u8>,
@@ -82,12 +82,12 @@ pub(crate) async fn store_setting(
 }
 
 /// Three management nodes, in config order.
-pub(crate) fn managers() -> [aruna_core::NodeId; 3] {
+pub fn managers() -> [aruna_core::NodeId; 3] {
     [61u8, 62, 63].map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
 }
 
 /// Creates a watch on this node as its holder, with the owner's READ check and replication.
-pub(crate) async fn create_holder_watch(
+pub async fn create_holder_watch(
     context: &DriverContext,
     local_node_id: aruna_core::NodeId,
     owner: UserId,
@@ -111,7 +111,7 @@ pub(crate) async fn create_holder_watch(
 }
 
 /// Stores a watch of `owner` on this node without authorization or replication.
-pub(crate) async fn create_local_watch(
+pub async fn create_local_watch(
     storage: &StorageHandle,
     owner: UserId,
     path_prefix: String,
@@ -135,7 +135,7 @@ pub(crate) async fn create_local_watch(
 }
 
 /// Deletes a watch of `owner` on this node without replication.
-pub(crate) async fn delete_local_watch(
+pub async fn delete_local_watch(
     storage: &StorageHandle,
     owner: UserId,
     watch_id: Ulid,
@@ -146,7 +146,7 @@ pub(crate) async fn delete_local_watch(
 }
 
 /// A delivery from `node_id(2)` to `node_id(1)`, which holds the inbox of `user(1, 2)`.
-pub(crate) fn peer_input() -> crate::notifications::deliver::DeliverInput {
+pub fn peer_input() -> crate::notifications::deliver::DeliverInput {
     use crate::tests::locations::node_id;
     crate::notifications::deliver::DeliverInput {
         peer: node_id(2),

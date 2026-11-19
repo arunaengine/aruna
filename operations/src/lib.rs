@@ -58,8 +58,8 @@ pub mod testing_objects;
 pub mod triggers;
 pub mod users;
 
-#[cfg(test)]
-mod tests;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod tests;
 
 /// Deterministic member order for records that several nodes must byte-match.
 pub(crate) fn sorted_user_ids(

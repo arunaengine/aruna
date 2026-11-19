@@ -13,8 +13,8 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 
 use ulid::Ulid;
 
-use aruna_operations::groups::deletion::tests::{Fixture, read};
 use aruna::inbound::initialize_incoming_fixture;
+use aruna_operations::groups::deletion::tests::{Fixture, read};
 use aruna_operations::metadata::MetadataHandle;
 
 async fn connect_fixture(fixture: &mut Fixture, seed: u8) -> NetHandle {
@@ -114,7 +114,8 @@ async fn check_reports_nodes() {
     let second_net = connect_fixture(&mut second, 2).await;
     first_net.add_peer_addr(second_net.endpoint_addr()).await;
     second_net.add_peer_addr(first_net.endpoint_addr()).await;
-    aruna_operations::groups::deletion::check_tests::buckets(&second, 2, &["owned", "hidden"]).await;
+    aruna_operations::groups::deletion::check_tests::buckets(&second, 2, &["owned", "hidden"])
+        .await;
     let auth = first.auth.clone();
     let group_id = first.plan.group_id;
     let first_context = Arc::new(first.context);
@@ -122,7 +123,11 @@ async fn check_reports_nodes() {
     let first_handler = initialize_incoming_fixture(first_context.clone()).unwrap();
     let second_handler = initialize_incoming_fixture(second_context.clone()).unwrap();
     let replies = aruna_operations::driver::drive(
-        aruna_operations::groups::deletion::CheckGroupOperation::new(first_context.node_and_realm(), auth, group_id),
+        aruna_operations::groups::deletion::CheckGroupOperation::new(
+            first_context.node_and_realm(),
+            auth,
+            group_id,
+        ),
         &first_context,
     )
     .await
