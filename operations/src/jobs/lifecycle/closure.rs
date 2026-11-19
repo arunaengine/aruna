@@ -1,6 +1,5 @@
-//! Closes what was sent and never taken up: a plugin task's submission past its admission
-//! deadline, and a launch without a receipt past its window. Each is answered by the node it went
-//! to from stored rows only, and the asking node keeps a closure row.
+//! Closes what was sent and never taken up: a plugin task's submission past its deadline and a
+//! launch without a receipt past its window, answered from stored rows by the node it went to.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -613,26 +612,27 @@ enum PassStep {
 }
 
 /// Asks the target of every launch of one family that has no receipt and no closure row and
-/// whose closure time passed on this node's clock. Answers how many launches it closed.
+/// whose closure time passed on this node's clock. Answers the launches closed here afterwards;
+/// a node without a network asks nobody and answers the closures it holds.
 #[derive(Debug, PartialEq)]
 pub struct CloseLaunchesOperation {
     family: JobFamilyId,
     records: Vec<JobRecordEnvelope>,
-    serving: (NodeId, RealmId),
+    serving: Option<(NodeId, RealmId)>,
     now_ms: u64,
     closed: BTreeSet<Ulid>,
     open: VecDeque<LaunchFrame>,
-    count: usize,
+    asking: Option<Ulid>,
     step: PassStep,
 }
 
-type PassNext = Result<Next<usize>, LifecycleError>;
+type PassNext = Result<Next<BTreeSet<Ulid>>, LifecycleError>;
 
 impl CloseLaunchesOperation {
     pub fn new(
         family: JobFamilyId,
         records: Vec<JobRecordEnvelope>,
-        serving: (NodeId, RealmId),
+        serving: Option<(NodeId, RealmId)>,
     ) -> Self {
         Self {
             family,
@@ -641,7 +641,7 @@ impl CloseLaunchesOperation {
             now_ms: 0,
             closed: BTreeSet::new(),
             open: VecDeque::new(),
-            count: 0,
+            asking: None,
             step: PassStep::Closed,
         }
     }
@@ -680,23 +680,28 @@ impl CloseLaunchesOperation {
     }
 
     fn ask_next(&mut self) -> PassNext {
+        let Some(serving) = self.serving else {
+            return Ok(Next::Done(std::mem::take(&mut self.closed)));
+        };
         while let Some(frame) = self.open.pop_front() {
-            if let Some(close) = CloseLaunchOperation::new((self.family, frame), self.serving) {
+            if let Some(close) = CloseLaunchOperation::new((self.family, frame), serving) {
+                self.asking = Some(close.launch_id);
                 self.step = PassStep::Ask;
                 return Ok(Next::Call(IoCall::child(close)));
             }
         }
-        Ok(Next::Done(self.count))
+        Ok(Next::Done(std::mem::take(&mut self.closed)))
     }
 
     fn asked(&mut self, outcome: ClosureOutcome) -> PassNext {
+        let (local, realm_id) = self.serving.ok_or(IoError::Unfinished)?;
         match outcome {
-            ClosureOutcome::Closed => self.count += 1,
+            ClosureOutcome::Closed => self.closed.extend(self.asking.take()),
             ClosureOutcome::Receipt(receipt) => {
                 let target = receipt.envelope().published_by;
                 let append = AppendRecordOperation::new(AppendRecordConfig {
-                    realm_id: self.serving.1,
-                    local_node_id: self.serving.0,
+                    realm_id,
+                    local_node_id: local,
                     record: receipt,
                     local: None,
                     origin: RecordOrigin::Peer(target),
@@ -712,7 +717,7 @@ impl CloseLaunchesOperation {
 }
 
 impl Operation for CloseLaunchesOperation {
-    type Output = usize;
+    type Output = BTreeSet<Ulid>;
     type Error = LifecycleError;
 
     fn stamp(&mut self, now_ms: u64) {

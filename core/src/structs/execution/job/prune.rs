@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::family::{CLOCK_MARGIN_MS, JobFamilyRecord, JobRecordEnvelope, LogicalJobState};
@@ -13,6 +14,17 @@ use crate::NodeId;
 
 /// How long tombstones and pending rows are kept; it is also the bound of spec freshness.
 pub const TOMBSTONE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// What stays of a pruned family on one node until it expires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FamilyTombstone {
+    /// When this node pruned the family.
+    pub pruned_at_ms: u64,
+    /// The largest record time of the pruned family.
+    pub last_record_ms: u64,
+    /// Every body page is deleted; until then every record of the family is refused for now.
+    pub finished: bool,
+}
 
 /// What one node knows about one family when it decides.
 #[derive(Clone, Copy, Debug)]

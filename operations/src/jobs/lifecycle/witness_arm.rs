@@ -99,14 +99,14 @@ fn jitter_ms(family: &JobFamilyId, node: NodeId, base_delay_ms: u64) -> u64 {
     u64::from(u16::from_be_bytes([key[0], key[1]])) % spread
 }
 
-pub(super) fn deadline_key(family: &JobFamilyId, due_at_ms: u64) -> Key {
+pub(crate) fn deadline_key(family: &JobFamilyId, due_at_ms: u64) -> Key {
     let mut bytes = Vec::with_capacity(DEADLINE_KEY_BYTES);
     bytes.extend_from_slice(&due_at_ms.to_be_bytes());
     bytes.extend_from_slice(&family.to_bytes());
     Key::from(bytes.as_slice())
 }
 
-pub(super) fn deadline_index_key(family: &JobFamilyId) -> Key {
+pub(crate) fn deadline_index_key(family: &JobFamilyId) -> Key {
     Key::from(family.to_bytes().as_slice())
 }
 

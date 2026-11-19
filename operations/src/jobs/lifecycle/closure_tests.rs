@@ -135,11 +135,11 @@ fn own_target_local() {
 
 // The pass asks only for open launches past their closure time and counts the closed ones.
 #[test]
-fn pass_asks_due_launches() {
+fn asks_due_launches() {
     let family = Family::new([74u8; 32]);
     let (frame, _) = launch(&family);
     let records = vec![frame.envelope().clone()];
-    let serving = (family.holder.public(), REALM);
+    let serving = Some((family.holder.public(), REALM));
     let mut early = CloseLaunchesOperation::new(family.family(), records.clone(), serving);
     early.stamp(created(&frame));
     early.first().unwrap();
@@ -147,7 +147,7 @@ fn pass_asks_due_launches() {
         rows: Vec::new(),
         next: None,
     };
-    assert_eq!(early.next(none()), Ok(Next::Done(0)));
+    assert_eq!(early.next(none()), Ok(Next::Done(BTreeSet::new())));
     let mut due = CloseLaunchesOperation::new(family.family(), records, serving);
     let JobFamilyRecord::Launch(intent) = &frame.envelope().record else {
         panic!("a launch");
@@ -156,7 +156,10 @@ fn pass_asks_due_launches() {
     due.first().unwrap();
     assert!(matches!(due.next(none()), Ok(Next::Call(IoCall::Child(_)))));
     let closed = child(Ok::<_, LifecycleError>(ClosureOutcome::Closed));
-    assert_eq!(due.next(closed), Ok(Next::Done(1)));
+    assert_eq!(
+        due.next(closed),
+        Ok(Next::Done(BTreeSet::from([intent.launch_id])))
+    );
 }
 
 fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
