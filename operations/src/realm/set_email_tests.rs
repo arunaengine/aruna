@@ -230,7 +230,7 @@ fn concurrent_firsts() -> (AdminDocumentState, BTreeSet<RealmVaultEntry>) {
     let mut rivals = Vec::new();
     for seed in [1u8, 2] {
         let mut state = base.clone();
-        let operation = EmailWrite::new(Arc::new(email_config(
+        let mut operation = EmailWrite::new(Arc::new(email_config(
             &actor(seed),
             Some(input(Some("mailer"), Some("first"))),
         )));
@@ -252,7 +252,7 @@ fn apply_change(
     state: &mut AdminDocumentState,
     profile: Option<EmailInput>,
 ) -> Option<RealmEmailProfile> {
-    let operation = EmailWrite::new(Arc::new(email_config(&actor(1), profile)));
+    let mut operation = EmailWrite::new(Arc::new(email_config(&actor(1), profile)));
     let (operations, profile) = operation.email_writes(state).unwrap();
     for operation in operations {
         state.apply_operation(&actor(1), operation).unwrap();

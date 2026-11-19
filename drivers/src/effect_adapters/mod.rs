@@ -22,6 +22,7 @@ use aruna_core::operation::SubOperation;
 use aruna_core::outbound::{
     ConnectionError, OutboundEffect, OutboundError, OutboundEvent, RangeAnswer,
 };
+use aruna_core::plugins::{MemoryPermit, PluginEffect, PluginEvent};
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
@@ -169,6 +170,7 @@ async fn dispatch_unboxed(
             Some(outbound) => Event::Outbound(Box::pin(outbound.run(effect)).await),
             None => Event::Outbound(outbound_unavailable(&effect)),
         },
+        Effect::Plugin(effect) => Event::Plugin(plugin_state(effect)),
         Effect::Metadata(metadata_effect) => {
             metadata::dispatch_metadata(metadata_effect, context).await
         }
@@ -268,6 +270,34 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Delay(_) => "delay",
         Effect::Job(_) => "job",
         Effect::Git(_) => "git",
+        Effect::Plugin(_) => "plugin",
+    }
+}
+
+/// Answers a plugin effect from the plugin host's node-wide state.
+fn plugin_state(effect: PluginEffect) -> PluginEvent {
+    use aruna_plugins::host_state;
+    match effect {
+        PluginEffect::TakeCall { install_id, now_ms } => {
+            PluginEvent::Taken(host_state::take_call(u128::from(install_id), now_ms))
+        }
+        PluginEffect::TakeHook { install_id, now_ms } => {
+            PluginEvent::Taken(host_state::take_hook(u128::from(install_id), now_ms))
+        }
+        PluginEffect::Reserve { bytes } => PluginEvent::Reserved(
+            host_state::reserve(bytes)
+                .map(|mib| MemoryPermit::new(mib, move || host_state::release(mib))),
+        ),
+        PluginEffect::FirstSeen {
+            named,
+            unnamed,
+            now_ms,
+        } => {
+            let keys = |users: Vec<aruna_core::UserId>| -> Vec<String> {
+                users.iter().map(ToString::to_string).collect()
+            };
+            PluginEvent::Seen(host_state::first_seen(&keys(named), &keys(unnamed), now_ms))
+        }
     }
 }
 

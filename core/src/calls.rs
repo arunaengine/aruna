@@ -403,6 +403,7 @@ enum Family {
     Compute,
     Job,
     Git,
+    Plugin,
 }
 
 impl Wait {
@@ -426,6 +427,7 @@ impl Wait {
             Self::Family(Family::Compute) => "a compute event",
             Self::Family(Family::Job) => "a job host event",
             Self::Family(Family::Git) => "a Git store event",
+            Self::Family(Family::Plugin) => "a plugin host event",
             Self::Child => "the child's event",
             Self::Group => "GroupEvent::Finished",
             Self::Window => "GroupEvent::Member or GroupEvent::Closed",
@@ -890,6 +892,7 @@ fn effect_family(effect: &Effect) -> Result<Family, IoError> {
         Effect::Compute(_) => Ok(Family::Compute),
         Effect::Job(_) => Ok(Family::Job),
         Effect::Git(_) => Ok(Family::Git),
+        Effect::Plugin(_) => Ok(Family::Plugin),
         Effect::Storage(
             StorageEffect::StartTransaction { .. }
             | StorageEffect::CommitTransaction { .. }
@@ -922,6 +925,7 @@ fn event_family(event: &Event) -> Option<Family> {
         Event::Compute(_) => Some(Family::Compute),
         Event::Job(_) => Some(Family::Job),
         Event::Git(_) => Some(Family::Git),
+        Event::Plugin(_) => Some(Family::Plugin),
         Event::SubOperation(_)
         | Event::Search()
         | Event::Stream()
