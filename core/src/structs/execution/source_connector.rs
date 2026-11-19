@@ -272,6 +272,18 @@ mod tests {
         assert!(rendered.contains("token"));
     }
 
+    #[test]
+    fn empty_secret_none() {
+        assert!(
+            SourceConnectorSecret::new(
+                Ulid::from_bytes([4u8; 16]),
+                HashMap::new(),
+                SystemTime::UNIX_EPOCH,
+            )
+            .is_none()
+        );
+    }
+
     // Table rows name URLs; they resolve below the endpoint and root, S3 has no base URL.
     #[test]
     fn base_joins_root() {

@@ -356,22 +356,6 @@ mod tests {
         }
     }
 
-    // the connector secret split stays redacted
-    #[test]
-    fn debug_hides_secrets() {
-        let secret = SourceConnectorSecret::new(
-            Ulid::from_bytes([1u8; 16]),
-            HashMap::from([("token".to_string(), "canary-7f3a".to_string())]),
-            SystemTime::UNIX_EPOCH,
-        )
-        .unwrap();
-
-        let rendered = format!("{secret:?}");
-
-        assert!(!rendered.contains("canary-7f3a"));
-        assert!(rendered.contains("token"));
-    }
-
     #[test]
     fn secret_stays_redacted() {
         let connector = RepositoryConnector::new(
@@ -404,18 +388,6 @@ mod tests {
                 .unwrap()
                 .windows("super-secret".len())
                 .any(|w| w == b"super-secret")
-        );
-    }
-
-    #[test]
-    fn empty_secret_none() {
-        assert!(
-            SourceConnectorSecret::new(
-                Ulid::from_bytes([4u8; 16]),
-                HashMap::new(),
-                SystemTime::UNIX_EPOCH,
-            )
-            .is_none()
         );
     }
 
