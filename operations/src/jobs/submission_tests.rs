@@ -25,11 +25,11 @@ use super::job_cancel::CancelOwnedOperation;
 use super::job_reads::tests::{read_owned_job, read_owned_report};
 use super::job_reports::{JobReportLookup, ReportQuery};
 use super::store::row_calls::preserve_artifact_tombstone;
-use super::submit::SubmitJobError;
+use super::submit::{SubmitJobError, SubmitJobResult};
 use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation, validate_execution};
 use super::submit_local::DedupLookupOperation;
-use crate::jobs::store::test_calls::read_job_record;
-use crate::jobs::store::test_calls::{insert_job, submit_execution_job};
+use aruna_test_support::jobs::read_job_record;
+use aruna_test_support::jobs::insert_job;
 use aruna_drivers::driver::{DriverContext, drive};
 
 fn node_id() -> NodeId {
@@ -67,6 +67,22 @@ fn submission(serving: Option<(NodeId, RealmId)>) -> ExecutionSubmission {
         serving,
         now_ms: 1,
     }
+}
+
+/// Submits `spec` into the existing workspace `shared` through this context's node.
+async fn submit_shared(
+    context: &DriverContext,
+    spec: ExecutionSpec,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let submission = ExecutionSubmission {
+        spec,
+        workspace_mode: WorkspaceMode::Existing,
+        workspace_bucket: Some("shared".to_string()),
+        serving: context.node_and_realm(),
+        now_ms: aruna_core::time::unix_timestamp_millis(),
+        ..submission(None)
+    };
+    drive(SubmitExecutionOperation::new(submission), context).await
 }
 
 // An unplaced node submits at once; a placed node reads its realm config first and refuses
@@ -127,17 +143,7 @@ async fn caps_declared_outputs() {
         collision_policy: Default::default(),
     };
 
-    let error = submit_execution_job(
-        &context,
-        spec.clone(),
-        UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
-        node_id(),
-        None,
-        WorkspaceMode::Existing,
-        Some("shared".to_string()),
-        1,
-        None,
-    )
+    let error = submit_shared(&context, spec.clone())
     .await
     .unwrap_err();
     assert!(matches!(
@@ -155,17 +161,7 @@ async fn caps_declared_outputs() {
     ));
     spec.output_prefixes.clear();
     assert!(!matches!(
-        submit_execution_job(
-            &context,
-            spec,
-            UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
-            node_id(),
-            None,
-            WorkspaceMode::Existing,
-            Some("shared".to_string()),
-            1,
-            None,
-        )
+        submit_shared(&context, spec)
         .await,
         Err(SubmitJobError::TooManyOutputs { .. })
     ));

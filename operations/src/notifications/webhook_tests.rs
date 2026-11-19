@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::jobs::store::test_calls::find_dedup_plan;
+use aruna_test_support::jobs::find_dedup_plan;
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::tests::staging::setup_driver_context;
 use aruna_core::calls::ChildOutcome;

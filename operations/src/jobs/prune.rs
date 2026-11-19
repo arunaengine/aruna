@@ -427,10 +427,8 @@ pub(crate) mod tests {
     use crate::jobs::JOB_PRUNE_PAGE;
     use crate::jobs::JOB_RETENTION_MS;
     use crate::jobs::store::job_calls::ClaimOutcome;
-    use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::test_calls::put_job_entry;
-    use crate::jobs::store::test_calls::read_job_record;
-    use crate::jobs::store::test_calls::{claim_job, complete_job, transition_to_running};
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::handle::Handle;
@@ -822,37 +820,30 @@ pub(crate) mod tests {
         record.retention_ms = retention_ms;
         insert_job(&context, &record).await.unwrap();
         let ClaimOutcome::Claimed(claimed) =
-            claim_job(&context, job_id, node_id(7), 2).await.unwrap()
+            aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, node_id(7), 2), &context).await.unwrap()
         else {
             panic!("job must be claimed")
         };
         let token = claimed.claim.unwrap().claim_token;
-        put_job_entry(&context, job_id, token, b"entry", &"row")
+        aruna_drivers::driver::drive(crate::jobs::store::job_calls::put_job_entry(job_id, token, b"entry", &"row"), &context)
             .await
             .unwrap();
-        transition_to_running(&context, job_id, token, 3)
+        aruna_drivers::driver::drive(crate::jobs::store::job_calls::transition_to_running(job_id, token, 3), &context)
             .await
             .unwrap();
-        complete_job(
-            &context,
-            job_id,
-            token,
-            JobResultPayload::ImportRoCrate(ImportRoCrateResult {
+        aruna_drivers::driver::drive(crate::jobs::store::job_calls::complete_job(job_id, token, JobResultPayload::ImportRoCrate(ImportRoCrateResult {
                 document_id: None,
                 entries_total: 1,
                 imported: 1,
                 unlisted: 0,
                 failed: 0,
                 report_digest: [0u8; 32],
-            }),
-            JobProgress {
+            }), JobProgress {
                 current: 1,
                 total: Some(1),
                 unit: "entries".to_string(),
                 paused_until: None,
-            },
-            unix_timestamp_millis().saturating_sub(2),
-        )
+            }, unix_timestamp_millis().saturating_sub(2)), &context)
         .await
         .unwrap();
         assert_eq!(count(&context, JOB_ENTRY_KEYSPACE).await, 1);

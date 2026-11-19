@@ -185,9 +185,8 @@ mod tests {
     use super::*;
     use crate::jobs::key_locks::{KeyCheckError, LockedInputsOperation, ParkLockedOperation};
     use crate::jobs::store::job_calls::ClaimOutcome;
-    use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::test_calls::park_job;
-    use crate::jobs::store::test_calls::{claim_job, read_job_record};
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
@@ -410,7 +409,7 @@ mod tests {
         let record = JobRecord::new(job_id, payload, owner, node, 1_000, 1_000, None);
         insert_job(&context, &record).await.unwrap();
         let ClaimOutcome::Claimed(claimed) =
-            claim_job(&context, job_id, node, 2_000).await.unwrap()
+            aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, node, 2_000), &context).await.unwrap()
         else {
             panic!("job must be claimed")
         };
@@ -422,7 +421,7 @@ mod tests {
             group_id: None,
             key,
         };
-        park_job(&context, job_id, token, 3_000, vec![wait])
+        aruna_drivers::driver::drive(crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait]), &context)
             .await
             .unwrap();
 
@@ -639,7 +638,7 @@ mod tests {
     #[tokio::test]
     async fn lock_after_precheck() {
         use crate::jobs::lifecycle::stage::stage_error;
-        use crate::jobs::store::test_calls::read_key_waits;
+        use aruna_test_support::jobs::read_key_waits;
         use crate::jobs::workflow::workspace::LOCKED_INPUT;
         use crate::replication::bao_read::BaoReadError;
         use aruna_core::replication_protocol::BaoReadRefusal;
@@ -676,7 +675,7 @@ mod tests {
         });
         insert_job(&context, &record).await.unwrap();
         let ClaimOutcome::Claimed(claimed) =
-            claim_job(&context, job_id, node, 2_000).await.unwrap()
+            aruna_drivers::driver::drive(crate::jobs::store::job_calls::claim_job(job_id, node, 2_000), &context).await.unwrap()
         else {
             panic!("job must be claimed")
         };

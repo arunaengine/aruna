@@ -21,8 +21,6 @@ use crate::jobs::output_record::StoreOutputsOperation;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
-use crate::jobs::store::test_calls::record_attempt_intent;
-use crate::jobs::store::test_calls::reserve_output_commits;
 use crate::tests::records::{Family, REALM, context};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
@@ -161,20 +159,12 @@ async fn publishes_terminal_success() {
         pinned_image: "alpine@sha256:0".to_string(),
         attempt_epoch: 0,
     };
-    let commit = record_attempt_intent(
-        &ctx,
-        physical(),
-        TOKEN,
-        intent,
-        Some(receipt.execution_id),
-        None,
-        4_100,
-    )
+    let commit = aruna_drivers::driver::drive(crate::jobs::store::job_calls::record_attempt_intent( physical(), TOKEN, intent, Some(receipt.execution_id), None, 4_100, ), &ctx)
     .await
     .expect("attempt intent commits");
     let executor = family.target.public();
     let destinations = vec![(executor, "ws".to_string(), "out.txt".to_string())];
-    let control = reserve_output_commits(&ctx, physical(), &destinations, &Default::default())
+    let control = aruna_drivers::driver::drive(crate::jobs::store::job_calls::reserve_output_commits(physical(), destinations.to_vec(), Default::default(), aruna_core::time::unix_timestamp_millis()), &ctx)
         .await
         .expect("output commits reserved");
     let outputs = vec![OutputObject {

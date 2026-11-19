@@ -623,7 +623,6 @@ fn page_bounds_entries() {
 // A progress flush and a lease renewal that commit while the page is open must not conflict.
 #[tokio::test]
 async fn flush_keeps_page() {
-    use crate::jobs::store::test_calls::{flush_progress, renew_lease};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
 
     let test = setup_driver_context().await;
@@ -633,7 +632,7 @@ async fn flush_keeps_page() {
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
     let job = record(token());
-    crate::jobs::store::test_calls::insert_job(context, &job)
+    aruna_test_support::jobs::insert_job(context, &job)
         .await
         .unwrap();
     let mut operation = PageImportOperation::new(PageImportInput {
@@ -651,10 +650,10 @@ async fn flush_keeps_page() {
         let commit = matches!(effect, StorageEffect::CommitTransaction { .. });
         if commit {
             let progress = job.progress.clone();
-            flush_progress(context, job.job_id, token(), progress, 2)
+            aruna_drivers::driver::drive(crate::jobs::store::job_calls::flush_progress(job.job_id, token(), progress, 2), context)
                 .await
                 .unwrap();
-            renew_lease(context, job.job_id, token(), 3, None)
+            aruna_drivers::driver::drive(crate::jobs::store::job_calls::renew_lease(job.job_id, token(), 3, None), context)
                 .await
                 .unwrap();
         }
@@ -688,7 +687,7 @@ async fn bare_size_unchanged() {
     let group_id = bucket().group_id;
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
-    crate::jobs::store::test_calls::insert_job(context, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let bare = |content_length| PageEntry {
@@ -729,7 +728,7 @@ async fn bare_size_unchanged() {
     let mut later = record(token());
     later.job_id = job_id;
     (later.created_at_ms, later.updated_at_ms) = (started, started);
-    crate::jobs::store::test_calls::insert_job(context, &later)
+    aruna_test_support::jobs::insert_job(context, &later)
         .await
         .unwrap();
     let mut moved = connector.clone();
@@ -769,7 +768,7 @@ async fn replay_charges_once() {
     let group_id = bucket().group_id;
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
-    crate::jobs::store::test_calls::insert_job(context, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let page = PageImportInput {
@@ -882,7 +881,7 @@ async fn page_maintains_inventory() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::test_calls::insert_job(context, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let page = PageImportInput {
@@ -953,7 +952,7 @@ async fn page_needs_coordinator() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::test_calls::insert_job(context, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let page = PageImportInput {
@@ -1084,7 +1083,7 @@ async fn distributed_sizes_measured() {
     };
     handle.send_storage_effect(write).await;
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::test_calls::insert_job(context, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let before = keyspace_bytes(handle).await;
@@ -1116,7 +1115,7 @@ async fn entry_sizes_measured() {
     let connector = bakrep_connector(context).await;
     let group_id = bucket().group_id;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
-    crate::jobs::store::test_calls::insert_job(context, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let before = keyspace_bytes(handle).await;
@@ -1214,7 +1213,7 @@ async fn page_exchanges_measured() {
     };
     handle.send_storage_effect(write).await;
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::test_calls::insert_job(context, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     for page in 0..4 {

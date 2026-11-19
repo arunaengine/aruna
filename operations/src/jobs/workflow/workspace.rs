@@ -1153,7 +1153,7 @@ mod tests {
             claim_token: Ulid::from_bytes([8; 16]),
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::test_calls::insert_job(context, &record)
+        aruna_test_support::jobs::insert_job(context, &record)
             .await
             .unwrap();
         let pin = SourcePin {
@@ -1163,7 +1163,7 @@ mod tests {
         };
         let stored = || async {
             let read =
-                crate::jobs::store::test_calls::read_job_record(context, record.job_id, None).await;
+                aruna_test_support::jobs::read_job_record(context, record.job_id, None).await;
             read.unwrap().unwrap().captured_inputs[0].served_by.clone()
         };
         let token = Ulid::from_bytes([8; 16]);

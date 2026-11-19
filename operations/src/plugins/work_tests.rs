@@ -298,7 +298,7 @@ fn prune_refuses_failure() {
 async fn settles_before_pruning() {
     // A finished job's row keeps its summary; until then the job record is held.
     use crate::jobs::JOB_PRUNE_PAGE;
-    use crate::jobs::store::test_calls::insert_job;
+    use aruna_test_support::jobs::insert_job;
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);
@@ -365,7 +365,7 @@ async fn prunes_settled_rows() {
     // A settled row goes once it aged and its run is pruned, since no rerun can ask for it; until
     // then it answers its paths, also after its job record was pruned.
     use crate::jobs::JOB_PRUNE_PAGE;
-    use crate::jobs::store::test_calls::insert_job;
+    use aruna_test_support::jobs::insert_job;
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
@@ -436,8 +436,8 @@ async fn prunes_settled_rows() {
 async fn removal_cancels_first() {
     // A removed install's running work is cancelled and its row stays until the job settled;
     // settled rows and work that never got a job go at once.
-    use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::test_calls::read_job_record;
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use crate::plugins::bound::tests::edit_config;
     use aruna_core::plugin_installs::InstallState;
     let fixture = Fixture::new().await;
@@ -498,7 +498,7 @@ fn finished(install: &PluginInstall, row: &WorkRow, job_id: JobId) -> JobRecord 
 async fn reserved_work_settles() {
     // The submission committed but its answer was lost, so the row stayed reserved; settling
     // finds the job by its dedup key without the call being repeated.
-    use crate::jobs::store::test_calls::insert_job;
+    use aruna_test_support::jobs::insert_job;
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);
@@ -527,7 +527,7 @@ async fn reserved_work_settles() {
 async fn removal_keeps_finished() {
     // A removed install's reserved work whose job already finished keeps the job, settles, and
     // only then goes.
-    use crate::jobs::store::test_calls::insert_job;
+    use aruna_test_support::jobs::insert_job;
     use crate::plugins::bound::tests::edit_config;
     use aruna_core::plugin_installs::InstallState;
     let fixture = Fixture::new().await;
@@ -618,7 +618,7 @@ async fn boundary_sends_once() {
 #[tokio::test]
 async fn settles_answer() {
     // A settled upload keeps its answer, so its status outlives the job record.
-    use crate::jobs::store::test_calls::insert_job;
+    use aruna_test_support::jobs::insert_job;
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);

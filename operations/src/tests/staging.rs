@@ -416,7 +416,7 @@ impl Fixture {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::test_calls::insert_job(&self.driver, &record)
+        aruna_drivers::driver::drive(crate::jobs::store::row_calls::insert_job(&record), &self.driver)
             .await
             .unwrap();
         JobContext {

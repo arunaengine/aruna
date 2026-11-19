@@ -345,9 +345,7 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::test_calls::read_output_record as read_stored;
-    use crate::jobs::store::test_calls::{read_attempt_control, reserve_output_commits};
+    use aruna_test_support::jobs::insert_job;
     use aruna_core::structs::execution::job::JobId;
     use aruna_drivers::driver::{DriverContext, drive};
 
@@ -458,26 +456,18 @@ mod tests {
         // The signed record must be readable back under the digest terminal
         // success will name, and a replay must not mint a second record.
         let (_dir, context, record, net) = fixture().await;
-        crate::jobs::store::test_calls::record_attempt_intent(
-            &context,
-            record.job_id,
-            TOKEN,
-            AttemptIntent {
+        aruna_drivers::driver::drive(crate::jobs::store::job_calls::record_attempt_intent( record.job_id, TOKEN, AttemptIntent {
                 attempt_no: 1,
                 external_name: "aruna-test-a1".to_string(),
                 executor_kind: "docker".to_string(),
                 pinned_image: "alpine@sha256:0".to_string(),
                 attempt_epoch: 0,
-            },
-            None,
-            None,
-            2_000,
-        )
+            }, None, None, 2_000, ), &context)
         .await
         .unwrap();
         let destinations = vec![(net.node_id(), "ws".to_string(), "reports/a.txt".to_string())];
         let control =
-            reserve_output_commits(&context, record.job_id, &destinations, &Default::default())
+            aruna_drivers::driver::drive(crate::jobs::store::job_calls::reserve_output_commits(record.job_id, destinations.to_vec(), Default::default(), aruna_core::time::unix_timestamp_millis()), &context)
                 .await
                 .unwrap();
         let version_id = control.output_commits[0].version_id;
@@ -487,13 +477,13 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = read_attempt_control(&context, record.job_id, control.attempt_epoch, None)
+        let stored = aruna_drivers::driver::drive(crate::jobs::store::row_calls::read_attempt_control(record.job_id, control.attempt_epoch), &context)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored.output_record, Some(digest));
 
-        let envelope = read_stored(&context, record.job_id, control.attempt_epoch)
+        let envelope = aruna_drivers::driver::drive(crate::jobs::store::row_calls::read_output_record(record.job_id, control.attempt_epoch), &context)
             .await
             .unwrap()
             .unwrap();
