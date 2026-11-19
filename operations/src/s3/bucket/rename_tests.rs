@@ -514,7 +514,7 @@ pub(crate) async fn access(context: &DriverContext) -> AuthContext {
         BUCKET,
         "secret/**",
     );
-    crate::tests::access::seed_access(context, (realm(), group(), node(4)), &secret).await
+    crate::testing_access::seed_access(context, (realm(), group(), node(4)), &secret).await
 }
 
 #[tokio::test]

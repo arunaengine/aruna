@@ -42,9 +42,9 @@ const PASS_BATCHES: usize = 4;
 /// Passes `rebuild_index` may drive before giving up on reaching a quiet state.
 const DRIVE_PASSES: usize = 100_000;
 /// Pause after a pass that found nothing to do, or failed.
-pub(crate) const REBUILD_INTERVAL: Duration = Duration::from_secs(60);
+pub const REBUILD_INTERVAL: Duration = Duration::from_secs(60);
 /// Pacing between the passes of a cycle that still has work to do.
-pub(crate) const WORK_INTERVAL: Duration = Duration::from_secs(1);
+pub const WORK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The single row naming the generation readers may serve, plus the resumable
 /// state of the maintenance cycle.

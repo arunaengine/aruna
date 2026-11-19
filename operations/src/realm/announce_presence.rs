@@ -17,7 +17,7 @@ use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use thiserror::Error;
 
 const REALM_PRESENCE_TTL: Duration = Duration::from_secs(60);
-pub(crate) const PRESENCE_REFRESH_AFTER: Duration = Duration::from_secs(10);
+pub const PRESENCE_REFRESH_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnnouncePresenceConfig {

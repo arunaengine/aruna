@@ -232,7 +232,7 @@ fn publishes_soon(config: &RealmConfigDocument, node_id: NodeId) -> bool {
 /// Moves the registry publication up on the reporting node after replicated realm settings
 /// materialize here, also when another management node served the change. True when armed.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PublishSoonOperation {
+pub struct PublishSoonOperation {
     realm_id: RealmId,
     node_id: NodeId,
     arming: bool,
@@ -299,12 +299,12 @@ impl Operation for PublishSoonOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::tasks::task_persistence::read_timer;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{AcceptedRealms, FederationSettings};
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::time::unix_timestamp_secs;
+    use aruna_storage::task_timers::read_timer;
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;

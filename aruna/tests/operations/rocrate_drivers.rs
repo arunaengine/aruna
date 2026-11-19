@@ -1,0 +1,2264 @@
+//! Tests RO-Crate zip import drivers, covering bad archives, rollback and resumed rollback.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+#[path = "rocrate_drivers/invenio.rs"]
+mod invenio;
+
+use std::collections::HashSet;
+use std::io::{Cursor, Read};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime};
+
+use crate::job_calls::read_artifact_range;
+use crate::job_calls::{claim_job, release_job, transition_to_running};
+use crate::job_calls::{insert_job, list_job_entries};
+use aruna::tasks::rocrate_jobs::{run_export_job, run_rocrate_import};
+use aruna_blob::blob::BlobHandler;
+use aruna_core::UserId;
+use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::egress::EgressPolicy;
+use aruna_core::errors::StorageError;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE, GROUP_KEYSPACE,
+    ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
+use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::execution::job::{
+    ExportRoCrateSpec, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
+    ImportRoCrateSpec, ImportRoCrateTarget, JobErrorKind, JobId, JobPayload, JobRecord,
+    JobResultPayload, ReasonCode, RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord,
+};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo, VersionKey};
+use aruna_core::structs::storage::bucket_metadata::release_marker;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::origin::VersionOrigin;
+use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::GroupId;
+use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_operations::connectors::create_connector::{
+    SourceConnectorInput, SourceConnectorOperation,
+};
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::jobs::context::JobContext;
+use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
+use aruna_operations::jobs::store::job_calls::ClaimOutcome;
+use aruna_operations::jobs::submit::mint_job_id;
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::object::origin::ReadOriginOperation;
+use aruna_operations::s3::object::put::{
+    PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
+use aruna_operations::testing::process_materialization_batch;
+use aruna_operations::testing::replay_event_log;
+use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_tasks::TaskHandle;
+use async_zip::{Compression, StringEncoding, ZipEntryBuilder, ZipString};
+use axum::Router;
+use axum::http::header;
+use axum::routing::get;
+use bytes::Bytes;
+use byteview::ByteView;
+use futures_util::io::AsyncWriteExt;
+use futures_util::{StreamExt, stream};
+use tempfile::TempDir;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
+
+use crate::blob_node::{seed_config, write_value};
+use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::{MetaResourceId, StructuredId};
+
+/// A fixed structured id (handle 1, bucket 0). The single-node import fixture
+/// holds every bucket, so bucket 0 is always held and the create resolves.
+fn doc_id(seed: u64) -> Ulid {
+    MetaResourceId::try_from((1u128 << 60) | u128::from(seed))
+        .unwrap()
+        .as_ulid()
+}
+
+fn job_id() -> JobId {
+    mint_job_id(
+        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+        BucketId::new(0).unwrap(),
+    )
+    .unwrap()
+}
+
+const ELABFTW: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/operations/fixtures/elabftw.eln"
+));
+const BUCKET: &str = "rocrate-target";
+const TARGET_KEY: &str = "imported/data.txt";
+const SOURCE_KEY: &str = "sources/crate.zip";
+const PAYLOAD: &[u8] = b"driver boundary payload";
+
+struct Fixture {
+    _root: TempDir,
+    actor: Actor,
+    group_id: GroupId,
+    context: Arc<DriverContext>,
+    net: NetHandle,
+    gate: Option<StorageGate>,
+}
+
+struct StorageGate {
+    storage: StorageHandle,
+    hit: Option<oneshot::Receiver<()>>,
+    release: mpsc::Sender<()>,
+    stop: Arc<AtomicBool>,
+    faulty: Arc<AtomicBool>,
+    conflict: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Fixture {
+    async fn stop(mut self) {
+        self.net.shutdown().await;
+        if let Some(gate) = self.gate.as_mut() {
+            gate.stop().await;
+        }
+    }
+}
+
+impl StorageGate {
+    fn take_hit(&mut self) -> oneshot::Receiver<()> {
+        self.hit.take().expect("version gate receiver exists")
+    }
+
+    fn release(&self) {
+        self.release.send(()).expect("version gate releases");
+    }
+
+    /// Make every bucket lookup fail, which is what an interrupted cleanup
+    /// looks like from inside the import.
+    fn fail_buckets(&self, faulty: bool) {
+        self.faulty.store(faulty, Ordering::Release);
+    }
+
+    /// Add a release marker just before the second fenced delete reads it, so that delete fails.
+    fn conflict_second(&self) {
+        self.conflict.store(true, Ordering::Release);
+    }
+
+    async fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self
+            .storage
+            .send_storage_effect(StorageEffect::SyncAll)
+            .await;
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("storage proxy exits");
+        }
+    }
+}
+
+#[tokio::test]
+async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let document_id = doc_id(1);
+    let upload_id = create_upload(&fixture, crate_archive().await?).await?;
+    let import = import_spec(&fixture, upload_id, document_id);
+    let import_job = job_id();
+    let import_context = claim_context(
+        &fixture,
+        import_job,
+        JobPayload::ImportRoCrate(import.clone()),
+    )
+    .await?;
+
+    let imported = run_rocrate_import(&import_context, &import).await;
+    let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) = imported else {
+        return Err("RO-Crate import did not succeed".into());
+    };
+    assert_eq!(result.imported, 1);
+    assert_eq!(result.failed, 0);
+    // The import job wrote the file, not an upload by its owner.
+    let place = (fixture.actor.realm_id, fixture.actor.node_id);
+    let origin = drive(
+        ReadOriginOperation::new(place.0, BUCKET, TARGET_KEY, None),
+        &fixture.context,
+    )
+    .await?;
+    assert_eq!(
+        origin.origin,
+        Some(VersionOrigin::Source {
+            job_id: Some(import_job.as_ulid())
+        })
+    );
+
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
+    let materialized = process_materialization_batch(fixture.context.as_ref()).await?;
+    assert_eq!(materialized.processed, 1);
+
+    let export = ExportRoCrateSpec {
+        selection: None,
+        destination: None,
+        auth_context: AuthContext {
+            user_id: fixture.actor.user_id,
+            realm_id: fixture.actor.realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        document_id,
+        limits: RoCrateLimits::default(),
+    };
+    let export_job = job_id();
+    let export_context = claim_context(
+        &fixture,
+        export_job,
+        JobPayload::ExportRoCrate(export.clone()),
+    )
+    .await?;
+    let exported = run_export_job(&export_context, &export).await;
+    let JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(result)) = exported else {
+        if let JobRunOutcome::Failed(error) = exported {
+            return Err(format!("RO-Crate export failed: {}", error.message).into());
+        }
+        return Err("RO-Crate export did not succeed".into());
+    };
+    assert_eq!(result.included, 1);
+    assert_eq!(result.omitted, Default::default());
+    let artifact = result.artifact.ok_or("export artifact is missing")?;
+    let bytes = artifact_bytes(&fixture, &artifact).await?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+    let mut payload = Vec::new();
+    archive.by_name("data.txt")?.read_to_end(&mut payload)?;
+    assert_eq!(payload, PAYLOAD);
+    assert!(archive.by_name("ro-crate-metadata.json").is_ok());
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn imports_eln_export() -> Result<(), Box<dyn std::error::Error>> {
+    // The eLabFTW export identifies its folders and files with literal spaces.
+    let fixture = build_fixture(false).await?;
+    let document_id = doc_id(1);
+    let upload_id = upload_media(&fixture, ELABFTW.to_vec(), RoCrateMediaType::Eln).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = job_id();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let result = match run_rocrate_import(&context, &spec).await {
+        JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => result,
+        JobRunOutcome::Failed(error) => {
+            return Err(format!("eln import failed: {}", error.message).into());
+        }
+        _ => return Err("eln import did not finish".into()),
+    };
+    assert_eq!(result.entries_total, 3);
+    assert_eq!(result.imported, 2);
+    assert_eq!(result.unlisted, 1);
+    assert_eq!(result.document_id, Some(document_id));
+    assert_eq!(
+        object_versions(
+            &fixture,
+            "imported/Demo - Gold-master-experiment - 4af4da4e/example.jpg"
+        )
+        .await?
+        .len(),
+        1
+    );
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
+    assert_eq!(
+        process_materialization_batch(fixture.context.as_ref())
+            .await?
+            .processed,
+        1
+    );
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn imports_nested_folders() -> Result<(), Box<dyn std::error::Error>> {
+    // Mirrors an ELN export: wrapper directory, doubled separator, spaced ids.
+    let fixture = build_fixture(false).await?;
+    let document_id = doc_id(1);
+    let upload_id = upload_media(&fixture, nested_eln().await?, RoCrateMediaType::Eln).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = job_id();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let result = match run_rocrate_import(&context, &spec).await {
+        JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => result,
+        JobRunOutcome::Failed(error) => {
+            return Err(format!("nested import failed: {}", error.message).into());
+        }
+        _ => return Err("nested import did not finish".into()),
+    };
+    assert_eq!(result.imported, 1);
+    assert_eq!(result.unlisted, 1);
+    assert_eq!(
+        object_versions(&fixture, "imported/Demo - Experiment - abc123/example.txt")
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
+    assert_eq!(
+        process_materialization_batch(fixture.context.as_ref())
+            .await?
+            .processed,
+        1
+    );
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn imports_mixed_encoding() -> Result<(), Box<dyn std::error::Error>> {
+    // One entity is encoded and referenced literally; the other is the reverse.
+    let fixture = build_fixture(false).await?;
+    let document_id = doc_id(1);
+    let upload_id = create_upload(&fixture, mixed_archive().await?).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = job_id();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let result = match run_rocrate_import(&context, &spec).await {
+        JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => result,
+        JobRunOutcome::Failed(error) => {
+            return Err(format!("mixed-encoding import failed: {}", error.message).into());
+        }
+        _ => return Err("mixed-encoding import did not finish".into()),
+    };
+    assert_eq!(result.imported, 2);
+    for key in ["imported/data/a b.txt", "imported/data/c d.txt"] {
+        assert_eq!(object_versions(&fixture, key).await?.len(), 1, "{key}");
+    }
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_before_writes() -> Result<(), Box<dyn std::error::Error>> {
+    // An unreachable file entity must fail the job without touching the bucket.
+    let fixture = build_fixture(false).await?;
+    let document_id = doc_id(1);
+    let upload_id = create_upload(&fixture, orphan_archive().await?).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = job_id();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let JobRunOutcome::Failed(error) = run_rocrate_import(&context, &spec).await else {
+        return Err("orphaned crate was imported".into());
+    };
+    assert!(
+        error.message.contains("no objects were written"),
+        "{}",
+        error.message
+    );
+    assert!(object_versions(&fixture, TARGET_KEY).await?.is_empty());
+    let rows = read_rows(&fixture, job_id).await?;
+    assert!(rows.iter().all(|row| row.detail.arn.is_none()));
+    assert!(rows.iter().any(|row| {
+        row.detail
+            .validation
+            .as_ref()
+            .is_some_and(|violation| violation.code == "orphaned_data_entity")
+    }));
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rollback_removes_writes() -> Result<(), Box<dyn std::error::Error>> {
+    check_rollback(false).await
+}
+
+#[tokio::test]
+async fn final_failure_cleans() -> Result<(), Box<dyn std::error::Error>> {
+    // A permanent error on the final attempt still runs the failure cleanup.
+    check_rollback(true).await
+}
+
+async fn check_rollback(final_attempt: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // The second payload fails its checksum after the first one has landed.
+    let fixture = build_fixture(false).await?;
+    let existing = put_object(&fixture, "imported/kept.txt", b"kept".to_vec()).await?;
+    let mut archive = pair_archive().await?;
+    let local = zip_offsets(&archive, b"PK\x03\x04")[2];
+    let central = zip_offsets(&archive, b"PK\x01\x02")[2];
+    write_u32(&mut archive, local + 14, 0);
+    write_u32(&mut archive, central + 16, 0);
+    let document_id = doc_id(1);
+    let upload_id = create_upload(&fixture, archive).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = job_id();
+    let mut context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    context.final_attempt = final_attempt;
+
+    let JobRunOutcome::Failed(error) = run_rocrate_import(&context, &spec).await else {
+        return Err("checksum mismatch did not fail the import".into());
+    };
+
+    assert_eq!(error.kind, JobErrorKind::Permanent);
+    assert!(
+        error.message.contains("1 written object was removed"),
+        "{}",
+        error.message
+    );
+    assert!(
+        object_versions(&fixture, "imported/data1.txt")
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        object_versions(&fixture, "imported/kept.txt").await?,
+        vec![existing.version_id]
+    );
+    assert!(
+        object_versions(&fixture, "imported/data2.txt")
+            .await?
+            .is_empty()
+    );
+    let rows = read_rows(&fixture, job_id).await?;
+    let first = rows
+        .iter()
+        .find(|row| row.entry_key == "data1.txt")
+        .ok_or("first entry report row is missing")?;
+    assert_eq!(first.code, ReasonCode::Failed);
+    assert_eq!(first.detail.arn, None);
+    assert_eq!(first.detail.version_id, None);
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn final_retry_resumes() -> Result<(), Box<dyn std::error::Error>> {
+    // A temporary error on the final attempt must leave the job retryable, so the
+    // later run resumes the write instead of finding a failed job.
+    let mut fixture = build_fixture(true).await?;
+    let document_id = doc_id(1);
+    let upload_id = create_upload(&fixture, pair_archive().await?).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = job_id();
+    let mut first_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    first_context.final_attempt = true;
+    let first_token = first_context.claim_token;
+    let mut first_run = tokio::spawn({
+        let spec = spec.clone();
+        async move { run_rocrate_import(&first_context, &spec).await }
+    });
+    let mut hit = fixture.gate.as_mut().expect("gated fixture").take_hit();
+
+    let gate_result = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = &mut first_run => Err(format!(
+                "import ended before the committed version gate: {}",
+                run_name(result)
+            )),
+            result = &mut hit => {
+                result.map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        }
+    })
+    .await
+    .map_err(|_| "import did not reach the committed version gate")?;
+    gate_result?;
+
+    // Break every bucket lookup once the first payload is committed: the next
+    // write fails with a temporary error.
+    let gate = fixture.gate.as_ref().expect("gated fixture");
+    gate.fail_buckets(true);
+    gate.release();
+    let JobRunOutcome::Failed(temporary) = first_run.await? else {
+        return Err("import with an unreadable bucket did not fail".into());
+    };
+    assert_eq!(temporary.kind, JobErrorKind::Retryable);
+    assert!(
+        !temporary.message.contains("written object"),
+        "{}",
+        temporary.message
+    );
+    assert_eq!(
+        object_versions(&fixture, "imported/data1.txt").await?.len(),
+        1,
+        "a temporary error must not roll back the first write"
+    );
+    gate.fail_buckets(false);
+
+    release_job(
+        &fixture.context,
+        job_id,
+        first_token,
+        unix_timestamp_millis(),
+    )
+    .await?;
+    let second_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+
+    let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) =
+        run_rocrate_import(&second_context, &spec).await
+    else {
+        return Err("resumed import did not succeed".into());
+    };
+    assert_eq!(result.imported, 2);
+    for key in ["imported/data1.txt", "imported/data2.txt"] {
+        assert_eq!(object_versions(&fixture, key).await?.len(), 1, "{key}");
+    }
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rollback_keeps_released() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+
+    // The first run stops after the first payload commits; a release then pins it before the
+    // resumed run fails the second payload's checksum and rolls back.
+    let mut fixture = build_fixture(true).await?;
+    let mut archive = pair_archive().await?;
+    let local = zip_offsets(&archive, b"PK\x03\x04")[2];
+    let central = zip_offsets(&archive, b"PK\x01\x02")[2];
+    write_u32(&mut archive, local + 14, 0);
+    write_u32(&mut archive, central + 16, 0);
+    let upload_id = create_upload(&fixture, archive).await?;
+    let spec = import_spec(&fixture, upload_id, doc_id(1));
+    let job_id = job_id();
+    let first_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let first_token = first_context.claim_token;
+    let first_run = tokio::spawn({
+        let spec = spec.clone();
+        async move { run_rocrate_import(&first_context, &spec).await }
+    });
+    let hit = fixture.gate.as_mut().expect("gated fixture").take_hit();
+    tokio::time::timeout(Duration::from_secs(30), hit)
+        .await
+        .map_err(|_| "import did not reach the committed version gate")??;
+    let gate = fixture.gate.as_ref().expect("gated fixture");
+    gate.fail_buckets(true);
+    gate.release();
+    let JobRunOutcome::Failed(temporary) = first_run.await? else {
+        return Err("import with an unreadable bucket did not fail".into());
+    };
+    assert_eq!(temporary.kind, JobErrorKind::Retryable);
+    gate.fail_buckets(false);
+
+    let written = object_versions(&fixture, "imported/data1.txt").await?;
+    let [version_id] = written[..] else {
+        return Err(format!("expected one written version, found {written:?}").into());
+    };
+    let arn = VersionedObjectArn::new(
+        fixture.actor.realm_id,
+        fixture.actor.node_id,
+        BUCKET,
+        "imported/data1.txt",
+        version_id,
+    )?;
+    let release = serde_json::json!({
+        "@graph": [{"@type": "File", "@id": arn.to_w3id(), "name": "imported/data1.txt"}]
+    });
+    let tags = std::collections::HashMap::from([
+        (RELEASE_TAG.to_string(), "1.0".to_string()),
+        (RELEASE_PREFIX_TAG.to_string(), "imported/".to_string()),
+    ]);
+    let release = serde_json::to_vec(&release)?;
+    put_tagged(&fixture, "imported/release.json", release, tags).await?;
+
+    release_job(
+        &fixture.context,
+        job_id,
+        first_token,
+        unix_timestamp_millis(),
+    )
+    .await?;
+    let second_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let JobRunOutcome::Failed(error) = run_rocrate_import(&second_context, &spec).await else {
+        return Err("checksum mismatch did not fail the import".into());
+    };
+
+    assert_eq!(error.kind, JobErrorKind::Permanent);
+    assert!(
+        error
+            .message
+            .contains("so they were kept: `imported/data1.txt`")
+            && error.message.ends_with("no other objects were written"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        object_versions(&fixture, "imported/data1.txt").await?,
+        vec![version_id]
+    );
+    let rows = read_rows(&fixture, job_id).await?;
+    let first = (rows.iter())
+        .find(|row| row.entry_key == "data1.txt")
+        .ok_or("first entry report row is missing")?;
+    assert_eq!(first.code, ReasonCode::Failed);
+    assert_eq!(first.detail.version_id, Some(version_id));
+    assert!(
+        (first.message.as_deref()).is_some_and(|message| message.contains("a release pins it")),
+        "{:?}",
+        first.message
+    );
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rollback_counts_earlier() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+
+    // A marker conflict stops the rollback after it removed the first payload; a release then
+    // pins the second, so the resumed rollback removes nothing new but must still count the first.
+    let fixture = build_fixture(true).await?;
+    let mut archive = triple_archive().await?;
+    let local = zip_offsets(&archive, b"PK\x03\x04")[3];
+    let central = zip_offsets(&archive, b"PK\x01\x02")[3];
+    write_u32(&mut archive, local + 14, 0);
+    write_u32(&mut archive, central + 16, 0);
+    let upload_id = create_upload(&fixture, archive).await?;
+    let spec = import_spec(&fixture, upload_id, doc_id(1));
+    let job_id = job_id();
+    let first_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let first_token = first_context.claim_token;
+    let gate = fixture.gate.as_ref().expect("gated fixture");
+    gate.release();
+    gate.conflict_second();
+    let JobRunOutcome::Failed(interrupted) = run_rocrate_import(&first_context, &spec).await else {
+        return Err("rollback with a marker conflict did not fail".into());
+    };
+    assert_eq!(
+        interrupted.kind,
+        JobErrorKind::Retryable,
+        "{}",
+        interrupted.message
+    );
+    assert!(
+        object_versions(&fixture, "imported/data1.txt")
+            .await?
+            .is_empty()
+    );
+    let written = object_versions(&fixture, "imported/data2.txt").await?;
+    let [version_id] = written[..] else {
+        return Err(format!("expected one written version, found {written:?}").into());
+    };
+
+    let arn = VersionedObjectArn::new(
+        fixture.actor.realm_id,
+        fixture.actor.node_id,
+        BUCKET,
+        "imported/data2.txt",
+        version_id,
+    )?;
+    let release = serde_json::json!({
+        "@graph": [{"@type": "File", "@id": arn.to_w3id(), "name": "imported/data2.txt"}]
+    });
+    let tags = std::collections::HashMap::from([
+        (RELEASE_TAG.to_string(), "1.0".to_string()),
+        (RELEASE_PREFIX_TAG.to_string(), "imported/".to_string()),
+    ]);
+    let release = serde_json::to_vec(&release)?;
+    put_tagged(&fixture, "imported/release.json", release, tags).await?;
+
+    release_job(
+        &fixture.context,
+        job_id,
+        first_token,
+        unix_timestamp_millis(),
+    )
+    .await?;
+    let second_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let JobRunOutcome::Failed(error) = run_rocrate_import(&second_context, &spec).await else {
+        return Err("resumed rollback did not fail the import".into());
+    };
+
+    assert_eq!(error.kind, JobErrorKind::Permanent);
+    assert!(
+        error
+            .message
+            .contains("so they were kept: `imported/data2.txt`")
+            && error.message.ends_with("1 written object was removed"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        object_versions(&fixture, "imported/data2.txt").await?,
+        vec![version_id]
+    );
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn report_rows_coexist() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let payload_path = "signature/ro-crate-metadata.json.minisig";
+    let target_key = format!("imported/{payload_path}");
+    let json = crate_json().replace("data.txt", payload_path);
+    let mut archive = async_zip::base::write::ZipFileWriter::new(Vec::new());
+    archive
+        .write_entry_whole(
+            ZipEntryBuilder::new(
+                "ro-crate-metadata.json".to_string().into(),
+                Compression::Stored,
+            ),
+            json.as_bytes(),
+        )
+        .await?;
+    archive
+        .write_entry_whole(
+            ZipEntryBuilder::new(
+                "ro-crate-metadata.json.minisig".to_string().into(),
+                Compression::Stored,
+            ),
+            b"untrusted signature",
+        )
+        .await?;
+    archive
+        .write_entry_whole(
+            ZipEntryBuilder::new(payload_path.to_string().into(), Compression::Deflate),
+            PAYLOAD,
+        )
+        .await?;
+
+    let document_id = doc_id(1);
+    let upload_id = create_upload(&fixture, archive.close().await?).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = job_id();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) =
+        run_rocrate_import(&context, &spec).await
+    else {
+        return Err("RO-Crate collision import did not succeed".into());
+    };
+    assert_eq!(result.imported, 1);
+    assert_eq!(result.unlisted, 0);
+
+    let rows = read_rows(&fixture, job_id).await?;
+    let matching = rows
+        .iter()
+        .filter(|row| row.entry_key == payload_path)
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 2);
+    let dropped = matching
+        .iter()
+        .find(|row| row.code == ReasonCode::SignatureDropped)
+        .ok_or("signature report row is missing")?;
+    assert_eq!(
+        dropped.detail.archive_path,
+        "ro-crate-metadata.json.minisig"
+    );
+    assert_eq!(dropped.detail.target_key, None);
+    assert_eq!(dropped.detail.version_id, None);
+    let imported = matching
+        .iter()
+        .find(|row| row.code == ReasonCode::Imported)
+        .ok_or("payload report row is missing")?;
+    assert_eq!(imported.detail.archive_path, payload_path);
+    assert_eq!(
+        imported.detail.target_key.as_deref(),
+        Some(target_key.as_str())
+    );
+    assert!(imported.detail.version_id.is_some());
+    assert_eq!(imported.detail.size, Some(PAYLOAD.len() as u64));
+    assert!(imported.detail.blake3.is_some());
+    assert!(imported.detail.arn.is_some());
+    assert!(imported.detail.w3id.is_some());
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_name_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let mut archive = crate_archive().await?;
+    let local = archive
+        .windows(4)
+        .position(|bytes| bytes == b"PK\x03\x04")
+        .ok_or("local ZIP header is missing")?;
+    archive[local + 30] ^= 1;
+
+    let message = run_rejected_import(&fixture, archive, RoCrateLimits::default()).await?;
+
+    assert!(
+        message.contains("local file header name did not match the central directory name"),
+        "{message}"
+    );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_descriptor_flag() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let mut archive = crate_archive().await?;
+    let local = archive
+        .windows(4)
+        .position(|bytes| bytes == b"PK\x03\x04")
+        .ok_or("local ZIP header is missing")?;
+    archive[local + 6] ^= 0x08;
+
+    let message = run_rejected_import(&fixture, archive, RoCrateLimits::default()).await?;
+
+    assert!(
+        message.contains(
+            "local file header data-descriptor flag did not match the central directory flag"
+        ),
+        "{message}"
+    );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_directory_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let mut archive = crate_archive().await?;
+    let central = archive
+        .windows(4)
+        .position(|bytes| bytes == b"PK\x01\x02")
+        .ok_or("central ZIP header is missing")?;
+    archive[central] = 0;
+    let limits = RoCrateLimits {
+        max_entries: 2,
+        key_bytes: 1,
+        ..RoCrateLimits::default()
+    };
+    let directory_limit = limits.max_entries * (46 + limits.key_bytes * 2);
+
+    let message = run_rejected_import(&fixture, archive, limits).await?;
+
+    assert_eq!(
+        message,
+        format!("ZIP central directory exceeds limit {directory_limit}; no objects were written")
+    );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_encrypted_zip() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let mut archive = crate_archive().await?;
+    let local = zip_offsets(&archive, b"PK\x03\x04")[0];
+    let central = zip_offsets(&archive, b"PK\x01\x02")[0];
+    archive[local + 6] |= 0x01;
+    archive[central + 8] |= 0x01;
+
+    let message = run_rejected_import(&fixture, archive, RoCrateLimits::default()).await?;
+
+    assert!(
+        message.to_ascii_lowercase().contains("encryption"),
+        "{message}"
+    );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_malformed_cd() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let mut archive = crate_archive().await?;
+    let central = zip_offsets(&archive, b"PK\x01\x02")[0];
+    archive[central] = 0;
+
+    let message = run_rejected_import(&fixture, archive, RoCrateLimits::default()).await?;
+
+    assert!(message.contains("invalid ZIP archive"), "{message}");
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_size_bomb() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let mut archive = crate_archive().await?;
+    let local = zip_offsets(&archive, b"PK\x03\x04")[1];
+    let central = zip_offsets(&archive, b"PK\x01\x02")[1];
+    write_u32(&mut archive, local + 22, 1);
+    write_u32(&mut archive, central + 24, 1);
+
+    let message = run_rejected_import(&fixture, archive, RoCrateLimits::default()).await?;
+
+    assert!(
+        message.contains("expanded size") || message.contains("content length"),
+        "{message}"
+    );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_crc_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let mut archive = crate_archive().await?;
+    let local = zip_offsets(&archive, b"PK\x03\x04")[1];
+    let central = zip_offsets(&archive, b"PK\x01\x02")[1];
+    write_u32(&mut archive, local + 14, 0);
+    write_u32(&mut archive, central + 16, 0);
+
+    let message = run_rejected_import(&fixture, archive, RoCrateLimits::default()).await?;
+
+    assert!(
+        message.to_ascii_lowercase().contains("checksum"),
+        "{message}"
+    );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_special_files() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    for mode in [0o120777, 0o060600] {
+        let archive = custom_archive(
+            crate_json(),
+            ZipEntryBuilder::new("data.txt".to_string().into(), Compression::Stored)
+                .unix_permissions(mode),
+            false,
+        )
+        .await?;
+        let message = run_rejected_import(&fixture, archive, RoCrateLimits::default()).await?;
+        assert!(message.contains("not a regular file"), "{message}");
+    }
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_invalid_utf8() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let archive = custom_archive(
+        crate_json(),
+        ZipEntryBuilder::new(
+            ZipString::new(b"data-\xff.txt".to_vec(), StringEncoding::Raw),
+            Compression::Stored,
+        ),
+        false,
+    )
+    .await?;
+
+    let message = run_rejected_import(&fixture, archive, RoCrateLimits::default()).await?;
+
+    assert!(message.contains("archive path is not UTF-8"), "{message}");
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepts_data_descriptor() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let archive = custom_archive(
+        crate_json(),
+        ZipEntryBuilder::new("data.txt".to_string().into(), Compression::Deflate),
+        true,
+    )
+    .await?;
+
+    let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) =
+        run_import(&fixture, archive, RoCrateLimits::default()).await?
+    else {
+        return Err("data-descriptor RO-Crate import did not succeed".into());
+    };
+    assert_eq!(result.imported, 1);
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepts_unicode_path() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let unicode_path = "dátá.txt";
+    let archive = custom_archive(
+        crate_json().replace("data.txt", unicode_path),
+        ZipEntryBuilder::new(
+            ZipString::new_with_alternative(unicode_path.to_string(), b"data.txt".to_vec()),
+            Compression::Stored,
+        ),
+        false,
+    )
+    .await?;
+
+    let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) =
+        run_import(&fixture, archive, RoCrateLimits::default()).await?
+    else {
+        return Err("Unicode-path RO-Crate import did not succeed".into());
+    };
+    assert_eq!(result.imported, 1);
+    assert_eq!(result.unlisted, 0);
+    assert_eq!(result.failed, 0);
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_denial_omits() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let document_id = doc_id(1);
+    let upload_id = create_upload(&fixture, crate_archive().await?).await?;
+    let import = import_spec(&fixture, upload_id, document_id);
+    let import_context = claim_context(
+        &fixture,
+        job_id(),
+        JobPayload::ImportRoCrate(import.clone()),
+    )
+    .await?;
+    if !matches!(
+        run_rocrate_import(&import_context, &import).await,
+        JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(_))
+    ) {
+        return Err("RO-Crate import did not succeed".into());
+    }
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
+    assert_eq!(
+        process_materialization_batch(fixture.context.as_ref())
+            .await?
+            .processed,
+        1
+    );
+
+    let metadata_path = MetadataRegistryRecord::permission_path_for(
+        &fixture.actor.realm_id,
+        fixture.group_id,
+        &import.metadata.path,
+        document_id,
+    );
+    let export = ExportRoCrateSpec {
+        selection: None,
+        destination: None,
+        auth_context: AuthContext {
+            user_id: fixture.actor.user_id,
+            realm_id: fixture.actor.realm_id,
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: metadata_path,
+                permission: Permission::READ,
+            }]),
+            session: None,
+        },
+        document_id,
+        limits: RoCrateLimits::default(),
+    };
+    let export_context = claim_context(
+        &fixture,
+        job_id(),
+        JobPayload::ExportRoCrate(export.clone()),
+    )
+    .await?;
+    let JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(result)) =
+        run_export_job(&export_context, &export).await
+    else {
+        return Err("restricted RO-Crate export did not succeed".into());
+    };
+    assert_eq!(result.included, 0);
+    assert_eq!(result.omitted.denied, 1);
+    let artifact = result.artifact.ok_or("export artifact is missing")?;
+    let bytes = artifact_bytes(&fixture, &artifact).await?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+    assert!(archive.by_name("data.txt").is_err());
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_restart_dedupes() -> Result<(), Box<dyn std::error::Error>> {
+    let mut fixture = build_fixture(true).await?;
+    let document_id = doc_id(1);
+    let upload_id = create_upload(&fixture, crate_archive().await?).await?;
+    let spec = import_spec(&fixture, upload_id, document_id);
+    let job_id = job_id();
+    let first_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let first_token = first_context.claim_token;
+    let mut first_run = tokio::spawn({
+        let spec = spec.clone();
+        async move { run_rocrate_import(&first_context, &spec).await }
+    });
+    let mut hit = fixture.gate.as_mut().expect("gated fixture").take_hit();
+
+    let gate_result = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = &mut first_run => Err(format!(
+                "import ended before the committed version gate: {}",
+                run_name(result)
+            )),
+            result = &mut hit => {
+                result.map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        }
+    })
+    .await
+    .map_err(|_| "import did not reach the committed version gate")?;
+    gate_result?;
+
+    first_run.abort();
+    let _ = first_run.await;
+    fixture.gate.as_ref().expect("gated fixture").release();
+
+    let fenced = read_rows(&fixture, job_id).await?;
+    let fenced = fenced
+        .iter()
+        .find(|row| row.detail.target_key.as_deref() == Some(TARGET_KEY))
+        .ok_or("preassigned version report row is missing")?;
+    let version_id = fenced
+        .detail
+        .version_id
+        .ok_or("preassigned version fence is missing")?;
+    assert_eq!(fenced.detail.blake3, None);
+    assert_eq!(version_keys(&fixture).await?, vec![version_id]);
+
+    release_job(
+        &fixture.context,
+        job_id,
+        first_token,
+        unix_timestamp_millis(),
+    )
+    .await?;
+    let second_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    assert_ne!(second_context.claim_token, first_token);
+
+    let resumed = run_rocrate_import(&second_context, &spec).await;
+    let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) = resumed else {
+        return Err("resumed RO-Crate import did not succeed".into());
+    };
+    assert_eq!(result.imported, 1);
+    assert_eq!(version_keys(&fixture).await?, vec![version_id]);
+    let rows = read_rows(&fixture, job_id).await?;
+    let imported = rows
+        .iter()
+        .find(|row| row.detail.target_key.as_deref() == Some(TARGET_KEY))
+        .ok_or("completed import report row is missing")?;
+    assert_eq!(imported.code, ReasonCode::Imported);
+    assert_eq!(imported.detail.version_id, Some(version_id));
+    assert!(imported.detail.blake3.is_some());
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn object_source_imports() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let source_version = put_object(&fixture, SOURCE_KEY, crate_archive().await?).await?;
+    let document_id = doc_id(1);
+    let source = ImportRoCrateSource::Object {
+        bucket: BUCKET.to_string(),
+        key: SOURCE_KEY.to_string(),
+        version: Some(source_version.version_id),
+    };
+    let spec = spec_with_source(&fixture, source, document_id);
+    let job_id = job_id();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+
+    let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) =
+        run_rocrate_import(&context, &spec).await
+    else {
+        return Err("object-source RO-Crate import did not succeed".into());
+    };
+    assert_eq!(result.imported, 1);
+    assert_eq!(result.failed, 0);
+    assert_eq!(result.document_id, Some(document_id));
+
+    let versions = object_versions(&fixture, TARGET_KEY).await?;
+    assert_eq!(versions.len(), 1);
+    let rows = read_rows(&fixture, job_id).await?;
+    let imported = rows
+        .iter()
+        .find(|row| row.detail.target_key.as_deref() == Some(TARGET_KEY))
+        .ok_or("imported report row is missing")?;
+    assert_eq!(imported.code, ReasonCode::Imported);
+    assert_eq!(imported.detail.version_id, Some(versions[0]));
+    assert_eq!(hidden_count(&fixture, job_id.as_ulid()).await?, 0);
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn object_source_pins() -> Result<(), Box<dyn std::error::Error>> {
+    // The acquired snapshot must win over a later overwrite of the same object.
+    let fixture = build_fixture(false).await?;
+    let pinned = put_object(&fixture, SOURCE_KEY, crate_archive().await?).await?;
+    put_object(&fixture, SOURCE_KEY, b"corrupted archive bytes".to_vec()).await?;
+    let document_id = doc_id(1);
+    let source = ImportRoCrateSource::Object {
+        bucket: BUCKET.to_string(),
+        key: SOURCE_KEY.to_string(),
+        version: Some(pinned.version_id),
+    };
+    let spec = spec_with_source(&fixture, source, document_id);
+    let context =
+        claim_context(&fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
+
+    let JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) =
+        run_rocrate_import(&context, &spec).await
+    else {
+        return Err("pinned object-source import did not succeed".into());
+    };
+    assert_eq!(result.imported, 1);
+    assert_eq!(result.document_id, Some(document_id));
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn connector_source_imports() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let (address, server) = serve_archive(crate_archive().await?).await?;
+    let connector_id = create_connector(&fixture, &format!("http://{address}")).await?;
+    let document_id = doc_id(1);
+    let source = ImportRoCrateSource::Connector {
+        group_id: fixture.group_id,
+        connector_id,
+        path: "crate.zip".to_string(),
+    };
+    let spec = spec_with_source(&fixture, source, document_id);
+    let job_id = job_id();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+
+    let outcome = run_rocrate_import(&context, &spec).await;
+    server.abort();
+    match outcome {
+        JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => {
+            assert_eq!(result.imported, 1);
+            assert_eq!(result.failed, 0);
+            assert_eq!(result.document_id, Some(document_id));
+        }
+        JobRunOutcome::Failed(error) => {
+            return Err(format!("connector-source import failed: {}", error.message).into());
+        }
+        _ => return Err("connector-source import did not succeed".into()),
+    }
+    assert_eq!(object_versions(&fixture, TARGET_KEY).await?.len(), 1);
+    assert_eq!(hidden_count(&fixture, job_id.as_ulid()).await?, 0);
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_mid_write() -> Result<(), Box<dyn std::error::Error>> {
+    // Cancelling after the first payload commits must freeze the remaining entries.
+    let mut fixture = build_fixture(true).await?;
+    let document_id = doc_id(1);
+    let upload_id = create_upload(&fixture, pair_archive().await?).await?;
+    let spec = spec_with_source(
+        &fixture,
+        ImportRoCrateSource::Upload { upload_id },
+        document_id,
+    );
+    let job_id = job_id();
+    let context = claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let cancel = context.cancel.clone();
+    let mut run = tokio::spawn({
+        let spec = spec.clone();
+        async move { run_rocrate_import(&context, &spec).await }
+    });
+    let mut hit = fixture.gate.as_mut().expect("gated fixture").take_hit();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = &mut run => Err(format!(
+                "import ended before the first committed version gate: {}",
+                run_name(result)
+            )),
+            result = &mut hit => {
+                result.map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        }
+    })
+    .await
+    .map_err(|_| "import did not reach the first committed version gate")??;
+
+    cancel.cancel();
+    fixture.gate.as_ref().expect("gated fixture").release();
+    let outcome = tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .map_err(|_| "cancelled import did not terminate")??;
+    if !matches!(outcome, JobRunOutcome::Cancelled) {
+        return Err(format!("import was not cancelled: {}", run_name(Ok(outcome))).into());
+    }
+
+    let rows = read_rows(&fixture, job_id).await?;
+    let first = rows
+        .iter()
+        .find(|row| row.detail.target_key.as_deref() == Some("imported/data1.txt"))
+        .ok_or("first entry report row is missing")?;
+    assert_eq!(first.code, ReasonCode::Imported);
+    let first_version = first
+        .detail
+        .version_id
+        .ok_or("first entry version is missing")?;
+    assert!(first.detail.blake3.is_some());
+    assert_eq!(
+        object_versions(&fixture, "imported/data1.txt").await?,
+        vec![first_version]
+    );
+
+    let second = rows
+        .iter()
+        .find(|row| row.detail.target_key.as_deref() == Some("imported/data2.txt"))
+        .ok_or("second entry report row is missing")?;
+    assert_eq!(second.code, ReasonCode::NotAttempted);
+    assert!(
+        second
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("cancelled"))
+    );
+    assert!(
+        object_versions(&fixture, "imported/data2.txt")
+            .await?
+            .is_empty()
+    );
+
+    assert_eq!(hidden_count(&fixture, upload_id).await?, 0);
+    assert!(
+        aruna_operations::driver::drive(
+            aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+            &fixture.context
+        )
+        .await
+        .map_err(|error| error.0)?
+        .is_none()
+    );
+
+    fixture.stop().await;
+    Ok(())
+}
+
+async fn build_fixture(gated: bool) -> Result<Fixture, Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let storage_path = root.path().join("storage");
+    let metadata_path = root.path().join("metadata");
+    let blob_path = root.path().join("blob");
+    std::fs::create_dir_all(&storage_path)?;
+    std::fs::create_dir_all(&metadata_path)?;
+    std::fs::create_dir_all(&blob_path)?;
+    let direct = FjallStorage::open(storage_path.to_str().ok_or("invalid storage path")?)?;
+    let (storage, gate) = if gated {
+        let (storage, gate) = storage_proxy(direct)?;
+        (storage, Some(gate))
+    } else {
+        (direct, None)
+    };
+    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    let realm_id = RealmId::from_bytes([41; 32]);
+    let net = NetHandle::new(
+        NetConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            realm_id,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        storage.clone(),
+    )
+    .await?;
+    let actor = Actor {
+        node_id: net.node_id(),
+        user_id: UserId::local(Ulid::generate(), realm_id),
+        realm_id,
+    };
+    seed_config(&storage, &actor).await?;
+    let group_id = Ulid::generate();
+    seed_auth(&storage, &actor, group_id).await?;
+    let blob = BlobHandler::with_egress(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100_000),
+            multipart_bucket: Some("multipart".to_string()),
+            root: blob_path.to_str().ok_or("invalid blob path")?.to_string(),
+            service_config: Default::default(),
+            timeouts: Default::default(),
+        },
+        storage.clone(),
+        net.clone(),
+        EgressPolicy::loopback(),
+    )
+    .await?;
+    let graph = aruna_graph::GraphHandle::open(
+        &metadata_path,
+        actor.node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )?;
+    let metadata = MetadataHandle::new(&metadata_path, storage.clone(), None, Default::default());
+    let context = Arc::new(DriverContext {
+        storage_handle: storage,
+        net_handle: Some(net.clone()),
+        blob_handle: Some(blob),
+        metadata_handle: Some(metadata),
+        graph_handle: Some(graph),
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    create_bucket(&context, &actor, group_id).await?;
+    Ok(Fixture {
+        _root: root,
+        actor,
+        group_id,
+        context,
+        net,
+        gate,
+    })
+}
+
+fn storage_proxy(
+    direct: StorageHandle,
+) -> Result<(StorageHandle, StorageGate), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (storage, receivers) = StorageHandle::new();
+    let receiver = receivers.foreground;
+    let (hit_sender, hit) = oneshot::channel();
+    let (release, release_receiver) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let faulty = Arc::new(AtomicBool::new(false));
+    let thread_faulty = faulty.clone();
+    let conflict = Arc::new(AtomicBool::new(false));
+    let thread_conflict = conflict.clone();
+    let thread = std::thread::Builder::new()
+        .name("rocrate-storage-gate".to_string())
+        .spawn(move || {
+            let mut version_transaction = None;
+            let mut hit_sender = Some(hit_sender);
+            let mut fenced = 0;
+            while let Ok((effect, response, _span, _queued, _in_flight)) = receiver.recv() {
+                if thread_conflict.load(Ordering::Acquire) && fenced_release(&effect) {
+                    fenced += 1;
+                    if fenced == 2 {
+                        thread_conflict.store(false, Ordering::Release);
+                        let marker = StorageEffect::Write {
+                            key_space: BUCKET_RELEASE_KEYSPACE.to_string(),
+                            key: ByteView::from(release_marker(BUCKET)),
+                            value: ByteView::from(Ulid::generate().to_bytes().to_vec()),
+                            txn_id: None,
+                        };
+                        runtime.block_on(direct.send_storage_effect(marker));
+                    }
+                }
+                if thread_faulty.load(Ordering::Acquire) && bucket_read(&effect) {
+                    response.send(StorageEvent::Error {
+                        error: StorageError::ReadError("boom".to_string()),
+                    });
+                    continue;
+                }
+                if let Some(transaction) = version_txn(&effect) {
+                    version_transaction = Some(transaction);
+                }
+                let gated_commit = match &effect {
+                    StorageEffect::CommitTransaction { txn_id } => {
+                        Some(*txn_id) == version_transaction
+                    }
+                    _ => false,
+                };
+                let Event::Storage(event) = runtime.block_on(direct.send_storage_effect(effect))
+                else {
+                    unreachable!("storage handle only returns storage events")
+                };
+                let committed = gated_commit
+                    && matches!(
+                        &event,
+                        StorageEvent::TransactionCommitted { txn_id }
+                            if Some(*txn_id) == version_transaction
+                    );
+                if committed {
+                    if let Some(sender) = hit_sender.take() {
+                        let _ = sender.send(());
+                        let _ = release_receiver.recv();
+                    }
+                    version_transaction = None;
+                }
+                response.send(event);
+                if thread_stop.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        })?;
+    Ok((
+        storage.clone(),
+        StorageGate {
+            storage,
+            hit: Some(hit),
+            release,
+            stop,
+            faulty,
+            conflict,
+            thread: Some(thread),
+        },
+    ))
+}
+
+fn bucket_read(effect: &StorageEffect) -> bool {
+    match effect {
+        StorageEffect::Read { key_space, .. } => key_space == S3_BUCKET_KEYSPACE,
+        StorageEffect::BatchRead { reads, .. } => reads
+            .iter()
+            .any(|(key_space, _)| key_space == S3_BUCKET_KEYSPACE),
+        _ => false,
+    }
+}
+
+fn fenced_release(effect: &StorageEffect) -> bool {
+    matches!(
+        effect,
+        StorageEffect::BatchRead { reads, txn_id: Some(_) }
+            if reads.iter().any(|(key_space, _)| key_space == BUCKET_RELEASE_KEYSPACE)
+    )
+}
+
+fn version_txn(effect: &StorageEffect) -> Option<Ulid> {
+    match effect {
+        StorageEffect::Write {
+            key_space,
+            txn_id: Some(txn_id),
+            ..
+        } if key_space == BLOB_VERSIONS_KEYSPACE => Some(*txn_id),
+        StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(txn_id),
+        } if writes
+            .iter()
+            .any(|(key_space, _, _)| key_space == BLOB_VERSIONS_KEYSPACE) =>
+        {
+            Some(*txn_id)
+        }
+        _ => None,
+    }
+}
+
+async fn seed_auth(
+    storage: &StorageHandle,
+    actor: &Actor,
+    group_id: GroupId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let realm = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
+    let group =
+        GroupAuthorizationDocument::default_group_doc(actor.user_id, actor.realm_id, group_id);
+    write_value(
+        storage,
+        AUTH_KEYSPACE,
+        actor.realm_id.as_bytes().to_vec(),
+        realm.to_bytes(actor)?,
+    )
+    .await?;
+    write_value(
+        storage,
+        AUTH_KEYSPACE,
+        group_id.to_bytes().to_vec(),
+        group.to_bytes(actor)?,
+    )
+    .await?;
+    // Policy loading resolves the group itself and fails closed when missing.
+    let group_doc = Group {
+        display_name: "rocrate".to_string(),
+        group_id,
+        realm_id: actor.realm_id,
+        roles: HashSet::new(),
+        owner: actor.user_id,
+    };
+    write_value(
+        storage,
+        GROUP_KEYSPACE,
+        group_id.to_bytes().to_vec(),
+        group_doc.to_bytes(actor)?,
+    )
+    .await
+}
+
+async fn create_bucket(
+    context: &DriverContext,
+    actor: &Actor,
+    group_id: GroupId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    drive(
+        CreateBucketOperation::new(
+            BUCKET.to_string(),
+            BucketInfo {
+                group_id,
+                created_at: SystemTime::now(),
+                created_by: actor.user_id,
+                cors_configuration: None,
+                storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
+                compression: aruna_core::structs::storage::format::Compression::Off,
+                distribution: None,
+            },
+        ),
+        context,
+    )
+    .await?;
+    Ok(())
+}
+
+fn crate_json() -> String {
+    serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "./"}
+            },
+            {
+                "@id": "./",
+                "@type": "Dataset",
+                "name": "Driver fixture",
+                "description": "Exercises the job driver boundary",
+                "datePublished": "2026-07-24",
+                "hasPart": {"@id": "data.txt"}
+            },
+            {
+                "@id": "data.txt",
+                "@type": "File",
+                "name": "Driver payload"
+            }
+        ]
+    })
+    .to_string()
+}
+
+async fn crate_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    custom_archive(
+        crate_json(),
+        ZipEntryBuilder::new("data.txt".to_string().into(), Compression::Deflate),
+        false,
+    )
+    .await
+}
+
+async fn custom_archive(
+    json: String,
+    payload: ZipEntryBuilder,
+    streamed: bool,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut archive = async_zip::base::write::ZipFileWriter::new(Vec::new());
+    archive
+        .write_entry_whole(
+            ZipEntryBuilder::new(
+                "ro-crate-metadata.json".to_string().into(),
+                Compression::Stored,
+            ),
+            json.as_bytes(),
+        )
+        .await?;
+    if streamed {
+        let mut entry = archive.write_entry_stream(payload).await?;
+        entry.write_all(PAYLOAD).await?;
+        entry.close().await?;
+    } else {
+        archive.write_entry_whole(payload, PAYLOAD).await?;
+    }
+    Ok(archive.close().await?)
+}
+
+fn zip_offsets(archive: &[u8], signature: &[u8; 4]) -> Vec<usize> {
+    archive
+        .windows(signature.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == signature).then_some(offset))
+        .collect()
+}
+
+fn write_u32(archive: &mut [u8], offset: usize, value: u32) {
+    archive[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+async fn create_upload(
+    fixture: &Fixture,
+    archive: Vec<u8>,
+) -> Result<Ulid, Box<dyn std::error::Error>> {
+    upload_media(fixture, archive, RoCrateMediaType::Zip).await
+}
+
+async fn upload_media(
+    fixture: &Fixture,
+    archive: Vec<u8>,
+    media_type: RoCrateMediaType,
+) -> Result<Ulid, Box<dyn std::error::Error>> {
+    let upload_id = Ulid::generate();
+    let size = archive.len() as u64;
+    let blob = BackendStream::<Result<Bytes, StreamError>>::new(stream::once(async move {
+        Ok::<Bytes, std::io::Error>(Bytes::from(archive))
+    }));
+    let handle = fixture
+        .context
+        .blob_handle
+        .as_ref()
+        .ok_or("blob handle is missing")?;
+    let Event::Blob(aruna_core::events::BlobEvent::HiddenSpooled {
+        location,
+        blake3,
+        size: stored_size,
+    }) = handle
+        .send_blob_effect(BlobEffect::SpoolHidden {
+            namespace: upload_id,
+            name: "input".to_string(),
+            created_by: fixture.actor.user_id,
+            max_bytes: Some(size),
+            deadline: None,
+            blob,
+        })
+        .await
+    else {
+        return Err("RO-Crate fixture spool failed".into());
+    };
+    let record = RoCrateUploadRecord {
+        upload_id,
+        owner: fixture.actor.user_id,
+        location,
+        blake3,
+        size: stored_size,
+        media_type,
+        expires_at_ms: unix_timestamp_millis().saturating_add(60_000),
+        claimed_by: None,
+    };
+    write_value(
+        &fixture.context.storage_handle,
+        ROCRATE_UPLOAD_KEYSPACE,
+        upload_id.to_bytes().to_vec(),
+        postcard::to_allocvec(&record)?,
+    )
+    .await?;
+    Ok(upload_id)
+}
+
+async fn run_rejected_import(
+    fixture: &Fixture,
+    archive: Vec<u8>,
+    limits: RoCrateLimits,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match run_import(fixture, archive, limits).await? {
+        JobRunOutcome::Failed(error) => Ok(error.message),
+        _ => Err("adversarial RO-Crate import was not rejected".into()),
+    }
+}
+
+async fn run_import(
+    fixture: &Fixture,
+    archive: Vec<u8>,
+    limits: RoCrateLimits,
+) -> Result<JobRunOutcome, Box<dyn std::error::Error>> {
+    let document_id = doc_id(1);
+    let upload_id = create_upload(fixture, archive).await?;
+    let mut spec = import_spec(fixture, upload_id, document_id);
+    spec.limits = limits;
+    let context = claim_context(fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
+    Ok(run_rocrate_import(&context, &spec).await)
+}
+
+fn import_spec(fixture: &Fixture, upload_id: Ulid, document_id: Ulid) -> ImportRoCrateSpec {
+    spec_with_source(
+        fixture,
+        ImportRoCrateSource::Upload { upload_id },
+        document_id,
+    )
+}
+
+fn spec_with_source(
+    fixture: &Fixture,
+    source: ImportRoCrateSource,
+    document_id: Ulid,
+) -> ImportRoCrateSpec {
+    ImportRoCrateSpec {
+        auth_context: AuthContext {
+            user_id: fixture.actor.user_id,
+            realm_id: fixture.actor.realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        source,
+        target: ImportRoCrateTarget {
+            bucket: BUCKET.to_string(),
+            prefix: "imported".to_string(),
+        },
+        metadata: ImportMetadataTarget {
+            group_id: fixture.group_id,
+            path: format!("datasets/{document_id}"),
+            public: false,
+        },
+        limits: RoCrateLimits::default(),
+        document_id,
+    }
+}
+
+async fn claim_context(
+    fixture: &Fixture,
+    job_id: JobId,
+    payload: JobPayload,
+) -> Result<JobContext, Box<dyn std::error::Error>> {
+    if crate::job_calls::read_job_record(&fixture.context, job_id, None)
+        .await?
+        .is_none()
+    {
+        let now = unix_timestamp_millis();
+        insert_job(
+            &fixture.context,
+            &JobRecord::new(
+                job_id,
+                payload,
+                fixture.actor.user_id,
+                fixture.actor.node_id,
+                now,
+                now,
+                None,
+            ),
+        )
+        .await?;
+    }
+    let ClaimOutcome::Claimed(claimed) = claim_job(
+        &fixture.context,
+        job_id,
+        fixture.actor.node_id,
+        unix_timestamp_millis(),
+    )
+    .await?
+    else {
+        return Err("job was not claimable".into());
+    };
+    let token = claimed
+        .claim
+        .as_ref()
+        .ok_or("claimed job has no claim")?
+        .claim_token;
+    let running =
+        transition_to_running(&fixture.context, job_id, token, unix_timestamp_millis()).await?;
+    Ok(JobContext {
+        driver: fixture.context.clone(),
+        job_id,
+        owner_node_id: fixture.actor.node_id,
+        claim_token: token,
+        final_attempt: false,
+        cancel: CancellationToken::new(),
+        shutdown: CancellationToken::new(),
+        progress: ProgressReporter::from_progress(&running.progress),
+        range_turns: Default::default(),
+        handlers: Default::default(),
+    })
+}
+
+async fn read_rows(
+    fixture: &Fixture,
+    job_id: JobId,
+) -> Result<Vec<ImportReportRow>, Box<dyn std::error::Error>> {
+    let (entries, next) = list_job_entries(&fixture.context, job_id, None, 100).await?;
+    assert_eq!(next, None);
+    entries
+        .into_iter()
+        .map(|(_, value)| postcard::from_bytes(value.as_ref()).map_err(Into::into))
+        .collect()
+}
+
+async fn version_keys(fixture: &Fixture) -> Result<Vec<Ulid>, Box<dyn std::error::Error>> {
+    object_versions(fixture, TARGET_KEY).await
+}
+
+async fn object_versions(
+    fixture: &Fixture,
+    key: &str,
+) -> Result<Vec<Ulid>, Box<dyn std::error::Error>> {
+    match fixture
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: Some(ByteView::from(VersionKey::object_prefix(BUCKET, key)?)),
+            start: None,
+            limit: 10,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values
+            .into_iter()
+            .map(|(key, _)| {
+                VersionKey::from_bytes(key.as_ref())
+                    .map(|key| key.version_id)
+                    .map_err(Into::into)
+            })
+            .collect(),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        event => Err(format!("unexpected version iteration event: {event:?}").into()),
+    }
+}
+
+async fn hidden_count(
+    fixture: &Fixture,
+    namespace: Ulid,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let handle = fixture
+        .context
+        .blob_handle
+        .as_ref()
+        .ok_or("blob handle is missing")?;
+    match handle
+        .send_blob_effect(BlobEffect::ListHidden {
+            namespace: Some(namespace),
+            cursor: None,
+        })
+        .await
+    {
+        Event::Blob(aruna_core::events::BlobEvent::HiddenListed { entries, .. }) => {
+            Ok(entries.len())
+        }
+        Event::Blob(aruna_core::events::BlobEvent::Error(error)) => Err(error.to_string().into()),
+        other => Err(format!("unexpected hidden list event: {other:?}").into()),
+    }
+}
+
+async fn put_object(
+    fixture: &Fixture,
+    key: &str,
+    bytes: Vec<u8>,
+) -> Result<PutObjectResult, Box<dyn std::error::Error>> {
+    put_tagged(fixture, key, bytes, Default::default()).await
+}
+
+async fn put_tagged(
+    fixture: &Fixture,
+    key: &str,
+    bytes: Vec<u8>,
+    tags: std::collections::HashMap<String, String>,
+) -> Result<PutObjectResult, Box<dyn std::error::Error>> {
+    let size = bytes.len() as u64;
+    let body = BackendStream::<Result<Bytes, StreamError>>::new(stream::once(async move {
+        Ok::<Bytes, std::io::Error>(Bytes::from(bytes))
+    }));
+    Ok(drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: fixture.actor.user_id,
+            group_id: fixture.group_id,
+            realm_id: fixture.actor.realm_id,
+            node_id: fixture.actor.node_id,
+            request: PutObjectInput {
+                bucket: BUCKET.to_string(),
+                key: key.to_string(),
+                content_length: Some(size),
+                body: Some(body),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(Ulid::generate()),
+        })
+        .with_metadata(tags),
+        fixture.context.as_ref(),
+    )
+    .await?)
+}
+
+async fn create_connector(
+    fixture: &Fixture,
+    endpoint: &str,
+) -> Result<Ulid, Box<dyn std::error::Error>> {
+    let result = drive(
+        SourceConnectorOperation::new(SourceConnectorInput {
+            group_id: fixture.group_id,
+            created_by: fixture.actor.user_id,
+            name: "driver-http".to_string(),
+            kind: SourceConnectorKind::Http,
+            public_config: std::collections::HashMap::from([(
+                "endpoint".to_string(),
+                endpoint.to_string(),
+            )]),
+            secret_config: std::collections::HashMap::new(),
+        }),
+        fixture.context.as_ref(),
+    )
+    .await?;
+    Ok(result.connector.connector_id)
+}
+
+async fn serve_archive(
+    archive: Vec<u8>,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
+    let archive = Arc::new(archive);
+    let router = Router::new().route(
+        "/{*path}",
+        get(move || {
+            let archive = archive.clone();
+            async move {
+                (
+                    [
+                        (header::CONTENT_TYPE, "application/zip"),
+                        (header::ETAG, "\"crate-fixture\""),
+                    ],
+                    archive.as_ref().clone(),
+                )
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    Ok((address, server))
+}
+
+fn pair_json() -> String {
+    serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "./"}
+            },
+            {
+                "@id": "./",
+                "@type": "Dataset",
+                "name": "Driver pair",
+                "description": "Exercises multi-entry writes",
+                "datePublished": "2026-07-24",
+                "hasPart": [{"@id": "data1.txt"}, {"@id": "data2.txt"}]
+            },
+            {"@id": "data1.txt", "@type": "File", "name": "First payload"},
+            {"@id": "data2.txt", "@type": "File", "name": "Second payload"}
+        ]
+    })
+    .to_string()
+}
+
+fn nested_json() -> String {
+    let folder = "./Demo - Experiment - abc123/";
+    serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "./"}
+            },
+            {
+                "@id": "./",
+                "@type": "Dataset",
+                "name": "Nested fixture",
+                "description": "Folder datasets carrying spaces",
+                "datePublished": "2026-07-27",
+                "hasPart": [{"@id": folder}, {"@id": "./ -  - bb8b469d/"}]
+            },
+            {
+                "@id": folder,
+                "@type": "Dataset",
+                "name": "Experiment",
+                "hasPart": [{"@id": format!("{folder}example.txt")}]
+            },
+            {"@id": "./ -  - bb8b469d/", "@type": "Dataset", "name": "Untitled"},
+            {"@id": format!("{folder}example.txt"), "@type": "File", "name": "Example"}
+        ]
+    })
+    .to_string()
+}
+
+async fn nested_eln() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let wrapper = "2026-07-27-export";
+    let mut archive = async_zip::base::write::ZipFileWriter::new(Vec::new());
+    for (name, bytes) in [
+        (
+            format!("{wrapper}/ro-crate-metadata.json"),
+            nested_json().into_bytes(),
+        ),
+        (
+            // Exports in the wild double the separator after the folder name.
+            format!("{wrapper}/Demo - Experiment - abc123//example.txt"),
+            PAYLOAD.to_vec(),
+        ),
+        (
+            format!("{wrapper}/ro-crate-preview.html"),
+            b"<html></html>".to_vec(),
+        ),
+    ] {
+        archive
+            .write_entry_whole(
+                ZipEntryBuilder::new(name.into(), Compression::Deflate),
+                &bytes,
+            )
+            .await?;
+    }
+    Ok(archive.close().await?)
+}
+
+async fn mixed_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let json = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "./"}
+            },
+            {
+                "@id": "./",
+                "@type": "Dataset",
+                "name": "Mixed fixture",
+                "description": "Identifiers and references disagree on encoding",
+                "datePublished": "2026-07-27",
+                "hasPart": [{"@id": "./data/a%20b.txt"}, {"@id": "./data/c d.txt"}]
+            },
+            {"@id": "./data/a b.txt", "@type": "File", "name": "Literal"},
+            {"@id": "./data/c%20d.txt", "@type": "File", "name": "Encoded"}
+        ]
+    })
+    .to_string();
+    let mut archive = async_zip::base::write::ZipFileWriter::new(Vec::new());
+    for (name, bytes) in [
+        ("ro-crate-metadata.json", json.into_bytes()),
+        ("data/a b.txt", PAYLOAD.to_vec()),
+        ("data/c d.txt", PAYLOAD.to_vec()),
+    ] {
+        archive
+            .write_entry_whole(
+                ZipEntryBuilder::new(name.to_string().into(), Compression::Deflate),
+                &bytes,
+            )
+            .await?;
+    }
+    Ok(archive.close().await?)
+}
+
+async fn orphan_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let json = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [
+            {
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "./"}
+            },
+            {
+                "@id": "./",
+                "@type": "Dataset",
+                "name": "Orphan fixture",
+                "description": "The root never mentions its file",
+                "datePublished": "2026-07-27"
+            },
+            {"@id": "data.txt", "@type": "File", "name": "Unreachable"}
+        ]
+    })
+    .to_string();
+    custom_archive(
+        json,
+        ZipEntryBuilder::new("data.txt".to_string().into(), Compression::Deflate),
+        false,
+    )
+    .await
+}
+
+async fn pair_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut archive = async_zip::base::write::ZipFileWriter::new(Vec::new());
+    archive
+        .write_entry_whole(
+            ZipEntryBuilder::new(
+                "ro-crate-metadata.json".to_string().into(),
+                Compression::Stored,
+            ),
+            pair_json().as_bytes(),
+        )
+        .await?;
+    archive
+        .write_entry_whole(
+            ZipEntryBuilder::new("data1.txt".to_string().into(), Compression::Deflate),
+            PAYLOAD,
+        )
+        .await?;
+    archive
+        .write_entry_whole(
+            ZipEntryBuilder::new("data2.txt".to_string().into(), Compression::Deflate),
+            PAYLOAD,
+        )
+        .await?;
+    Ok(archive.close().await?)
+}
+
+async fn triple_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut json: serde_json::Value = serde_json::from_str(&pair_json())?;
+    let graph = json["@graph"]
+        .as_array_mut()
+        .ok_or("pair graph is missing")?;
+    graph[1]["hasPart"] = serde_json::json!([
+        {"@id": "data1.txt"}, {"@id": "data2.txt"}, {"@id": "data3.txt"}
+    ]);
+    graph.push(serde_json::json!({"@id": "data3.txt", "@type": "File", "name": "Third"}));
+    let mut archive = async_zip::base::write::ZipFileWriter::new(Vec::new());
+    let metadata = ZipEntryBuilder::new(
+        "ro-crate-metadata.json".to_string().into(),
+        Compression::Stored,
+    );
+    archive
+        .write_entry_whole(metadata, json.to_string().as_bytes())
+        .await?;
+    for name in ["data1.txt", "data2.txt", "data3.txt"] {
+        let entry = ZipEntryBuilder::new(name.to_string().into(), Compression::Deflate);
+        archive.write_entry_whole(entry, PAYLOAD).await?;
+    }
+    Ok(archive.close().await?)
+}
+
+async fn artifact_bytes(
+    fixture: &Fixture,
+    artifact: &aruna_core::structs::execution::job::ArtifactRef,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut read =
+        read_artifact_range(fixture.context.as_ref(), artifact, 0..artifact.size).await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = read.blob.next().await {
+        bytes.extend_from_slice(&chunk?);
+    }
+    Ok(bytes)
+}
+
+fn run_name(result: Result<JobRunOutcome, tokio::task::JoinError>) -> &'static str {
+    match result {
+        Ok(JobRunOutcome::Succeeded(_)) => "succeeded",
+        Ok(JobRunOutcome::Failed(_)) => "failed",
+        Ok(JobRunOutcome::Deferred(_) | JobRunOutcome::DeferredFor(..)) => "deferred",
+        Ok(JobRunOutcome::Cancelled) => "cancelled",
+        Ok(JobRunOutcome::Interrupted) => "interrupted",
+        Ok(JobRunOutcome::AwaitingKey(_)) => "awaiting key",
+        Ok(JobRunOutcome::Undecided(_)) => "undecided",
+        Err(_) => "panicked",
+    }
+}

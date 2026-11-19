@@ -400,7 +400,6 @@ mod tests {
         ReclaimSweepOperation,
     };
     use crate::driver::{DriverContext, drive};
-    use crate::storage_read::iter_prefix_page;
     use crate::testing::path_context;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -413,6 +412,7 @@ mod tests {
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
     use aruna_core::types::Value;
+    use aruna_storage::scan::iter_prefix_page;
     use std::collections::HashMap;
     use tempfile::tempdir;
 

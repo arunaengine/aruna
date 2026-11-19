@@ -28,8 +28,8 @@ pub mod links;
 pub mod pull;
 pub(crate) mod push;
 mod submit;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_support;
 pub use invenio::query::RecordReference;
 
 /// The running job an operation works for: its identity, stop signals and progress.

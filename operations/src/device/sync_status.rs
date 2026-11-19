@@ -677,7 +677,7 @@ mod tests {
     #[tokio::test]
     async fn runs_pending_beat() {
         // A device always has its folder beat pending, so an explicit run must move it to now.
-        use crate::tests::incoming::RecordingTaskHandler;
+        use crate::testing::RecordingTaskHandler;
         let dir = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let (seen, mut fired) = tokio::sync::mpsc::channel(16);

@@ -19,7 +19,6 @@ use crate::jobs::store::test_calls::{
     release_job, renew_lease, requeue_before_attempt, requeue_job, set_cancel_requested,
     settle_attempt, transition_to_running,
 };
-use crate::storage_read::iter_prefix_page;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -37,6 +36,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::TxnId;
+use aruna_storage::scan::iter_prefix_page;
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::tempdir;
 

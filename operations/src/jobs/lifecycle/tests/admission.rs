@@ -25,9 +25,9 @@ use crate::jobs::lifecycle::admit::{
 use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
 use crate::jobs::submit::SubmitJobError;
-use crate::storage_read::iter_prefix_page;
 use crate::tests::records::{Family, REALM, context, node, payload, secret, user};
 use aruna_core::metadata::AuthToken;
+use aruna_storage::scan::iter_prefix_page;
 
 fn frame(record: JobFamilyRecord, family: &Family) -> JobRecordFrame {
     JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")

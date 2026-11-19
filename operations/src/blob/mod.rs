@@ -4,7 +4,7 @@
 
 pub mod cleanup;
 pub(crate) mod cleanup_rows;
-pub(crate) mod hidden;
+pub mod hidden;
 pub mod holders;
 pub mod import_rows;
 pub(crate) mod merge_copies;
@@ -21,4 +21,4 @@ pub(crate) mod release;
 pub mod sweep_timer;
 pub(crate) mod trail;
 pub mod unify;
-pub(crate) mod unlocked;
+pub mod unlocked;

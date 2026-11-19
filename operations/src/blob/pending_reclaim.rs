@@ -299,7 +299,7 @@ mod tests {
         );
         assert!(!present(&context, PENDING_LOCATION_KEYSPACE, row.clone()).await);
         assert!(!present(&context, PENDING_RECLAIM_KEYSPACE, row).await);
-        let (queued, _) = crate::storage_read::iter_prefix_page(
+        let (queued, _) = aruna_storage::scan::iter_prefix_page(
             &context.storage_handle,
             BLOB_CLEANUP_KEYSPACE,
             None,

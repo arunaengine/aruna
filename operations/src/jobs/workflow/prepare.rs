@@ -26,7 +26,7 @@ use super::input_view::{CachedKeysOperation, ViewEntry, ViewError, view_bucket, 
 use super::inputs::LoadInputsOperation;
 use crate::jobs::lifecycle::ids::session_of;
 
-pub(super) const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
+pub const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 
 /// What one attempt needs of its preparation.
 #[derive(Debug, PartialEq)]
@@ -334,7 +334,7 @@ impl Operation for PrepareAttemptOperation {
     }
 }
 
-pub(super) fn build_task_spec(
+pub fn build_task_spec(
     spec: &ExecutionSpec,
     attempt: &AttemptRef,
     pinned_image: &str,

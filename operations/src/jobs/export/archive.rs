@@ -153,7 +153,7 @@ pub(super) fn plan_export(
     Ok(())
 }
 
-pub(super) fn recognize_entities(
+pub fn recognize_entities(
     document: &JsonValue,
     nquads: &str,
     realm_id: RealmId,
@@ -1011,7 +1011,7 @@ pub(super) fn validation_rows(violations: &[MetadataValidationViolation]) -> Vec
         .collect()
 }
 
-pub(super) fn failure_outcome(error: ExportFailure) -> JobRunOutcome {
+pub fn failure_outcome(error: ExportFailure) -> JobRunOutcome {
     match error {
         ExportFailure::Permanent(message) => permanent(message),
         ExportFailure::Retryable(message) => retryable(message),

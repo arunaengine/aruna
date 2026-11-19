@@ -286,6 +286,8 @@ mod tests {
     use super::{ConfigView, fetch_info, http_base_url};
     use crate::tests::fixtures::{TestEnvGuard, env_lock};
     use aruna::config::load;
+    use aruna::inbound::initialize_net_holder;
+    use aruna::tasks::incoming::start_task_queues;
     use aruna_api::server::state::ServerState;
     use aruna_api::server::{Server, ServerConfig};
     use aruna_core::keys::generate_signing_key;
@@ -293,12 +295,10 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::inbound::initialize_net_holder;
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::tasks::incoming::start_task_queues;
     use aruna_tasks::TaskHandle;
     use std::sync::Arc;
     use tempfile::tempdir;

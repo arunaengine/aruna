@@ -25,7 +25,7 @@ use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::types::TxnId;
 use std::collections::BTreeMap;
 
-pub(crate) async fn adopt_external_attempt(
+pub async fn adopt_external_attempt(
     context: &DriverContext,
     job_id: JobId,
     holder_node_id: NodeId,
@@ -38,7 +38,7 @@ pub(crate) async fn adopt_external_attempt(
     .await
 }
 
-pub(crate) async fn begin_external_running(
+pub async fn begin_external_running(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -52,7 +52,7 @@ pub(crate) async fn begin_external_running(
     .await
 }
 
-pub(crate) async fn cancel_running_job(
+pub async fn cancel_running_job(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -65,7 +65,7 @@ pub(crate) async fn cancel_running_job(
     .await
 }
 
-pub(crate) async fn claim_job(
+pub async fn claim_job(
     context: &DriverContext,
     job_id: JobId,
     holder_node_id: NodeId,
@@ -78,7 +78,7 @@ pub(crate) async fn claim_job(
     .await
 }
 
-pub(crate) async fn complete_execution(
+pub async fn complete_execution(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -101,7 +101,7 @@ pub(crate) async fn complete_execution(
     .await
 }
 
-pub(crate) async fn complete_job(
+pub async fn complete_job(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -116,7 +116,7 @@ pub(crate) async fn complete_job(
     .await
 }
 
-pub(crate) async fn defer_job(
+pub async fn defer_job(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -131,7 +131,7 @@ pub(crate) async fn defer_job(
     .await
 }
 
-pub(crate) async fn delete_finished_run(
+pub async fn delete_finished_run(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
@@ -144,7 +144,7 @@ pub(crate) async fn delete_finished_run(
     .await
 }
 
-pub(crate) async fn exhaust_job(
+pub async fn exhaust_job(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -158,7 +158,7 @@ pub(crate) async fn exhaust_job(
     .await
 }
 
-pub(crate) async fn fail_job(
+pub async fn fail_job(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -168,7 +168,7 @@ pub(crate) async fn fail_job(
     drive(job_calls::fail_job(job_id, token, error, now_ms), context).await
 }
 
-pub(crate) async fn find_dedup_job(
+pub async fn find_dedup_job(
     context: &DriverContext,
     created_by: UserId,
     dedup_key: &[u8],
@@ -179,7 +179,7 @@ pub(crate) async fn find_dedup_job(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn find_dedup_plan(
+pub async fn find_dedup_plan(
     context: &DriverContext,
     created_by: UserId,
     dedup_key: &[u8],
@@ -190,7 +190,7 @@ pub(crate) async fn find_dedup_plan(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn flush_progress(
+pub async fn flush_progress(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -204,7 +204,7 @@ pub(crate) async fn flush_progress(
     .await
 }
 
-pub(crate) async fn handoff_external_attempt(
+pub async fn handoff_external_attempt(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -217,13 +217,13 @@ pub(crate) async fn handoff_external_attempt(
     .await
 }
 
-pub(crate) async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(), String> {
+pub async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(), String> {
     drive(row_calls::insert_job(record), context)
         .await
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn list_job_entries(
+pub async fn list_job_entries(
     context: &DriverContext,
     job_id: JobId,
     last_key: Option<Vec<u8>>,
@@ -237,7 +237,7 @@ pub(crate) async fn list_job_entries(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn list_user_jobs(
+pub async fn list_user_jobs(
     context: &DriverContext,
     user_id: UserId,
     cursor: Option<Vec<u8>>,
@@ -252,7 +252,7 @@ pub(crate) async fn list_user_jobs(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn mark_indeterminate(
+pub async fn mark_indeterminate(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -266,7 +266,7 @@ pub(crate) async fn mark_indeterminate(
     .await
 }
 
-pub(crate) async fn mutate_job<F>(
+pub async fn mutate_job<F>(
     context: &DriverContext,
     job_id: JobId,
     mutate: F,
@@ -289,7 +289,7 @@ where
     }
 }
 
-pub(crate) async fn park_job(
+pub async fn park_job(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -299,7 +299,7 @@ pub(crate) async fn park_job(
     drive(row_calls::park_job(job_id, token, now_ms, waits), context).await
 }
 
-pub(crate) async fn persist_output_record(
+pub async fn persist_output_record(
     context: &DriverContext,
     job_id: JobId,
     control: &AttemptControl,
@@ -313,7 +313,7 @@ pub(crate) async fn persist_output_record(
     .await
 }
 
-pub(crate) async fn put_crate_outcome(
+pub async fn put_crate_outcome(
     context: &DriverContext,
     job_id: JobId,
     status: &aruna_core::structs::execution::job::RunCrateStatus,
@@ -324,7 +324,7 @@ pub(crate) async fn put_crate_outcome(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn put_crate_status(
+pub async fn put_crate_status(
     context: &DriverContext,
     job_id: JobId,
     status: &aruna_core::structs::execution::job::RunCrateStatus,
@@ -334,7 +334,7 @@ pub(crate) async fn put_crate_status(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn put_job_entry<T: Serialize>(
+pub async fn put_job_entry<T: Serialize>(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -348,7 +348,7 @@ pub(crate) async fn put_job_entry<T: Serialize>(
     .await
 }
 
-pub(crate) async fn put_state<T: Serialize>(
+pub async fn put_state<T: Serialize>(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -363,7 +363,7 @@ pub(crate) async fn put_state<T: Serialize>(
     .await
 }
 
-pub(crate) async fn read_attempt_control(
+pub async fn read_attempt_control(
     context: &DriverContext,
     job_id: JobId,
     attempt_epoch: u64,
@@ -376,7 +376,7 @@ pub(crate) async fn read_attempt_control(
     .await
 }
 
-pub(crate) async fn read_crate_status(
+pub async fn read_crate_status(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<aruna_core::structs::execution::job::RunCrateStatus>, String> {
@@ -385,7 +385,7 @@ pub(crate) async fn read_crate_status(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn read_job_record(
+pub async fn read_job_record(
     context: &DriverContext,
     job_id: JobId,
     _txn_id: Option<TxnId>,
@@ -395,7 +395,7 @@ pub(crate) async fn read_job_record(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn read_key_waits(
+pub async fn read_key_waits(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Vec<KeyWait>, String> {
@@ -404,7 +404,7 @@ pub(crate) async fn read_key_waits(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn read_launch_record(
+pub async fn read_launch_record(
     context: &DriverContext,
     record: &JobRecord,
 ) -> Result<Option<LaunchRecord>, String> {
@@ -413,7 +413,7 @@ pub(crate) async fn read_launch_record(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn read_output_record(
+pub async fn read_output_record(
     context: &DriverContext,
     job_id: JobId,
     attempt_epoch: u64,
@@ -425,7 +425,7 @@ pub(crate) async fn read_output_record(
     .await
 }
 
-pub(crate) async fn read_run_link(
+pub async fn read_run_link(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<aruna_core::structs::execution::job::RunLink>, String> {
@@ -434,7 +434,7 @@ pub(crate) async fn read_run_link(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn read_state<T: DeserializeOwned + Send + std::fmt::Debug + 'static>(
+pub async fn read_state<T: DeserializeOwned + Send + std::fmt::Debug + 'static>(
     context: &DriverContext,
     key_space: &str,
     key: Key,
@@ -445,7 +445,7 @@ pub(crate) async fn read_state<T: DeserializeOwned + Send + std::fmt::Debug + 's
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn record_attempt_intent(
+pub async fn record_attempt_intent(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -468,7 +468,7 @@ pub(crate) async fn record_attempt_intent(
     .await
 }
 
-pub(crate) async fn record_attempt_started(
+pub async fn record_attempt_started(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -481,7 +481,7 @@ pub(crate) async fn record_attempt_started(
     .await
 }
 
-pub(crate) async fn release_job(
+pub async fn release_job(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -490,7 +490,7 @@ pub(crate) async fn release_job(
     drive(job_calls::release_job(job_id, token, now_ms), context).await
 }
 
-pub(crate) async fn renew_lease(
+pub async fn renew_lease(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -504,7 +504,7 @@ pub(crate) async fn renew_lease(
     .await
 }
 
-pub(crate) async fn requeue_before_attempt(
+pub async fn requeue_before_attempt(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -518,7 +518,7 @@ pub(crate) async fn requeue_before_attempt(
     .await
 }
 
-pub(crate) async fn requeue_job(
+pub async fn requeue_job(
     context: &DriverContext,
     job_id: JobId,
     token: Option<Ulid>,
@@ -533,7 +533,7 @@ pub(crate) async fn requeue_job(
     .await
 }
 
-pub(crate) async fn reserve_output_commits(
+pub async fn reserve_output_commits(
     context: &DriverContext,
     job_id: JobId,
     destinations: &[(NodeId, String, String)],
@@ -546,7 +546,7 @@ pub(crate) async fn reserve_output_commits(
     .await
 }
 
-pub(crate) async fn set_cancel_requested(
+pub async fn set_cancel_requested(
     context: &DriverContext,
     job_id: JobId,
     now_ms: u64,
@@ -554,7 +554,7 @@ pub(crate) async fn set_cancel_requested(
     drive(job_calls::set_cancel_requested(job_id, now_ms), context).await
 }
 
-pub(crate) async fn transition_to_preparing(
+pub async fn transition_to_preparing(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -567,7 +567,7 @@ pub(crate) async fn transition_to_preparing(
     .await
 }
 
-pub(crate) async fn transition_to_ready(
+pub async fn transition_to_ready(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -580,7 +580,7 @@ pub(crate) async fn transition_to_ready(
     .await
 }
 
-pub(crate) async fn transition_to_running(
+pub async fn transition_to_running(
     context: &DriverContext,
     job_id: JobId,
     token: Ulid,
@@ -593,7 +593,7 @@ pub(crate) async fn transition_to_running(
     .await
 }
 
-pub(crate) async fn wake_key_page(
+pub async fn wake_key_page(
     context: &DriverContext,
     key: BucketKeyRef,
     now_ms: u64,
@@ -601,7 +601,7 @@ pub(crate) async fn wake_key_page(
     drive(row_calls::wake_key_page(key, now_ms), context).await
 }
 
-pub(crate) async fn wake_key_waits(
+pub async fn wake_key_waits(
     context: &DriverContext,
     key: BucketKeyRef,
     now_ms: u64,
@@ -609,7 +609,7 @@ pub(crate) async fn wake_key_waits(
     drive(row_calls::wake_key_waits(key, now_ms), context).await
 }
 
-pub(crate) async fn settle_attempt<T>(
+pub async fn settle_attempt<T>(
     result: Result<T, JobMutationError>,
     attempt: u32,
     exhausted: &str,

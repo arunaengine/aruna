@@ -7,7 +7,6 @@ use crate::auth::request_authorization::BucketAccessOperation;
 use crate::blob::release::{ReleaseFile, ReleaseRenamedOperation};
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::s3::bucket::rename::tests::{BUCKET, access, group, put, realm, rule, setup, store_job};
-use crate::storage_read::iter_prefix_page;
 use crate::tests::records::node;
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
@@ -23,6 +22,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
 use aruna_core::structs::storage::linked_job::LinkedTask;
+use aruna_storage::scan::iter_prefix_page;
 use std::time::SystemTime;
 
 async fn read(context: &DriverContext, space: &str, key: Key) -> Result<Option<Vec<u8>>, String> {

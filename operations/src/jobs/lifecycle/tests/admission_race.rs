@@ -28,9 +28,9 @@ use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::store::test_calls::read_job_record;
-use crate::storage_read::iter_prefix_page;
 use crate::tests::records::{Family, REALM, context};
 use aruna_core::structs::execution::job::record_keys::kind_prefix;
+use aruna_storage::scan::iter_prefix_page;
 
 pub(super) fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {

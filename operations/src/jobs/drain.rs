@@ -520,10 +520,9 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::JOB_LEASE_MS;
+    use crate::jobs::context::ExternalReconciler;
     use crate::jobs::store::test_calls::insert_job;
     use crate::jobs::store::test_calls::read_job_record;
-    use crate::storage_read::iter_prefix_page;
-    use crate::tasks::job_reconcile::ExternalReconciler;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::Event;
@@ -537,6 +536,7 @@ mod tests {
     use aruna_core::task::TaskEvent;
     use aruna_core::time::unix_timestamp_millis;
     use aruna_storage::FjallStorage;
+    use aruna_storage::scan::iter_prefix_page;
     use aruna_tasks::TaskHandle;
     use byteview::ByteView;
     use std::sync::Arc;
@@ -724,10 +724,15 @@ mod tests {
         seen: Mutex<Vec<JobId>>,
     }
 
-    #[async_trait::async_trait]
     impl ExternalReconciler for RecordingReconciler {
-        async fn reconcile_lost_attempt(&self, _context: &DriverContext, record: JobRecord) {
-            self.seen.lock().unwrap().push(record.job_id);
+        fn reconcile_lost_attempt<'a>(
+            &'a self,
+            _context: &'a DriverContext,
+            record: JobRecord,
+        ) -> futures_util::future::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.seen.lock().unwrap().push(record.job_id);
+            })
         }
     }
 

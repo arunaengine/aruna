@@ -38,7 +38,7 @@ enum SyncStage {
 /// `retry`, a failed projection arms the projection drain; otherwise it is only logged. Its
 /// timings come from the runner's clock.
 #[derive(Debug, PartialEq)]
-pub(crate) struct AfterSyncOperation {
+pub struct AfterSyncOperation {
     node_id: Option<NodeId>,
     retry: bool,
     targets: Vec<DocumentTarget>,
@@ -54,11 +54,7 @@ pub(crate) struct AfterSyncOperation {
 }
 
 impl AfterSyncOperation {
-    pub(crate) fn new(
-        node_id: Option<NodeId>,
-        result: DocumentReconcileResult,
-        retry: bool,
-    ) -> Self {
+    pub fn new(node_id: Option<NodeId>, result: DocumentReconcileResult, retry: bool) -> Self {
         let DocumentReconcileResult {
             targets,
             metadata_create_events,

@@ -33,7 +33,7 @@ use crate::jobs::repository::links::LinkError;
 use crate::metadata::call_results::effect_event;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::repository::schedule_prune_drain;
-use crate::tasks::queue_backoff::due_after;
+use crate::queue_backoff::due_after;
 
 const PRUNE_BATCH_SIZE: usize = 128;
 /// Index rows deleted per call.
@@ -718,7 +718,7 @@ impl Operation for PruneTimerOperation {
 }
 
 /// Whether any prune job is queued, due or not; repairs the queue on the way.
-pub(crate) fn jobs_queued() -> DuePruneOperation {
+pub fn jobs_queued() -> DuePruneOperation {
     DuePruneOperation::new(u64::MAX, 1)
 }
 

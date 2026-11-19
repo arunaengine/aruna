@@ -313,3 +313,37 @@ pub async fn prune_jobs_exist(
     let due = crate::driver::drive(crate::metadata::prune_queue::jobs_queued(), context).await?;
     Ok(!due.jobs.is_empty())
 }
+
+pub struct RecordingTaskHandler {
+    pub seen: tokio::sync::mpsc::Sender<aruna_core::task::TaskKey>,
+}
+
+#[async_trait::async_trait]
+impl aruna_tasks::InboundTaskHandler for RecordingTaskHandler {
+    async fn handle_timer(&self, key: aruna_core::task::TaskKey) {
+        let _ = self.seen.send(key).await;
+    }
+}
+
+/// Tokio inhibits paused-clock auto-advance while a blocking task is alive.
+/// Storage and net answer from their own threads, so without this the clock
+/// races ahead of every round trip. `tokio::time::advance` still applies.
+pub struct ClockGuard {
+    _stop: std::sync::mpsc::Sender<()>,
+}
+
+pub fn freeze_clock() -> ClockGuard {
+    let (stop, wait) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        let _ = wait.recv();
+    });
+    ClockGuard { _stop: stop }
+}
+
+/// The graph handle a test installed on its context.
+pub fn installed_graph_handle(context: &DriverContext) -> &aruna_graph::GraphHandle {
+    context
+        .graph_handle
+        .as_ref()
+        .expect("graph handle installed")
+}

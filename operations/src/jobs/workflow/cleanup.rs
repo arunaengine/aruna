@@ -232,7 +232,7 @@ impl Operation for TerminalCleanupOperation {
 }
 
 /// How the job runtime takes the end of a cleanup run.
-pub(crate) fn cleanup_outcome(result: Result<(), JobError>) -> JobRunOutcome {
+pub fn cleanup_outcome(result: Result<(), JobError>) -> JobRunOutcome {
     match result {
         Ok(()) => JobRunOutcome::Succeeded(JobResultPayload::Cleanup),
         Err(error) => JobRunOutcome::Failed(error),
@@ -301,12 +301,12 @@ mod tests {
 
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::jobs::context::JobContext;
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::test_calls::{insert_job, record_attempt_intent};
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;
-    use crate::tasks::job_context::JobContext;
 
     async fn run_terminal_cleanup(
         ctx: &JobContext,

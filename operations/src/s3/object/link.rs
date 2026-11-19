@@ -559,7 +559,7 @@ mod tests {
     use super::*;
     use crate::driver::drive;
     use crate::testing::test_context;
-    use crate::tests::access::seed_access;
+    use crate::testing_access::seed_access;
     use crate::tests::s3::test_storage;
 
     #[tokio::test]

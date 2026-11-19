@@ -1600,9 +1600,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "table_tests.rs"]
-mod adapter_tests;
-
-#[cfg(test)]
 #[path = "chunk_tests.rs"]
 mod chunk_tests;
