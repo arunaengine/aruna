@@ -22,6 +22,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::check::{CallError, RunScope};
+use super::held::ReplyShown;
+use super::host_steps::AdmitCall;
 use super::grants::short_path;
 use super::rows::{Rows, StoreError, decode, delete_rows, scan_rows};
 use super::submit::{PrepareWork, PreparedWork, WORK_ACTIVE, WorkRequest};
@@ -664,6 +666,84 @@ impl Operation for StartWork {
                 recorded.map_err(|error| call_unavailable(error.0))?;
                 Ok(Next::Done(work_id))
             }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReadPhase {
+    Admit,
+    State(Box<PluginInstall>),
+    Row(Box<JobStatus>),
+    Shown(Box<JobStatus>),
+}
+
+/// The state of the run's job `id`, admitted as a host call. A kept reply comes with it only
+/// while [`ReplyShown`] says it may be shown; otherwise the state comes without the reply.
+#[derive(Debug, PartialEq)]
+pub struct ReadJob {
+    scope: RunScope,
+    id: String,
+    phase: ReadPhase,
+}
+
+impl ReadJob {
+    pub fn new(scope: &RunScope, id: &str) -> Self {
+        Self {
+            scope: scope.clone(),
+            id: id.to_string(),
+            phase: ReadPhase::Admit,
+        }
+    }
+}
+
+/// A job state without its kept reply.
+fn without_reply(mut status: JobStatus) -> JobStatus {
+    (status.reply_status, status.reply_body) = (None, None);
+    status.reply_headers.clear();
+    status
+}
+
+impl Operation for ReadJob {
+    type Output = JobStatus;
+    type Error = CallError;
+
+    fn first(&mut self) -> Result<Next<JobStatus>, CallError> {
+        let admit = AdmitCall::new(&self.scope, None);
+        Ok(Next::Call(IoCall::child(admit)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<JobStatus>, CallError> {
+        match std::mem::replace(&mut self.phase, ReadPhase::Admit) {
+            ReadPhase::Admit => {
+                let install = result.child::<PluginInstall, CallError>()??;
+                let state = JobState::new((&install, self.scope.local), &self.id);
+                self.phase = ReadPhase::State(Box::new(install));
+                Ok(Next::Call(IoCall::child(state)))
+            }
+            ReadPhase::State(install) => {
+                let status = result.child::<JobStatus, CallError>()??;
+                if status.reply_status.is_none() {
+                    return Ok(Next::Done(status));
+                }
+                let row = JobRow::new(&install, &self.id);
+                self.phase = ReadPhase::Row(Box::new(status));
+                Ok(Next::Call(IoCall::child(row)))
+            }
+            ReadPhase::Row(status) => {
+                let row = result.child::<WorkRow, CallError>()??;
+                // A refused check answers the state without the reply.
+                let Some(context) = &row.context else {
+                    return Ok(Next::Done(without_reply(*status)));
+                };
+                self.phase = ReadPhase::Shown(status);
+                let shown = ReplyShown::new(&self.scope, context);
+                Ok(Next::Call(IoCall::child(shown)))
+            }
+            ReadPhase::Shown(status) => match result.child::<bool, CallError>()?? {
+                true => Ok(Next::Done(*status)),
+                false => Ok(Next::Done(without_reply(*status))),
+            },
         }
     }
 }

@@ -6,19 +6,25 @@
 use std::str::FromStr;
 
 use aruna_core::NodeId;
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
 use aruna_plugin_types::calls::{ErrorKind, HostError};
+use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
 
-use super::check::CallError;
+use super::check::{CallError, RunScope};
+use super::host_calls::version_id;
+use super::host_steps::{Granted, GrantedCall};
 use super::marks::{MARKED, is_marked};
 use super::rows::{StoreError, mapped_child};
 use super::unavailable;
 use crate::s3::bucket::get::GetBucketOperation;
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Whether a head found no such object or version.
@@ -153,6 +159,136 @@ impl Operation for Unmarked {
         self.resolved = Some(resolved);
         let marked = is_marked((&self.bucket, &self.key, resolved))?;
         Ok(Next::Call(IoCall::child(marked)))
+    }
+}
+
+/// A byte bound as people read it: `1 MiB` rather than `1048576 bytes`.
+fn byte_size(bytes: usize) -> String {
+    match bytes % (1 << 20) {
+        0 => format!("{} MiB", bytes >> 20),
+        _ => format!("{bytes} bytes"),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReadPhase {
+    Grant,
+    Locate(Box<Granted>),
+    Version(Box<Granted>, (String, String)),
+    Get,
+    Collect,
+}
+
+/// The bytes of the object at the full path `path` below the install's group data, the current
+/// or the given version, under the read grants; one larger than `max_bytes` is for a task.
+#[derive(Debug, PartialEq)]
+pub struct ReadObject {
+    scope: RunScope,
+    path: String,
+    version: Option<String>,
+    max_bytes: usize,
+    phase: ReadPhase,
+}
+
+impl ReadObject {
+    pub fn new(scope: &RunScope, path: &str, version: Option<String>, max_bytes: usize) -> Self {
+        Self {
+            scope: scope.clone(),
+            path: path.to_string(),
+            version,
+            max_bytes,
+            phase: ReadPhase::Grant,
+        }
+    }
+
+    fn missing(&self) -> CallError {
+        let path = &self.path;
+        CallError(HostError::new(ErrorKind::NotFound, format!("no object at {path}")))
+    }
+
+    fn too_large(&self) -> CallError {
+        let message = format!(
+            "objects larger than {} cannot be read by a plugin; give them to a task",
+            byte_size(self.max_bytes)
+        );
+        CallError(HostError::new(ErrorKind::Limit, message))
+    }
+}
+
+impl Operation for ReadObject {
+    type Output = Vec<u8>;
+    type Error = CallError;
+
+    fn first(&mut self) -> Result<Next<Vec<u8>>, CallError> {
+        let read = Permission::ObjectsRead;
+        let check = GrantedCall::target(&self.scope, read, &self.path);
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<u8>>, CallError> {
+        match std::mem::replace(&mut self.phase, ReadPhase::Get) {
+            ReadPhase::Grant => {
+                let granted = result.child::<Granted, CallError>()??;
+                let place = (self.scope.realm_id, self.scope.local);
+                let locate = LocalObject::new(place, &granted.install, &self.path);
+                self.phase = ReadPhase::Locate(Box::new(granted));
+                Ok(Next::Call(IoCall::child(locate)))
+            }
+            ReadPhase::Locate(granted) => {
+                let (bucket, key) = result.child::<(String, String), CallError>()??;
+                let version = (self.version.as_deref()).map(version_id).transpose()?;
+                let unmarked = Unmarked::new((&bucket, &key), version);
+                self.phase = ReadPhase::Version(granted, (bucket, key));
+                Ok(Next::Call(IoCall::child(unmarked)))
+            }
+            ReadPhase::Version(granted, (bucket, key)) => {
+                let version = result.child::<Option<Ulid>, CallError>()??;
+                let Granted { install, auth } = *granted;
+                let input = GetObjectInput {
+                    bucket,
+                    key,
+                    version_id: Some(version.ok_or_else(|| self.missing())?),
+                    range: None,
+                    group_id: install.group_id,
+                    user_identity: install.account,
+                    realm_id: self.scope.realm_id,
+                    node_id: self.scope.local,
+                };
+                let read = GetObjectOperation::new(input).with_restrictions(auth.path_restrictions);
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            ReadPhase::Get => {
+                let got = match result.child::<GetObjectResult, GetObjectError>()? {
+                    Ok(got) => got,
+                    Err(GetObjectError::NoSuchKey | GetObjectError::NoSuchVersion) => {
+                        return Err(self.missing());
+                    }
+                    Err(other) => return Err(CallError(unavailable(other.to_string()))),
+                };
+                if got.info.size > self.max_bytes as u64 {
+                    return Err(self.too_large());
+                }
+                self.phase = ReadPhase::Collect;
+                let collect = BlobEffect::CollectStream { blob: got.blob };
+                Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(collect)))))
+            }
+            ReadPhase::Collect => match result.event()? {
+                Event::Blob(BlobEvent::StreamCollected { bytes: Ok(bytes) }) => {
+                    match bytes.len() > self.max_bytes {
+                        true => Err(self.too_large()),
+                        false => Ok(Next::Done(bytes)),
+                    }
+                }
+                Event::Blob(BlobEvent::StreamCollected { bytes: Err(error) }) => {
+                    Err(CallError(unavailable(error)))
+                }
+                other => Err(IoError::Unexpected {
+                    expected: "BlobEvent::StreamCollected",
+                    got: other.label(),
+                }
+                .into()),
+            },
+        }
     }
 }
 
