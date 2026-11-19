@@ -5,6 +5,7 @@
 mod adapter;
 mod admission;
 mod evidence;
+mod expiry;
 mod projection;
 pub(crate) mod prune;
 mod reduction;

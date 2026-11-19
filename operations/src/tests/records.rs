@@ -290,7 +290,12 @@ impl Family {
 
     /// A successful run of execution 1 with its stop record, as the target signed it.
     pub fn stopped_run(&self) -> Vec<JobRecordEnvelope> {
-        let mut records = self.run(1, 0, PhysicalExecutionState::Succeeded);
+        self.stopped_with(PhysicalExecutionState::Succeeded)
+    }
+
+    /// One execution that ended in `terminal` and stopped.
+    pub fn stopped_with(&self, terminal: PhysicalExecutionState) -> Vec<JobRecordEnvelope> {
+        let mut records = self.run(1, 0, terminal);
         let (JobFamilyRecord::Receipt(receipt), JobFamilyRecord::Update(update)) =
             (&records[4].record, &records[7].record)
         else {
