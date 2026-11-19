@@ -221,7 +221,7 @@ enum TargetStage {
 
 /// The targets of one preflight. A bucket target needs the caller's write permission on its
 /// scope and on every key it resolves to; a cut scope is incomplete.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(super) struct ResolveTargetsOperation {
     realm_id: RealmId,
     local_node: NodeId,

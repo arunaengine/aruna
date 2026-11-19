@@ -160,7 +160,7 @@ pub async fn accept_pull(
             (node.0, node_routing(&context)),
             (auth, bucket),
             request,
-            bytes_done,
+            PullProgress(bytes_done),
         );
         let result = drive(commit, context.as_ref()).await;
         if let Err(refusal) = &result {

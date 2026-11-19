@@ -4,7 +4,7 @@
 
 use super::{ApiQueryMode, AuthToken, MetadataApiError, NodeId};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum MetadataFanoutOperation {
     Query,
     Search,

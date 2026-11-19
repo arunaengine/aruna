@@ -176,6 +176,7 @@ impl SignedCursor<ObjectCursorPayload> {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) struct ObjectSearchPlan {
     pub(super) auth: AuthContext,
     pub(super) bearer_token: Option<String>,
@@ -189,6 +190,7 @@ pub(super) struct ObjectSearchPlan {
     pub(super) fingerprint: [u8; 32],
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) struct ObjectSearchPartitions {
     pub(super) as_of: SystemTime,
     pub(super) partitions: Vec<ObjectPartitionState>,

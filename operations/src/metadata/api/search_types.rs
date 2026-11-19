@@ -32,7 +32,7 @@ pub struct MetadataSearchExecution {
     pub fanout_stats: MetadataFanoutStats,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BucketSearchRequest {
     pub auth: AuthContext,
     pub bearer_token: Option<String>,
@@ -81,7 +81,7 @@ impl ObjectQueryMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchQueryRequest {
     pub auth: AuthContext,
     pub bearer_token: Option<String>,
@@ -126,7 +126,7 @@ pub struct ObjectExecution {
     pub layout_changed: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct ObjectPartitionState {
     pub(super) node_id: NodeId,
     pub(super) start_after: Option<Vec<u8>>,

@@ -27,6 +27,7 @@ use crate::metadata::secondary_ids::{IdentifierMatch, merge_matches};
 type Matches = Vec<IdentifierMatch>;
 
 /// How the lookup asks each node's reverse index.
+#[derive(Debug, PartialEq)]
 struct LookupCalls {
     realm_id: RealmId,
     auth: Option<AuthContext>,
@@ -79,6 +80,7 @@ impl NodeCalls for LookupCalls {
 }
 
 /// The merged readable matches of every node, and whether any node failed to answer.
+#[derive(Debug, PartialEq)]
 pub struct IdentifierFanoutOperation {
     realm_id: RealmId,
     local_node: NodeId,

@@ -24,7 +24,7 @@ pub(super) fn preflight_fingerprint(
     *hasher.finalize().as_bytes()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ReferenceTarget {
     ContentW3ids {
         content_w3ids: Vec<String>,
@@ -44,7 +44,7 @@ pub enum MetadataStorageOperation {
     AllVersionsPurge,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReferenceRequest {
     pub auth: AuthContext,
     pub bearer_token: Option<String>,

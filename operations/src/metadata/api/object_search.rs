@@ -42,6 +42,7 @@ use crate::s3::object::search::{SearchNodePage, SearchObjectsError, SearchObject
 use crate::s3::object::search_scan::SearchObjectsOperation;
 
 /// How the object fanout asks each node, from where the cursor left that node.
+#[derive(Debug, PartialEq)]
 struct ObjectCalls {
     auth_token: Option<AuthToken>,
     input: SearchObjectsInput,
@@ -105,6 +106,7 @@ impl NodeCalls for ObjectCalls {
 }
 
 /// The skipped bucket searches of one page and what the realm-wide part answered.
+#[derive(Debug, PartialEq)]
 struct Answered {
     partitions: ObjectSearchPartitions,
     parts: Vec<(NodeId, SearchNodePage)>,
@@ -112,6 +114,7 @@ struct Answered {
     searched: Vec<PendingBucket>,
 }
 
+#[derive(Debug, PartialEq)]
 enum ObjectStage {
     Start,
     Signers(String),
@@ -124,6 +127,7 @@ enum ObjectStage {
 /// One page of an object search. A realm-wide page also searches up to
 /// [`MAX_SKIPPED_SEARCHES`] distributed buckets it skipped, each through its range indexes from
 /// where the cursor left it, all within the same deadline; the rest wait in the cursor.
+#[derive(Debug, PartialEq)]
 pub struct ObjectSearchOperation {
     realm_id: RealmId,
     local_node: NodeId,

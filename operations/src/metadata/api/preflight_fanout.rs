@@ -46,6 +46,7 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::search_cursor::{SearchCursor, resume_fetch_limit};
 
 /// How the preflight fanout asks each node, deeper for nodes a cursor resumes.
+#[derive(Debug, PartialEq)]
 struct PreflightCalls {
     realm_id: RealmId,
     auth: AuthContext,
@@ -124,6 +125,7 @@ struct Unsigned {
     cursor: SearchCursor,
 }
 
+#[derive(Debug, PartialEq)]
 enum PreflightStage {
     Start,
     Targets,
@@ -133,6 +135,7 @@ enum PreflightStage {
 }
 
 /// One page of a reference preflight across the realm, or on this node in local mode.
+#[derive(Debug, PartialEq)]
 pub struct ReferencesPreflightOperation {
     realm_id: RealmId,
     local_node: NodeId,

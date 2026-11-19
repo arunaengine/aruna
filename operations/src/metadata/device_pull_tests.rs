@@ -139,8 +139,12 @@ fn ordinary_bucket_checks_write() {
 
 fn commit(deleted: bool) -> CommitPullOperation {
     let node = (node(1), NodeRouting::default());
-    let bytes_done = Arc::new(AtomicU64::new(0));
-    CommitPullOperation::new(node, (auth(), bucket()), request(deleted), bytes_done)
+    CommitPullOperation::new(
+        node,
+        (auth(), bucket()),
+        request(deleted),
+        PullProgress::default(),
+    )
 }
 
 #[test]

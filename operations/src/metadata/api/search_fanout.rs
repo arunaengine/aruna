@@ -186,6 +186,7 @@ impl Operation for NodeSearchOperation {
 }
 
 /// How the search fanout asks each node: deeper for nodes a cursor resumes.
+#[derive(Debug, PartialEq)]
 struct SearchCalls {
     auth: Option<AuthContext>,
     auth_token: Option<AuthToken>,

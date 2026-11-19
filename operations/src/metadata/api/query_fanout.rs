@@ -268,6 +268,7 @@ fn merge_stats(left: MetadataFanoutStats, right: MetadataFanoutStats) -> Metadat
 }
 
 /// How the query fanout asks each node: a tie fetch here or at a peer.
+#[derive(Debug, PartialEq)]
 struct QueryCalls {
     auth: Option<AuthContext>,
     auth_token: Option<AuthToken>,

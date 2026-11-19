@@ -462,6 +462,18 @@ fn pull_fence(request: &SyncPull) -> Result<FenceRows, SyncRefusal> {
     Ok((vec![(space.clone(), key.clone(), None)], vec![(space, key)]))
 }
 
+/// The bytes of a pull that arrived so far, shared with the poll that reports them.
+#[derive(Clone, Debug, Default)]
+pub struct PullProgress(pub Arc<AtomicU64>);
+
+/// Two progress counters are the same when they count the same pull.
+impl PartialEq for PullProgress {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Debug, PartialEq)]
 enum CommitStage {
     Start,
     Replay,
@@ -477,12 +489,13 @@ enum CommitStage {
 /// Commits one admitted pull as the owner's own write: a delete marker, or the device's exact
 /// version read from the device, counting the bytes that arrive into `bytes_done`. A failure
 /// whose device version committed anyway answers with that receipt.
+#[derive(Debug, PartialEq)]
 pub struct CommitPullOperation {
     node: (NodeId, NodeRouting),
     auth: AuthContext,
     bucket: BucketInfo,
     request: SyncPull,
-    bytes_done: Arc<AtomicU64>,
+    bytes_done: PullProgress,
     stage: CommitStage,
 }
 
@@ -494,7 +507,7 @@ impl CommitPullOperation {
         node: (NodeId, NodeRouting),
         (auth, bucket): (AuthContext, BucketInfo),
         request: SyncPull,
-        bytes_done: Arc<AtomicU64>,
+        bytes_done: PullProgress,
     ) -> Self {
         Self {
             node,
@@ -647,7 +660,7 @@ impl Operation for CommitPullOperation {
                     .map_err(unavailable);
                 let blob = match read {
                     Ok(Ok(BaoReadOutput::Stream { blob, .. })) => {
-                        counted(blob, self.bytes_done.clone())
+                        counted(blob, self.bytes_done.0.clone())
                     }
                     // A metadata-only answer to a full read is a broken exchange, not an absent
                     // object: parking the upload on it would lose the file.

@@ -62,6 +62,7 @@ where
 }
 
 /// How the set preview asks each node for its first page of the set's postings.
+#[derive(Debug, PartialEq)]
 struct PreviewCalls {
     realm_id: RealmId,
     auth: Option<AuthContext>,
@@ -117,6 +118,7 @@ impl NodeCalls for PreviewCalls {
 }
 
 /// Every metadata node's first page of the documents that link `set_id`, merged.
+#[derive(Debug, PartialEq)]
 pub struct SetPreviewFanout {
     realm_id: RealmId,
     local_node: NodeId,
@@ -181,6 +183,7 @@ impl Operation for SetPreviewFanout {
 }
 
 /// How the links fanout asks each node's reverse index.
+#[derive(Debug, PartialEq)]
 struct LinkCalls {
     realm_id: RealmId,
     auth: Option<AuthContext>,
@@ -238,6 +241,7 @@ impl NodeCalls for LinkCalls {
 
 /// Every metadata node's page of the documents that link the request's identifiers, merged
 /// by document id.
+#[derive(Debug, PartialEq)]
 pub struct LinksFanout {
     realm_id: RealmId,
     local_node: NodeId,
@@ -468,6 +472,7 @@ fn read_path(realm: RealmId, group: GroupId, node: NodeId, bucket: &str, prefix:
 }
 
 /// The derived `isPartOf` of a file of a local bucket, as `auth` may see it.
+#[derive(Debug, PartialEq)]
 pub struct PartOfOperation {
     realm_id: RealmId,
     node_id: NodeId,

@@ -180,6 +180,7 @@ pub(super) struct ResolvedPreflightTargets {
     pub(super) complete: bool,
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) struct PreflightPlan {
     pub(super) auth: AuthContext,
     pub(super) bearer_token: Option<String>,
@@ -191,6 +192,7 @@ pub(super) struct PreflightPlan {
     pub(super) allow_partial: bool,
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) struct PreflightCursorPlan {
     pub(super) fingerprint: [u8; 32],
     pub(super) watermark: Option<SearchWatermark>,

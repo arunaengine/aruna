@@ -231,7 +231,7 @@ pub(super) fn child_part<T: 'static, E: 'static>(event: Event) -> Result<T, Meta
 }
 
 /// How one fanout asks a node and reads its answer.
-pub(super) trait NodeCalls: Send + 'static {
+pub(super) trait NodeCalls: Send + std::fmt::Debug + PartialEq + 'static {
     type Part: std::fmt::Debug + Send + PartialEq + 'static;
 
     /// The call this node answers itself.
@@ -263,6 +263,7 @@ enum FanoutStage {
 /// `QUERY_MAX_NODES` of them chosen by rank, `QUERY_FANOUT_LIMIT` at a time, all within the
 /// scope's deadline. A forbidden answer fails the fanout; a missing document anywhere is
 /// unavailable; any failed node fails a caller that asked for a complete answer.
+#[derive(Debug, PartialEq)]
 pub(super) struct NodeFanoutOperation<C: NodeCalls> {
     realm_id: RealmId,
     local_node: NodeId,

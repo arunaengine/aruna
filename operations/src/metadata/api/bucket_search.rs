@@ -30,6 +30,7 @@ use crate::s3::bucket::search::{BucketPage, SearchBucketsError, SearchBucketsInp
 
 /// How the bucket fanout asks each node, from where the cursor left that node. Nodes the cursor
 /// marks done are skipped by the fanout scope, so they are never asked.
+#[derive(Debug, PartialEq)]
 struct BucketCalls {
     auth_token: Option<AuthToken>,
     input: SearchBucketsInput,
@@ -94,6 +95,7 @@ impl NodeCalls for BucketCalls {
 
 /// One page of the realm's readable buckets; a node that retired during the page counts as
 /// failed, since its part ended early.
+#[derive(Debug, PartialEq)]
 pub struct BucketSearchOperation {
     realm_id: RealmId,
     local_node: NodeId,

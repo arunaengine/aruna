@@ -14,6 +14,7 @@ fn node(seed: u8) -> NodeId {
 }
 
 /// Asks every node for one number; the test answers with the number or the error it wants.
+#[derive(Debug, PartialEq)]
 struct Numbers;
 
 impl NodeCalls for Numbers {
