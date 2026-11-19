@@ -281,6 +281,22 @@ async fn peer_request(
                 .await
                 .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
         }
+        MetadataTransportMessage::ForwardClosureQuery { launch } => {
+            use aruna_operations::jobs::lifecycle::closure::{
+                AnswerClosureOperation, ClosureError,
+            };
+            let answer = AnswerClosureOperation::new(*launch, context.node_and_realm(), Some(peer));
+            Ok(match Box::pin(drive(answer, context.as_ref())).await {
+                Ok(answer) => MetadataTransportMessage::ForwardedClosureQuery { answer },
+                Err(ClosureError::Outsider) => {
+                    let refused = "closure query from outside the realm".to_string();
+                    MetadataTransportMessage::Reject(refused)
+                }
+                Err(ClosureError::Undecided(_)) => {
+                    MetadataTransportMessage::ForwardedWriteUnavailable
+                }
+            })
+        }
         MetadataTransportMessage::ForwardJobSubmission {
             auth_token,
             submission_id,
