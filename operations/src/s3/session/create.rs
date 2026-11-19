@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    MAX_GROUP_SESSIONS, S3SessionCredentials, S3SessionError, build_session, decode_index,
-    encode_index, expiry_key, owner_key, session_age,
+    MAX_GROUP_SESSIONS, S3SessionCredentials, S3SessionError, SESSION_SECRETS_LEN, build_session,
+    decode_index, draw_secret, drawn_secret, encode_index, expiry_key, owner_key, session_age,
 };
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
@@ -33,6 +34,7 @@ pub struct CreateS3Config {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CreatePhase {
+    Secret,
     Index,
     Sessions,
     Delete,
@@ -76,8 +78,32 @@ impl CreateS3Operation {
             encryption_key,
             pending: None,
             index: BTreeSet::new(),
-            phase: CreatePhase::Index,
+            phase: CreatePhase::Secret,
         }
+    }
+
+    /// Builds the session from the drawn secrets, then reads the group's sessions.
+    fn secret_drawn(
+        &mut self,
+        drawn: Secret,
+    ) -> Result<Next<S3SessionCredentials>, S3SessionError> {
+        let access_key = S3Session::build_access_key(&self.key_id)?;
+        self.pending = Some(build_session(
+            access_key,
+            self.config.user_identity,
+            self.config.group_id,
+            self.config.expiry,
+            self.config.path_restrictions.clone(),
+            self.config.issued_by,
+            &self.encryption_key,
+            drawn,
+        )?);
+        let owner = owner_key(self.config.user_identity, self.config.group_id);
+        self.phase = CreatePhase::Index;
+        Ok(Next::Call(IoCall::Read(vec![
+            (SESSION_OWNER_KEYSPACE.to_string(), owner),
+            group_fence_key(self.config.group_id),
+        ])))
     }
 
     fn pending_key(&self) -> Result<String, S3SessionError> {
@@ -208,25 +234,13 @@ impl Operation for CreateS3Operation {
         if ttl.is_zero() || ttl > SESSION_MAX_TTL {
             return Err(S3SessionError::InvalidExpiry);
         }
-        let access_key = S3Session::build_access_key(&self.key_id)?;
-        self.pending = Some(build_session(
-            access_key,
-            self.config.user_identity,
-            self.config.group_id,
-            self.config.expiry,
-            self.config.path_restrictions.clone(),
-            self.config.issued_by,
-            &self.encryption_key,
-        )?);
-        let owner = owner_key(self.config.user_identity, self.config.group_id);
-        Ok(Next::Call(IoCall::Read(vec![
-            (SESSION_OWNER_KEYSPACE.to_string(), owner),
-            group_fence_key(self.config.group_id),
-        ])))
+        self.phase = CreatePhase::Secret;
+        Ok(Next::Call(draw_secret(SESSION_SECRETS_LEN)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<S3SessionCredentials>, S3SessionError> {
         match self.phase {
+            CreatePhase::Secret => self.secret_drawn(drawn_secret(result)?),
             CreatePhase::Index => self.index_read(result.values()?),
             CreatePhase::Sessions => self.sessions_read(result.values()?),
             CreatePhase::Delete => {
@@ -261,6 +275,8 @@ impl Operation for CreateS3Operation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::effects::{Effect, NetEffect};
+    use aruna_core::events::{Event, NetEvent};
     use aruna_core::structs::identity::realm::RealmId;
     use std::time::Duration;
     use ulid::Ulid;
@@ -279,10 +295,23 @@ mod tests {
         CreateS3Operation::with_key(config, key_id, CredentialEncryptionKey::derive(&[7; 32]))
     }
 
+    /// Fixed drawn secrets: 30 signing letters, then 64 token letters.
+    fn drawn() -> IoResult {
+        let secret = Secret::new(format!("{}{}", "s".repeat(30), "t".repeat(64)));
+        IoResult::Event(Box::new(Event::Net(NetEvent::SecretDrawn(secret))))
+    }
+
     #[test]
     fn reads_index_fence() {
         let mut create = operation();
-        let Ok(Next::Call(IoCall::Read(reads))) = create.first() else {
+        let Ok(Next::Call(IoCall::Effect(draw))) = create.first() else {
+            panic!("expected the secret draw");
+        };
+        assert_eq!(
+            *draw,
+            Effect::Net(NetEffect::DrawSecret(SESSION_SECRETS_LEN))
+        );
+        let Ok(Next::Call(IoCall::Read(reads))) = create.next(drawn()) else {
             panic!("expected the owner index and group fence read");
         };
         assert_eq!(reads[1], group_fence_key(Ulid::from_parts(3, 3)));
@@ -298,17 +327,24 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         let write = create.next(IoResult::Values(vec![None]));
         assert!(matches!(write, Ok(Next::Call(IoCall::Write(rows))) if rows.len() == 3));
+        let Ok(Next::Done(credentials)) = create.next(IoResult::Done) else {
+            panic!("expected the new credentials");
+        };
+        assert_eq!(credentials.secret_access_key.expose(), "s".repeat(30));
+        assert_eq!(credentials.session_token.expose(), "t".repeat(64));
     }
 
     #[test]
     fn refuses_taken_key() {
         let mut create = operation();
         create.first().unwrap();
+        create.next(drawn()).unwrap();
         create.next(IoResult::Values(vec![None, None])).unwrap();
         let taken = IoResult::Values(vec![Some(vec![1].into())]);
         assert_eq!(create.next(taken), Err(S3SessionError::IndexInconsistent));
         let mut short = operation();
         short.first().unwrap();
+        short.next(drawn()).unwrap();
         let answer = short.next(IoResult::Values(vec![None]));
         assert_eq!(
             answer,

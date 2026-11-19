@@ -4,6 +4,9 @@
 
 use crate::position::{open_position, seal_position};
 use aruna_blob::native::{body_stream, send_request};
+use aruna_core::compute::Secret;
+use rand::distr::Alphanumeric;
+use rand::{RngExt, rng};
 use std::sync::Arc;
 
 use aruna_core::NodeId;
@@ -340,6 +343,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
     if let NetEffect::OpenPosition(position) = effect {
         return Event::Net(NetEvent::PositionOpened(open_position(&position)));
     }
+    if let NetEffect::DrawSecret(length) = effect {
+        return Event::Net(NetEvent::SecretDrawn(draw_secret(length)));
+    }
     if let NetEffect::AvoidHolder { node_id, now_ms } = effect {
         context.avoid_holder(node_id, now_ms);
         return Event::Net(NetEvent::HolderAvoided);
@@ -401,6 +407,15 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
         }
     }
+}
+
+/// A secret of `length` letters and digits from the OS random source.
+fn draw_secret(length: usize) -> Secret {
+    let drawn = rng()
+        .sample_iter(&Alphanumeric)
+        .take(length)
+        .map(char::from);
+    Secret::new(drawn.collect::<String>())
 }
 
 /// Rebuilds the peer set from the realm config a reconcile just applied.

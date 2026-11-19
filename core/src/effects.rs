@@ -857,6 +857,9 @@ pub enum NetEffect {
     SealPosition(Vec<u8>),
     /// Opens a position this process sealed; answers `NetEvent::PositionOpened`.
     OpenPosition(Vec<u8>),
+    /// Draws a secret of this many letters and digits from the OS random source; answers
+    /// `NetEvent::SecretDrawn`.
+    DrawSecret(usize),
     /// Refreshes the last-contact time of a peer whose request was just accepted; answers
     /// `NetEvent::PeerContact`.
     PeerContact(NodeId),
