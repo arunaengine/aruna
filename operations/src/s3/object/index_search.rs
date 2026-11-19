@@ -5,12 +5,12 @@
 
 use std::collections::VecDeque;
 use std::ops::Bound;
-use std::sync::LazyLock;
 use std::time::{Duration, UNIX_EPOCH};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, EffectGroup, GroupForm};
-use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::cursor::sealed_position;
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
+use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
 use aruna_core::key_index::{IndexEffect, IndexEvent, KeyPage, KeyQuery, MetaTerms};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, SEARCH_INDEX_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -20,8 +20,6 @@ use aruna_core::structs::storage::distribution::inventory::Position;
 use aruna_core::structs::storage::distribution::search::IndexState;
 use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionView, KeyRange};
 use aruna_core::types::Key;
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ulid::Ulid;
 
 use super::{
@@ -45,6 +43,10 @@ type RangeFound = (KeyPage, Option<String>);
 #[derive(Debug, PartialEq)]
 enum RangeStep {
     Record,
+    /// The sealed position the page starts after is opened.
+    Open(Box<DistributionView>),
+    /// The position the page ends at is sealed.
+    Seal,
     States(Vec<Ulid>, KeyQuery),
     Search(Vec<(Ulid, Option<Option<String>>)>),
     Through(Ulid, String),
@@ -113,12 +115,22 @@ impl RangeSearchOperation {
     }
 
     fn record_read(&mut self, view: DistributionView) -> RangeTurn {
-        let ranges = &view.head.snapshot.config.ranges;
-        self.layout = Some(layout_digest(ranges));
-        let after = match self.input.start_after.as_deref() {
-            Some(position) => Some(BlobHeadKey::from_bytes(&open_position(position)?)?.key),
+        let after = match self.input.start_after.clone() {
+            Some(position) if sealed_position(&position) => {
+                self.step = RangeStep::Open(Box::new(view));
+                let open = Effect::Net(NetEffect::OpenPosition(position));
+                return Ok(Next::Call(open.into()));
+            }
+            Some(position) => Some(BlobHeadKey::from_bytes(&position)?.key),
             None => None,
         };
+        self.windowed(view, after)
+    }
+
+    /// Covers the ranges of the record from the position the page starts after.
+    fn windowed(&mut self, view: DistributionView, after: Option<String>) -> RangeTurn {
+        let ranges = &view.head.snapshot.config.ranges;
+        self.layout = Some(layout_digest(ranges));
         let (start, end) = window(&self.input, after);
         let mut local = Vec::new();
         for range in ranges {
@@ -332,7 +344,10 @@ impl RangeSearchOperation {
             return self.next_range();
         };
         let position = BlobHeadKey::new(self.bucket.as_str(), last).to_bytes()?;
-        self.finish(Some(seal_position(&position)?))
+        self.step = RangeStep::Seal;
+        Ok(Next::Call(
+            Effect::Net(NetEffect::SealPosition(position)).into(),
+        ))
     }
 
     fn finish(&mut self, next: Option<Vec<u8>>) -> RangeTurn {
@@ -404,6 +419,21 @@ impl Operation for RangeSearchOperation {
                     }
                 }
             }
+            RangeStep::Open(view) => {
+                let opened = match result.event()? {
+                    Event::Net(NetEvent::PositionOpened(opened)) => opened,
+                    _ => None,
+                };
+                let plain = opened.ok_or(SearchObjectsError::Position)?;
+                let after = BlobHeadKey::from_bytes(&plain)?.key;
+                self.windowed(*view, Some(after))
+            }
+            RangeStep::Seal => match result.event()? {
+                Event::Net(NetEvent::PositionSealed(Some(sealed))) => self.finish(Some(sealed)),
+                _ => Err(SearchObjectsError::Storage(
+                    "search position not sealed".to_string(),
+                )),
+            },
             RangeStep::States(chunk, query) => self.search_chunk(chunk, query, result.values()?),
             RangeStep::Search(slots) => self.searched(slots, result),
             RangeStep::Through(range_id, through) => {
@@ -520,40 +550,6 @@ impl Operation for ResolveKeysOperation {
         // The index leaves very common metadata prefixes out, so versions are matched again.
         Self::built(self.hits.start(candidates)?)
     }
-}
-
-/// Starts a sealed position; no head key encoding starts with it, as bucket names are short.
-const SEALED: u8 = 0xFF;
-
-/// This process's key for sealed positions; a restart makes older sealed cursors invalid.
-static POSITION_KEY: LazyLock<[u8; 32]> = LazyLock::new(rand::random);
-
-/// A head key position encrypted and authenticated with this node's key, so a cursor carries
-/// no key name; only this node opens it again.
-pub(crate) fn seal_position(position: &[u8]) -> Result<Vec<u8>, SearchObjectsError> {
-    let nonce: [u8; 24] = rand::random();
-    let cipher = XChaCha20Poly1305::new((&*POSITION_KEY).into());
-    let sealed = (cipher.encrypt(&XNonce::from(nonce), position))
-        .map_err(|_| SearchObjectsError::Storage("search position not sealed".to_string()))?;
-    Ok([&[SEALED][..], &nonce, &sealed].concat())
-}
-
-/// The head key of a position: a sealed one is opened, a plain one is passed on.
-pub(crate) fn open_position(position: &[u8]) -> Result<Vec<u8>, SearchObjectsError> {
-    let Some(sealed) = position.strip_prefix(&[SEALED]) else {
-        return Ok(position.to_vec());
-    };
-    let (nonce, sealed) = sealed
-        .split_at_checked(24)
-        .ok_or(SearchObjectsError::Position)?;
-    let nonce: [u8; 24] = nonce.try_into().map_err(|_| SearchObjectsError::Position)?;
-    let cipher = XChaCha20Poly1305::new((&*POSITION_KEY).into());
-    (cipher.decrypt(&XNonce::from(nonce), sealed)).map_err(|_| SearchObjectsError::Position)
-}
-
-/// Whether `position` is a sealed one, which only its node can check.
-pub fn sealed_position(position: &[u8]) -> bool {
-    position.first() == Some(&SEALED)
 }
 
 /// The keys a page may return: after the cursor and, for a prefix, inside the prefix.

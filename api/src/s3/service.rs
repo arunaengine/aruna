@@ -85,6 +85,7 @@ use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive, drive_retry, drive_until, node_routing};
+use aruna_drivers::position::open_cursor;
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
@@ -133,7 +134,7 @@ use aruna_operations::s3::object::read::{
     GetRoutedOperation, KeyedReadOperation, ObjectInfoOperation, TokenRead,
 };
 use aruna_operations::s3::object::versions::{ListVersionsInput as LOVI, ListVersionsOperation};
-use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed, open_cursor};
+use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed};
 use aruna_operations::sync::mirror_repair::{
     KickRepairOperation, MirrorRecordOperation, SyncMirrorIntent,
 };
