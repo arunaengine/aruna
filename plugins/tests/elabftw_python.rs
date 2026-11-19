@@ -1,5 +1,5 @@
 //! Builds the eLabFTW Python example and runs one timer run in the plugin runtime, against a
-//! broker with one tagged experiment. Opt in with ARUNA_PLUGIN_LANGUAGES=1 and uv installed.
+//! broker with one tagged experiment. Ignored by default; a run on purpose needs uv.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,7 +7,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -20,9 +19,12 @@ use aruna_plugin_types::permission::Permission;
 use aruna_plugins::broker::{
     Broker, CallContext, MetadataCreate, MetadataPatch, SendRequest, StatePut,
 };
-use aruna_plugins::limits::{Limits, RuntimeConfig};
+use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
 use aruna_plugins::{CancellationToken, Invocation, Runtime, Trigger};
+use common::{limits, require};
+
+mod common;
 
 const DATASET: &str = "01JD000000000000000000000C";
 
@@ -177,29 +179,10 @@ impl Broker for Team {
     async fn abandoned(&self, _: &CallContext, _: &Intent) {}
 }
 
-/// Whether the opt-in is exactly `1` and uv runs; prints why the test is skipped.
-fn available() -> bool {
-    if std::env::var("ARUNA_PLUGIN_LANGUAGES").as_deref() != Ok("1") {
-        eprintln!("skipping: set ARUNA_PLUGIN_LANGUAGES=1 to build the example");
-        return false;
-    }
-    let runs = Command::new("uv").arg("--version").output();
-    runs.is_ok_and(|out| out.status.success())
-}
-
-fn limits() -> Limits {
-    Limits {
-        memory: 512 << 20,
-        fuel: 1 << 40,
-        ..Limits::default()
-    }
-}
-
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn enrols_tagged() {
-    if !available() {
-        return;
-    }
+    require("python", "uv");
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/elabftw-python");
     let built = build_project(&project).unwrap_or_else(|err| panic!("{err}"));
     let config = RuntimeConfig {
