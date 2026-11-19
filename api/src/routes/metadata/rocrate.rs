@@ -20,6 +20,7 @@ use crate::routes::repository::links::{
     connector, ensure_capable, ensure_requirements, validate_record_id,
 };
 use crate::server::state::ServerState;
+use aruna_core::metadata_api::UpdateDocumentMutation;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::job::ExportRoCrateSpec;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -31,7 +32,6 @@ use aruna_operations::metadata::forward::routed::export::{
     RoutedExportOperation, ensure_export_limit,
 };
 use aruna_operations::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
-use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

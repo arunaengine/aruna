@@ -37,12 +37,12 @@ use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::metadata::api::export_types::RoCrateExportView;
-use crate::metadata::api::preflight_types::{ReferenceNodeExecution, ReferenceNodeRequest};
-use crate::metadata::create_document::CreateDocumentPayload;
-use crate::metadata::update_document::UpdateDocumentMutation;
 use aruna_core::job_request::SubmissionRequest;
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
+use aruna_core::metadata_api::{
+    CreateDocumentPayload, ReferenceNodeExecution, ReferenceNodeRequest, RoCrateExportView,
+    UpdateDocumentMutation,
+};
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::search::{BucketPage, ObjectKeyMatch, SearchNodePage};
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
@@ -498,7 +498,7 @@ pub enum MetadataTransportMessage {
         endpoint: Option<String>,
     },
     IdentifierMatches {
-        result: Result<Vec<crate::metadata::secondary_ids::IdentifierMatch>, MetadataReadError>,
+        result: Result<Vec<aruna_core::metadata_api::IdentifierMatch>, MetadataReadError>,
     },
     /// A forwarded update refused because the document moved past the expected revision.
     ForwardedRevisionConflict {
@@ -582,10 +582,10 @@ pub enum MetadataTransportMessage {
     /// One node's data link postings for the caller's lookup, read under the caller's token.
     DataLinks {
         auth_token: Option<AuthToken>,
-        request: Box<crate::metadata::api::links::types::LinkNodeRequest>,
+        request: Box<aruna_core::metadata_api::LinkNodeRequest>,
     },
     DataLinkResults {
-        result: Result<Box<crate::metadata::api::links::types::LinkNodePage>, MetadataReadError>,
+        result: Result<Box<aruna_core::metadata_api::LinkNodePage>, MetadataReadError>,
     },
     /// The group that owns a local bucket, asked by a management node for a database mark.
     BucketOwner {
@@ -602,7 +602,7 @@ pub enum MetadataTransportMessage {
         limit: usize,
     },
     SetPreviewResults {
-        result: Result<Box<crate::metadata::api::links::types::SetPreviewPage>, MetadataReadError>,
+        result: Result<Box<aruna_core::metadata_api::SetPreviewPage>, MetadataReadError>,
     },
     /// A staging job the former coordinator of a range hands over in transfer `transfer_id`.
     StagingSpec {
@@ -732,7 +732,7 @@ pub enum MetadataTransportMessage {
     /// that asked, and it never crosses the wire.
     ExportAnswer {
         result: Result<
-            Box<crate::metadata::api::export_types::ExportMetadataResult>,
+            Box<aruna_core::metadata_api::ExportMetadataResult>,
             MetadataReadError,
         >,
     },

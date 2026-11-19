@@ -4,10 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use super::super::super::preflight_types::{MetadataIndexState, MetadataResolvedTarget};
 use super::*;
 use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
+use aruna_core::metadata_api::{MetadataIndexState, MetadataResolvedTarget};
 
 const LOCATION: &str = "s3://genes/dir/a";
 

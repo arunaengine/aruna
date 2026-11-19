@@ -4,11 +4,10 @@
 
 use super::*;
 use aruna_core::calls::ChildOutcome;
+use aruna_core::metadata_api::CreateDocumentPayload;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-
-use crate::metadata::create_document::CreateDocumentPayload;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()

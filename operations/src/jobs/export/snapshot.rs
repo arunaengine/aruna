@@ -19,11 +19,10 @@ use super::archive::{keep_references, map_crate_error, recognize_entities, web_e
 use super::{ExportCheckpoint, ExportEntity, ExportFailure, ExportPhase};
 use crate::jobs::repository::TransferError;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::export_types::{
-    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
-};
+use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::forward::routed::export::RoutedExportOperation;
 use crate::metadata::pid_read::ReadPidOperation;
+use aruna_core::metadata_api::{ExportMetadataResult, RoCrateExportView};
 
 fn unexpected_view() -> ExportFailure {
     ExportFailure::Permanent("metadata export returned an unexpected view".to_string())

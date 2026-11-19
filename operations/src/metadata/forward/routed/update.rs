@@ -26,12 +26,13 @@ use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::realm::load_config::config_unavailable;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::metadata_api::UpdateDocumentMutation;
 
 type UpdateTurn = Result<Next<MetadataRegistryRecord>, MetadataWriteError>;
 

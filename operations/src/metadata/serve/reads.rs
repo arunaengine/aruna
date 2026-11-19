@@ -20,9 +20,7 @@ use super::ServeNode;
 use crate::forward::transport::read_error;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::links::local::{LinksLocalOperation, SetPreviewOperation};
-use crate::metadata::api::links::types::{LinkNodePage, SetPreviewPage};
 use crate::metadata::api::preflight::local::references_preflight_local;
-use crate::metadata::api::preflight_types::{ReferenceNodeExecution, ReferenceNodeRequest};
 use crate::metadata::identifier_lookup::{IdentifierLookupOperation, IdentifierQuery};
 use crate::metadata::local_query::LocalQueryOperation;
 use crate::metadata::protocol::{
@@ -30,7 +28,6 @@ use crate::metadata::protocol::{
 };
 use crate::metadata::read_peer::{PeerReader, ReadPeerOperation, SearchPeerOperation};
 use crate::metadata::search_cursor::MAX_PAGINATION_DEPTH;
-use crate::metadata::secondary_ids::IdentifierMatch;
 use crate::metadata::text_search::LocalSearchOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::LocalBucketSearch;
@@ -38,6 +35,9 @@ use crate::s3::bucket::release::publish::{HolderAnswerOperation, PublishError};
 use crate::s3::bucket::search::{SearchBucketsError, SearchBucketsInput};
 use crate::s3::object::search::{SearchObjectsError, SearchObjectsInput};
 use crate::s3::object::search_scan::SearchObjectsOperation;
+use aruna_core::metadata_api::{
+    IdentifierMatch, LinkNodePage, ReferenceNodeExecution, ReferenceNodeRequest, SetPreviewPage,
+};
 use aruna_core::search::{BucketPage, SearchNodePage};
 
 /// The reply a forwarded read answers with.

@@ -23,6 +23,7 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataBatchSource, MetadataDeleteRecord, MetadataEffect, MetadataEvent,
     MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
 };
+use aruna_core::metadata_api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::placement::{
     PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
     strategy_for_target, subject_bytes,
@@ -38,12 +39,12 @@ use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, Struc
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use aruna_operations::metadata::update_entry::UpdateEntryOperation;
 use aruna_operations::realm::announce_presence::{

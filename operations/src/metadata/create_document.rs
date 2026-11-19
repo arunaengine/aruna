@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::id_mint::IdMint;
+use aruna_core::metadata_api::CreateDocumentPayload;
 
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
@@ -61,19 +62,6 @@ pub struct CreateDocumentConfig {
     pub document_path: String,
     pub public: bool,
     pub payload: CreateDocumentPayload,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum CreateDocumentPayload {
-    Scaffold {
-        name: String,
-        description: String,
-        date_published: String,
-        license: Option<String>,
-    },
-    RoCrate {
-        jsonld: String,
-    },
 }
 
 /// Result returned after a metadata create is durably accepted.

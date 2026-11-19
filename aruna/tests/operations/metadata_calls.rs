@@ -184,7 +184,7 @@ pub async fn route_metadata_update(
     record: Option<&MetadataRegistryRecord>,
     document_id: Ulid,
     public: Option<bool>,
-    mutation: aruna_operations::metadata::update_document::UpdateDocumentMutation,
+    mutation: aruna_core::metadata_api::UpdateDocumentMutation,
     expected_revision: Option<Ulid>,
     token: Option<AuthToken>,
     commit_message: Option<String>,

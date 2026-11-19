@@ -14,6 +14,7 @@ use aruna_core::metadata::{
     MetadataError, MetadataEventRecord, MetadataQueryResults, MetadataRoCratePage,
     MetadataSearchHit,
 };
+use aruna_core::metadata_api::ReferenceNodeExecution;
 use aruna_core::storage_entries::{event_log_key, pending_projection_target};
 use aruna_core::structs::PathClaimRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -106,7 +107,6 @@ use self::fanout_types::MetadataFanoutStats;
 #[cfg(test)]
 use self::path_types::PathShardView;
 
-use self::preflight_types::ReferenceNodeExecution;
 #[cfg(test)]
 use self::preflight_types::authorized_realm_nodes;
 use self::read_types::ApiQueryMode;

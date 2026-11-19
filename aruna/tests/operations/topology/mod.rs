@@ -27,6 +27,7 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata_api::CreateDocumentPayload;
 use aruna_core::placement::transition::{TransitionRequest, plan_transition};
 use aruna_core::placement::{
     PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
@@ -55,7 +56,7 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::notifications::placement::resolve_inbox_holder;

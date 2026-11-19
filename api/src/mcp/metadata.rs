@@ -9,12 +9,13 @@ use super::{
     parse_ulid, request_auth, server_error, tool_extras,
 };
 use crate::lookup::actor;
+use aruna_core::metadata_api::{CreateDocumentPayload, RoCrateExportView, UpdateDocumentMutation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::AuthorizeDocumentOperation;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
-use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, RoCrateExportView};
+use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
 use aruna_operations::metadata::api::read::query_metadata;
 use aruna_operations::metadata::api::read_types::{
     DocumentQueryRequest, MetadataQueryRequest, MetadataReferencesRequest,
@@ -22,11 +23,9 @@ use aruna_operations::metadata::api::read_types::{
 use aruna_operations::metadata::api::realm_search::search_metadata;
 use aruna_operations::metadata::api::references::ReferencesOperation;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
-use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
 use aruna_operations::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use aruna_operations::metadata::profile::validation::ProfileAssessOperation;
-use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
@@ -1041,6 +1040,7 @@ mod authorization_tests {
         seed_group_docs, seed_realm_auth, test_state, test_storage, write_doc,
     };
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::metadata_api::CreateDocumentPayload;
     use aruna_core::structs::identity::auth::{
         Actor, NodeCapabilities, PathRestriction, Permission,
     };
@@ -1048,7 +1048,6 @@ mod authorization_tests {
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::metadata::create_document::CreateDocumentPayload;
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };

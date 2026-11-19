@@ -22,7 +22,8 @@ use super::node_fanout::{
 use super::{ApiQueryMode, MetadataApiError, MetadataReadError};
 use crate::metadata::identifier_lookup::{IdentifierLookupOperation, IdentifierQuery};
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::secondary_ids::{IdentifierMatch, merge_matches};
+use crate::metadata::secondary_ids::merge_matches;
+use aruna_core::metadata_api::IdentifierMatch;
 
 type Matches = Vec<IdentifierMatch>;
 

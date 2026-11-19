@@ -22,16 +22,16 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
-use super::types::{
-    LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkQuery,
-    SetPreviewPage,
-};
+use super::types::LINKS_MAX_LIMIT;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::api::title::DocumentTitleOperation;
 use crate::metadata::call_results::page_rows;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
+use aruna_core::metadata_api::{
+    LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkQuery, SetPreviewPage,
+};
 
 const NODE_SEEKS: usize = 1100;
 const NODE_ROWS: usize = 4096;

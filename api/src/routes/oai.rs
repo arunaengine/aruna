@@ -15,14 +15,13 @@ use ulid::Ulid;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use aruna_core::metadata_api::{ExportMetadataResult, RoCrateExportView};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_drivers::driver::DriverContext;
 use aruna_operations::harvest::oai_pmh::mapping::jsonld_to_dc;
 use aruna_operations::harvest::oai_pmh::request::format_from;
-use aruna_operations::metadata::api::export_types::{
-    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
-};
+use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
 use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::visibility_index::{

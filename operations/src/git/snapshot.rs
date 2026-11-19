@@ -33,7 +33,8 @@ use super::generate::{checkpoint, generate};
 use super::project::{inputs, project, recent};
 use super::{GitError, GitNode, document, pending, publish, records, repository};
 use crate::metadata::raw_events::RawReadError;
-use crate::metadata::revision_read::{MetadataRawView, RawDisplayOperation};
+use crate::metadata::revision_read::RawDisplayOperation;
+use aruna_core::metadata_api::MetadataRawView;
 
 type Document = MetadataRegistryRecord;
 type PendingRows = Vec<(Vec<u8>, PendingMerge)>;

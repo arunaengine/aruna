@@ -18,14 +18,14 @@ use aruna_core::{MetaResourceId, NodeId};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::create_document::{
-    CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload, CreateDocumentResult,
-    mint_document_for,
+    CreateDocumentError, CreateDocumentOperation, CreateDocumentResult, mint_document_for,
 };
 use crate::metadata::profile::rules::not_profiled_status;
 use crate::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, submission_verdict,
 };
 use crate::metadata::repository::{schedule_materialization, schedule_projection};
+use aruna_core::metadata_api::CreateDocumentPayload;
 
 /// Mints a metadata document id from the realm config: from a local held bucket and a
 /// pre-provisioned binding, or with the blind placement a job-produced or forwarded document

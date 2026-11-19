@@ -26,10 +26,7 @@ use super::super::node_fanout::{
     FanoutParts, NodeCalls, NodeFanoutOperation, discovery_answer, discovery_call, peer_answer,
     peer_request,
 };
-use super::super::preflight_types::{
-    MetadataResolvedTarget, ReferenceExecution, ReferenceNodeExecution, ReferenceNodeRequest,
-    ReferenceRequest, preflight_fingerprint,
-};
+use super::super::preflight_types::{ReferenceExecution, ReferenceRequest, preflight_fingerprint};
 use super::super::realm_search::{cursor_signers, resume_cursor};
 use super::super::{
     ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MAX_PAGINATION_DEPTH, MetadataApiError,
@@ -44,6 +41,9 @@ use super::{
 use crate::forward::transport::read_error;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::search_cursor::{SearchCursor, resume_fetch_limit};
+use aruna_core::metadata_api::{
+    MetadataResolvedTarget, ReferenceNodeExecution, ReferenceNodeRequest,
+};
 
 /// How the preflight fanout asks each node, deeper for nodes a cursor resumes.
 #[derive(Debug, PartialEq)]

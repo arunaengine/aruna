@@ -20,6 +20,7 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::NodeId;
 use aruna_core::holder_choice::{HolderCandidate, HolderChoiceOperation, pick};
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata_api::IdentifierMatch;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::secondary_id::{
@@ -42,7 +43,6 @@ use aruna_operations::metadata::persistent_id::forward::{
     PidRouteOperation, outcome_mapping, outcome_resolution, outcome_status,
 };
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
-use aruna_operations::metadata::secondary_ids::IdentifierMatch;
 use aruna_operations::metadata::{PersistentIdOutcome, PersistentIdRequest};
 
 use crate::auth::UnrestrictedAuth;

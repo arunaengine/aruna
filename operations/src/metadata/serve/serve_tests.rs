@@ -454,7 +454,7 @@ fn create_needs_path() {
     // A create whose path is only slashes is refused before any write check.
     use super::writes::WriteServeOperation;
     use crate::forward::authorize::ForwardAuthError;
-    use crate::metadata::create_document::CreateDocumentPayload;
+    use aruna_core::metadata_api::CreateDocumentPayload;
     let request = MetadataTransportMessage::ForwardCreateDocument {
         auth_token: None,
         config_digest: digest(1),

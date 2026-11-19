@@ -12,9 +12,10 @@ use thiserror::Error;
 
 use crate::metadata::checkpoint_window::{CheckpointWindowOperation, due};
 use crate::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use crate::metadata::update_entry::UpdateEntryOperation;
+use aruna_core::metadata_api::UpdateDocumentMutation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CheckpointError {

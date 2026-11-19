@@ -16,6 +16,7 @@ use aruna_core::metadata::{
     CRATE_PROFILE_IRI, INVENIO_PROFILE_IRI, MetadataEffect, MetadataError, MetadataEvent,
     ProfileValidationSeverity, ProfileValidationState, ZENODO_PROFILE_IRI,
 };
+use aruna_core::metadata_api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::storage_entries::event_log_prefix;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -27,8 +28,7 @@ use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::forward::profile_export::ProfileLocalOperation;
 use aruna_operations::metadata::forward::read::admits_profile_peer;
@@ -38,7 +38,7 @@ use aruna_operations::metadata::profile::validation::{
     ValidationStatusOperation, profile_public_iri, profile_verdict,
 };
 use aruna_operations::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use aruna_operations::metadata::update_entry::UpdateEntryOperation;
 use aruna_operations::testing::{drain_projection_queue, process_materialization_batch};

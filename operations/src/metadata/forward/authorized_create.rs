@@ -31,13 +31,14 @@ use crate::forward::routing::{
 use crate::forward::transport::{MetadataWriteError, unexpected_response};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-    CreateDocumentResult, mint_forward_document, mint_local_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
+    mint_forward_document, mint_local_document,
 };
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata_api::CreateDocumentPayload;
 use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Errors of the shared authorized create flow. Every variant maps onto the

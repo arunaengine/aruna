@@ -10,6 +10,7 @@ use super::*;
 use crate::job_calls::{complete_job, fail_job};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
+use aruna_core::metadata_api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::repository::{
     LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, RepositoryLink, link_key,
 };
@@ -20,14 +21,10 @@ use aruna_drivers::driver::drive;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange};
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::jobs::submit_local::SubmitLocalOperation;
-use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
-};
+use aruna_operations::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::revision_read::RawViewOperation;
-use aruna_operations::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
-};
+use aruna_operations::metadata::update_document::{UpdateDocumentConfig, UpdateDocumentOperation};
 use aruna_operations::testing::process_prune_batch;
 
 pub(super) const LINK_TOKEN: &str = "link-token";

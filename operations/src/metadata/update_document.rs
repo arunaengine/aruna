@@ -18,6 +18,7 @@ use aruna_core::metadata::{
     MetadataLifecycleRecord, MetadataMaterializationRecord, ProfileValidationStatus,
     RAW_BYTES_LIMIT, RawOriginBudget, raw_quotas,
 };
+use aruna_core::metadata_api::UpdateDocumentMutation;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
 use aruna_core::storage_entries::{
@@ -33,7 +34,6 @@ use aruna_core::structs::storage::metadata_registry::{
 use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use craqle::GraphReplicaSnapshot;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -61,35 +61,6 @@ pub struct UpdateDocumentConfig {
     pub mutation: UpdateDocumentMutation,
     /// The newest event the caller based the change on; any later event fails the update.
     pub expected_revision: Option<Ulid>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UpdateDocumentMutation {
-    ReplaceRoCrate {
-        jsonld: String,
-    },
-    UpsertDataEntity {
-        jsonld: String,
-    },
-    UpsertContextualEntity {
-        jsonld: String,
-    },
-    /// Replaces one data entity by `@id`, so the properties it omits go.
-    ReplaceDataEntity {
-        jsonld: String,
-    },
-    /// Removes one root-linked `File` entity by `@id` and the root's link to it.
-    RemoveDataEntity {
-        id: String,
-    },
-    /// A batch a device planned against its own replica. It is appended
-    /// verbatim, under the device's actor, so both replicas converge on it.
-    ApplyBatch {
-        batch: Box<MetadataBatch>,
-        authored: MetadataBatchSource,
-    },
-    /// Opens a new history window with this holder's current graph state.
-    Checkpoint,
 }
 
 #[derive(Debug, Error, PartialEq)]

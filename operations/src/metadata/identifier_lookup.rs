@@ -23,7 +23,7 @@ use crate::metadata::id_mapping::PersistentIdError;
 use crate::metadata::persistent_id::MappingReadOperation;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::StorageReadError;
-use crate::metadata::secondary_ids::IdentifierMatch;
+use aruna_core::metadata_api::IdentifierMatch;
 
 /// Index rows one page of the reverse index holds.
 const INDEX_PAGE: usize = 256;

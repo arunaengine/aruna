@@ -51,9 +51,9 @@ use crate::metadata::protocol::{
 };
 use crate::metadata::raw_events::RawReadError;
 use crate::metadata::record_reads::RecordMaterializedOperation;
-use crate::metadata::revision_read::{MetadataRawView, RawDisplayOperation};
+use crate::metadata::revision_read::RawDisplayOperation;
 use crate::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::metadata::write_peer::WritePeerOperation;
@@ -61,6 +61,7 @@ use crate::realm::load_config::config_unavailable;
 use crate::realm::node_name::{NodeDisplays, NodeNameError, ReadNamesOperation};
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use aruna_core::errors::StorageReadError;
+use aruna_core::metadata_api::{MetadataRawView, UpdateDocumentMutation};
 
 pub(super) const GROUP_SCAN_PAGE: usize = 10_000;
 

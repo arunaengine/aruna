@@ -16,9 +16,7 @@ use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
 use super::super::access::{child_results, children};
 use super::super::head_versions::{HeadVersions, HeadVersionsError, HeadVersionsOperation};
 use super::super::prefix_scan::{PrefixScanError, PrefixScanOperation, ScannedRows};
-use super::super::preflight_types::{
-    MetadataResolvedTarget, MetadataStorageOperation, ReferenceTarget,
-};
+use super::super::preflight_types::{MetadataStorageOperation, ReferenceTarget};
 use super::super::readable::PathPermissionOperation;
 use super::super::{
     ARUNA_DATA_PREFIX, BLOB_VERSIONS_KEYSPACE, BlobHeadKey, BlobVersion, Key, MetadataApiError,
@@ -28,6 +26,7 @@ use super::{
     LONG_KEY_ROWS, MAX_TARGET_VERSIONS, ResolvedPreflightTargets, decode_version, version_targets,
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::metadata_api::MetadataResolvedTarget;
 
 type Versions = Vec<(VersionKey, BlobVersion)>;
 

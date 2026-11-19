@@ -13,13 +13,13 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord, MetadataEventRecord,
     MetadataLifecycleRecord, MetadataRawRevision, resolve_raw_revision,
 };
+use aruna_core::metadata_api::MetadataRawView;
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     document_lifecycle_key, graph_lifecycle_key, materialization_status_key, raw_revision_key,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, TxnId, Value};
-use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::metadata::call_results::read_value;
@@ -32,14 +32,6 @@ pub type RawViewOutput = (
     Option<MaterializationStatusRecord>,
     Option<MetadataRawRevision>,
 );
-
-/// A document's raw revision with how far its projection has caught up.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataRawView {
-    pub revision: MetadataRawRevision,
-    pub projection_state: MaterializationState,
-    pub projected_event_id: Option<Ulid>,
-}
 
 /// One row read, in the caller's transaction when there is one.
 fn row_call(key_space: &str, key: Key, txn_id: Option<TxnId>) -> IoCall {

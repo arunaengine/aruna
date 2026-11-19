@@ -48,6 +48,7 @@ pub mod link;
 pub mod managed_copy;
 pub mod member_read;
 pub mod metadata;
+pub mod metadata_api;
 pub mod metrics;
 pub mod native_reference;
 pub mod node_facts;

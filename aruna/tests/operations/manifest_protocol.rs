@@ -4,13 +4,14 @@
 
 use aruna_core::StructuredId;
 use aruna_core::document::{DocumentTarget, ShardManifest};
+use aruna_core::metadata_api::CreateDocumentPayload;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
 use aruna_core::{NodeId, UserId};
 use aruna_drivers::driver::drive;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use ulid::Ulid;
 

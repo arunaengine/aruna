@@ -3,11 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::super::super::MetadataFanoutStats;
-use super::super::super::preflight_types::{
-    MetadataIndexState, MetadataNodeFreshness, ReferenceTarget,
-};
+use super::super::super::preflight_types::ReferenceTarget;
 use super::*;
 use aruna_core::UserId;
+use aruna_core::metadata_api::{MetadataIndexState, MetadataNodeFreshness};
 
 fn realm() -> RealmId {
     RealmId::from_bytes([1; 32])

@@ -19,16 +19,15 @@ use super::routed::export::RoutedExportOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer};
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::export_types::{
-    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
-};
+use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::profile::rules::PROFILE_DOCUMENT_PREFIX;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::metadata::raw_events::RawReadError;
-use crate::metadata::revision_read::{MetadataRawView, RawDisplayOperation};
+use crate::metadata::revision_read::RawDisplayOperation;
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::metadata_api::{ExportMetadataResult, MetadataRawView, RoCrateExportView};
 
 type ExportTurn = Result<Next<ExportMetadataResult>, MetadataReadError>;
 

@@ -14,6 +14,7 @@ use crate::metadata::{
     serialize_jsonld_object, with_global_ids,
 };
 use crate::server::state::ServerState;
+use aruna_core::metadata_api::CreateDocumentPayload;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_drivers::driver::drive;
@@ -21,7 +22,6 @@ use aruna_operations::git::GitError;
 use aruna_operations::metadata::api::export_types::GetVisibleRequest;
 use aruna_operations::metadata::api::path::LookupPathOperation;
 use aruna_operations::metadata::api::path_types::MetadataLookupRequest;
-use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::routed::read::RoutedReadOperation;
 use aruna_operations::metadata::forward::routed::write::RouteDeleteOperation;
 use axum::extract::{Path, Query, State};
