@@ -133,7 +133,9 @@ async fn fetch_checks_copy() {
 mod operations {
     use super::*;
     use crate::plugins::copy_rows::{chunk_count, chunk_of};
-    use crate::plugins::fixtures::{config_result, is_child, is_effect, peer_says, peer_silent};
+    use crate::plugins::fixtures::{
+        config_result, is_child, is_effect, memory_answer, peer_says, peer_silent,
+    };
     use crate::plugins::rows::tests::child_result;
 
     fn digest() -> String {
@@ -163,7 +165,7 @@ mod operations {
         assert_eq!(unknown.unwrap_err(), ArtifactError::NotPublished);
         let mut read = fetch(None);
         assert!(is_child(&read.first()));
-        let memory = reserve(FIXTURE.len()).unwrap();
+        let memory = MemoryPermit::new(1, || {});
         let copy = Assembled::new(FIXTURE.to_vec(), memory);
         let local = child_result(Ok::<_, ArtifactError>(Some(copy)));
         let Ok(Next::Done(found)) = read.next(local) else {
@@ -178,10 +180,14 @@ mod operations {
         read.first().unwrap();
         assert!(is_effect(&read.next(no_local())));
         let count = chunk_count(FIXTURE.len() as u64);
-        for index in 0..count - 1 {
-            assert!(is_effect(&read.next(chunk_from(node(2), index))));
+        // The first chunk reserves the whole artifact's memory before it is kept.
+        assert!(is_effect(&read.next(chunk_from(node(2), 0))));
+        let mut answer = read.next(memory_answer(true));
+        for index in 1..count {
+            assert!(is_effect(&answer));
+            answer = read.next(chunk_from(node(2), index));
         }
-        let Ok(Next::Done(fetched)) = read.next(chunk_from(node(2), count - 1)) else {
+        let Ok(Next::Done(fetched)) = answer else {
             panic!("the last chunk completes the copy");
         };
         assert!(fetched.fresh);

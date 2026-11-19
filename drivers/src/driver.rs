@@ -811,6 +811,7 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::Session(_)
         | Effect::Compute(_)
         | Effect::Outbound(_)
+        | Effect::Plugin(_)
         | Effect::SubOperation(_)
         | Effect::Background(_)
         | Effect::Group(_)

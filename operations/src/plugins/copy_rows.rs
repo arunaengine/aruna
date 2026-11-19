@@ -9,12 +9,12 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_ARTIFACT_KEYSPACE;
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::plugins::{ArtifactBytes, Chunk, MAX_ARTIFACT};
+use aruna_core::plugins::{ArtifactBytes, Chunk, MAX_ARTIFACT, MemoryPermit};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
 
 use super::artifacts::ArtifactError;
-use super::copies::{Assembled, MemoryPermit, reserve};
+use super::copies::{Assembled, reserve_call, reserved};
 use super::rows::{Row, Rows, Scan, StoreError, delete_call, done, read_call, row, values, writes};
 
 /// Bytes of one artifact chunk; node messages stay far below their 16 MiB limit.
@@ -821,35 +821,27 @@ impl Operation for SweepCopies {
 #[derive(Debug, PartialEq)]
 pub(crate) struct ReadLocal {
     digest: String,
-    memory: Option<HeldMemory>,
+    memory: Memory,
 }
 
-/// Memory reserved for what an operation assembles; two reservations count as equal.
-struct HeldMemory(MemoryPermit);
-
-impl std::fmt::Debug for HeldMemory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HeldMemory({} MiB)", self.0.mib())
-    }
+/// Memory for what an operation assembles: not asked yet, asked for `total` bytes, or held.
+#[derive(Debug, PartialEq)]
+enum Memory {
+    Free,
+    Asked(u64),
+    Held(MemoryPermit),
 }
 
-impl PartialEq for HeldMemory {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-
-fn held_memory(total: u64) -> Result<HeldMemory, ArtifactError> {
-    reserve(total as usize)
-        .map(HeldMemory)
-        .ok_or(ArtifactError::Busy)
+/// The reservation a reserve call answered; a spent budget makes the node busy.
+fn held(result: IoResult) -> Result<MemoryPermit, ArtifactError> {
+    reserved(result)?.ok_or(ArtifactError::Busy)
 }
 
 impl ReadLocal {
     pub(crate) fn new(digest: &str) -> Self {
         Self {
             digest: digest.to_string(),
-            memory: None,
+            memory: Memory::Free,
         }
     }
 }
@@ -863,18 +855,24 @@ impl Operation for ReadLocal {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ArtifactError> {
-        if let Some(HeldMemory(memory)) = self.memory.take() {
-            let bytes = result.child::<Vec<u8>, ArtifactError>()??;
-            return Ok(Next::Done(Some(Assembled::new(bytes, memory))));
+        match std::mem::replace(&mut self.memory, Memory::Free) {
+            Memory::Held(memory) => {
+                let bytes = result.child::<Vec<u8>, ArtifactError>()??;
+                Ok(Next::Done(Some(Assembled::new(bytes, memory))))
+            }
+            Memory::Asked(total) => {
+                self.memory = Memory::Held(held(result)?);
+                let read = ReadCopy::new(&self.digest, total);
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            Memory::Free => {
+                let Some(total) = result.child::<Option<u64>, ArtifactError>()?? else {
+                    return Ok(Next::Done(None));
+                };
+                self.memory = Memory::Asked(total);
+                Ok(Next::Call(reserve_call(total)))
+            }
         }
-        let Some(total) = result.child::<Option<u64>, ArtifactError>()?? else {
-            return Ok(Next::Done(None));
-        };
-        self.memory = Some(held_memory(total)?);
-        Ok(Next::Call(IoCall::child(ReadCopy::new(
-            &self.digest,
-            total,
-        ))))
     }
 }
 
@@ -887,7 +885,7 @@ pub(crate) struct KeepChunk {
     total: u64,
     now_ms: u64,
     /// Held while the whole copy is read and checked.
-    memory: Option<HeldMemory>,
+    memory: Memory,
 }
 
 impl KeepChunk {
@@ -897,7 +895,7 @@ impl KeepChunk {
             total: chunk.total,
             now_ms,
             store: Some(StoreChunk::new(config, chunk, now_ms)),
-            memory: None,
+            memory: Memory::Free,
         }
     }
 }
@@ -916,17 +914,24 @@ impl Operation for KeepChunk {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, ArtifactError> {
-        if self.memory.is_some() {
-            result.child::<(), ArtifactError>()??;
-            return Ok(Next::Done(true));
+        match self.memory {
+            Memory::Held(_) => {
+                result.child::<(), ArtifactError>()??;
+                return Ok(Next::Done(true));
+            }
+            Memory::Asked(_) => {
+                self.memory = Memory::Held(held(result)?);
+                let complete = CompleteCopy::new(self.digest.clone(), self.total, self.now_ms);
+                return Ok(Next::Call(IoCall::child(complete)));
+            }
+            Memory::Free => {}
         }
         match result.child::<ChunkStored, ArtifactError>()?? {
             ChunkStored::Held => Ok(Next::Done(false)),
             ChunkStored::Confirmed => Ok(Next::Done(true)),
             ChunkStored::AllHere => {
-                self.memory = Some(held_memory(self.total)?);
-                let complete = CompleteCopy::new(self.digest.clone(), self.total, self.now_ms);
-                Ok(Next::Call(IoCall::child(complete)))
+                self.memory = Memory::Asked(self.total);
+                Ok(Next::Call(reserve_call(self.total)))
             }
         }
     }

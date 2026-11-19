@@ -2,45 +2,60 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
+use aruna_core::operation::Operation;
+use aruna_core::plugins::MemoryPermit;
+use aruna_core::plugins::{PluginEffect, PluginEvent};
 
-/// Memory one node spends at most on artifact uploads and assemblies, in MiB.
-const MEMORY_MIB: u32 = 256;
-
-/// MiB of the budget reserved now.
-static RESERVED: AtomicU32 = AtomicU32::new(0);
-
-/// Memory reserved for one artifact upload or assembly, released when dropped.
-#[derive(Debug)]
-pub struct MemoryPermit {
-    mib: u32,
+/// The call that reserves memory for `bytes` from the node's budget.
+pub(crate) fn reserve_call(bytes: u64) -> IoCall {
+    let effect = Effect::Plugin(PluginEffect::Reserve { bytes });
+    IoCall::Effect(Box::new(effect))
 }
 
-impl MemoryPermit {
-    /// MiB this reservation holds of the node's budget.
-    pub fn mib(&self) -> u32 {
-        self.mib
+/// The reservation a [`reserve_call`] answered, or `None` while the node spends its budget
+/// elsewhere.
+pub(crate) fn reserved(result: IoResult) -> Result<Option<MemoryPermit>, IoError> {
+    match result {
+        IoResult::Event(event) => match *event {
+            Event::Plugin(PluginEvent::Reserved(permit)) => Ok(permit),
+            other => Err(IoError::Unexpected {
+                expected: "Event::Plugin(PluginEvent::Reserved)",
+                got: other.label(),
+            }),
+        },
+        other => Err(IoError::Unexpected {
+            expected: "Event::Plugin(PluginEvent::Reserved)",
+            got: other.label(),
+        }),
     }
 }
 
-impl Drop for MemoryPermit {
-    fn drop(&mut self) {
-        RESERVED.fetch_sub(self.mib, Ordering::AcqRel);
+/// Reserves memory for an artifact upload of `bytes` before its body is read.
+#[derive(Debug, PartialEq)]
+pub struct ReserveMemory {
+    bytes: u64,
+}
+
+impl ReserveMemory {
+    pub fn new(bytes: u64) -> Self {
+        Self { bytes }
     }
 }
 
-/// Reserves memory for `bytes`, or `None` while the node spends its budget elsewhere.
-pub fn reserve(bytes: usize) -> Option<MemoryPermit> {
-    let mib = u32::try_from(bytes.div_ceil(1 << 20).max(1)).ok()?;
-    let fits = |reserved: u32| {
-        reserved
-            .checked_add(mib)
-            .filter(|total| *total <= MEMORY_MIB)
-    };
-    RESERVED
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, fits)
-        .ok()?;
-    Some(MemoryPermit { mib })
+impl Operation for ReserveMemory {
+    type Output = Option<MemoryPermit>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<MemoryPermit>>, IoError> {
+        Ok(Next::Call(reserve_call(self.bytes)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<MemoryPermit>>, IoError> {
+        Ok(Next::Done(reserved(result)?))
+    }
 }
 
 /// A whole artifact in memory together with the memory reserved for it; dropping it releases
