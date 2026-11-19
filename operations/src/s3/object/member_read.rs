@@ -423,9 +423,12 @@ impl MemberCallOperation {
             method: request.method,
             url,
             headers,
+            raw_headers: Vec::new(),
             body,
             answer_limit: self.read.then_some(ANSWER_LIMIT),
+            whole_limit: None,
             any_status: false,
+            no_redirect: false,
         };
         self.step = CallStep::Answer;
         let fetch = OutboundEffect::MemberFetch(Box::new(fetch));
@@ -470,7 +473,7 @@ impl Operation for MemberCallOperation {
                         code: xml_field(&body, "Code"),
                         message: xml_field(&body, "Message").unwrap_or_default(),
                     }),
-                    MemberAnswer::Silent => self.failed(self.unreached(false)),
+                    MemberAnswer::Silent | MemberAnswer::Lost => self.failed(self.unreached(false)),
                     MemberAnswer::Late => self.failed(self.unreached(true)),
                 },
                 other => Err(unexpected("OutboundEvent::MemberAnswered", &other)),

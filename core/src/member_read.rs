@@ -24,6 +24,7 @@ pub enum MemberMethod {
     Head,
     Put,
     Post,
+    Patch,
     Delete,
 }
 
@@ -34,8 +35,23 @@ impl MemberMethod {
             Self::Head => "HEAD",
             Self::Put => "PUT",
             Self::Post => "POST",
+            Self::Patch => "PATCH",
             Self::Delete => "DELETE",
         }
+    }
+
+    /// The method an HTTP request names, when a member request can carry it.
+    pub fn parse(name: &str) -> Option<Self> {
+        [
+            Self::Get,
+            Self::Head,
+            Self::Put,
+            Self::Post,
+            Self::Patch,
+            Self::Delete,
+        ]
+        .into_iter()
+        .find(|method| method.as_str() == name)
     }
 }
 
@@ -76,11 +92,17 @@ pub struct MemberFetch {
     pub method: MemberMethod,
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// Headers a relay passes on byte for byte, as it received them.
+    pub raw_headers: Vec<(String, Vec<u8>)>,
     pub body: MemberSend,
     /// How long the member may take to start its answer.
     pub answer_limit: Option<Duration>,
+    /// How long the whole exchange may take, the answer's body included.
+    pub whole_limit: Option<Duration>,
     /// Hands back a refusal like any other answer, its body streaming through.
     pub any_status: bool,
+    /// Takes a redirect as the answer instead of following it.
+    pub no_redirect: bool,
 }
 
 impl std::fmt::Debug for MemberFetch {
@@ -120,10 +142,12 @@ pub enum MemberAnswer {
         status: u16,
         body: String,
     },
-    /// The member could not be reached.
+    /// The member could not be reached, so it never saw the request.
     Silent,
-    /// The member did not start answering in time.
+    /// The member did not answer in time.
     Late,
+    /// The request went out but no answer came back, so the member may have acted on it.
+    Lost,
 }
 
 /// Seals the trailer of a framed body with this node's key.

@@ -19,8 +19,12 @@ use ulid::Ulid;
 
 use crate::s3::object::member_read::Header;
 
-const API_PREFIX: &str = "/api/v1";
-const RELAY_HOP_HEADER: &str = "x-aruna-relay-hop";
+/// The nest every REST route is served under.
+pub const API_PREFIX: &str = "/api/v1";
+/// The nodes a relayed call passed, comma-separated.
+pub const RELAY_HOP_HEADER: &str = "x-aruna-relay-hop";
+/// The node a directed call is meant for; that node answers it itself.
+pub const RELAY_NODE_HEADER: &str = "x-aruna-relay-node";
 const RELAY_SET_HEADER: &str = "x-aruna-relay-set";
 /// How long a node may take to start its answer to a read.
 const ANSWER_LIMIT: Duration = Duration::from_secs(30);
@@ -137,9 +141,12 @@ impl RestCallOperation {
             method,
             url: rest_url(base, &call.path),
             headers,
+            raw_headers: Vec::new(),
             body,
             answer_limit: call.timed.then_some(ANSWER_LIMIT),
+            whole_limit: None,
             any_status: call.any_status,
+            no_redirect: false,
         };
         self.asked = true;
         let fetch = OutboundEffect::MemberFetch(Box::new(fetch));
@@ -176,7 +183,7 @@ impl Operation for RestCallOperation {
         Ok(Next::Done(match answer {
             MemberAnswer::Body(body) => RestAnswer::Body(body),
             MemberAnswer::Refused { status, body } => RestAnswer::Refused { status, body },
-            MemberAnswer::Silent | MemberAnswer::Late => RestAnswer::Silent,
+            MemberAnswer::Silent | MemberAnswer::Late | MemberAnswer::Lost => RestAnswer::Silent,
         }))
     }
 }

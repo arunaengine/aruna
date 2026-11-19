@@ -26,3 +26,4 @@ ulid = { workspace = true }
 
 [dev-dependencies]
 iroh = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
