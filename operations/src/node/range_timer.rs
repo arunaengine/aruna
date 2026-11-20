@@ -1,6 +1,5 @@
-//! Runs the range maintenance timer: one bounded pass over the range accounts, then the handed
-//! imports that pass hands over, then one page of unverified data links, with every cursor in
-//! the timer's memory.
+//! Runs the range maintenance timer: a bounded pass over the range accounts, the imports it
+//! hands over and a page of unverified data links, with every cursor in the timer's memory.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
