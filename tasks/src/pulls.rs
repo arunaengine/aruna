@@ -174,7 +174,7 @@ mod tests {
         registry.finish(vec![2], Err(SyncRefusal::Unavailable), start);
         let later = start + REFUSAL_KEPT;
         let progress = registry.claim(vec![3], 10, later);
-        assert_eq!(registry.pulls().tasks.len(), 1, "the dropped run and stale refusal are gone");
+        assert_eq!(registry.pulls().tasks.len(), 1, "stale entries are gone");
         assert_eq!(registry.status(&[2], later), None);
         drop(progress);
     }
