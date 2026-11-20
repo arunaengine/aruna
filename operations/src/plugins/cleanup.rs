@@ -69,10 +69,17 @@ pub struct SweepEvents {
 #[derive(Debug, PartialEq)]
 enum SweepPhase {
     Scanning(Table, Scan),
-    /// Sends the deletes of a table; the next table follows.
-    Deleting(Option<Table>),
+    /// Sends the deletes of one page; the same table goes on, or the next table follows.
+    Deleting(SweepNext),
     /// The sweep ended; another answer is refused.
     Finished,
+}
+
+/// Where a sweep goes once a page's deletes are sent.
+#[derive(Debug, PartialEq)]
+enum SweepNext {
+    Page(Table, Scan),
+    Table(Option<Table>),
 }
 
 /// The tables a sweep reads, in order.
@@ -154,16 +161,17 @@ impl SweepEvents {
         }
     }
 
-    /// The next delete, or the next table once every delete was sent.
-    fn advance(&mut self, next: Option<Table>) -> Next<usize> {
+    /// The next delete, or the next page or table once every delete was sent.
+    fn advance(&mut self, next: SweepNext) -> Next<usize> {
         if let Some(keys) = self.deletes.pop() {
             self.phase = SweepPhase::Deleting(next);
             return Next::Call(delete_call(keys));
         }
-        let Some(table) = next else {
-            return Next::Done(self.dropped);
+        let (table, scan) = match next {
+            SweepNext::Page(table, scan) => (table, scan),
+            SweepNext::Table(Some(table)) => (table, table.scan()),
+            SweepNext::Table(None) => return Next::Done(self.dropped),
         };
-        let scan = table.scan();
         let ask = scan.ask();
         self.phase = SweepPhase::Scanning(table, scan);
         Next::Call(ask)
@@ -189,16 +197,17 @@ impl Operation for SweepEvents {
                 Ok(self.advance(next))
             }
             SweepPhase::Scanning(table, mut scan) => {
-                let Some(rows) = scan.take(answer)? else {
-                    let ask = scan.ask();
-                    self.phase = SweepPhase::Scanning(table, scan);
-                    return Ok(Next::Call(ask));
-                };
+                // Each page is reduced and deleted before the next one is read.
+                let (rows, more) = scan.page(answer)?;
                 let mut deletes = self.dropped(table, rows);
                 self.dropped += deletes.last().map_or(0, Vec::len);
                 deletes.reverse();
                 self.deletes = deletes;
-                Ok(self.advance(table.after()))
+                let next = match more {
+                    true => SweepNext::Page(table, scan),
+                    false => SweepNext::Table(table.after()),
+                };
+                Ok(self.advance(next))
             }
         }
     }
