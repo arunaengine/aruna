@@ -936,7 +936,7 @@ mod tests {
     #[test]
     fn unconverted_keys_absent() {
         assert!(timer_operation(&TaskKey::DrainJobQueue, &input()).is_none());
-        assert!(timer_operation(&TaskKey::PruneJobs, &input()).is_none());
+        assert!(timer_operation(&TaskKey::DrainSyncOutbox, &input()).is_none());
     }
 
     #[test]
