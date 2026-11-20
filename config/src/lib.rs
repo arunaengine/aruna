@@ -1,6 +1,12 @@
 //! Builds the node config from operator settings, opening storage and reading realm config.
+//! The node and the doctor share it, with the settings and the node identity it reads.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+#![allow(clippy::result_large_err)]
+
+pub mod identity;
+pub mod settings;
 
 use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::effects::{Effect, StorageEffect};

@@ -202,9 +202,9 @@ mod tests {
         KeyspaceCreateOptions, OptimisticTxDatabase, import_new_database, snapshot_database,
     };
     use crate::tests::fixtures::env_lock;
-    use aruna::config::load;
     use aruna_api::server::state::ServerState;
     use aruna_blob::blob::BlobHandler;
+    use aruna_config::load;
     use aruna_core::keyspaces::{
         API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, NODE_STATE_KEYSPACE,
         REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,

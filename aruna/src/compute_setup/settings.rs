@@ -9,7 +9,7 @@ use std::time::Duration;
 use aruna_core::compute::ResourceEnvelope;
 
 use super::{BackendSettings, ComputeBuildError, ComputeSettings};
-use crate::config::Config;
+use aruna_config::Config;
 
 /// One selected compute backend with its already-parsed settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +42,7 @@ pub(super) fn selected_backend(selected: &str) -> Result<SelectedBackend, Comput
 /// for the selected backend, so an invalid value for an unused backend never
 /// fails a start.
 pub(super) fn collect(
-    env: &dyn crate::settings::SettingsEnv,
+    env: &dyn aruna_config::settings::SettingsEnv,
 ) -> Result<ComputeSettings, ComputeBuildError> {
     let selected = env
         .var("ARUNA_COMPUTE_EXECUTOR")
@@ -71,13 +71,13 @@ pub(super) fn collect(
 
 /// The session subnet an operator configured, else the default. Read once,
 /// inside the one collection boundary.
-fn session_subnet(env: &dyn crate::settings::SettingsEnv) -> String {
+fn session_subnet(env: &dyn aruna_config::settings::SettingsEnv) -> String {
     env.var("ARUNA_COMPUTE_DOCKER_SESSION_SUBNET")
         .unwrap_or_else(|| aruna_compute::executor::config::DEFAULT_SESSION_SUBNET.to_string())
 }
 
 fn collect_docker(
-    env: &dyn crate::settings::SettingsEnv,
+    env: &dyn aruna_config::settings::SettingsEnv,
 ) -> Result<super::DockerSettings, ComputeBuildError> {
     Ok(super::DockerSettings {
         disk_bytes: parse_disk_limit(env.var("ARUNA_COMPUTE_DOCKER_DISK_BYTES").as_deref())?,
@@ -93,7 +93,7 @@ fn collect_docker(
 }
 
 fn collect_apptainer(
-    env: &dyn crate::settings::SettingsEnv,
+    env: &dyn aruna_config::settings::SettingsEnv,
 ) -> Result<super::ApptainerSettings, ComputeBuildError> {
     let cgroup_root = env
         .var("ARUNA_COMPUTE_APPTAINER_CGROUP_ROOT")
@@ -129,7 +129,7 @@ fn collect_apptainer(
 }
 
 fn collect_slurm(
-    env: &dyn crate::settings::SettingsEnv,
+    env: &dyn aruna_config::settings::SettingsEnv,
 ) -> Result<super::SlurmSettings, ComputeBuildError> {
     // Compute nodes read the staged inputs and write logs there, so no default fits.
     let state_root = env
@@ -156,7 +156,7 @@ fn collect_slurm(
 }
 
 fn collect_kubernetes(
-    env: &dyn crate::settings::SettingsEnv,
+    env: &dyn aruna_config::settings::SettingsEnv,
 ) -> Result<super::KubernetesSettings, ComputeBuildError> {
     let storage_class = env.var("ARUNA_COMPUTE_K8S_STORAGE_CLASS").ok_or_else(|| {
         ComputeBuildError::Invalid(
@@ -219,7 +219,7 @@ fn collect_kubernetes(
 
 /// The KubeDAL worker cache: a scope enables it, worker labels are optional.
 fn kubedal_cache(
-    env: &dyn crate::settings::SettingsEnv,
+    env: &dyn aruna_config::settings::SettingsEnv,
 ) -> Result<Option<aruna_compute::executor::config::KubedalCache>, String> {
     let Some(scope) = parse_nonempty(env.var("ARUNA_COMPUTE_K8S_KUBEDAL_CACHE_SCOPE").as_deref())
     else {
@@ -292,7 +292,9 @@ pub(super) fn parse_path(value: Option<&str>) -> Option<PathBuf> {
     parse_nonempty(value).map(PathBuf::from)
 }
 
-fn compute_envelope(env: &dyn crate::settings::SettingsEnv) -> Result<ResourceEnvelope, String> {
+fn compute_envelope(
+    env: &dyn aruna_config::settings::SettingsEnv,
+) -> Result<ResourceEnvelope, String> {
     Ok(ResourceEnvelope {
         max_cpu_cores: parse_number(
             "ARUNA_COMPUTE_MAX_CPU_CORES",

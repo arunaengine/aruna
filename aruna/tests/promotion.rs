@@ -4,7 +4,7 @@
 
 use crate::shared;
 
-use aruna::identity::IdentityStore;
+use aruna_config::identity::IdentityStore;
 use aruna_core::onboarding::OnboardingMode;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmNodeKind;

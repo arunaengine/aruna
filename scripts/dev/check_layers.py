@@ -47,10 +47,22 @@ CRATE_TARGETS = {
     "aruna-doctor": (
         "aruna-core",
         "aruna-clock",
+        "aruna-config",
         "aruna-storage",
         "aruna-blob",
         "aruna-operations",
         "aruna-drivers",
+    ),
+    # The node configuration, settings and identity that the node and the doctor share.
+    "aruna-config": (
+        "aruna-core",
+        "aruna-clock",
+        "aruna-api",
+        "aruna-drivers",
+        "aruna-graph",
+        "aruna-net",
+        "aruna-storage",
+        "aruna-wire",
     ),
     "aruna-cli": ("aruna-wire", "aruna-plugins", "aruna-plugin-types"),
     "aruna-operations": ("aruna-core", "aruna-plugin-types"),

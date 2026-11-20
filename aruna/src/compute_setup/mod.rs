@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
-use crate::config::Config;
+use aruna_config::Config;
 
 /// Why a selected compute backend could not be built. The categories stay
 /// distinct so an invalid configuration is never silently treated as
@@ -165,7 +165,9 @@ impl ComputeSettings {
 /// Collects the typed compute settings once from one explicit operator-input
 /// source. Production passes the process environment at the resource boundary;
 /// tests pass a map.
-pub(crate) fn collect(env: &dyn crate::settings::SettingsEnv) -> Result<ComputeSettings, String> {
+pub(crate) fn collect(
+    env: &dyn aruna_config::settings::SettingsEnv,
+) -> Result<ComputeSettings, String> {
     settings::collect(env).map_err(compute_error_message)
 }
 

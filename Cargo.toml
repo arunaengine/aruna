@@ -6,6 +6,7 @@
 members = [
     "api",
     "aruna",
+    "config",
     "blob",
     "compute",
     "core",
@@ -53,6 +54,7 @@ aruna-blob = { path = "blob" }
 aruna-cli = { path = "cli" }
 aruna-compute = { path = "compute", default-features = false }
 aruna-clock = { path = "clock" }
+aruna-config = { path = "config" }
 aruna-core = { path = "core" }
 aruna-graph = { path = "graph" }
 aruna-net = { path = "net" }

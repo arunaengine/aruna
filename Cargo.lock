@@ -325,6 +325,7 @@ dependencies = [
  "aruna-cli",
  "aruna-clock",
  "aruna-compute",
+ "aruna-config",
  "aruna-core",
  "aruna-drivers",
  "aruna-graph",
@@ -605,6 +606,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-config"
+version = "3.0.0-alpha.207"
+dependencies = [
+ "aruna-api",
+ "aruna-clock",
+ "aruna-core",
+ "aruna-drivers",
+ "aruna-graph",
+ "aruna-net",
+ "aruna-storage",
+ "base64 0.23.1",
+ "byteview",
+ "crypto_box",
+ "dotenvy",
+ "ed25519-dalek 3.0.0",
+ "hex",
+ "ipnet",
+ "iroh",
+ "irokle",
+ "postcard",
+ "rand 0.10.3",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "aruna-core"
 version = "3.0.0-alpha.207"
 dependencies = [
@@ -671,6 +704,7 @@ dependencies = [
  "aruna-api",
  "aruna-blob",
  "aruna-clock",
+ "aruna-config",
  "aruna-core",
  "aruna-drivers",
  "aruna-net",

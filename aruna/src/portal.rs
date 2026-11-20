@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::config::{PortalArtifactConfig, PortalConfig};
 use aruna_api::server::state::ServerState;
+use aruna_config::{PortalArtifactConfig, PortalConfig};
 use aruna_wire::info::PortalStatus;
 use chrono::{SecondsFormat, Utc};
 use flate2::read::GzDecoder;
@@ -542,7 +542,7 @@ mod tests {
         CHECKSUM_FILE, PortalArtifactError, install_parent, installed_status, portal_dir,
         replace_existing_path, safe_archive_path, unpack_archive, verify_sha256,
     };
-    use crate::config::PortalArtifactConfig;
+    use aruna_config::PortalArtifactConfig;
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use sha2::Digest;

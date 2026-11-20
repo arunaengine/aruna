@@ -26,6 +26,7 @@ aruna-wire = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
 aruna-clock = { workspace = true }
+aruna-config = { workspace = true }
 aruna-core = { workspace = true }
 aruna-graph = { workspace = true }
 aruna-net = { workspace = true }

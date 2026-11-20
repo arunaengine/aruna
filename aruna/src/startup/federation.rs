@@ -23,7 +23,7 @@ use reqwest::Url;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use aruna_config::Config;
 
 /// Bound on resolving this node's own public host names.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -166,8 +166,8 @@ async fn is_public(url: &Url, policy: &EgressPolicy) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::resolve_settings;
-    use crate::settings::read_settings_from;
+    use aruna_config::resolve_settings;
+    use aruna_config::settings::read_settings_from;
     use aruna_core::federation::FederationSettings;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use std::collections::BTreeMap;
