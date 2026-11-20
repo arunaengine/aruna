@@ -4,7 +4,7 @@
 
 use super::*;
 use aruna_operations::node::outbox_finish::FinishBatchOperation;
-use aruna_operations::node::outbox_sync::SyncBatchOperation;
+use aruna_operations::node::outbox_publish::PublishBatchesOperation;
 
 /// The realm configuration the drain decides with: `None` on a node that has none yet, where the
 /// bootstrap rules apply, and an error when it cannot be read or decoded, which postpones the drain
@@ -489,148 +489,34 @@ impl OperationsTaskHandler {
 }
 
 impl OperationsTaskHandler {
+    /// Publishes and syncs the sub-batches through their operation and keeps which records this
+    /// process published; a run that broke off retries every sub-batch and blocks its domains.
     async fn publish_drain_batches(
         &self,
         retry_key: &TaskKey,
         net_handle: &aruna_net::NetHandle,
         subbatches: Vec<DrainSubBatch>,
     ) -> (Duration, DrainSyncOutcome) {
-        let mut publish_elapsed = Duration::ZERO;
-        let mut outcome = DrainSyncOutcome::default();
-        let mut awaiting_sync: Option<DrainSubBatch> = None;
-        for mut subbatch in subbatches {
-            if subbatch.documents.is_empty() {
-                let synced = self
-                    .sync_drain_subbatch(retry_key, net_handle, awaiting_sync.take())
-                    .await;
-                outcome.merge(synced);
-                awaiting_sync = Some(subbatch);
-                continue;
-            }
-            let documents = std::mem::take(&mut subbatch.documents);
-            let peers = subbatch.peers.clone();
-            let (batch_topics, batch_origins) = subbatch.ordering_domains();
-            let publish = async {
-                let publish_started = Instant::now();
-                let event = net_handle
-                    .send_effect(Effect::Net(NetEffect::DocumentSync(
-                        DocumentEffect::PublishDocuments { documents, peers },
-                    )))
-                    .await;
-                (event, publish_started.elapsed())
-            };
-            let ((publish_event, publish_time), sync_outcome) = tokio::join!(
-                publish,
-                self.sync_drain_subbatch(retry_key, net_handle, awaiting_sync.take())
-            );
-            publish_elapsed += publish_time;
-            outcome.merge(sync_outcome);
-            match publish_event {
-                Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPublished {
-                    ..
-                })) => {
-                    self.note_published(&subbatch.record_keys);
-                    awaiting_sync = Some(subbatch);
-                }
-                Event::Net(NetEvent::DocumentSync(
-                    DocumentNetEvent::DocumentsPartiallyPublished {
-                        published_indices,
-                        retry_indices,
-                        error,
-                    },
-                )) => {
-                    warn!(
-                        task_id = ?retry_key,
-                        published = published_indices.len(),
-                        retry = retry_indices.len(),
-                        error = %error,
-                        "Partially created local document sync batch"
-                    );
-                    outcome.retry_needed = true;
-                    if let Some(retried) = subbatch.sync_subset(&retry_indices) {
-                        let (topics, origins) = retried.ordering_domains();
-                        outcome.blocked_topics.extend(topics);
-                        outcome.blocked_origins.extend(origins);
-                    } else {
-                        outcome.blocked_topics.extend(batch_topics.iter().copied());
-                        outcome
-                            .blocked_origins
-                            .extend(batch_origins.iter().copied());
-                    }
-                    match subbatch.sync_subset(&published_indices) {
-                        Some(published) if !published.record_keys.is_empty() => {
-                            self.note_published(&published.record_keys);
-                            awaiting_sync = Some(published);
-                        }
-                        Some(_) => {}
-                        None => {
-                            warn!(task_id = ?retry_key, "Invalid partial document publish indices");
-                        }
-                    }
-                }
-                Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
-                    warn!(task_id = ?retry_key, error = %error, "Failed to create local document sync batch");
-                    outcome.retry_needed = true;
-                    outcome.blocked_topics.extend(batch_topics.iter().copied());
-                    outcome
-                        .blocked_origins
-                        .extend(batch_origins.iter().copied());
-                }
-                Event::Net(NetEvent::Error(error)) => {
-                    warn!(task_id = ?retry_key, error = ?error, "Failed to create local document sync batch");
-                    outcome.retry_needed = true;
-                    outcome.blocked_topics.extend(batch_topics.iter().copied());
-                    outcome
-                        .blocked_origins
-                        .extend(batch_origins.iter().copied());
-                }
-                other => {
-                    warn!(task_id = ?retry_key, event = ?other, "Unexpected local document sync batch result");
-                    outcome.retry_needed = true;
-                    outcome.blocked_topics.extend(batch_topics.iter().copied());
-                    outcome
-                        .blocked_origins
-                        .extend(batch_origins.iter().copied());
-                }
-            }
-        }
-        let sync_outcome = self
-            .sync_drain_subbatch(retry_key, net_handle, awaiting_sync.take())
-            .await;
-        outcome.merge(sync_outcome);
-        (publish_elapsed, outcome)
-    }
-}
-
-impl OperationsTaskHandler {
-    async fn sync_drain_subbatch(
-        &self,
-        retry_key: &TaskKey,
-        net_handle: &aruna_net::NetHandle,
-        subbatch: Option<DrainSubBatch>,
-    ) -> DrainSyncOutcome {
-        let Some(subbatch) = subbatch else {
-            return DrainSyncOutcome::default();
+        let mut blocked = DrainSyncOutcome {
+            retry_needed: true,
+            ..DrainSyncOutcome::default()
         };
-        let record_keys = subbatch.record_keys.clone();
-        let (topics, origins) = subbatch.ordering_domains();
+        for subbatch in &subbatches {
+            let (topics, origins) = subbatch.ordering_domains();
+            blocked.blocked_topics.extend(topics);
+            blocked.blocked_origins.extend(origins);
+        }
         let serving = (net_handle.node_id(), *net_handle.realm_id());
-        let sync = SyncBatchOperation::new(serving, ulid::Ulid::generate(), subbatch);
-        match drive(sync, self.context.as_ref()).await {
-            Ok(finished) => {
-                if finished.deleted {
-                    self.forget_published(&record_keys);
-                }
-                finished.outcome
+        let publish = PublishBatchesOperation::new(serving, subbatches);
+        match drive(publish, self.context.as_ref()).await {
+            Ok(done) => {
+                self.note_published(&done.published);
+                self.forget_published(&done.deleted);
+                (done.publish_elapsed, done.outcome)
             }
             Err(error) => {
-                warn!(task_id = ?retry_key, %error, "Syncing a document sync batch broke off");
-                DrainSyncOutcome {
-                    retry_needed: true,
-                    blocked_topics: topics,
-                    blocked_origins: origins,
-                    ..DrainSyncOutcome::default()
-                }
+                warn!(task_id = ?retry_key, %error, "Publishing document sync batches broke off");
+                (Duration::ZERO, blocked)
             }
         }
     }

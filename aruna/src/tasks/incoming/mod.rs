@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::document::{
-    DocumentEffect, DocumentNetEvent, DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget,
+    DocumentNetEvent, DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget,
 };
-use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::effects::Effect;
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::identity::JobExecutionClass;
