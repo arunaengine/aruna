@@ -27,8 +27,8 @@ use crate::calls::{IoCall, IoResult, Next};
 use crate::config_authority::AdminEventValidation;
 use crate::deferred_topics::DocumentSyncDependency;
 use crate::document::{
-    DocumentChange, DocumentChangeKind, DocumentEvent, DocumentReconcileResult,
-    DocumentSyncRevision, DocumentTarget,
+    AppliedStep, AppliedSync, DocumentChange, DocumentChangeKind, DocumentEvent,
+    DocumentReconcileResult, DocumentSyncRevision, DocumentTarget,
 };
 use crate::effects::{Effect, StorageEffect};
 use crate::events::{Event, StorageEvent};
@@ -437,36 +437,13 @@ fn lifecycle_stores_delete() {
 // delete applied and skips it leaves the queued graph prune in place.
 #[test]
 fn delete_queues_followups() {
-    let target = DocumentTarget::MetadataDocumentLifecycle {
-        document_id: document_id(),
-    };
-    let record = MetadataLifecycleRecord::Delete {
-        event: delete_record(),
-    };
-    let plan = ApplyEventPlan {
-        topic_id: config_topic(),
-        actor_id: actor(),
-        realm_id: realm(),
-        identity: identity(),
-        event: DocumentEvent::Upsert {
-            event_id: Ulid::from_parts(8, 8),
-            target: target.clone(),
-            bytes: postcard::to_allocvec(&record).unwrap(),
-            change: change(DocumentChangeKind::Upsert, placed()),
-        },
-    };
     let queued = QueuedApply {
-        plan,
+        plan: lifecycle_delete(),
         node: followup_node(),
         identity: identity(),
     };
     let ran = run(queued.clone(), &nothing());
-    let result = DocumentReconcileResult {
-        targets: vec![target],
-        metadata_graph_tombstones: vec![tombstone(10)],
-        ..DocumentReconcileResult::default()
-    };
-    let row = followup_row(&followup_node(), &[identity()], result).unwrap();
+    let row = followup_row(&followup_node(), &[identity()], deleted_result()).unwrap();
     assert!(ran.writes.contains(&row));
     let stored: Stored = (ran.writes.iter())
         .map(|(space, key, value)| ((space.clone(), key.clone()), value.clone()))
@@ -474,6 +451,61 @@ fn delete_queues_followups() {
     let replayed = run(queued, &stored);
     assert!(replayed.unchanged());
     assert_eq!(replayed.output(), ApplyOutcome::Skipped);
+}
+
+/// The pulled delete of the document, as its lifecycle record.
+fn lifecycle_delete() -> ApplyEventPlan {
+    let record = MetadataLifecycleRecord::Delete {
+        event: delete_record(),
+    };
+    ApplyEventPlan {
+        topic_id: config_topic(),
+        actor_id: actor(),
+        realm_id: realm(),
+        identity: identity(),
+        event: DocumentEvent::Upsert {
+            event_id: Ulid::from_parts(8, 8),
+            target: lifecycle_target(),
+            bytes: postcard::to_allocvec(&record).unwrap(),
+            change: change(DocumentChangeKind::Upsert, placed()),
+        },
+    }
+}
+
+fn lifecycle_target() -> DocumentTarget {
+    DocumentTarget::MetadataDocumentLifecycle {
+        document_id: document_id(),
+    }
+}
+
+/// What the drain has to do after the delete: clean up its graph.
+fn deleted_result() -> DocumentReconcileResult {
+    DocumentReconcileResult {
+        targets: vec![lifecycle_target()],
+        metadata_graph_tombstones: vec![tombstone(10)],
+        ..DocumentReconcileResult::default()
+    }
+}
+
+// An inbound or outbox sync runs the refreshes itself and queues only the metadata follow-up,
+// in the apply's own transaction: a graph cleanup refused later, and a refused write after the
+// cursor moved, leave the obligation stored with the delete it came with.
+#[test]
+fn metadata_followup_stored() {
+    let node = FollowUpNode {
+        from: AppliedStep::Metadata,
+        ..followup_node()
+    };
+    let queued = QueuedApply {
+        plan: lifecycle_delete(),
+        node,
+        identity: identity(),
+    };
+    let ran = run(queued, &nothing());
+    let row = followup_row(&node, &[identity()], deleted_result()).unwrap();
+    assert!(ran.writes.contains(&row));
+    let stored = AppliedSync::from_bytes(&row.2).unwrap();
+    assert_eq!(stored.next, AppliedStep::Metadata);
 }
 
 #[test]
@@ -675,6 +707,7 @@ fn followup_node() -> FollowUpNode {
     FollowUpNode {
         node_id: node(),
         realm_id: realm(),
+        from: AppliedStep::Usage,
     }
 }
 

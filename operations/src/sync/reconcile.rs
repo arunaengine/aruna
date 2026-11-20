@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::document::{DocumentEffect, DocumentNetEvent, DocumentReconcileResult};
+use aruna_core::document::{AppliedStep, DocumentEffect, DocumentNetEvent, DocumentReconcileResult};
 use aruna_core::document_apply::ApplyError;
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::effects::{Effect, NetEffect};
@@ -18,7 +18,8 @@ pub struct SyncTopicsOperation {
     realm_id: RealmId,
     effect: Option<DocumentEffect>,
     fetched: Option<DocumentNetEvent>,
-    followups: Option<NodeId>,
+    /// The node whose drain runs the follow-ups of what is applied, and its first follow-up.
+    followups: Option<(NodeId, AppliedStep)>,
     reconciling: bool,
 }
 
@@ -44,9 +45,16 @@ impl SyncTopicsOperation {
             realm_id,
             effect: None,
             fetched: Some(fetched),
-            followups: Some(node_id),
+            followups: Some((node_id, AppliedStep::Usage)),
             reconciling: false,
         }
+    }
+
+    /// Also stores the metadata follow-up of each apply for `node_id`'s drain in the apply's own
+    /// transaction; the caller runs the other follow-ups itself.
+    pub fn queuing_metadata(mut self, node_id: NodeId) -> Self {
+        self.followups = Some((node_id, AppliedStep::Metadata));
+        self
     }
 
     fn with(realm_id: RealmId, effect: DocumentEffect) -> Self {
@@ -67,8 +75,8 @@ impl SyncTopicsOperation {
             DocumentNetEvent::DocumentsSynced { topics } => {
                 self.reconciling = true;
                 let mut reconcile = ReconcileTopicsOperation::new(self.realm_id, topics);
-                if let Some(node_id) = self.followups {
-                    reconcile = reconcile.queuing_followups(node_id);
+                if let Some((node_id, from)) = self.followups {
+                    reconcile = reconcile.queuing_followups(node_id, from);
                 }
                 Ok(Next::Call(IoCall::child(reconcile)))
             }
@@ -163,7 +171,7 @@ mod tests {
         };
         let mut operation = SyncTopicsOperation::after_fetch(realm(), fetched, node());
         let reconcile = ReconcileTopicsOperation::new(realm(), vec![topic()]);
-        let reconcile = reconcile.queuing_followups(node());
+        let reconcile = reconcile.queuing_followups(node(), AppliedStep::Usage);
         let expected = Next::Call(IoCall::child(reconcile));
         assert_eq!(operation.first(), Ok(expected));
     }

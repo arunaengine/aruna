@@ -210,9 +210,10 @@ fn queues_followups_first() {
     let node = FollowUpNode {
         node_id,
         realm_id: realm(),
+        from: AppliedStep::Usage,
     };
     let pass = ReconcileTopicsOperation::new(realm(), vec![config_topic()]);
-    let mut pass = pass.queuing_followups(node_id);
+    let mut pass = pass.queuing_followups(node_id, AppliedStep::Usage);
     pass.first().unwrap();
     pass.next(child(work(&[config_topic()]))).unwrap();
     pass.next(IoResult::Values(vec![None])).unwrap();

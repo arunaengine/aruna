@@ -8,8 +8,11 @@ use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{AppliedStep, AppliedSync, applied_sync_entry};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::APPLIED_SYNC_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
 use tracing::warn;
 
@@ -197,6 +200,59 @@ impl Operation for AppliedDrainOperation {
     }
 }
 
+/// Runs the queued follow-ups once where a sync applied them, and arms the drain's timer for the
+/// work it leaves. Answers whether that work is safe: the timer took it, or nothing is left. A
+/// node without a task handle runs no drain at all, so it has nothing to arm.
+#[derive(Debug, PartialEq)]
+pub struct SettleAppliedOperation {
+    arming: bool,
+}
+
+impl Default for SettleAppliedOperation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SettleAppliedOperation {
+    pub fn new() -> Self {
+        Self { arming: false }
+    }
+}
+
+impl Operation for SettleAppliedOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        Ok(Next::Call(IoCall::child(AppliedDrainOperation::new())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        if self.arming {
+            return match result.event()? {
+                Event::Task(TaskEvent::Error { message, .. }) if message != NO_TASK_HANDLE => {
+                    warn!(%message, "Failed to arm the applied sync drain for queued follow-ups");
+                    Ok(Next::Done(false))
+                }
+                _ => Ok(Next::Done(true)),
+            };
+        }
+        let after = match result.child::<Option<Duration>, IoError>()? {
+            Ok(None) => return Ok(Next::Done(true)),
+            Ok(Some(after)) => after,
+            Err(error) => {
+                warn!(%error, "Queued follow-ups stopped after a document sync; the drain reruns");
+                APPLIED_RETRY_AFTER
+            }
+        };
+        self.arming = true;
+        let key = TaskKey::DrainAppliedSync;
+        let arm = Effect::Task(TaskEffect::ShortenTimer { key, after });
+        Ok(Next::Call(IoCall::from(arm)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +416,33 @@ mod tests {
         let rows = vec![(Key::from(vec![9]), Value::from(vec![0xff]))];
         let turn = drain.next(IoResult::Page { rows, next: None });
         assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+    }
+
+    fn task(event: TaskEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Task(event)))
+    }
+
+    // Work the drain leaves where the sync ran arms its timer; a timer that did not take it
+    // fails the settle, so the caller runs it again, and a drain that finished arms nothing.
+    #[test]
+    fn settle_arms_leftovers() {
+        let mut settle = SettleAppliedOperation::new();
+        let drain = Ok(Next::Call(IoCall::child(AppliedDrainOperation::new())));
+        assert_eq!(settle.first(), drain);
+        let left = child::<_, IoError>(Ok(Some(APPLIED_RETRY_AFTER)));
+        let key = TaskKey::DrainAppliedSync;
+        let after = APPLIED_RETRY_AFTER;
+        let arm = Effect::Task(TaskEffect::ShortenTimer { key, after });
+        assert_eq!(settle.next(left), Ok(Next::Call(IoCall::from(arm))));
+        let refused = task(TaskEvent::Error {
+            key: None,
+            message: "full".to_string(),
+        });
+        assert_eq!(settle.next(refused), Ok(Next::Done(false)));
+
+        let mut finished = SettleAppliedOperation::new();
+        finished.first().unwrap();
+        let none = child::<Option<Duration>, IoError>(Ok(None));
+        assert_eq!(finished.next(none), Ok(Next::Done(true)));
     }
 }

@@ -21,7 +21,8 @@ use crate::deferred_topics::{
     remove_deferred_topic,
 };
 use crate::document::{
-    DocumentEffect, DocumentNetEvent, DocumentReconcileResult, DocumentTarget, ReconcileBatch,
+    AppliedStep, DocumentEffect, DocumentNetEvent, DocumentReconcileResult, DocumentTarget,
+    ReconcileBatch,
 };
 use crate::effects::{Effect, NetEffect};
 use crate::events::{Event, NetEvent};
@@ -167,11 +168,15 @@ impl ReconcileTopicsOperation {
         }
     }
 
-    /// Also stores the follow-ups of each apply for `node_id`'s drain, in the apply's own
-    /// transaction, so a replay that skips an applied event still finds them.
-    pub fn queuing_followups(mut self, node_id: NodeId) -> Self {
+    /// Also stores the follow-ups of each apply from `from` on for `node_id`'s drain, in the
+    /// apply's own transaction, so a replay that skips an applied event still finds them.
+    pub fn queuing_followups(mut self, node_id: NodeId, from: AppliedStep) -> Self {
         let realm_id = self.realm_id;
-        self.followups = Some(FollowUpNode { node_id, realm_id });
+        self.followups = Some(FollowUpNode {
+            node_id,
+            realm_id,
+            from,
+        });
         self
     }
 

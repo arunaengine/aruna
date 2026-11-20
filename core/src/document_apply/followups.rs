@@ -19,11 +19,24 @@ use crate::row_plan::{PlanRows, Planned, RowPlan};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::sync_quarantine::SyncQuarantineIdentity;
 
-/// The node whose drain runs the follow-ups a reconcile queues, and the realm it serves.
+/// The node whose drain runs the follow-ups a reconcile queues, the realm it serves, and the
+/// follow-up the drain starts at: a caller that runs the earlier ones itself queues from later.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FollowUpNode {
     pub node_id: NodeId,
     pub realm_id: RealmId,
+    pub from: AppliedStep,
+}
+
+impl FollowUpNode {
+    /// Whether `result` leaves the drain work from this node's first follow-up on.
+    fn wants(&self, result: &DocumentReconcileResult) -> bool {
+        let metadata = !result.metadata_create_events.is_empty()
+            || !result.metadata_graph_tombstones.is_empty()
+            || (result.targets.iter())
+                .any(|target| matches!(target, DocumentTarget::MetadataCreateEvent { .. }));
+        self.from != AppliedStep::Metadata || metadata
+    }
 }
 
 /// The applied sync row of the events one transaction applied. Its id comes from their sync
@@ -45,7 +58,7 @@ pub fn followup_row(
         node_id: node.node_id,
         realm_id: Some(node.realm_id),
         result,
-        next: AppliedStep::Usage,
+        next: node.from,
     };
     applied_sync_entry(&applied).map_err(invalid)
 }
@@ -65,6 +78,9 @@ impl<P> QueuedApply<P> {
         mut planned: Planned<T>,
         result: DocumentReconcileResult,
     ) -> Step<Planned<T>> {
+        if !self.node.wants(&result) {
+            return Ok(planned);
+        }
         planned
             .writes
             .push(followup_row(&self.node, &[self.identity], result)?);
@@ -148,5 +164,40 @@ impl RowPlan for QueuedApply<DistributionPlan> {
 
     fn conflict_retries() -> u32 {
         DistributionPlan::conflict_retries()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::fixtures::{config_target, node, realm};
+    use super::*;
+
+    // A node that queues from the metadata follow-up stores rows only for metadata work; one that
+    // queues every follow-up stores them all.
+    #[test]
+    fn metadata_wants_work() {
+        let metadata = FollowUpNode {
+            node_id: node(),
+            realm_id: realm(),
+            from: AppliedStep::Metadata,
+        };
+        let config = DocumentReconcileResult {
+            targets: vec![config_target()],
+            ..DocumentReconcileResult::default()
+        };
+        assert!(!metadata.wants(&config));
+        let created = DocumentReconcileResult {
+            targets: vec![DocumentTarget::MetadataCreateEvent {
+                document_id: Ulid::from_parts(1, 1),
+                event_id: Ulid::from_parts(2, 2),
+            }],
+            ..DocumentReconcileResult::default()
+        };
+        assert!(metadata.wants(&created));
+        let every = FollowUpNode {
+            from: AppliedStep::Usage,
+            ..metadata
+        };
+        assert!(every.wants(&config));
     }
 }

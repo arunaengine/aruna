@@ -10,7 +10,7 @@ use super::super::fixtures::{
 };
 use super::*;
 use crate::calls::IoError;
-use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
+use crate::document::{AppliedStep, DocumentChange, DocumentChangeKind, DocumentSyncRevision};
 use crate::events::{Event, NetEvent};
 
 type Answer = Result<Next<BatchOutcome>, ApplyError>;
@@ -91,6 +91,7 @@ fn queued_apply_event() {
     let followups = FollowUpNode {
         node_id: node(),
         realm_id: realm(),
+        from: AppliedStep::Usage,
     };
     let mut batch = operation(vec![event.clone()]).queuing(Some(followups));
     let plan = ApplyEventPlan {
