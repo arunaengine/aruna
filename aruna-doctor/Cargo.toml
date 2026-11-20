@@ -47,6 +47,9 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 ulid = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 aruna = { workspace = true }
 aruna-core = { workspace = true, features = ["test-hooks"] }

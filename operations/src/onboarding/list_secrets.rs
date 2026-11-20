@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use byteview::ByteView;
 use thiserror::Error;
 
@@ -31,9 +31,20 @@ pub struct SecretPage {
 /// Reads one page of secret records, then the state row of each record of that page.
 #[derive(Debug, Default, PartialEq)]
 pub struct ListSecretsOperation {
+    phase: Phase,
     after: Option<ByteView>,
     records: Vec<OnboardingSecretRecord>,
     next: Option<ByteView>,
+}
+
+/// The answer the operation waits for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Created,
+    Page,
+    States,
+    Done,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -101,7 +112,13 @@ impl Operation for ListSecretsOperation {
     type Output = SecretPage;
     type Error = ListSecretsError;
 
+    /// A page's records and their state rows come from one snapshot, never two database states.
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
+    }
+
     fn first(&mut self) -> Result<Next<Self::Output>, ListSecretsError> {
+        self.phase = Phase::Page;
         Ok(Next::Call(IoCall::Page {
             space: ONBOARDING_KEYSPACE.to_string(),
             prefix: ByteView::from(b"secret:".as_slice()),
@@ -111,23 +128,27 @@ impl Operation for ListSecretsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ListSecretsError> {
-        let values = match result {
-            IoResult::Page { rows, next } => {
+        let values = match (self.phase, result) {
+            (Phase::Page, IoResult::Page { rows, next }) => {
+                self.phase = Phase::States;
                 self.next = next;
                 return self.read_states(rows);
             }
-            IoResult::Values(values) if values.len() == self.records.len() => values,
-            IoResult::Values(_) => {
+            (Phase::States, IoResult::Values(values)) if values.len() == self.records.len() => {
+                self.phase = Phase::Done;
+                values
+            }
+            (Phase::States, IoResult::Values(_)) => {
                 return Err(ListSecretsError::UnexpectedEvent {
                     state: "ReadStates".to_string(),
                     expected: "state batch read result matching record count",
                     got: "a batch of another length",
                 });
             }
-            other => {
+            (phase, other) => {
                 return Err(ListSecretsError::UnexpectedEvent {
-                    state: "ListSecrets".to_string(),
-                    expected: "storage iteration or batch read result",
+                    state: format!("{phase:?}"),
+                    expected: "the page, then the state batch of its records",
                     got: other.label(),
                 });
             }
@@ -170,6 +191,41 @@ mod tests {
             operation.next(IoResult::Values(Vec::new())),
             Ok(Next::Done(empty))
         );
+    }
+
+    // The runner opens one read snapshot before the page, and the page reads in it.
+    #[test]
+    fn page_reads_snapshot() {
+        use aruna_core::calls::CallRun;
+        use aruna_core::effects::{Effect, StorageEffect};
+        use aruna_core::events::{Event, StorageEvent};
+        let mut run = CallRun::new(ListSecretsOperation::new(None));
+        let start = StorageEffect::StartTransaction { read: true };
+        assert_eq!(run.start().as_slice(), [Effect::Storage(start)]);
+        let txn_id = ulid::Ulid::from(5_u128);
+        let page = run.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert!(matches!(
+            page.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { txn_id: Some(read), .. })] if *read == txn_id
+        ));
+    }
+
+    // Each answer is taken only in the phase that asked for it.
+    #[test]
+    fn mismatched_answers_refused() {
+        let mut early = ListSecretsOperation::new(None);
+        early.first().unwrap();
+        let refused = early.next(IoResult::Values(Vec::new()));
+        assert!(matches!(refused, Err(ListSecretsError::UnexpectedEvent { .. })));
+        let mut twice = ListSecretsOperation::new(None);
+        twice.first().unwrap();
+        let page = || IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        twice.next(page()).unwrap();
+        let refused = twice.next(page());
+        assert!(matches!(refused, Err(ListSecretsError::UnexpectedEvent { .. })));
     }
 
     #[test]

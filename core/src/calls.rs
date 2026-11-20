@@ -125,7 +125,10 @@ impl IoCall {
 
 /// A child's `Result<Output, Error>`, boxed so events stay free of operation types. The value
 /// sits behind a mutex, so an output that is only `Send`, such as a stream, can be carried.
-pub struct ChildOutcome(Box<dyn ChildValue>);
+pub struct ChildOutcome {
+    value: Box<dyn ChildValue>,
+    failed: bool,
+}
 
 trait ChildValue: Any + Send + Sync + Debug {
     fn eq_dyn(&self, other: &dyn ChildValue) -> bool;
@@ -161,12 +164,21 @@ impl ChildOutcome {
         T: Send + Debug + PartialEq + 'static,
         E: Send + Debug + PartialEq + 'static,
     {
-        Self(Box::new(Held(Mutex::new(result))))
+        let failed = result.is_err();
+        Self {
+            value: Box::new(Held(Mutex::new(result))),
+            failed,
+        }
+    }
+
+    /// Whether the child ended with its error, readable without knowing its types.
+    pub fn failed(&self) -> bool {
+        self.failed
     }
 
     /// The child's result, or `None` when the child's output or error has another type.
     pub fn take<T: 'static, E: 'static>(self) -> Option<Result<T, E>> {
-        let value: Box<dyn Any> = self.0;
+        let value: Box<dyn Any> = self.value;
         let held = value.downcast::<Held<Result<T, E>>>().ok()?;
         Some(held.0.into_inner().unwrap_or_else(PoisonError::into_inner))
     }
@@ -174,13 +186,13 @@ impl ChildOutcome {
 
 impl Debug for ChildOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.value.fmt(f)
     }
 }
 
 impl PartialEq for ChildOutcome {
     fn eq(&self, other: &Self) -> bool {
-        self.0.eq_dyn(&*other.0)
+        self.value.eq_dyn(&*other.value)
     }
 }
 
@@ -630,7 +642,8 @@ impl<P: Operation> CallRun<P> {
                         &other,
                         Event::Storage(StorageEvent::Error {
                             error: StorageError::TransactionConflict
-                                | StorageError::TransactionNotFound,
+                                | StorageError::TransactionNotFound
+                                | StorageError::RolledBack(_),
                         })
                     ) {
                         self.operation.rolled_back();
@@ -662,6 +675,10 @@ impl<P: Operation> CallRun<P> {
                     // An adapter refusal is a valid answer of its family, yet the call failed.
                     Ok(IoResult::Event(event)) if event.label().ends_with("::Error") => {
                         warn!(event = ?event, "A call after the commit failed");
+                    }
+                    // A child's error may carry private values, so only its failure is logged.
+                    Ok(IoResult::Child(outcome)) if outcome.failed() => {
+                        warn!(call = "child operation", "A call after the commit failed");
                     }
                     Ok(_) => {}
                 }

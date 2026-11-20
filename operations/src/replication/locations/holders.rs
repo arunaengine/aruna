@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::heartbeat::HeartbeatEffect;
-use aruna_core::holder_choice::{HolderCandidate, HolderChoiceError, PickHolderOperation};
 use aruna_core::id::NodeId;
 use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
@@ -19,6 +18,7 @@ use ulid::Ulid;
 
 use super::LocationSummaryError;
 use super::remote::RemoteLocationOperation;
+use crate::holder_choice::{HolderCandidate, HolderChoiceError, PickHolderOperation};
 
 /// Holders one resolution asks at most.
 pub const MAX_HOLDER_TRIES: usize = 3;

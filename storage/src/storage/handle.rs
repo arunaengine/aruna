@@ -975,7 +975,9 @@ pub(super) fn observe_cleanup(
         (
             CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
             StorageEvent::Error {
-                error: StorageError::TransactionConflict | StorageError::TransactionNotFound,
+                error: StorageError::TransactionConflict
+                    | StorageError::TransactionNotFound
+                    | StorageError::RolledBack(_),
             },
         ) => Some(CleanupKind::Aborted),
         _ => None,
@@ -1112,6 +1114,7 @@ impl ResponseToken {
                     StorageEvent::Error {
                         error: StorageError::TransactionConflict
                             | StorageError::TransactionNotFound
+                            | StorageError::RolledBack(_)
                     }
                 ) {
                     ResponseCleanup::Terminal(txn_id)
