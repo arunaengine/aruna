@@ -23,7 +23,7 @@ use aruna_plugins::broker::{
 use aruna_plugins::host::Limit;
 use aruna_plugins::host::wit::aruna::plugin::types::{FailureKind, Trigger, WatchEvent};
 use aruna_plugins::limits::{Limits, RuntimeConfig};
-use aruna_plugins::runtime::{Invocation, InvokeError, Runtime};
+use aruna_plugins::runtime::{CompileError, Invocation, InvokeError, Runtime};
 use wasm_encoder::{ComponentSection, CustomSection};
 
 const FIXTURE: &[u8] = include_bytes!("fixture.wasm");
@@ -341,6 +341,22 @@ fn runtime() -> Runtime {
     let mut config = RuntimeConfig::default();
     config.ceiling.fuel = 1 << 50;
     Runtime::new(config).unwrap()
+}
+
+#[tokio::test]
+async fn refuses_large_first() {
+    // An artifact over the limit is refused at once, before it is hashed or waits for a slot.
+    let mut config = RuntimeConfig::default();
+    config.max_artifact = 4;
+    let runtime = Runtime::new(config).unwrap();
+    let mut prepared = std::pin::pin!(runtime.prepare(vec![0; 5]));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    let first = prepared.as_mut().poll(&mut context);
+    let refused = matches!(
+        first,
+        std::task::Poll::Ready(Err(CompileError::TooLarge { size: 5, limit: 4 }))
+    );
+    assert!(refused, "the first poll refuses the artifact");
 }
 
 fn call(trigger: Trigger) -> Invocation {
