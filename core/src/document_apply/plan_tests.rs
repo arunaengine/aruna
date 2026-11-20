@@ -32,7 +32,7 @@ use crate::document::{
 };
 use crate::effects::{Effect, StorageEffect};
 use crate::events::{Event, StorageEvent};
-use crate::keyspaces::{DOCUMENT_LIFECYCLE_KEYSPACE, SYNC_REVISION_KEYSPACE};
+use crate::keyspaces::{APPLIED_SYNC_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, SYNC_REVISION_KEYSPACE};
 use crate::metadata::{
     GraphLifecycleRecord, MetadataDeleteRecord, MetadataEventPayload, MetadataEventRecord,
     MetadataLifecycleRecord,
@@ -464,7 +464,7 @@ fn delete_queues_followups() {
         metadata_graph_tombstones: vec![tombstone(10)],
         ..DocumentReconcileResult::default()
     };
-    let row = followup_row(&followup_node(), &identity(), result).unwrap();
+    let row = followup_row(&followup_node(), &[identity()], result).unwrap();
     assert!(ran.writes.contains(&row));
     let stored: Stored = (ran.writes.iter())
         .map(|(space, key, value)| ((space.clone(), key.clone()), value.clone()))
@@ -689,7 +689,7 @@ fn batch_queues_accepted() {
         metadata_create_events: vec![accepted.1.clone()],
         ..DocumentReconcileResult::default()
     };
-    let row = followup_row(&followup_node(), &identity(), result).unwrap();
+    let row = followup_row(&followup_node(), &[identity()], result).unwrap();
     assert!(ran.writes.contains(&row));
     assert_eq!(ran.output().accepted, vec![accepted]);
 
@@ -697,6 +697,52 @@ fn batch_queues_accepted() {
     let plan = CreateBatchPlan::new(Vec::new(), cursor, Vec::new()).unwrap();
     let ran = run(plan.queuing(Some(followup_node())), &nothing());
     assert_eq!(ran.writes, vec![cursor_row()]);
+}
+
+// The events one create transaction accepts share one follow-up row in acceptance order, so the
+// drain never projects the update before its create, even where their own rows sorted reversed.
+#[test]
+fn batch_keeps_order() {
+    let (create, stored) = accepted_create();
+    let alone = |identity: SyncQuarantineIdentity| {
+        let empty = DocumentReconcileResult::default();
+        let row = followup_row(&followup_node(), &[identity], empty).unwrap();
+        row.1.to_vec()
+    };
+    let first = alone(create.identity);
+    let sorts_first = |actor_seq| {
+        let mut identity = create.identity;
+        identity.actor_seq = actor_seq;
+        alone(identity) < first
+    };
+    let actor_seq = (2..64)
+        .find(|seq| sorts_first(*seq))
+        .expect("an identity whose own row sorts first");
+    let mut update = create.clone();
+    update.identity.actor_seq = actor_seq;
+    update.record.event_id = Ulid::from_parts(8, 8);
+    update.record.record.last_event_id = update.record.event_id;
+    update.record.payload = MetadataEventPayload::UpsertContextualEntity {
+        jsonld: r##"{"@id":"#person","@type":"Person"}"##.to_string(),
+    };
+    update.target = DocumentTarget::MetadataCreateEvent {
+        document_id: update.record.record.document_id,
+        event_id: update.record.event_id,
+    };
+    let order = [create.clone(), update.clone()];
+    let plan = CreateBatchPlan::new(order.to_vec(), Vec::new(), Vec::new()).unwrap();
+    let ran = run(plan.queuing(Some(followup_node())), &stored);
+    let result = DocumentReconcileResult {
+        targets: vec![create.target.clone(), update.target.clone()],
+        metadata_create_events: vec![create.record.clone(), update.record.clone()],
+        ..DocumentReconcileResult::default()
+    };
+    let identities = [create.identity, update.identity];
+    let row = followup_row(&followup_node(), &identities, result).unwrap();
+    let queued: Vec<_> = (ran.writes.iter())
+        .filter(|(space, ..)| space == APPLIED_SYNC_KEYSPACE)
+        .collect();
+    assert_eq!(queued, vec![&row]);
 }
 
 #[test]
