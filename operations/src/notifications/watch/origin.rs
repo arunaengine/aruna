@@ -188,7 +188,8 @@ impl EmitWatchOperation {
                     holders.extend(members);
                 }
                 None => {
-                    self.open.extend(only.iter().filter(|holder| **holder != local));
+                    self.open
+                        .extend(only.iter().filter(|holder| **holder != local));
                     holders.retain(|holder| *holder == local && only.contains(holder));
                 }
             }

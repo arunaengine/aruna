@@ -165,7 +165,9 @@ fn retry_needs_membership() {
     let mut device = single_server();
     device.ensure_node(node_id(3), RealmNodeKind::User { owner: user(1, 2) });
     let mut enrolled = retrying();
-    enrolled.next(child::<_, GetConfigError>(Ok(device))).unwrap();
+    enrolled
+        .next(child::<_, GetConfigError>(Ok(device)))
+        .unwrap();
     let empty = child::<_, WatchSubscriptionError>(Ok(WatchPage::default()));
     assert_eq!(enrolled.next(empty), Ok(Next::Done(Vec::new())));
 }

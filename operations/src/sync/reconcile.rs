@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::document::{AppliedStep, DocumentEffect, DocumentNetEvent, DocumentReconcileResult};
+use aruna_core::document::{
+    AppliedStep, DocumentEffect, DocumentNetEvent, DocumentReconcileResult,
+};
 use aruna_core::document_apply::ApplyError;
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::effects::{Effect, NetEffect};
