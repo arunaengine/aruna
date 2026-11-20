@@ -710,26 +710,6 @@ impl OperationsTaskHandler {
         }
     }
 
-    pub(super) async fn drain_refresh_queue(&self) {
-        let drain = aruna_operations::s3::object::metadata_drain::DrainRefreshOperation::new();
-        match drive(drain, &self.context).await {
-            Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainRefreshQueue, Duration::ZERO)
-                    .await;
-            }
-            Ok(result) => {
-                if let Some(after) = result.next_due_after {
-                    self.reschedule_timer(TaskKey::DrainRefreshQueue, after)
-                        .await;
-                }
-            }
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainRefreshQueue, error = ?error, "Failed to drain reference metadata refresh queue");
-                self.reschedule_timer(TaskKey::DrainRefreshQueue, REFRESH_RETRY_AFTER)
-                    .await;
-            }
-        }
-    }
 }
 
 impl OperationsTaskHandler {

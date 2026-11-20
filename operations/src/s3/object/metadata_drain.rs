@@ -425,7 +425,7 @@ impl Operation for SettleJob {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum DrainState {
     ReadDue,
     ReadJob(Key),
@@ -436,7 +436,7 @@ enum DrainState {
 
 /// Runs one batch of due refreshes: walks a page of the due index in due order with a point read
 /// per row, refreshes each job and settles it, rescheduling the ones that failed.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrainRefreshOperation {
     state: DrainState,
     started_ms: u64,

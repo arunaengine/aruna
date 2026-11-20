@@ -155,7 +155,6 @@ use aruna_operations::replication::mirror_repair::drain::{
 };
 use aruna_operations::replication::page::deliver::MetadataPages;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
-use aruna_operations::s3::object::metadata::REFRESH_RETRY_AFTER;
 use aruna_operations::sync::document_outbox::{
     DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
 };
@@ -805,9 +804,7 @@ impl OperationsTaskHandler {
             TaskKey::DrainReplicationQueue => Box::pin(async move {
                 self.drain_replication_queue().await;
             }),
-            TaskKey::DrainRefreshQueue => Box::pin(async move {
-                self.drain_refresh_queue().await;
-            }),
+            TaskKey::DrainRefreshQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainNotificationOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::PruneNotifications => Box::pin(self.run_trigger(key)),
             TaskKey::PublishWatchInterest => Box::pin(self.run_trigger(key)),

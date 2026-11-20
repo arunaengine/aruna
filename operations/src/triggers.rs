@@ -24,9 +24,9 @@ use thiserror::Error;
 use crate::blob::cleanup_timer::CleanupTimerOperation;
 use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
 use crate::blob::migration::drain::ProcessMigrationsOperation;
+use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
-use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
@@ -40,6 +40,8 @@ use crate::notifications::serve::{InboxRequest, ServeInboxOperation, WatchEvents
 use crate::notifications::watch::drain::WatchDrainOperation;
 use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;
+use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
+use crate::s3::object::metadata_drain::DrainRefreshOperation;
 
 /// What a timer keeps on this node between its runs, in memory only: its attempts since the last
 /// clean run and where its work goes on. The shell stores it per key and hands it back unread, so
@@ -155,6 +157,7 @@ pub enum TimerOperation {
     PruneConnectorReferences(PruneReferencesOperation),
     DeliverKeyWakes(DeliverWakesOperation),
     DrainCleanupQueue(CleanupTimerOperation),
+    DrainRefreshQueue(DrainRefreshOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -201,6 +204,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::DrainCleanupQueue => Some(TimerOperation::DrainCleanupQueue(
             CleanupTimerOperation::new(input),
         )),
+        TaskKey::DrainRefreshQueue => Some(TimerOperation::DrainRefreshQueue(
+            DrainRefreshOperation::new(),
+        )),
         _ => None,
     }
 }
@@ -221,6 +227,7 @@ macro_rules! each_timer {
             TimerOperation::PruneConnectorReferences($operation) => $body,
             TimerOperation::DeliverKeyWakes($operation) => $body,
             TimerOperation::DrainCleanupQueue($operation) => $body,
+            TimerOperation::DrainRefreshQueue($operation) => $body,
         }
     };
 }
@@ -419,6 +426,21 @@ impl TimerRun for DeliverWakesOperation {
             cursor: delivery.next.map(|key| key.to_vec()),
         };
         Ok(TimerPlan { after, memory })
+    }
+}
+
+impl TimerRun for DrainRefreshOperation {
+    /// More due refreshes run at once, the next one when it is due; a failed batch retries soon.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let drained = result.map_err(|error| TimerFailure {
+            retry_after: REFRESH_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        let after = match drained.has_more_due {
+            true => Some(Duration::ZERO),
+            false => drained.next_due_after,
+        };
+        Ok(TimerPlan::from(after))
     }
 }
 
@@ -692,6 +714,8 @@ impl Operation for PeerOperation {
 mod tests {
     use super::*;
     use crate::blob::hidden::HiddenSweepOutcome;
+    use crate::s3::object::metadata::ReferenceRefreshError;
+    use crate::s3::object::metadata_drain::ReferenceDrainResult;
     use crate::blob::migration::drain::MigrationRun;
     use crate::blob::migration::shared::MigrationError;
     use crate::connectors::reference_prune::PruneError;
@@ -769,6 +793,26 @@ mod tests {
         assert_eq!(unread, Ok(TimerPlan::from(Some(WAKE_RETRY))));
         let idle = DeliverWakesOperation::rearm(Ok(Delivery::default()));
         assert_eq!(idle, Ok(TimerPlan::default()));
+    }
+
+    #[test]
+    fn refresh_drain_plans() {
+        // More due work runs at once, the next due one at its time; a failure retries soon.
+        let result = |has_more_due, next_due_after| ReferenceDrainResult {
+            processed: 0,
+            succeeded: 0,
+            failed: 0,
+            has_more_due,
+            next_due_after,
+        };
+        let more = DrainRefreshOperation::rearm(Ok(result(true, None))).unwrap();
+        assert_eq!(more.after, Some(Duration::ZERO));
+        let due = Some(Duration::from_secs(9));
+        let later = DrainRefreshOperation::rearm(Ok(result(false, due))).unwrap();
+        assert_eq!(later.after, due);
+        let error = ReferenceRefreshError::Refresh("boom".to_string());
+        let failed = DrainRefreshOperation::rearm(Err(error));
+        assert_eq!(failed.unwrap_err().retry_after, REFRESH_RETRY_AFTER);
     }
 
     #[test]
