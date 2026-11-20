@@ -92,7 +92,7 @@ impl ListWatchesOperation {
                 }
             };
             if let Some(reason) = foreign {
-                return Err(WatchSubscriptionError::Storage(reason.to_string()));
+                return Err(WatchSubscriptionError::Malformed(reason.to_string()));
             }
             self.page.subscriptions.push(subscription);
         }

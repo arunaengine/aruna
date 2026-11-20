@@ -49,6 +49,10 @@ pub enum WatchSubscriptionError {
     CapExceeded,
     #[error("{0}")]
     Storage(String),
+    /// A stored watch subscription that does not decode or fit its key or scope; reading it
+    /// again never passes.
+    #[error("{0}")]
+    Malformed(String),
 }
 
 impl From<IoError> for WatchSubscriptionError {
@@ -188,26 +192,28 @@ pub(crate) fn watch_delete_replication(
     WatchReplication { revision, outbox }
 }
 
+fn malformed(error: impl ToString) -> WatchSubscriptionError {
+    WatchSubscriptionError::Malformed(error.to_string())
+}
+
 pub(crate) fn decode_stored_subscription(
     key: &[u8],
     value: &[u8],
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let (key_owner, key_watch_id) =
-        parse_watch_key(key).map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?;
-    let subscription = WatchSubscription::from_bytes(value)
-        .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?;
+    let (key_owner, key_watch_id) = parse_watch_key(key).map_err(malformed)?;
+    let subscription = WatchSubscription::from_bytes(value).map_err(malformed)?;
     if key_owner.is_nil()
         || key_watch_id.is_nil()
         || subscription.owner != key_owner
         || subscription.watch_id != key_watch_id
     {
-        return Err(WatchSubscriptionError::Storage(
+        return Err(WatchSubscriptionError::Malformed(
             "stored watch subscription key does not match payload identity".to_string(),
         ));
     }
     validate_subscription_fields(&subscription.path_prefix, subscription.event_mask).map_err(
         |error| {
-            WatchSubscriptionError::Storage(format!(
+            WatchSubscriptionError::Malformed(format!(
                 "stored watch subscription violates invariants: {error}"
             ))
         },
@@ -215,7 +221,7 @@ pub(crate) fn decode_stored_subscription(
     if !subscription.authorization.is_valid()
         || subscription.authorization.watch_path_prefix != subscription.path_prefix
     {
-        return Err(WatchSubscriptionError::Storage(
+        return Err(WatchSubscriptionError::Malformed(
             "stored watch subscription has invalid authorization binding".to_string(),
         ));
     }

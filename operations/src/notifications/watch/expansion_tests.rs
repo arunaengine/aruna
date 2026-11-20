@@ -256,3 +256,26 @@ fn failed_children_retry() {
     let broken = operation.upserted(upsert(), broken);
     assert!(matches!(broken, Err(ExpandError::Fatal(_))));
 }
+
+// A stored watch row that does not decode fails the same way on every delivery, so the
+// expansion refuses it instead of retrying it forever.
+#[test]
+fn malformed_watch_final() {
+    let scope = WatchScope::Page {
+        realm_id: REALM,
+        start: None,
+        limit: 4,
+    };
+    let mut listing = ListWatchesOperation::new(scope);
+    listing.first().unwrap();
+    let key = watch_subscription_key(user(4, 2), Ulid::from_bytes([6; 16]));
+    let rows = vec![(key, Value::from(vec![0xff]))];
+    let Err(error) = listing.next(IoResult::Page { rows, next: None }) else {
+        panic!("an undecodable watch row fails the listing");
+    };
+    assert!(matches!(error, WatchSubscriptionError::Malformed(_)));
+    let mut expansion = expanding(None);
+    expansion.first().unwrap();
+    let failed = IoResult::Child(ChildOutcome::new(Err::<WatchPage, _>(error)));
+    assert!(matches!(expansion.next(failed), Err(ExpandError::Fatal(_))));
+}

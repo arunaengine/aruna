@@ -294,7 +294,7 @@ mod tests {
         );
         assert!(matches!(
             decode_stored_subscription(&wrong_key, &bytes),
-            Err(WatchSubscriptionError::Storage(_))
+            Err(WatchSubscriptionError::Malformed(_))
         ));
 
         subscription.watch_id = Ulid::nil();
@@ -307,7 +307,7 @@ mod tests {
                 &nil_key,
                 &subscription.to_bytes().expect("nil row encodes")
             ),
-            Err(WatchSubscriptionError::Storage(_))
+            Err(WatchSubscriptionError::Malformed(_))
         ));
 
         subscription.watch_id = watch_id;
@@ -317,7 +317,7 @@ mod tests {
                 &key,
                 &subscription.to_bytes().expect("invalid row encodes")
             ),
-            Err(WatchSubscriptionError::Storage(_))
+            Err(WatchSubscriptionError::Malformed(_))
         ));
     }
 
