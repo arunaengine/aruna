@@ -3609,14 +3609,17 @@ mod test {
         let minted = drive(Minter::default(), &bare_context()).await.unwrap();
         crate::recorder::disable();
         // Other tests may record at the same time, so only this run's header counts.
-        let header = crate::recorder::take().records.into_iter().find_map(|record| {
-            match record.entry {
+        let header = crate::recorder::take()
+            .records
+            .into_iter()
+            .find_map(|record| match record.entry {
                 Entry::Started {
-                    operation, entropy, ..
+                    operation,
+                    entropy,
+                    ..
                 } if operation.contains("::Minter>") => Some((record.at_ms, entropy)),
                 _ => None,
-            }
-        });
+            });
         let (at_ms, entropy) = header.expect("the run was recorded");
         let again = aruna_core::id_mint::IdMint::new(entropy).mint(at_ms);
         assert_eq!(again, minted, "the header gives the run's ids again");
