@@ -399,17 +399,15 @@ impl Resolver {
         };
         match kept {
             Kept::Fixed(answer) => Some(answer),
-            Kept::Realm(realm) => {
-                match self.direct(realm, item, now).await {
-                    Answer::Redirect(target) => Some(Answer::Redirect(target)),
-                    _ => {
-                        if let Ok(mut cache) = self.cache.lock() {
-                            cache.pop(key);
-                        }
-                        None
+            Kept::Realm(realm) => match self.direct(realm, item, now).await {
+                Answer::Redirect(target) => Some(Answer::Redirect(target)),
+                _ => {
+                    if let Ok(mut cache) = self.cache.lock() {
+                        cache.pop(key);
                     }
+                    None
                 }
-            }
+            },
         }
     }
 
@@ -421,7 +419,12 @@ impl Resolver {
             .await
             .map_err(|_| StoreError::Poisoned)??;
         let mut approved: Vec<_> = (resolvable.into_iter())
-            .map(|entry| (entry.registration.payload.descriptor.payload.realm_id, entry))
+            .map(|entry| {
+                (
+                    entry.registration.payload.descriptor.payload.realm_id,
+                    entry,
+                )
+            })
             .collect();
         approved.sort_by_key(|(realm, _)| Some(*realm) != self.default_realm);
         Ok(approved)

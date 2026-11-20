@@ -316,7 +316,10 @@ async fn serving_policy_hides() {
         };
         let resume = decode_resume(&next).expect("a visit cursor decodes");
         let fields = visible_fields(&resume);
-        assert!(fields.iter().all(|field| !field.contains("private")), "{resume:?}");
+        assert!(
+            fields.iter().all(|field| !field.contains("private")),
+            "{resume:?}"
+        );
         cursors += 1;
         cursor = Some(next);
     }
@@ -355,7 +358,10 @@ fn cursor_fields_named() {
         group: Some("private/".into()),
     };
     assert_eq!(visible_fields(&after), ["private/a", "private/"]);
-    assert_eq!(visible_fields(&Resume::From("private/b".into())), ["private/b"]);
+    assert_eq!(
+        visible_fields(&Resume::From("private/b".into())),
+        ["private/b"]
+    );
     let hidden = Resume::Hidden {
         lower: "private/c".into(),
         node: iroh::SecretKey::from_bytes(&[1; 32]).public(),

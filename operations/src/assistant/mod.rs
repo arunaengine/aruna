@@ -98,7 +98,11 @@ fn totals_entry(
     totals: AssistantChatTotals,
 ) -> Result<(String, Key, Value), ChatStoreError> {
     let key = ByteView::from(user_id.to_storage_key());
-    Ok((CHAT_TOTAL_KEYSPACE.to_string(), key, totals.to_bytes()?.into()))
+    Ok((
+        CHAT_TOTAL_KEYSPACE.to_string(),
+        key,
+        totals.to_bytes()?.into(),
+    ))
 }
 
 /// What reading a user's chat totals needs next.

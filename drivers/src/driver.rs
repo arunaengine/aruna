@@ -3614,9 +3614,7 @@ mod test {
             .into_iter()
             .find_map(|record| match record.entry {
                 Entry::Started {
-                    operation,
-                    entropy,
-                    ..
+                    operation, entropy, ..
                 } if operation.contains("::Minter>") => Some((record.at_ms, entropy)),
                 _ => None,
             });

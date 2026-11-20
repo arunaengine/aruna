@@ -440,7 +440,10 @@ mod tests {
         let names: Vec<_> = (std::fs::read_dir(dir.path()).unwrap())
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert!(names.iter().all(|name| !name.ends_with(".partial")), "{names:?}");
+        assert!(
+            names.iter().all(|name| !name.ends_with(".partial")),
+            "{names:?}"
+        );
     }
 
     #[test]

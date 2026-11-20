@@ -146,7 +146,9 @@ fn written_head(call: &IoCall) -> AssistantChatHead {
     let IoCall::Write(rows) = call else {
         panic!("expected a write, got {call:?}");
     };
-    let head = rows.iter().find(|(_, key, _)| *key == head_key(user(), CHAT));
+    let head = rows
+        .iter()
+        .find(|(_, key, _)| *key == head_key(user(), CHAT));
     let (_, _, value) = head.expect("the write holds the head");
     AssistantChatHead::from_bytes(value.as_ref()).unwrap()
 }

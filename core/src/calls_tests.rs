@@ -741,7 +741,10 @@ struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl std::io::Write for Captured {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut logs = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut logs = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         logs.extend_from_slice(buf);
         Ok(buf.len())
     }

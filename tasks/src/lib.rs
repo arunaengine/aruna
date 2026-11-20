@@ -1798,7 +1798,11 @@ mod tests {
         }
         state.dispatch_due_timers(now, &weak);
         assert_eq!(state.running_by_id.len(), 2);
-        assert!(state.timers_by_key.contains_key(&TaskKey::DrainRefreshQueue));
+        assert!(
+            state
+                .timers_by_key
+                .contains_key(&TaskKey::DrainRefreshQueue)
+        );
         assert!(
             state.next_deadline().is_none_or(|deadline| deadline > now),
             "a full scheduler does not wake for the waiting deadline"

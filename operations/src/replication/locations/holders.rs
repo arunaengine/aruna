@@ -128,7 +128,9 @@ impl HolderResolveOperation {
             }
             Ok(summary) if summary.group_id.is_some() && summary.blob_size.is_some() => {
                 self.stage = HolderStage::Origin(holder, Box::new(summary));
-                Ok(Next::Call(IoCall::child(ReadInfoOperation::new(vec![holder]))))
+                Ok(Next::Call(IoCall::child(ReadInfoOperation::new(vec![
+                    holder,
+                ]))))
             }
             Err(LocationSummaryError::Denied) => {
                 self.denied = true;
@@ -179,7 +181,10 @@ impl Operation for HolderResolveOperation {
             }
             HolderStage::Origin(holder, summary) => {
                 let documents = result.child::<Documents, NodeInfoError>()??;
-                match documents.get(&holder).and_then(|document| document.urls.api.clone()) {
+                match documents
+                    .get(&holder)
+                    .and_then(|document| document.urls.api.clone())
+                {
                     Some(api_url) => Ok(Next::Done(HolderAnswer::Found {
                         node_id: holder,
                         summary,

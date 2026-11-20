@@ -98,7 +98,9 @@ impl Sites {
     }
 
     async fn owned(&self, resolver: &Resolver, rest: &str, now: u64) -> Answer {
-        resolver.owned(rest, now, IpAddr::from([192, 0, 2, 1])).await
+        resolver
+            .owned(rest, now, IpAddr::from([192, 0, 2, 1]))
+            .await
     }
 
     fn asked(&self) -> usize {
@@ -792,7 +794,6 @@ async fn probes_follow_nothing() {
     let refused = probe(&strict, url("/ok"), Source::Legacy).await;
     assert_eq!(refused, Holding::Unavailable);
 }
-
 
 // A current realm's nodes serve the w3id route, so its 404 is final: no older route is asked
 // and no route check runs, so an absent id costs one request per realm.

@@ -232,7 +232,11 @@ mod tests {
         daemon.verify().unwrap();
         let left = std::fs::read_dir(&daemon.root).unwrap();
         let names: Vec<_> = left.map(|entry| entry.unwrap().file_name()).collect();
-        assert!(names.iter().all(|name| !name.to_string_lossy().starts_with("health")));
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.to_string_lossy().starts_with("health"))
+        );
     }
 
     #[test]
