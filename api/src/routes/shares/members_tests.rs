@@ -28,7 +28,12 @@ struct Shared {
 }
 
 async fn shared() -> Shared {
-    let members = members(2, &["m"], 0).await;
+    shared_ranges(&["m"]).await
+}
+
+/// Two members whose bucket ranges start at `bounds`.
+async fn shared_ranges(bounds: &[&str]) -> Shared {
+    let members = members(2, bounds, 0).await;
     let node = &members.nodes[0];
     let capabilities = NodeCapabilities::user_node(members.realm_id).unwrap();
     let context = node.context.clone();
@@ -347,6 +352,62 @@ fn visible_fields(resume: &aruna_operations::s3::object::pages::Resume) -> Vec<S
             .flatten()
             .collect(),
     }
+}
+
+// A page that visits its bound of empty ranges goes on from the next range's lower bound.
+#[tokio::test]
+async fn empty_ranges_resume() {
+    use aruna_operations::s3::object::pages::{Resume, decode_resume};
+    let bounds: Vec<String> = (0..64).map(|n| format!("k{n:02}")).collect();
+    let bounds: Vec<&str> = bounds.iter().map(String::as_str).collect();
+    let shared = shared_ranges(&bounds).await;
+    put(&shared, 0, "z.txt", "last").await;
+    let (_, visit) = visit(&shared, ShareModeBody::Read).await;
+    let listed = page(&shared, &visit, ("", None, Some(10))).await.unwrap();
+    assert!(listed.files.is_empty() && listed.folders.is_empty());
+    let next = listed.next_cursor.expect("the range bound ends the page");
+    assert_eq!(
+        decode_resume(&next).unwrap(),
+        Resume::From("k63".to_string())
+    );
+    let rest = page(&shared, &visit, ("", Some(next), Some(10)))
+        .await
+        .unwrap();
+    let names: Vec<_> = rest.files.into_iter().map(|file| file.name).collect();
+    assert_eq!(names, ["z.txt"]);
+}
+
+// The serving member's own policy hides a run longer than its scan budget: the page stops among
+// the hidden entries with a sealed cursor that names none of them. A holder's sealed cursor is
+// followed by the serving member's own scan, so only this member's rules end a page there.
+#[tokio::test]
+async fn hidden_run_resumes() {
+    use aruna_operations::s3::object::pages::{Resume, decode_resume};
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
+    let shared = shared().await;
+    // Member 0 coordinates the keys below "m"; the visible key sorts after the hidden run.
+    for n in 0..=SCAN_BUDGET {
+        put(&shared, 0, &format!("hidden{n:04}.txt"), "closed").await;
+    }
+    put(&shared, 0, "i.txt", "open").await;
+    let expression = "request.session.kind == 'share' && path.contains('/hidden')";
+    shared.members.deny_on(0, expression).await;
+    let (_, visit) = visit(&shared, ShareModeBody::Read).await;
+    let listed = page(&shared, &visit, ("", None, Some(10))).await.unwrap();
+    assert!(listed.files.is_empty());
+    let next = listed.next_cursor.expect("the scan budget ends the page");
+    let resume = decode_resume(&next).unwrap();
+    assert!(matches!(resume, Resume::Hidden { .. }), "{resume:?}");
+    let fields = visible_fields(&resume);
+    assert!(
+        fields.iter().all(|field| !field.contains("hidden")),
+        "{resume:?}"
+    );
+    let rest = page(&shared, &visit, ("", Some(next), Some(10)))
+        .await
+        .unwrap();
+    let names: Vec<_> = rest.files.into_iter().map(|file| file.name).collect();
+    assert_eq!(names, ["i.txt"]);
 }
 
 #[test]

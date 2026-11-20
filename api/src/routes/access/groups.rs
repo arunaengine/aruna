@@ -114,6 +114,13 @@ pub struct RoleResponse {
     pub public: bool,
 }
 
+/// A bucket and member whose key request could not be opened; granting again retries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct KeyRequestFailure {
+    pub bucket: String,
+    pub user_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreatedRoleResponse {
     #[serde(flatten)]
@@ -124,6 +131,9 @@ pub struct CreatedRoleResponse {
     /// False when a key request could not be opened; granting the role again retries it.
     #[serde(default)]
     pub key_requests_complete: bool,
+    /// The buckets and users whose key request could not be opened.
+    #[serde(default)]
+    pub key_requests_failed: Vec<KeyRequestFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -144,6 +154,9 @@ pub struct GroupRolesResponse {
     /// False when a key request could not be opened; adding the member again retries it.
     #[serde(default)]
     pub key_requests_complete: bool,
+    /// The buckets and users whose key request could not be opened.
+    #[serde(default)]
+    pub key_requests_failed: Vec<KeyRequestFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
@@ -1586,7 +1599,8 @@ administrative path for the user being added, so authority can be granted per me
                     }
                 ],
                 "key_requests": ["01JABCDEF0123456789ABCDEFG"],
-                "key_requests_complete": true
+                "key_requests_complete": true,
+                "key_requests_failed": []
             })
         ),
         (status = 400, description = "Malformed ids, a user id standing for everyone, or no default `user` role to fall back on", body = ErrorResponse),
@@ -1655,7 +1669,7 @@ pub async fn add_group_member(
     .await
     .map_err(map_member_error)?;
     let members = vec![user_id];
-    let (key_requests, key_requests_complete) =
+    let keys =
         crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members)
             .await;
 
@@ -1663,8 +1677,9 @@ pub async fn add_group_member(
         StatusCode::CREATED,
         Json(GroupRolesResponse {
             roles: map_roles(auth_doc, state.get_realm_id()),
-            key_requests,
-            key_requests_complete,
+            key_requests: keys.opened,
+            key_requests_complete: keys.complete,
+            key_requests_failed: keys.failed,
         }),
     ))
 }
@@ -1856,7 +1871,8 @@ administrative path.
                 ],
                 "public": false,
                 "key_requests": ["01JABCDEF0123456789ABCDEFG"],
-                "key_requests_complete": true
+                "key_requests_complete": true,
+                "key_requests_failed": []
             })
         ),
         (status = 400, description = "Reserved or empty name, an unknown grant value, a permission path outside the group, a malformed assigned user, or a public role asking for more than `READ`", body = ErrorResponse),
@@ -1956,13 +1972,14 @@ pub async fn create_group_role(
         crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
     }
     let members = assigned_users.into_iter().collect();
-    let (key_requests, key_requests_complete) =
+    let keys =
         crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members)
             .await;
     let role = CreatedRoleResponse {
         role,
-        key_requests,
-        key_requests_complete,
+        key_requests: keys.opened,
+        key_requests_complete: keys.complete,
+        key_requests_failed: keys.failed,
     };
     Ok((StatusCode::CREATED, Json(role)))
 }

@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TXN_ENTRY_LIMIT: usize = 1_000;
+/// Bytes of keys and values one import transaction holds before it commits, so large values
+/// commit in smaller batches than the entry limit alone gives.
+const TXN_BYTE_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportStats {
@@ -128,11 +131,12 @@ pub(crate) fn unix_now() -> Result<u64, SnapshotError> {
         .as_secs())
 }
 
-/// Commits one keyspace's imported entries in transactions of bounded size.
+/// Commits one keyspace's imported entries in transactions of bounded entries and bytes.
 pub(crate) struct ImportKeyspaceState {
     keyspace: OptimisticTxKeyspace,
     pending_txn: Option<fjall::OptimisticWriteTx>,
     pending_txn_entries: usize,
+    pending_txn_bytes: usize,
 }
 
 impl ImportKeyspaceState {
@@ -141,6 +145,7 @@ impl ImportKeyspaceState {
             keyspace,
             pending_txn: None,
             pending_txn_entries: 0,
+            pending_txn_bytes: 0,
         }
     }
 
@@ -155,11 +160,12 @@ impl ImportKeyspaceState {
         }
 
         if let Some(txn) = self.pending_txn.as_mut() {
+            self.pending_txn_bytes += key.len() + value.len();
             txn.insert(self.keyspace.clone(), key, value);
             self.pending_txn_entries += 1;
         }
 
-        if self.pending_txn_entries >= TXN_ENTRY_LIMIT {
+        if self.pending_txn_entries >= TXN_ENTRY_LIMIT || self.pending_txn_bytes >= TXN_BYTE_LIMIT {
             self.commit_pending_txn()?;
         }
 
@@ -175,6 +181,7 @@ impl ImportKeyspaceState {
             let _ = txn.commit()?;
         }
         self.pending_txn_entries = 0;
+        self.pending_txn_bytes = 0;
         Ok(())
     }
 }
@@ -199,7 +206,8 @@ pub(crate) fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotEr
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyspaceCreateOptions, OptimisticTxDatabase, import_new_database, snapshot_database,
+        ImportKeyspaceState, KeyspaceCreateOptions, OptimisticTxDatabase, TXN_BYTE_LIMIT,
+        import_new_database, snapshot_database,
     };
     use crate::tests::fixtures::env_lock;
     use aruna_api::server::state::ServerState;
@@ -235,6 +243,29 @@ mod tests {
     use tempfile::tempdir;
     use tokio_util::io::ReaderStream;
     use ulid::Ulid;
+
+    // Large values commit once their bytes reach the limit, long before the entry limit.
+    #[test]
+    fn large_values_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OptimisticTxDatabase::builder(dir.path()).open().unwrap();
+        let keyspace = db
+            .keyspace("large", KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut state = ImportKeyspaceState::new(keyspace);
+        state.insert(&db, b"a".to_vec(), vec![0; 16]).unwrap();
+        assert!(
+            state.pending_txn.is_some(),
+            "a small value waits for its batch"
+        );
+        state
+            .insert(&db, b"b".to_vec(), vec![0; TXN_BYTE_LIMIT])
+            .unwrap();
+        assert!(
+            state.pending_txn.is_none(),
+            "the batch committed on its bytes"
+        );
+    }
 
     #[tokio::test]
     async fn snapshot_preserves_data() {

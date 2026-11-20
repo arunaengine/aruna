@@ -187,7 +187,10 @@ pub fn timer_needs(key: &TaskKey) -> TimerNeeds {
             | TaskKey::MaintainRanges
     );
     TimerNeeds {
-        facts: matches!(key, TaskKey::SyncPlacements { .. } | TaskKey::PublishNodeInfo),
+        facts: matches!(
+            key,
+            TaskKey::SyncPlacements { .. } | TaskKey::PublishNodeInfo
+        ),
         routing,
         running: matches!(key, TaskKey::PublishNodeInfo),
         cluster: matches!(key, TaskKey::DrainWitnessQueue | TaskKey::MaintainRanges),
@@ -959,7 +962,10 @@ impl PeerAnswer {
             Alpn::JobControl => Some(PeerAnswer::Job(JobAnswer::unavailable(failure))),
             Alpn::NativeReference => {
                 let reject = NativeReferenceReject::Unavailable(failure.to_string());
-                Some(PeerAnswer::Native((NativeReferenceResponse::Rejected(reject), None)))
+                Some(PeerAnswer::Native((
+                    NativeReferenceResponse::Rejected(reject),
+                    None,
+                )))
             }
             _ => None,
         }
@@ -1562,7 +1568,10 @@ mod tests {
     // only the heartbeat reads facts and job counts, and only the materialization drain the cores.
     #[test]
     fn telemetry_only_heartbeat() {
-        assert_eq!(timer_needs(&TaskKey::DrainNotificationOutbox), TimerNeeds::default());
+        assert_eq!(
+            timer_needs(&TaskKey::DrainNotificationOutbox),
+            TimerNeeds::default()
+        );
         let heartbeat = timer_needs(&TaskKey::PublishNodeInfo);
         assert!(heartbeat.facts && heartbeat.running && !heartbeat.routing);
         let materialize = timer_needs(&TaskKey::DrainMaterializationQueue);

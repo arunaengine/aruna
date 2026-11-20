@@ -13,6 +13,8 @@ use aruna_core::task::{PullEffect, PullEvent, PullProgress};
 
 /// How long a refusal waits for its device; a later status answers none, so it claims again.
 const REFUSAL_KEPT: Duration = Duration::from_secs(3600);
+/// How often a claim drops ended runs and stale refusals; between sweeps they only wait.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 enum PullTask {
@@ -26,10 +28,17 @@ enum PullTask {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct PullRegistry(Mutex<HashMap<Vec<u8>, PullTask>>);
+pub(crate) struct PullRegistry(Mutex<Pulls>);
+
+/// The pulls by receipt key and when they were last swept.
+#[derive(Debug, Default)]
+struct Pulls {
+    tasks: HashMap<Vec<u8>, PullTask>,
+    swept: Option<Instant>,
+}
 
 impl PullRegistry {
-    fn pulls(&self) -> MutexGuard<'_, HashMap<Vec<u8>, PullTask>> {
+    fn pulls(&self) -> MutexGuard<'_, Pulls> {
         self.0.lock().unwrap_or_else(|error| error.into_inner())
     }
 
@@ -53,8 +62,8 @@ impl PullRegistry {
         now: Instant,
     ) -> Result<PullProgress, SyncPullStatus> {
         let mut pulls = self.pulls();
-        sweep(&mut pulls, now);
-        if let Some(PullTask::Running { bytes_done, total }) = pulls.get(&key)
+        pulls.sweep(now);
+        if let Some(PullTask::Running { bytes_done, total }) = pulls.tasks.get(&key)
             && let Some(bytes_done) = bytes_done.upgrade()
         {
             let bytes_done = bytes_done.load(Ordering::Relaxed);
@@ -63,24 +72,25 @@ impl PullRegistry {
         }
         let progress = PullProgress::default();
         let bytes_done = Arc::downgrade(&progress.0);
-        pulls.insert(key, PullTask::Running { bytes_done, total });
+        pulls
+            .tasks
+            .insert(key, PullTask::Running { bytes_done, total });
         Ok(progress)
     }
 
     // A commit is answered by its receipt from now on, a refusal by its entry.
     fn finish(&self, key: Vec<u8>, result: Result<SyncPullAck, SyncRefusal>, now: Instant) {
-        let mut pulls = self.pulls();
-        sweep(&mut pulls, now);
+        let tasks = &mut self.pulls().tasks;
         match result {
-            Ok(_) => pulls.remove(&key),
-            Err(refusal) => pulls.insert(key, PullTask::Refused { refusal, at: now }),
+            Ok(_) => tasks.remove(&key),
+            Err(refusal) => tasks.insert(key, PullTask::Refused { refusal, at: now }),
         };
     }
 
     // The run `key` names; a refusal is handed out once and a dead run is forgotten.
     fn status(&self, key: &[u8], now: Instant) -> Option<SyncPullStatus> {
-        let mut pulls = self.pulls();
-        if let Some(PullTask::Running { bytes_done, total }) = pulls.get(key)
+        let tasks = &mut self.pulls().tasks;
+        if let Some(PullTask::Running { bytes_done, total }) = tasks.get(key)
             && let Some(bytes_done) = bytes_done.upgrade()
         {
             let bytes_done = bytes_done.load(Ordering::Relaxed);
@@ -89,7 +99,7 @@ impl PullRegistry {
                 total: *total,
             });
         }
-        match pulls.remove(key) {
+        match tasks.remove(key) {
             Some(PullTask::Refused { refusal, at }) if kept(at, now) => {
                 Some(SyncPullStatus::Refused(refusal))
             }
@@ -98,12 +108,19 @@ impl PullRegistry {
     }
 }
 
-/// Drops runs that ended without finishing and refusals nobody asked for in time.
-fn sweep(pulls: &mut HashMap<Vec<u8>, PullTask>, now: Instant) {
-    pulls.retain(|_, task| match task {
-        PullTask::Running { bytes_done, .. } => bytes_done.strong_count() > 0,
-        PullTask::Refused { at, .. } => kept(*at, now),
-    });
+impl Pulls {
+    /// Drops runs that ended without finishing and refusals nobody asked for in time, at most
+    /// once per `SWEEP_EVERY`, so a burst of pulls does not scan the registry each time.
+    fn sweep(&mut self, now: Instant) {
+        if (self.swept).is_some_and(|at| now.saturating_duration_since(at) < SWEEP_EVERY) {
+            return;
+        }
+        self.swept = Some(now);
+        self.tasks.retain(|_, task| match task {
+            PullTask::Running { bytes_done, .. } => bytes_done.strong_count() > 0,
+            PullTask::Refused { at, .. } => kept(*at, now),
+        });
+    }
 }
 
 fn kept(at: Instant, now: Instant) -> bool {
@@ -157,12 +174,27 @@ mod tests {
         let start = Instant::now();
         drop(registry.claim(vec![1], 10, start));
         registry.finish(vec![2], Err(SyncRefusal::Unavailable), start);
-        assert_eq!(registry.pulls().len(), 1, "the dropped run is gone");
         let later = start + REFUSAL_KEPT;
         let progress = registry.claim(vec![3], 10, later);
-        assert_eq!(registry.pulls().len(), 1, "the unasked refusal expired");
+        assert_eq!(registry.pulls().tasks.len(), 1, "stale entries are gone");
         assert_eq!(registry.status(&[2], later), None);
         drop(progress);
+    }
+
+    // Claims within one sweep interval leave ended runs alone; the next one after it drops them.
+    #[test]
+    fn sweep_runs_rarely() {
+        let registry = PullRegistry::default();
+        let start = Instant::now();
+        drop(registry.claim(vec![1], 10, start));
+        drop(registry.claim(vec![2], 10, start + Duration::from_secs(1)));
+        assert_eq!(
+            registry.pulls().tasks.len(),
+            2,
+            "no sweep within the interval"
+        );
+        drop(registry.claim(vec![3], 10, start + SWEEP_EVERY));
+        assert_eq!(registry.pulls().tasks.len(), 1, "the next interval sweeps");
     }
 
     #[test]

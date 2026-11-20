@@ -154,47 +154,48 @@ fn fetch_range(
 
 /// Emit every regular file below `prefix` as NUL-terminated absolute container
 /// paths, then an empty record and the count, so the caller can reject a truncated
-/// listing. Symlinks, also in the prefix itself, are skipped to stay in the workspace.
+/// listing. Every folder opens one component at a time without following a link.
 fn list_files(workspace: &Path, prefix: &str, mut writer: impl Write) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Dir, FileType, statat};
     use std::os::unix::ffi::OsStrExt;
 
     let relative = safe_absolute(prefix)?;
     let root = workspace.canonicalize()?;
-    let mut pending = match crosses_link(&root, &relative)? {
-        true => Vec::new(),
-        false => vec![root.join(&relative)],
-    };
+    let mut pending = vec![relative];
     let mut listed = 0u64;
     // Starts at the widest terminator record so it always fits under the bound.
     let mut written = 32u64;
     while let Some(directory) = pending.pop() {
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+        let Some(handle) = open_beneath(&root, &directory)? else {
+            continue;
         };
-        for entry in entries {
+        for entry in Dir::read_from(&handle)? {
             let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
+            let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+            if name == "." || name == ".." {
                 continue;
             }
-            if file_type.is_dir() {
-                pending.push(entry.path());
+            let kind = match entry.file_type() {
+                FileType::Unknown => match statat(&handle, name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+                    Err(rustix::io::Errno::NOENT) => continue,
+                    Err(error) => return Err(error.into()),
+                },
+                kind => kind,
+            };
+            if kind == FileType::Directory {
+                pending.push(directory.join(name));
                 continue;
             }
-            if !file_type.is_file() {
+            if kind != FileType::RegularFile {
                 continue;
             }
             listed += 1;
             if listed > MAX_LISTED_FILES {
                 return Err(io::Error::other("listing limit exceeded"));
             }
-            let path = entry.path();
-            let relative = path
-                .strip_prefix(&root)
-                .map_err(|_| io::Error::other("listing escaped workspace"))?;
-            let bytes = relative.as_os_str().as_bytes();
+            let path = directory.join(name);
+            let bytes = path.as_os_str().as_bytes();
             written = written
                 .checked_add(bytes.len() as u64 + 2)
                 .ok_or_else(|| io::Error::other("listing size overflows"))?;
@@ -212,19 +213,31 @@ fn list_files(workspace: &Path, prefix: &str, mut writer: impl Write) -> io::Res
     writer.flush()
 }
 
-/// Whether `relative` below `root` passes a symlink; a missing component passes none.
-fn crosses_link(root: &Path, relative: &Path) -> io::Result<bool> {
-    let mut current = root.to_path_buf();
+/// Opens the folder `relative` below `root` one component at a time without following a link,
+/// so a folder swapped for a link meanwhile is never entered; `None` when one is missing or a link.
+fn open_beneath(root: &Path, relative: &Path) -> io::Result<Option<rustix::fd::OwnedFd>> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, openat, statat};
+    use rustix::io::Errno;
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut handle = open(root, flags, Mode::empty())?;
     for component in relative.components() {
-        current.push(component);
-        match current.symlink_metadata() {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
+        let name = component.as_os_str();
+        match openat(&handle, name, flags, Mode::empty()) {
+            Ok(next) => handle = next,
+            Err(Errno::NOENT | Errno::LOOP) => return Ok(None),
+            // Linux answers a link opened as a folder without following with ENOTDIR.
+            Err(Errno::NOTDIR) => match statat(&handle, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
+                    return Ok(None);
+                }
+                Err(Errno::NOENT) => return Ok(None),
+                _ => return Err(Errno::NOTDIR.into()),
+            },
+            Err(error) => return Err(error.into()),
         }
     }
-    Ok(false)
+    Ok(Some(handle))
 }
 
 fn compare_marker(marker: &Path, sentinel: &Path) -> io::Result<()> {
@@ -457,6 +470,23 @@ mod tests {
         let mut empty = Vec::new();
         list_files(&workspace, "/absent", &mut empty).unwrap();
         assert_eq!(empty, b"\x000\x00");
+    }
+
+    #[test]
+    fn opens_without_links() {
+        // A folder path through a link or a missing folder opens nothing.
+        let directory = tempfile::tempdir().unwrap();
+        let (workspace, outside) = (
+            directory.path().join("workspace"),
+            directory.path().join("o"),
+        );
+        std::fs::create_dir_all(workspace.join("real/sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("real/link")).unwrap();
+        let open = |path: &str| open_beneath(&workspace, Path::new(path)).unwrap().is_some();
+        assert!(open("real/sub"));
+        assert!(!open("real/link"));
+        assert!(!open("real/absent"));
     }
 
     #[test]

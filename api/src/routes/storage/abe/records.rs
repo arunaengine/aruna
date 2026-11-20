@@ -5,6 +5,7 @@
 use super::*;
 use crate::auth::RealmAuth;
 use crate::auth::UnrestrictedAuth;
+use crate::routes::access::groups::KeyRequestFailure;
 use aruna_core::structs::storage::abe_access::{
     GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope, MAX_REQUESTS,
 };
@@ -140,25 +141,49 @@ async fn execute(
         .await
         .map_err(key_error)
 }
-/// Opens key requests for members in the group's encrypted buckets and returns the open ids,
-/// and `false` when a request could not be opened; the membership change holds either way.
+/// The key requests a member grant opened, the pairs that failed, and whether all were opened.
+#[derive(Debug, Default)]
+pub(crate) struct MemberKeyRequests {
+    pub opened: Vec<String>,
+    pub failed: Vec<KeyRequestFailure>,
+    pub complete: bool,
+}
+
+impl MemberKeyRequests {
+    /// The outcome of a change that opens no key request.
+    pub fn none() -> Self {
+        Self {
+            complete: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Opens key requests for members in the group's encrypted buckets; the membership change holds
+/// whatever fails, and the failed pairs are named so the caller can retry them.
 pub(crate) async fn member_requests(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
     members: Vec<aruna_core::user::id::UserId>,
-) -> (Vec<String>, bool) {
+) -> MemberKeyRequests {
     let now = aruna_clock::unix_timestamp_millis();
     let node = state.get_node_id();
     let operation = MemberKeysOperation::new(auth.clone(), node, group_id, members, now);
     match drive(operation, &state.get_ctx()).await {
-        Ok(keys) => {
-            let opened = keys.opened.iter().map(Ulid::to_string).collect();
-            (opened, keys.failed.is_empty())
-        }
+        Ok(keys) => MemberKeyRequests {
+            opened: keys.opened.iter().map(Ulid::to_string).collect(),
+            complete: keys.failed.is_empty(),
+            failed: (keys.failed.into_iter())
+                .map(|(bucket, member)| KeyRequestFailure {
+                    bucket,
+                    user_id: member.to_string(),
+                })
+                .collect(),
+        },
         Err(error) => {
             tracing::warn!(event = "abe.member_requests.failed", error = %error);
-            (Vec::new(), false)
+            MemberKeyRequests::default()
         }
     }
 }

@@ -7,20 +7,20 @@
 
 use std::collections::BTreeMap;
 
-use crate::calls::{IoCall, IoError, IoResult, Next};
-use crate::document::DocumentTarget;
-use crate::effects::{Effect, NetEffect};
-use crate::events::{Event, NetEvent};
-use crate::heartbeat::{HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, HolderFacts};
-use crate::id::NodeId;
-use crate::keyspaces::NODE_INFO_KEYSPACE;
-use crate::operation::Operation;
-use crate::structs::identity::realm::RealmConfigDocument;
-use crate::structs::placement::compute_config::RealmComputeConfig;
-use crate::structs::storage::node_info::{
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::document::DocumentTarget;
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
+use aruna_core::heartbeat::{HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, HolderFacts};
+use aruna_core::id::NodeId;
+use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::compute_config::RealmComputeConfig;
+use aruna_core::structs::storage::node_info::{
     LOCATION_LABEL_KEY, NodeInfoDocument, NodeUrls, node_info_key,
 };
-use crate::types::{Key, Value};
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
 
@@ -67,6 +67,7 @@ pub fn pick(mut candidates: Vec<HolderCandidate>, seed: u128) -> Option<HolderCa
     if candidates.is_empty() {
         return None;
     }
+    let seed = sample_seed(seed);
     let len = candidates.len() as u128;
     let first = candidates.swap_remove((seed % len) as usize);
     if candidates.is_empty() {
@@ -80,6 +81,17 @@ pub fn pick(mut candidates: Vec<HolderCandidate>, seed: u128) -> Option<HolderCa
             false => first,
         },
     )
+}
+
+/// `seed` spread over all its bits. Run entropy keeps its low bits zero for id counters, so taking
+/// it modulo a candidate count unmixed would always draw the first candidates.
+fn sample_seed(seed: u128) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-holder-pick-v1\0");
+    hasher.update(&seed.to_le_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
 }
 
 /// The bandwidth from `from` to `to`: unlimited within one location, the configured link

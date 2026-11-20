@@ -141,7 +141,7 @@ async fn data_round_trip() -> TestResult<()> {
         std::fs::write(&local, &big)?;
         let target = (s3.as_str(), "cli-data", "up/big.bin");
         let upload_id = started.upload_id().unwrap_or_default();
-        aruna_cli::keep_upload(&config, target, (&local, 5 * 1024 * 1024), upload_id)?;
+        aruna_cli::keep_upload(&config, target, (&local, 5 * 1024 * 1024), upload_id).await?;
         let local_text = local.to_string_lossy().to_string();
         let up = cli_json(
             &config,

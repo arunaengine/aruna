@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use aruna_core::events::{Event, StorageEvent};
 
-/// How much the recorder keeps: at most `total_bytes` of text, oldest records dropped first,
-/// and at most `entry_bytes` of text per record.
+/// How much the recorder keeps: at most `total_bytes` of record storage, oldest records dropped
+/// first, and `entry_bytes` bounds the formatting one record may count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecordLimits {
     pub total_bytes: usize,
@@ -68,7 +68,7 @@ static BUFFER: Mutex<Buffer> = Mutex::new(Buffer::new());
 /// Starts recording every run on this node.
 pub fn enable(limits: RecordLimits) {
     if let Ok(mut buffer) = BUFFER.lock() {
-        buffer.total_bytes = limits.total_bytes;
+        buffer.limit(limits.total_bytes);
     }
     ENTRY_BYTES.store(limits.entry_bytes, Ordering::Relaxed);
     ENABLED.store(true, Ordering::Relaxed);
@@ -196,21 +196,30 @@ impl Buffer {
         }
     }
 
+    /// Sets the budget and reserves room for its records, so the deque never grows past it.
+    fn limit(&mut self, total_bytes: usize) {
+        self.total_bytes = total_bytes;
+        while self.bytes > total_bytes && self.records.pop_front().is_some() {
+            self.bytes -= RECORD_BYTES;
+            self.dropped += 1;
+        }
+        let count = total_bytes / RECORD_BYTES;
+        self.records.shrink_to(count);
+        self.records.reserve_exact(count - self.records.len());
+    }
+
     fn push(&mut self, run: u64, at_ms: u64, entry: Entry) {
-        let size = entry_bytes(&entry);
-        // A record the whole budget cannot hold is refused instead of dropping every other one.
-        if size > self.total_bytes {
+        // A budget below one record refuses it instead of dropping every other one.
+        if RECORD_BYTES > self.total_bytes {
             self.dropped += 1;
             return;
         }
-        while self.bytes + size > self.total_bytes
-            && let Some(old) = self.records.pop_front()
-        {
-            self.bytes -= entry_bytes(&old.entry);
+        while self.bytes + RECORD_BYTES > self.total_bytes && self.records.pop_front().is_some() {
+            self.bytes -= RECORD_BYTES;
             self.dropped += 1;
         }
         self.sequence += 1;
-        self.bytes += size;
+        self.bytes += RECORD_BYTES;
         let sequence = self.sequence;
         let record = Record {
             sequence,
@@ -230,15 +239,8 @@ impl Buffer {
     }
 }
 
-/// The bytes a record keeps: its label and its size field.
-fn entry_bytes(entry: &Entry) -> usize {
-    let label = match entry {
-        Entry::Started { operation, .. } => operation,
-        Entry::Event { label, .. } => label,
-        Entry::Ended { outcome, .. } => outcome,
-    };
-    label.len() + std::mem::size_of::<usize>()
-}
+/// The memory one kept record takes; its labels are static, so they add nothing.
+const RECORD_BYTES: usize = std::mem::size_of::<Record>();
 
 #[cfg(test)]
 mod tests {
@@ -286,6 +288,20 @@ mod tests {
     }
 
     // A large result is counted only up to the per-record bound; its text is never kept.
+    // The budget counts each record's own storage, and the deque keeps the room it reserved.
+    #[test]
+    fn charge_matches_storage() {
+        let mut buffer = Buffer::new();
+        buffer.limit(3 * RECORD_BYTES);
+        let reserved = buffer.records.capacity();
+        for _ in 0..5 {
+            buffer.push(1, 0, ended("Ok", &(), 64));
+        }
+        assert_eq!(buffer.records.len(), 3);
+        assert_eq!(buffer.dropped, 2);
+        assert_eq!(buffer.records.capacity(), reserved);
+    }
+
     #[test]
     fn large_result_capped() {
         let large = vec![7u8; 1 << 20];
@@ -299,36 +315,25 @@ mod tests {
         );
     }
 
-    // A record larger than the whole budget is refused; the older records stay.
+    // A budget below one record refuses each record and keeps none.
     #[test]
     fn oversized_record_refused() {
         let mut buffer = Buffer::new();
-        buffer.total_bytes = 2 + std::mem::size_of::<usize>();
-        let kept = Entry::Ended {
+        buffer.limit(RECORD_BYTES - 1);
+        let refused = Entry::Ended {
             outcome: "Ok",
             outcome_bytes: 1,
         };
-        buffer.push(1, 0, kept.clone());
-        let oversized = Entry::Ended {
-            outcome: "Err",
-            outcome_bytes: 1,
-        };
-        buffer.push(1, 0, oversized);
+        buffer.push(1, 0, refused);
         let taken = buffer.take();
         assert_eq!(taken.dropped, 1);
-        let entries: Vec<Entry> = taken
-            .records
-            .into_iter()
-            .map(|record| record.entry)
-            .collect();
-        assert_eq!(entries, [kept]);
+        assert!(taken.records.is_empty());
     }
 
     #[test]
     fn drops_oldest_records() {
         let mut buffer = Buffer::new();
-        // Each record keeps a four byte label and its size field.
-        buffer.total_bytes = 2 * (4 + std::mem::size_of::<usize>());
+        buffer.limit(2 * RECORD_BYTES);
         for outcome in ["aaaa", "bbbb", "cccc"] {
             let outcome_bytes = 1;
             buffer.push(

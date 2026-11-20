@@ -244,6 +244,9 @@ pub enum StorageError {
     InvalidEffect,
     #[error("Storage is closed for shutdown")]
     Closed,
+    /// A commit storage refused before applying it, for the cause given: its writes are gone.
+    #[error("Transaction rolled back: {0}")]
+    RolledBack(Box<StorageError>),
 }
 
 impl StorageError {
@@ -253,7 +256,10 @@ impl StorageError {
     pub fn proves_no_commit(&self) -> bool {
         matches!(
             self,
-            Self::TransactionConflict | Self::QueueFull | Self::CleanupCapacity
+            Self::TransactionConflict
+                | Self::QueueFull
+                | Self::CleanupCapacity
+                | Self::RolledBack(_)
         )
     }
 

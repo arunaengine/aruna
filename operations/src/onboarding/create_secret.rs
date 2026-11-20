@@ -18,6 +18,8 @@ use ulid::Ulid;
 use crate::onboarding::secret_state::secret_state_entry;
 
 pub(crate) const SECRET_RECORD_PREFIX: &str = "secret:";
+/// Prefixes the expiry index: one row per secret, soonest expiry first.
+pub const SECRET_EXPIRY_PREFIX: &str = "secret-expiry:";
 /// Secrets one page of the outstanding-secret scan reads. The scan follows its
 /// cursor to the end of the range: an owner's secret beyond the first page
 /// still occupies one of their device slots.
@@ -106,6 +108,7 @@ impl CreateSecretOperation {
         Ok(Next::Call(IoCall::Write(vec![
             (ONBOARDING_KEYSPACE.to_string(), key, ByteView::from(value)),
             state_entry,
+            expiry_entry(&self.input.record),
         ])))
     }
 
@@ -244,6 +247,24 @@ pub fn secret_record_key(enrollment_id: Ulid) -> ByteView {
     ByteView::from(format!("{SECRET_RECORD_PREFIX}{enrollment_id}").into_bytes())
 }
 
+/// The expiry index key of a secret: its expiry big-endian, then its enrollment id.
+pub fn secret_expiry_key(expires_at: u64, enrollment_id: Ulid) -> ByteView {
+    let mut key = SECRET_EXPIRY_PREFIX.as_bytes().to_vec();
+    key.extend_from_slice(&expires_at.to_be_bytes());
+    key.extend_from_slice(&enrollment_id.to_bytes());
+    ByteView::from(key)
+}
+
+/// The expiry index row of `record`, written in the transaction that writes the record.
+pub(crate) fn expiry_entry(record: &OnboardingSecretRecord) -> (String, Key, Value) {
+    let key = secret_expiry_key(record.expires_at, record.enrollment_id);
+    (
+        ONBOARDING_KEYSPACE.to_string(),
+        key,
+        ByteView::from(Vec::new()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CreateSecretError, CreateSecretInput, CreateSecretOperation};
@@ -265,6 +286,28 @@ mod tests {
 
     fn realm() -> RealmId {
         RealmId::from_bytes([4u8; 32])
+    }
+
+    #[test]
+    fn expiry_keys_order() {
+        // The index sorts by expiry first, whatever the enrollment id.
+        let (late, early) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([9; 16]));
+        assert!(super::secret_expiry_key(5, early) < super::secret_expiry_key(6, late));
+        assert!(super::secret_expiry_key(256, late) > super::secret_expiry_key(255, early));
+    }
+
+    #[test]
+    fn writes_expiry_row() {
+        // The record, its state and its expiry row are written together.
+        let record = device_record(UserId::new(Ulid::from_bytes([2; 16]), realm()));
+        let key = super::secret_expiry_key(record.expires_at, record.enrollment_id);
+        let mut operation = CreateSecretOperation::new(CreateSecretInput { record });
+        let Ok(aruna_core::calls::Next::Call(aruna_core::calls::IoCall::Write(rows))) =
+            operation.write_record()
+        else {
+            panic!("expected the record writes");
+        };
+        assert!(rows.iter().any(|(_, row, _)| *row == key));
     }
 
     fn device_node(index: usize) -> iroh::PublicKey {

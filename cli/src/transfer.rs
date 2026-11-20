@@ -320,7 +320,6 @@ pub async fn upload(
     records: &Path,
 ) -> Result<Uploaded, CliError> {
     let size = tokio::fs::metadata(path).await?.len();
-    let client = access.client().await?;
     if size <= part_size {
         // One read is hashed and sent, so the reported digest and size are of the sent bytes.
         let bytes = tokio::fs::read(path).await?;
@@ -332,7 +331,9 @@ pub async fn upload(
         .map_err(|error| CliError::Io(std::io::Error::other(error)))?;
         let size = bytes.len() as u64;
         let body = ByteStream::from(bytes);
-        client
+        access
+            .client()
+            .await?
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -354,8 +355,9 @@ pub async fn upload(
             .map_err(|error| CliError::Io(std::io::Error::other(error)))??
     };
     let named = (access.endpoint.as_str(), bucket, key, blake3.as_str());
-    let record_path = upload_record(records, named, &parts);
-    let (mut record, kept) = claim_record(record_path.clone()).await?;
+    let (mut record, kept) = claim_record(upload_record(records, named, &parts)).await?;
+    // Hashing and the wait for the record can outlast the session, so it refreshes only now.
+    let client = access.client().await?;
     let resumed = match kept {
         Some(upload_id) => (stored_parts(&client, bucket, key, &upload_id).await?)
             .map(|stored| (upload_id, stored)),
@@ -374,7 +376,17 @@ pub async fn upload(
             let upload_id = created
                 .upload_id
                 .ok_or_else(|| CliError::S3("the node returned no upload id".into()))?;
-            keep_id(&mut record, &upload_id)?;
+            if let Err(error) = keep_id(&mut record, &upload_id) {
+                // Without its record no run could resume or find the new upload, so it goes.
+                let abort = client.abort_multipart_upload().bucket(bucket).key(key);
+                if let Err(failed) = abort.upload_id(&upload_id).send().await {
+                    eprintln!(
+                        "warning: upload {upload_id} was not aborted: {}",
+                        s3_error(failed)
+                    );
+                }
+                return Err(error.into());
+            }
             (upload_id, Vec::new())
         }
     };
@@ -431,9 +443,7 @@ pub async fn upload(
         .send()
         .await
         .map_err(s3_error)?;
-    // The emptied record of a finished transfer is harmless if it cannot be removed.
-    keep_id(&mut record, "")?;
-    let _ = std::fs::remove_file(&record_path);
+    clear_record(&mut record, key);
     Ok(Uploaded {
         size,
         blake3,
@@ -446,7 +456,8 @@ pub(crate) const UPLOAD_RECORDS: &str = "uploads";
 
 /// Records `upload_id` as the provider upload of copying `path` to `bucket` and `key` at
 /// `endpoint` in parts of `part_size` bytes, as an interrupted run leaves it.
-pub(crate) fn keep_upload(
+#[cfg(feature = "test-hooks")]
+pub(crate) async fn keep_upload(
     config_dir: &Path,
     (endpoint, bucket, key): (&str, &str, &str),
     (path, part_size): (&Path, u64),
@@ -455,9 +466,9 @@ pub(crate) fn keep_upload(
     let parts = split_parts(std::fs::metadata(path)?.len(), part_size);
     let (blake3, _) = digest_file(path, &parts)?;
     let records = config_dir.join(UPLOAD_RECORDS);
-    std::fs::create_dir_all(&records)?;
     let record = upload_record(&records, (endpoint, bucket, key, &blake3), &parts);
-    std::fs::write(record, upload_id)?;
+    let (mut record, _) = claim_record(record).await?;
+    keep_id(&mut record, upload_id)?;
     Ok(())
 }
 
@@ -498,6 +509,20 @@ async fn claim_record(path: PathBuf) -> Result<(std::fs::File, Option<String>), 
     Ok(claimed
         .await
         .map_err(|error| CliError::Io(std::io::Error::other(error)))??)
+}
+
+/// Marks a claimed record finished. The emptied file stays, so a run waiting on its lock and
+/// every later run lock this same file.
+fn finish_record(record: &mut std::fs::File) -> std::io::Result<()> {
+    keep_id(record, "")
+}
+
+/// Finishes the record of a completed upload, best effort: the object exists, and a kept id
+/// only makes a later run of the same file meet `NoSuchUpload` and start afresh.
+fn clear_record(record: &mut std::fs::File, key: &str) {
+    if let Err(error) = finish_record(record) {
+        eprintln!("warning: the upload record of {key} was not cleared: {error}");
+    }
 }
 
 /// Replaces the upload id in a claimed record; an empty id marks the transfer as finished.
@@ -755,6 +780,31 @@ mod tests {
         assert_eq!(kept.as_deref(), Some("upload-1"));
         keep_id(&mut record, "").unwrap();
         drop(record);
+        assert_eq!(claim_record(path).await.unwrap().1, None);
+    }
+
+    #[test]
+    fn clearing_best_effort() {
+        // A record that cannot be written leaves the completed upload a success.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("record.upload");
+        std::fs::write(&path, "upload-1").unwrap();
+        let mut read_only = std::fs::File::open(&path).unwrap();
+        clear_record(&mut read_only, "key");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "upload-1");
+    }
+
+    #[tokio::test]
+    async fn finished_record_stays() {
+        // A finished transfer keeps its emptied record, so a waiting run locks the same file.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("record.upload");
+        let (mut record, _) = claim_record(path.clone()).await.unwrap();
+        keep_id(&mut record, "upload-1").unwrap();
+        finish_record(&mut record).unwrap();
+        assert!(path.exists(), "the record stays while its lock is held");
+        drop(record);
+        assert!(path.exists());
         assert_eq!(claim_record(path).await.unwrap().1, None);
     }
 

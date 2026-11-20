@@ -27,6 +27,11 @@ const RECORD_BEGIN_KEYSPACE: u8 = 1;
 const RECORD_ENTRY: u8 = 2;
 const RECORD_END_KEYSPACE: u8 = 3;
 const RECORD_FOOTER: u8 = 4;
+/// The longest field of each kind a stream may hold: a store prefix with a Fjall keyspace name
+/// of at most 255 bytes, a Fjall key, and a value read into memory, which Fjall bounds too.
+const MAX_NAME_BYTES: u64 = SYNC_PREFIX.len() as u64 + 255;
+const MAX_KEY_BYTES: u64 = u16::MAX as u64;
+const MAX_VALUE_BYTES: u64 = u32::MAX as u64;
 /// Tries and pause between tries to open snapshots of several databases at one instant.
 const CUT_ATTEMPTS: u32 = 1_000;
 const CUT_PAUSE: Duration = Duration::from_millis(1);
@@ -346,13 +351,13 @@ impl<R: Read> SnapshotReader<R> {
                     ));
                 };
                 self.hasher.update(&[tag]);
-                let key = self.read_hashed_bytes()?;
+                let key = self.read_hashed_bytes(MAX_KEY_BYTES)?;
                 let value = match sink(&key)? {
                     Some(mut out) => {
                         self.copy_hashed(&mut out)?;
                         Vec::new()
                     }
-                    None => self.read_hashed_bytes()?,
+                    None => self.read_hashed_bytes(MAX_VALUE_BYTES)?,
                 };
                 self.open_entries = Some(count + 1);
                 self.entry_count += 1;
@@ -389,7 +394,7 @@ impl<R: Read> SnapshotReader<R> {
             ));
         }
         self.hasher.update(&[tag]);
-        let name = String::from_utf8(self.read_hashed_bytes()?)
+        let name = String::from_utf8(self.read_hashed_bytes(MAX_NAME_BYTES)?)
             .map_err(|_| SnapshotError::InvalidKeyspaceName)?;
         if !self.seen_keyspaces.insert(name.clone()) {
             return Err(SnapshotError::DuplicateKeyspace(name));
@@ -436,10 +441,15 @@ impl<R: Read> SnapshotReader<R> {
         Ok(u64::from_be_bytes(bytes))
     }
 
-    /// Reads a length-prefixed field; memory grows with the bytes that arrive, never with the
-    /// length a corrupt stream claims.
-    fn read_hashed_bytes(&mut self) -> Result<Vec<u8>, SnapshotError> {
+    /// Reads a length-prefixed field of at most `limit` bytes, refused at its length prefix;
+    /// memory grows with the bytes that arrive, never with the length a corrupt stream claims.
+    fn read_hashed_bytes(&mut self, limit: u64) -> Result<Vec<u8>, SnapshotError> {
         let len = self.read_hashed_u64()?;
+        if len > limit {
+            return Err(SnapshotError::InvalidStructure(
+                "a snapshot field is longer than its format allows",
+            ));
+        }
         let mut bytes = Vec::new();
         let read = (&mut self.input).take(len).read_to_end(&mut bytes)?;
         if read as u64 != len {
@@ -514,11 +524,25 @@ mod tests {
         assert_eq!(early.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
+    // A keyspace name longer than any store prefix and Fjall name is refused at its length.
+    #[test]
+    fn long_name_refused() {
+        let mut writer = SnapshotWriter::new(Vec::new(), 7).unwrap();
+        writer.begin_keyspace(&"k".repeat(1000)).unwrap();
+        writer.end_keyspace().unwrap();
+        let bytes = writer.finish().unwrap().0;
+        assert!(matches!(
+            read_all(&bytes),
+            Err(SnapshotError::InvalidStructure(_))
+        ));
+    }
+
     #[test]
     fn claimed_length_bounded() {
         let mut bytes = sample_stream()[..27].to_vec();
         bytes.push(1);
-        bytes.extend_from_slice(&(1_u64 << 40).to_be_bytes());
+        // A length within the name limit, with fewer bytes behind it than it claims.
+        bytes.extend_from_slice(&200_u64.to_be_bytes());
         bytes.extend_from_slice(b"ab");
         assert!(matches!(read_all(&bytes), Err(SnapshotError::Io(_))));
     }

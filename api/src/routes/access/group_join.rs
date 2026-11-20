@@ -5,6 +5,8 @@
 use crate::auth::UnrestrictedAuth;
 use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::access::groups::KeyRequestFailure;
+use crate::routes::storage::abe::records::MemberKeyRequests;
 use crate::server::state::ServerState;
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
@@ -83,6 +85,8 @@ pub struct JoinDecisionResponse {
     pub key_requests: Vec<String>,
     /// False when a key request could not be opened; the decision holds anyway.
     pub key_requests_complete: bool,
+    /// The buckets and users whose key request could not be opened.
+    pub key_requests_failed: Vec<KeyRequestFailure>,
 }
 
 fn timestamp(value: u64) -> ServerResult<String> {
@@ -404,7 +408,7 @@ Realm and group request policies may deny.
 - Concurrent decisions retain approval if either node accepted an approval granting membership."#,
     params(("id" = Ulid, Path, description = "Group id"), ("request_id" = Ulid, Path, description = "Membership request id")),
     request_body(content = DecideJoinRequest, example = json!({"approve":true,"role_ids":[]})),
-    responses((status = 200, body = JoinDecisionResponse, description = "Saved decision", example = json!({"request":{"request_id":"01JABCDEF0123456789ABCDEFG","group_id":"01JABCDEF0123456789ABCDEFG","user_id":"01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA","message":null,"status":"approved","decided_by":"01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA","decision_reason":null,"created_at":"2026-09-08T00:00:00+00:00","decided_at":"2026-09-08T01:00:00+00:00"},"key_requests":[],"key_requests_complete":true})),
+    responses((status = 200, body = JoinDecisionResponse, description = "Saved decision", example = json!({"request":{"request_id":"01JABCDEF0123456789ABCDEFG","group_id":"01JABCDEF0123456789ABCDEFG","user_id":"01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA","message":null,"status":"approved","decided_by":"01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA","decision_reason":null,"created_at":"2026-09-08T00:00:00+00:00","decided_at":"2026-09-08T01:00:00+00:00"},"key_requests":[],"key_requests_complete":true,"key_requests_failed":[]})),
         (status = 400, body = ErrorResponse, description = "Invalid roles or reason"), (status = 401, body = ErrorResponse, description = "Authentication required"), (status = 403, body = ErrorResponse, description = "Membership administration required"), (status = 404, body = ErrorResponse, description = "Request not found"), (status = 409, body = ErrorResponse, description = "Different terminal decision, concurrent change, or device node")), security(("bearer_auth" = [])))]
 async fn decide_join(
     State(state): State<Arc<ServerState>>,
@@ -432,18 +436,18 @@ async fn decide_join(
         },
     )
     .await?;
-    let (key_requests, key_requests_complete) =
-        match aruna_core::user::id::UserId::from_string(&request.user_id) {
-            Ok(member) if request.status == "approved" => {
-                let members = vec![member];
-                let requests = crate::routes::storage::abe::records::member_requests;
-                requests(&state, &actor, group_id, members).await
-            }
-            _ => (Vec::new(), true),
-        };
+    let keys = match aruna_core::user::id::UserId::from_string(&request.user_id) {
+        Ok(member) if request.status == "approved" => {
+            let members = vec![member];
+            let requests = crate::routes::storage::abe::records::member_requests;
+            requests(&state, &actor, group_id, members).await
+        }
+        _ => MemberKeyRequests::none(),
+    };
     Ok(Json(JoinDecisionResponse {
         request,
-        key_requests,
-        key_requests_complete,
+        key_requests: keys.opened,
+        key_requests_complete: keys.complete,
+        key_requests_failed: keys.failed,
     }))
 }

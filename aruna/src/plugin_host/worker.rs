@@ -67,6 +67,8 @@ pub struct Worker {
     rechecked: AtomicU64,
     /// A replay has more pages than the last tick read, so the next tick comes at once.
     replaying: AtomicBool,
+    /// The replay key the next tick's replays start after.
+    replay_after: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl Worker {
@@ -95,12 +97,15 @@ impl Worker {
             backoff: tokio::sync::Mutex::default(),
             rechecked: AtomicU64::new(0),
             replaying: AtomicBool::new(false),
+            replay_after: std::sync::Mutex::new(None),
         }))
     }
 
     /// Queues due timer occurrences, then starts the due runs of the active installs this node
     /// receives, at most `RUNS_PARALLEL` per install. A `running` run no task runs starts again.
     pub async fn claim(self: &Arc<Self>, now_ms: u64) -> Result<usize, String> {
+        // Only a replay pass that ends with pages left asks for the next tick at once.
+        self.replaying.store(false, Ordering::Relaxed);
         if self.supervisor.stopping() {
             return Ok(0);
         }
@@ -120,9 +125,15 @@ impl Worker {
         if let Err(error) = drive(matched, &self.ctx).await {
             warn!(%error, "Could not match plugin events to installs");
         }
-        let replays = RunReplays::new(now_ms, (JOURNAL_PAGE, REPLAY_PAGES));
+        let after = (self.replay_after.lock()).map_or(None, |after| after.clone());
+        let replays = RunReplays::new(now_ms, (JOURNAL_PAGE, REPLAY_PAGES), after);
         match drive(replays, &self.ctx).await {
-            Ok((_, more)) => self.replaying.store(more, Ordering::Relaxed),
+            Ok(replayed) => {
+                self.replaying.store(replayed.more, Ordering::Relaxed);
+                if let Ok(mut after) = self.replay_after.lock() {
+                    *after = replayed.after;
+                }
+            }
             Err(error) => warn!(%error, "Could not replay plugin events"),
         }
         self.forward(&shared, now_ms).await;

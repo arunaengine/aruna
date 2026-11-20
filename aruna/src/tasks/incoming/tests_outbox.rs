@@ -341,8 +341,15 @@ async fn close_routes_defer() {
     handler.close_rotation(key.clone(), rotation).await;
 
     assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
-    let attempts = handler.rotation.lock().expect("rotation lock").retry_attempts;
-    assert_eq!(attempts, 0, "progress in the clean suffix resets failure backoff");
+    let attempts = handler
+        .rotation
+        .lock()
+        .expect("rotation lock")
+        .retry_attempts;
+    assert_eq!(
+        attempts, 0,
+        "progress in the clean suffix resets failure backoff"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -363,7 +370,11 @@ async fn close_keeps_retry() {
     handler.close_rotation(key.clone(), rotation).await;
 
     assert_eq!(scheduled_after(&task_handle).await, Duration::from_secs(2));
-    let attempts = handler.rotation.lock().expect("rotation lock").retry_attempts;
+    let attempts = handler
+        .rotation
+        .lock()
+        .expect("rotation lock")
+        .retry_attempts;
     assert_eq!(attempts, 4);
 }
 
@@ -391,7 +402,11 @@ async fn close_resets_progress() {
         scheduled_after(&task_handle).await,
         Duration::from_millis(250)
     );
-    let attempts = handler.rotation.lock().expect("rotation lock").retry_attempts;
+    let attempts = handler
+        .rotation
+        .lock()
+        .expect("rotation lock")
+        .retry_attempts;
     assert_eq!(attempts, 1);
 }
 
@@ -517,7 +532,11 @@ async fn empty_resets_backoff() {
     let rotation = std::mem::take(&mut *handler.rotation.lock().expect("rotation lock"));
 
     assert!(handler.open_rotation(&key, rotation).await.is_none());
-    let attempts = handler.rotation.lock().expect("rotation lock").retry_attempts;
+    let attempts = handler
+        .rotation
+        .lock()
+        .expect("rotation lock")
+        .retry_attempts;
     assert_eq!(attempts, 0, "an empty outbox drops the retry ladder");
 }
 
@@ -568,7 +587,11 @@ async fn blocked_keeps_backoff() {
     handler.drain_sync_outbox().await;
 
     assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
-    let attempts = handler.rotation.lock().expect("rotation lock").retry_attempts;
+    let attempts = handler
+        .rotation
+        .lock()
+        .expect("rotation lock")
+        .retry_attempts;
     assert_eq!(attempts, 3);
     shutdown_net(&net).await;
 }

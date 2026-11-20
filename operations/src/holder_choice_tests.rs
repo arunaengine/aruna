@@ -6,22 +6,22 @@ use super::{
     HEARTBEAT_STALE_MS, HolderCandidate, HolderChoiceError, HolderChoiceOperation,
     PickHolderOperation, candidate, link_bandwidth, pick,
 };
-use crate::calls::{IoCall, IoResult, Next};
-use crate::document::DocumentTarget;
-use crate::download_slots::DownloadSlots;
-use crate::effects::{Effect, NetEffect};
-use crate::events::{Event, NetError, NetEvent};
-use crate::heartbeat::{HeartbeatEffect, HeartbeatEvent, HolderFacts};
-use crate::heartbeat::{HeldHeartbeat, NodeHeartbeat};
-use crate::keyspaces::NODE_INFO_KEYSPACE;
-use crate::operation::Operation;
-use crate::structs::identity::realm::RealmId;
-use crate::structs::placement::compute_config::{LocationLink, RealmComputeConfig};
-use crate::structs::storage::node_info::node_info_key;
-use crate::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
-use crate::types::{Key, Value};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::document::DocumentTarget;
+use aruna_core::download_slots::DownloadSlots;
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetError, NetEvent};
+use aruna_core::heartbeat::{HeartbeatEffect, HeartbeatEvent, HolderFacts};
+use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
+use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::compute_config::{LocationLink, RealmComputeConfig};
+use aruna_core::structs::storage::node_info::node_info_key;
+use aruna_core::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
+use aruna_core::types::{Key, Value};
 
-fn node(seed: u8) -> crate::id::NodeId {
+fn node(seed: u8) -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
@@ -107,10 +107,31 @@ fn free_slots_win() {
         );
     }
     assert_eq!(pick(Vec::new(), 3), None);
-    // The seed alone decides which two of more candidates are compared.
+    // The seed decides which two of more candidates are compared; the fewest slots never win.
     let three = || vec![holder(1, 10, 0), holder(2, 20, 0), holder(3, 30, 0)];
-    assert_eq!(pick(three(), 0), Some(holder(3, 30, 0)));
-    assert_eq!(pick(three(), 1), Some(holder(2, 20, 0)));
+    let winners: std::collections::BTreeSet<_> = (0..64)
+        .filter_map(|seed| pick(three(), seed))
+        .map(|chosen| chosen.free_slots)
+        .collect();
+    assert_eq!(winners, [20, 30].into());
+}
+
+// Run entropy has zero low bits, so equal holders must still each win over consecutive runs.
+#[test]
+fn run_seeds_balance() {
+    let equal = || vec![holder(1, 10, 0), holder(2, 10, 0)];
+    let picks: Vec<_> = (0..64)
+        .filter_map(|slot| pick(equal(), aruna_core::id_mint::run_entropy(7, slot)))
+        .map(|chosen| chosen.node_id)
+        .collect();
+    let first = picks.iter().filter(|chosen| **chosen == node(1)).count();
+    assert!((16..=48).contains(&first), "node one won {first} of 64");
+    let seed = aruna_core::id_mint::run_entropy(7, 3);
+    assert_eq!(
+        pick(equal(), seed),
+        pick(equal(), seed),
+        "a seed picks the same again"
+    );
 }
 
 // The pick operation chooses with the entropy the runner gave its run, so the same seed and
@@ -118,13 +139,14 @@ fn free_slots_win() {
 #[test]
 fn seeded_pick_replays() {
     let three = || vec![holder(1, 10, 0), holder(2, 20, 0), holder(3, 30, 0)];
-    for (seed, chosen) in [(0, holder(3, 30, 0)), (1, holder(2, 20, 0))] {
+    for seed in 0..4 {
+        let chosen = pick(three(), seed).expect("a candidate is chosen");
         let mut picking = PickHolderOperation::new(&[node(1), node(2), node(3)], 5);
         picking.seed(seed);
         let choice = HolderChoiceOperation::new(&[node(1), node(2), node(3)], 5);
         assert_eq!(picking.first(), Ok(Next::Call(IoCall::child(choice))));
         let candidates: Result<_, HolderChoiceError> = Ok(three());
-        let candidates = IoResult::Child(crate::calls::ChildOutcome::new(candidates));
+        let candidates = IoResult::Child(aruna_core::calls::ChildOutcome::new(candidates));
         assert_eq!(picking.next(candidates), Ok(Next::Done(Some(chosen))));
     }
 }
@@ -172,7 +194,7 @@ fn links_rank_bandwidth() {
 
 const REALM: RealmId = RealmId([1; 32]);
 
-fn facts(held: Vec<HeldHeartbeat>, avoided: Vec<crate::id::NodeId>) -> IoResult {
+fn facts(held: Vec<HeldHeartbeat>, avoided: Vec<aruna_core::id::NodeId>) -> IoResult {
     let facts = HolderFacts {
         local: node(9),
         realm_id: REALM,
