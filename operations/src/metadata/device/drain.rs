@@ -84,7 +84,7 @@ pub fn drain_publish_queue(ids: NodeRealm) -> DrainPublishOperation {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrainPublishOperation {
     ids: NodeRealm,
     step: DrainStep,

@@ -38,6 +38,8 @@ use crate::blob::holders::HoldersTimerOperation;
 use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
+use crate::device::publish_queue::DrainOutcome;
+use crate::device::sync::outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER, drain_sync_outbox};
 use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
 use crate::jobs::backend_import::schedule::RunDueOperation;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
@@ -48,6 +50,9 @@ use crate::jobs::node_inputs::witness_node;
 use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
+use crate::metadata::device::drain::{
+    DrainPublishOperation, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, drain_publish_queue,
+};
 use crate::metadata::materialization_queue::MATERIALIZATION_RETRY_AFTER;
 use crate::metadata::projection::{PROJECTION_RETRY_AFTER, ProjectionRunOperation};
 use crate::metadata::prune_queue::GRAPH_RETRY_AFTER;
@@ -241,6 +246,8 @@ pub enum TimerOperation {
     RunBackendImports(RunDueOperation),
     MaintainRanges(RangeTimerOperation),
     RefreshBlobHolders(HoldersTimerOperation),
+    DrainUploadOutbox(crate::device::sync::outbox::DrainOutboxOperation),
+    DrainDeviceIntake(DrainPublishOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -401,6 +408,12 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
                 TimerOperation::Wait(WaitOperation::after(Some(after)))
             }
         }),
+        TaskKey::DrainUploadOutbox => Some(TimerOperation::DrainUploadOutbox(drain_sync_outbox(
+            input.facts.serving,
+        ))),
+        TaskKey::DrainDeviceIntake => Some(TimerOperation::DrainDeviceIntake(drain_publish_queue(
+            input.facts.serving,
+        ))),
         _ => None,
     }
 }
@@ -447,6 +460,8 @@ macro_rules! each_timer {
             TimerOperation::RunBackendImports($operation) => $body,
             TimerOperation::MaintainRanges($operation) => $body,
             TimerOperation::RefreshBlobHolders($operation) => $body,
+            TimerOperation::DrainUploadOutbox($operation) => $body,
+            TimerOperation::DrainDeviceIntake($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -820,6 +835,31 @@ impl TimerRun for RangeTimerOperation {
 impl TimerRun for HoldersTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
+    }
+}
+
+/// When a device queue drain runs again: soon after a pass that could not complete, at once
+/// after one that asked for another pass, and only on new work once it is idle.
+fn device_plan(outcome: DrainOutcome, defer: Duration, again: Duration) -> TimerPlan {
+    let after = match outcome {
+        DrainOutcome::Deferred => Some(defer),
+        DrainOutcome::Recheck => Some(again),
+        DrainOutcome::Idle => None,
+    };
+    TimerPlan::from(after)
+}
+
+impl TimerRun for crate::device::sync::outbox::DrainOutboxOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let outcome = result.unwrap_or(DrainOutcome::Deferred);
+        Ok(device_plan(outcome, UPLOAD_DEFER_AFTER, UPLOAD_CONTINUE_AFTER))
+    }
+}
+
+impl TimerRun for DrainPublishOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let outcome = result.unwrap_or(DrainOutcome::Deferred);
+        Ok(device_plan(outcome, PUBLISH_DEFER_AFTER, PUBLISH_CONTINUE_AFTER))
     }
 }
 
@@ -1435,6 +1475,18 @@ mod tests {
         assert_eq!(failed, Ok(TimerPlan::default()));
         let mut idle = timer_operation(&TaskKey::RunBackendImports, &input()).unwrap();
         assert_eq!(idle.first(), Ok(Next::Done(TimerPlan::default())));
+    }
+
+    #[test]
+    fn device_drains_plan() {
+        // A broken pass retries after the defer delay, a recheck goes on soon, idle waits.
+        type Upload = crate::device::sync::outbox::DrainOutboxOperation;
+        let deferred = Upload::rearm(Err(IoError::Unfinished));
+        assert_eq!(deferred, Ok(TimerPlan::from(Some(UPLOAD_DEFER_AFTER))));
+        let recheck = DrainPublishOperation::rearm(Ok(DrainOutcome::Recheck));
+        assert_eq!(recheck, Ok(TimerPlan::from(Some(PUBLISH_CONTINUE_AFTER))));
+        let idle = DrainPublishOperation::rearm(Ok(DrainOutcome::Idle));
+        assert_eq!(idle, Ok(TimerPlan::default()));
     }
 
     #[test]

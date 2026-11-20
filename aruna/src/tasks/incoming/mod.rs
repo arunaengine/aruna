@@ -49,7 +49,6 @@ use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
 use aruna_operations::device::publish_queue::DrainOutcome;
-use aruna_operations::device::sync::outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER};
 use aruna_operations::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER,
 };
@@ -59,7 +58,6 @@ use aruna_operations::jobs::DRAIN_RETRY_AFTER;
 use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
 use aruna_operations::jobs::prune::PruneTimerOperation;
 use aruna_operations::jobs::store::job_calls;
-use aruna_operations::metadata::device::drain::{PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER};
 use aruna_operations::metadata::materialization_queue::{
     NextTimerOperation, RequeueParkedOperation, materialization_group_concurrency,
 };
@@ -801,38 +799,8 @@ impl OperationsTaskHandler {
                 self.fetch_realm_documents().await;
                 self.refresh_device_replicas().await;
             }),
-            TaskKey::DrainUploadOutbox => Box::pin(async move {
-                let drain = aruna_operations::device::sync::outbox::drain_sync_outbox(
-                    self.context.node_and_realm(),
-                );
-                let outcome = drive(drain, &self.context).await;
-                let after = match outcome.unwrap_or(DrainOutcome::Deferred) {
-                    DrainOutcome::Deferred => Some(UPLOAD_DEFER_AFTER),
-                    DrainOutcome::Recheck => Some(UPLOAD_CONTINUE_AFTER),
-                    DrainOutcome::Idle => None,
-                };
-                if let Some(after) = after {
-                    self.reschedule_timer(TaskKey::DrainUploadOutbox, after)
-                        .await;
-                }
-            }),
-            TaskKey::DrainDeviceIntake => Box::pin(async move {
-                let drain = aruna_operations::metadata::device::drain::drain_publish_queue(
-                    self.context.node_and_realm(),
-                );
-                let after = match drive(drain, &self.context)
-                    .await
-                    .unwrap_or(DrainOutcome::Deferred)
-                {
-                    DrainOutcome::Deferred => Some(PUBLISH_DEFER_AFTER),
-                    DrainOutcome::Recheck => Some(PUBLISH_CONTINUE_AFTER),
-                    DrainOutcome::Idle => None,
-                };
-                if let Some(after) = after {
-                    self.reschedule_timer(TaskKey::DrainDeviceIntake, after)
-                        .await;
-                }
-            }),
+            TaskKey::DrainUploadOutbox => Box::pin(self.run_trigger(key)),
+            TaskKey::DrainDeviceIntake => Box::pin(self.run_trigger(key)),
         }
     }
 }
