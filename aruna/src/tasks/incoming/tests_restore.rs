@@ -464,7 +464,10 @@ async fn applied_retry_kept() {
     else {
         panic!("expected timer scheduled");
     };
-    assert!(after <= APPLIED_RETRY_AFTER, "the retry stays armed in memory");
+    assert!(
+        after <= APPLIED_RETRY_AFTER,
+        "the retry stays armed in memory"
+    );
 }
 
 // A timer change waits while another change of the same key holds it, so its row and the
@@ -495,12 +498,26 @@ async fn timer_change_waits() {
 
     let rearm = handler.reschedule_timer(key.clone(), Duration::from_secs(60));
     tokio::pin!(rearm);
-    assert!(tokio::time::timeout(Duration::ZERO, &mut rearm).await.is_err());
-    assert!(read_timer(&storage, &key).await.expect("timer reads").is_none());
+    assert!(
+        tokio::time::timeout(Duration::ZERO, &mut rearm)
+            .await
+            .is_err()
+    );
+    assert!(
+        read_timer(&storage, &key)
+            .await
+            .expect("timer reads")
+            .is_none()
+    );
 
     drop(held);
     assert!(rearm.await);
-    assert!(read_timer(&storage, &key).await.expect("timer reads").is_some());
+    assert!(
+        read_timer(&storage, &key)
+            .await
+            .expect("timer reads")
+            .is_some()
+    );
 }
 
 #[tokio::test]

@@ -463,7 +463,10 @@ mod tests {
     fn skips_linked_prefix() {
         // A prefix that is, or lies below, a link lists nothing from outside the workspace.
         let directory = tempfile::tempdir().unwrap();
-        let (workspace, outside) = (directory.path().join("workspace"), directory.path().join("o"));
+        let (workspace, outside) = (
+            directory.path().join("workspace"),
+            directory.path().join("o"),
+        );
         std::fs::create_dir_all(outside.join("sub")).unwrap();
         std::fs::write(outside.join("sub/secret.txt"), b"s").unwrap();
         std::fs::create_dir_all(&workspace).unwrap();

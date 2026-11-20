@@ -21,8 +21,11 @@ const TIMER_LOCK_COUNT: usize = 64;
 
 /// A durable timer change holds its key's lock until the scheduler took it, so the durable and
 /// the live changes of one key happen in the same order.
-static TIMER_LOCKS: LazyLock<Vec<tokio::sync::Mutex<()>>> =
-    LazyLock::new(|| (0..TIMER_LOCK_COUNT).map(|_| tokio::sync::Mutex::new(())).collect());
+static TIMER_LOCKS: LazyLock<Vec<tokio::sync::Mutex<()>>> = LazyLock::new(|| {
+    (0..TIMER_LOCK_COUNT)
+        .map(|_| tokio::sync::Mutex::new(()))
+        .collect()
+});
 
 /// Holds the key of a timer change that has a durable row, until its caller handed the change to
 /// the scheduler too; a change without a row holds nothing.

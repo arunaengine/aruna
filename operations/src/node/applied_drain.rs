@@ -674,7 +674,6 @@ mod tests {
     // so two drains over the same order head never both project its batch.
     #[test]
     fn drains_share_hold() {
-        use aruna_core::operation::SubOperation;
         let input = crate::triggers::TimerInput {
             now_ms: 1,
             local_node: Some(node()),

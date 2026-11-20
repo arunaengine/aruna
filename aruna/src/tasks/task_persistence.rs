@@ -44,7 +44,12 @@ pub async fn restore_task_timers(
                 txn_id: None,
             })
             .await;
-        let stopped = |resume_after, error| Err(RestoreStopped { resume_after, error });
+        let stopped = |resume_after, error| {
+            Err(RestoreStopped {
+                resume_after,
+                error,
+            })
+        };
         let (values, next_start_after) = match event {
             Event::Storage(StorageEvent::IterResult {
                 values,
@@ -164,7 +169,9 @@ mod tests {
             key: key.clone(),
             after: Duration::from_millis(1),
         };
-        persist_task_effect(&storage, &reset).await.expect("timer persists");
+        persist_task_effect(&storage, &reset)
+            .await
+            .expect("timer persists");
         let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let first_page = move |effect: &StorageEffect| {
             let page = matches!(effect, StorageEffect::Iter { .. });
@@ -206,15 +213,29 @@ mod tests {
             after,
         };
         let later = reset(Duration::from_secs(3600));
-        persist_task_effect(&storage, &later).await.expect("timer persists");
+        persist_task_effect(&storage, &later)
+            .await
+            .expect("timer persists");
 
         aruna_storage::task_timers::delete_persisted_timer(&storage, &key).await;
-        assert!(read_timer(&storage, &key).await.expect("timer reads").is_some());
+        assert!(
+            read_timer(&storage, &key)
+                .await
+                .expect("timer reads")
+                .is_some()
+        );
 
         let due = reset(Duration::ZERO);
-        persist_task_effect(&storage, &due).await.expect("timer persists");
+        persist_task_effect(&storage, &due)
+            .await
+            .expect("timer persists");
         aruna_storage::task_timers::delete_persisted_timer(&storage, &key).await;
-        assert!(read_timer(&storage, &key).await.expect("timer reads").is_none());
+        assert!(
+            read_timer(&storage, &key)
+                .await
+                .expect("timer reads")
+                .is_none()
+        );
     }
 
     // A cancellation whose row could not be deleted fails, so no caller acknowledges it while the
@@ -229,12 +250,19 @@ mod tests {
             key: key.clone(),
             after: Duration::from_secs(60),
         };
-        persist_task_effect(&storage, &reset).await.expect("timer persists");
+        persist_task_effect(&storage, &reset)
+            .await
+            .expect("timer persists");
         let refused = aruna_test_support::metadata::refusing(storage.clone(), TASK_TIMER_KEYSPACE);
 
         let cancel = TaskEffect::CancelTimer { key: key.clone() };
         assert!(persist_task_effect(&refused, &cancel).await.is_err());
-        assert!(read_timer(&storage, &key).await.expect("timer reads").is_some());
+        assert!(
+            read_timer(&storage, &key)
+                .await
+                .expect("timer reads")
+                .is_some()
+        );
     }
 
     #[tokio::test]

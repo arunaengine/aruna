@@ -521,7 +521,10 @@ impl DeleteObjectOperation {
                     return Ok(None);
                 }
                 let version = BlobVersion::from_bytes(value.as_ref())?;
-                Ok(Some(VersionSummary::from_blob_version(&version_key, &version)))
+                Ok(Some(VersionSummary::from_blob_version(
+                    &version_key,
+                    &version,
+                )))
             })
             .collect::<Result<Vec<_>, ConversionError>>()?;
         let remaining = remaining.into_iter().flatten();

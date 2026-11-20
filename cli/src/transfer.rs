@@ -784,6 +784,7 @@ mod tests {
             api: Api::new("http://127.0.0.1:1", None).unwrap(),
             client: s3_client(&session),
             session: Some(session),
+            endpoint: "http://127.0.0.1:1".into(),
         };
         let error = access.client().await.unwrap_err();
         assert!(error.to_string().contains("cannot refresh"), "{error}");

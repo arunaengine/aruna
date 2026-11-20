@@ -286,7 +286,11 @@ mod tests {
         buffer.push(1, 0, oversized);
         let taken = buffer.take();
         assert_eq!(taken.dropped, 1);
-        let entries: Vec<Entry> = taken.records.into_iter().map(|record| record.entry).collect();
+        let entries: Vec<Entry> = taken
+            .records
+            .into_iter()
+            .map(|record| record.entry)
+            .collect();
         assert_eq!(entries, [kept]);
     }
 
@@ -297,7 +301,14 @@ mod tests {
         buffer.total_bytes = 2 * (4 + std::mem::size_of::<usize>());
         for outcome in ["aaaa", "bbbb", "cccc"] {
             let outcome_bytes = 1;
-            buffer.push(1, 0, Entry::Ended { outcome, outcome_bytes });
+            buffer.push(
+                1,
+                0,
+                Entry::Ended {
+                    outcome,
+                    outcome_bytes,
+                },
+            );
         }
         let taken = buffer.take();
         assert_eq!(taken.dropped, 1);

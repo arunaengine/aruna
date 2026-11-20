@@ -559,7 +559,10 @@ fn unreadable_version_stops() {
         (newer.to_bytes().unwrap().into(), vec![0xffu8].into()),
     ];
     let turn = op.next(IoResult::Page { rows, next: None });
-    assert!(matches!(turn, Err(DeleteObjectError::ConversionError(_))), "{turn:?}");
+    assert!(
+        matches!(turn, Err(DeleteObjectError::ConversionError(_))),
+        "{turn:?}"
+    );
 }
 
 #[test]

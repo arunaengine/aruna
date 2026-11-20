@@ -110,7 +110,10 @@ pub(super) async fn load_drain_config(
                 config.map(Some).map_err(|error| error.to_string())
             }
         },
-        other => Err(format!("the realm configuration read answered {}", other.label())),
+        other => Err(format!(
+            "the realm configuration read answered {}",
+            other.label()
+        )),
     }
 }
 

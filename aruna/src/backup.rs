@@ -180,7 +180,10 @@ async fn write_client(
 fn blocking_stream(
     stream: UnixStream,
     stall: Duration,
-) -> std::io::Result<(std::os::unix::net::UnixStream, std::os::unix::net::UnixStream)> {
+) -> std::io::Result<(
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+)> {
     let stream = stream.into_std()?;
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(stall))?;
@@ -236,7 +239,10 @@ mod tests {
             sync: open("sync"),
             metadata: open("metadata"),
             git_root: root.join("git"),
-            git: Some(Arc::new(GitStore::new(root.join("git"), root.join("helper")))),
+            git: Some(Arc::new(GitStore::new(
+                root.join("git"),
+                root.join("helper"),
+            ))),
         }
     }
 

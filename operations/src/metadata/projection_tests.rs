@@ -1505,7 +1505,10 @@ async fn owned_recovery_waits() {
                 txn_id: None,
             })
             .await;
-        assert!(matches!(deleted, Event::Storage(StorageEvent::DeleteResult { .. })));
+        assert!(matches!(
+            deleted,
+            Event::Storage(StorageEvent::DeleteResult { .. })
+        ));
     }
     let result = drain_projection_queue(&context).await.expect("drain runs");
     assert_eq!(result.projected, 1);
