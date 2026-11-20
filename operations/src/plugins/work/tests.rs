@@ -830,6 +830,35 @@ fn reserve_decisions() {
     );
 }
 
+// A pruned task goes with its task row in the same delete, and each work counts once however
+// many keys it has.
+#[test]
+fn task_row_pruned() {
+    let install = sample_install(Ulid::from_parts(1, 1));
+    let (run_id, work_id) = (Ulid::from_parts(2, 2), Ulid::from_parts(3, 3));
+    let mut row = WorkRow::reserved(&install, WorkKind::Recipe, (run_id, work_id), 1);
+    (row.state, row.notified, row.settled_ms) = (WorkState::Settled, true, Some(1));
+    let identity = Identity::Call { run_id, ordinal: 0 };
+    let key = row_key(install.install_id, &identity).unwrap();
+    let mut prune = prune_work(1 + RUN_RETENTION_MS);
+    prune.first().unwrap();
+    let scanned = page_result(vec![(key.clone(), encode(&row).unwrap())], None);
+    assert!(matches!(
+        prune.next(scanned),
+        Ok(Next::Call(IoCall::Read(_)))
+    ));
+    let Ok(Next::Call(IoCall::Delete(keys))) = prune.next(values_result(vec![None])) else {
+        panic!("the aged work is deleted");
+    };
+    let deleted: Vec<Vec<u8>> = keys.into_iter().map(|(_, key)| key.to_vec()).collect();
+    let task = task_key(install.install_id, work_id);
+    assert_eq!(
+        deleted,
+        vec![index_key(install.install_id, work_id), key, task]
+    );
+    assert_eq!(prune.next(IoResult::Done), Ok(Next::Done(1)));
+}
+
 pub(crate) fn sample_install(install_id: Ulid) -> PluginInstall {
     let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]);
     let node = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
