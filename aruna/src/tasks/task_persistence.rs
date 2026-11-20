@@ -99,7 +99,10 @@ async fn restore_timer(
     let after = Duration::from_millis(current.due_unix_millis.saturating_sub(now_ms));
     // The row already exists, so its own admission arms the wake and its firing deletes it.
     let admission = current.admission;
-    match task_handle.shorten_owned(current.key, after, admission).await {
+    match task_handle
+        .shorten_owned(current.key, after, admission)
+        .await
+    {
         (Event::Task(TaskEvent::Error { message, .. }), _) => Err(message),
         _ => Ok(()),
     }
@@ -335,7 +338,10 @@ mod tests {
         assert_ne!(first.admission, second.admission);
         let stamp = Some(first.admission);
         aruna_storage::task_timers::delete_persisted_timer(&storage, &key, stamp).await;
-        assert_eq!(read_timer(&storage, &key).await.expect("reads"), Some(second));
+        assert_eq!(
+            read_timer(&storage, &key).await.expect("reads"),
+            Some(second)
+        );
     }
 
     // A row that stopped decoding is deleted only while it still does not decode, so a timer a
@@ -443,7 +449,10 @@ mod tests {
             .expect("timer persists");
         aruna_storage::task_timers::delete_persisted_timer(&storage, &key, None).await;
         let unstamped = read_timer(&storage, &key).await.expect("timer reads");
-        assert!(unstamped.is_some(), "a firing without an admission owns no row");
+        assert!(
+            unstamped.is_some(),
+            "a firing without an admission owns no row"
+        );
         let owner = Some(aruna_storage::task_timers::NO_ADMISSION);
         aruna_storage::task_timers::delete_persisted_timer(&storage, &key, owner).await;
         assert!(

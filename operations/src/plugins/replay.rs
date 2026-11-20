@@ -534,7 +534,11 @@ impl RunReplays {
     /// the ordinary delay instead of the next tick at once.
     fn done(&mut self, more: bool) -> Next<Replayed> {
         let failed = self.failed;
-        let after = if more || failed > 0 { self.last.take() } else { None };
+        let after = if more || failed > 0 {
+            self.last.take()
+        } else {
+            None
+        };
         Next::Done(Replayed {
             read: self.read,
             more: more && failed == 0,

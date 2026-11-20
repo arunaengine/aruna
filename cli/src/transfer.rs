@@ -190,7 +190,8 @@ impl S3Access {
         if expires_within(&session.token.expires_at, now, chrono::TimeDelta::zero()) {
             // The node refuses to refresh an expired session; the caller's token gives the new
             // one the same restrictions.
-            let fresh = request_session(&self.api, &self.group_id, self.fallback.as_deref()).await?;
+            let fresh =
+                request_session(&self.api, &self.group_id, self.fallback.as_deref()).await?;
             self.client = s3_client(&fresh);
             *session = fresh;
             return Ok(self.client.clone());
@@ -910,7 +911,10 @@ mod tests {
             session.token.expires_at = lapsed.to_rfc3339();
         }
         let error = access.client().await.unwrap_err();
-        assert!(error.to_string().contains("cannot reach the API"), "{error}");
+        assert!(
+            error.to_string().contains("cannot reach the API"),
+            "{error}"
+        );
     }
 
     #[test]

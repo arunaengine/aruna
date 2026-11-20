@@ -130,7 +130,10 @@ impl Worker {
         match drive(replays, &self.ctx).await {
             Ok(replayed) => {
                 if replayed.failed > 0 {
-                    warn!(failed = replayed.failed, "Plugin event replays failed and wait");
+                    warn!(
+                        failed = replayed.failed,
+                        "Plugin event replays failed and wait"
+                    );
                 }
                 self.replaying.store(replayed.more, Ordering::Relaxed);
                 if let Ok(mut after) = self.replay_after.lock() {

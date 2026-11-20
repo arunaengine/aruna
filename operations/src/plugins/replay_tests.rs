@@ -409,11 +409,15 @@ fn failed_replay_waits() {
     let mut replays = RunReplays::new(9, (10, 5), None);
     replays.first().unwrap();
     replays.next(key_page(&[b"r1", b"r2"])).unwrap();
-    let failed = IoResult::Child(aruna_core::calls::ChildOutcome::new(Err::<(usize, bool), _>(
-        StoreError("unreadable".into()),
-    )));
+    let failed = IoResult::Child(aruna_core::calls::ChildOutcome::new(
+        Err::<(usize, bool), _>(StoreError("unreadable".into())),
+    ));
     replays.next(failed).unwrap();
-    assert_eq!(replays.current.as_deref(), Some(&b"r2"[..]), "the next install goes on");
+    assert_eq!(
+        replays.current.as_deref(),
+        Some(&b"r2"[..]),
+        "the next install goes on"
+    );
     let more = child_result(Ok::<_, StoreError>((3usize, false)));
     let done = Replayed {
         read: 3,

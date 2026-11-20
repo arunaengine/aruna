@@ -140,6 +140,9 @@ mod tests {
             panic!("expected the deletes");
         };
         assert_eq!(keys.len(), 3);
-        assert_eq!(prune.next(IoResult::Done), Ok(Next::Done(PruneOutcome::Removed)));
+        assert_eq!(
+            prune.next(IoResult::Done),
+            Ok(Next::Done(PruneOutcome::Removed))
+        );
     }
 }

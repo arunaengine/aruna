@@ -124,7 +124,10 @@ mod tests {
             ],
             next: Some(ByteView::from(b"next".as_slice())),
         };
-        assert!(matches!(live.next(child(page)), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(matches!(
+            live.next(child(page)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
         let Ok(Next::Done(page)) = live.next(child(PruneOutcome::Removed)) else {
             panic!("expected the page");
         };

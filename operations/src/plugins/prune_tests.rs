@@ -151,7 +151,10 @@ fn removed_hooks_paged() {
     plan.first().unwrap();
     let no_old = plan.next(page_result(Vec::new(), None)).unwrap();
     assert_eq!(no_old, Next::Call(delete_call(Vec::new())));
-    assert!(matches!(plan.next(IoResult::Done).unwrap(), Next::Call(IoCall::Page { .. })));
+    assert!(matches!(
+        plan.next(IoResult::Done).unwrap(),
+        Next::Call(IoCall::Page { .. })
+    ));
     let id = hook_key(install, "d1");
     let page = page_result(vec![(id.clone(), encode(&7u64).unwrap())], Some(id.clone()));
     let Next::Call(IoCall::Delete(keys)) = plan.next(page).unwrap() else {

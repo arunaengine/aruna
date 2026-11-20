@@ -41,7 +41,9 @@ pub async fn change_timer(
         let Some(task_handle) = task_handle else {
             return refused_handle();
         };
-        let (event, armed) = task_handle.shorten_owned(key.clone(), *after, admission).await;
+        let (event, armed) = task_handle
+            .shorten_owned(key.clone(), *after, admission)
+            .await;
         if armed && let Err(message) = write_owned(storage, key, *after, admission).await {
             warn!(key = ?key, %message, "Timer kept in memory only");
             if !keep_live {

@@ -584,7 +584,10 @@ mod tests {
         let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
         operation.first().unwrap();
         let garbage = || IoResult::Values(vec![Some(Value::from(vec![0xff; 3]))]);
-        assert_eq!(operation.next(garbage()), Err(KeyError::Abe(AbeError::Context)));
+        assert_eq!(
+            operation.next(garbage()),
+            Err(KeyError::Abe(AbeError::Context))
+        );
         operation.state = State::Settings;
         let unreadable = operation.settings_read(Some(Value::from(vec![0xff; 3])));
         assert_eq!(unreadable, Err(KeyError::Abe(AbeError::Context)));
@@ -675,7 +678,10 @@ mod tests {
         };
         assert_eq!(rest.len(), 300 - requests::HOLDER_PAGE);
         let turn = operation.next(IoResult::Done);
-        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))), "then the explicit pages");
+        assert!(
+            matches!(turn, Ok(Next::Call(IoCall::Page { .. }))),
+            "then the explicit pages"
+        );
     }
 
     #[test]
