@@ -317,6 +317,57 @@ mod tests {
         assert_eq!(run.next(failed), Ok(Next::Done((reply, None))));
     }
 
+    // A claim question goes to this receiver's closure answer; a run that broke off decides
+    // nothing.
+    #[test]
+    fn claim_query_answered() {
+        let (submission_id, admit_by) = (SubmissionId([4; 32]), 9);
+        let query = MetadataTransportMessage::QuerySubmissionClaim {
+            submission_id,
+            admit_by,
+        };
+        let mut run = operation(query.clone(), false);
+        let serve = ServeClosureOperation::new(local().1, peer(), (submission_id, admit_by));
+        assert_eq!(run.first(), Ok(Next::Call(IoCall::child(serve))));
+        let absent = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(ClosureAnswer::Absent)));
+        let answer = ClosureAnswer::Absent;
+        let reply = MetadataTransportMessage::SubmissionClaimAnswered { answer };
+        assert_eq!(run.next(absent), Ok(Next::Done((reply, None))));
+        let mut broken = operation(query, false);
+        broken.first().unwrap();
+        let failed = Err::<ClosureAnswer, _>(IoError::Unfinished);
+        let failed = IoResult::Child(ChildOutcome::new(failed));
+        let answer = ClosureAnswer::Undecided;
+        let reply = MetadataTransportMessage::SubmissionClaimAnswered { answer };
+        assert_eq!(broken.next(failed), Ok(Next::Done((reply, None))));
+    }
+
+    // A launch closure answer goes back as is; an outsider is rejected and an undecided answer
+    // is unavailable, so the holder asks again.
+    #[test]
+    fn closure_answer_replied() {
+        let reply = |answer: Result<LaunchClosureAnswer, ClosureError>| {
+            let mut run = operation(MetadataTransportMessage::ForwardedWriteUnavailable, false);
+            run.asked = Some(Asked::Closure);
+            match run.next(IoResult::Child(ChildOutcome::new(answer))) {
+                Ok(Next::Done((reply, None))) => reply,
+                other => panic!("a closure answer is a reply: {other:?}"),
+            }
+        };
+        let never = LaunchClosureAnswer::NeverAccepted;
+        let answered = MetadataTransportMessage::LaunchClosureAnswered {
+            answer: never.clone(),
+        };
+        assert_eq!(reply(Ok(never)), answered);
+        let outsider = MetadataTransportMessage::Reject(ClosureError::Outsider.to_string());
+        assert_eq!(reply(Err(ClosureError::Outsider)), outsider);
+        let undecided = Err(ClosureError::Undecided("down".to_string()));
+        assert_eq!(
+            reply(undecided),
+            MetadataTransportMessage::ForwardedWriteUnavailable
+        );
+    }
+
     // A request no plugin or job operation takes is served by the metadata domain, and a run
     // that broke off is answered with its refusal.
     #[test]
