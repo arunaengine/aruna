@@ -206,9 +206,15 @@ pub(crate) mod tests {
         assert!(matches!(sources, Next::Call(IoCall::Page { .. })));
         let old = (vec![SOURCE_ROW, 1], 1u64.to_be_bytes().to_vec());
         let first = page_result(vec![old], Some(vec![SOURCE_ROW, 1]));
-        assert!(matches!(prune.next(first).unwrap(), Next::Call(IoCall::Delete(_))));
+        assert!(matches!(
+            prune.next(first).unwrap(),
+            Next::Call(IoCall::Delete(_))
+        ));
         let next = prune.next(IoResult::Done).unwrap();
-        assert!(matches!(next, Next::Call(IoCall::Page { .. })), "then the next page");
+        assert!(
+            matches!(next, Next::Call(IoCall::Page { .. })),
+            "then the next page"
+        );
         let kept = (vec![SOURCE_ROW, 2], now.to_be_bytes().to_vec());
         let last = prune.next(page_result(vec![kept], None)).unwrap();
         assert_eq!(last, Next::Done(1));

@@ -358,11 +358,17 @@ fn key_page(keys: &[&[u8]]) -> IoResult {
 fn replays_pages_bounded() {
     // The key page and every journal page cost one page; a spent budget names where to go on.
     let mut replays = RunReplays::new(9, (10, 3), None);
-    assert!(matches!(replays.first(), Ok(Next::Call(IoCall::Page { .. }))));
+    assert!(matches!(
+        replays.first(),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
     let turn = replays.next(key_page(&[b"r1"]));
     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     let more = child_result(Ok::<_, StoreError>((4usize, false)));
-    assert!(matches!(replays.next(more), Ok(Next::Call(IoCall::Page { .. }))));
+    assert!(matches!(
+        replays.next(more),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
     let spent = Replayed {
         read: 4,
         more: true,
@@ -380,7 +386,11 @@ fn replays_take_turns() {
     assert_eq!(replays.current.as_deref(), Some(&b"r1"[..]));
     let more = || child_result(Ok::<_, StoreError>((10usize, false)));
     replays.next(more()).unwrap();
-    assert_eq!(replays.current.as_deref(), Some(&b"r2"[..]), "then the other one");
+    assert_eq!(
+        replays.current.as_deref(),
+        Some(&b"r2"[..]),
+        "then the other one"
+    );
     let ended = child_result(Ok::<_, StoreError>((2usize, true)));
     let spent = Replayed {
         read: 12,
@@ -401,9 +411,16 @@ fn cursor_wraps_once() {
     replays.next(key_page(&[b"r2"])).unwrap();
     assert_eq!(replays.current.as_deref(), Some(&b"r2"[..]));
     let ended = || child_result(Ok::<_, StoreError>((1usize, true)));
-    assert!(matches!(replays.next(ended()), Ok(Next::Call(IoCall::Page { .. }))));
+    assert!(matches!(
+        replays.next(ended()),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
     replays.next(key_page(&[b"r1", b"r2"])).unwrap();
-    assert_eq!(replays.current.as_deref(), Some(&b"r1"[..]), "then the first one");
+    assert_eq!(
+        replays.current.as_deref(),
+        Some(&b"r1"[..]),
+        "then the first one"
+    );
     let done = Replayed {
         read: 2,
         more: false,

@@ -467,7 +467,10 @@ mod tests {
     fn opens_without_links() {
         // A folder path through a link or a missing folder opens nothing.
         let directory = tempfile::tempdir().unwrap();
-        let (workspace, outside) = (directory.path().join("workspace"), directory.path().join("o"));
+        let (workspace, outside) = (
+            directory.path().join("workspace"),
+            directory.path().join("o"),
+        );
         std::fs::create_dir_all(workspace.join("real/sub")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, workspace.join("real/link")).unwrap();
