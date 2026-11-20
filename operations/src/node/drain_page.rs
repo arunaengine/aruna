@@ -534,3 +534,51 @@ impl Operation for DrainPageOperation {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+
+    fn page() -> DrainPageOperation {
+        let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let serving = (local, RealmId::from_bytes([3; 32]));
+        let rotation = OutboxRotation::default();
+        let invocation = DrainInvocation::new(&rotation);
+        DrainPageOperation::new(serving, None, rotation, invocation, 8, BTreeSet::new())
+    }
+
+    fn read(result: Result<OutboxReadBatch, ApplyError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    // A failed read stops the invocation and marks it for a retry.
+    #[test]
+    fn failed_read_stops() {
+        let mut run = page();
+        assert!(matches!(run.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let failed = read(Err(ApplyError::Failed("down".to_string())));
+        let Ok(Next::Done(page)) = run.next(failed) else {
+            panic!("a failed read ends the page");
+        };
+        assert_eq!(page.end, PageEnd::Stop);
+        assert!(page.invocation.read_failed);
+    }
+
+    // An empty page at the tail ends the rotation.
+    #[test]
+    fn empty_tail_ends() {
+        let mut run = page();
+        run.first().unwrap();
+        let empty = OutboxReadBatch {
+            records: Vec::new(),
+            has_more: false,
+            next_start_after: None,
+        };
+        let Ok(Next::Done(page)) = run.next(read(Ok(empty))) else {
+            panic!("an empty tail ends the page");
+        };
+        assert_eq!(page.end, PageEnd::Stop);
+        assert!(page.invocation.reached_end);
+    }
+}
