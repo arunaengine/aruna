@@ -13,6 +13,7 @@ pub mod compute_setup;
 pub mod default_env;
 pub mod inbound;
 mod inbound_frames;
+mod peer_frames;
 pub mod plugin_host;
 pub mod portal;
 pub mod shutdown;

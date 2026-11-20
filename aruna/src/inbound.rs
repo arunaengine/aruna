@@ -7,21 +7,18 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::inbound_frames;
+use crate::peer_frames::{PeerRead, read_peer, write_peer};
 use aruna_blob::blob::inbound::{InboundError, refuse_stream};
-use aruna_blob::native;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{AppliedStep, DocumentEvictedDocument, DocumentTarget};
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
-use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::protocol::{
     INBOUND_FRAME_BYTES, MetadataReadError, MetadataTransportMessage,
 };
-use aruna_core::native_reference::{NativeAuthority, NativeReferenceResponse};
 use aruna_core::structs::execution::job::input::RoCrateLimits;
-use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
 use aruna_core::telemetry::record_elapsed_ms;
@@ -29,19 +26,13 @@ use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_drivers::driver::{DriverContext, drive, drive_retry_until, node_routing};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_net::InboundEventHandler;
-use aruna_net::job_control::{read_request, write_answer};
-use aruna_net::notification::{
-    close_stream, drain_request, read_frame, write_frame, write_message,
-};
 use aruna_net::streams::BiStream;
-use aruna_operations::jobs::protocol::{JobAnswer, JobRequestOperation};
 use aruna_operations::jobs::records::pages::ServePageOperation;
 use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
 use aruna_operations::metadata::serve::forwards::needs_view;
 use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, ServedReply};
 use aruna_operations::node::applied_drain::SettleAppliedOperation;
-use aruna_operations::node::heartbeat::ReceiveHeartbeatOperation;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 use aruna_operations::notifications::email::RefreshMailOperation;
 use aruna_operations::notifications::watch::interest::RefreshInterestOperation;
@@ -53,18 +44,16 @@ use aruna_operations::replication::catch_up::WakeBootstrapOperation;
 use aruna_operations::replication::incoming::stream::{
     BaoAdmission, BaoAdmissionOperation, BaoPeerStream, ServeBaoOperation,
 };
-use aruna_operations::shard::incoming::{ManifestAnswer, ServeManifestOperation};
-use aruna_operations::staging::native_source::PrepareReferenceOperation;
 use aruna_operations::sync::evicted::ReemitEvictedOperation;
-use aruna_operations::triggers::{PeerInput, peer_operation};
+use aruna_operations::triggers::{PeerAnswer, PeerInput, peer_operation};
 use aruna_tasks::shutdown::Shutdown;
 use async_trait::async_trait;
+use futures_util::future::BoxFuture;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, warn};
 use ulid::Ulid;
 
-const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Peer audit pages this node serves at once.
 const AUDIT_INBOUND_LIMIT: usize = 16;
 const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
@@ -83,22 +72,52 @@ struct OperationsInboundHandler {
 }
 
 impl OperationsInboundHandler {
-    /// Answers one job-control request and signals the attempts a cancel reached.
-    async fn answer_job_stream(&self, mut stream: BiStream, peer: NodeId) {
-        let Some(request) = read_request(&mut stream, peer).await else {
+    /// Serves one peer request through the operation the trigger table names for it: reads the
+    /// request in its protocol's framing, drives the operation once and writes its answer.
+    #[tracing::instrument(
+        name = "peer.incoming.stream",
+        level = "debug",
+        skip(self, stream),
+        fields(peer = %peer, alpn = ?alpn)
+    )]
+    async fn serve_peer(&self, alpn: Alpn, mut stream: BiStream, peer: NodeId) {
+        let context = self.context.as_ref();
+        let Some(net_handle) = context.net_handle.as_ref() else {
+            debug!(peer = %peer, "Dropping inbound peer stream without net handle");
             return;
         };
-        let context = self.context.as_ref();
-        let serving = context.node_and_realm();
-        let now_ms = aruna_clock::unix_timestamp_millis();
-        let serve = JobRequestOperation::new(peer, request, serving, now_ms);
-        let answer = drive(serve, context)
-            .await
-            .unwrap_or_else(JobAnswer::unavailable);
-        for job_id in answer.running {
-            self.jobs_runtime.request_cancel(job_id);
+        let Some(PeerRead { request, slot: _slot }) =
+            read_peer(alpn, &mut stream, peer, net_handle).await
+        else {
+            return;
+        };
+        let input = PeerInput {
+            alpn,
+            peer,
+            local_node: net_handle.node_id(),
+            local_realm: *net_handle.realm_id(),
+            now_ms: unix_timestamp_millis(),
+            request,
+        };
+        let answer = match peer_operation(&input) {
+            Some(operation) => match operation.deadline() {
+                Some(limit) => {
+                    let build = || operation.clone();
+                    let deadline = tokio::time::Instant::now() + limit;
+                    drive_retry_until(build, context, peer.as_bytes(), deadline).await
+                }
+                None => drive(operation, context).await,
+            },
+            // A request no operation answers gets no answer of its own; its protocol refuses it.
+            None => Ok(PeerAnswer::Kept),
+        };
+        // The attempts a cancel reached run here, so the runtime signals them.
+        if let Ok(PeerAnswer::Job(job)) = &answer {
+            for job_id in &job.running {
+                self.jobs_runtime.request_cancel(*job_id);
+            }
         }
-        write_answer(stream, peer, &answer.response, answer.body).await;
+        write_peer(&input, stream, answer).await;
     }
 
     fn new(
@@ -777,54 +796,28 @@ impl InboundEventHandler for OperationsInboundHandler {
             trace!(event = "stream.received", peer = %node_id, alpn = ?alpn, "Received inbound stream");
             // Debug poll frames reserve stack for every branch at once, so each
             // protocol branch is boxed to keep only the active one on the stack.
-            match alpn {
-                Alpn::Bao => {
-                    Box::pin(handle_bao_stream(
-                        self.context.as_ref(),
-                        &self.rocrate_limits,
-                        stream,
-                        node_id,
-                    ))
-                    .await;
-                }
-                Alpn::DocumentSync => {
-                    Box::pin(self.accept_document_sync(stream, node_id)).await;
-                }
-                Alpn::Metadata => {
-                    Box::pin(self.handle_metadata_stream(stream, node_id)).await;
-                }
-                Alpn::NativeReference => {
-                    Box::pin(answer_native_stream(
-                        self.context.as_ref(),
-                        stream,
-                        node_id,
-                    ))
-                    .await;
-                }
-                Alpn::Notification => {
-                    Box::pin(receive_notification(
-                        self.context.as_ref(),
-                        stream,
-                        node_id,
-                    ))
-                    .await
-                }
-                Alpn::Shard => {
-                    Box::pin(serve_shard_stream(self.context.as_ref(), stream, node_id)).await
-                }
-                Alpn::Heartbeat => {
-                    Box::pin(receive_heartbeat(self.context.as_ref(), stream, node_id)).await
-                }
-                Alpn::JobControl => {
-                    Box::pin(self.answer_job_stream(stream, node_id)).await
-                }
+            let serve: BoxFuture<'_, ()> = match alpn {
+                Alpn::Bao => Box::pin(async move {
+                    let limits = &self.rocrate_limits;
+                    handle_bao_stream(self.context.as_ref(), limits, stream, node_id).await;
+                }),
+                Alpn::DocumentSync => Box::pin(async move {
+                    self.accept_document_sync(stream, node_id).await;
+                }),
+                Alpn::Metadata => Box::pin(async move {
+                    self.handle_metadata_stream(stream, node_id).await;
+                }),
+                Alpn::Notification
+                | Alpn::Shard
+                | Alpn::Heartbeat
+                | Alpn::JobControl
+                | Alpn::NativeReference => Box::pin(self.serve_peer(alpn, stream, node_id)),
                 Alpn::Dht => {
-                    warn!(
-                        peer = %node_id,
-                        "Ignoring inbound stream for non-stream ALPN"
-                    );
+                    warn!(peer = %node_id, "Ignoring inbound stream for non-stream ALPN");
+                    return;
                 }
-            }
+            };
+            serve.await;
         }
         .instrument(span)
         .await;
@@ -892,179 +885,6 @@ fn schedule_sync_maintenance(
             run_maintenance(&context, "periodic", cycle).await;
         }
     });
-}
-
-/// Answers one native reference stream with what its request prepared.
-async fn answer_native_stream(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
-    let Some(request) = native::read_request(&mut stream, peer).await else {
-        return;
-    };
-    let relationship = matches!(request.authority, NativeAuthority::Relationship(_));
-    let prepare = PrepareReferenceOperation::new(context.node_and_realm(), peer, request);
-    let (response, body) = match drive(prepare, context).await {
-        Ok(prepared) => {
-            // Only a caller read names the group; a sync relationship knows its own bucket.
-            let response = match prepared.group_id.filter(|_| !relationship) {
-                None => NativeReferenceResponse::Content(prepared.metadata),
-                Some(group_id) => NativeReferenceResponse::Described {
-                    metadata: prepared.metadata,
-                    group_id,
-                },
-            };
-            (response, prepared.body)
-        }
-        Err(reject) => (NativeReferenceResponse::Rejected(reject), None),
-    };
-    native::write_answer(stream, peer, &response, body).await;
-}
-
-/// Serves one inbound notification stream: reads a request frame, runs the operation the trigger
-/// table names for it and writes its answer frame.
-#[tracing::instrument(
-    name = "notifications.incoming.stream",
-    level = "debug",
-    skip(context, stream),
-    fields(peer = %peer)
-)]
-async fn receive_notification(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        warn!(peer = %peer, "Dropping inbound notification stream without net handle");
-        return;
-    };
-    let frame = match read_frame(&mut stream).await {
-        Ok(frame) => frame,
-        Err(error) => {
-            warn!(peer = %peer, error = %error, "Failed to read notification message");
-            return;
-        }
-    };
-    if let Err(error) = drain_request(&mut stream).await {
-        warn!(peer = %peer, error = %error, "Failed to drain notification request stream");
-        close_stream(&mut stream).await;
-        return;
-    }
-    let input = PeerInput {
-        alpn: Alpn::Notification,
-        peer,
-        local_node: net_handle.node_id(),
-        local_realm: *net_handle.realm_id(),
-        now_ms: unix_timestamp_millis(),
-        frame: &frame,
-    };
-    let written = match peer_operation(input) {
-        // The same bound the config read had before, so a slow store cannot hold the stream.
-        Some(operation) => {
-            let build = || operation.clone();
-            let deadline = tokio::time::Instant::now() + NOTIFICATION_AUTH_TIMEOUT;
-            match drive_retry_until(build, context, peer.as_bytes(), deadline).await {
-                Ok(answer) => write_frame(&mut stream, &answer).await,
-                Err(error) => Err(error.to_string()),
-            }
-        }
-        // Every request has an operation; an answer frame sent as a request is refused.
-        None => match postcard::from_bytes::<NotificationTransportMessage>(&frame) {
-            Ok(message) => {
-                debug!(peer = %peer, message = message.label(), "Received notification message");
-                let reason = "unexpected notification control message".to_string();
-                let response = NotificationTransportMessage::Reject(reason);
-                write_message(&mut stream, &response).await
-            }
-            Err(error) => Err(error.to_string()),
-        },
-    };
-    if let Err(error) = written {
-        warn!(peer = %peer, error = %error, "Failed to write notification response");
-    }
-    close_stream(&mut stream).await;
-}
-
-/// Reads one bounded heartbeat frame of `peer` within the stream limits and keeps it through
-/// the heartbeat operation; every refusal is only logged.
-async fn receive_heartbeat(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return;
-    };
-    let Some(_slot) = net_handle.heartbeat_slot(peer) else {
-        debug!(%peer, "Dropping a heartbeat stream past the stream limits");
-        return;
-    };
-    let read = tokio::time::timeout(HEARTBEAT_IO_TIMEOUT, heartbeat_frame(&mut stream)).await;
-    let _ = stream.0.finish();
-    let frame = match read {
-        Ok(Ok(frame)) => frame,
-        Ok(Err(error)) => {
-            debug!(%peer, %error, "Dropping an invalid heartbeat");
-            return;
-        }
-        Err(_) => {
-            debug!(%peer, "Heartbeat read timed out");
-            return;
-        }
-    };
-    let receive = ReceiveHeartbeatOperation::new(peer, *net_handle.realm_id(), frame);
-    if let Err(error) = drive(receive, context).await {
-        debug!(%peer, %error, "Heartbeat not kept");
-    }
-}
-
-/// One length-prefixed heartbeat frame, at most [`MAX_HEARTBEAT_BYTES`] long.
-async fn heartbeat_frame(stream: &mut BiStream) -> Result<Vec<u8>, String> {
-    use tokio::io::AsyncReadExt;
-    let mut length = [0u8; 4];
-    stream
-        .1
-        .read_exact(&mut length)
-        .await
-        .map_err(|error| error.to_string())?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length > MAX_HEARTBEAT_BYTES {
-        return Err("heartbeat frame exceeds the size limit".to_string());
-    }
-    let mut bytes = vec![0u8; length];
-    stream
-        .1
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(bytes)
-}
-
-/// Answers one inbound shard manifest request on `stream`.
-#[tracing::instrument(
-    name = "shard.incoming.stream",
-    level = "debug",
-    skip(context, stream),
-    fields(peer = %peer)
-)]
-async fn serve_shard_stream(
-    context: &DriverContext,
-    mut stream: aruna_net::streams::BiStream,
-    peer: NodeId,
-) {
-    use aruna_net::shard_manifest::{
-        close_shard_stream, read_manifest_request, write_manifest, write_rejection,
-    };
-    let Some(local) = context.node_and_realm() else {
-        warn!(peer = %peer, "Dropping inbound shard stream without net handle");
-        return;
-    };
-    let message = match read_manifest_request(&mut stream).await {
-        Ok(message) => message,
-        Err(error) => {
-            warn!(peer = %peer, error = %error, "Failed to read shard manifest request");
-            return;
-        }
-    };
-    let serve = ServeManifestOperation::new(local, peer, message);
-    let written = match drive(serve, context).await {
-        Ok(ManifestAnswer::Manifest(manifest)) => write_manifest(&mut stream, &manifest).await,
-        Ok(ManifestAnswer::Reject(reason)) => write_rejection(&mut stream, reason).await,
-        Err(error) => write_rejection(&mut stream, error.to_string()).await,
-    };
-    if let Err(error) = written {
-        warn!(peer = %peer, error = %error, "Failed to write shard manifest response");
-    }
-    close_shard_stream(&mut stream).await;
 }
 
 /// Reconciles the metadata store with document sync and prunes deleted graphs.

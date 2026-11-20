@@ -39,6 +39,7 @@ pub mod prune_jobs;
 pub mod prune_queue;
 pub mod public_preview;
 mod query_cache;
+pub mod queue_timer;
 pub(crate) mod raw_events;
 pub mod raw_revision;
 pub(crate) mod read_peer;

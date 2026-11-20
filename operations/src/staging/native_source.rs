@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::id::NodeId;
 use aruna_core::native_reference::{
-    NativeAuthority, NativeReferenceReject, NativeReferenceRequest,
+    NativeAuthority, NativeReferenceReject, NativeReferenceRequest, NativeReferenceResponse,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -637,6 +637,62 @@ fn head_metadata(
     Ok(metadata)
 }
 
+/// The answer to a native reference stream and its bytes, for a read.
+pub type NativeAnswer = (
+    NativeReferenceResponse,
+    Option<BackendStream<Result<Bytes, StreamError>>>,
+);
+
+/// Prepares a peer's native reference request and decides its answer: a caller read names the
+/// group, while a sync relationship knows its own bucket; a refusal is answered as such.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeAnswerOperation {
+    ids: Option<Ids>,
+    peer: NodeId,
+    request: Option<NativeReferenceRequest>,
+    relationship: bool,
+}
+
+impl NativeAnswerOperation {
+    pub fn new(ids: Option<Ids>, peer: NodeId, request: NativeReferenceRequest) -> Self {
+        let relationship = matches!(request.authority, NativeAuthority::Relationship(_));
+        Self {
+            ids,
+            peer,
+            request: Some(request),
+            relationship,
+        }
+    }
+}
+
+impl Operation for NativeAnswerOperation {
+    type Output = NativeAnswer;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<NativeAnswer>, IoError> {
+        let request = self.request.take().ok_or(IoError::Unfinished)?;
+        let prepare = PrepareReferenceOperation::new(self.ids, self.peer, request);
+        Ok(Next::Call(IoCall::child(prepare)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<NativeAnswer>, IoError> {
+        let answer = match result.child::<PreparedReference, Reject>()? {
+            Ok(prepared) => {
+                let response = match prepared.group_id.filter(|_| !self.relationship) {
+                    None => NativeReferenceResponse::Content(prepared.metadata),
+                    Some(group_id) => NativeReferenceResponse::Described {
+                        metadata: prepared.metadata,
+                        group_id,
+                    },
+                };
+                (response, prepared.body)
+            }
+            Err(reject) => (NativeReferenceResponse::Rejected(reject), None),
+        };
+        Ok(Next::Done(answer))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +724,47 @@ mod tests {
             head: false,
             range: None,
         }
+    }
+
+    // A relationship read never names the group, a caller read does, and a refusal is answered.
+    #[test]
+    fn native_answer_chosen() {
+        let metadata = SourceMetadata {
+            content_length: 3,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        };
+        let group_id = GroupId::from_bytes([5; 16]);
+        let prepared = || PreparedReference {
+            metadata: metadata.clone(),
+            group_id: Some(group_id),
+            body: None,
+        };
+        let authority = NativeAuthority::Relationship(Ulid::from_bytes([4; 16]));
+        let mut answer = NativeAnswerOperation::new(Some(ids()), ids().0, read_request(authority));
+        assert!(matches!(answer.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let content = NativeReferenceResponse::Content(metadata.clone());
+        let Ok(Next::Done((response, None))) = answer.next(child(Ok::<_, Reject>(prepared())))
+        else {
+            panic!("a prepared read is answered");
+        };
+        assert_eq!(response, content);
+        answer.relationship = false;
+        let Ok(Next::Done((response, None))) = answer.next(child(Ok::<_, Reject>(prepared())))
+        else {
+            panic!("a prepared read is answered");
+        };
+        let described = NativeReferenceResponse::Described { metadata, group_id };
+        assert_eq!(response, described);
+        let refused = Reject::Unavailable("gone".to_string());
+        let rejected = answer.next(child(Err::<PreparedReference, _>(refused.clone())));
+        let Ok(Next::Done((NativeReferenceResponse::Rejected(reason), None))) = rejected else {
+            panic!("a refusal is answered");
+        };
+        assert_eq!(reason, refused);
     }
 
     // Without a network there is no identity to check a peer's read against.

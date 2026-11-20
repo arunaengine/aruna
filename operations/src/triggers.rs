@@ -3,17 +3,25 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::time::Duration;
 
 use aruna_core::alpn::Alpn;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::document::ShardTransportMessage;
 use aruna_core::git::GitNode;
-use aruna_core::heartbeat::{INFO_PUBLISH_INTERVAL, RunningJobs};
+use aruna_core::compute::ResourceEnvelope;
+use aruna_core::heartbeat::{HeldHeartbeat, INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
+use aruna_core::jobs::JobRequest;
+use aruna_core::native_reference::{
+    NativeReferenceReject, NativeReferenceRequest, NativeReferenceResponse,
+};
 use aruna_core::node::facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
 use aruna_core::structs::identity::realm::RealmId;
@@ -22,22 +30,39 @@ use aruna_core::task::TaskKey;
 use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::blob::cleanup_timer::CleanupTimerOperation;
 use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
+use crate::blob::holders::HoldersTimerOperation;
 use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
+use crate::device::publish_queue::DrainOutcome;
+use crate::device::sync::outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER, drain_sync_outbox};
 use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
+use crate::jobs::backend_import::schedule::RunDueOperation;
+use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
+use crate::jobs::lifecycle::outbox::timers::FamilyTimerOperation;
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperation};
+use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation};
+use crate::jobs::node_inputs::witness_node;
+use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
+use crate::metadata::device::drain::{
+    DrainPublishOperation, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, drain_publish_queue,
+};
+use crate::metadata::materialization_queue::MATERIALIZATION_RETRY_AFTER;
 use crate::metadata::projection::{PROJECTION_RETRY_AFTER, ProjectionRunOperation};
+use crate::metadata::prune_queue::GRAPH_RETRY_AFTER;
+use crate::metadata::queue_timer::{MaterializationRunOperation, PruneRunOperation};
 use crate::node::applied_drain::AppliedDrainOperation;
+use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::info_timer::InfoTimerOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
+use crate::node::range_timer::RangeTimerOperation;
 use crate::node::usage_publish::PublishUsageOperation;
 use crate::notifications::deliver::{DeliverBatchOperation, DeliverInput};
 use crate::notifications::holder::HolderRead;
@@ -57,11 +82,14 @@ use crate::replication::mirror_repair::drain::DrainRepairsOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::s3::object::metadata_drain::DrainRefreshOperation;
 use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
+use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
+use crate::staging::native_source::{NativeAnswer, NativeAnswerOperation};
+use crate::transfer::sharding::{MaintainCursors, maintain_retry};
 
 /// What a timer keeps on this node between its runs, in memory only: its attempts since the last
 /// clean run and where its work goes on. The shell stores it per key and hands it back unread, so
 /// every decision about it stays with the timer's operation; a restart starts it afresh.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TimerMemory {
     pub attempts: u32,
     pub cursor: Option<Vec<u8>>,
@@ -69,6 +97,8 @@ pub struct TimerMemory {
     pub sequence: u64,
     /// Where the replication drain's bootstrap work goes on.
     pub catch_up: CatchUpCursors,
+    /// Where range maintenance goes on.
+    pub ranges: MaintainCursors,
 }
 
 /// Retry steps after which a timer's retry ladder stops doubling.
@@ -88,7 +118,7 @@ impl TimerMemory {
 }
 
 /// When a timer runs again, `None` while it waits for work, and what it keeps until then.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TimerPlan {
     pub after: Option<Duration>,
     pub memory: TimerMemory,
@@ -119,6 +149,22 @@ pub struct TimerInput {
     pub has_blob: bool,
     /// The jobs running on this node, for its heartbeat.
     pub running: Option<RunningJobs>,
+    /// Whether this node runs a task handle.
+    pub has_tasks: bool,
+    /// Graph groups the materialization drain finishes at once on this host.
+    pub group_concurrency: usize,
+    /// The fresh heartbeats this node holds, filled only for a key [`needs_cluster`] names.
+    pub heartbeats: BTreeMap<NodeId, HeldHeartbeat>,
+    /// What each local executor backend advertises, filled like `heartbeats`.
+    pub limits: BTreeMap<String, ResourceEnvelope>,
+    /// This node's ROCrate limits, such as the artifact retention and the holder refresh.
+    pub rocrate_limits: RoCrateLimits,
+}
+
+/// Whether the timer of `key` reads the heartbeats and executor limits; they are copied only
+/// for such a timer, since most runs never look at them.
+pub fn needs_cluster(key: &TaskKey) -> bool {
+    matches!(key, TaskKey::DrainWitnessQueue | TaskKey::MaintainRanges)
 }
 
 impl TimerInput {
@@ -132,6 +178,11 @@ impl TimerInput {
             routing: NodeRouting::default(),
             has_blob: false,
             running: None,
+            has_tasks: false,
+            group_concurrency: 1,
+            heartbeats: BTreeMap::new(),
+            limits: BTreeMap::new(),
+            rocrate_limits: RoCrateLimits::default(),
         }
     }
 }
@@ -188,6 +239,15 @@ pub enum TimerOperation {
     PublishNodeInfo(InfoTimerOperation),
     DrainProjectionQueue(ProjectionRunOperation),
     DrainReplicationQueue(ReplicationTimerOperation),
+    DrainMaterializationQueue(MaterializationRunOperation),
+    DrainPruneQueue(PruneRunOperation),
+    DrainFamilyOutbox(FamilyTimerOperation),
+    DrainWitnessQueue(WitnessDrainOperation),
+    RunBackendImports(RunDueOperation),
+    MaintainRanges(RangeTimerOperation),
+    RefreshBlobHolders(HoldersTimerOperation),
+    DrainUploadOutbox(crate::device::sync::outbox::DrainOutboxOperation),
+    DrainDeviceIntake(DrainPublishOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -307,7 +367,64 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::DrainReplicationQueue => Some(TimerOperation::DrainReplicationQueue(
             ReplicationTimerOperation::new(input),
         )),
+        TaskKey::DrainMaterializationQueue => Some(TimerOperation::DrainMaterializationQueue(
+            MaterializationRunOperation::new(input),
+        )),
+        TaskKey::DrainPruneQueue => Some(TimerOperation::DrainPruneQueue(PruneRunOperation::new(
+            input,
+        ))),
+        TaskKey::DrainFamilyOutbox => Some(match input.facts.serving {
+            Some((node_id, realm_id)) => {
+                TimerOperation::DrainFamilyOutbox(FamilyTimerOperation::new(realm_id, node_id))
+            }
+            None => TimerOperation::Wait(WaitOperation::after(None)),
+        }),
+        TaskKey::DrainWitnessQueue => {
+            let (fresh, limits) = (input.heartbeats.clone(), input.limits.clone());
+            let node = witness_node(input.facts.serving, fresh, limits);
+            let drain = WitnessDrainOperation::new(node, input.now_ms);
+            Some(TimerOperation::DrainWitnessQueue(drain))
+        }
+        TaskKey::RunBackendImports => Some(match input.facts.serving {
+            Some((node_id, _)) => {
+                let retention_ms = input.rocrate_limits.artifact_retention_ms;
+                let now_ms = input.now_ms;
+                let run = RunDueOperation::new(node_id, retention_ms, now_ms, input.facts.serving);
+                TimerOperation::RunBackendImports(run)
+            }
+            None => TimerOperation::Wait(WaitOperation::after(None)),
+        }),
+        TaskKey::MaintainRanges => Some(TimerOperation::MaintainRanges(RangeTimerOperation::new(
+            input,
+        ))),
+        TaskKey::RefreshBlobHolders => Some(match input.facts.serving {
+            Some((node_id, realm_id)) => {
+                let limits = input.rocrate_limits.clone();
+                let refresh = HoldersTimerOperation::new(realm_id, node_id, limits);
+                TimerOperation::RefreshBlobHolders(refresh)
+            }
+            None => {
+                let after = Duration::from_millis(input.rocrate_limits.holder_refresh_ms);
+                TimerOperation::Wait(WaitOperation::after(Some(after)))
+            }
+        }),
+        TaskKey::DrainUploadOutbox => Some(TimerOperation::DrainUploadOutbox(drain_sync_outbox(
+            input.facts.serving,
+        ))),
+        TaskKey::DrainDeviceIntake => Some(TimerOperation::DrainDeviceIntake(drain_publish_queue(
+            input.facts.serving,
+        ))),
         _ => None,
+    }
+}
+
+impl TimerOperation {
+    /// Whether the run uses the bulk storage lane, so background batches never delay requests.
+    pub fn bulk_lane(&self) -> bool {
+        matches!(
+            self,
+            TimerOperation::DrainMaterializationQueue(_) | TimerOperation::DrainPruneQueue(_)
+        )
     }
 }
 
@@ -336,6 +453,15 @@ macro_rules! each_timer {
             TimerOperation::PublishNodeInfo($operation) => $body,
             TimerOperation::DrainProjectionQueue($operation) => $body,
             TimerOperation::DrainReplicationQueue($operation) => $body,
+            TimerOperation::DrainMaterializationQueue($operation) => $body,
+            TimerOperation::DrainPruneQueue($operation) => $body,
+            TimerOperation::DrainFamilyOutbox($operation) => $body,
+            TimerOperation::DrainWitnessQueue($operation) => $body,
+            TimerOperation::RunBackendImports($operation) => $body,
+            TimerOperation::MaintainRanges($operation) => $body,
+            TimerOperation::RefreshBlobHolders($operation) => $body,
+            TimerOperation::DrainUploadOutbox($operation) => $body,
+            TimerOperation::DrainDeviceIntake($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -649,6 +775,94 @@ impl TimerRun for ReplicationTimerOperation {
     }
 }
 
+impl TimerRun for MaterializationRunOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
+            retry_after: MATERIALIZATION_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for PruneRunOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
+            retry_after: GRAPH_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for FamilyTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
+            retry_after: OUTBOX_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for WitnessDrainOperation {
+    /// Deadlines left after a bounded pass, or a failed pass, run again soon.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let remaining = result.unwrap_or_else(|error| {
+            warn!(error = %error, "Witness deadline scan failed");
+            true
+        });
+        Ok(TimerPlan::from(remaining.then_some(WITNESS_RETRY_AFTER)))
+    }
+}
+
+impl TimerRun for RunDueOperation {
+    /// The run names when a schedule is due next; a failed run waits for the next rule change.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.unwrap_or(None)))
+    }
+}
+
+impl TimerRun for RangeTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(|error| TimerFailure {
+            retry_after: maintain_retry(),
+            reason: error.to_string(),
+        })
+    }
+}
+
+impl TimerRun for HoldersTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
+    }
+}
+
+/// When a device queue drain runs again: soon after a pass that could not complete, at once
+/// after one that asked for another pass, and only on new work once it is idle.
+fn device_plan(outcome: DrainOutcome, defer: Duration, again: Duration) -> TimerPlan {
+    let after = match outcome {
+        DrainOutcome::Deferred => Some(defer),
+        DrainOutcome::Recheck => Some(again),
+        DrainOutcome::Idle => None,
+    };
+    TimerPlan::from(after)
+}
+
+impl TimerRun for crate::device::sync::outbox::DrainOutboxOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let outcome = result.unwrap_or(DrainOutcome::Deferred);
+        Ok(device_plan(outcome, UPLOAD_DEFER_AFTER, UPLOAD_CONTINUE_AFTER))
+    }
+}
+
+impl TimerRun for DrainPublishOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let outcome = result.unwrap_or(DrainOutcome::Deferred);
+        Ok(device_plan(outcome, PUBLISH_DEFER_AFTER, PUBLISH_CONTINUE_AFTER))
+    }
+}
+
 impl TimerRun for PruneNotificationsOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         match result {
@@ -661,16 +875,43 @@ impl TimerRun for PruneNotificationsOperation {
     }
 }
 
-/// One request frame read by the peer shell, with what the shell knows about its stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PeerInput<'a> {
+/// One request read by the peer shell, with what the shell knows about its stream.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeerInput {
     pub alpn: Alpn,
     pub peer: NodeId,
     pub local_node: NodeId,
     pub local_realm: RealmId,
     pub now_ms: u64,
-    /// The frame body without its length prefix, at most the protocol's frame bound.
-    pub frame: &'a [u8],
+    pub request: PeerRequest,
+}
+
+/// A request as the peer shell read it in its protocol's framing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PeerRequest {
+    /// A frame body without its length prefix, at most the protocol's frame bound.
+    Frame(Vec<u8>),
+    /// A shard manifest request.
+    Manifest(ShardTransportMessage),
+    /// A job-control request.
+    Job(JobRequest),
+    /// A native reference read or head request.
+    Native(NativeReferenceRequest),
+}
+
+/// What a peer operation answers; the shell writes it in its protocol's framing.
+#[derive(Debug, PartialEq)]
+pub enum PeerAnswer {
+    /// An answer frame body.
+    Frame(Vec<u8>),
+    /// A shard manifest or why it cannot be served.
+    Manifest(ManifestAnswer),
+    /// A job-control answer with the attempts a cancel reached.
+    Job(JobAnswer),
+    /// A native reference answer and its bytes, for a read.
+    Native(NativeAnswer),
+    /// The request was kept or dropped without an answer.
+    Kept,
 }
 
 /// A peer request that ended without an answer; the shell logs it and closes the stream.
@@ -678,9 +919,9 @@ pub struct PeerInput<'a> {
 #[error("{0}")]
 pub struct PeerFailure(pub String);
 
-/// A peer operation produces the answer frame body the shell writes back.
+/// A peer operation produces the answer the shell writes back.
 pub trait PeerRun: Operation + Sized {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure>;
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure>;
 }
 
 impl From<IoError> for PeerFailure {
@@ -700,20 +941,66 @@ pub enum PeerOperation {
     ServeInbox(ServeInboxOperation),
     /// Watch events expanded into the inboxes this node holds.
     WatchEvents(WatchEventsOperation),
+    /// A peer's heartbeat, kept when it is newer than the held one.
+    Heartbeat(ReceiveHeartbeatOperation),
+    /// A shard manifest request this node answers as a holder.
+    Manifest(ServeManifestOperation),
+    /// A job-control request this node answers for a job it owns or knows.
+    Job(JobRequestOperation),
+    /// A native reference request this node answers from its own copies.
+    Native(NativeAnswerOperation),
+}
+
+/// How long a notification request may run with its retries, so a slow store cannot hold the
+/// stream.
+pub const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl PeerOperation {
+    /// How long the run may take with its conflict reruns; `None` runs it once.
+    pub fn deadline(&self) -> Option<Duration> {
+        match self {
+            PeerOperation::Heartbeat(_)
+            | PeerOperation::Manifest(_)
+            | PeerOperation::Job(_)
+            | PeerOperation::Native(_) => None,
+            _ => Some(NOTIFICATION_AUTH_TIMEOUT),
+        }
+    }
 }
 
 /// The operation that answers `input`, or `None` while its protocol or request kind is not
 /// converted; the shell then answers the frame with its own code.
-pub fn peer_operation(input: PeerInput<'_>) -> Option<PeerOperation> {
-    match input.alpn {
-        Alpn::Notification => {
+pub fn peer_operation(input: &PeerInput) -> Option<PeerOperation> {
+    match (input.alpn, &input.request) {
+        (Alpn::Heartbeat, PeerRequest::Frame(frame)) => {
+            let (peer, realm_id) = (input.peer, input.local_realm);
+            let operation = ReceiveHeartbeatOperation::new(peer, realm_id, frame.clone());
+            Some(PeerOperation::Heartbeat(operation))
+        }
+        (Alpn::Shard, PeerRequest::Manifest(message)) => {
+            let local = (input.local_node, input.local_realm);
+            let operation = ServeManifestOperation::new(local, input.peer, message.clone());
+            Some(PeerOperation::Manifest(operation))
+        }
+        (Alpn::JobControl, PeerRequest::Job(request)) => {
+            let serving = Some((input.local_node, input.local_realm));
+            let operation =
+                JobRequestOperation::new(input.peer, request.clone(), serving, input.now_ms);
+            Some(PeerOperation::Job(operation))
+        }
+        (Alpn::NativeReference, PeerRequest::Native(request)) => {
+            let ids = Some((input.local_node, input.local_realm));
+            let operation = NativeAnswerOperation::new(ids, input.peer, request.clone());
+            Some(PeerOperation::Native(operation))
+        }
+        (Alpn::Notification, PeerRequest::Frame(frame)) => {
             let deliver = DeliverInput {
                 peer: input.peer,
                 local: input.local_node,
                 local_realm: input.local_realm,
                 now_ms: input.now_ms,
             };
-            match postcard::from_bytes(input.frame) {
+            match postcard::from_bytes(frame) {
                 Ok(NotificationTransportMessage::DeliverBatch { records }) => {
                     let operation = DeliverBatchOperation::new(deliver, records);
                     Some(PeerOperation::DeliverNotifications(operation))
@@ -734,45 +1021,75 @@ pub fn peer_operation(input: PeerInput<'_>) -> Option<PeerOperation> {
                 _ => None,
             }
         }
-        Alpn::Dht
-        | Alpn::Bao
-        | Alpn::DocumentSync
-        | Alpn::Metadata
-        | Alpn::NativeReference
-        | Alpn::Shard
-        | Alpn::JobControl
-        | Alpn::Heartbeat => None,
+        _ => None,
     }
 }
 
 /// The answer frame of a notification peer request; an error closes the stream.
 fn notification_answer<E: Display>(
     result: Result<NotificationTransportMessage, E>,
-) -> Result<Vec<u8>, PeerFailure> {
+) -> Result<PeerAnswer, PeerFailure> {
     let answer = result.map_err(|error| PeerFailure(error.to_string()))?;
-    postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))
+    let frame = postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))?;
+    Ok(PeerAnswer::Frame(frame))
 }
 
 impl PeerRun for DeliverBatchOperation {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
         notification_answer(result)
     }
 }
 
 impl PeerRun for RemoveWatchOperation {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
         notification_answer(result)
     }
 }
 
 impl PeerRun for ServeInboxOperation {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
         notification_answer(result)
     }
 }
 
+impl PeerRun for ReceiveHeartbeatOperation {
+    /// A heartbeat gets no answer; one that is not kept is only logged.
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
+        if let Err(error) = result {
+            debug!(%error, "Heartbeat not kept");
+        }
+        Ok(PeerAnswer::Kept)
+    }
+}
+
+impl PeerRun for ServeManifestOperation {
+    /// A failed request is answered with its refusal.
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
+        let reject = |error: IoError| ManifestAnswer::Reject(error.to_string());
+        Ok(PeerAnswer::Manifest(result.unwrap_or_else(reject)))
+    }
+}
+
+impl PeerRun for JobRequestOperation {
+    /// A request this node cannot finish is answered as unavailable.
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
+        Ok(PeerAnswer::Job(result.unwrap_or_else(JobAnswer::unavailable)))
+    }
+}
+
+impl PeerRun for NativeAnswerOperation {
+    /// A run that broke off is answered as unavailable, like any other refusal.
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
+        let unavailable = |error: IoError| {
+            let reject = NativeReferenceReject::Unavailable(error.to_string());
+            (NativeReferenceResponse::Rejected(reject), None)
+        };
+        Ok(PeerAnswer::Native(result.unwrap_or_else(unavailable)))
+    }
+}
+
 impl PeerRun for WatchEventsOperation {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
         notification_answer(result)
     }
 }
@@ -836,14 +1153,18 @@ macro_rules! each_peer {
             PeerOperation::RemoveWatch($operation) => $body,
             PeerOperation::ServeInbox($operation) => $body,
             PeerOperation::WatchEvents($operation) => $body,
+            PeerOperation::Heartbeat($operation) => $body,
+            PeerOperation::Manifest($operation) => $body,
+            PeerOperation::Job($operation) => $body,
+            PeerOperation::Native($operation) => $body,
         }
     };
 }
 
-/// The next call of a peer operation, or its answer frame body.
+/// The next call of a peer operation, or its answer.
 fn peer_turn<O: PeerRun>(
     turn: Result<Next<O::Output>, O::Error>,
-) -> Result<Next<Vec<u8>>, PeerFailure> {
+) -> Result<Next<PeerAnswer>, PeerFailure> {
     match turn {
         Ok(Next::Call(call)) => Ok(Next::Call(call)),
         Ok(Next::Wait) => Ok(Next::Wait),
@@ -856,7 +1177,7 @@ fn peer_turn<O: PeerRun>(
 }
 
 /// The conflict decision of a peer operation; an output it finishes with is encoded.
-fn peer_conflict<O: PeerRun>(operation: &mut O, attempt: u32) -> AfterConflict<Vec<u8>> {
+fn peer_conflict<O: PeerRun>(operation: &mut O, attempt: u32) -> AfterConflict<PeerAnswer> {
     match operation.on_conflict(attempt) {
         AfterConflict::Rerun => AfterConflict::Rerun,
         AfterConflict::Fail => AfterConflict::Fail,
@@ -867,19 +1188,19 @@ fn peer_conflict<O: PeerRun>(operation: &mut O, attempt: u32) -> AfterConflict<V
     }
 }
 
-fn peer_first<O: PeerRun>(operation: &mut O) -> Result<Next<Vec<u8>>, PeerFailure> {
+fn peer_first<O: PeerRun>(operation: &mut O) -> Result<Next<PeerAnswer>, PeerFailure> {
     peer_turn::<O>(operation.first())
 }
 
 fn peer_next<O: PeerRun>(
     operation: &mut O,
     result: IoResult,
-) -> Result<Next<Vec<u8>>, PeerFailure> {
+) -> Result<Next<PeerAnswer>, PeerFailure> {
     peer_turn::<O>(operation.next(result))
 }
 
 impl Operation for PeerOperation {
-    type Output = Vec<u8>;
+    type Output = PeerAnswer;
     type Error = PeerFailure;
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
@@ -928,6 +1249,8 @@ mod tests {
     use crate::replication::mirror_repair::{SyncMirrorError, SyncMirrorResult};
     use crate::s3::object::metadata::ReferenceRefreshError;
     use crate::s3::object::metadata_drain::ReferenceDrainResult;
+    use aruna_core::native_reference::NativeAuthority;
+    use ulid::Ulid;
 
     fn input() -> TimerInput {
         TimerInput::new(1_000, None)
@@ -936,7 +1259,7 @@ mod tests {
     #[test]
     fn unconverted_keys_absent() {
         assert!(timer_operation(&TaskKey::DrainJobQueue, &input()).is_none());
-        assert!(timer_operation(&TaskKey::PruneJobs, &input()).is_none());
+        assert!(timer_operation(&TaskKey::DrainSyncOutbox, &input()).is_none());
     }
 
     #[test]
@@ -1123,6 +1446,50 @@ mod tests {
     }
 
     #[test]
+    fn queue_timers_bulk() {
+        // The metadata queues run on the bulk lane; other timers stay on the request lane.
+        let materialize = timer_operation(&TaskKey::DrainMaterializationQueue, &input());
+        assert!(materialize.unwrap().bulk_lane());
+        assert!(timer_operation(&TaskKey::DrainPruneQueue, &input()).unwrap().bulk_lane());
+        assert!(!timer_operation(&TaskKey::PruneJobs, &input()).unwrap().bulk_lane());
+        let failed = PruneRunOperation::rearm(Err(IoError::Unfinished));
+        assert_eq!(failed.unwrap_err().retry_after, GRAPH_RETRY_AFTER);
+    }
+
+    #[test]
+    fn witness_drain_plans() {
+        // Only the witness timer copies the cluster facts; left or failed rows retry soon.
+        assert!(needs_cluster(&TaskKey::DrainWitnessQueue));
+        assert!(!needs_cluster(&TaskKey::PruneJobs));
+        let retry = Ok(TimerPlan::from(Some(WITNESS_RETRY_AFTER)));
+        assert_eq!(WitnessDrainOperation::rearm(Err(IoError::Unfinished)), retry);
+        assert_eq!(WitnessDrainOperation::rearm(Ok(false)), Ok(TimerPlan::default()));
+    }
+
+    #[test]
+    fn backend_imports_plan() {
+        // The next due schedule is kept; a failed run or a node without network waits.
+        let due = Some(Duration::from_secs(60));
+        assert_eq!(RunDueOperation::rearm(Ok(due)), Ok(TimerPlan::from(due)));
+        let failed = RunDueOperation::rearm(Err(IoError::Unfinished));
+        assert_eq!(failed, Ok(TimerPlan::default()));
+        let mut idle = timer_operation(&TaskKey::RunBackendImports, &input()).unwrap();
+        assert_eq!(idle.first(), Ok(Next::Done(TimerPlan::default())));
+    }
+
+    #[test]
+    fn device_drains_plan() {
+        // A broken pass retries after the defer delay, a recheck goes on soon, idle waits.
+        type Upload = crate::device::sync::outbox::DrainOutboxOperation;
+        let deferred = Upload::rearm(Err(IoError::Unfinished));
+        assert_eq!(deferred, Ok(TimerPlan::from(Some(UPLOAD_DEFER_AFTER))));
+        let recheck = DrainPublishOperation::rearm(Ok(DrainOutcome::Recheck));
+        assert_eq!(recheck, Ok(TimerPlan::from(Some(PUBLISH_CONTINUE_AFTER))));
+        let idle = DrainPublishOperation::rearm(Ok(DrainOutcome::Idle));
+        assert_eq!(idle, Ok(TimerPlan::default()));
+    }
+
+    #[test]
     fn prune_key_named() {
         let operation = timer_operation(&TaskKey::PruneNotifications, &input());
         assert_eq!(
@@ -1163,7 +1530,7 @@ mod tests {
             records: Vec::new(),
         })
         .unwrap();
-        let mut peer = peer_operation(peer_input(Alpn::Notification, &frame)).unwrap();
+        let mut peer = peer_operation(&peer_input(Alpn::Notification, &frame)).unwrap();
         assert_eq!(peer.on_conflict(1), AfterConflict::Rerun);
         assert_eq!(peer.hold_scope(), None);
     }
@@ -1178,7 +1545,11 @@ mod tests {
         assert_eq!(runner.retry_after, TIMER_RETRY_AFTER);
     }
 
-    fn peer_input(alpn: Alpn, frame: &[u8]) -> PeerInput<'_> {
+    fn peer_input(alpn: Alpn, frame: &[u8]) -> PeerInput {
+        peer_request(alpn, PeerRequest::Frame(frame.to_vec()))
+    }
+
+    fn peer_request(alpn: Alpn, request: PeerRequest) -> PeerInput {
         let node = crate::tests::locations::node_id(1);
         PeerInput {
             alpn,
@@ -1186,29 +1557,76 @@ mod tests {
             local_node: node,
             local_realm: RealmId::from_bytes([1; 32]),
             now_ms: 1_000,
-            frame,
+            request,
         }
+    }
+
+    // A heartbeat frame and a manifest request name their operations; a heartbeat is never
+    // answered and a failed manifest request is answered with its refusal.
+    #[test]
+    fn heartbeat_manifest_named() {
+        let heartbeat = peer_operation(&peer_input(Alpn::Heartbeat, b"beat"));
+        assert!(matches!(heartbeat, Some(PeerOperation::Heartbeat(_))));
+        assert!(peer_operation(&peer_input(Alpn::Shard, b"frame")).is_none());
+        let request = ShardTransportMessage::ManifestRequest {
+            realm_id: RealmId::from_bytes([1; 32]),
+            placement: aruna_core::structs::placement::record::PlacementRef::NIL,
+        };
+        let manifest = peer_operation(&peer_request(Alpn::Shard, PeerRequest::Manifest(request)));
+        assert!(matches!(manifest, Some(PeerOperation::Manifest(_))));
+        let dropped = Err(crate::node::heartbeat::HeartbeatError::Io(IoError::Unfinished));
+        assert_eq!(ReceiveHeartbeatOperation::answer(dropped), Ok(PeerAnswer::Kept));
+        let Ok(PeerAnswer::Manifest(ManifestAnswer::Reject(_))) =
+            ServeManifestOperation::answer(Err(IoError::Unfinished))
+        else {
+            panic!("a failed manifest request is refused");
+        };
+    }
+
+    // A native request names its answer operation; a job or native run that broke off is still
+    // answered, as unavailable.
+    #[test]
+    fn job_native_answered() {
+        let request = NativeReferenceRequest {
+            authority: NativeAuthority::Relationship(Ulid::nil()),
+            bucket: "source".to_string(),
+            key: "data.txt".to_string(),
+            version_id: Ulid::nil(),
+            head: true,
+            range: None,
+        };
+        let native = peer_request(Alpn::NativeReference, PeerRequest::Native(request));
+        assert!(matches!(peer_operation(&native), Some(PeerOperation::Native(_))));
+        assert!(peer_operation(&peer_input(Alpn::JobControl, b"frame")).is_none());
+        let job = JobRequestOperation::answer(Err(IoError::Unfinished));
+        let unavailable = JobAnswer::unavailable(IoError::Unfinished);
+        assert_eq!(job, Ok(PeerAnswer::Job(unavailable)));
+        let Ok(PeerAnswer::Native((NativeReferenceResponse::Rejected(_), None))) =
+            NativeAnswerOperation::answer(Err(IoError::Unfinished))
+        else {
+            panic!("a broken native run is refused");
+        };
     }
 
     #[test]
     fn unconverted_peers_absent() {
         for alpn in Alpn::ALL {
-            if alpn != Alpn::Notification {
-                assert!(peer_operation(peer_input(alpn, &[])).is_none());
+            if !matches!(alpn, Alpn::Notification | Alpn::Heartbeat) {
+                assert!(peer_operation(&peer_input(alpn, &[])).is_none());
             }
         }
         let ack = NotificationTransportMessage::WatchEventsAck { written: 0 };
         let frame = postcard::to_allocvec(&ack).unwrap();
-        assert!(peer_operation(peer_input(Alpn::Notification, &frame)).is_none());
+        assert!(peer_operation(&peer_input(Alpn::Notification, &frame)).is_none());
         let list = NotificationTransportMessage::ListWatches {
             owner: crate::tests::notifications::user(1, 2),
         };
         let frame = postcard::to_allocvec(&list).unwrap();
         assert!(matches!(
-            peer_operation(peer_input(Alpn::Notification, &frame)),
+            peer_operation(&peer_input(Alpn::Notification, &frame)),
             Some(PeerOperation::ServeInbox(_))
         ));
-        assert!(peer_operation(peer_input(Alpn::Notification, &[0xff])).is_none());
+        assert!(peer_operation(&peer_input(Alpn::Notification, &[0xff])).is_none());
     }
 
     #[test]
@@ -1217,8 +1635,8 @@ mod tests {
             records: Vec::new(),
         };
         let frame = postcard::to_allocvec(&delivery).unwrap();
-        let mut operation = peer_operation(peer_input(Alpn::Notification, &frame)).unwrap();
-        let Ok(Next::Done(answer)) = operation.first() else {
+        let mut operation = peer_operation(&peer_input(Alpn::Notification, &frame)).unwrap();
+        let Ok(Next::Done(PeerAnswer::Frame(answer))) = operation.first() else {
             panic!("an empty batch is answered");
         };
         let decoded: NotificationTransportMessage = postcard::from_bytes(&answer).unwrap();
