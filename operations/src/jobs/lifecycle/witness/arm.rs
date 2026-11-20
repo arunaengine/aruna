@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::super::LifecycleError;
-use super::deferred::{DeferKind, DeferredTarget};
+use super::super::deferred::{DeferKind, DeferredTarget};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::verify::FamilyView;

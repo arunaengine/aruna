@@ -66,7 +66,10 @@ impl Operation for KeepReport {
                 Event::Compute(answer) => match *answer {
                     ComputeAnswer::Output(Ok(body)) if body.size <= MAX_REPORT as u64 => {
                         self.phase = ReportPhase::Collect;
-                        let collect = BlobEffect::CollectStream { blob: body.bytes };
+                        let collect = BlobEffect::CollectStream {
+                            blob: body.bytes,
+                            limit: Some(MAX_REPORT as u64),
+                        };
                         Ok(Next::Call(Effect::Blob(collect).into()))
                     }
                     _ => self.keep(&[]),

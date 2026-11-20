@@ -626,7 +626,9 @@ impl Operation for CloseLaunchOperation {
                 Some(MetadataTransportMessage::LaunchClosureAnswered { answer }) => {
                     self.answered(answer)
                 }
-                Some(other) => Self::later(crate::metadata::transport_message_kind(&other)),
+                Some(other) => Self::later(aruna_core::metadata::protocol::transport_message_kind(
+                    &other,
+                )),
                 None => Self::later("no answer"),
             },
         }
