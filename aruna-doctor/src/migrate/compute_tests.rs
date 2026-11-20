@@ -22,7 +22,7 @@ use aruna_core::structs::execution::job::local::{AttemptIntent, JobRecord};
 use aruna_core::structs::execution::job::rows::job_insert_entries;
 use aruna_core::structs::storage::node_info::node_info_key;
 use aruna_core::user::id::UserId;
-use aruna_operations::sync::outbox_record::new_outbox_record;
+use aruna_operations::sync::outbox::record::new_identified_record;
 use std::path::Path;
 use tempfile::tempdir;
 
@@ -477,7 +477,16 @@ fn queued(node_id: NodeId, bytes: Vec<u8>) -> Vec<u8> {
         node_id,
     };
     let event = DocumentOutboxEvent::Upsert { bytes, change };
-    let record = new_outbox_record(node_id, target, Vec::new(), event, PlacementRef::NIL, false);
+    let id = Ulid::from_parts(1_000, 1);
+    let record = new_identified_record(
+        id,
+        node_id,
+        target,
+        Vec::new(),
+        event,
+        PlacementRef::NIL,
+        false,
+    );
     postcard::to_allocvec(&record).unwrap()
 }
 

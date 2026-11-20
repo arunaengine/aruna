@@ -29,7 +29,6 @@ use aruna_operations::plugins::install::InstallRequest;
 use aruna_operations::plugins::marks::{MARKED, Mark, mark_row};
 use aruna_operations::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use aruna_operations::plugins::rows::{decode, encode};
-use aruna_operations::plugins::store::Txn;
 use aruna_operations::plugins::task::cancel::CancelTask;
 use aruna_operations::plugins::task::pass::SettleTasks;
 use aruna_operations::plugins::task::send::SendTask;
@@ -39,6 +38,7 @@ use aruna_operations::plugins::work::reserve;
 use aruna_operations::s3::object::put::PutObjectOperation;
 use aruna_operations::testing_objects::{put_config, seed_bucket};
 use aruna_plugin_types::recipe::Recipe;
+use aruna_test_support::plugins::rows::Txn;
 use serde_json::json;
 use ulid::Ulid;
 

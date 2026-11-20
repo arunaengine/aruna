@@ -438,6 +438,16 @@ fn reject_token_clashes(
     Ok(())
 }
 
+/// A Kubernetes destination named by its kubeconfig and context. The settings check never reads
+/// the kubeconfig; the compute tables it checks are refused before any backend runs.
+fn configured_server(entry: &compute_backend::KubernetesEntry) -> Result<String, String> {
+    let kubeconfig = entry.kubeconfig.as_deref().unwrap_or("in-cluster");
+    Ok(format!(
+        "{kubeconfig}#{}",
+        entry.context.as_deref().unwrap_or_default()
+    ))
+}
+
 /// Reads the operator's backends file, or synthesises the implicit single
 /// filesystem backend so a zero-config node keeps working.
 fn load_backends_config(
@@ -460,7 +470,7 @@ fn load_backends_config(
     let docker_host = env.var("DOCKER_HOST");
     let inputs = DestinationInputs {
         docker_host: docker_host.as_deref(),
-        kube_server: &crate::compute_setup::kube_server,
+        kube_server: &configured_server,
     };
     // Dormant until the fencing, site and tenant checks exist: checked, never run.
     if !compute_backend::resolve(&file, &inputs)?.is_empty() {
