@@ -448,7 +448,7 @@ fn wake_answer(result: Result<bool, KeyCheckError>) -> JobResponse {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum RequestStep {
     Auth,
     Alias,
@@ -464,7 +464,7 @@ enum RequestStep {
 /// Authenticates one job-control request and answers it. Owner-directed requests are answered
 /// by the immutable owner or a node that knows the job's family; key waits address the node
 /// that holds the content or the job instead. Every refusal is an answer to the peer.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct JobRequestOperation {
     peer: NodeId,
     request: Option<JobRequest>,

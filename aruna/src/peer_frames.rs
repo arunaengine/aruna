@@ -7,8 +7,10 @@ use aruna_core::alpn::Alpn;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
+use aruna_blob::native;
 use aruna_net::NetHandle;
 use aruna_net::heartbeat::HeartbeatSlot;
+use aruna_net::job_control;
 use aruna_net::notification::{
     close_stream, drain_request, read_frame, write_frame, write_message,
 };
@@ -61,6 +63,14 @@ pub(crate) async fn read_peer(
                 return None;
             }
         },
+        Alpn::JobControl => {
+            let request = job_control::read_request(stream, peer).await?;
+            (PeerRequest::Job(request), None)
+        }
+        Alpn::NativeReference => {
+            let request = native::read_request(stream, peer).await?;
+            (PeerRequest::Native(request), None)
+        }
         Alpn::Notification => {
             let frame = match read_frame(stream).await {
                 Ok(frame) => frame,
@@ -87,32 +97,43 @@ pub(crate) async fn read_peer(
 /// Writes the answer of one converted protocol in its framing and closes the stream.
 pub(crate) async fn write_peer(
     input: &PeerInput,
-    stream: &mut BiStream,
+    mut stream: BiStream,
     answer: Result<PeerAnswer, PeerFailure>,
 ) {
     let peer = input.peer;
     let written = match (input.alpn, answer) {
+        (Alpn::JobControl, Ok(PeerAnswer::Job(answer))) => {
+            job_control::write_answer(stream, peer, &answer.response, answer.body).await;
+            Ok(())
+        }
+        (Alpn::NativeReference, Ok(PeerAnswer::Native((response, body)))) => {
+            native::write_answer(stream, peer, &response, body).await;
+            Ok(())
+        }
         (Alpn::Shard, answer) => {
             let written = match answer {
                 Ok(PeerAnswer::Manifest(ManifestAnswer::Manifest(manifest))) => {
-                    write_manifest(stream, &manifest).await
+                    write_manifest(&mut stream, &manifest).await
                 }
                 Ok(PeerAnswer::Manifest(ManifestAnswer::Reject(reason))) => {
-                    write_rejection(stream, reason).await
+                    write_rejection(&mut stream, reason).await
                 }
-                Ok(_) => write_rejection(stream, "unexpected shard answer".to_string()).await,
-                Err(error) => write_rejection(stream, error.to_string()).await,
+                Ok(_) => {
+                    let reason = "unexpected shard answer".to_string();
+                    write_rejection(&mut stream, reason).await
+                }
+                Err(error) => write_rejection(&mut stream, error.to_string()).await,
             };
-            close_shard_stream(stream).await;
+            close_shard_stream(&mut stream).await;
             written
         }
         (Alpn::Notification, answer) => {
             let written = match answer {
-                Ok(PeerAnswer::Frame(frame)) => write_frame(stream, &frame).await,
-                Ok(_) => refuse_notification(input, stream).await,
+                Ok(PeerAnswer::Frame(frame)) => write_frame(&mut stream, &frame).await,
+                Ok(_) => refuse_notification(input, &mut stream).await,
                 Err(error) => Err(error.to_string()),
             };
-            close_stream(stream).await;
+            close_stream(&mut stream).await;
             written
         }
         _ => Ok(()),

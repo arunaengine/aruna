@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use crate::inbound_frames;
 use crate::peer_frames::{PeerRead, read_peer, write_peer};
 use aruna_blob::blob::inbound::{InboundError, refuse_stream};
-use aruna_blob::native;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{AppliedStep, DocumentEvictedDocument, DocumentTarget};
@@ -19,7 +18,6 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::protocol::{
     INBOUND_FRAME_BYTES, MetadataReadError, MetadataTransportMessage,
 };
-use aruna_core::native_reference::{NativeAuthority, NativeReferenceResponse};
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
@@ -28,9 +26,7 @@ use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_drivers::driver::{DriverContext, drive, drive_retry_until, node_routing};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_net::InboundEventHandler;
-use aruna_net::job_control::{read_request, write_answer};
 use aruna_net::streams::BiStream;
-use aruna_operations::jobs::protocol::{JobAnswer, JobRequestOperation};
 use aruna_operations::jobs::records::pages::ServePageOperation;
 use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
@@ -48,7 +44,6 @@ use aruna_operations::replication::catch_up::WakeBootstrapOperation;
 use aruna_operations::replication::incoming::stream::{
     BaoAdmission, BaoAdmissionOperation, BaoPeerStream, ServeBaoOperation,
 };
-use aruna_operations::staging::native_source::PrepareReferenceOperation;
 use aruna_operations::sync::evicted::ReemitEvictedOperation;
 use aruna_operations::triggers::{PeerAnswer, PeerInput, peer_operation};
 use aruna_tasks::shutdown::Shutdown;
@@ -116,25 +111,13 @@ impl OperationsInboundHandler {
             // A request no operation answers gets no answer of its own; its protocol refuses it.
             None => Ok(PeerAnswer::Kept),
         };
-        write_peer(&input, &mut stream, answer).await;
-    }
-
-    /// Answers one job-control request and signals the attempts a cancel reached.
-    async fn answer_job_stream(&self, mut stream: BiStream, peer: NodeId) {
-        let Some(request) = read_request(&mut stream, peer).await else {
-            return;
-        };
-        let context = self.context.as_ref();
-        let serving = context.node_and_realm();
-        let now_ms = aruna_clock::unix_timestamp_millis();
-        let serve = JobRequestOperation::new(peer, request, serving, now_ms);
-        let answer = drive(serve, context)
-            .await
-            .unwrap_or_else(JobAnswer::unavailable);
-        for job_id in answer.running {
-            self.jobs_runtime.request_cancel(job_id);
+        // The attempts a cancel reached run here, so the runtime signals them.
+        if let Ok(PeerAnswer::Job(job)) = &answer {
+            for job_id in &job.running {
+                self.jobs_runtime.request_cancel(*job_id);
+            }
         }
-        write_answer(stream, peer, &answer.response, answer.body).await;
+        write_peer(&input, stream, answer).await;
     }
 
     fn new(
@@ -824,15 +807,11 @@ impl InboundEventHandler for OperationsInboundHandler {
                 Alpn::Metadata => Box::pin(async move {
                     self.handle_metadata_stream(stream, node_id).await;
                 }),
-                Alpn::NativeReference => Box::pin(async move {
-                    answer_native_stream(self.context.as_ref(), stream, node_id).await;
-                }),
-                Alpn::JobControl => Box::pin(async move {
-                    self.answer_job_stream(stream, node_id).await;
-                }),
-                Alpn::Notification | Alpn::Shard | Alpn::Heartbeat => {
-                    Box::pin(self.serve_peer(alpn, stream, node_id))
-                }
+                Alpn::Notification
+                | Alpn::Shard
+                | Alpn::Heartbeat
+                | Alpn::JobControl
+                | Alpn::NativeReference => Box::pin(self.serve_peer(alpn, stream, node_id)),
                 Alpn::Dht => {
                     warn!(peer = %node_id, "Ignoring inbound stream for non-stream ALPN");
                     return;
@@ -906,30 +885,6 @@ fn schedule_sync_maintenance(
             run_maintenance(&context, "periodic", cycle).await;
         }
     });
-}
-
-/// Answers one native reference stream with what its request prepared.
-async fn answer_native_stream(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
-    let Some(request) = native::read_request(&mut stream, peer).await else {
-        return;
-    };
-    let relationship = matches!(request.authority, NativeAuthority::Relationship(_));
-    let prepare = PrepareReferenceOperation::new(context.node_and_realm(), peer, request);
-    let (response, body) = match drive(prepare, context).await {
-        Ok(prepared) => {
-            // Only a caller read names the group; a sync relationship knows its own bucket.
-            let response = match prepared.group_id.filter(|_| !relationship) {
-                None => NativeReferenceResponse::Content(prepared.metadata),
-                Some(group_id) => NativeReferenceResponse::Described {
-                    metadata: prepared.metadata,
-                    group_id,
-                },
-            };
-            (response, prepared.body)
-        }
-        Err(reject) => (NativeReferenceResponse::Rejected(reject), None),
-    };
-    native::write_answer(stream, peer, &response, body).await;
 }
 
 /// Reconciles the metadata store with document sync and prunes deleted graphs.

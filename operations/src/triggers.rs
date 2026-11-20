@@ -13,6 +13,10 @@ use aruna_core::document::ShardTransportMessage;
 use aruna_core::git::GitNode;
 use aruna_core::heartbeat::{INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
+use aruna_core::jobs::JobRequest;
+use aruna_core::native_reference::{
+    NativeReferenceReject, NativeReferenceRequest, NativeReferenceResponse,
+};
 use aruna_core::node_facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
@@ -32,6 +36,7 @@ use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperation};
+use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::projection::{PROJECTION_RETRY_AFTER, ProjectionRunOperation};
@@ -60,6 +65,7 @@ use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::s3::object::metadata_drain::DrainRefreshOperation;
 use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
 use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
+use crate::staging::native_source::{NativeAnswer, NativeAnswerOperation};
 
 /// What a timer keeps on this node between its runs, in memory only: its attempts since the last
 /// clean run and where its work goes on. The shell stores it per key and hands it back unread, so
@@ -682,6 +688,10 @@ pub enum PeerRequest {
     Frame(Vec<u8>),
     /// A shard manifest request.
     Manifest(ShardTransportMessage),
+    /// A job-control request.
+    Job(JobRequest),
+    /// A native reference read or head request.
+    Native(NativeReferenceRequest),
 }
 
 /// What a peer operation answers; the shell writes it in its protocol's framing.
@@ -691,6 +701,10 @@ pub enum PeerAnswer {
     Frame(Vec<u8>),
     /// A shard manifest or why it cannot be served.
     Manifest(ManifestAnswer),
+    /// A job-control answer with the attempts a cancel reached.
+    Job(JobAnswer),
+    /// A native reference answer and its bytes, for a read.
+    Native(NativeAnswer),
     /// The request was kept or dropped without an answer.
     Kept,
 }
@@ -726,6 +740,10 @@ pub enum PeerOperation {
     Heartbeat(ReceiveHeartbeatOperation),
     /// A shard manifest request this node answers as a holder.
     Manifest(ServeManifestOperation),
+    /// A job-control request this node answers for a job it owns or knows.
+    Job(JobRequestOperation),
+    /// A native reference request this node answers from its own copies.
+    Native(NativeAnswerOperation),
 }
 
 /// How long a notification request may run with its retries, so a slow store cannot hold the
@@ -736,7 +754,10 @@ impl PeerOperation {
     /// How long the run may take with its conflict reruns; `None` runs it once.
     pub fn deadline(&self) -> Option<Duration> {
         match self {
-            PeerOperation::Heartbeat(_) | PeerOperation::Manifest(_) => None,
+            PeerOperation::Heartbeat(_)
+            | PeerOperation::Manifest(_)
+            | PeerOperation::Job(_)
+            | PeerOperation::Native(_) => None,
             _ => Some(NOTIFICATION_AUTH_TIMEOUT),
         }
     }
@@ -755,6 +776,17 @@ pub fn peer_operation(input: &PeerInput) -> Option<PeerOperation> {
             let local = (input.local_node, input.local_realm);
             let operation = ServeManifestOperation::new(local, input.peer, message.clone());
             Some(PeerOperation::Manifest(operation))
+        }
+        (Alpn::JobControl, PeerRequest::Job(request)) => {
+            let serving = Some((input.local_node, input.local_realm));
+            let operation =
+                JobRequestOperation::new(input.peer, request.clone(), serving, input.now_ms);
+            Some(PeerOperation::Job(operation))
+        }
+        (Alpn::NativeReference, PeerRequest::Native(request)) => {
+            let ids = Some((input.local_node, input.local_realm));
+            let operation = NativeAnswerOperation::new(ids, input.peer, request.clone());
+            Some(PeerOperation::Native(operation))
         }
         (Alpn::Notification, PeerRequest::Frame(frame)) => {
             let deliver = DeliverInput {
@@ -833,6 +865,24 @@ impl PeerRun for ServeManifestOperation {
     }
 }
 
+impl PeerRun for JobRequestOperation {
+    /// A request this node cannot finish is answered as unavailable.
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
+        Ok(PeerAnswer::Job(result.unwrap_or_else(JobAnswer::unavailable)))
+    }
+}
+
+impl PeerRun for NativeAnswerOperation {
+    /// A run that broke off is answered as unavailable, like any other refusal.
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
+        let unavailable = |error: IoError| {
+            let reject = NativeReferenceReject::Unavailable(error.to_string());
+            (NativeReferenceResponse::Rejected(reject), None)
+        };
+        Ok(PeerAnswer::Native(result.unwrap_or_else(unavailable)))
+    }
+}
+
 impl PeerRun for WatchEventsOperation {
     fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
         notification_answer(result)
@@ -900,6 +950,8 @@ macro_rules! each_peer {
             PeerOperation::WatchEvents($operation) => $body,
             PeerOperation::Heartbeat($operation) => $body,
             PeerOperation::Manifest($operation) => $body,
+            PeerOperation::Job($operation) => $body,
+            PeerOperation::Native($operation) => $body,
         }
     };
 }
@@ -992,6 +1044,8 @@ mod tests {
     use crate::replication::mirror_repair::{SyncMirrorError, SyncMirrorResult};
     use crate::s3::object::metadata::ReferenceRefreshError;
     use crate::s3::object::metadata_drain::ReferenceDrainResult;
+    use aruna_core::native_reference::NativeAuthority;
+    use ulid::Ulid;
 
     fn input() -> TimerInput {
         TimerInput::new(1_000, None)
@@ -1277,6 +1331,31 @@ mod tests {
             ServeManifestOperation::answer(Err(IoError::Unfinished))
         else {
             panic!("a failed manifest request is refused");
+        };
+    }
+
+    // A native request names its answer operation; a job or native run that broke off is still
+    // answered, as unavailable.
+    #[test]
+    fn job_native_answered() {
+        let request = NativeReferenceRequest {
+            authority: NativeAuthority::Relationship(Ulid::nil()),
+            bucket: "source".to_string(),
+            key: "data.txt".to_string(),
+            version_id: Ulid::nil(),
+            head: true,
+            range: None,
+        };
+        let native = peer_request(Alpn::NativeReference, PeerRequest::Native(request));
+        assert!(matches!(peer_operation(&native), Some(PeerOperation::Native(_))));
+        assert!(peer_operation(&peer_input(Alpn::JobControl, b"frame")).is_none());
+        let job = JobRequestOperation::answer(Err(IoError::Unfinished));
+        let unavailable = JobAnswer::unavailable(IoError::Unfinished);
+        assert_eq!(job, Ok(PeerAnswer::Job(unavailable)));
+        let Ok(PeerAnswer::Native((NativeReferenceResponse::Rejected(_), None))) =
+            NativeAnswerOperation::answer(Err(IoError::Unfinished))
+        else {
+            panic!("a broken native run is refused");
         };
     }
 
