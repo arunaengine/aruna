@@ -7,12 +7,13 @@ use crate::error::{CliError, s3_error};
 use aruna_wire::info::InfoResponse;
 use aruna_wire::session::{CLIENT_REFRESH_WINDOW, SessionTokenResponse};
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use reqwest::Method;
 use serde::Serialize;
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinSet;
 
@@ -141,6 +142,7 @@ pub struct S3Access {
     api: Api,
     session: Option<S3Session>,
     client: aws_sdk_s3::Client,
+    endpoint: String,
 }
 
 impl S3Access {
@@ -156,18 +158,20 @@ impl S3Access {
             Err(CliError::Api(error)) if error.status == 403 => return Err(refused(group_id)),
             other => Some(other?),
         };
-        let client = match &session {
-            Some(session) => s3_client(session),
+        let (client, endpoint) = match &session {
+            Some(session) => (s3_client(session), session.endpoint.clone()),
             None => {
                 let node_id = api.node_id.clone().unwrap_or_default();
                 let endpoint = node_endpoint(api, fallback, &node_id).await?;
-                aws_sdk_s3::Client::from_conf(client_config(&endpoint).allow_no_auth().build())
+                let config = client_config(&endpoint).allow_no_auth().build();
+                (aws_sdk_s3::Client::from_conf(config), endpoint)
             }
         };
         Ok(Self {
             api: api.clone(),
             session,
             client,
+            endpoint,
         })
     }
 
@@ -317,13 +321,14 @@ pub struct Uploaded {
     pub reused_parts: usize,
 }
 
-/// Uploads a file; above `part_size` as a multipart upload that continues an unfinished one.
+/// Uploads a file; above `part_size` as a multipart upload. The upload id is kept in `records`,
+/// so only a rerun of the same transfer continues it, and never two runs at once.
 pub async fn upload(
     access: &mut S3Access,
-    bucket: &str,
-    key: &str,
+    (bucket, key): (&str, &str),
     path: &Path,
     part_size: u64,
+    records: &Path,
 ) -> Result<Uploaded, CliError> {
     let size = tokio::fs::metadata(path).await?.len();
     let client = access.client().await?;
@@ -353,11 +358,16 @@ pub async fn upload(
             .await
             .map_err(|error| CliError::Io(std::io::Error::other(error)))??
     };
-    let (upload_id, stored) = match unfinished_upload(&client, bucket, key).await? {
-        Some(upload_id) => {
-            let stored = stored_parts(&client, bucket, key, &upload_id).await?;
-            (upload_id, stored)
-        }
+    let named = (access.endpoint.as_str(), bucket, key, blake3.as_str());
+    let record_path = upload_record(records, named, &parts);
+    let (mut record, kept) = claim_record(record_path.clone()).await?;
+    let resumed = match kept {
+        Some(upload_id) => (stored_parts(&client, bucket, key, &upload_id).await?)
+            .map(|stored| (upload_id, stored)),
+        None => None,
+    };
+    let (upload_id, stored) = match resumed {
+        Some(resumed) => resumed,
         None => {
             let created = client
                 .create_multipart_upload()
@@ -369,6 +379,7 @@ pub async fn upload(
             let upload_id = created
                 .upload_id
                 .ok_or_else(|| CliError::S3("the node returned no upload id".into()))?;
+            keep_id(&mut record, &upload_id)?;
             (upload_id, Vec::new())
         }
     };
@@ -423,11 +434,61 @@ pub async fn upload(
         .send()
         .await
         .map_err(s3_error)?;
+    // The emptied record of a finished transfer is harmless if it cannot be removed.
+    keep_id(&mut record, "")?;
+    let _ = std::fs::remove_file(&record_path);
     Ok(Uploaded {
         size,
         blake3,
         reused_parts,
     })
+}
+
+/// The record file of one transfer: its endpoint, bucket, key, content and part layout name it.
+fn upload_record(records: &Path, named: (&str, &str, &str, &str), parts: &[Part]) -> PathBuf {
+    let (endpoint, bucket, key, blake3) = named;
+    let mut hasher = blake3::Hasher::new();
+    for field in [endpoint, bucket, key, blake3] {
+        hasher.update(&(field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    for part in parts {
+        hasher.update(&part.offset.to_le_bytes());
+        hasher.update(&part.length.to_le_bytes());
+    }
+    records.join(format!("{}.upload", hasher.finalize().to_hex()))
+}
+
+/// Opens and locks the record at `path`, waiting while another run holds it, and answers the
+/// upload id an earlier run of the same transfer kept there. The lock ends with the file.
+async fn claim_record(path: PathBuf) -> Result<(std::fs::File, Option<String>), CliError> {
+    let claimed = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+        if let Some(folder) = path.parent() {
+            std::fs::create_dir_all(folder)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        file.lock()?;
+        let mut kept = String::new();
+        file.read_to_string(&mut kept)?;
+        let kept = kept.trim().to_string();
+        Ok((file, (!kept.is_empty()).then_some(kept)))
+    });
+    Ok(claimed
+        .await
+        .map_err(|error| CliError::Io(std::io::Error::other(error)))??)
+}
+
+/// Replaces the upload id in a claimed record; an empty id marks the transfer as finished.
+fn keep_id(record: &mut std::fs::File, upload_id: &str) -> std::io::Result<()> {
+    record.set_len(0)?;
+    record.rewind()?;
+    record.write_all(upload_id.as_bytes())?;
+    record.sync_all()
 }
 
 fn joined(
@@ -467,47 +528,34 @@ async fn send_part(
     Ok((part.number, etag))
 }
 
-/// The newest unfinished multipart upload of exactly `key`, which a rerun continues.
-async fn unfinished_upload(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<String>, CliError> {
-    let listed = client
-        .list_multipart_uploads()
-        .bucket(bucket)
-        .prefix(key)
-        .send()
-        .await
-        .map_err(s3_error)?;
-    let mut uploads: Vec<_> = listed
-        .uploads
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|upload| upload.key.as_deref() == Some(key))
-        .collect();
-    uploads.sort_by_key(|upload| upload.initiated);
-    Ok(uploads.pop().and_then(|upload| upload.upload_id))
-}
-
+/// The parts the node holds for `upload_id`, or `None` once the node no longer knows the upload.
 async fn stored_parts(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
     upload_id: &str,
-) -> Result<Vec<StoredPart>, CliError> {
+) -> Result<Option<Vec<StoredPart>>, CliError> {
     let mut stored = Vec::new();
     let mut marker = None;
     loop {
-        let page = client
+        let listed = client
             .list_parts()
             .bucket(bucket)
             .key(key)
             .upload_id(upload_id)
             .set_part_number_marker(marker)
             .send()
-            .await
-            .map_err(s3_error)?;
+            .await;
+        let page = match listed {
+            Ok(page) => page,
+            Err(error)
+                if error.as_service_error().and_then(|error| error.code())
+                    == Some("NoSuchUpload") =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(s3_error(error)),
+        };
         for part in page.parts.unwrap_or_default() {
             if let (Some(number), Some(size), Some(etag)) =
                 (part.part_number, part.size, part.e_tag)
@@ -521,7 +569,7 @@ async fn stored_parts(
         }
         match (page.is_truncated, page.next_part_number_marker) {
             (Some(true), Some(next)) => marker = Some(next),
-            _ => return Ok(stored),
+            _ => return Ok(Some(stored)),
         }
     }
 }
@@ -629,6 +677,35 @@ mod tests {
             parts.iter().map(|part| part.length).sum::<u64>(),
             MAX_PARTS * 100 + 1
         );
+    }
+
+    #[test]
+    fn transfers_keep_apart() {
+        // Another file for the same key is another transfer, with an upload of its own.
+        let records = Path::new("records");
+        let parts = split_parts(25, 10);
+        let named = |blake3| ("http://node", "bucket", "key", blake3);
+        let first = upload_record(records, named("aa"), &parts);
+        assert_eq!(first, upload_record(records, named("aa"), &parts));
+        assert_ne!(first, upload_record(records, named("bb"), &parts));
+        let other = split_parts(25, 5);
+        assert_ne!(first, upload_record(records, named("aa"), &other));
+    }
+
+    #[tokio::test]
+    async fn record_keeps_id() {
+        // A rerun of the same transfer reads the id the first run kept; a finished one none.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("nested").join("record.upload");
+        let (mut record, kept) = claim_record(path.clone()).await.unwrap();
+        assert_eq!(kept, None);
+        keep_id(&mut record, "upload-1").unwrap();
+        drop(record);
+        let (mut record, kept) = claim_record(path.clone()).await.unwrap();
+        assert_eq!(kept.as_deref(), Some("upload-1"));
+        keep_id(&mut record, "").unwrap();
+        drop(record);
+        assert_eq!(claim_record(path).await.unwrap().1, None);
     }
 
     #[test]
