@@ -9,9 +9,13 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::GROUP_ENCRYPTED_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key};
 use aruna_core::user::id::UserId;
+use std::collections::VecDeque;
 use ulid::Ulid;
+
+/// Encrypted buckets of the group read per page.
+const BUCKET_PAGE: usize = 256;
 
 /// Runs one member key operation per encrypted bucket and member, best effort.
 ///
@@ -23,8 +27,12 @@ pub struct MemberKeysOperation {
     group_id: GroupId,
     members: Vec<UserId>,
     now: u64,
-    scanned: bool,
-    pending: Vec<(String, UserId)>,
+    /// A bucket page was asked for; `None` before the first page.
+    paging: Option<bool>,
+    /// The buckets of the current page, and the next member of the front one.
+    buckets: VecDeque<String>,
+    member: usize,
+    next_page: Option<Key>,
     opened: Vec<Ulid>,
 }
 impl MemberKeysOperation {
@@ -41,15 +49,40 @@ impl MemberKeysOperation {
             group_id,
             members,
             now,
-            scanned: false,
-            pending: Vec::new(),
+            paging: None,
+            buckets: VecDeque::new(),
+            member: 0,
+            next_page: None,
             opened: Vec::new(),
         }
     }
-    /// The key operation of the next bucket and member, or the opened requests.
+
+    fn page(&mut self, after: Option<Key>) -> Next<Vec<Ulid>> {
+        self.paging = Some(true);
+        Next::Call(IoCall::Page {
+            space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            prefix: self.group_id.to_bytes().to_vec().into(),
+            after,
+            limit: BUCKET_PAGE,
+        })
+    }
+
+    /// The key operation of the next bucket and member, the next bucket page, or the opened
+    /// requests; pairs are made one at a time.
     fn request(&mut self) -> Next<Vec<Ulid>> {
-        let Some((bucket, member)) = self.pending.pop() else {
-            return Next::Done(std::mem::take(&mut self.opened));
+        let (bucket, member) = loop {
+            let Some(bucket) = self.buckets.front() else {
+                if let Some(after) = self.next_page.take() {
+                    return self.page(Some(after));
+                }
+                return Next::Done(std::mem::take(&mut self.opened));
+            };
+            if let Some(member) = self.members.get(self.member) {
+                self.member += 1;
+                break (bucket.clone(), *member);
+            }
+            self.buckets.pop_front();
+            self.member = 0;
         };
         let action = KeyAction::Member(member);
         let operation = KeyOperation::new(bucket, self.auth.clone(), self.node, action, self.now);
@@ -75,28 +108,21 @@ impl Operation for MemberKeysOperation {
         if self.members.is_empty() {
             return Ok(self.request());
         }
-        Ok(Next::Call(IoCall::Page {
-            space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
-            prefix: self.group_id.to_bytes().to_vec().into(),
-            after: None,
-            limit: usize::MAX,
-        }))
+        Ok(self.page(None))
     }
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<Ulid>>, KeyError> {
         match result {
-            IoResult::Page { rows, .. } if !self.scanned => {
-                self.scanned = true;
+            IoResult::Page { rows, next } if self.paging == Some(true) => {
+                self.paging = Some(false);
+                self.next_page = next;
                 for (key, _) in rows {
-                    let Some(Ok(bucket)) = key.get(16..).map(std::str::from_utf8) else {
-                        continue;
-                    };
-                    for member in &self.members {
-                        self.pending.push((bucket.to_string(), *member));
+                    if let Some(Ok(bucket)) = key.get(16..).map(std::str::from_utf8) {
+                        self.buckets.push_back(bucket.to_string());
                     }
                 }
                 Ok(self.request())
             }
-            IoResult::Event(event) if self.scanned => match *event {
+            IoResult::Event(event) if self.paging == Some(false) => match *event {
                 Event::SubOperation(SubOperationEvent::KeyRequestsOpened { request_ids }) => {
                     self.opened.extend(request_ids);
                     Ok(self.request())
@@ -134,8 +160,28 @@ mod tests {
         ));
         assert_eq!(operation.members, vec![foreign]);
         let key = [&group_id.to_bytes()[..], b"bucket"].concat();
+        let after = Key::from(key.clone());
         let page = IoResult::Page {
             rows: vec![(key.into(), Vec::new().into())],
+            next: Some(after.clone()),
+        };
+        assert!(matches!(
+            operation.next(page),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let opened = Event::SubOperation(SubOperationEvent::KeyRequestsOpened {
+            request_ids: Vec::new(),
+        });
+        // The next bucket page follows once the page's buckets have their requests.
+        let Ok(Next::Call(IoCall::Page { after: asked, limit, .. })) =
+            operation.next(IoResult::Event(Box::new(opened)))
+        else {
+            panic!("expected the next bucket page");
+        };
+        assert_eq!((asked, limit), (Some(after), BUCKET_PAGE));
+        let last = [&group_id.to_bytes()[..], b"other"].concat();
+        let page = IoResult::Page {
+            rows: vec![(last.into(), Vec::new().into())],
             next: None,
         };
         assert!(matches!(

@@ -13,6 +13,9 @@ use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin};
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
+/// Bucket holders read per page before the pending request is announced to them.
+const HOLDER_PAGE: usize = 256;
+
 impl KeyOperation {
     /// Checks the bucket-wide request bindings that do not depend on the recipient.
     fn current_bucket(&self, request: &KeyRequest) -> Result<(), KeyError> {
@@ -514,31 +517,48 @@ impl KeyOperation {
     }
     /// Reads the bucket holders, including a caller who holds the bucket key.
     pub(super) fn holders(&mut self) -> Option<KeyTurn> {
+        self.holder_page(None)
+    }
+    /// One page of bucket holders after the holder key `after`.
+    fn holder_page(&mut self, after: Option<Key>) -> Option<KeyTurn> {
         let snapshot = self.snapshot.as_ref()?;
         let prefix = snapshot.parameters.key.bucket_id.to_bytes().to_vec();
         self.state = State::Holders;
         Some(Ok(Next::Call(IoCall::Page {
             space: BUCKET_HOLDER_KEYSPACE.to_string(),
             prefix: prefix.into(),
-            after: None,
-            limit: usize::MAX,
+            after,
+            limit: HOLDER_PAGE,
         })))
     }
-    /// Tells every current holder except the member that the member waits for keys.
-    pub(super) fn notify_holders(&mut self, values: Vec<(Key, Value)>) -> KeyTurn {
-        let (Some(info), Some(snapshot)) = (&self.info, &self.snapshot) else {
-            return self.fail(KeyError::Missing);
-        };
-        let mut holders = snapshot.holders.clone();
+    /// Keeps the explicit holders of one page; after the last page tells them.
+    pub(super) fn holders_read(&mut self, page: (Vec<(Key, Value)>, Option<Key>)) -> KeyTurn {
+        let (values, next) = page;
+        let mut explicit = Vec::new();
         for (_, value) in values {
             match BucketHolder::from_bytes(&value) {
                 Ok(holder) if holder.origin == HolderOrigin::Explicit => {
-                    holders.insert(holder.user_id);
+                    explicit.push(holder.user_id);
                 }
                 Ok(_) => {}
                 Err(_) => return self.fail(AbeError::Context),
             }
         }
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return self.fail(KeyError::Missing);
+        };
+        snapshot.holders.extend(explicit);
+        match next.and_then(|after| self.holder_page(Some(after))) {
+            Some(turn) => turn,
+            None => self.notify_holders(),
+        }
+    }
+    /// Tells every current holder except the member that the member waits for keys.
+    fn notify_holders(&mut self) -> KeyTurn {
+        let (Some(info), Some(snapshot)) = (&self.info, &self.snapshot) else {
+            return self.fail(KeyError::Missing);
+        };
+        let mut holders = snapshot.holders.clone();
         let member = self.recipient();
         holders.remove(&member);
         // Users of another realm have no inbox here; they see requests on the bucket page.
