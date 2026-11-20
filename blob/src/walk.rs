@@ -110,9 +110,9 @@ pub(crate) fn walk_after(
     let path = match &request.cursor {
         None => return Ok(Vec::new()),
         Some(ListCursor::Walk(path)) => path.trim_matches('/'),
-        Some(ListCursor::After(_) | ListCursor::At(_) | ListCursor::Offset(_)) => {
+        Some(ListCursor::After(_) | ListCursor::At(_)) => {
             return Err(StagingSourceError::InvalidListing(
-                "this source continues after a walked path, not by key or offset".to_string(),
+                "this source continues after a walked path, not by key".to_string(),
             ));
         }
     };

@@ -714,7 +714,7 @@ async fn list_applies_limit() {
 
     assert_eq!(entries.len(), 1);
     assert!(entries[0].path.starts_with("prefix/"));
-    assert_eq!(cursor, Some(ListCursor::Offset(1)));
+    assert_eq!(cursor, Some(ListCursor::Walk("prefix/a.txt".to_string())));
 
     request.cursor = cursor;
     let (entries, cursor) = list_operator(&operator, "prefix/", &request).await.unwrap();
@@ -781,11 +781,11 @@ async fn recursive_list_truncates() {
         entries[0].kind,
         aruna_core::structs::execution::source_access::SourceEntryKind::File
     );
-    assert_eq!(cursor, Some(ListCursor::Offset(1)));
+    assert_eq!(cursor, Some(ListCursor::Walk("prefix/a.txt".to_string())));
 }
 
-// A source without a provider cursor is walked from its start, so a page that reads too many
-// entries, directories included, fails instead of walking on.
+// A source without a provider cursor lists the directories on the cursor path again for every
+// page, so a page that reads too many entries, directories included, fails instead.
 #[tokio::test]
 async fn fallback_walk_bounded() {
     let dir = tempdir().unwrap();
@@ -804,14 +804,13 @@ async fn fallback_walk_bounded() {
     .unwrap();
     let request = list_request(1, true, true);
 
-    let refused = list_skipping(&operator, "prefix/", &request, (0, 3)).await;
+    let walk = || Walk::new("prefix/", Vec::new(), true);
+    let refused = list_walking(&operator, walk(), &request, 3).await;
     assert!(matches!(
         refused,
         Err(StagingSourceError::InvalidListing(_))
     ));
-    let (entries, _) = list_skipping(&operator, "prefix/", &request, (0, 100))
-        .await
-        .unwrap();
+    let (entries, _) = list_walking(&operator, walk(), &request, 100).await.unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path, "prefix/z.txt");
 }
@@ -1155,9 +1154,9 @@ fn native_signs_alike() {
     );
 }
 
-// Local listings re-walk from the start as well, so they are capped like remote ones.
+// A local listing continues after a walked path, so a provider key cursor is refused.
 #[tokio::test]
-async fn local_skip_capped() {
+async fn local_key_refused() {
     use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_ROOT;
     let dir = tempdir().unwrap();
     tokio::fs::write(dir.path().join("a.txt"), b"a")
@@ -1178,7 +1177,7 @@ async fn local_skip_capped() {
         .await
         .unwrap();
     assert_eq!(entries.len(), 1);
-    request.cursor = Some(ListCursor::Offset(FALLBACK_SKIP_LIMIT as u64 + 1));
+    request.cursor = Some(ListCursor::After("a.txt".to_string()));
     let refused = list_staging_source(&test_guard(), &access, &request).await;
     assert!(matches!(
         refused,

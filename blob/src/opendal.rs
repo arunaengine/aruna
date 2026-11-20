@@ -4,7 +4,7 @@
 
 use crate::egress::EgressGuard;
 use crate::local_fs::LocalFsBuilder;
-use crate::walk::{walk_after, walk_page};
+use crate::walk::{Child, Step, Walk, walk_after, walk_page};
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::source_access::{
@@ -358,46 +358,11 @@ pub(crate) async fn list_staging_source(
     list_operator(&operator, path, request).await
 }
 
-/// Entries a source without a provider cursor may skip per page: each page re-lists from the
-/// start, so deeper pages are refused rather than growing without bound.
-const FALLBACK_SKIP_LIMIT: usize = 100_000;
-/// Entries, directories included, a fallback page may read before it fails: a re-listed tree
-/// is walked from its start for every page.
+/// Entries, directories included, a fallback page may read before it fails: the directories on
+/// the cursor path are listed again for every page.
 const MAX_FALLBACK_EXAMINED: usize = 250_000;
 /// Largest page a provider answers in one request, so a page never needs a second request.
 const PROVIDER_PAGE_LIMIT: usize = 1000;
-
-fn fallback_offset(request: &ListRequest, skip_limit: usize) -> Result<usize, StagingSourceError> {
-    if request.lower.is_some() || request.stop.is_some() {
-        return Err(StagingSourceError::InvalidListing(
-            "key bounds need a source with a provider cursor".to_string(),
-        ));
-    }
-    let offset = match &request.cursor {
-        None => 0,
-        Some(ListCursor::Offset(offset)) => usize::try_from(*offset).unwrap_or(usize::MAX),
-        Some(ListCursor::After(_) | ListCursor::At(_)) => {
-            return Err(StagingSourceError::InvalidListing(
-                "this source continues by offset, not by key".to_string(),
-            ));
-        }
-    };
-    if offset > skip_limit {
-        return Err(StagingSourceError::InvalidListing(format!(
-            "this source cannot continue a listing past {skip_limit} entries; list a narrower path"
-        )));
-    }
-    Ok(offset)
-}
-
-fn offset_page(
-    entries: Vec<SourceEntry>,
-    truncated: bool,
-    offset: usize,
-) -> (Vec<SourceEntry>, Option<ListCursor>) {
-    let next = truncated.then(|| ListCursor::Offset((offset + entries.len()) as u64));
-    (entries, next)
-}
 
 async fn list_operator(
     operator: &Operator,
@@ -406,10 +371,9 @@ async fn list_operator(
 ) -> Result<(Vec<SourceEntry>, Option<ListCursor>), StagingSourceError> {
     let capability = operator.info().capability();
     if !(capability.list_with_start_after && capability.list_with_recursive) {
-        let offset = fallback_offset(request, FALLBACK_SKIP_LIMIT)?;
-        let bounds = (offset, MAX_FALLBACK_EXAMINED);
-        let (entries, truncated) = list_skipping(operator, path, request, bounds).await?;
-        return Ok(offset_page(entries, truncated, offset));
+        let walk = Walk::new(path, walk_after(request, path)?, request.recursive);
+        let listed = list_walking(operator, walk, request, MAX_FALLBACK_EXAMINED).await?;
+        return Ok(walk_page(listed.0, listed.1));
     }
     if !request.recursive && (request.lower.is_some() || request.stop.is_some()) {
         return Err(StagingSourceError::InvalidListing(
@@ -418,9 +382,9 @@ async fn list_operator(
     }
     let floor = match &request.cursor {
         Some(ListCursor::After(key) | ListCursor::At(key)) => Some(key.clone()),
-        Some(ListCursor::Offset(_)) => {
+        Some(ListCursor::Walk(_)) => {
             return Err(StagingSourceError::InvalidListing(
-                "this source continues by key, not by offset".to_string(),
+                "this source continues by key, not after a walked path".to_string(),
             ));
         }
         None => request.lower.clone(),
@@ -577,44 +541,61 @@ async fn probe_lower(
     Ok(source_entry(lower, &metadata, path, request.files_only))
 }
 
-/// The fallback for a provider without `start_after`: it re-lists and skips `offset` entries,
-/// reading at most `max_examined` listed entries before it fails.
-async fn list_skipping(
+/// The fallback for a provider without `start_after`: it lists directory by directory in walk
+/// order and fails once it read more than `max_examined` listed entries.
+async fn list_walking(
     operator: &Operator,
-    path: &str,
+    mut walk: Walk<opendal::Metadata>,
     request: &ListRequest,
-    (offset, max_examined): (usize, usize),
+    max_examined: usize,
 ) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
-    let mut lister = operator
-        .lister_with(path)
-        .recursive(request.recursive)
-        .await
-        .map_err(list_error)?;
-    let mut entries = Vec::with_capacity(request.limit);
-    let mut skipped = 0usize;
+    let mut entries = Vec::new();
     let mut examined = 0usize;
-    while let Some(entry) = lister.try_next().await.map_err(list_error)? {
-        examined += 1;
-        if examined > max_examined {
-            return Err(StagingSourceError::InvalidListing(format!(
-                "this source lists more than {max_examined} entries for one page; list a \
-                 narrower path"
-            )));
-        }
-        let Some(entry) = source_entry(entry.path(), entry.metadata(), path, request.files_only)
-        else {
+    loop {
+        let (path, child) = match walk.step() {
+            Step::List(directory) => {
+                let listed = match directory.is_empty() {
+                    true => String::new(),
+                    false => format!("{directory}/"),
+                };
+                let mut lister = operator.lister(&listed).await.map_err(list_error)?;
+                let mut children = Vec::new();
+                while let Some(entry) = lister.try_next().await.map_err(list_error)? {
+                    examined += 1;
+                    if examined > max_examined {
+                        return Err(StagingSourceError::InvalidListing(format!(
+                            "this source lists more than {max_examined} entries for one page; \
+                             list a narrower path"
+                        )));
+                    }
+                    let trimmed = entry.path().trim_end_matches('/');
+                    // The listing names the listed directory itself as well.
+                    if trimmed == directory {
+                        continue;
+                    }
+                    let name = trimmed.rsplit('/').next().unwrap_or(trimmed).to_string();
+                    let metadata = entry.metadata().clone();
+                    let is_dir = metadata.is_dir();
+                    children.push(Child {
+                        name,
+                        is_dir,
+                        value: metadata,
+                    });
+                }
+                walk.listed(children);
+                continue;
+            }
+            Step::Entry { path, child } => (path, child),
+            Step::Done => return Ok((entries, false)),
+        };
+        let Some(entry) = source_entry(&path, &child.value, "", request.files_only) else {
             continue;
         };
-        if skipped < offset {
-            skipped += 1;
-            continue;
-        }
         if entries.len() == request.limit {
             return Ok((entries, true));
         }
         entries.push(entry);
     }
-    Ok((entries, false))
 }
 
 /// The listed entry as a source entry; `None` for the listed directory itself and for kinds

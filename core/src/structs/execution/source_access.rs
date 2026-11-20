@@ -315,8 +315,6 @@ pub enum ListCursor {
     After(String),
     /// Provider key: the next page starts at it, so a key a full page deferred is read first.
     At(String),
-    /// Entries to skip, for a source whose provider cannot start after a key.
-    Offset(u64),
     /// The last path a walked source listed: the next page continues after it in walk order.
     Walk(String),
 }
