@@ -85,6 +85,13 @@ impl<T> Walk<T> {
         Step::Done
     }
 
+    /// The cursor name the directory the last [`Step::List`] asked for resumes from, if any;
+    /// the names before it were listed on earlier pages.
+    pub(crate) fn resume_name(&self) -> Option<&str> {
+        let (_, after) = self.pending.as_ref()?;
+        after.first().map(String::as_str)
+    }
+
     /// Takes the children of the directory the last [`Step::List`] asked for.
     pub(crate) fn listed(&mut self, mut children: Vec<Child<T>>) {
         let Some((path, after)) = self.pending.take() else {
