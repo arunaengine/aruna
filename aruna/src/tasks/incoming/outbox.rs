@@ -5,6 +5,7 @@
 use super::*;
 use aruna_operations::node::finish_batch::FinishBatchOperation;
 use aruna_operations::node::publish_batches::PublishBatchesOperation;
+use aruna_operations::node::relay_records::RelayRecordsOperation;
 
 /// The realm configuration the drain decides with: `None` on a node that has none yet, where the
 /// bootstrap rules apply, and an error when it cannot be read or decoded, which postpones the drain
@@ -353,18 +354,16 @@ impl OperationsTaskHandler {
                     Some((record_ms, record.target.clone(), *topic, record.placement));
             }
         }
-        let relayed = self
-            .relay_undeliverable_records(config, &undeliverable)
-            .await;
-        invocation.undeliverable += undeliverable.len().saturating_sub(relayed.len());
-        if !relayed.is_empty()
-            && let Err(error) = drive(
-                PlanOperation::new(DeleteOutboxPlan { keys: relayed }),
-                self.context.as_ref(),
-            )
-            .await
-        {
-            warn!(%error, "Failed to delete relayed admin outbox records");
+        let shared = config.cloned().map(Arc::new);
+        let relay = RelayRecordsOperation::new(net_handle.node_id(), shared, undeliverable);
+        match drive(relay, self.context.as_ref()).await {
+            Ok(relayed) => {
+                // A relayed record left this node, so it never counts as undeliverable.
+                let left = relayed.left as u64;
+                UNDELIVERABLE_RECORD_COUNT.fetch_add(left, std::sync::atomic::Ordering::Relaxed);
+                invocation.undeliverable += relayed.left;
+            }
+            Err(error) => warn!(%error, "Relaying undeliverable outbox records broke off"),
         }
 
         let (groups, subbatches) = {

@@ -18,6 +18,7 @@ pub mod publish_batches;
 pub mod range_timer;
 mod rebuild_counts;
 pub mod recovery_run;
+pub mod relay_records;
 pub mod summary_refresh;
 pub mod sync_batch;
 pub mod usage_publish;

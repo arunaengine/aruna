@@ -52,7 +52,6 @@ use aruna_operations::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER,
 };
 use aruna_operations::device_node::sync_note::{NoteSyncOperation, SyncNote};
-use aruna_operations::forward::realm::RelayAdminOperation;
 use aruna_operations::jobs::DRAIN_RETRY_AFTER;
 use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
 use aruna_operations::jobs::prune::PruneTimerOperation;
@@ -105,7 +104,7 @@ use aruna_operations::replication::drain::RestoreDrainOperation;
 use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
 use aruna_operations::sync::document_outbox::{
-    DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
+    OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
 };
 use aruna_operations::sync::outbox::batches::{
     DrainInvocation, DrainSubBatch, DrainSyncOutcome, build_drain_batches,
@@ -248,52 +247,6 @@ impl OperationsTaskHandler {
         self
     }
 
-    /// Handles records this node cannot publish itself: admin records are relayed under
-    /// this node's origin signature and deleted once a holder takes custody, while
-    /// unsigned upserts/deletes stay in the outbox. Returns keys whose custody moved.
-    async fn relay_undeliverable_records(
-        &self,
-        config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
-        undeliverable: &[DrainRecord],
-    ) -> Vec<Vec<u8>> {
-        let mut relayed = Vec::new();
-        let device = self.is_device(config);
-        for (record_key, record, topic) in undeliverable {
-            if let Some(config) = config
-                && self.relay_admin_record(config, record).await
-            {
-                relayed.push(record_key.clone());
-                continue;
-            }
-            // A device can never become a holder, so an unrelayable row of its
-            // own would only be error-logged on every drain: drop it instead.
-            if device && !matches!(record.event, DocumentOutboxEvent::AdminOperation { .. }) {
-                warn!(
-                    event = "pipeline.drain.dropped",
-                    target = ?record.target,
-                    "Dropping a document sync outbox record no device can publish"
-                );
-                relayed.push(record_key.clone());
-                continue;
-            }
-            error!(
-                event = "pipeline.drain.undeliverable",
-                target = ?record.target,
-                %topic,
-                strategy = %record.placement.strategy_id,
-                shard = record.placement.shard,
-                age_ms = unix_timestamp_millis().saturating_sub(record.outbox_id.timestamp_ms()),
-                "Cannot publish a document sync outbox record from this node and it is not relayable; leaving it in the outbox"
-            );
-        }
-        // A relayed record left this node, so it never counts as undeliverable.
-        UNDELIVERABLE_RECORD_COUNT.fetch_add(
-            undeliverable.len().saturating_sub(relayed.len()) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        relayed
-    }
-
     /// Whether this node is a device: configured with a kind that holds no
     /// sync topic. Unknown kinds count as infrastructure.
     fn is_device(
@@ -308,74 +261,6 @@ impl OperationsTaskHandler {
                 aruna_operations::realm::mutate_placement::node_kind(config, net_handle.node_id())
             })
             .is_some_and(|kind| !kind.is_sync_eligible())
-    }
-
-    /// Signs one locally originated administrative envelope and hands it to a
-    /// holder. Returns whether a holder took custody.
-    async fn relay_admin_record(
-        &self,
-        config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-        record: &DocumentOutboxRecord,
-    ) -> bool {
-        let DocumentOutboxEvent::AdminOperation {
-            event,
-            origin_signature,
-        } = &record.event
-        else {
-            return false;
-        };
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            return false;
-        };
-        let origin_signature = match origin_signature {
-            Some(signature) => *signature,
-            None if event.origin_node_id == net_handle.node_id() => {
-                match event.signing_bytes(&record.placement) {
-                    Ok(bytes) => net_handle.sign(&bytes),
-                    Err(error) => {
-                        warn!(%error, "Cannot sign an admin event for relay");
-                        return false;
-                    }
-                }
-            }
-            None => return false,
-        };
-        let holders = aruna_core::placement::resolve_shard_holders(config, &record.placement);
-        if holders.is_empty() {
-            return false;
-        }
-        match drive(
-            RelayAdminOperation::new(
-                self.context.node_and_realm().map(|(node_id, _)| node_id),
-                &holders,
-                record.target.clone(),
-                event.clone(),
-                record.placement,
-                origin_signature,
-            ),
-            &self.context,
-        )
-        .await
-        {
-            Ok(()) => {
-                info!(
-                    event = "pipeline.drain.relayed",
-                    target = ?record.target,
-                    origin = %event.origin_node_id,
-                    "Relayed an admin outbox record to a holder"
-                );
-                true
-            }
-            Err(error) => {
-                warn!(
-                    event = "pipeline.drain.relay_failed",
-                    target = ?record.target,
-                    %error,
-                    "No holder accepted a relayed admin outbox record"
-                );
-                false
-            }
-        }
     }
 
     /// Re-arms the outbox drain on the rotation's retry ladder, which counts the attempt. The
