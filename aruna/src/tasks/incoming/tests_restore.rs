@@ -589,6 +589,45 @@ async fn renewal_keeps_prompt() {
     assert!(row.is_some_and(|row| row.due_unix_millis <= limit));
 }
 
+// A prompt publication already due when a stop ended its wake keeps its row: the renewal that
+// still runs rearms around it, and the next boot restores the prompt deadline.
+#[tokio::test]
+async fn stopped_prompt_restored() {
+    use aruna_core::federation::PUBLISH_INTERVAL;
+    use aruna_storage::task_timers::{persist_task_effect, read_timer};
+
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+    let key = TaskKey::PublishRegistration;
+    let prompt = TaskEffect::ResetTimer {
+        key: key.clone(),
+        after: Duration::from_secs(5),
+    };
+    persist_task_effect(&storage, &prompt)
+        .await
+        .expect("timer persists");
+    let before = read_timer(&storage, &key).await.expect("reads");
+    handler.run_trigger(key.clone()).await;
+    assert_eq!(read_timer(&storage, &key).await.expect("reads"), before);
+
+    let booted = TaskHandle::new();
+    let restored = crate::tasks::task_persistence::restore_task_timers(&storage, &booted, None);
+    assert!(restored.await.is_ok());
+    let after = armed_after(&booted, key, PUBLISH_INTERVAL).await;
+    assert!(after <= Duration::from_secs(5), "the prompt deadline is restored");
+}
+
 // The backend import pass armed at start stays armed in memory when its row cannot be stored,
 // so rules without a restored wake still run.
 #[tokio::test]

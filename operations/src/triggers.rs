@@ -183,8 +183,8 @@ pub struct TimerNeeds {
     pub cores: bool,
 }
 
-/// Whether the timer of `key` rearms with a shorten after a run, so a wake armed while it ran,
-/// such as the prompt publication of a settings change, is never postponed.
+/// Whether the timer of `key` rearms after a run only without a row stored while it ran, so a
+/// newer wake, such as the prompt publication of a settings change, is never postponed.
 pub fn keeps_earlier(key: &TaskKey) -> bool {
     matches!(key, TaskKey::PublishRegistration)
 }

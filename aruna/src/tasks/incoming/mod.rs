@@ -571,11 +571,26 @@ impl OperationsTaskHandler {
             return;
         };
         // The fired row is gone, so a refused rearm keeps a live wake that stores it again.
-        let effect = match keeps_earlier(&key) {
-            true => TaskEffect::ShortenTimer { key, after },
-            false => TaskEffect::ResetTimer { key, after },
+        if keeps_earlier(&key) {
+            return self.rearm_stored(key, after).await;
+        }
+        self.rearm_live(TaskEffect::ResetTimer { key, after }).await;
+    }
+
+    /// Rearms `key` unless a row stored while it ran holds a newer wake, also one no longer live
+    /// after a stop; live even when the row cannot be stored.
+    async fn rearm_stored(&self, key: TaskKey, after: Duration) {
+        let Some(task_handle) = self.context.task_handle.as_ref() else {
+            warn!(task_id = ?key, "Cannot rearm a timer without task handle");
+            return;
         };
-        self.rearm_live(effect).await;
+        let storage = &self.context.storage_handle;
+        let effect = TaskEffect::ShortenTimer { key, after };
+        if let Event::Task(TaskEvent::Error { key, message }) =
+            arm_unless_stored(storage, task_handle, effect).await
+        {
+            warn!(task_id = ?key, message = %message, "Failed to arm the retry timer");
+        }
     }
 
     /// What a timer kept from its last run, empty for its first run since the start.

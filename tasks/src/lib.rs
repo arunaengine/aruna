@@ -409,6 +409,12 @@ impl SchedulerState {
             return (TaskEvent::Error { key, message }, None);
         };
 
+        // A wake that came due while its key ran fires again right after the run, earliest of all.
+        if let Some(&pending) = self.refire_requested.get(&key) {
+            let after = Duration::ZERO;
+            return (TaskEvent::TimerScheduled { key, after }, pending);
+        }
+
         if let Some(existing) = self.timers_by_key.get(&key)
             && existing.deadline <= requested_deadline
         {
@@ -2352,6 +2358,23 @@ mod decision_tests {
             !state.refire_requested.contains_key(&key),
             "no run follows the cancel"
         );
+    }
+
+    // A shorten while a due wake waits for its running key keeps that wake and arms no other.
+    #[test]
+    fn pending_refire_kept() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        state.refire_requested.insert(key.clone(), Some(5));
+        let (event, holder) =
+            state.shorten_timer((key.clone(), Some(6)), Duration::from_secs(30), start);
+        let expected = TaskEvent::TimerScheduled {
+            key: key.clone(),
+            after: Duration::ZERO,
+        };
+        assert_eq!((event, holder), (expected, Some(5)));
+        assert!(!state.timers_by_key.contains_key(&key));
     }
 
     #[test]
