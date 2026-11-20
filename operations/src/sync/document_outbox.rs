@@ -48,6 +48,8 @@ impl RowPlan for ReadOutboxPlan {
 #[derive(Debug, PartialEq)]
 pub struct OutboxReadBatch {
     pub records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
+    /// The rows the page read, decoded or not; the invocation limits charge them.
+    pub scanned: usize,
     pub has_more: bool,
     pub next_start_after: Option<Vec<u8>>,
 }
@@ -73,6 +75,7 @@ impl RowPlan for OutboxPagePlan {
         )?;
         let has_more = values.len() > self.limit;
         let page: Vec<_> = values.into_iter().take(self.limit).collect();
+        let scanned = page.len();
         let next_start_after = page.last().map(|(key, _)| key.to_vec());
         let mut records = Vec::with_capacity(page.len());
         let mut malformed = Vec::new();
@@ -88,6 +91,7 @@ impl RowPlan for OutboxPagePlan {
         }
         let batch = OutboxReadBatch {
             records,
+            scanned,
             has_more,
             next_start_after,
         };

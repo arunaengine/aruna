@@ -256,6 +256,8 @@ pub struct DrainInvocation {
     pub groups: usize,
     pub subbatches: usize,
     pub pages: usize,
+    /// The rows this invocation's pages read, admitted or not.
+    pub scanned: usize,
     pub oldest_record_ms: Option<u64>,
     pub read_failed: bool,
     pub config_drained: bool,
@@ -284,6 +286,7 @@ impl DrainInvocation {
             groups: 0,
             subbatches: 0,
             pages: 0,
+            scanned: 0,
             oldest_record_ms: None,
             read_failed: false,
             config_drained: false,
