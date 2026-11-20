@@ -243,6 +243,9 @@ impl Store {
         after: Option<&[u8]>,
         limit: usize,
     ) -> Result<(Vec<Listed>, Option<Vec<u8>>), StoreError> {
+        // Every write holds the writer lock, so the index row and the rows it joins are read
+        // as one state: no status or entry change lands inside a page.
+        let _guard = self.writer.lock().map_err(|_| StoreError::Poisoned)?;
         let start = after.map_or(Bound::Unbounded, |after| Bound::Excluded(after.to_vec()));
         let (mut listed, mut read) = (Vec::new(), 0);
         for item in self.listing.range::<Vec<u8>, _>((start, Bound::Unbounded)) {
