@@ -74,6 +74,9 @@ pub enum KeyError {
     Abe(#[from] AbeError),
     #[error("the bucket or key request was not found")]
     Missing,
+    /// A record the request needs is not on this node yet; unlike `Missing`, the bucket exists.
+    #[error("a record the key request needs is not on this node yet")]
+    Unprepared,
     #[error("access to the encryption record is denied")]
     Denied,
     #[error("encryption storage is unavailable")]
@@ -541,6 +544,25 @@ mod tests {
         let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
         assert_eq!(operation.transaction(), TransactionMode::Write);
         assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+    }
+
+    #[test]
+    fn missing_records_unprepared() {
+        // An absent authorization, parameter or epoch row is no vanished bucket.
+        let realm_id = RealmId([1; 32]);
+        let user_id = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let action = KeyAction::Member(user_id);
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        let mut values = vec![None; 8];
+        values[7] = Some(Value::from(b"user".to_vec()));
+        assert_eq!(operation.snapshot_read(values), Err(KeyError::Unprepared));
     }
 
     #[test]

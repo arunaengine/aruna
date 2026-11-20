@@ -47,7 +47,7 @@ impl KeyOperation {
         if issues && local && values[7].is_none() {
             return Err(KeyError::Storage);
         }
-        let bytes = |index: usize| values[index].as_deref().ok_or(KeyError::Missing);
+        let bytes = |index: usize| values[index].as_deref().ok_or(KeyError::Unprepared);
         let realm =
             RealmAuthorizationDocument::from_bytes(bytes(0)?).map_err(|_| AbeError::Context)?;
         let group =
