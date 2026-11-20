@@ -777,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_is_best_effort() {
+    fn clearing_best_effort() {
         // A record that cannot be written leaves the completed upload a success.
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("record.upload");
