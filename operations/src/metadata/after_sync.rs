@@ -312,12 +312,14 @@ mod tests {
         let mut handed = AfterSyncOperation::new(None, result.clone());
         handed.first().unwrap();
         handed.next(unprojected()).unwrap();
-        handed.next(child(Ok::<(), MetadataProjectionError>(()))).unwrap();
+        handed
+            .next(child(Ok::<(), MetadataProjectionError>(())))
+            .unwrap();
         let pruned = child(Ok::<_, MetadataGraphError>(
             TombstoneProcessingResult::default(),
         ));
-        let unprojected = AfterSyncError::Project(MetadataProjectionError::PlacementFenced);
-        assert_eq!(handed.next(pruned), Err(unprojected));
+        let held = AfterSyncError::Project(MetadataProjectionError::PlacementFenced);
+        assert_eq!(handed.next(pruned), Err(held));
 
         let mut after = AfterSyncOperation::new(None, result);
         after.first().unwrap();
